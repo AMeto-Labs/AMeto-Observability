@@ -151,6 +151,15 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual IngestionOptions ConfiguredIngestion => new();
 
+    /// <summary>
+    /// The trace and metric knobs this host runs under. Defaults (the derived budgets) for every
+    /// suite but the one that needs figures no derivation produces; see DiagnosticsBudgetTests.
+    /// </summary>
+    protected virtual TracesOptions  ConfiguredTraces  => new();
+
+    /// <inheritdoc cref="ConfiguredTraces"/>
+    protected virtual MetricsOptions ConfiguredMetrics => new();
+
     /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
     public string WebRootPath { get; private set; } = "";
 
@@ -207,6 +216,8 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                 Query     = ConfiguredQuery,
                 LiveTail  = ConfiguredLiveTail,
                 Ingestion = ConfiguredIngestion,
+                Traces    = ConfiguredTraces,
+                Metrics   = ConfiguredMetrics,
             };
 
             services.AddSingleton(opts);

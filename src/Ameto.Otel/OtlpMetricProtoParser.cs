@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Ameto.Metrics;
 
 namespace Ameto.Otel;
@@ -17,25 +18,105 @@ namespace Ameto.Otel;
 /// <c>long.TryParse</c> in the mapper, once per timestamp, per int value, per histogram
 /// count and per bucket.</para>
 ///
+/// <para><b>No label string is materialised twice.</b> Keys, values, metric names and units are
+/// resolved from their UTF-8 bytes through a <see cref="MetricLabelInterner"/>, which answers a
+/// string the process already holds with that instance and allocates nothing; and a point whose
+/// labels are all pooled gets the label set built the first time those labels were seen. A
+/// 500-point batch decoded 8 000 label strings of which 26 were distinct — 99.7 % of them copies,
+/// ~900 B a point, retained into gen2 by every structure that keys on a label set. Past the
+/// interner's bounds a string or a label set is simply built fresh, as before; nothing is
+/// refused.</para>
+///
 /// Semantics are identical to <c>OtlpProtoDecoder</c> + <c>OtlpMetricMapper</c>;
 /// <c>OtlpMetricProtoParityTests</c> pins that.
 /// </summary>
 public static class OtlpMetricProtoParser
 {
+    /// <summary>A resolved string and its interner id (see <see cref="MetricLabelInterner.Intern(ReadOnlySpan{byte}, out string)"/>).</summary>
+    private readonly record struct Interned(string Text, int Id);
+
     /// <summary>Per-call scratch state — keeps the recursive readers to two parameters.</summary>
     private sealed class ParseState
     {
+        public readonly MetricLabelInterner Interner;
         public readonly List<MetricIngestItem> Result = [];
-        /// <summary>Refilled per data point; LabelSet copies the pairs into its own array.</summary>
-        public readonly List<KeyValuePair<string, string>> Labels = new(16);
 
-        public string? ServiceName;
-        public List<KeyValuePair<string, string>>? ResourceLabels;
+        /// <summary>
+        /// One point's labels, interleaved k0, v0, k1, v1, …, with each string's interner id beside
+        /// it — refilled per data point and handed to <see cref="MetricLabelInterner.GetLabelSet"/>,
+        /// which sorts both in place and copies only on a miss.
+        /// </summary>
+        public string[] Kv  = new string[32];
+        public int[]    Ids = new int[32];
+        public int      Used;
+
+        public readonly Interned ServiceNameKey;
+        public Interned? ServiceName;
+
+        /// <summary>The resource's labels, interleaved like <see cref="Kv"/>; <see cref="ResUsed"/> strings.</summary>
+        public string[] ResKv  = new string[16];
+        public int[]    ResIds = new int[16];
+        public int      ResUsed;
+
+        /// <summary>Histogram scratch, so a point's arrays are allocated once at their exact size.</summary>
+        public readonly List<long>   Counts = new(32);
+        public readonly List<double> Bounds = new(32);
+
+        /// <summary>
+        /// The bounds array of the previous histogram point in this batch. Every point of an
+        /// instrument carries the same bounds and nothing downstream mutates them (the hot tier
+        /// keeps its series' first array, the log and the writer only read), so a point whose
+        /// bounds match bit for bit shares the array instead of allocating its own.
+        /// </summary>
+        public double[]? LastBounds;
+
+        public ParseState(MetricLabelInterner interner)
+        {
+            Interner       = interner;
+            int id         = interner.Intern("service.name", out string key);
+            ServiceNameKey = new Interned(key, id);
+        }
+
+        public void Add(Interned key, Interned value)
+        {
+            if (Used + 2 > Kv.Length)
+            {
+                Array.Resize(ref Kv,  Kv.Length * 2);
+                Array.Resize(ref Ids, Ids.Length * 2);
+            }
+            Kv[Used] = key.Text;   Ids[Used] = key.Id;   Used++;
+            Kv[Used] = value.Text; Ids[Used] = value.Id; Used++;
+        }
+
+        public void AddResource(Interned key, Interned value)
+        {
+            if (ResUsed + 2 > ResKv.Length)
+            {
+                Array.Resize(ref ResKv,  ResKv.Length * 2);
+                Array.Resize(ref ResIds, ResIds.Length * 2);
+            }
+            ResKv[ResUsed] = key.Text;   ResIds[ResUsed] = key.Id;   ResUsed++;
+            ResKv[ResUsed] = value.Text; ResIds[ResUsed] = value.Id; ResUsed++;
+        }
+
+        public Interned Intern(ReadOnlySpan<byte> utf8)
+        {
+            int id = Interner.Intern(utf8, out string s);
+            return new Interned(s, id);
+        }
     }
 
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload)
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload) =>
+        Parse(payload, MetricLabelInterner.Shared);
+
+    /// <summary>
+    /// <see cref="Parse(ReadOnlySpan{byte})"/> against a given interner — the process-wide
+    /// <see cref="MetricLabelInterner.Shared"/> in production; tests pass a small one to reach its
+    /// bounds.
+    /// </summary>
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner)
     {
-        var st = new ParseState();
+        var st = new ParseState(interner);
         var r  = new ProtoReader(payload);
         uint tag;
         while ((tag = r.ReadTag()) != 0)
@@ -50,8 +131,8 @@ public static class OtlpMetricProtoParser
     {
         // Resource first: the wire format does not guarantee field order, and the service
         // name / resource labels are stamped onto every point below.
-        st.ServiceName    = null;
-        st.ResourceLabels = null;
+        st.ServiceName = null;
+        st.ResUsed     = 0;
 
         var pass1 = new ProtoReader(bytes);
         uint tag;
@@ -73,7 +154,9 @@ public static class OtlpMetricProtoParser
     /// Splits the resource attributes into the dedicated service name and the label set
     /// stamped onto every point. Exclusions mirror <c>OtlpMetricMapper</c>: the SDK's own
     /// <c>telemetry.*</c> self-description, and <c>service.instance.id</c>, which is a fresh
-    /// GUID per process start and would fork every series on every restart.
+    /// GUID per process start and would fork every series on every restart. The key is
+    /// decided on before the value is resolved, so an excluded value — the per-restart GUID
+    /// above all — never takes a slot in the interner.
     /// </summary>
     private static void ReadResource(ReadOnlySpan<byte> bytes, ParseState st)
     {
@@ -82,20 +165,19 @@ public static class OtlpMetricProtoParser
         while ((tag = r.ReadTag()) != 0)
         {
             if (tag != 10) { r.SkipField(tag); continue; }                       // field 1: attributes
-            if (!TryReadKeyValue(r.ReadLengthDelimited(), st, out var key, out var value)) continue;
+            if (!TryReadKeyValue(r.ReadLengthDelimited(), out var keyUtf8, out var value)) continue;
 
-            if (key == "service.name")
+            if (keyUtf8.SequenceEqual("service.name"u8))
             {
-                if (value.IsString) st.ServiceName = value.Text;                 // mapper parity: string only
+                if (value.IsString) st.ServiceName = st.Intern(value.Utf8);      // mapper parity: string only
                 continue;
             }
-            if (key == "service.instance.id") continue;
-            if (key.StartsWith("telemetry.sdk.",    StringComparison.Ordinal) ||
-                key.StartsWith("telemetry.distro.", StringComparison.Ordinal)) continue;
+            if (keyUtf8.SequenceEqual("service.instance.id"u8)) continue;
+            if (keyUtf8.StartsWith("telemetry.sdk."u8) ||
+                keyUtf8.StartsWith("telemetry.distro."u8)) continue;
 
-            string? sv = value.Format();
-            if (sv is not null)
-                (st.ResourceLabels ??= []).Add(new KeyValuePair<string, string>(key, sv));
+            if (value.TryFormat(st, out var sv))
+                st.AddResource(st.Intern(keyUtf8), sv);
         }
     }
 
@@ -114,6 +196,8 @@ public static class OtlpMetricProtoParser
     {
         // Name/unit precede the data in every OTLP encoder, but the wire format allows any
         // order — collect the scalars first, then walk the point sets with them in hand.
+        // Both are interned: every point of the metric and every series key built from it
+        // holds them for the series' life.
         string? name = null;
         string  unit = string.Empty;
 
@@ -123,8 +207,8 @@ public static class OtlpMetricProtoParser
         {
             switch (tag)
             {
-                case 10: name = pass1.ReadString(); break;   // field 1: name
-                case 26: unit = pass1.ReadString(); break;   // field 3: unit
+                case 10: name = st.Intern(pass1.ReadLengthDelimited()).Text; break;   // field 1: name
+                case 26: unit = st.Intern(pass1.ReadLengthDelimited()).Text; break;   // field 3: unit
                 default: pass1.SkipField(tag); break;
             }
         }
@@ -207,8 +291,16 @@ public static class OtlpMetricProtoParser
             var dp = r.ReadLengthDelimited();
             long   ts = 0, count = 0;
             double sum = 0;
-            List<long>?           counts    = null;
-            List<double>?         bounds    = null;
+
+            // The arrays are collected into reused scratch lists and allocated once, at their
+            // exact length: growing a fresh List by doubling and then copying it out cost four
+            // arrays per field per point. The flags keep "the field was present but empty" (an
+            // empty array) apart from "absent" (null), as the lists-on-demand shape did.
+            var counts = st.Counts;
+            var bounds = st.Bounds;
+            counts.Clear();
+            bounds.Clear();
+            bool haveCounts = false, haveBounds = false;
             List<MetricExemplar>? exemplars = null;
 
             var p = new ProtoReader(dp);
@@ -220,12 +312,12 @@ public static class OtlpMetricProtoParser
                     case 25: ts    = (long)p.ReadFixed64(); break;               // field 3: time_unix_nano
                     case 33: count = (long)p.ReadFixed64(); break;               // field 4: count (SDK emits fixed64)
                     case 41: sum   = p.ReadDouble();        break;               // field 5: sum
-                    case 48: (counts ??= []).Add((long)p.ReadVarint());  break;  // field 6 unpacked varint
-                    case 49: (counts ??= []).Add((long)p.ReadFixed64()); break;  // field 6 unpacked fixed64
+                    case 48: haveCounts = true; counts.Add((long)p.ReadVarint());  break;  // field 6 unpacked varint
+                    case 49: haveCounts = true; counts.Add((long)p.ReadFixed64()); break;  // field 6 unpacked fixed64
                     case 50:                                                     // field 6 packed
                     {
                         var packed = p.ReadLengthDelimited();
-                        counts ??= [];
+                        haveCounts = true;
                         // N x fixed64 is always a multiple of 8; varints almost never are —
                         // the same auto-detection the DOM decoder used.
                         bool asFixed = packed.Length % 8 == 0;
@@ -233,11 +325,11 @@ public static class OtlpMetricProtoParser
                         while (!pr.End) counts.Add((long)(asFixed ? pr.ReadFixed64() : pr.ReadVarint()));
                         break;
                     }
-                    case 57: (bounds ??= []).Add(p.ReadDouble()); break;         // field 7 unpacked
+                    case 57: haveBounds = true; bounds.Add(p.ReadDouble()); break;         // field 7 unpacked
                     case 58:                                                     // field 7 packed double
                     {
                         var packed = p.ReadLengthDelimited();
-                        bounds ??= [];
+                        haveBounds = true;
                         var pr = new ProtoReader(packed);
                         while (!pr.End) bounds.Add(pr.ReadDouble());
                         break;
@@ -261,11 +353,29 @@ public static class OtlpMetricProtoParser
                 TimestampUnixNano = ts,
                 HistogramCount    = count,
                 HistogramSum      = sum,
-                BucketBounds      = bounds?.ToArray(),
-                BucketCounts      = counts?.ToArray(),
+                BucketBounds      = haveBounds ? SharedBounds(st) : null,
+                BucketCounts      = haveCounts ? counts.ToArray() : null,
                 Exemplars         = exemplars?.ToArray(),
             });
         }
+    }
+
+    /// <summary>
+    /// This point's bounds: the previous point's array when the values match BIT FOR BIT (so
+    /// <c>-0.0</c> never stands in for <c>0.0</c>, nor one NaN payload for another), else a new
+    /// exact-length array that becomes the one the next point is compared with.
+    /// </summary>
+    private static double[] SharedBounds(ParseState st)
+    {
+        var scratch = CollectionsMarshal.AsSpan(st.Bounds);
+        var last    = st.LastBounds;
+        if (last is not null &&
+            MemoryMarshal.Cast<double, long>(last.AsSpan()).SequenceEqual(MemoryMarshal.Cast<double, long>(scratch)))
+            return last;
+
+        var fresh = scratch.ToArray();
+        st.LastBounds = fresh;
+        return fresh;
     }
 
     /// <summary>Only exemplars carrying a trace link are useful — the rest are dropped (mapper parity).</summary>
@@ -309,10 +419,9 @@ public static class OtlpMetricProtoParser
     /// </summary>
     private static LabelSet BuildLabels(ReadOnlySpan<byte> dp, int attrField, ParseState st)
     {
-        var pairs = st.Labels;
-        pairs.Clear();
-        if (st.ServiceName is not null)
-            pairs.Add(new KeyValuePair<string, string>("service.name", st.ServiceName));
+        st.Used = 0;
+        if (st.ServiceName is { } service)
+            st.Add(st.ServiceNameKey, service);
 
         uint attrTag = ((uint)attrField << 3) | 2;
         var r = new ProtoReader(dp);
@@ -320,66 +429,97 @@ public static class OtlpMetricProtoParser
         while ((tag = r.ReadTag()) != 0)
         {
             if (tag != attrTag) { r.SkipField(tag); continue; }
-            if (!TryReadKeyValue(r.ReadLengthDelimited(), st, out var key, out var value)) continue;
-            string? sv = value.Format();
-            if (sv is not null) pairs.Add(new KeyValuePair<string, string>(key, sv));
+            if (!TryReadKeyValue(r.ReadLengthDelimited(), out var keyUtf8, out var value)) continue;
+            if (value.TryFormat(st, out var sv)) st.Add(st.Intern(keyUtf8), sv);
         }
 
-        var res = st.ResourceLabels;
-        if (res is not null)
-            for (int i = 0; i < res.Count; i++)
-            {
-                bool exists = false;
-                for (int j = 0; j < pairs.Count; j++)
-                    if (pairs[j].Key == res[i].Key) { exists = true; break; }
-                if (!exists) pairs.Add(res[i]);
-            }
+        var res = st.ResKv;
+        for (int i = 0; i < st.ResUsed; i += 2)
+        {
+            // Against everything added so far, resource labels included: a resource that repeats
+            // a key keeps its first value, as the pair-list shape always did.
+            bool exists = false;
+            for (int j = 0; j < st.Used; j += 2)
+                if (st.Kv[j] == res[i]) { exists = true; break; }
+            if (!exists) st.Add(new Interned(res[i], st.ResIds[i]), new Interned(res[i + 1], st.ResIds[i + 1]));
+        }
 
-        return pairs.Count == 0 ? LabelSet.Empty : new LabelSet(pairs);
+        return st.Used == 0
+            ? LabelSet.Empty
+            : st.Interner.GetLabelSet(st.Kv.AsSpan(0, st.Used), st.Ids.AsSpan(0, st.Used));
     }
 
     // ── KeyValue / AnyValue ───────────────────────────────────────────────────
 
     /// <summary>
-    /// A decoded OTLP AnyValue, kept unformatted so callers that only need to know
-    /// "was it a string?" (the service-name rule) do not force a conversion.
+    /// A decoded OTLP AnyValue, kept as its wire bytes so callers that only need to know
+    /// "was it a string?" (the service-name rule) — or that skip the attribute outright — do
+    /// not force a conversion, and one that keeps it resolves it through the interner.
     /// </summary>
-    private readonly struct AnyValue
+    private readonly ref struct AnyValue
     {
-        public readonly string? Text;
+        public readonly ReadOnlySpan<byte> Utf8;
         public readonly long    Int;
         public readonly double  Double;
         public readonly bool    Bool;
         public readonly byte    Which;   // 0 none, 1 string, 2 bool, 3 int, 4 double
 
-        private AnyValue(string? text, long i, double d, bool b, byte which)
-        { Text = text; Int = i; Double = d; Bool = b; Which = which; }
+        private AnyValue(ReadOnlySpan<byte> utf8, long i, double d, bool b, byte which)
+        { Utf8 = utf8; Int = i; Double = d; Bool = b; Which = which; }
 
-        public static AnyValue Str(string s)   => new(s, 0, 0, false, 1);
-        public static AnyValue Boolean(bool b) => new(null, 0, 0, b, 2);
-        public static AnyValue Integer(long i) => new(null, i, 0, false, 3);
-        public static AnyValue Dbl(double d)   => new(null, 0, d, false, 4);
-        public static AnyValue None            => default;
+        public static AnyValue Str(ReadOnlySpan<byte> s) => new(s, 0, 0, false, 1);
+        public static AnyValue Boolean(bool b) => new(default, 0, 0, b, 2);
+        public static AnyValue Integer(long i) => new(default, i, 0, false, 3);
+        public static AnyValue Dbl(double d)   => new(default, 0, d, false, 4);
 
         public bool IsString => Which == 1;
 
-        /// <summary>Label text, or null when the value carries nothing usable — same
-        /// precedence as the mapper's FormatLabelValue (string, int, double, bool).</summary>
-        public string? Format() => Which switch
+        /// <summary>
+        /// Label text through the interner, or false when the value carries nothing usable — same
+        /// precedence and the same text as the mapper's FormatLabelValue (string, int, double,
+        /// bool). Numbers are formatted as UTF-8 into the stack and interned from there, so a
+        /// repeating number allocates nothing either: <c>IUtf8SpanFormattable</c> with the
+        /// invariant culture writes exactly the characters <c>ToString(InvariantCulture)</c>
+        /// returns.
+        /// </summary>
+        public bool TryFormat(ParseState st, out Interned text)
         {
-            1 => Text,
-            3 => Int.ToString(CultureInfo.InvariantCulture),
-            4 => Double.ToString(CultureInfo.InvariantCulture),
-            2 => Bool ? "true" : "false",
-            _ => null,
-        };
+            Span<byte> buf = stackalloc byte[32];   // long ≤ 20, shortest round-trip double ≤ 24
+            int n;
+            switch (Which)
+            {
+                case 1:
+                    text = st.Intern(Utf8);
+                    return true;
+                case 3:
+                    if (!Int.TryFormat(buf, out n, default, CultureInfo.InvariantCulture)) break;
+                    text = st.Intern(buf[..n]);
+                    return true;
+                case 4:
+                    if (!Double.TryFormat(buf, out n, default, CultureInfo.InvariantCulture)) break;
+                    text = st.Intern(buf[..n]);
+                    return true;
+                case 2:
+                    text = st.Intern(Bool ? "true"u8 : "false"u8);
+                    return true;
+                default:
+                    text = default;
+                    return false;
+            }
+
+            // A number whose invariant text outgrows the buffer — not reachable for long or
+            // double, kept so a wrong size can only cost an allocation.
+            text = new Interned(Which == 3 ? Int.ToString(CultureInfo.InvariantCulture)
+                                           : Double.ToString(CultureInfo.InvariantCulture), -1);
+            return true;
+        }
     }
 
     private static bool TryReadKeyValue(
-        ReadOnlySpan<byte> bytes, ParseState st, out string key, out AnyValue value)
+        ReadOnlySpan<byte> bytes, out ReadOnlySpan<byte> key, out AnyValue value)
     {
-        key   = string.Empty;
-        value = AnyValue.None;
+        key   = default;
+        value = default;
         bool haveKey = false;
 
         var r = new ProtoReader(bytes);
@@ -388,24 +528,24 @@ public static class OtlpMetricProtoParser
         {
             switch (tag)
             {
-                case 10: key = r.ReadString(); haveKey = true; break;             // field 1: key
-                case 18: value = ReadAnyValue(r.ReadLengthDelimited(), st); break; // field 2: value
+                case 10: key = r.ReadLengthDelimited(); haveKey = true; break;   // field 1: key
+                case 18: value = ReadAnyValue(r.ReadLengthDelimited()); break;   // field 2: value
                 default: r.SkipField(tag); break;
             }
         }
         return haveKey;
     }
 
-    private static AnyValue ReadAnyValue(ReadOnlySpan<byte> bytes, ParseState st)
+    private static AnyValue ReadAnyValue(ReadOnlySpan<byte> bytes)
     {
-        var result = AnyValue.None;
+        AnyValue result = default;
         var r = new ProtoReader(bytes);
         uint tag;
         while ((tag = r.ReadTag()) != 0)
         {
             switch (tag)
             {
-                case 10: result = AnyValue.Str(r.ReadString());            break; // field 1: string_value
+                case 10: result = AnyValue.Str(r.ReadLengthDelimited());   break; // field 1: string_value
                 case 16: result = AnyValue.Boolean(r.ReadVarint() != 0);   break; // field 2: bool_value
                 case 24: result = AnyValue.Integer((long)r.ReadVarint());  break; // field 3: int_value
                 case 33: result = AnyValue.Dbl(r.ReadDouble());            break; // field 4: double_value

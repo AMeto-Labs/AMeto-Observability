@@ -77,8 +77,8 @@ public sealed class FileBoundsConventionTests
             "expectedLen is a call-site constant (8 or 16, an id width), never a file field",
         ["MetricStorageEngine.cs:public ExemplarRing(int capacity) => _buf = new ExemplarSample[capacity]"] =
             "the ring is a hot-tier structure sized by config; nothing reads it back off disk",
-        ["MetricStorageEngine.cs:var outArr = new ExemplarSample[_count]"] =
-            "_count is the ring's own occupancy, bounded by the capacity above",
+        ["MetricStorageEngine.cs:heap ??= new ExemplarSample[size]"] =
+            "size is Math.Min(the caller's limit, the ring's own occupancy), bounded by the capacity above",
         ["MetricWriteAheadLog.cs:var snapshot = new byte[kept]"] =
             "kept is Math.Min(orphaned, 4 MiB) on the line above — already clamped by a literal",
         ["MetricWriteAheadLog.cs:buckets = new long[eh.BucketCount]"] =
@@ -96,6 +96,10 @@ public sealed class FileBoundsConventionTests
           + "the same `take`",
         ["MetricStorageEngine.cs:var copy = new List<MetricDataPoint>(_points)"] =
             "a copy of an in-memory list",
+        ["MetricStorageEngine.cs:var slice = new List<MetricDataPoint>(hi - lo)"] =
+            "hi and lo are binary-search indices into the hot series' own in-memory point list",
+        ["MetricStorageEngine.cs:var result = new List<MetricDataPoint>(count)"] =
+            "count is the number of the hot series' own in-memory points found in range, counted above",
         // COPY CONSTRUCTORS, NOT CAPACITIES. `new List<T>(someCollection)` and
         // `new List<T>(someCount)` are one shape to a textual scan and opposites in fact — the
         // first copies what is already in memory, the second reserves for a number a file may have

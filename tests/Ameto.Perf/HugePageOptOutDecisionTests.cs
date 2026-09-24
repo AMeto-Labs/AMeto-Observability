@@ -1,3 +1,4 @@
+using SlabArena = Ameto.Core.SlabArena;
 using Ameto.Ingestion;
 using Microsoft.Extensions.Logging;
 using Xunit;

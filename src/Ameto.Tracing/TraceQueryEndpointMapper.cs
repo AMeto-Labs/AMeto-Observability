@@ -1,4 +1,7 @@
+using System.Buffers;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using MessagePack;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -103,25 +106,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/compare?a={traceId}&b={traceId}
-        group.MapGet("/api/traces/compare", async (HttpContext ctx) =>
-        {
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            string? aHex = ctx.Request.Query["a"];
-            string? bHex = ctx.Request.Query["b"];
-
-            if (!TraceId.TryParseHex(aHex, out var tidA) || !TraceId.TryParseHex(bHex, out var tidB))
-            {
-                ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsync("'a' and 'b' must be valid 32-char hex trace IDs");
-                return;
-            }
-
-            var taskA = CollectSpansAsync(provider, tidA, ctx.RequestAborted);
-            var taskB = CollectSpansAsync(provider, tidB, ctx.RequestAborted);
-            await Task.WhenAll(taskA, taskB);
-
-            await ctx.Response.WriteAsJsonAsync(new { traceA = taskA.Result, traceB = taskB.Result });
-        });
+        group.MapGet("/api/traces/compare", static (HttpContext ctx) => WriteCompareAsync(ctx));
 
         // GET /api/traces/service-graph?from=&to=
         group.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
@@ -244,21 +229,8 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}/flamegraph
-        group.MapGet("/api/traces/{traceId}/flamegraph", async (HttpContext ctx, string traceId) =>
-        {
-            if (!TraceId.TryParseHex(traceId, out var tid))
-            {
-                ctx.Response.StatusCode = 400;
-                return;
-            }
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
-
-            if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
-
-            var flame = BuildFlamegraph(spans);
-            await ctx.Response.WriteAsJsonAsync(flame);
-        });
+        group.MapGet("/api/traces/{traceId}/flamegraph",
+            static (HttpContext ctx, string traceId) => WriteFlamegraphAsync(ctx, traceId));
 
         // GET /api/traces/index — what the trace-id index is doing, and whether it is finished.
         //
@@ -275,20 +247,119 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}
-        group.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
-        {
-            if (!TraceId.TryParseHex(traceId, out var tid))
-            {
-                ctx.Response.StatusCode = 400;
-                return;
-            }
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var spans    = new List<SpanDto>();
-            await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
-                spans.Add(SpanDto.From(s));
+        group.MapGet("/api/traces/{traceId}",
+            static (HttpContext ctx, string traceId) => WriteTraceDetailAsync(ctx, traceId));
+    }
 
-            await ctx.Response.WriteAsJsonAsync(spans);
-        });
+    // ── Trace detail and flame graph ──────────────────────────────────────────
+
+    /// <summary>
+    /// <c>GET /api/traces/{traceId}</c>: every span of one trace, in start order. A method rather
+    /// than a lambda in <see cref="MapTraceEndpoints"/> so <c>TraceDetailAllocProbe</c> can drive
+    /// the handler itself over a <c>DefaultHttpContext</c>, without a host.
+    ///
+    /// <para>WRITTEN, NOT SERIALISED. Each span goes straight from the record into the response —
+    /// ids as hex into the writer, the attribute map transcoded out of its msgpack bytes by
+    /// <see cref="TraceDetailJson"/> — where it used to become a <see cref="SpanDto"/> with three id
+    /// strings, a <c>Dictionary&lt;string,string&gt;</c> and a string per attribute value, all of
+    /// them buffered in a list until the last span arrived, and then walked back out by the
+    /// reflection serialiser. On a hot-tier trace that route also DECODED the blob through
+    /// <see cref="SpanRecord.Attributes"/>, which memoises the dictionary on the record — so one
+    /// look at a trace left every one of its spans ~1.5 KB heavier in the live tier until it
+    /// flushed (<c>TraceDetailAllocProbe.A_trace_detail_or_compare_does_not_inflate_the_hot_tier_it_read</c>).</para>
+    ///
+    /// <para>THE BYTES ARE THE OLD BYTES, pinned by <c>TraceDetailShapeTests</c>: the same property
+    /// names and order, every attribute value still the STRING <c>ToString()</c> gave it under the
+    /// request's culture, and the host's JSON encoder (see <see cref="TraceDetailJson.WriterOptions"/>).
+    /// </para>
+    ///
+    /// <para>STREAMED, and nothing is written before the first span arrives: the provider does all
+    /// of its reading before it yields anything (it sorts the union of both tiers), so a lookup
+    /// that fails still fails before the response has started — a 500, as before — and once a span
+    /// is in hand the rest are already in memory.</para>
+    /// </summary>
+    internal static async Task WriteTraceDetailAsync(HttpContext ctx, string traceId)
+    {
+        if (!TraceId.TryParseHex(traceId, out var tid))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        var body     = ctx.Response.BodyWriter;
+
+        Utf8JsonWriter? json    = null;
+        long            flushed = 0;
+        try
+        {
+            await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
+            {
+                json ??= TraceDetailJson.BeginArray(ctx);
+                TraceDetailJson.WriteSpan(json, s);
+
+                if (json.BytesCommitted + json.BytesPending - flushed < TraceDetailJson.FlushThresholdBytes)
+                    continue;
+                json.Flush();
+                flushed = json.BytesCommitted;
+                // No token, as WriteAsJsonAsync passed none that could fail a write: a client that
+                // has gone completes the pipe, and that is the signal to stop writing.
+                if ((await body.FlushAsync()).IsCompleted) return;
+            }
+
+            json ??= TraceDetailJson.BeginArray(ctx);
+            json.WriteEndArray();
+            json.Flush();
+            await body.FlushAsync();
+        }
+        finally { json?.Dispose(); }
+    }
+
+    /// <summary>
+    /// <c>GET /api/traces/compare?a=&amp;b=</c>: <c>{"traceA":[…],"traceB":[…]}</c>, each array exactly
+    /// the body <see cref="WriteTraceDetailAsync"/> writes for that trace — and for the same reasons
+    /// written from the records: it used to build a <see cref="SpanDto"/> per span of BOTH traces,
+    /// and to decode every hot-tier span's blob through the memoising
+    /// <see cref="SpanRecord.Attributes"/>, which left both traces ~1.5 KB per span heavier in the
+    /// live tier. <c>TraceDetailShapeTests</c> pins the body.
+    /// </summary>
+    internal static async Task WriteCompareAsync(HttpContext ctx)
+    {
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        string? aHex = ctx.Request.Query["a"];
+        string? bHex = ctx.Request.Query["b"];
+
+        if (!TraceId.TryParseHex(aHex, out var tidA) || !TraceId.TryParseHex(bHex, out var tidB))
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsync("'a' and 'b' must be valid 32-char hex trace IDs");
+            return;
+        }
+
+        // Both traces are collected before anything is written, as before: a lookup that fails is
+        // still a 500 before the response has started. What is collected is the records the
+        // provider already holds — no DTO, no dictionary, no decode memoised onto the hot tier.
+        var taskA = CollectSpansRawAsync(provider, tidA, ctx.RequestAborted);
+        var taskB = CollectSpansRawAsync(provider, tidB, ctx.RequestAborted);
+        await Task.WhenAll(taskA, taskB);
+
+        await TraceDetailJson.WriteCompareAsync(ctx, taskA.Result, taskB.Result);
+    }
+
+    /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
+    internal static async Task WriteFlamegraphAsync(HttpContext ctx, string traceId)
+    {
+        if (!TraceId.TryParseHex(traceId, out var tid))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
+
+        if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
+
+        var flame = BuildFlamegraph(spans);
+        await ctx.Response.WriteAsJsonAsync(flame);
     }
 
     // ── SSE streaming ─────────────────────────────────────────────────────────
@@ -444,8 +515,28 @@ public static class TraceQueryEndpointMapper
     ///   <item>the HOT TIER is walked in full on every page, by both fetchers. A descending
     ///   cursor does not shorten that walk at all — it only makes more spans fail the range test
     ///   inside it, and on the list path each surviving span still costs a MergeSpanInto
-    ///   (dictionary probe, HashSet add, field writes) inside the read lock.</item>
+    ///   (dictionary probe, HashSet add, field writes) — outside the read lock since 5de1c8f; the
+    ///   TraceQL path (<c>SearchSpansAsync</c>) still walks the tier and the in-flight flush
+    ///   snapshot under it. Measured (Release, a 49 000-span hot tier, ten spans a trace, 500-row
+    ///   pages of the filter list walking down the window): 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and
+    ///   10.6, 9.2, 13.5, 7.4, 6.0, 5.0 ms for pages 0-5 — falling only as the window loses
+    ///   traces to merge, never below the cost of the walk itself.</item>
     /// </list>
+    /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
+    /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is
+    /// recorded here so it is not asked again. What a page computes is a function of its WINDOW:
+    /// <c>MergeSpanInto</c> only merges spans inside <c>[from, pageTo]</c>, so a trace straddling
+    /// the ceiling contributes a different summary on every page, and every page of a stream has a
+    /// different ceiling. A memo keyed on (window, filters, cold array, unflushed generation, hot
+    /// count) — the key <c>TraceStorageEngine</c> already uses for its aggregate memo — is exact
+    /// and would never hit here: the window moves every page, and on a live server the hot count
+    /// moves between any two pages as well. A memo keyed on the tier alone would have to hold
+    /// every trace's spans to re-derive a window's summary from them, which is the walk again with
+    /// a copy of the tier on top. What would actually cut the cost is inside the engine, which this
+    /// file does not own: an index of the unflushed spans by start time, extended per append and
+    /// rebuilt per generation, so a page visits only the spans of its own window, and a hot-tier
+    /// merge bounded like the cold one instead of merging every in-window trace to return
+    /// <c>limit</c> of them.</para>
     /// <para>So the cost is bounded by the number of pages, not independent of it, and the
     /// per-page scan budget (<c>max(limit*5, 500)</c> merged summaries) is a budget on the MERGE,
     /// not on the reading: <c>MaxSpansPerPass</c> lets one compacted segment hold 200 000 spans,
@@ -1142,62 +1233,155 @@ public static class TraceQueryEndpointMapper
 
     // ── Flamegraph builder ────────────────────────────────────────────────────
 
-    private static FlamegraphNode? BuildFlamegraph(List<SpanRecord> spans)
+    /// <summary>
+    /// The flame graph's tree, WITHOUT the index it used to be built through: a
+    /// <c>Dictionary&lt;SpanId, SpanRecord&gt;</c>, a <c>Dictionary&lt;SpanId, List&lt;SpanRecord&gt;&gt;</c>
+    /// holding a fresh list per span, and a LINQ <c>Select</c>/<c>ToArray</c>/<c>Sum</c> per node.
+    /// The index is now one sort of the span ids (pooled arrays, no comparer) and the child lists
+    /// are linked through pooled int arrays, so what is left per span is what the response is made
+    /// of: the node, its id string, its children array.
+    ///
+    /// <para>THE SAME TREE, rule for rule, and <c>TraceDetailShapeTests</c> holds it byte for byte:
+    /// a span whose parent is empty or names no span of the trace is a root candidate, and the LAST
+    /// candidate in the provider's order is the root; the children of a node are every span naming
+    /// its id as parent, in the provider's order — GROUPED BY ID, as the dictionary was, so two spans
+    /// sharing an id (only the empty id can, after the provider's dedupe) share one child list;
+    /// <c>selfMs</c> is the node's total less the sum, left to right, of its children's ROUNDED
+    /// totals, floored at zero.</para>
+    ///
+    /// <para>STILL <see cref="FlamegraphNode"/> OBJECTS, STILL THE HOST SERIALISER — deliberately.
+    /// Writing the tree straight into the response would drop the last per-node allocations, but it
+    /// would also change what a trace deeper than 32 levels gets: the serialiser refuses anything
+    /// past its MaxDepth of 64 (a node is an object and an array), and today that is a 500. Making
+    /// deep traces draw is a behaviour the client would see — a fix, not a performance change — so
+    /// it is reported, not taken here. A source-generated context was not taken either: byte parity
+    /// needs the host's encoder (UnsafeRelaxedJsonEscaping), which a context's attribute options
+    /// cannot carry; and of the 336 208 B this request allocates of its own for 2 000 spans
+    /// (<c>TraceDetailAllocProbe</c>), the nodes, their id strings, the children arrays and the
+    /// span list account for 333 000 B of it (80 + 56 per node, 56 per parent, 33 008 of list),
+    /// leaving ~3 KB for the serialiser and the state machines — nothing left to buy back.</para>
+    /// </summary>
+    internal static FlamegraphNode? BuildFlamegraph(List<SpanRecord> spans)
     {
-        // Index for O(1) lookup
-        var byId       = new Dictionary<SpanId, SpanRecord>(spans.Count);
-        var children   = new Dictionary<SpanId, List<SpanRecord>>(spans.Count);
+        int n = spans.Count;
+        if (n == 0) return null;
 
-        foreach (var s in spans)
+        ulong[] ids     = ArrayPool<ulong>.Shared.Rent(n);
+        int[]   scratch = ArrayPool<int>.Shared.Rent(n * 6);
+        try
         {
-            byId[s.SpanId] = s;
-            if (!children.ContainsKey(s.SpanId)) children[s.SpanId] = [];
-        }
+            var order   = scratch.AsSpan(0,     n);   // sorted position -> span index
+            var groupOf = scratch.AsSpan(n,     n);   // span index -> its id's group (first sorted position)
+            var head    = scratch.AsSpan(2 * n, n);   // group -> first child's span index, or -1
+            var tail    = scratch.AsSpan(3 * n, n);   // group -> last child's span index
+            var count   = scratch.AsSpan(4 * n, n);   // group -> number of children
+            var next    = scratch.AsSpan(5 * n, n);   // span index -> next sibling's span index, or -1
 
-        SpanRecord? root = null;
-        foreach (var s in spans)
+            for (int i = 0; i < n; i++) { ids[i] = spans[i].SpanId.RawValue; order[i] = i; }
+            Array.Sort(ids, scratch, 0, n);           // the keys, carrying their span indexes in `order`
+
+            for (int p = 0, run = 0; p < n; p++)
+            {
+                if (p > 0 && ids[p] != ids[p - 1]) run = p;
+                groupOf[order[p]] = run;
+            }
+            head.Fill(-1);
+            count.Clear();
+            next.Fill(-1);
+
+            var sortedIds = new ReadOnlySpan<ulong>(ids, 0, n);
+            int root = -1;
+            for (int i = 0; i < n; i++)
+            {
+                var parent = spans[i].ParentSpanId;
+                int g = parent.IsEmpty ? -1 : FindGroup(sortedIds, parent.RawValue);
+                if (g < 0) { root = i; continue; }   // the last candidate wins, as it always did
+
+                if (head[g] < 0) head[g] = i;
+                else             next[tail[g]] = i;
+                tail[g] = i;
+                count[g]++;
+            }
+
+            return root < 0 ? null : BuildNode(spans, groupOf, head, next, count, root);
+        }
+        finally
         {
-            if (s.ParentSpanId.IsEmpty || !byId.ContainsKey(s.ParentSpanId))
-            { root = s; continue; }
-            children[s.ParentSpanId].Add(s);
+            ArrayPool<int>.Shared.Return(scratch);
+            ArrayPool<ulong>.Shared.Return(ids);
         }
+    }
 
-        return root is null ? null : BuildNode(root, children);
+    /// <summary>The first sorted position holding <paramref name="id"/>, or -1 — the group's key.</summary>
+    private static int FindGroup(ReadOnlySpan<ulong> sortedIds, ulong id)
+    {
+        int lo = 0, hi = sortedIds.Length;
+        while (lo < hi)
+        {
+            int mid = (int)(((uint)lo + (uint)hi) >> 1);
+            if (sortedIds[mid] < id) lo = mid + 1;
+            else                     hi = mid;
+        }
+        return lo < sortedIds.Length && sortedIds[lo] == id ? lo : -1;
     }
 
     private static FlamegraphNode BuildNode(
-        SpanRecord span, Dictionary<SpanId, List<SpanRecord>> childMap)
+        List<SpanRecord> spans, ReadOnlySpan<int> groupOf, ReadOnlySpan<int> head,
+        ReadOnlySpan<int> next, ReadOnlySpan<int> count, int index)
     {
-        var kids    = childMap.TryGetValue(span.SpanId, out var c) ? c : [];
-        var kidNodes = kids.Select(k => BuildNode(k, childMap)).ToArray();
+        var span = spans[index];
+        int g    = groupOf[index];
+
+        FlamegraphNode[] kidNodes = count[g] == 0 ? [] : new FlamegraphNode[count[g]];
+        int k = 0;
+        for (int c = head[g]; c >= 0; c = next[c])
+            kidNodes[k++] = BuildNode(spans, groupOf, head, next, count, c);
 
         double totalMs = span.DurationNanos / 1_000_000.0;
-        double childMs = kidNodes.Sum(n => n.TotalMs);
+        double childMs = 0;
+        foreach (var kid in kidNodes) childMs += kid.TotalMs;   // left to right, as Sum did
         double selfMs  = Math.Max(0, totalMs - childMs);
 
         return new FlamegraphNode
         {
-            SpanId   = span.SpanId.ToString(),
+            SpanId   = HexId(span.SpanId.RawValue),
             Name     = span.Name,
             Service  = span.ServiceName,
-            Kind     = span.Kind.ToString(),
-            Status   = span.Status.ToString(),
+            Kind     = (byte)span.Kind   < KindText.Length   ? KindText[(byte)span.Kind]     : span.Kind.ToString(),
+            Status   = (byte)span.Status < StatusText.Length ? StatusText[(byte)span.Status] : span.Status.ToString(),
             TotalMs  = Math.Round(totalMs, 3),
             SelfMs   = Math.Round(selfMs,  3),
             Children = kidNodes,
         };
     }
 
-    // ── Misc helpers ──────────────────────────────────────────────────────────
+    /// <summary><c>SpanId.ToString()</c> in one allocation: the string itself.</summary>
+    private static string HexId(ulong value) =>
+        string.Create(16, value, static (chars, v) =>
+        {
+            for (int i = 15; i >= 0; i--)
+            {
+                chars[i] = "0123456789abcdef"[(int)(v & 0xF)];
+                v >>= 4;
+            }
+        });
 
-    private static async Task<List<SpanDto>> CollectSpansAsync(
-        ITraceProvider provider, TraceId tid, CancellationToken ct)
+    /// <summary><c>ToString()</c> of every value up to the largest defined one, taken once — no box
+    /// per node. A value past it (a producer can send kind 9) is rare and takes <c>ToString()</c>.</summary>
+    private static readonly string[] KindText   = EnumTexts<SpanKind>();
+    private static readonly string[] StatusText = EnumTexts<SpanStatusCode>();
+
+    private static string[] EnumTexts<T>() where T : struct, Enum
     {
-        var list = new List<SpanDto>();
-        await foreach (var s in provider.GetTraceAsync(tid, ct))
-            list.Add(SpanDto.From(s));
-        return list;
+        int max = 0;
+        foreach (var v in Enum.GetValues<T>())
+            max = Math.Max(max, Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture));
+        var texts = new string[max + 1];
+        for (int i = 0; i <= max; i++) texts[i] = ((T)Enum.ToObject(typeof(T), i)).ToString();
+        return texts;
     }
+
+    // ── Misc helpers ──────────────────────────────────────────────────────────
 
     private static async Task<List<SpanRecord>> CollectSpansRawAsync(
         ITraceProvider provider, TraceId tid, CancellationToken ct)
@@ -1271,7 +1455,13 @@ public sealed class TraceRowDto
     public int      SpanCount         { get; init; }
 }
 
-/// <summary>JSON DTO for a single span, returned to the Angular client.</summary>
+/// <summary>
+/// JSON DTO for a single span — the shape the Angular client reads from the trace detail and the
+/// compare view. NO ENDPOINT SERIALISES IT ANY MORE: both are written by <see cref="TraceDetailJson"/>
+/// straight from the records. It stays as the definition of that shape and as the REFERENCE the
+/// writer is held to byte for byte (<c>TraceDetailTranscodeParityTests</c> serialises
+/// <see cref="From"/>'s output next to <see cref="TraceDetailJson.WriteSpan"/>'s).
+/// </summary>
 public sealed class SpanDto
 {
     public string                    TraceId           { get; init; } = string.Empty;
@@ -1300,6 +1490,478 @@ public sealed class SpanDto
         HttpStatusCode    = s.HttpStatusCode,
         Attributes        = s.Attributes?.ToDictionary(kv => kv.Key, kv => kv.Value?.ToString() ?? string.Empty) ?? [],
     };
+}
+
+/// <summary>
+/// THE TRACE DETAIL'S WIRE FORMAT, WRITTEN BY HAND — byte for byte what serialising a
+/// <c>List&lt;SpanDto&gt;</c> through the host's JSON options produced, without the DTO, its
+/// dictionary, or a string per attribute value. <c>TraceDetailShapeTests</c> pins the bytes over
+/// every attribute shape, both tiers and two cultures; <c>TraceDetailTranscodeParityTests</c> holds
+/// <see cref="WriteSpan"/> to <see cref="SpanDto.From"/> over seeded random blobs.
+/// </summary>
+internal static class TraceDetailJson
+{
+    /// <summary>
+    /// How much of the response may sit in the pipe before it is flushed — what
+    /// <c>JsonSerializer.SerializeAsync</c> buffered, near enough (16 KB × 0.9), so the socket sees
+    /// the same rhythm of writes it always did.
+    /// </summary>
+    internal const int FlushThresholdBytes = 16 * 1024;
+
+    /// <summary>What <c>WriteAsJsonAsync</c> sets, and so what the client has always been sent.</summary>
+    private const string ContentType = "application/json; charset=utf-8";
+
+    private static readonly JsonEncodedText PTraceId           = JsonEncodedText.Encode("traceId");
+    private static readonly JsonEncodedText PSpanId            = JsonEncodedText.Encode("spanId");
+    private static readonly JsonEncodedText PParentSpanId      = JsonEncodedText.Encode("parentSpanId");
+    private static readonly JsonEncodedText PStartTimeUnixNano = JsonEncodedText.Encode("startTimeUnixNano");
+    private static readonly JsonEncodedText PDurationNanos     = JsonEncodedText.Encode("durationNanos");
+    private static readonly JsonEncodedText PName              = JsonEncodedText.Encode("name");
+    private static readonly JsonEncodedText PServiceName       = JsonEncodedText.Encode("serviceName");
+    private static readonly JsonEncodedText PKind              = JsonEncodedText.Encode("kind");
+    private static readonly JsonEncodedText PStatus            = JsonEncodedText.Encode("status");
+    private static readonly JsonEncodedText PHttpStatusCode    = JsonEncodedText.Encode("httpStatusCode");
+    private static readonly JsonEncodedText PAttributes        = JsonEncodedText.Encode("attributes");
+
+    /// <summary>
+    /// The enum names, as <c>ToString()</c> spells them, for every DEFINED value — derived from the
+    /// enums rather than typed out, so a renamed member cannot put a different word on the wire
+    /// than the DTO did. An undefined value (a producer can send kind 9) is rare and takes
+    /// <c>ToString()</c> itself, which prints its number.
+    /// </summary>
+    private static readonly JsonEncodedText[] KindNames   = EnumNames<SpanKind>();
+    private static readonly JsonEncodedText[] StatusNames = EnumNames<SpanStatusCode>();
+
+    private static JsonEncodedText[] EnumNames<T>() where T : struct, Enum
+    {
+        var values = Enum.GetValues<T>();
+        int max = 0;
+        foreach (var v in values) max = Math.Max(max, Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture));
+        var names = new JsonEncodedText[max + 1];
+        for (int i = 0; i <= max; i++)
+            names[i] = JsonEncodedText.Encode(((T)Enum.ToObject(typeof(T), i)).ToString());
+        return names;
+    }
+
+    /// <summary>The fallback for a host with no <c>JsonOptions</c> registered — what
+    /// <c>WriteAsJsonAsync</c> falls back to as well: a fresh <c>JsonOptions</c>' serializer
+    /// options, whose encoder is ASP.NET Core's relaxed one.</summary>
+    private static readonly JsonSerializerOptions FallbackOptions =
+        new Microsoft.AspNetCore.Http.Json.JsonOptions().SerializerOptions;
+
+    /// <summary>
+    /// THE HOST'S ENCODER AND LAYOUT, taken from the options <c>WriteAsJsonAsync</c> resolves — not
+    /// System.Text.Json's defaults, and not a source-generated context's. ASP.NET Core's HTTP JSON
+    /// options carry <c>JavaScriptEncoder.UnsafeRelaxedJsonEscaping</c>, under which <c>&lt;</c>,
+    /// <c>&amp;</c>, <c>'</c> and non-ASCII text go out as UTF-8 rather than as <c>\uXXXX</c>; the
+    /// default encoder would change the bytes of every span with a non-ASCII name or value. The
+    /// property names and their order are this type's own and fixed: they ARE the contract.
+    /// </summary>
+    internal static JsonWriterOptions WriterOptions(HttpContext ctx) => WriterOptions(HostOptions(ctx));
+
+    /// <summary>The serializer options <c>WriteAsJsonAsync</c> would have used for this request.</summary>
+    internal static JsonSerializerOptions HostOptions(HttpContext ctx) =>
+        ctx.RequestServices?.GetService<Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>()
+            ?.Value?.SerializerOptions
+     ?? FallbackOptions;
+
+    /// <summary>The writer settings of <paramref name="o"/> that change bytes: encoder and layout.</summary>
+    internal static JsonWriterOptions WriterOptions(JsonSerializerOptions o) => new()
+    {
+        Encoder         = o.Encoder,
+        Indented        = o.WriteIndented,
+        IndentCharacter = o.IndentCharacter,
+        IndentSize      = o.IndentSize,
+        NewLine         = o.NewLine,
+    };
+
+    private static readonly JsonEncodedText PTraceA = JsonEncodedText.Encode("traceA");
+    private static readonly JsonEncodedText PTraceB = JsonEncodedText.Encode("traceB");
+
+    /// <summary>
+    /// The compare view's body: what serialising <c>new { traceA, traceB }</c> — two
+    /// <c>List&lt;SpanDto&gt;</c> — through the host's options produced.
+    /// </summary>
+    internal static async Task WriteCompareAsync(HttpContext ctx, List<SpanRecord> a, List<SpanRecord> b)
+    {
+        ctx.Response.ContentType = ContentType;
+        var body = ctx.Response.BodyWriter;
+        using var json = new Utf8JsonWriter(body, WriterOptions(ctx));
+
+        json.WriteStartObject();
+        json.WritePropertyName(PTraceA);
+        long flushed = await WriteArrayAsync(json, body, a, 0);
+        if (flushed < 0) return;
+        json.WritePropertyName(PTraceB);
+        flushed = await WriteArrayAsync(json, body, b, flushed);
+        if (flushed < 0) return;
+        json.WriteEndObject();
+        json.Flush();
+        await body.FlushAsync();
+    }
+
+    /// <summary>
+    /// One array of spans, flushed every <see cref="FlushThresholdBytes"/>. Returns the new flushed
+    /// mark, or -1 when the client has gone (the pipe completed) and nothing more should be written.
+    /// </summary>
+    private static async ValueTask<long> WriteArrayAsync(
+        Utf8JsonWriter json, System.IO.Pipelines.PipeWriter body, List<SpanRecord> spans, long flushed)
+    {
+        json.WriteStartArray();
+        foreach (var s in spans)
+        {
+            WriteSpan(json, s);
+            if (json.BytesCommitted + json.BytesPending - flushed < FlushThresholdBytes) continue;
+            json.Flush();
+            flushed = json.BytesCommitted;
+            if ((await body.FlushAsync()).IsCompleted) return -1;
+        }
+        json.WriteEndArray();
+        return flushed;
+    }
+
+    /// <summary>Sets the content type, opens a writer on the response body and writes <c>[</c>.</summary>
+    internal static Utf8JsonWriter BeginArray(HttpContext ctx)
+    {
+        ctx.Response.ContentType = ContentType;
+        var json = new Utf8JsonWriter(ctx.Response.BodyWriter, WriterOptions(ctx));
+        json.WriteStartArray();
+        return json;
+    }
+
+    /// <summary>One span, exactly as <c>SpanDto.From(s)</c> serialised.</summary>
+    internal static void WriteSpan(Utf8JsonWriter w, SpanRecord s)
+    {
+        Span<byte> hex = stackalloc byte[32];
+
+        w.WriteStartObject();
+        FormatHex(s.TraceId, hex);
+        w.WriteString(PTraceId, hex);
+        FormatHex(s.SpanId.RawValue, hex[..16]);
+        w.WriteString(PSpanId, hex[..16]);
+        FormatHex(s.ParentSpanId.RawValue, hex[..16]);
+        w.WriteString(PParentSpanId, hex[..16]);
+        w.WriteNumber(PStartTimeUnixNano, s.StartTimeUnixNano);
+        w.WriteNumber(PDurationNanos,     s.DurationNanos);
+        w.WriteString(PName,              s.Name);
+        w.WriteString(PServiceName,       s.ServiceName);
+        WriteEnum(w, PKind,   (byte)s.Kind,   KindNames,   s.Kind);
+        WriteEnum(w, PStatus, (byte)s.Status, StatusNames, s.Status);
+        w.WriteNumber(PHttpStatusCode, (int)s.HttpStatusCode);
+        w.WritePropertyName(PAttributes);
+        WriteAttributes(w, s);
+        w.WriteEndObject();
+    }
+
+    private static void WriteEnum<T>(Utf8JsonWriter w, JsonEncodedText property, byte value,
+                                     JsonEncodedText[] names, T boxedOnlyWhenUndefined) where T : struct, Enum
+    {
+        if (value < names.Length) w.WriteString(property, names[value]);
+        else                      w.WriteString(property, boxedOnlyWhenUndefined.ToString());
+    }
+
+    private static ReadOnlySpan<byte> HexDigits => "0123456789abcdef"u8;
+
+    /// <summary><c>SpanId.ToString()</c> — <c>{value:x16}</c> — as UTF-8, into the caller's stack.</summary>
+    internal static void FormatHex(ulong value, Span<byte> dest16)
+    {
+        for (int i = 15; i >= 0; i--)
+        {
+            dest16[i] = HexDigits[(int)(value & 0xF)];
+            value >>= 4;
+        }
+    }
+
+    /// <summary><c>TraceId.ToString()</c> — high half then low half, each <c>x16</c>.</summary>
+    internal static void FormatHex(TraceId id, Span<byte> dest32)
+    {
+        Span<byte> raw = stackalloc byte[16];
+        id.WriteTo(raw);
+        FormatHex(System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(raw),      dest32[..16]);
+        FormatHex(System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(raw[8..]), dest32[16..]);
+    }
+
+    // ── The attribute map ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The attribute map as the DTO's <c>Dictionary&lt;string,string&gt;</c> serialised: the map
+    /// <see cref="SpanAttributeBlob.Decode"/> builds, each value as <c>ToString()</c> of the box it
+    /// decodes to, <c>""</c> for null, and <c>{}</c> when there is no map or it will not decode.
+    ///
+    /// <para>READ FROM THE BYTES, NEVER FROM <see cref="SpanRecord.Attributes"/> for a record that
+    /// has them: that property memoises its decode on the record, and a hot-tier record belongs to
+    /// the tier. A record with no bytes is one built from a dictionary (test fixtures) or one with
+    /// no attributes, and takes the dictionary it has.</para>
+    /// </summary>
+    internal static void WriteAttributes(Utf8JsonWriter w, SpanRecord s)
+    {
+        var blob = s.AttributesBytes;
+        if (blob.IsEmpty)                   { WriteDecoded(w, s.Attributes); return; }
+        if (TryWriteBlob(w, blob))          return;
+        WriteDecoded(w, SpanAttributeBlob.Decode(blob));   // not memoised: Decode, not .Attributes
+    }
+
+    /// <summary>
+    /// THE REFERENCE PATH, and the one every shape the fast path declines takes: the dictionary,
+    /// in its own order, each value through <c>ToString()</c>. Exact by construction — it is the
+    /// old code minus the copy <c>ToDictionary</c> made of a map it then only enumerated.
+    /// </summary>
+    private static void WriteDecoded(Utf8JsonWriter w, IReadOnlyDictionary<string, object?>? attrs)
+    {
+        w.WriteStartObject();
+        if (attrs is not null)
+            foreach (var kv in attrs)
+                w.WriteString(kv.Key, kv.Value?.ToString() ?? string.Empty);
+        w.WriteEndObject();
+    }
+
+    /// <summary>One pair of the map, located in the blob. Unmanaged, so it can live on the stack.</summary>
+    private struct AttrPair
+    {
+        public int          KeyStart, KeyLength;       // a nil key is the empty key: length 0
+        public int          ValueStart, ValueLength;   // Kind == Utf8String
+        public SpanAttrKind Kind;
+        public bool         Boolean;
+        public long         Integer;
+        public double       Float;
+        public int          Last;                      // on a key's FIRST copy: the index of its last
+        public bool         Repeat;                    // a later copy of a key already seen
+    }
+
+    /// <summary>Pairs located on the stack; a larger map rents.</summary>
+    private const int StackPairs = 32;
+
+    /// <summary>
+    /// Past this many pairs the fast path declines and the reference path's dictionary takes the
+    /// map. Not a cost limit any more — duplicate detection is a hash probe per key (see
+    /// <see cref="FindCopies"/>) — but a bound on what is rented for one span.
+    /// </summary>
+    private const int MaxFastPairs = 256;
+
+    /// <summary>Probe slots on the stack; a larger map rents. Twice <see cref="StackPairs"/>.</summary>
+    private const int StackSlots = 64;
+
+    /// <summary>
+    /// The map straight from its bytes. FALSE — with nothing written — when this path cannot
+    /// PROVE it would write what the reference path writes, and the caller then takes that path:
+    /// <list type="bullet">
+    ///   <item>a key that is not valid UTF-8: two DIFFERENT byte strings can decode to the SAME key
+    ///   (every ill-formed sequence becomes U+FFFD), which the dictionary folds into one entry and a
+    ///   byte comparison would not;</item>
+    ///   <item>more than <see cref="MaxFastPairs"/> pairs.</item>
+    /// </list>
+    ///
+    /// <para>A MAP THAT WILL NOT DECODE IS ANSWERED HERE, as <c>{}</c>, and not declined. The walk
+    /// makes the SAME reader calls <see cref="SpanAttributeBlob.Decode"/> makes, in its order —
+    /// nil-or-string keys, <c>ReadInt64</c> for every integer (which throws past
+    /// <c>long.MaxValue</c>), <c>Skip</c> for everything it boxes as null — so it throws exactly
+    /// where Decode throws, and Decode's answer to a throw is null, which the reference path writes
+    /// as <c>{}</c>. Declining bought nothing but a SECOND exception per span per request — the
+    /// walk's, then Decode's — where the DTO path paid one (and memoised it on a hot record); an
+    /// exception is most of what such a span costs (<c>TraceDetailJsonFaultTests</c> counts them).
+    /// The fuzz (<c>TraceDetailTranscodeParityTests</c>, ~17% of its spans undecodable) holds the two
+    /// answers equal.</para>
+    ///
+    /// <para>What it then writes: each key once, at the position of its FIRST copy, with the value of
+    /// its LAST — which is where a dictionary indexer leaves them — and each value as the text
+    /// <c>ToString()</c> gives its box: a string as decoded (an ill-formed one through the decoder,
+    /// so its U+FFFD land where they did), an integer and a double through
+    /// <see cref="IUtf8SpanFormattable"/> with the CURRENT culture — the same call
+    /// <c>long.ToString()</c> and <c>double.ToString()</c> make — a bool as <c>True</c> /
+    /// <c>False</c>, and nil, arrays, maps, binary and extensions as <c>""</c>. Trailing bytes after
+    /// the map are ignored, as Decode ignores them.</para>
+    /// </summary>
+    internal static bool TryWriteBlob(Utf8JsonWriter w, ReadOnlyMemory<byte> blob)
+    {
+        var reader = new MessagePackReader(blob);
+        int count;
+        try   { count = reader.ReadMapHeader(); }
+        catch { count = -1; }     // not a map, or torn in its header: Decode answers null
+        if (count < 0)            { WriteEmptyMap(w); return true; }
+        if (count > MaxFastPairs) return false;
+
+        // Open addressing at no more than half full: a power of two at least twice the pair count.
+        int slots = Math.Max(8, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)count * 2));
+
+        // Both rentals sit inside the try, so a second Rent that throws still returns the first.
+        AttrPair[]? rented = null;
+        int[]?      rentedSlots = null;
+        try
+        {
+            Span<AttrPair> pairs = count <= StackPairs
+                ? stackalloc AttrPair[StackPairs]
+                : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
+            Span<int> table = slots <= StackSlots
+                ? stackalloc int[StackSlots]
+                : (rentedSlots = ArrayPool<int>.Shared.Rent(slots));
+            pairs = pairs[..count];
+            table = table[..slots];
+            var bytes = blob.Span;
+            switch (Walk(ref reader, bytes, pairs))
+            {
+                case WalkResult.IllFormedKey: return false;
+                case WalkResult.Undecodable:  WriteEmptyMap(w); return true;   // Decode's null
+            }
+
+            // NOTHING BELOW IS CAUGHT. Only the walk may turn a throw into a decline — a throw there
+            // means the blob will not decode, and nothing has been written. A throw from here on is
+            // the WRITER's (its output failed, say), with a half-written object behind it: falling
+            // back would open a second object where a property name is due, and the writer's own
+            // state check would replace the real failure with an InvalidOperationException
+            // (TraceDetailJsonFaultTests).
+            FindCopies(bytes, pairs, table);
+
+            w.WriteStartObject();
+            for (int i = 0; i < count; i++)
+            {
+                if (pairs[i].Repeat) continue;   // written at its first copy, with its last copy's value
+                var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
+                WriteValue(w, key, bytes, in pairs[pairs[i].Last]);
+            }
+            w.WriteEndObject();
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)      ArrayPool<AttrPair>.Shared.Return(rented);
+            if (rentedSlots is not null) ArrayPool<int>.Shared.Return(rentedSlots);
+        }
+    }
+
+    /// <summary>
+    /// Links every key's copies in ONE pass: a hash of the key's UTF-8 bytes into an open-addressed
+    /// table of first-copy indexes, so the first copy of a key learns the index of its LAST copy
+    /// and every later copy is marked a repeat — where a dictionary indexer leaves them. It was a
+    /// pairwise scan, ~n² key comparisons per span: at 256 attributes with keys of one length,
+    /// 6x the old decode's cost (review of WP9, finding 1). Byte equality is key equality here
+    /// because an ill-formed key has already declined the map (see <see cref="TryWriteBlob"/>);
+    /// a nil key and the empty key are both empty spans, and meet.
+    /// </summary>
+    private static void FindCopies(ReadOnlySpan<byte> bytes, Span<AttrPair> pairs, Span<int> table)
+    {
+        table.Clear();
+        int mask = table.Length - 1;
+        for (int i = 0; i < pairs.Length; i++)
+        {
+            var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
+            var hash = new HashCode();
+            hash.AddBytes(key);
+            int slot = hash.ToHashCode() & mask;
+            while (true)
+            {
+                int entry = table[slot];
+                if (entry == 0)
+                {
+                    table[slot]   = i + 1;   // 0 is "empty", so indexes are stored one up
+                    pairs[i].Last = i;
+                    break;
+                }
+                int first = entry - 1;
+                if (KeyEquals(pairs[first], bytes, key))
+                {
+                    pairs[first].Last = i;
+                    pairs[i].Repeat   = true;
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+    }
+
+    private enum WalkResult { Walked, IllFormedKey, Undecodable }
+
+    /// <summary>What the reference path writes for a map Decode answers null to.</summary>
+    private static void WriteEmptyMap(Utf8JsonWriter w)
+    {
+        w.WriteStartObject();
+        w.WriteEndObject();
+    }
+
+    /// <summary>
+    /// Locates every pair, making the reader calls <see cref="SpanAttributeBlob.Decode"/> makes, in
+    /// its order — so it throws exactly where Decode throws, and that is reported as
+    /// <see cref="WalkResult.Undecodable"/>. Writes nothing.
+    /// </summary>
+    private static WalkResult Walk(ref MessagePackReader reader, ReadOnlySpan<byte> bytes, scoped Span<AttrPair> pairs)
+    {
+        try
+        {
+            for (int i = 0; i < pairs.Length; i++)
+            {
+                ref var p = ref pairs[i];
+                p = default;
+
+                // ReadString's rules for the key: nil is the empty key, a string is its bytes, and
+                // anything else throws.
+                if (!reader.TryReadNil())
+                {
+                    long len = reader.ReadStringSequence()!.Value.Length;
+                    p.KeyLength = (int)len;
+                    p.KeyStart  = (int)(reader.Consumed - len);
+                    if (!System.Text.Unicode.Utf8.IsValid(bytes.Slice(p.KeyStart, p.KeyLength)))
+                        return WalkResult.IllFormedKey;
+                }
+
+                // SpanAttributeBlob.ReadBoxedValue's rules for the value, call for call.
+                switch (reader.NextMessagePackType)
+                {
+                    case MessagePackType.String:
+                    {
+                        long len = reader.ReadStringSequence()!.Value.Length;
+                        p.Kind        = SpanAttrKind.Utf8String;
+                        p.ValueLength = (int)len;
+                        p.ValueStart  = (int)(reader.Consumed - len);
+                        break;
+                    }
+                    case MessagePackType.Integer: p.Kind = SpanAttrKind.Integer; p.Integer = reader.ReadInt64();   break;
+                    case MessagePackType.Float:   p.Kind = SpanAttrKind.Float;   p.Float   = reader.ReadDouble();  break;
+                    case MessagePackType.Boolean: p.Kind = SpanAttrKind.Boolean; p.Boolean = reader.ReadBoolean(); break;
+                    case MessagePackType.Nil:     p.Kind = SpanAttrKind.Null;    reader.ReadNil();                 break;
+                    default:                      p.Kind = SpanAttrKind.Other;   reader.Skip();                    break;
+                }
+            }
+            return WalkResult.Walked;
+        }
+        catch
+        {
+            return WalkResult.Undecodable;
+        }
+    }
+
+    private static bool KeyEquals(in AttrPair p, ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> key) =>
+        p.KeyLength == key.Length && bytes.Slice(p.KeyStart, p.KeyLength).SequenceEqual(key);
+
+    private static void WriteValue(Utf8JsonWriter w, ReadOnlySpan<byte> key, ReadOnlySpan<byte> bytes, in AttrPair p)
+    {
+        switch (p.Kind)
+        {
+            case SpanAttrKind.Utf8String:
+            {
+                var v = bytes.Slice(p.ValueStart, p.ValueLength);
+                if (System.Text.Unicode.Utf8.IsValid(v)) w.WriteString(key, v);
+                else                                     w.WriteString(key, System.Text.Encoding.UTF8.GetString(v));
+                break;
+            }
+            case SpanAttrKind.Integer: WriteFormatted(w, key, p.Integer); break;
+            case SpanAttrKind.Float:   WriteFormatted(w, key, p.Float);   break;
+            case SpanAttrKind.Boolean: w.WriteString(key, p.Boolean ? "True"u8 : "False"u8); break;
+            default:                   w.WriteString(key, ReadOnlySpan<byte>.Empty); break;
+        }
+    }
+
+    /// <summary>
+    /// <c>value.ToString()</c> as UTF-8 on the stack: <c>TryFormat</c> with no format and no
+    /// provider is the call <c>ToString()</c> makes — the current culture's NumberFormatInfo — so
+    /// "0,375" on a ru-KZ host stays "0,375" (issue #86 is a decision for the client, not for this
+    /// writer). A culture whose symbols do not fit the buffer takes <c>ToString()</c> itself.
+    /// </summary>
+    private static void WriteFormatted<T>(Utf8JsonWriter w, ReadOnlySpan<byte> key, T value)
+        where T : struct, IUtf8SpanFormattable
+    {
+        Span<byte> text = stackalloc byte[128];
+        if (value.TryFormat(text, out int n, default, provider: null)) w.WriteString(key, text[..n]);
+        else                                                           w.WriteString(key, value.ToString());
+    }
 }
 
 /// <summary>Single node in a trace flamegraph tree.</summary>

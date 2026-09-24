@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
-using Ameto.Core;
 
-namespace Ameto.Storage;
+namespace Ameto.Core;
 
 /// <summary>
 /// Interns message template strings to avoid storing the same string for every event
@@ -16,18 +15,43 @@ namespace Ameto.Storage;
 /// slot holds either its string or null (not yet interned in that copy).
 /// Maximum pool size is capped to prevent unbounded growth (eviction is not implemented —
 /// templates are typically low-cardinality).
+///
+/// <para>The cap is per instance. <see cref="Shared"/> keeps the 65 536 the logs tier has
+/// always had; a caller interning a different population — metric label keys and values —
+/// builds its own pool with its own bound, so a high-cardinality label cannot saturate the
+/// pool log templates are indexed in (every event past that point would carry its own
+/// template string, permanently).</para>
 /// </summary>
 public sealed class StringInternPool
 {
-    private const int MaxPoolSize  = 65536;
+    /// <summary>The cap <see cref="Shared"/> and the parameterless constructor use.</summary>
+    public const int DefaultMaxPoolSize = 65536;
     private const int InitialSlots = 1024;
 
+    private readonly int                               _maxPoolSize;
+    private readonly int                               _initialSlots;
     private readonly ConcurrentDictionary<string, int> _stringToIndex = new(StringComparer.Ordinal);
-    private volatile string?[]                         _indexToString  = new string?[InitialSlots];
+    private volatile string?[]                         _indexToString;
     private readonly Lock                              _slotLock       = new();
     private          int                               _nextIndex      = 0;
 
     public static readonly StringInternPool Shared = new();
+
+    public StringInternPool() : this(DefaultMaxPoolSize) { }
+
+    /// <param name="maxPoolSize">How many distinct strings this pool will ever hold. Past it
+    /// every miss is answered with a fresh, unpooled string (index -1) and
+    /// <see cref="PoolExhausted"/> fires once.</param>
+    public StringInternPool(int maxPoolSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxPoolSize, 1);
+        _maxPoolSize   = maxPoolSize;
+        _initialSlots  = Math.Min(InitialSlots, maxPoolSize);
+        _indexToString = new string?[_initialSlots];
+    }
+
+    /// <summary>The most distinct strings this pool holds before it stops pooling.</summary>
+    public int MaxPoolSize => _maxPoolSize;
 
     /// <summary>
     /// Raised once, the first time the pool saturates. Past that point every event carries
@@ -65,7 +89,7 @@ public sealed class StringInternPool
 
         // Fast reject once saturated, so a saturated pool's misses do not keep incrementing
         // the counter (a stream of new templates could carry it round to negative ids).
-        if (_nextIndex >= MaxPoolSize)
+        if (_nextIndex >= _maxPoolSize)
             return Exhausted();
 
         // The cap is checked AGAIN on the index actually claimed: two threads missing
@@ -74,7 +98,7 @@ public sealed class StringInternPool
         // the number of threads racing at the boundary; each overshooter answers -1 and
         // never touches the map.
         int newIdx = System.Threading.Interlocked.Increment(ref _nextIndex) - 1;
-        if (newIdx >= MaxPoolSize)
+        if (newIdx >= _maxPoolSize)
             return Exhausted();
 
         if (_stringToIndex.TryAdd(template, newIdx))
@@ -170,16 +194,69 @@ public sealed class StringInternPool
         return Claim(template, out canonical);
     }
 
+    /// <summary>
+    /// LOOKUP ONLY: the pool's instance of <paramref name="chars"/> and its index when the pool
+    /// already holds that text, else false. Nothing is claimed, added or signalled on a miss —
+    /// for a reader of text that may not be live (a cold file, where every dead value ever
+    /// written would otherwise take a slot this never-evicting pool keeps for the life of the
+    /// process). Allocation-free either way.
+    /// </summary>
+    public bool TryGet(ReadOnlySpan<char> chars, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? canonical, out int index)
+    {
+        var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(chars, out string? existing, out index))
+        {
+            canonical = existing;
+            return true;
+        }
+        canonical = null;
+        index     = -1;
+        return false;
+    }
+
+    /// <summary>
+    /// As <see cref="TryGet(ReadOnlySpan{char}, out string?, out int)"/>, for UTF-8 — decoded
+    /// exactly as <see cref="Intern(ReadOnlySpan{byte}, out string)"/> decodes it. Empty input
+    /// is not in the pool (<see cref="Intern(ReadOnlySpan{byte}, out string)"/> never pools it).
+    /// </summary>
+    public bool TryGet(ReadOnlySpan<byte> utf8, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? canonical, out int index)
+    {
+        if (utf8.IsEmpty) { canonical = null; index = -1; return false; }
+
+        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
+        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
+        Span<char> chars = rented ?? stackalloc char[charCount];
+        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        try { return TryGet(chars[..charCount], out canonical, out index); }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Indices claimed so far, capped at <see cref="MaxPoolSize"/> — how full the pool is.</summary>
+    public int ClaimedCount => Math.Min(Volatile.Read(ref _nextIndex), _maxPoolSize);
+
     public string Get(int index)
     {
         var slots = _indexToString;            // one volatile read; index the copy taken
         return (uint)index < (uint)slots.Length ? slots[index] ?? string.Empty : string.Empty;
     }
 
+    /// <summary>
+    /// Every miss on a full pool comes here, for the life of the process — and a pool that
+    /// never evicts stays full once it gets there (the metric label pool does, on a cluster whose
+    /// pods and containers churn their ids into it). The exchange that claims the one
+    /// <see cref="PoolExhausted"/> signal is a WRITE, even when it writes the 1 already there: it
+    /// takes the cache line exclusive, and the line is the one every other ingest thread reads
+    /// <c>_nextIndex</c> and the dictionary reference from on its own way through. So it is
+    /// asked only while the answer can still be "first": a plain read once signalled.
+    /// </summary>
     private int Exhausted()
     {
-        if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
-            PoolExhausted?.Invoke(MaxPoolSize);
+        if (Volatile.Read(ref _exhaustedSignalled) == 0
+            && Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
+            PoolExhausted?.Invoke(_maxPoolSize);
         return -1; // pool full — caller stores -1, template resolved differently
     }
 
@@ -190,11 +267,11 @@ public sealed class StringInternPool
     /// </summary>
     private void SetSlot(int index, string template)
     {
-        // The growth loop below is bounded by MaxPoolSize; an index at or past it would
+        // The growth loop below is bounded by the cap; an index at or past it would
         // spin it for ever — under the lock, with ingest behind it. No such id is ever
         // handed out (Claim re-checks the cap on the claimed index), so this is a guard,
         // not a path.
-        if ((uint)index >= MaxPoolSize) return;
+        if ((uint)index >= (uint)_maxPoolSize) return;
 
         lock (_slotLock)
         {
@@ -202,7 +279,7 @@ public sealed class StringInternPool
             if (index >= slots.Length)
             {
                 int newLen = slots.Length;
-                while (newLen <= index) newLen = Math.Min(newLen * 2, MaxPoolSize);
+                while (newLen <= index) newLen = Math.Min(newLen * 2, _maxPoolSize);
                 var bigger = new string?[newLen];
                 slots.AsSpan().CopyTo(bigger);
                 bigger[index]  = template;
@@ -218,7 +295,7 @@ public sealed class StringInternPool
     /// <summary>Restores a known index→template mapping during WAL recovery.</summary>
     public void ForceIntern(int index, string template)
     {
-        // The array is bounded by MaxPoolSize; an id beyond it was never handed out by this
+        // The array is bounded by the cap; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
         _stringToIndex[template] = index;
         SetSlot(index, template);   // guarded inside for an id beyond the cap
@@ -234,7 +311,7 @@ public sealed class StringInternPool
     public void Clear()
     {
         _stringToIndex.Clear();
-        lock (_slotLock) _indexToString = new string?[InitialSlots];
+        lock (_slotLock) _indexToString = new string?[_initialSlots];
         System.Threading.Interlocked.Exchange(ref _nextIndex, 0);
         System.Threading.Interlocked.Exchange(ref _exhaustedSignalled, 0);
     }

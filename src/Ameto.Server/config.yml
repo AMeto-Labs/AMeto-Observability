@@ -51,6 +51,59 @@ Ameto:
     # unrecognised value falls back to Idle rather than failing the start.
     IndexBackfill: Idle
 
+  # ── Metrics ──────────────────────────────────────────────────────────────────
+  # Every ceiling here is a quantity of BYTES or of objects, and the ones left unset derive
+  # themselves from the memory this process may actually use rather than being the same
+  # number on a 512 MB container and a 64 GB host. In a 512 MB container the GC's own heap
+  # hard limit is 384 MB, and the managed shares are taken of THAT. An explicit value always
+  # wins. The effective figures are printed at startup (the "Metric budgets:" line) and in
+  # GET /api/diagnostics (metricsHotTierBudgetBytes, metricsMinFlushBytes, metricsWalInitialBytes,
+  # metricsExemplarsPerMetric, metricsMaxExemplarMetrics).
+  Metrics:
+    # Bytes the hot tier may hold before a flush is forced. Unset = min(32 MB, 5% of the
+    # managed-heap limit), so ~19 MB in a 512 MB container. Points are not the unit: a
+    # 16-bucket histogram point weighs 3.4x a gauge point, so the flat 500 000-POINT
+    # threshold this replaces was 20 MB of one or 84 MB of the other. 32 MB is exactly that
+    # threshold restated in bytes (500 000 x 64 B), so a host with room flushes as it always did.
+    # HotTierBytes: 32000000
+    #
+    # The bar a PERIODIC flush tick must clear to write files at all; below it the tier keeps
+    # accumulating, because the points are already durable in metrics.wal and a file per metric
+    # name is not worth writing for a handful of them. Unset = a tenth of the tier budget.
+    # MinFlushBytes: 3200000
+    #
+    # Initial capacity of metrics.wal. Unset = the tier budget capped at the 8 MB this has
+    # always been, so it can only make the file smaller, never larger. Set it to pre-size the log.
+    # WalInitialBytes: 8388608
+    #
+    # Flush a non-empty tier at least this often whatever its size. Matches the rollup's own
+    # first cutoff, so nothing waits longer because of it.
+    MaxHotAge: "01:00:00"
+    # How often the flush loop ASKS whether the tier has earned its files — a check interval,
+    # not a flush interval: durability belongs to the log, not to this.
+    FlushCheckInterval: "00:01:00"
+    #
+    # Exemplars are metric-to-trace jumps, and their rings are the one piece of metric memory
+    # nothing takes back: a ring is allocated at full depth the first time a name carries an
+    # exemplar, and is never pruned, never aged out, invisible to the tier's byte accounting and
+    # out of reach of the RAM-pressure shed. MaxExemplarMetrics x ExemplarsPerMetric x 208 B is
+    # therefore resident for the life of the process, so the two knobs trade against each other
+    # inside one budget — half the hot tier.
+    #
+    # Unset, the depth is derived to fit that budget and clamped to [64, 4000]. Setting it
+    # explicitly buys depth out of the RING COUNT, not out of the budget: 1 000 slots on a
+    # 512 MB stand admits 48 rings, not 256, and names past the 48th get no exemplars.
+    # ExemplarsPerMetric: 300
+    # Metric names that may own a ring. Past it exemplars are dropped — a correlation hint,
+    # never data; GET /api/diagnostics counts the refusals (metricsExemplarMetricsRefused).
+    # Raising it makes every ring proportionally shallower, not the budget bigger.
+    MaxExemplarMetrics: 256
+    #
+    # Explore's catalog and the cardinality bookkeeping behind it.
+    MaxLabelValuesPerKey: 2000        # distinct values remembered per label key, per metric
+    MaxTrackedSeriesPerMetric: 50000  # distinct label-set hashes counted per metric before
+                                      # the reported cardinality stops rising
+
   # TLS — leave empty for plain HTTP
   SslCertPath: ""
   SslCertPassword: ""
@@ -161,8 +214,8 @@ Ameto:
   # Search budgets and the cross-query cache of decoded segment indexes.
   Query:
     # Cache of decoded index sections, charged at each entry's RETAINED size (expanded
-    # postings + dictionaries + bloom bits). Unset = min(256 MB, 15% of the managed-heap
-    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~57 MB. 0 disables
+    # postings + dictionaries + bloom bits). Unset = min(256 MB, 12% of the managed-heap
+    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~46 MB. 0 disables
     # the cache entirely (every query re-reads and re-decodes what it consults).
     # For a 512 MB stand an explicit 48 MB is a reasonable floor to pin:
     # IndexCacheBytes: 50331648

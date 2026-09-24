@@ -54,9 +54,18 @@ public sealed class ApiKeyValidateProbe : IClassFixture<AmetoWebAppFactory>
         for (int i = 0; i < iters; i++) LegacyValidate(legacyMap, key, ApiKeyPermissions.Logs);
         double legacyBytes = (GC.GetAllocatedBytesForCurrentThread() - b0) / (double)iters;
 
-        long b1 = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < iters; i++) cache.Validate(key, ApiKeyPermissions.Logs);
-        double nowBytes = (GC.GetAllocatedBytesForCurrentThread() - b1) / (double)iters;
+        // BEST OF FIVE. The per-thread counter can step by the unused remainder of this thread's
+        // allocation context (up to the 8 KB quantum) when ANOTHER thread's allocation triggers a GC
+        // mid-loop — and the host behind this fixture runs the whole server's background work. That
+        // read 0.045-0.069 B/call (one 4.5-6.9 KB step over 100 000 calls) in about 1 run in 8 on
+        // two cores. A real regression allocates on every call, so it shows in every round.
+        double nowBytes = double.MaxValue;
+        for (int r = 0; r < 5 && nowBytes > 0; r++)
+        {
+            long b1 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < iters; i++) cache.Validate(key, ApiKeyPermissions.Logs);
+            nowBytes = Math.Min(nowBytes, (GC.GetAllocatedBytesForCurrentThread() - b1) / (double)iters);
+        }
 
         double legacyNs = double.MaxValue, nowNs = double.MaxValue;
         var sw = new Stopwatch();

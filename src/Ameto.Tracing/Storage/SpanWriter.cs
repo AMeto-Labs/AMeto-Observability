@@ -122,23 +122,78 @@ internal static class SpanWriter
                                         Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null,
                                         ushort version = DefaultVersion)
     {
-        if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
+        int count = spans.Count;
+        if (count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
-        // Sort by start time: keeps the per-block Δts encoding tiny and gives the
-        // trace/service indices better block locality.
-        var ordered = new List<SpanRecord>(spans);
-        ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
-        spans = ordered;
+        // ── Flush order, without a second copy of the batch ────────────────────────
+        //
+        // Sort by start time: keeps the per-block Δts encoding tiny and gives the trace/service
+        // indices better block locality. What is sorted is a PERMUTATION, not the spans.
+        //
+        // THE CALLER'S LIST IS NOT OURS TO TOUCH, and the plan's note that "CompleteFlush hands
+        // over a detached snapshot" is only half true. It is detached from the HOT TIER —
+        // TakeSnapshotLocked swaps a fresh list in — but TraceStorageEngine then parks the same
+        // reference in `_flushingSpans` for the whole of this call (cleared at :1870, after the
+        // publish), and two read paths walk it while we run: the by-trace lookup at :656 and
+        // `UnflushedSpansLocked` at :1930, which the trace list, the volume sparkline, the
+        // per-service stats and the service graph all go through. They hold the ENGINE read lock;
+        // this method holds nothing. A List<T>.Sort under them bumps the list's version stamp and
+        // faults every live enumerator with "Collection was modified", and the ones that survived
+        // would read a half-permuted tier. So: sort indices, leave the batch alone.
+        //
+        // The old shape copied 50 000 references into a fresh List first — 400 KB straight onto
+        // the LOH, per flush, to be thrown away at the end of it. The permutation is an int per
+        // span and the keys a long per span, both RENTED, so a steady flush loop allocates neither.
+        //
+        // BYTE-IDENTICAL, AND THIS IS THE ONE PLACE IT IS SUBTLE. Introsort is unstable, so ties —
+        // and a real tier is full of them — are resolved by the algorithm's swap sequence rather
+        // than by the data. Sorting `order` with a comparison that reads `keys[i]` performs
+        // EXACTLY the comparisons the old code performed on the records, in the same sequence, and
+        // Span<T>.Sort(Comparison<T>) is the very entry point List<T>.Sort(Comparison<T>) calls
+        // (ArraySortHelper<T>.Sort → IntrospectiveSort), whose behaviour depends on nothing but
+        // those comparison results. The permutation is therefore the same one, and
+        // TraceFlushProbe's corpus — 12 000 spans over 500 start times, 24 ties apiece — is what
+        // holds that claim to the byte.
+        int[]  order = ArrayPool<int>.Shared.Rent(count);
+        long[] keys  = ArrayPool<long>.Shared.Rent(count);
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                order[i] = i;
+                keys[i]  = spans[i].StartTimeUnixNano;
+            }
+            order.AsSpan(0, count).Sort((a, b) => keys[a].CompareTo(keys[b]));
 
+            var batch = new OrderedSpans(spans, order, count);
+            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version);
+        }
+        finally
+        {
+            ArrayPool<long>.Shared.Return(keys);
+            ArrayPool<int>.Shared.Return(order);
+        }
+    }
+
+    /// <summary>
+    /// The body of <see cref="Write"/>, once the flush order is known. Split out so the rented
+    /// permutation has exactly one <c>finally</c> guarding it, however this method leaves.
+    /// </summary>
+    private static SpanSegmentInfo WriteOrdered(string dataDir, in OrderedSpans spans, bool recoverable,
+                                                Action<string>? onNamed,
+                                                Action<Dictionary<TraceId, List<uint>>>? onTraceIndex,
+                                                ushort version)
+    {
+        int  count   = spans.Count;
         long minNano = spans[0].StartTimeUnixNano;
-        long maxNano = spans[^1].StartTimeUnixNano;
+        long maxNano = spans[count - 1].StartTimeUnixNano;
 
         // Nonce keeps the name unique across a v2→v3 rewrite of the same span
         // batch (same min/max/count → same name) — otherwise two flushes would
         // collide on one path. The name is never parsed back; sidecars share this
         // base so they stay grouped.
         string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
-        string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}-{nonce}";
+        string baseName = $"spans-{minNano}-{maxNano}-{count}-{nonce}";
         string trcPath  = Path.Combine(dataDir, baseName + ".trc");
         onNamed?.Invoke(trcPath);
 
@@ -160,8 +215,18 @@ internal static class SpanWriter
         string tracesumFinal = Path.ChangeExtension(trcPath, ".tracesum");
 
         // Accumulate service→block mapping and stats in a single pass through WriteBlock
-        var traceIndex  = new Dictionary<TraceId, List<uint>>(capacity: spans.Count / 4);
-        var svcBlockMap = new Dictionary<string, SortedSet<uint>>(StringComparer.Ordinal);
+        var traceIndex  = new Dictionary<TraceId, List<uint>>(capacity: count / 4);
+        // A LIST WITH A LAST-BLOCK GUARD, NOT A SET. Block indices are handed to WriteBlock in
+        // ascending order and are constant within a block, so "have I already recorded this block
+        // for this service" is answered by looking at the last element — one comparison against a
+        // red-black tree insertion per SPAN. The SortedSet was paying for an ordering the walk
+        // already guaranteed, in a node per block per service.
+        var svcBlockMap = new Dictionary<string, List<uint>>(StringComparer.Ordinal);
+        // span → service, built HERE because the block pass is already holding both. It is what
+        // .svcgraph needs to resolve a parent's service, and building it there cost a second full
+        // walk of the batch (6,3 ms and a 50 000-entry dictionary per flush, measured). Same walk
+        // order, same last-writer-wins for a duplicated span id, so the same map.
+        var spanSvc     = new Dictionary<SpanId, string>(count);
         // Per-service stats accumulators (service → mutable stats)
         var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
 
@@ -176,7 +241,7 @@ internal static class SpanWriter
                 // ── Header ─────────────────────────────────────────────────────
                 bw.Write(Magic);
                 bw.Write(version);
-                bw.Write((uint)spans.Count);
+                bw.Write((uint)count);
                 bw.Write(minNano);
                 bw.Write(maxNano);
                 bw.Write((byte)0); // flags
@@ -190,13 +255,15 @@ internal static class SpanWriter
                 int written  = 0;
                 var blockBuf = new ArrayBufferWriter<byte>(1024 * 1024);
                 var blooms   = new List<byte[]>();
+                // One bloom-hash set for the whole file, cleared per block — see WriteBlock.
+                var bloomHashes = new HashSet<ulong>();
 
-                while (written < spans.Count)
+                while (written < count)
                 {
-                    int batchCount = Math.Min(BlockSize, spans.Count - written);
+                    int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
-                    var block      = WriteBlock(spans, written, batchCount, blockBuf, blockIdx,
-                                                traceIndex, svcBlockMap, svcStats, blooms);
+                    var block      = WriteBlock(in spans, written, batchCount, blockBuf, blockIdx,
+                                                traceIndex, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
                     bw.Write(block.CompressedBytes);
@@ -284,8 +351,8 @@ internal static class SpanWriter
             // ── Sidecars, at temp names (each fsyncs itself). Some legitimately write
             //    nothing — an empty stats/edge set produces no file at all.
             WriteStatsSidecar(statsFinal + ".tmp", svcStats);
-            ServiceGraphSidecar.Write(trcPath, spans, svcgraphFinal + ".tmp");
-            TraceSummarySidecar.Write(trcPath, spans, tracesumFinal + ".tmp");
+            ServiceGraphSidecar.WriteOrdered(trcPath, in spans, svcgraphFinal + ".tmp", spanSvc);
+            TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp");
 
             // ── Publish: sidecars first, the .trc last — a visible .trc implies its
             //    sidecars are complete.
@@ -319,7 +386,7 @@ internal static class SpanWriter
             FilePath      = trcPath,
             MinStartNano  = minNano,
             MaxStartNano  = maxNano,
-            SpanCount     = spans.Count,
+            SpanCount     = count,
             Services      = services,
             FormatVersion = version,
             // The file was published a moment ago, so its write time is now — and it has to be
@@ -350,13 +417,15 @@ internal static class SpanWriter
     // ── Block serialisation ────────────────────────────────────────────────────
 
     private static (byte[] CompressedBytes, int UncompressedSize) WriteBlock(
-        IList<SpanRecord>                        spans,
+        in OrderedSpans                          spans,
         int                                      offset,
         int                                      count,
         ArrayBufferWriter<byte>                  bufWriter,
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
-        Dictionary<string, SortedSet<uint>>      svcBlockMap,
+        Dictionary<string, List<uint>>           svcBlockMap,
+        Dictionary<SpanId, string>               spanSvc,
+        HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms)
     {
@@ -368,7 +437,13 @@ internal static class SpanWriter
 
         Span<byte> idBuf = stackalloc byte[16];
         long prevTs = 0;
-        var bloomHashes = new HashSet<ulong>();
+        // Caller-owned and CLEARED, not reallocated: a fresh HashSet per block threw away its
+        // whole bucket array every 4096 spans, and the set for an eight-attribute block holds
+        // ~8 000 hashes. Clear() keeps the capacity, so after the first block the set is free.
+        // The bloom it feeds is an OR of bit positions, so neither the set's iteration order nor
+        // its internal layout can reach the bytes — only its contents and its Count can, and both
+        // are exactly what a fresh set would have held.
+        bloomHashes.Clear();
 
         for (int i = 0; i < count; i++)
         {
@@ -386,10 +461,14 @@ internal static class SpanWriter
             // ── Service block map ────────────────────────────────────────────
             if (!svcBlockMap.TryGetValue(s.ServiceName, out var blocks))
             {
-                blocks = new SortedSet<uint>();
+                blocks = new List<uint>(4);
                 svcBlockMap[s.ServiceName] = blocks;
             }
-            blocks.Add(blockIdx);
+            // Ascending and distinct by construction — see the map's declaration.
+            if (blocks.Count == 0 || blocks[^1] != blockIdx) blocks.Add(blockIdx);
+
+            // ── span → service, for .svcgraph ────────────────────────────────
+            spanSvc[s.SpanId] = s.ServiceName;
 
             // ── Per-service stats ────────────────────────────────────────────
             if (!svcStats.TryGetValue(s.ServiceName, out var st))
@@ -433,7 +512,20 @@ internal static class SpanWriter
             writer.Write((byte)s.Status);
             writer.Write(s.HttpStatusCode);
 
-            if (s.Attributes is { Count: > 0 } attrs)
+            // THE BYTES THE MAPPER PRODUCED, COPIED THROUGH. The span arrived as one msgpack map
+            // and leaves as the same one: no decode on the way in, no type-switched re-encode on
+            // the way out. The one pass that remains is the bloom's, and it doubles as the
+            // validation — TryAddAttrBlobToBloom returns false unless the blob is exactly one
+            // well-formed map with nothing after it, because a verbatim copy of anything else
+            // would corrupt the span array around it. A blob that fails that test falls back to
+            // the dictionary path below, which is also where a record built from a dictionary
+            // (no blob at all — every test fixture, and SpanReader's legacy v2 path) goes.
+            var attrBlob = s.AttributesBytes;
+            if (!attrBlob.IsEmpty && TryAddAttrBlobToBloom(bloomHashes, attrBlob))
+            {
+                writer.WriteRaw(attrBlob.Span);
+            }
+            else if (s.Attributes is { Count: > 0 } attrs)
             {
                 WriteAttributes(ref writer, attrs);
                 foreach (var (k, v) in attrs)
@@ -455,6 +547,25 @@ internal static class SpanWriter
         var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
         return (compressed, raw.Length);
     }
+
+    /// <summary>
+    /// Feeds one span's attribute blob to the block bloom, one boxed value at a time instead of a
+    /// whole dictionary, and says whether the blob is safe to copy through verbatim.
+    ///
+    /// <para>THE BLOOM IS FED FROM THE DECODE, NOT FROM THE UTF-8, on purpose. <c>SpanBloom</c>
+    /// hashes <c>lowercase(value.ToString())</c>; hashing from the bytes instead would have to
+    /// reproduce every <c>long</c> and <c>double</c> formatting decision exactly or turn existing
+    /// <c>.trc</c> blooms into a false-negative source — silent data loss on TraceQL attribute
+    /// predicates. That is TS#12 and it needs its own proof. What this move buys is the decode
+    /// leaving the ingest path's write lock for the flush thread, not the decode disappearing.</para>
+    ///
+    /// <para>A partial walk leaves the hashes it already added. Extra bloom bits only ever make a
+    /// block MORE likely to be read, so a blob that dies half way costs a wasted block read and
+    /// never a missing row.</para>
+    /// </summary>
+    private static bool TryAddAttrBlobToBloom(HashSet<ulong> hashes, ReadOnlyMemory<byte> blob) =>
+        SpanAttributeBlob.TryWalk(blob, hashes,
+            static (h, k, v) => SpanBloom.AddAttr(h, k, v));
 
     /// <summary>Inline typed attribute map — no nested serializer, no per-span buffers.</summary>
     private static void WriteAttributes(ref MessagePackWriter w, IReadOnlyDictionary<string, object?> attrs)
@@ -526,4 +637,52 @@ internal static class SpanWriter
         public long   MaxDuration = long.MinValue;
         public uint[] Buckets    = new uint[HistogramBuckets.Count];
     }
+}
+
+/// <summary>
+/// A SPAN BATCH IN FLUSH ORDER, WITHOUT A COPY OF IT — the caller's list plus the permutation
+/// <see cref="SpanWriter.Write"/> sorted, read through one indexer.
+///
+/// <para>It exists because the flush order is needed by four consumers — the block writer, the
+/// service index, <c>.svcgraph</c> and <c>.tracesum</c> — and the obvious way to give it to them
+/// was a sorted copy of the batch: 50 000 references, 400 KB of LOH per flush, thrown away at the
+/// end of it. Worse, the list a flush is handed is still live: <c>TraceStorageEngine</c> keeps it
+/// in <c>_flushingSpans</c> and serves trace lookups, the trace list and every aggregate from it
+/// for the whole of the write, so it cannot be reordered in place either.</para>
+///
+/// <para>A <c>readonly struct</c> passed by <c>in</c>: no allocation at all, and no defensive copy
+/// at the call sites, which matters because the indexer is on the per-span path of every one of
+/// those four consumers.</para>
+///
+/// <para>A null <see cref="_order"/> is the IDENTITY permutation, which is what the sidecars'
+/// public entry points hand themselves when a caller (every test fixture, and anything outside
+/// this writer) gives them a plain list that is already in the order it wants.</para>
+/// </summary>
+internal readonly struct OrderedSpans
+{
+    private readonly IList<SpanRecord> _spans;
+    private readonly int[]?            _order;
+
+    /// <summary>The batch as it stands, in its own order.</summary>
+    public OrderedSpans(IList<SpanRecord> spans)
+    {
+        _spans = spans;
+        _order = null;
+        Count  = spans.Count;
+    }
+
+    /// <param name="order">
+    /// A permutation of <c>[0, count)</c>. May be longer than <paramref name="count"/> — it is
+    /// rented — so the count is carried separately rather than read off the array.
+    /// </param>
+    public OrderedSpans(IList<SpanRecord> spans, int[] order, int count)
+    {
+        _spans = spans;
+        _order = order;
+        Count  = count;
+    }
+
+    public int Count { get; }
+
+    public SpanRecord this[int i] => _spans[_order is null ? i : _order[i]];
 }

@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -63,14 +64,41 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE THRESHOLDS THIS CLASS RUNS AT, INJECTED RATHER THAN INHERITED.
+    ///
+    /// <para>Every flush in this file is one a test schedules, and the batches are sized to stay
+    /// in the tier until it does. That used to be a property of a literal — <c>HotFlushThreshold
+    /// = 500 000</c> points, the same number everywhere — and is now a share of the managed-heap
+    /// limit, so the premise of half this file became a property of the machine running it. At
+    /// the 512 MB stand's 384 MB limit the tier budget is 20.1 MB against
+    /// <see cref="SlowFlushBatch"/>'s 19.2 MB: a 4.6 % margin. Below a ~488 MB container the
+    /// batch crosses it, <c>Ingest</c> schedules a flush of its own, and tests whose setup
+    /// asserts "the first flush must still be held at its seam" race a drain they did not start.
+    /// Measured before this was pinned: 2 failures in 7 runs of this class under
+    /// <c>DOTNET_GCHeapHardLimit=0x13000000</c>, in a different fact each time.</para>
+    ///
+    /// <para>These three are exactly the pre-<c>MemoryBudgets</c> literals — 500 000 points,
+    /// 50 000, and the log's 8 MB initial capacity — so the file behaves on every host the way it
+    /// behaved on all of them before the caps were derived.</para>
+    /// </summary>
+    private static readonly MetricsOptions PinnedThresholds = new()
+    {
+        HotTierBytes    = MemoryBudgets.MetricHotTierCapBytes,
+        MinFlushBytes   = MemoryBudgets.MetricHotTierCapBytes / 10,
+        WalInitialBytes = 8L * 1024 * 1024,
+    };
+
+    /// <summary>
     /// The only way this class builds an engine. Double disposal is what the registry relies on
     /// being free: most tests close their own engine mid-body, because closing it is how the log
     /// gets its final flush, and none of them should have to unregister it to do that.
     /// </summary>
     private MetricStorageEngine NewEngine(string? dir = null,
-                                          Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>? logger = null)
+                                          Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>? logger = null,
+                                          MetricsOptions? options = null)
     {
-        var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance);
+        var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance,
+                                             options ?? PinnedThresholds);
         _engines.Add(engine);
         return engine;
     }
@@ -495,8 +523,9 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// restart replayed them beside the file that already held them. Duplicates, not loss, and
     /// once per start for as long as the state lasts.</para>
     ///
-    /// <para>The state is built here by making the log file read-only: both of <c>Grow</c>'s
-    /// opens ask for write access, so both fail, which is what leaves the pointer null.</para>
+    /// <para>Growth no longer produces this state — it builds the larger mapping before it drops
+    /// the old one (M#10) — but a shrink that can neither resize nor restore still does, so the
+    /// state is built here directly through <c>LoseMappingForTest</c>.</para>
     /// </summary>
     [Fact]
     public void A_log_that_lost_its_mapping_refuses_to_open_a_flush()
@@ -506,28 +535,48 @@ public sealed class MetricWalTests : IAsyncLifetime
         using var wal = OpenWal(64 * 1024);   // ~1 365 entries
         Append(wal, Scalar("m", baseNano, 1));
 
-        // The disk that fills mid-run, injected through the seam: the ReadOnly-attribute trick
-        // this used died with the lifetime handle (Windows enforces the attribute at CreateFile
-        // time, and resizes no longer reopen the file).
+        wal.LoseMappingForTest();
+
+        // Alive, not disposed, and unable to log anything: this is the honest half.
+        var appended = Record.Exception(() => Append(wal, Scalar("m", baseNano, 1)));
+        Assert.IsType<InvalidOperationException>(appended);   // not ObjectDisposedException
+
+        // So a flush must fail the same way rather than be handed a generation nobody
+        // opened. Exact type: this is the unmapped log, not a disposed one.
+        var began = Record.Exception(() => wal.BeginFlush());
+        Assert.IsType<InvalidOperationException>(began);
+    }
+
+    /// <summary>
+    /// A GROWTH THAT FAILS FAILS ONE APPEND, NOT THE LOG. <c>Grow</c> used to unmap before it
+    /// extended, so a full disk at the moment of growth could leave the log alive with no mapping,
+    /// refusing every later append and every flush until a restart. <c>GrowTo</c> builds the new
+    /// mapping beside the old one, so the batch that needed the room is refused and everything
+    /// else carries on. Revert to unmap-first and the second append throws
+    /// <c>InvalidOperationException</c> ("no mapping").
+    /// </summary>
+    [Fact]
+    public void A_growth_that_fails_leaves_the_log_appending_and_flushing()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        using var wal = OpenWal(64 * 1024);   // ~1 365 entries
+        Append(wal, Scalar("m", baseNano, 1));
+
+        var big = new MetricIngestItem[5_000];
+        for (int i = 0; i < big.Length; i++) big[i] = Scalar("m", baseNano + i, i);
+
         wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
         try
         {
-            var grew = Record.Exception(() =>
-            {
-                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
-            });
-            Assert.NotNull(grew);   // setup: Grow really did fail rather than extend the file
-
-            // Alive, not disposed, and unable to log anything: this is the honest half.
-            var appended = Record.Exception(() => Append(wal, Scalar("m", baseNano, 1)));
-            Assert.IsType<InvalidOperationException>(appended);   // not ObjectDisposedException
-
-            // So a flush must fail the same way rather than be handed a generation nobody
-            // opened. Exact type: this is the unmapped log, not a disposed one.
-            var began = Record.Exception(() => wal.BeginFlush());
-            Assert.IsType<InvalidOperationException>(began);
+            Assert.ThrowsAny<IOException>(() => wal.Append(big));
         }
         finally { wal.BeforeResize = null; }
+
+        Append(wal, Scalar("m", baseNano + 1, 2));            // the log is still alive
+        ulong gen = wal.BeginFlush();
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
+        Assert.Empty(wal.ReadAll(out _));
     }
 
     /// <summary>
@@ -559,25 +608,16 @@ public sealed class MetricWalTests : IAsyncLifetime
         ulong flushing = wal.BeginFlush();
         long  logged   = wal.WrittenBytes;
 
-        // Same seam-injected disk-full as above; see A_log_that_lost_its_mapping.
-        wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
-        try
-        {
-            var grew = Record.Exception(() =>
-            {
-                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
-            });
-            Assert.NotNull(grew);   // setup: the mapping is gone, mid-flush
+        // The mapping is gone, mid-flush; see A_log_that_lost_its_mapping for why directly.
+        wal.LoseMappingForTest();
 
-            Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
+        Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
 
-            // Nothing was reclaimed, so the generation is still replayable in full. This is the
-            // half the argument for deleting the files rests on: the log's copy is whole, so
-            // removing the flush's copy leaves the points durable exactly once rather than none.
-            Assert.True(wal.WrittenBytes >= logged,
-                "the refused commit reclaimed records it had not covered by a watermark");
-        }
-        finally { wal.BeforeResize = null; }
+        // Nothing was reclaimed, so the generation is still replayable in full. This is the
+        // half the argument for deleting the files rests on: the log's copy is whole, so
+        // removing the flush's copy leaves the points durable exactly once rather than none.
+        Assert.True(wal.WrittenBytes >= logged,
+            "the refused commit reclaimed records it had not covered by a watermark");
     }
 
     /// <summary>
@@ -641,11 +681,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// unavoidable. It is not: a duplicate needs two copies, the reclaim never ran, so the
     /// log's copy is whole and the flush's is the deletable one.</para>
     ///
-    /// <para>Driven by filling the log to within a few thousand entries of its capacity and
-    /// then, from the seam that fires once the file is in place, arming the WAL's resize seam
-    /// to throw and ingesting past the end of it. <c>Grow</c> unmaps before it extends and can
-    /// re-map neither, which is the production state exactly: alive, unmapped, refusing every
-    /// append, with a flush's generation still open. The count is taken from a SECOND engine
+    /// <para>Driven by dropping the log's mapping from the seam that fires once the file is in
+    /// place — the state a shrink that can neither resize nor restore leaves: alive, unmapped,
+    /// refusing every append, with a flush's generation still open. (Growth used to be the way
+    /// in, by unmapping before it extended; it no longer can.) The count is taken from a SECOND engine
     /// over the same directory, because the question is what a restart sees.</para>
     /// </summary>
     [Fact]
@@ -669,23 +708,11 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         try
         {
-            engine.OnFileWrittenForTest = _ =>
-            {
-                // Seam-injected: the ReadOnly trick died with the lifetime handle (see
-                // A_log_that_lost_its_mapping for the mechanics).
-                engine.WalForTest.BeforeResize = static _ => throw new IOException("disk full (test seam)");
-
-                // Past the capacity, so the append underneath has to Grow — and cannot. The
-                // throw is this batch's, not the flush's: ingest fails honestly from here,
-                // which is the loud half of the fault and not what is under test. Swallowed
-                // whatever it is (Grow rethrows the file system's own refusal), because a
-                // throw OUT of this seam is a failed write, and a failed write is the other
-                // path entirely — it restores, abandons, and never reaches a commit.
-                var poison = new MetricIngestItem[20_000];
-                for (int i = 0; i < poison.Length; i++)
-                    poison[i] = Scalar("poison.metric", baseNano + i * 1_000L, 1.0);
-                try { engine.Ingest(poison); } catch { /* the log is dead; that is the setup */ }
-            };
+            // The log loses its mapping once the file is in place — directly, because growth no
+            // longer can (see A_log_that_lost_its_mapping). Nothing is thrown OUT of this seam:
+            // a throw there is a failed write, which is the other path entirely — it restores,
+            // abandons, and never reaches a commit.
+            engine.OnFileWrittenForTest = _ => engine.WalForTest.LoseMappingForTest();
 
             await engine.ScheduleThresholdFlushForTest();
 
@@ -947,10 +974,82 @@ public sealed class MetricWalTests : IAsyncLifetime
 
     /// <summary>
     /// A tier whose files take long enough to write that the flush is provably still running
-    /// while shutdown does its work — 300 000 points over 2 000 series, which is also
-    /// comfortably under <c>HotFlushThreshold</c>, so the only flushes in these tests are the
-    /// ones they schedule.
+    /// while shutdown does its work — 300 000 points over 2 000 series. At 64 B a scalar point
+    /// that charges 19.2 MB against the 32 MB <see cref="PinnedThresholds"/> gives every engine
+    /// in this class, so the only flushes in these tests are the ones they schedule — on every
+    /// host, which is what pinning the threshold buys.
     /// </summary>
+    /// <summary>
+    /// THE PREMISE OF THIS CLASS, ASSERTED RATHER THAN ASSUMED. Every seam test here holds a
+    /// flush at <c>OnSnapshotTakenForTest</c> and then asserts that nothing else has drained the
+    /// tier; that only holds while the engine's own threshold is above the batch. Inheriting the
+    /// derived threshold made it a property of the host — at <c>MemoryBudgets</c>' own floor the
+    /// tier is 4 MB and <see cref="SlowFlushBatch"/> is 19.2 MB, so <c>Ingest</c> would schedule
+    /// a flush before the test that called it reached its next line.
+    ///
+    /// <para>Three separable things have to hold, and the fact used to check only the third —
+    /// against a constant, on a constant, which made it a tautology: <c>PinnedThresholds</c>
+    /// names <c>HotTierBytes</c> explicitly, <c>HotTierBytesFor</c> returns an explicit value
+    /// whatever budget it is handed, so all four host rows evaluated the identical
+    /// 19.2 MB &lt; 32 MB and the fact would have stayed green with the injection at
+    /// <see cref="NewEngine"/> deleted — the exact regression it exists to catch.</para>
+    ///
+    /// <para>(1) the engines of this class really are built from <c>PinnedThresholds</c>, asked
+    /// by REFERENCE because on a large host the derived ceilings equal the pinned literals by
+    /// design and no comparison of figures can tell the two apart; (2) the threshold that
+    /// reaches the engine's own <c>Ingest</c> is that pinned figure; (3) the batch — measured
+    /// from a real <see cref="SlowFlushBatch"/>, not from a copy of its default arguments — fits
+    /// under it on every host the derivation can produce.</para>
+    /// </summary>
+    [Fact]
+    public void The_batches_this_class_ingests_stay_in_the_tier_on_every_host()
+    {
+        const long MB = 1024 * 1024;
+
+        // (1) and (2): an engine built exactly the way every fact in this file builds one, and
+        // the batch itself rather than a second copy of its default arguments — widening
+        // SlowFlushBatch used to be invisible here.
+        var  engine     = NewEngine();
+        var  batch      = SlowFlushBatch(1_700_000_000_000_000_000L);
+        long batchBytes = batch.Length * (long)MetricStorageEngine.HotPointBytes;
+
+        Assert.Same(PinnedThresholds, engine.ConfiguredOptions);
+        Assert.Equal(MemoryBudgets.MetricHotTierCapBytes, engine.HotFlushThresholdBytes);
+        Assert.True(batchBytes < engine.HotFlushThresholdBytes,
+            $"on THIS host SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against the "
+          + $"{engine.HotFlushThresholdBytes / 1048576.0:N1} MB this engine flushes above");
+
+        // …and the premise itself, on the engine: ingest the batch and the tier still holds
+        // every point of it, with no flush of the engine's own in between.
+        engine.Ingest(batch);
+        Assert.Equal(batch.Length, engine.HotPointCount);
+
+        // (3): and it would on any host — which is what the pin is for, and what inheriting
+        // would cost. The derived column is the counter-example, printed as the reason.
+        var derived = new MetricsOptions();
+        bool inheritingWouldBreak = false;
+
+        foreach (var (label, budgets) in new (string, MemoryBudgets)[]
+                 {
+                     ("16 GB host",   MemoryBudgets.Derive(16L * 1024 * MB, 16L * 1024 * MB)),
+                     ("512 MB stand", MemoryBudgets.Derive(384 * MB, 512 * MB)),
+                     ("128 MB heap",  MemoryBudgets.Derive(128 * MB, 160 * MB)),
+                     ("16 MB heap",   MemoryBudgets.Derive(16 * MB, 16 * MB)),
+                 })
+        {
+            long tier = PinnedThresholds.HotTierBytesFor(budgets);
+            Assert.True(batchBytes < tier,
+                $"{label}: SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against a tier budget of "
+              + $"{tier / 1048576.0:N1} MB — the engine flushes it before the test that ingested it does");
+
+            inheritingWouldBreak |= derived.HotTierBytesFor(budgets) <= batchBytes;
+        }
+
+        Assert.True(inheritingWouldBreak,
+            "no host in the table would flush this batch under the DERIVED threshold, so the "
+          + "injection this fact pins is no longer buying anything — re-check the table or drop it");
+    }
+
     private static MetricIngestItem[] SlowFlushBatch(
         long baseNano, string seriesPrefix = "s", int series = 2_000, int pointsPerSeries = 150)
     {
@@ -962,15 +1061,49 @@ public sealed class MetricWalTests : IAsyncLifetime
         return [.. items];
     }
 
-    /// <summary>Waits until a scheduled flush has taken its snapshot and moved on to the files.</summary>
-    private static async Task DrainedAsync(MetricStorageEngine engine)
+    /// <summary>
+    /// Bounds a hang and decides nothing: every wait it guards is ended by a signal out of the
+    /// engine, so reaching this figure is a wedged test rather than a slow one.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Holds the FIRST flush this engine runs at the instant it is about to write its files, and
+    /// returns the task that says it is there. The caller owns <paramref name="held"/> and
+    /// releases it where the window it wanted has been opened.
+    ///
+    /// <para>What this replaces polled <see cref="MetricStorageEngine.HotPointCount"/> down to
+    /// nought and then asserted, one statement later, that the flush had not finished — two facts
+    /// read at two different instants with the entire file write sitting between them. The drain
+    /// and the write are adjacent inside <c>FlushHotTierAsync</c>, and the poll woke on
+    /// <c>Task.Delay(1)</c>, whose real floor is the platform timer: on two cores in Debug under
+    /// load the wake landed after all 2 000 <c>.mts</c> files were on disk and the flush was
+    /// complete, so the fact failed on its own setup line — <c>6 runs in 10</c> of this class at
+    /// <c>/affinity 3</c>, on <see cref="A_finished_flush_cannot_hide_one_that_is_still_writing"/>
+    /// and <see cref="Every_batch_ingest_returns_from_during_shutdown_is_durable"/>.</para>
+    ///
+    /// <para><see cref="MetricStorageEngine.OnSnapshotTakenForTest"/> IS that instant rather than a
+    /// sample of it: it fires inside the flush after the drain has zeroed the counters and the
+    /// log's generation is open, and before <c>MetricWriter.Write</c> has written one byte. A flush
+    /// parked there is drained AND unfinished on any machine at any speed, so the two facts the
+    /// poll guessed at are now true by construction, and the test chooses when the write starts
+    /// instead of hoping it has not finished.</para>
+    ///
+    /// <para>Only the first flush is held. The later ones — a second schedule, the shutdown loop's
+    /// final flush — reach this seam too whenever they have points of their own, and holding one of
+    /// those would wedge the very shutdown under test.</para>
+    /// </summary>
+    private static Task HoldTheFirstFlushAtItsFileWrite(MetricStorageEngine engine, TaskCompletionSource held)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (engine.HotPointCount > 0)
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int flushes = 0;
+        engine.OnSnapshotTakenForTest = () =>
         {
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "the scheduled flush never took its snapshot");
-            await Task.Delay(1);
-        }
+            if (Interlocked.Increment(ref flushes) != 1) return;
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+        return reached.Task;
     }
 
     /// <summary>
@@ -1245,16 +1378,27 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);                          // past its snapshot, into the files
+        await atItsWrite.WaitAsync(HangGuard);               // past its snapshot, at its files
 
-        // Empty tier, so this returns at snapshot.Count == 0 — the flush that finishes first
-        // and publishes last.
+        // Empty tier, so this returns at the pre-check above the gate — the flush that finishes
+        // first and publishes last.
         await engine.ScheduleThresholdFlushForTest();
+        Assert.Equal(0, engine.HotPointCount);               // the seam stands past the drain
         Assert.False(writing.IsCompleted, "setup: the first flush must still be writing its files");
 
-        await engine.DisposeAsync();
+        // Released INTO the shutdown rather than ahead of it: the teardown is already under way
+        // when the first .mts is opened, so what follows measures a flush shutdown must notice
+        // rather than one it could have missed by a hair. What remains to be written is 300 000
+        // points of files — work that scales with the machine, unlike the window this stood on.
+        var dispose = engine.DisposeAsync();
+        held.SetResult();
+        await dispose;
         int running = engine.RunningThresholdFlushes;
 
         Assert.True(running == 0,
@@ -1300,17 +1444,25 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         var flushed = SlowFlushBatch(baseNano);
         engine.Ingest(flushed);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
         Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
 
         var stillArriving = SlowFlushBatch(baseNano + 3_600_000_000_000L, "late", series: 200, pointsPerSeries: 10);
         engine.Ingest(stillArriving);                        // tier NOT empty at the final flush
 
-        await engine.DisposeAsync();
+        // The orphan starts its files with the teardown already running, so the final flush and
+        // the orphan's write overlap by construction rather than by how the poll above landed.
+        var dispose = engine.DisposeAsync();
+        held.SetResult();
+        await dispose;
         string frozen = FreezeDataDir();
 
         long expected = flushed.Length + stillArriving.Length;
@@ -1331,14 +1483,20 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         var flushed = SlowFlushBatch(baseNano);
         engine.Ingest(flushed);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
         Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
 
-        await engine.DisposeAsync();                          // tier quiesced — no final flush data
+        var dispose = engine.DisposeAsync();                 // tier quiesced — no final flush data
+        held.SetResult();
+        await dispose;
         try { await writing; } catch (ObjectDisposedException) { /* the orphan's own end */ }
 
         long durable = await DurablePointsAsync(_dir, "instrument.0");
@@ -1361,14 +1519,26 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         // Give the teardown real work to wait on, so the batches below straddle it rather than
         // arriving before or after: 2 000 series of files, with the tier emptied by the
         // snapshot so the loop's own final pass returns at snapshot.Count == 0.
         var first = SlowFlushBatch(baseNano);
         engine.Ingest(first);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
+
+        // Released HERE, before the batches below are even built: the write this shutdown has to
+        // wait on starts at a point the test chose rather than wherever a poll happened to land,
+        // and the twelve batches then straddle a teardown that is genuinely held up by it. Later
+        // than this and the ingest loop runs to its end while the flush is still parked, which is
+        // no straddle at all — measured: every batch accepted, and the fence mutation below goes
+        // undetected in 2 runs of 3.
+        held.SetResult();
 
         var late = new MetricIngestItem[12][];
         for (int i = 0; i < late.Length; i++)
@@ -1416,9 +1586,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
 
         // Observed AT each caller's return, not afterwards — the question is what a caller is
@@ -1430,8 +1604,10 @@ public sealed class MetricWalTests : IAsyncLifetime
             return (flush.IsCompleted, e.RunningThresholdFlushes);
         }
 
-        var seen = await Task.WhenAll(Task.Run(() => DisposeAndLook(engine, writing)),
-                                      Task.Run(() => DisposeAndLook(engine, writing)));
+        var both = Task.WhenAll(Task.Run(() => DisposeAndLook(engine, writing)),
+                                Task.Run(() => DisposeAndLook(engine, writing)));
+        held.SetResult();          // both callers are in flight before the first .mts is opened
+        var seen = await both;
 
         foreach (var (flushDone, running) in seen)
         {
@@ -1455,9 +1631,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var __   = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
 
         using var stop = new CancellationTokenSource();
         var scheduled = new List<Task>();
@@ -1470,7 +1650,9 @@ public sealed class MetricWalTests : IAsyncLifetime
             }
         });
 
-        await engine.DisposeAsync();
+        var dispose = engine.DisposeAsync();
+        held.SetResult();          // the flush opens its first .mts with the teardown under way
+        await dispose;
         int runningAtReturn = engine.RunningThresholdFlushes;
 
         await Task.Delay(50);          // and past the return, the worst moment of all
@@ -1913,10 +2095,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void Poisoned_head_is_reconciled_and_shrunk_at_open()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 16 KiB
+        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
@@ -2231,10 +2413,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void A_grown_file_with_a_rotted_magic_shrinks_at_reopen()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 300; i++)                       // grows 4 → 16 KiB
+        for (int i = 0; i < 300; i++)                       // grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {

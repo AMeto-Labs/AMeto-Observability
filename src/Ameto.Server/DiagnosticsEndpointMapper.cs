@@ -30,8 +30,15 @@ public static class DiagnosticsEndpointMapper
         app.MapGet("/api/diagnostics", (
             StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
             Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer,
-            Ameto.Indexing.IndexingWiring indexing, Ameto.Indexing.SegmentIndexCache indexCache) =>
+            Ameto.Indexing.IndexingWiring indexing, Ameto.Indexing.SegmentIndexCache indexCache,
+            HttpContext http) =>
         {
+            // Metrics and tracing can each be switched off (Ameto:Metrics:Enabled,
+            // Ameto:Tracing:Enabled), and then nothing registers these: looked up rather than
+            // injected, so a disabled signal reports nulls instead of failing the endpoint.
+            var metrics = http.RequestServices.GetService<Ameto.Metrics.Storage.MetricStorageEngine>();
+            var traces  = http.RequestServices.GetService<Ameto.Tracing.TraceDiagnostics>();
+
             // Disk space for the data directory drive
             long diskFreeBytes  = 0;
             long diskTotalBytes = 0;
@@ -230,6 +237,38 @@ public static class DiagnosticsEndpointMapper
                 // Bytes parked in the index build pools — transient after a gen2 trim, but
                 // counted in no memory budget.
                 indexBuildPooledBytes           = indexing.IndexBuildPooledBytes,
+
+                // ── Metrics: the EFFECTIVE budgets ─────────────────────────────
+                // What the engine enforces after the explicit-value, floor and budget rules — the
+                // figures config.yml tells an operator tuning HotTierBytes or ExemplarsPerMetric on
+                // a small host to read here. Null when metrics are disabled.
+                metricsHotTierBudgetBytes       = metrics?.HotTierBudgetBytes,
+                metricsMinFlushBytes            = metrics?.MinFlushBytes,
+                metricsWalInitialBytes          = metrics?.WalInitialBytes,
+                metricsExemplarsPerMetric       = metrics?.ExemplarsPerMetric,
+                metricsMaxExemplarMetrics       = metrics?.MaxExemplarMetrics,
+                // Exemplars dropped because MaxExemplarMetrics names already own a ring. A hint,
+                // never data — this counter is the only place the refusal shows.
+                metricsExemplarMetricsRefused   = metrics?.ExemplarMetricsRefused,
+
+                // ── Traces: the EFFECTIVE budgets, and the ring's back-pressure ─
+                // Refusals by cause, because they are different problems: RefusedForBytes is a
+                // burst heavier than RingMaxBytes, RefusedNoSlot a drainer that fell behind, and
+                // RefusedNoArena a payload mix the 64 KiB chunks pack badly (32–64 KB spans take a
+                // chunk each). Null when tracing is disabled.
+                tracesHotTierBudgetBytes        = traces?.HotTierBudgetBytes,
+                tracesMergeBudgetBytes          = traces?.MergeBudgetBytes,
+                tracesRingCapacity              = traces?.RingCapacity,
+                tracesRingMaxBytes              = traces?.RingMaxBytes,
+                tracesRingBytesInFlight         = traces?.RingBytesInFlight,
+                tracesRingRefusedForBytes       = traces?.RingRefusedForBytes,
+                tracesRingRefusedNoSlot         = traces?.RingRefusedNoSlot,
+                tracesRingRefusedNoArena        = traces?.RingRefusedNoArena,
+                // A full intern pool drops nothing — each span then keeps its own string — so
+                // these are memory, not loss: a service.name per pod, or span names carrying ids.
+                tracesUnpooledSpanNames         = traces?.UnpooledSpanNames,
+                tracesUnpooledServiceNames      = traces?.UnpooledServiceNames,
+                tracesInternPoolSaturations     = traces?.InternPoolSaturations,
             });
         }).RequireAuthorization();
     }

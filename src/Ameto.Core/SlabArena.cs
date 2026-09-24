@@ -1,14 +1,14 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Ameto.Ingestion;
+namespace Ameto.Core;
 
 /// <summary>
 /// The ingest payload arena: one contiguous address range whose pages are paid for only as
 /// the buffer actually grows into them.
 ///
 /// <para>Why this exists. The arena is sized to the back-pressure ceiling — 512 MB by default —
-/// on the assumption stated in <see cref="IngestionRingBuffer"/> that it is "reserved virtual
+/// on the assumption stated in <c>IngestionRingBuffer</c> that it is "reserved virtual
 /// memory; only pages actually written become resident". That is true of
 /// <c>NativeMemory.Alloc</c> on Linux, where a large malloc is an anonymous mmap and pages fault
 /// in lazily. It is NOT true on Windows: a block that large goes straight to
@@ -34,7 +34,21 @@ namespace Ameto.Ingestion;
 /// above the high-water mark would need a background sweep — a timer wake on an idle server,
 /// which is the thing this work package is removing — to reclaim memory that a LIFO free list
 /// will ask for again on the next burst of the same size. The high-water mark IS the residency,
-/// and it is the true peak, not the ceiling.</para>
+/// and it is the true peak, not the ceiling. (The SPAN ring does trim — <see cref="TryDecommitTail"/> — from
+/// the drainer's existing idle wake, not a timer of its own; the log ring still does not.)</para>
+///
+/// <para><b>Why it lives in Ameto.Core, and why it is still <c>internal</c>.</b> It was written
+/// for the log ring and lived beside it in <c>Ameto.Ingestion</c>; the span ring needs the same
+/// reserve-then-commit arena, and <c>Ameto.Tracing</c> does not (and must not) reference the log
+/// ingestion module. Moving it down to the one assembly both reference is the only home that
+/// serves both. It stays <c>internal</c>, with <c>InternalsVisibleTo</c> for exactly the
+/// assemblies that use it — the two rings and the three test files that drive its hooks —
+/// because every one of those callers reaches members that are internal ON PURPOSE:
+/// <see cref="SimulateCommitFailure"/> is a test hook, the <c>reserve: false</c> overload of
+/// <c>Create</c> exists so Windows can take the Linux path in a test, and
+/// <see cref="PageAlignInward"/> / <see cref="DisableHugePages"/> are internal so the decision
+/// arithmetic is testable on every platform. Making the TYPE public would have published the
+/// allocation surface and still left every test needing <c>InternalsVisibleTo</c> for the rest.</para>
 /// </summary>
 internal sealed unsafe class SlabArena : IDisposable
 {
@@ -46,7 +60,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     private readonly int   _hugePageOptOut; // NoHugePageOptOut, 0 when madvise succeeded, else its errno
 
-    private nuint _committed;               // bytes committed from _base; only grows
+    private nuint _committed;               // bytes committed from _base; grows, and falls only through TryDecommitTail
     private bool  _disposed;
 
     /// <summary>
@@ -265,6 +279,47 @@ internal sealed unsafe class SlabArena : IDisposable
         }
     }
 
+    /// <summary>
+    /// Gives back the pages of <c>[fromOffset, end)</c> — the span ring's idle trim, which the log
+    /// ring does not call (see the class remarks for why the log arena keeps its high-water mark).
+    /// <b>The caller guarantees nothing in the range is in use and nothing will be written to it
+    /// before <see cref="TryEnsureCommitted"/> has been asked for it again.</b>
+    ///
+    /// <para>Reserved (Windows): the range is decommitted and the committed mark lowered to
+    /// <paramref name="fromOffset"/>, so the next write that far is committed afresh. Plain
+    /// allocation on Linux: <c>madvise(MADV_DONTNEED)</c> over its whole pages — they stop being
+    /// resident and read as zeros when touched again, so no mark moves. Anywhere else: nothing.
+    /// Returns the bytes given back (0 when nothing was, or could be).</para>
+    /// </summary>
+    internal long TryDecommitTail(nuint fromOffset)
+    {
+        if (fromOffset >= _bytes) return 0;
+        lock (_growGate)
+        {
+            if (_reserved)
+            {
+                // ROUNDED UP TO A PAGE, never down. VirtualFree(MEM_DECOMMIT) takes every page that
+                // holds ANY byte of the range, so an unaligned start would decommit the bytes just
+                // below it too — live data, since the caller only vouches for what lies above. (The
+                // span ring passes chunk boundaries, which are aligned; this does not rely on it.)
+                // The Linux branch below rounds inward for the same reason (PageAlignInward).
+                nuint page = (nuint)Environment.SystemPageSize;
+                nuint from = (fromOffset + page - 1) / page * page;
+                if (from >= _committed) return 0;
+                nuint len = _committed - from;
+                if (!VirtualFree((nint)(_base + from), len, MEM_DECOMMIT)) return 0;
+                Volatile.Write(ref _committed, from);
+                return (long)len;
+            }
+
+            if (!OperatingSystem.IsLinux() || _simulateCommitFailure) return 0;
+            var (start, length) = PageAlignInward((nuint)(_base + fromOffset), _bytes - fromOffset, (nuint)Environment.SystemPageSize);
+            if (length == 0) return 0;
+            try { return madvise((nint)start, length, MADV_DONTNEED) == 0 ? (long)length : 0; }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { return 0; }
+        }
+    }
+
     // ── Test hook ──────────────────────────────────────────────────────────────
 
     private bool    _simulateCommitFailure;   // read and written under _growGate only
@@ -309,6 +364,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     private const uint MEM_COMMIT     = 0x1000;
     private const uint MEM_RESERVE    = 0x2000;
+    private const uint MEM_DECOMMIT   = 0x4000;
     private const uint MEM_RELEASE    = 0x8000;
     private const uint PAGE_READWRITE = 0x04;
 
@@ -320,6 +376,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     // ── Linux ──────────────────────────────────────────────────────────────────
 
+    private const int MADV_DONTNEED   = 4;
     private const int MADV_NOHUGEPAGE = 15;
 
     [DllImport("libc", SetLastError = true)]

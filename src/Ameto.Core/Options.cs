@@ -411,6 +411,353 @@ public sealed class TracesOptions
     /// backfill re-indexes, at whatever pace <see cref="IndexBackfill"/> allows.</para>
     /// </summary>
     public bool IndexEnabled { get; init; } = true;
+
+    // ── Memory ────────────────────────────────────────────────────────────────
+    //
+    // THE SPAN COUNTS THESE REPLACE were the same numbers on a 512 MB container and a 64 GB host:
+    // a 50 000-span hot tier, a 120 000-span compaction pass and a 65 536-slot ring, whatever a
+    // span weighed. An ordinary eight-attribute span is ~540 B in the tier; one carrying a SQL
+    // statement or a stack is 5-10 KB, so the same 50 000 was 27 MB or 500 MB. Every default
+    // below is min(what it has always been, a share of what this process may use), so a host with
+    // room for the caps behaves exactly as it did.
+
+    /// <summary>
+    /// Bytes the trace hot tier may hold before a flush is forced, counted as the tier's own
+    /// estimate of each span it takes in (<c>TraceStorageEngine.HotSpanBytes</c>: a fixed
+    /// per-span cost plus the attribute blob). Whichever comes first — this or the 50 000-span
+    /// cap — flushes. Unset: <see cref="MemoryBudgets.TraceHotTierBytes"/>, a share of the
+    /// managed-heap limit capped at the 27 MB that IS 50 000 ordinary spans, so a large host
+    /// flushes on the cadence it always did.
+    /// </summary>
+    public long? HotTierMaxBytes { get; init; }
+
+    /// <summary>
+    /// Bytes one compaction pass may materialise — the spans of every segment it merges, read
+    /// back. The planner admits segments against it, and the pass stops loading once it is
+    /// spent. A segment is a compaction candidate below half of it, so the largest two
+    /// candidates always fit one pass. Unset: <see cref="MemoryBudgets.TraceMergeBytes"/>, capped
+    /// at the 73 MB that is the 120 000 spans a pass always held.
+    /// </summary>
+    public long? MergeBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Slots in the span ingest ring. Rounded up to a power of two and clamped to
+    /// [1 024, 4 194 304]. Unset: 65 536, what the ring has always had. This used to be
+    /// unreachable: the ring was registered with its parameterless constructor.
+    /// </summary>
+    public int? RingCapacity { get; init; }
+
+    /// <summary>
+    /// The most the spans waiting in the ingest ring may weigh, in bytes: past it the ring refuses
+    /// a span whatever slots are free (back-pressure by bytes, not by count). 65 536 ordinary spans
+    /// weigh ~36 MB; the same slots of spans carrying 10 KB of attributes, ~650 MB.
+    ///
+    /// <para>Unset: <b>what the full ring held of ordinary spans, restated in bytes</b> —
+    /// <see cref="EffectiveRingCapacity"/> × <see cref="OrdinaryRingSpanBytes"/>, 36.7 MB at the
+    /// default 65 536 slots — so a host with room for the caps absorbs exactly the burst it always
+    /// did, and a heavy burst no longer buys eighteen times that. A host whose hot-tier budget is
+    /// below its cap gets the same fraction of it: 27.4 MB on the 512 MB stand.</para>
+    /// </summary>
+    public long? RingMaxBytes { get; init; }
+
+    /// <summary>
+    /// What one ordinary span (eight attributes, a 375-byte blob) weighs waiting in the ring —
+    /// <c>SpanRingBytesProbe</c> reads 560-562 B. The unit <see cref="RingMaxBytes"/>' default is
+    /// counted in.
+    /// </summary>
+    public const int OrdinaryRingSpanBytes = 560;
+
+    /// <inheritdoc cref="RingMaxBytes"/>
+    public long EffectiveRingMaxBytes => RingMaxBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="RingMaxBytes"/>
+    public long RingMaxBytesFor(in MemoryBudgets budgets)
+    {
+        if (RingMaxBytes is { } explicitBytes && explicitBytes > 0) return explicitBytes;
+        double hostShare = Math.Min(1.0, HotTierMaxBytesFor(in budgets) / (double)MemoryBudgets.TraceHotTierCapBytes);
+        return (long)((long)EffectiveRingCapacity * OrdinaryRingSpanBytes * hostShare);
+    }
+
+    /// <summary>The ring's slot count when nothing is configured.</summary>
+    public const int DefaultRingCapacity = 1 << 16;
+
+    private const int MinRingCapacity = 1 << 10;
+    private const int MaxRingCapacity = 1 << 22;
+
+    /// <inheritdoc cref="HotTierMaxBytes"/>
+    public long EffectiveHotTierMaxBytes => HotTierMaxBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// The pure function behind <see cref="EffectiveHotTierMaxBytes"/>, so the arithmetic can be
+    /// checked at 384 MB and 64 GB without a machine of each — the shape
+    /// <see cref="MetricsOptions.HotTierBytesFor"/> already has.
+    /// </summary>
+    public long HotTierMaxBytesFor(in MemoryBudgets budgets) =>
+        HotTierMaxBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceHotTierBytes;
+
+    /// <inheritdoc cref="MergeBudgetBytes"/>
+    public long EffectiveMergeBudgetBytes => MergeBudgetBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="MergeBudgetBytes"/>
+    public long MergeBudgetBytesFor(in MemoryBudgets budgets) =>
+        MergeBudgetBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceMergeBytes;
+
+    /// <inheritdoc cref="RingCapacity"/>
+    public int EffectiveRingCapacity =>
+        (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
+            (uint)Math.Clamp(RingCapacity is { } slots && slots > 0 ? slots : DefaultRingCapacity,
+                             MinRingCapacity, MaxRingCapacity));
+}
+
+/// <summary>
+/// Metric storage sizing — every ceiling the metric engine used to spell as a literal.
+///
+/// <para><b>What was wrong with the literals.</b> <c>HotFlushThreshold = 500_000</c>,
+/// <c>MinFlushPoints = 50_000</c>, <c>ExemplarsPerMetric = 4_000</c>,
+/// <c>MaxTrackedSeries = 50_000</c>, <c>MaxLabelValuesPerKey = 2_000</c> and the log's 8 MB
+/// initial capacity were the same number on a 512 MB container and a 64 GB host, and nothing in
+/// the metrics module consulted <see cref="MemoryBudgets"/> at all. Worst case at those defaults
+/// is 20 MB of gauge points or <b>84 MB of histogram points</b> before a flush, plus 832 KB of
+/// exemplars per metric NAME (4 000 x <see cref="MetricsOptions.ExemplarBytes"/>) with no cap on
+/// the number of names — inside a GC heap hard limit of 384 MB, next to a 48 MB index cache and a
+/// 16 MB log tier.</para>
+///
+/// <para><b>A host large enough for the caps behaves exactly as it did</b> — with one deliberate
+/// exception. Every derived default below is <c>min(what it has always been, a share of what this
+/// process may use)</c>, and <see cref="MemoryBudgets.MetricHotTierCapBytes"/> is today's
+/// 500 000-point threshold restated in bytes. So the flush cadence changes on a constrained host
+/// and nowhere else. <see cref="ExemplarsPerMetric"/> is the exception: 4 000 slots could only
+/// ever be a default while nothing bounded the number of rings, and 4 000 x
+/// <see cref="MaxExemplarMetrics"/> x <see cref="ExemplarBytes"/> is 213 MB of retained memory
+/// that no tier accounting and no <c>Shed()</c> can reach. It derives on every host.</para>
+///
+/// <para><b>Points are not the unit.</b> A 16-bucket histogram point carries its own
+/// <c>long[]</c> and weighs 4.3x a scalar point, so a point count cannot bound memory. The tier
+/// spends bytes; <c>MetricStorageEngine.EstimatedPointBytes</c> is what a point costs.</para>
+/// </summary>
+public sealed class MetricsOptions
+{
+    /// <summary>
+    /// Bytes the hot tier may hold before a flush is forced. Unset: a share of the managed-heap
+    /// limit, capped at <see cref="MemoryBudgets.MetricHotTierCapBytes"/>.
+    /// </summary>
+    public long? HotTierBytes { get; init; }
+
+    /// <summary>
+    /// The bar a PERIODIC tick has to clear to write files at all — below it the tier keeps
+    /// accumulating, because the points are already durable in the write-ahead log and a file per
+    /// metric name is not worth writing for a handful of them. Unset: a tenth of
+    /// <see cref="HotTierBytes"/>, which is exactly the old 50 000 points at the old threshold.
+    /// </summary>
+    public long? MinFlushBytes { get; init; }
+
+    /// <summary>
+    /// Initial capacity of <c>metrics.wal</c>. Unset: the hot-tier budget, <b>capped at the 8 MB
+    /// this has always been</b> — so it can only ever make the file smaller, on a host whose tier
+    /// budget is smaller than that.
+    ///
+    /// <para>Sizing it UP to the tier budget is the other half of the idea and is deliberately
+    /// not the default: it would save two unmap/remap cycles under the append lock on a busy
+    /// host, and leave every quiet install a 20-32 MB file at rest for the life of the
+    /// deployment, since the log never shrinks below the capacity it was opened with. The bound
+    /// that would make a pre-sized log a ceiling rather than a floor — a bounded growth increment
+    /// instead of doubling — belongs to the package that owns the log's locking. Set this
+    /// explicitly to pre-size.</para>
+    /// </summary>
+    public long? WalInitialBytes { get; init; }
+
+    /// <summary>
+    /// How long the tier may hold points before a flush becomes due regardless of size. Matches
+    /// the rollup's own first cutoff, so nothing waits longer because of this. Default: 1 h.
+    /// </summary>
+    public TimeSpan MaxHotAge { get; init; } = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// How often the flush loop asks whether the tier has earned its files. A CHECK interval, not
+    /// a flush interval — durability belongs to the log. Default: 60 s.
+    /// </summary>
+    public TimeSpan FlushCheckInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Exemplars kept per metric name, for metric-to-trace jumps. Unset: derived so that
+    /// <see cref="MaxExemplarMetrics"/> full rings fit in half the hot-tier budget, clamped to
+    /// [64, 4 000].
+    ///
+    /// <para><b>A value set here is honoured only as far as half the tier can hold ONE ring of
+    /// it</b>, and is lowered to that depth beyond — the budget is a quantity of bytes, and the
+    /// ring count cannot fall below 1 to pay for a deeper ring. 50 000 on a 4 MB tier is
+    /// 10.4 MB retained against a 2 MB budget; it is given the 9 615 slots the budget buys.</para>
+    ///
+    /// <para><b>The derivation spends against the ceiling the engine enforces, and that is the
+    /// whole point.</b> It used to divide by a private "this many names actually carry exemplars"
+    /// assumption of 32 while <see cref="MaxExemplarMetrics"/> let 256 rings exist — so the bound
+    /// in the sentence above was false by 8x, and by 13x once the real per-entry cost was counted.
+    /// A ring is never pruned, never aged out, invisible to the tier's byte accounting and out of
+    /// reach of <c>Shed()</c>, so <see cref="MaxExemplarMetrics"/> x this x
+    /// <see cref="ExemplarBytes"/> is memory retained for the life of the process. If a
+    /// deployment wants deeper rings, it lowers <see cref="MaxExemplarMetrics"/> — the product is
+    /// the budget, and the two knobs trade against each other inside it.</para>
+    /// </summary>
+    public int? ExemplarsPerMetric { get; init; }
+
+    /// <summary>
+    /// How many metric names may own an exemplar ring. <b>New ceiling:</b> there was none, and a
+    /// ring is allocated at full capacity the first time a name carries an exemplar, so an
+    /// instrumentation change could add rings until the heap ran out. Past this, exemplars for
+    /// further names are dropped — a correlation hint, never data. Default: 256.
+    ///
+    /// <para>This is the divisor <see cref="ExemplarsPerMetricFor"/> spends the exemplar budget
+    /// against, so raising it makes every ring proportionally shallower rather than claiming more
+    /// memory, and lowering it makes them deeper. <b>Past the point where that would take a ring
+    /// below <c>MinExemplarsPerMetric</c></b> — 64 slots, under which a ring stops being worth
+    /// keeping — the depth cannot give way any further and the COUNT does instead: see
+    /// <see cref="MaxExemplarMetricsFor"/>, which is the number of rings the engine really
+    /// admits. Names past THAT are refused exactly as they are past this cap.</para>
+    ///
+    /// <para>Without that second clamp the sentence above was false wherever the floor binds —
+    /// about 756 rings on the 512 MB stand. An operator raising this to 5 000 to admit more
+    /// exemplar-carrying instruments, which is the case the cap exists for, got
+    /// 5 000 x 64 x 208 B = 66 MB of rings on a 384 MB heap: resident for the life of the
+    /// process, never pruned or aged out, invisible to <c>ShedableBytes</c> and unreachable by
+    /// <c>Shed()</c>. The same setting now claims the 10 MB the derivation names.</para>
+    /// </summary>
+    public int MaxExemplarMetrics { get; init; } = 256;
+
+    /// <summary>Distinct values remembered per label key, per metric, for the Explore catalog.</summary>
+    public int MaxLabelValuesPerKey { get; init; } = 2_000;
+
+    /// <summary>Distinct label-set hashes counted per metric before cardinality stops rising.</summary>
+    public int MaxTrackedSeriesPerMetric { get; init; } = 50_000;
+
+    /// <summary>One scalar point's cost in the tier. See <c>MetricStorageEngine.HotPointBytes</c>.</summary>
+    private const int ScalarPointBytes = 64;
+
+    /// <summary>
+    /// What ONE exemplar costs once it is in a ring, retained: the 8-byte slot in the ring array,
+    /// the 56-byte <c>ExemplarSample</c> it points at (a sealed class — 16 B header, a
+    /// <c>long</c>, a <c>double</c> and three references), and the two id strings the OTLP parser
+    /// hex-encodes fresh for every exemplar and the sample then holds alive — 88 B for a 32-char
+    /// trace id and 56 B for a 16-char span id. 8 + 56 + 88 + 56 = 208.
+    ///
+    /// <para><c>ExemplarSample.Labels</c> is not in the figure because the ring retains no label
+    /// set of its own: <c>MetricStorageEngine.AddExemplars</c> files the SERIES' canonical
+    /// <c>LabelSet</c> — <c>HotSeries.Labels</c>, the instance the series' key already holds —
+    /// rather than the fresh instance the OTLP parser builds per data point. That was not true
+    /// when this constant was written: the ring took <c>item.Labels</c>, nothing else kept it,
+    /// and an entry really cost 860 B here — weighed, 52.5 MB for 64 000 entries where the
+    /// canonical set reads 13.5 MB. The claim is now the engine's behaviour and
+    /// <c>MetricHotTierRetentionProbe.An_exemplar_does_not_retain_its_points_label_set</c> holds
+    /// it there by feeding a distinct, freshly-stringed label set per point and weighing the
+    /// heap.</para>
+    ///
+    /// <para>This was 120 — the slot and the two ids with the sample itself forgotten, 1.7x low
+    /// on a figure the ring budget divides by. <c>MetricHotTierRetentionProbe</c> now fills rings
+    /// and weighs the heap rather than taking anyone's word for it.</para>
+    /// </summary>
+    public const int ExemplarBytes = 208;
+
+    private const int  MaxExemplarsPerMetricCap = 4_000;
+    private const int  MinExemplarsPerMetric    =    64;
+    private const long WalInitialCapBytes       = 8L * 1024 * 1024;
+    private const long MinWalInitialBytes       = 1L * 1024 * 1024;
+
+    /// <inheritdoc cref="HotTierBytes"/>
+    public long EffectiveHotTierBytes => HotTierBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// The pure function behind <see cref="EffectiveHotTierBytes"/>, so the arithmetic can be
+    /// checked at 384 MB, 4 GB and 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> already uses.
+    /// </summary>
+    public long HotTierBytesFor(in MemoryBudgets budgets) =>
+        HotTierBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.MetricHotTierBytes;
+
+    /// <inheritdoc cref="MinFlushBytes"/>
+    public long EffectiveMinFlushBytes => MinFlushBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="MinFlushBytes"/>
+    public long MinFlushBytesFor(in MemoryBudgets budgets) =>
+        MinFlushBytes is { } explicitBytes && explicitBytes > 0
+            ? explicitBytes
+            : Math.Max(ScalarPointBytes, HotTierBytesFor(in budgets) / 10);
+
+    /// <inheritdoc cref="WalInitialBytes"/>
+    public long EffectiveWalInitialBytes => WalInitialBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="WalInitialBytes"/>
+    public long WalInitialBytesFor(in MemoryBudgets budgets) =>
+        WalInitialBytes is { } explicitBytes && explicitBytes > 0
+            ? explicitBytes
+            : Math.Clamp(HotTierBytesFor(in budgets), MinWalInitialBytes, WalInitialCapBytes);
+
+    /// <inheritdoc cref="ExemplarsPerMetric"/>
+    public int EffectiveExemplarsPerMetric => ExemplarsPerMetricFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="ExemplarsPerMetric"/>
+    public int ExemplarsPerMetricFor(in MemoryBudgets budgets)
+    {
+        // THE DEEPEST RING HALF THE TIER CAN HOLD AT ALL — one ring, nothing beside it. It is
+        // the ceiling on BOTH branches below, because <see cref="MaxExemplarMetricsFor"/> clamps
+        // the ring count to at least 1: at a depth past this there is no count left to buy it
+        // out of, and the product escapes the budget outright. long, because an operator-set
+        // depth times ExemplarBytes overflows int well before it stops being affordable.
+        long deepestAffordable = Math.Max(1, HotTierBytesFor(in budgets) / 2 / ExemplarBytes);
+
+        // An explicit depth wins up to that ceiling and not past it. ExemplarsPerMetric = 50 000
+        // on a 4 MB tier used to be honoured whole: 1 ring x 50 000 x 208 B = 10.4 MB of
+        // permanently resident heap — never pruned, aged out, shed or counted — against a 2 MB
+        // budget, which was the one way left to spend more than the derivation names.
+        if (ExemplarsPerMetric is { } explicitCount && explicitCount > 0)
+            return (int)Math.Min(explicitCount, deepestAffordable);
+
+        // MaxExemplarMetrics, not a smaller "actually active" guess: the divisor has to be the
+        // number of rings the engine will let exist, or the budget bounds nothing. long, because
+        // at a raised cap the product overflows int before the clamp gets a chance.
+        long rings   = Math.Max(1, MaxExemplarMetrics);
+        long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * rings);
+
+        // The 64-slot floor is a floor on what is WORTH keeping, not a licence to exceed the
+        // budget: on a tier too small to hold even one ring of 64 it gives way to the ceiling.
+        return (int)Math.Min(Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap),
+                             deepestAffordable);
+    }
+
+    /// <inheritdoc cref="MaxExemplarMetricsFor"/>
+    public int EffectiveMaxExemplarMetrics => MaxExemplarMetricsFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// HOW MANY RINGS THE ENGINE WILL ACTUALLY LET EXIST — <see cref="MaxExemplarMetrics"/>, or
+    /// as many as the budget can afford at the depth <see cref="ExemplarsPerMetricFor"/> settled
+    /// on, whichever is smaller.
+    ///
+    /// <para>The two knobs MULTIPLY, and only their product is memory. Spending the budget on
+    /// depth alone stops bounding anything the moment the depth hits its 64-slot floor: past
+    /// there every further ring is 64 x <see cref="ExemplarBytes"/> = 13 KB of permanently
+    /// resident heap that nothing prunes, ages out, sheds or even counts, and the cap is
+    /// operator-settable. So the leftover goes on the count. While the DERIVED depth is in force
+    /// this returns <see cref="MaxExemplarMetrics"/> unchanged and nothing moves: the derivation
+    /// divided the budget by that very count, so it is affordable by construction, and only past
+    /// the floor, where the depth can give way no further, does the count begin to.</para>
+    ///
+    /// <para><b>An explicit <see cref="ExemplarsPerMetric"/> moves the count immediately, at any
+    /// tier size — there is no floor point to reach first.</b> The depth was chosen rather than
+    /// derived, so the budget is divided by IT and the ring count is whatever is left over:
+    /// 1 000 slots on the 512 MB stand's 19.2 MB tier admits 48 rings, not the 256 the cap says,
+    /// and names past the 48th are refused their exemplars exactly as they are past the cap. An
+    /// operator who sets a depth is therefore setting both knobs — the budget is a quantity of
+    /// BYTES, and asking for deeper rings on a tier that cannot hold more of them is asking for
+    /// fewer of them. Lower the depth, or raise <see cref="HotTierBytes"/>, to get the count
+    /// back. (Past the point where even ONE ring of that depth would not fit,
+    /// <see cref="ExemplarsPerMetricFor"/> lowers the depth instead: the count stops at one.)
+    /// </para>
+    /// </summary>
+    public int MaxExemplarMetricsFor(in MemoryBudgets budgets)
+    {
+        long rings      = Math.Max(1, MaxExemplarMetrics);
+        long perRing    = ExemplarsPerMetricFor(in budgets);
+        long affordable = HotTierBytesFor(in budgets) / 2 / (perRing * ExemplarBytes);
+        return (int)Math.Clamp(affordable, 1, rings);
+    }
 }
 
 /// <summary>
@@ -429,6 +776,7 @@ public sealed class ServerOptions
     public UpdatesOptions   Updates          { get; init; } = new();
     public LoggingOptions   Logging          { get; init; } = new();
     public TracesOptions    Traces           { get; init; } = new();
+    public MetricsOptions   Metrics          { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
 
     /// <summary>

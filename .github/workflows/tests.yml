@@ -38,9 +38,11 @@ concurrency:
 jobs:
   backend:
     runs-on: windows-latest
-    # The suite is ~11 minutes; the default is six hours. A test that hangs should cost a coffee,
-    # not a runner-day.
-    timeout-minutes: 30
+    # The suite is ~11 minutes when its projects run one after another and ~20 when Storage and
+    # Integration overlap on the two cores; the default is six hours. A test that hangs should cost
+    # a coffee, not a runner-day. 40, not 30: a hang late in a ~20 minute run needs its 15-minute
+    # blame timeout (below) to fire and report before the job limit cancels everything silently.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -64,10 +66,27 @@ jobs:
       # It runs once: the integration suite is run three times locally because of a known flake,
       # and a flake that only ever shows up on a developer's third attempt is precisely what CI
       # should be allowed to go red on.
+      #
+      # A HANG MUST NAME ITS TEST, NOT SPEND THE JOB. Run 35964432043 (PR #84) was cancelled at the
+      # 30-minute limit with the integration suite simply silent: `-v minimal` prints nothing for a
+      # test that never ends, and a cancelled job keeps no output of the test host. With a hang
+      # timeout the blame collector kills a test host that has sat on ONE test for 15 minutes (the
+      # timer is per test, not per project), prints "The test running when the crash occurred:
+      # <name>", writes a mini dump of the
+      # host under that project's TestResults, and the step fails through the exit-code check
+      # below with the suite named — well inside the job's budget. The same collector also names
+      # the test that was running when a test host crashes outright. The skip guard is unaffected:
+      # blame adds "Data collector 'Blame' message" lines, none of which match `Skipped:`.
+      #
+      # 15, NOT 5: SINGLE TESTS DO TAKE MINUTES HERE. Run 35971819964 killed the Storage host after
+      # 5 minutes on SegmentBucketAdversarialProbe.OpenBucketAmplificationConverges — not hung: its
+      # dump shows the test thread inside CreateFile (4 000 flushes, each opening files on a runner
+      # whose real-time scanning slows file creation) and no Ameto thread waiting on anything. The
+      # test takes 41 s on a developer box and fitted inside the 11-13 minute Storage run before.
       - name: Test (Debug)
         shell: pwsh
         run: |
-          dotnet test -c Debug --nologo -v minimal 2>&1 | Tee-Object -FilePath test-output.txt
+          dotnet test -c Debug --nologo -v minimal --blame-hang-timeout 15m --blame-hang-dump-type mini 2>&1 | Tee-Object -FilePath test-output.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # A SKIPPED TEST READS AS A PASSING ONE. Nothing in a green report distinguishes "the
@@ -104,6 +123,22 @@ jobs:
           }
           Write-Host "no skipped tests across $($summaries.Count) test projects"
 
+      # THE HANG'S EVIDENCE LEAVES WITH THE RUNNER unless it is uploaded. A hang in a class fixture's
+      # teardown (a WebApplicationFactory host stopping after its last test) happens after every test
+      # has finished, so "the test running when the crash occurred" has nothing to name, and the dump
+      # and the blame Sequence file are the only record of which thread waited on what.
+      - name: Upload hang and crash evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blame-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            **/TestResults/**/*.dmp
+            **/TestResults/**/Sequence_*.xml
+            test-output.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
   # THE LINUX INGEST ARENA, ON LINUX.
   #
   # The server runs in Linux containers (install/docker), and on Linux its ingest payload arena is
@@ -112,7 +147,8 @@ jobs:
   # — runs in the backend job above on Windows, takes its off-Linux branch and passes, so the madvise
   # call, its errno and the smaps check behind it were exercised by no CI run at all.
   #
-  # This job runs that test's class and nothing else. The whole suite already runs above; this job
+  # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
+  # madvise(MADV_DONTNEED) on Linux — see the second step). The whole suite already runs above; this job
   # exists for the code that only does anything on Linux.
   #
   # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
@@ -124,7 +160,8 @@ jobs:
   # renamed test method by running only its neighbours.
   backend-linux:
     runs-on: ubuntu-latest
-    # Restore, a Debug build of Ameto.Perf and its references, and a few seconds of tests.
+    # Restore, Debug builds of Ameto.Perf and Ameto.Storage.Tests and their references, and a few
+    # seconds of tests.
     timeout-minutes: 15
     env:
       AMETO_REQUIRE_THP: '1'
@@ -142,10 +179,39 @@ jobs:
             --filter "FullyQualifiedName~SlabArenaCommitTests" \
             --logger "console;verbosity=normal" 2>&1 | tee test-output.txt
 
-          if ! grep -q "Passed Ameto.Perf.SlabArenaCommitTests.On_Linux_the_arena_is_opted_out_of_transparent_huge_pages" test-output.txt; then
-            echo "::error::On_Linux_the_arena_is_opted_out_of_transparent_huge_pages did not run and pass; the filter no longer reaches it."
-            exit 1
-          fi
+          for t in On_Linux_the_arena_is_opted_out_of_transparent_huge_pages \
+                   A_decommitted_tail_leaves_every_byte_below_it_intact_and_is_usable_again; do
+            if ! grep -q "Passed Ameto.Perf.SlabArenaCommitTests.$t" test-output.txt; then
+              echo "::error::$t did not run and pass; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE SPAN RING'S IDLE TRIM, ON LINUX. On Linux the trim gives the arena back with
+      # madvise(MADV_DONTNEED) on a plain allocation — the path the Linux stand runs — while the
+      # backend job above takes Windows' VirtualFree path. A page rounded the wrong way here would
+      # silently zero live span payloads, so the ring's arena facts run on the platform they are
+      # about. Same guard as above: each named fact must appear as Passed, or the job fails.
+      - name: Test the span ring's arena trim (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~SpanRingRawTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee ring-output.txt
+
+          for t in A_burst_is_given_back_once_the_ring_is_idle_and_the_ring_still_works \
+                   The_trim_never_gives_back_a_chunk_a_span_still_uses \
+                   A_trim_under_steady_single_batch_traffic_gives_the_burst_back \
+                   A_chunk_released_during_a_trim_goes_back_above_the_given_back_ones \
+                   The_drainer_trims_the_arena_once_it_finds_the_ring_idle_after_a_burst \
+                   A_producer_that_meets_a_trim_waits_for_it_instead_of_refusing \
+                   A_payload_goes_through_the_ring_and_comes_back_byte_for_byte; do
+            if ! grep -q "Passed Ameto.Storage.Tests.SpanRingRawTests.$t" ring-output.txt; then
+              echo "::error::SpanRingRawTests.$t did not run and pass; the filter no longer reaches it."
+              exit 1
+            fi
+          done
 
   client:
     runs-on: ubuntu-latest

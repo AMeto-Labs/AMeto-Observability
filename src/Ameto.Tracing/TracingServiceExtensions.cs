@@ -58,16 +58,50 @@ public static class TracingServiceExtensions
         bool indexEnabled = true)
     {
         services.AddSingleton(new TraceIndexOptions(backfill));
+        // The span-name and service intern pools: one set per process, shared by the engine (which
+        // resolves names into them and sheds the name pool at every flush) and the ingest side.
+        services.AddSingleton(static _ => new SpanStringPools());
         services.AddSingleton(sp =>
             new TraceStorageEngine(
                 Path.Combine(dataDirectory, "traces"),
                 sp.GetRequiredService<ILogger<TraceStorageEngine>>(),
                 writeSegmentFormatV4,
-                indexEnabled));
+                indexEnabled,
+                TracesOptionsFrom(sp),
+                sp.GetRequiredService<SpanStringPools>()));
 
-        services.AddSingleton<SpanRingBuffer>();
+        // FIRST, SO IT STOPS LAST. Hosted services are stopped in reverse registration order, so
+        // this one's StopAsync — the engine's teardown — runs after the drainer has handed over
+        // its last batch and after both background workers have been asked to stop. Registered
+        // anywhere later it would tear the engine down underneath the drainer that is still
+        // feeding it, and the drainer's spans would be refused rather than stored.
+        //
+        // The container disposes the engine as well, under each of the six interfaces it is
+        // registered as; those calls await the teardown this one started instead of returning
+        // into a half-torn engine.
+        services.AddHostedService<TraceStorageHostedService>();
+
+        // THE CAPACITY FROM CONFIG. This was AddSingleton<SpanRingBuffer>() — the parameterless
+        // constructor — so Traces:RingCapacity could not have reached the ring even had it existed.
+        services.AddSingleton(static sp =>
+        {
+            var traces = TracesOptionsFrom(sp);
+            var ring   = new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes,
+                                            sp.GetRequiredService<SpanStringPools>());
+            // The effective trace budgets, once, from what the ring and the engine were BUILT with.
+            // The engine is already constructed by now in the host (its hosted service is registered
+            // first, above), so resolving it here changes no construction order.
+            TraceDiagnostics.LogBudgets(sp.GetRequiredService<ILogger<TraceDiagnostics>>(),
+                                        sp.GetRequiredService<TraceStorageEngine>(), ring);
+            return ring;
+        });
+        // What GET /api/diagnostics reads: the engine's budgets and the ring's refusals by cause.
+        services.AddSingleton(static sp => new TraceDiagnostics(sp.GetRequiredService<TraceStorageEngine>(),
+                                                                sp.GetRequiredService<SpanRingBuffer>()));
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
+        // The raw sink the OTLP/HTTP parsers stream into — the same endpoint, the same ring.
+        services.AddSingleton<ISpanSink>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
         services.AddSingleton<ITraceProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<ITraceStatsProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<IServiceGraphProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
@@ -81,6 +115,15 @@ public static class TracingServiceExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// The <c>Ameto:Traces</c> section, from the <see cref="ServerOptions"/> the host registers —
+    /// read here rather than passed in, so the memory knobs reach the engine and the ring without
+    /// widening <see cref="AddAmetoTracing"/>'s signature. A container without one (a test that
+    /// registers tracing alone) gets the defaults, which are <see cref="MemoryBudgets"/>' shares.
+    /// </summary>
+    internal static TracesOptions TracesOptionsFrom(IServiceProvider sp) =>
+        sp.GetService<ServerOptions>()?.Traces ?? new TracesOptions();
 }
 
 /// <summary>
@@ -189,6 +232,24 @@ internal sealed class TraceIndexBackfillWorker(
             catch (OperationCanceledException) { return; }
         }
     }
+}
+
+/// <summary>
+/// The engine's teardown, on the host's schedule rather than the container's. Registered first so
+/// it stops last; <c>StopAsync</c> is awaited by the host, which the container's disposal of a
+/// singleton is not — and the trace engine's teardown ends in a segment build and an fsync.
+/// </summary>
+internal sealed class TraceStorageHostedService : IHostedService, IAsyncDisposable
+{
+    private readonly TraceStorageEngine _engine;
+
+    public TraceStorageHostedService(TraceStorageEngine engine) => _engine = engine;
+
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public async Task StopAsync(CancellationToken ct) => await _engine.DisposeAsync();
+
+    public async ValueTask DisposeAsync() => await _engine.DisposeAsync();
 }
 
 internal sealed class SpanDrainerService : IHostedService, IAsyncDisposable

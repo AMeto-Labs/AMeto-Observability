@@ -1,5 +1,6 @@
 using Ameto.Core;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Text;
 using K4os.Compression.LZ4;
 
@@ -78,20 +79,32 @@ internal static class TraceSummarySidecar
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
 
-    private static readonly string[] MethodKeys = { "http.request.method", "http.method" };
-    private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
-
     // ── Writer ──────────────────────────────────────────────────────────────────
 
     public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
     {
-        if (spans.Count == 0) return;
+        var batch = new OrderedSpans(spans);
+        WriteOrdered(baseTrcPath, in batch, outputPath);
+    }
 
-        // One pass: group spans by trace id into per-trace accumulators.
+    /// <summary>
+    /// The same, for a batch the flush has already put in order — see <see cref="OrderedSpans"/>.
+    /// The order decides the file: <c>traces</c>, <c>vol</c> and the service pool are all written
+    /// in INSERTION order, and "the first empty-parent span wins the root slot" is a statement
+    /// about the walk.
+    /// </summary>
+    internal static void WriteOrdered(string baseTrcPath, in OrderedSpans spans, string? outputPath = null)
+    {
+        int spanCount = spans.Count;
+        if (spanCount == 0) return;
+
+        // One pass: group spans by trace id into per-trace accumulators. Sized by `spans.Count`
+        // rather than the `spanCount` local, so FileBoundsConventionTests — which scans this
+        // file for its READER half — can see the size comes from memory, not from a file.
         var traces = new Dictionary<TraceId, Acc>(spans.Count / 2 + 1);
         long segMin = long.MaxValue, segMax = long.MinValue;
 
-        for (int i = 0; i < spans.Count; i++)
+        for (int i = 0; i < spanCount; i++)
         {
             var s = spans[i];
             if (s.StartTimeUnixNano < segMin) segMin = s.StartTimeUnixNano;
@@ -124,8 +137,28 @@ internal static class TraceSummarySidecar
                 a.RootHttpStatus = s.HttpStatusCode;
                 a.RootName       = s.Name;
                 a.RootService    = s.ServiceName;
-                a.RootMethod     = GetAttr(s.Attributes, MethodKeys);
-                a.RootPath       = GetAttr(s.Attributes, PathKeys);
+
+                // READ OUT OF THE BLOB, NOT OUT OF A DECODE OF IT — TS#7(f).
+                //
+                // This used to be `GetAttr(s.Attributes, …)`, and on a record that holds a blob
+                // `Attributes` IS the lazy decode: a Dictionary, a key string and a box per
+                // attribute, ~987 B for an ordinary eight-attribute span against the blob's 375 B.
+                // The flush already decodes every blob once, on this thread, to feed the bloom
+                // (SpanWriter.TryAddAttrBlobToBloom); this was a second decode of every ROOT, and
+                // the worse kind — SpanRecord memoises it, and these records are the snapshot
+                // TraceStorageEngine keeps serving queries from (`_flushingSpans`) until the
+                // publish, so each dictionary stayed attached for the rest of the flush.
+                //
+                // `Resolve` answers both questions in one non-decoding walk and allocates only the
+                // strings it returns; a record with no blob (a dictionary-built one) still goes
+                // through GetAttr. Same answers by construction — key order, first non-null value
+                // wins, last copy of a key wins, ToString() text — and the golden .tracesum hash in
+                // TraceFlushProbe, whose roots carry every value shape including a truncated blob,
+                // holds that to the byte. It is also the helper the trace list and TraceQL's row
+                // builder use, so the three readers of a trace row cannot drift apart again.
+                HttpSemconvKeys.Resolve(s, out string rootMethod, out string rootPath);
+                a.RootMethod     = rootMethod;
+                a.RootPath       = rootPath;
             }
         }
 
@@ -140,75 +173,76 @@ internal static class TraceSummarySidecar
             vol[grid] = cell;
         }
 
-        // Service pool (dedupes repeated service names across trace rows).
+        // ── Service pool, interned BEFORE the rows are written ──────────────────────
+        //
+        // The body is the pool followed by the rows, and the pool used to be discovered WHILE the
+        // rows were written — so the rows went to a scratch MemoryStream, the pool to a second
+        // one, the first was CopyTo'd behind the second, the result ToArray()'d, and that array
+        // pickled: four copies of the body, two of them growing by doubling, on a sidecar the
+        // recon measured at 6,2 MB per 50 000-span flush.
+        //
+        // Interning the pool FIRST, in exactly the order the row pass meets the names — per trace,
+        // in `traces` order: the root's (else the first) service, then the trace's service set in
+        // its own enumeration order — yields the same pool and the same indices, so the body can
+        // be written front to back into ONE buffer. Neither collection is modified between the
+        // two passes, so both enumerate identically; the row pass below interns again, which is
+        // now a lookup that always hits.
         var pool    = new Dictionary<string, int>(StringComparer.Ordinal);
         var poolArr = new List<string>();
-        int Intern(string name)
+        foreach (var a in traces.Values)
         {
-            if (name.Length == 0) return -1;
-            if (pool.TryGetValue(name, out var idx)) return idx;
-            idx = poolArr.Count;
-            pool[name] = idx;
-            poolArr.Add(name);
-            return idx;
+            Intern(pool, poolArr, a.HasRoot ? a.RootService : a.FirstService);
+            foreach (var sv in a.Services!) Intern(pool, poolArr, sv);
         }
 
-        // Serialise the body first (needs the pool built up).
-        byte[] rawBody;
-        using (var bodyMs = new MemoryStream(traces.Count * 64))
-        using (var bw = new BinaryWriter(bodyMs, Encoding.UTF8, leaveOpen: true))
+        // ONE RENTED BUFFER for the whole body, returned before the file is opened. Sized for the
+        // common case — a ~60-byte fixed row plus three short strings per trace, and at most one
+        // service index per span — so it grows at most once or twice rather than a dozen times.
+        int    rawLength;
+        byte[] compBody;
+        var body = new PooledBody(ArrayPool<byte>.Shared.Rent(traces.Count * 80 + spans.Count * 4 + 256));
+        try
         {
-            // Reserve pool position — write traces into a temp, interning as we go, then
-            // write pool + traces. Simpler: iterate twice — intern in first pass already
-            // done for services set; do row writing after pool is known. We build rows
-            // into a scratch stream while interning, then prepend the pool.
-            using var rowsMs = new MemoryStream(traces.Count * 48);
-            using (var rw = new BinaryWriter(rowsMs, Encoding.UTF8, leaveOpen: true))
+            body.UInt32((uint)poolArr.Count);
+            foreach (var name in poolArr) body.Utf8(name, prefixBytes: 2, maxBytes: int.MaxValue);
+
+            body.UInt32((uint)traces.Count);
+            Span<byte> tid = stackalloc byte[16];
+            foreach (var a in traces.Values)
             {
-                rw.Write((uint)traces.Count);
-                Span<byte> tid = stackalloc byte[16];
-                foreach (var a in traces.Values)
-                {
-                    a.TraceId.WriteTo(tid);
-                    rw.Write(tid);
-                    rw.Write(a.RootSpanId.RawValue);
-                    rw.Write(a.HasRoot ? a.RootStartNano : a.EarliestNano);
-                    rw.Write(a.HasRoot ? a.RootDurNanos  : 0L);
-                    rw.Write(a.SpanCount);
+                a.TraceId.WriteTo(tid);
+                body.Bytes(tid);
+                body.UInt64(a.RootSpanId.RawValue);
+                body.Int64(a.HasRoot ? a.RootStartNano : a.EarliestNano);
+                body.Int64(a.HasRoot ? a.RootDurNanos  : 0L);
+                body.UInt32(a.SpanCount);
 
-                    byte flags = 0;
-                    if (a.HasRoot)  flags |= 0b01;
-                    if (a.HasError) flags |= 0b10;
-                    rw.Write(flags);
-                    rw.Write((byte)a.RootStatus);
-                    rw.Write(a.RootHttpStatus);
-                    rw.Write(Intern(a.HasRoot ? a.RootService : a.FirstService));
+                byte flags = 0;
+                if (a.HasRoot)  flags |= 0b01;
+                if (a.HasError) flags |= 0b10;
+                body.Byte(flags);
+                body.Byte((byte)a.RootStatus);
+                body.Int16(a.RootHttpStatus);
+                body.Int32(Intern(pool, poolArr, a.HasRoot ? a.RootService : a.FirstService));
 
-                    WriteStr16(rw, a.HasRoot ? a.RootName   : string.Empty);
-                    WriteStr8 (rw, a.HasRoot ? a.RootMethod : string.Empty);
-                    WriteStr16(rw, a.HasRoot ? a.RootPath   : string.Empty);
+                body.Utf8(a.HasRoot ? a.RootName   : string.Empty, prefixBytes: 2, maxBytes: ushort.MaxValue);
+                body.Utf8(a.HasRoot ? a.RootMethod : string.Empty, prefixBytes: 1, maxBytes: byte.MaxValue);
+                body.Utf8(a.HasRoot ? a.RootPath   : string.Empty, prefixBytes: 2, maxBytes: ushort.MaxValue);
 
-                    var svcs = a.Services!;
-                    rw.Write((ushort)svcs.Count);
-                    foreach (var sv in svcs) rw.Write(Intern(sv));
-                }
+                var svcs = a.Services!;
+                body.UInt16((ushort)svcs.Count);
+                foreach (var sv in svcs) body.Int32(Intern(pool, poolArr, sv));
             }
 
-            // Now write pool, then the rows blob.
-            bw.Write((uint)poolArr.Count);
-            foreach (var name in poolArr)
-            {
-                var nb = Encoding.UTF8.GetBytes(name);
-                bw.Write((ushort)nb.Length);
-                bw.Write(nb);
-            }
-            rowsMs.Position = 0;
-            rowsMs.CopyTo(bodyMs);
-            bw.Flush();
-            rawBody = bodyMs.ToArray();
+            // Pickled straight from the written span: the span overload of the same pickler at the
+            // same default level (L00_FAST), and the golden hashes hold it to the same bytes.
+            rawLength = body.Length;
+            compBody  = LZ4Pickler.Pickle(body.Written);
         }
-
-        var compBody = LZ4Pickler.Pickle(rawBody);
+        finally
+        {
+            body.Dispose();
+        }
 
         string path = outputPath ?? Path.ChangeExtension(baseTrcPath, ".tracesum");
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
@@ -227,7 +261,7 @@ internal static class TraceSummarySidecar
             w.Write(cell.Errors);
         }
 
-        w.Write((uint)rawBody.Length);
+        w.Write((uint)rawLength);
         w.Write((uint)compBody.Length);
         w.Write(compBody);
 
@@ -529,33 +563,108 @@ internal static class TraceSummarySidecar
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
-    private static void WriteStr8(BinaryWriter w, string s)
+    /// <summary>
+    /// The pool index of <paramref name="name"/>, adding it at the end if it is new; -1 for the
+    /// empty name, which is never pooled. Called by both passes of the writer — the pre-pass that
+    /// fixes the pool's order and the row pass that reads the indices back — so it is one function
+    /// over the collections it is handed rather than a local one closing over them.
+    /// </summary>
+    private static int Intern(Dictionary<string, int> pool, List<string> poolArr, string name)
     {
-        var b = Encoding.UTF8.GetBytes(s);
-        if (b.Length > 255) b = b[..255];
-        w.Write((byte)b.Length);
-        w.Write(b);
+        if (name.Length == 0) return -1;
+        if (pool.TryGetValue(name, out var idx)) return idx;
+        idx = poolArr.Count;
+        pool[name] = idx;
+        poolArr.Add(name);
+        return idx;
     }
 
-    private static void WriteStr16(BinaryWriter w, string s)
+    /// <summary>
+    /// The <c>.tracesum</c> body, written front to back into ONE <see cref="ArrayPool{T}"/> rental
+    /// — little-endian throughout, exactly as the <c>BinaryWriter</c> it replaces wrote it.
+    ///
+    /// <para>A <c>ref struct</c>, so it lives in the writer's frame and cannot be boxed or
+    /// captured. Mutated through its methods, so it must be held in an ordinary local — NOT a
+    /// <c>using var</c>, whose local is read-only and would make every call below work on a
+    /// defensive copy; the caller returns the rental in a <c>finally</c> instead.</para>
+    /// </summary>
+    private ref struct PooledBody
     {
-        var b = Encoding.UTF8.GetBytes(s);
-        if (b.Length > 65535) b = b[..65535];
-        w.Write((ushort)b.Length);
-        w.Write(b);
+        private byte[] _buf;
+        private int    _len;
+
+        /// <param name="rented">
+        /// The first buffer, rented BY THE CALLER, where the size it is rented at can be seen to be
+        /// the batch's own (FileBoundsConventionTests scans this file for its reader half, and a
+        /// rent sized by a parameter reads to it as a size that may have come from a file). Owned
+        /// from here on: <see cref="Dispose"/> returns it, or whatever it grew into.
+        /// </param>
+        public PooledBody(byte[] rented)
+        {
+            _buf = rented;
+            _len = 0;
+        }
+
+        public readonly int                Length  => _len;
+        public readonly ReadOnlySpan<byte> Written => _buf.AsSpan(0, _len);
+
+        public void Byte  (byte v)   => Take(1)[0] = v;
+        public void UInt16(ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(Take(2), v);
+        public void Int16 (short v)  => BinaryPrimitives.WriteInt16LittleEndian (Take(2), v);
+        public void UInt32(uint v)   => BinaryPrimitives.WriteUInt32LittleEndian(Take(4), v);
+        public void Int32 (int v)    => BinaryPrimitives.WriteInt32LittleEndian (Take(4), v);
+        public void UInt64(ulong v)  => BinaryPrimitives.WriteUInt64LittleEndian(Take(8), v);
+        public void Int64 (long v)   => BinaryPrimitives.WriteInt64LittleEndian (Take(8), v);
+        public void Bytes (scoped ReadOnlySpan<byte> v) => v.CopyTo(Take(v.Length));
+
+        /// <summary>
+        /// A length-prefixed UTF-8 string, encoded straight into the buffer. The prefix is
+        /// <paramref name="prefixBytes"/> wide (1 or 2) and holds the length CAST to that width;
+        /// the text is cut at <paramref name="maxBytes"/> BYTES, which is what the old
+        /// <c>GetBytes(s)[..max]</c> did — mid-character if that is where the limit falls. The
+        /// service pool passes no limit and a two-byte prefix, reproducing its old
+        /// <c>(ushort)bytes.Length</c> exactly, overflow included.
+        /// </summary>
+        public void Utf8(string s, int prefixBytes, int maxBytes)
+        {
+            var dst = Reserve(prefixBytes + Encoding.UTF8.GetMaxByteCount(s.Length));
+            int n   = Encoding.UTF8.GetBytes(s, dst[prefixBytes..]);
+            if (n > maxBytes) n = maxBytes;
+            if (prefixBytes == 1) dst[0] = (byte)n;
+            else                  BinaryPrimitives.WriteUInt16LittleEndian(dst, (ushort)n);
+            _len += prefixBytes + n;
+        }
+
+        public void Dispose()
+        {
+            ArrayPool<byte>.Shared.Return(_buf);
+            _buf = [];
+            _len = 0;
+        }
+
+        private Span<byte> Take(int n)
+        {
+            var dst = Reserve(n)[..n];
+            _len += n;
+            return dst;
+        }
+
+        /// <summary>At least <paramref name="n"/> writable bytes at the cursor, without advancing it.</summary>
+        private Span<byte> Reserve(int n)
+        {
+            if (_buf.Length - _len < n)
+            {
+                var next = ArrayPool<byte>.Shared.Rent(Math.Max(_buf.Length * 2, _len + n));
+                _buf.AsSpan(0, _len).CopyTo(next);
+                ArrayPool<byte>.Shared.Return(_buf);
+                _buf = next;
+            }
+            return _buf.AsSpan(_len);
+        }
     }
 
     private static string ReadStr8(BinaryReader r)  => Encoding.UTF8.GetString(r.ReadBytes(r.ReadByte()));
     private static string ReadStr16(BinaryReader r) => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
-
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, string[] keys)
-    {
-        if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
 
     private struct VolCell { public uint Traces; public uint Errors; }
 

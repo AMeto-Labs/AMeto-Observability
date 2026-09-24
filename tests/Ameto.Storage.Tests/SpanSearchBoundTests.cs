@@ -17,15 +17,17 @@ namespace Ameto.Storage.Tests;
 /// <see cref="Spans"/> spans, exactly <c>ceil(Spans / 4096)</c> blocks, every run.</para>
 ///
 /// <para>The span shape is the one that costs: a SqlClient client span with eight ordinary OTel
-/// attributes. A record read out of this file weighs about 1.7 kilobytes — the dictionary, its
-/// eight keys, its eight values — against the ~96 bytes an attribute-less record weighs. A
-/// fixture that writes <c>AttributesBytes = []</c> defends a shape twenty times lighter than the
-/// one that killed the server.</para>
+/// attributes. A record read out of this file weighs about 600 bytes — the 375-byte msgpack
+/// attribute blob and two strings — against the ~100 bytes an attribute-less record weighs. A
+/// fixture that writes <c>AttributesBytes = []</c> defends a shape six times lighter than the one
+/// that killed the server.</para>
 ///
 /// <para>The per-span figure is MEASURED by the tests below and printed, not asserted from a
-/// constant; 1,749 B is what it reads on the reference machine. Every megabyte quoted anywhere in
-/// this file derives from it, so if the numbers here and in <c>SpanReader</c> ever disagree, the
-/// test output is the one that is right.</para>
+/// constant; 607 B is what it reads on the reference machine, and it read 1,749 B while the
+/// reader inflated every span's attribute map into a <c>Dictionary</c> with eight key strings and
+/// eight boxed values. Every megabyte quoted anywhere in this file derives from it, so if the
+/// numbers here and in <c>SpanReader</c> ever disagree, the test output is the one that is
+/// right.</para>
 /// </summary>
 public sealed class ColdSpanSegmentFixture : IDisposable
 {
@@ -142,12 +144,14 @@ public sealed class ColdSpanSegmentFixture : IDisposable
 /// materialising every span of every admitted block into a <c>List</c> before the first
 /// predicate ran.</para>
 ///
-/// <para>A record read out of the fixture below weighs about 1.7 kilobytes: two strings, and an
+/// <para>A record read out of the fixture below weighed about 1.7 kilobytes: two strings, and an
 /// attribute dictionary that the decoder built for EVERY span, not — as the comments then
-/// claimed — whenever the query touched an attribute. At the 1,749 B the fixture measures, an
-/// ordinary 50,000-span segment is therefore ~83 MB live and a compacted one
-/// (<c>MaxSpansPerPass</c> = 200,000) ~334 MB. On a 512 MB server, on exactly the query this
-/// bound was written for, one segment was still enough.</para>
+/// claimed — whenever the query touched an attribute. It now weighs the 607 B the fixture
+/// measures, because the decoder keeps the msgpack blob and <c>SpanRecord.Attributes</c> decodes
+/// on demand, so an ordinary 50,000-span segment is ~29 MB live and a compacted one
+/// (<c>MaxSpansPerPass</c> = 200,000) ~116 MB, down from ~83 MB and ~334 MB. On a 512 MB server,
+/// on exactly the query this bound was written for, one segment was still enough at the old
+/// figure — which is what the bound below is for, at either figure.</para>
 ///
 /// <para>WHERE THE MEASUREMENTS ARE TAKEN. The peak lives inside <c>SpanReader.SearchAsync</c>,
 /// and it is gone before <c>TraceStorageEngine.SearchSpansAsync</c> yields anything: the engine

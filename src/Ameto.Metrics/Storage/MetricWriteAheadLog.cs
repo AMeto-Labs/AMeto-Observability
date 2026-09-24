@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
@@ -218,7 +219,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// Test seam invoked with the target file size just before a resize touches the file — the
-    /// disk that fills at exactly the wrong moment. Fired on BOTH legs of Grow and ShrinkLocked
+    /// disk that fills at exactly the wrong moment. Fired once by GrowTo (which touches nothing
+    /// before it, so has nothing to restore) and on BOTH legs of ShrinkLocked
     /// (the resize and its restore), because the state under test is the log that could do
     /// neither. It exists because the fault the tests used to inject died with the lifetime
     /// handle: marking the file read-only no longer bites, since Windows enforces the attribute
@@ -260,6 +262,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private FileStream? _poolStream;
 
     /// <summary>
+    /// Bumped whenever <see cref="Compact"/> empties the log and clears the registry. An index
+    /// resolved outside <c>_writeLock</c> (see <see cref="Append(ReadOnlySpan{MetricIngestItem})"/>)
+    /// is only usable if this has not moved since: past a clear the pool file is truncated and
+    /// indices are re-issued from 0, so a carried-over index names a record that is gone.
+    /// Written under the lock, read without it, hence <see cref="Volatile"/>.
+    /// </summary>
+    private long _seriesEpoch;
+
+    /// <summary>"Not in the registry when it was looked up" — <see cref="uint.MaxValue"/> is
+    /// beyond <see cref="SeriesIndexSanityCap"/>, so it can never be a real index.</summary>
+    private const uint Unregistered = uint.MaxValue;
+
+    /// <summary>
+    /// Test seam fired between the lock-free series lookups and the acquisition of the write
+    /// lock — the window in which a commit can clear the registry under a batch that has already
+    /// resolved its indices. Null in production. The alternative is a timing race, and a
+    /// concurrency test judged by a timer is not judged.
+    /// </summary>
+    internal Action? OnSeriesResolvedForTest;
+
+    /// <summary>
     /// One past the highest <c>SeriesIndex</c> the reopen walk saw in the log's OWN entries;
     /// 0 when the walk saw none. Held in u64 so that an index of <c>uint.MaxValue</c> cannot
     /// wrap it back to 0 — a wrapped seed is the collision the seeding exists to prevent.
@@ -273,17 +296,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>Bytes of point data currently held. Diagnostics and tests only.</summary>
     public long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
-    private MetricWriteAheadLog(string filePath, ILogger? logger)
+    /// <summary>
+    /// What the pool's strings and label sets are replayed through: <see cref="MetricLabelInterner.Shared"/>,
+    /// the instance the OTLP parsers use, unless <see cref="Open"/> was handed another — which
+    /// only a test does, so that what it checks about the replay does not hang on how full the
+    /// rest of its process has made the shared one.
+    /// </summary>
+    internal MetricLabelInterner Interner { get; }
+
+    private MetricWriteAheadLog(string filePath, ILogger? logger, MetricLabelInterner? interner)
     {
         _filePath = filePath;
         _poolPath = filePath + ".pool";
         _logger   = logger;
+        Interner  = interner ?? MetricLabelInterner.Shared;
     }
 
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
-                                           ILogger? logger = null, Action<long>? beforeResize = null)
+                                           ILogger? logger = null, Action<long>? beforeResize = null,
+                                           MetricLabelInterner? interner = null)
     {
-        var wal = new MetricWriteAheadLog(filePath, logger);
+        var wal = new MetricWriteAheadLog(filePath, logger, interner);
         // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
         // cannot reach — and its double-failure path is exactly what needs the coverage.
         wal.BeforeResize = beforeResize;
@@ -410,13 +443,13 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // possible. The saturating cast parks the counter at uint.MaxValue instead, where the
         // next registration reuses that index — a log with 4 billion live series has run out of
         // index space by any route, and reuse at the ceiling beats reuse from zero.
+        //
+        // THE INDICES ONLY. Seeding needs the largest index of every record, dead or alive, and
+        // nothing about their text: the walk reads each record's head and steps over its body, so
+        // opening the log interns nothing (see LoadPool for why that matters).
         if (_writeOffset > 0)
         {
-            ulong poolMaxPlusOne = 0;
-            var   pool           = LoadPool(out long cleanPoolEnd);
-            foreach (var index in pool.Keys)
-                if (index + 1UL > poolMaxPlusOne)
-                    poolMaxPlusOne = index + 1UL;
+            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne);
 
             _nextSeriesIndex = (uint)Math.Min(uint.MaxValue,
                                               Math.Max(poolMaxPlusOne, _survivorSeriesSeed));
@@ -549,18 +582,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// The capacity a log holding <paramref name="dataBytes"/> needs: what <see cref="Open"/>
-    /// was asked for, doubled until it fits — the same ladder <see cref="Grow"/> climbs, so
+    /// was asked for, climbed along <see cref="NextCapacity"/> until it fits — the ladder <see cref="GrowTo"/> climbs, so
     /// shrink and growth move along one set of sizes instead of two.
     /// </summary>
     private long FitCapacity(long dataBytes)
     {
         long capacity = _floorCapacity;
-        while (capacity < dataBytes) capacity *= 2;
+        while (capacity < dataBytes) capacity = NextCapacity(capacity);
         return capacity;
     }
 
     /// <summary>
-    /// Shrinks the file to <paramref name="targetCapacity"/> — <see cref="Grow"/> run downward,
+    /// Shrinks the file to <paramref name="targetCapacity"/> — <see cref="GrowTo"/> run downward,
     /// with one deliberate difference: a failure here is swallowed, not thrown. Growth failing
     /// means an append cannot proceed and the caller must hear it; a shrink is reclamation of
     /// space nothing references, and the log is exactly as correct at the old size.
@@ -620,47 +653,201 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     // ── Append ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Logs one data point. The series is registered in the pool on first sight and referred
-    /// to by index afterwards, so the per-point cost is a struct store plus the histogram
-    /// bucket counts — no managed allocation on the steady-state path.
+    /// Logs one data point, with the stored form supplied by the caller. Kept for the tests and
+    /// for any caller that genuinely has one point; it is the one-element case of
+    /// <see cref="Append(ReadOnlySpan{MetricIngestItem})"/> and runs the same code, so the two
+    /// cannot drift.
     /// </summary>
     public void Append(MetricIngestItem item, in MetricDataPoint point)
     {
-        var key = new SeriesKey(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty,
-                                item.Labels ?? LabelSet.Empty);
+        AppendCore(MemoryMarshal.CreateReadOnlySpan(ref item, 1),
+                   MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1),
+                   default, 0);
+        PreGrowIfClaimed();
+    }
 
-        long[]? buckets = point.BucketCounts;
-        int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
-        int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
+    /// <summary>
+    /// Logs a whole ingest batch under ONE acquisition of the write lock.
+    ///
+    /// <para><b>The lock was taken per point, and it is the process-global one.</b> An OTLP
+    /// export is 500–1 000 points and every Kestrel thread handling a POST was queueing on this
+    /// monitor once per point: measured 714 ns/point on one thread and 4 091 ns/point each on
+    /// eight, with aggregate throughput flat — every core past the first bought nothing. Taking
+    /// it once per batch is the same work behind one uncontended acquisition, and it matches how
+    /// the caller actually calls: <c>MetricStorageEngine.Ingest</c> already has the whole batch
+    /// in hand.</para>
+    ///
+    /// <para><b>The file-header write offset is stored once, at the end.</b> That is what makes
+    /// this all-or-nothing rather than a prefix: recovery never walks past the offset the header
+    /// claims (<see cref="ReconcileDataEndLocked"/> only ever truncates DOWN from it), so a
+    /// throw part-way through — <see cref="GrowTo"/> on a full disk is the one that can — leaves
+    /// the entries written so far unclaimed and therefore unreadable, and <c>_writeOffset</c>
+    /// unmoved, so the next append overwrites them. The caller's contract is unchanged and
+    /// strictly cleaner: it applies NOTHING to the hot tier for a batch whose log append threw,
+    /// where the per-point shape left the prefix logged and visible and the rest neither.</para>
+    ///
+    /// <para>The stored point of each item is derived here, through
+    /// <see cref="MetricIngestItem.ToDataPoint"/> — the same one definition the hot tier uses,
+    /// so the log and the tier still agree to the bit without a 40-byte struct per point being
+    /// carried between them through a side array.</para>
+    /// </summary>
+    public void Append(ReadOnlySpan<MetricIngestItem> items)
+    {
+        if (items.IsEmpty) return;
 
-        lock (_writeLock)
+        uint[] rented = ArrayPool<uint>.Shared.Rent(items.Length);
+        try
         {
-            if (_disposed) return;                          // shutdown race — dropping is correct
-            if (_ptr is null)
-                throw new InvalidOperationException(
-                    "Metric WAL has no mapping; the log is not accepting appends.");
+            long epoch = SeriesEpoch;
+            for (int i = 0; i < items.Length; i++) rented[i] = ResolveSeries(items[i]);
+            AppendResolved(items, rented.AsSpan(0, items.Length), epoch);
+            PreGrowIfClaimed();
+        }
+        finally { ArrayPool<uint>.Shared.Return(rented); }
+    }
 
-            uint seriesIdx = RegisterSeriesLocked(key, item.BucketBounds);
+    /// <summary>
+    /// SERIES LOOKUP WITHOUT THE LOCK. <c>_seriesIndex</c> is a <see cref="ConcurrentDictionary{
+    /// TKey,TValue}"/> and a hit needs no exclusion at all, yet it was probed from INSIDE the
+    /// exclusive lock, once per point — a hash of the name, a hash of the unit, a bucket walk and
+    /// a compare, all of it serialising every other ingest thread in the process. In the steady
+    /// state every point hits, so a batch that arrives here pre-resolved leaves the critical
+    /// section with no dictionary work and no <see cref="SeriesKey"/> construction in it: it
+    /// reads an int out of a span and stores 48 bytes.
+    ///
+    /// <para>Exposed so the CALLER can fold it into a pass it already makes over the batch — the
+    /// engine's future-skew scan. A pass of its own here re-touched every item's name, unit and
+    /// label set a second time, and at OTLP batch sizes that object graph does not stay in L2.</para>
+    ///
+    /// <para><see cref="Unregistered"/> when the series is not in the registry yet; the append
+    /// registers it under the lock.</para>
+    /// </summary>
+    public uint ResolveSeries(MetricIngestItem item) =>
+        _seriesIndex.TryGetValue(KeyOf(item), out uint known) ? known : Unregistered;
 
-            while (_writeOffset + entrySize > _capacity)
-                Grow();
+    /// <summary>
+    /// The epoch a <see cref="ResolveSeries"/> answer is only valid in. Read it BEFORE the
+    /// resolutions and hand it back to <see cref="AppendResolved"/>, which re-checks it under
+    /// the lock: <see cref="Compact"/> clears the registry and truncates the pool file when a
+    /// commit empties the log, and re-issues indices from 0, so an index resolved before such a
+    /// clear names a pool record that no longer exists and replay could not resolve the series.
+    /// A bumped epoch throws the whole batch's pre-resolution away and re-registers under the
+    /// lock, which is correct rather than merely rare.
+    /// </summary>
+    public long SeriesEpoch => Volatile.Read(ref _seriesEpoch);
 
-            byte* dest = _ptr + FileHeaderSize + _writeOffset;
+    /// <summary>
+    /// <see cref="Append(ReadOnlySpan{MetricIngestItem})"/> over series the caller resolved with
+    /// <see cref="ResolveSeries"/>. <b>It does not grow the log ahead of need</b> — it only claims
+    /// that growth (<see cref="WantsPreGrowLocked"/>); the caller runs it with
+    /// <see cref="PreGrowIfClaimed"/> once it holds none of its OWN locks. The engine calls this
+    /// under its snapshot read lock, and a growth run there held off the threshold flush's write
+    /// lock for the length of a file extension.
+    /// </summary>
+    public void AppendResolved(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<uint> resolved, long epoch)
+    {
+        OnSeriesResolvedForTest?.Invoke();
+        AppendCore(items, default, resolved, epoch);
+    }
 
-            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
-            eh.Generation        = _generation;
-            eh.SeriesIndex       = seriesIdx;
-            eh.TimestampUnixNano = point.TimestampUnixNano;
-            eh.Value             = point.Value;
-            eh.Count             = point.Count;
-            eh.Sum               = point.Sum;
-            eh.BucketCount       = (ushort)bucketCount;
+    private static SeriesKey KeyOf(MetricIngestItem item) =>
+        new(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty, item.Labels ?? LabelSet.Empty);
 
-            if (bucketCount > 0)
-                buckets.AsSpan(0, bucketCount)
-                       .CopyTo(new Span<long>(dest + EntryHeaderSize, bucketCount));
+    /// <summary>
+    /// The one append. <paramref name="points"/> empty means "derive each item's stored point";
+    /// non-empty means positional, <c>points[i]</c> for <c>items[i]</c>, which is the single-point
+    /// overload's contract. <paramref name="preResolved"/> empty means "resolve every series
+    /// under the lock"; otherwise <see cref="Unregistered"/> marks the ones that still must be.
+    /// </summary>
+    private void AppendCore(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
+                            ReadOnlySpan<uint> preResolved, long resolvedAtEpoch)
+    {
+        if (items.IsEmpty) return;
 
-            _writeOffset += entrySize;
+        // THE BATCH'S SIZE, KNOWN BEFORE THE LOCK — so the log is big enough before the batch
+        // starts, and growing it never happens inside the append's critical section. See Grow.
+        long batchBytes = 0;
+        for (int i = 0; i < items.Length; i++)
+        {
+            long[]? b = points.IsEmpty ? items[i].BucketCounts : points[i].BucketCounts;
+            batchBytes += EntryHeaderSize + (b is null ? 0 : Math.Min(b.Length, MaxBucketCounts)) * sizeof(long);
+        }
+
+        while (true)
+        {
+            long needed;
+            lock (_writeLock)
+            {
+                if (_disposed) return;                      // shutdown race — dropping is correct
+                if (_ptr is null)
+                    throw new InvalidOperationException(
+                        "Metric WAL has no mapping; the log is not accepting appends.");
+
+                needed = _writeOffset + batchBytes;
+                if (needed <= _capacity)
+                {
+                    WriteBatchLocked(items, points, preResolved, resolvedAtEpoch);
+                    // Claimed here, RUN by the caller once it holds no lock: see AppendResolved.
+                    WantsPreGrowLocked();
+                    return;
+                }
+            }
+
+            // Did not fit. Grow OUTSIDE the write lock — every other thread whose batch fits keeps
+            // appending into the mapping it has meanwhile — and try again: somebody else's batch
+            // may have taken the room in between, which the loop simply measures again.
+            lock (_resizeLock) GrowTo(needed);
+        }
+    }
+
+    /// <summary>
+    /// Writes a batch the caller has checked fits. Caller holds <c>_writeLock</c>. Nothing in here
+    /// can resize the mapping, so <c>_ptr</c> is taken once per entry off a view that stays put.
+    /// </summary>
+    private void WriteBatchLocked(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
+                                  ReadOnlySpan<uint> preResolved, long resolvedAtEpoch)
+    {
+        // Block kept from the lock body this was lifted out of, so the diff stays reviewable.
+        {
+            // The running end of data, committed to the field and the header only once the whole
+            // batch is down. See the remarks above for why the partial state must stay unclaimed.
+            long offset = _writeOffset;
+
+            // Did the registry turn over between the caller's lock-free lookups and this lock?
+            bool staleResolution = preResolved.IsEmpty || _seriesEpoch != resolvedAtEpoch;
+
+            for (int i = 0; i < items.Length; i++)
+            {
+                var item  = items[i];
+                var point = points.IsEmpty ? item.ToDataPoint() : points[i];
+
+                long[]? buckets = point.BucketCounts;
+                int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
+                int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
+
+                uint seriesIdx = !staleResolution && preResolved[i] != Unregistered
+                    ? preResolved[i]
+                    : RegisterSeriesLocked(KeyOf(item), item.BucketBounds);
+
+                byte* dest = _ptr + FileHeaderSize + offset;
+
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
+                eh.Generation        = _generation;
+                eh.SeriesIndex       = seriesIdx;
+                eh.TimestampUnixNano = point.TimestampUnixNano;
+                eh.Value             = point.Value;
+                eh.Count             = point.Count;
+                eh.Sum               = point.Sum;
+                eh.BucketCount       = (ushort)bucketCount;
+
+                if (bucketCount > 0)
+                    buckets.AsSpan(0, bucketCount)
+                           .CopyTo(new Span<long>(dest + EntryHeaderSize, bucketCount));
+
+                offset += entrySize;
+            }
+
+            _writeOffset = offset;
             Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
         }
     }
@@ -685,12 +872,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         body.WriteString(key.Name);
         body.WriteString(key.Unit);
 
-        var pairs = key.Labels.Pairs;
-        body.WriteUInt16((ushort)Math.Min(pairs.Count, ushort.MaxValue));
-        for (int i = 0; i < pairs.Count && i < ushort.MaxValue; i++)
+        var labels = key.Labels;
+        body.WriteUInt16((ushort)Math.Min(labels.Count, ushort.MaxValue));
+        for (int i = 0; i < labels.Count && i < ushort.MaxValue; i++)
         {
-            body.WriteString(pairs[i].Key);
-            body.WriteString(pairs[i].Value);
+            body.WriteString(labels.KeyAt(i));
+            body.WriteString(labels.ValueAt(i));
         }
 
         int boundsLen = bounds is null ? 0 : Math.Min(bounds.Length, ushort.MaxValue);
@@ -720,7 +907,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// by an earlier <see cref="BeginFlush"/> has neither committed nor been abandoned —
     /// committing this one would reclaim that one's records while its files are still being
     /// written, the loss this guard exists to make impossible — or the log has no mapping to
-    /// stamp the new generation into (see <see cref="Grow"/>). Throwing happens BEFORE the
+    /// stamp the new generation into (see <see cref="GrowTo"/>). Throwing happens BEFORE the
     /// caller's snapshot is drained, so nothing is in flight to lose.
     /// </exception>
     /// <exception cref="ObjectDisposedException">
@@ -739,17 +926,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // loss — duplicates, once per start, for as long as the state lasts.
             //
             // _disposed alone is covered by the drain in MetricStorageEngine.DisposeAsync, which
-            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: Grow
-            // unmaps before it extends, and if the extend and the restoring re-map both fail
-            // (a full disk, which is when a log grows) the object stays alive with no mapping
+            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: a resize
+            // that unmaps first (the shrink; growth used to, see GrowTo), if the resize and the restoring re-map both fail
+            // (a full disk) leaves the object alive with no mapping
             // and no disposal, for good. Append throws from there, so ingest fails honestly
             // while a flush would have kept writing files nobody ever commits.
             ObjectDisposedException.ThrowIf(_disposed, this);
 
             if (_ptr is null)
                 throw new InvalidOperationException(
-                    "Metric WAL has no mapping; no generation can be opened. Grow could neither " +
-                    "extend the file nor restore the previous mapping, and appends are already " +
+                    "Metric WAL has no mapping; no generation can be opened. A resize could neither " +
+                    "change the file nor restore the previous mapping, and appends are already " +
                     "failing for the same reason.");
 
             ulong flushing = _generation;
@@ -827,7 +1014,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// points that are still durable here — which the next start replays beside them unless the
     /// caller takes its files back. Returning nothing made those two states identical from the
     /// outside, and the second was reached by a real route: a flush opens a generation, the log
-    /// loses its mapping while the files are being written (see <see cref="Grow"/>), and the
+    /// loses its mapping while the files are being written (see <see cref="GrowTo"/>), and the
     /// commit then returned exactly as if it had succeeded.</para>
     ///
     /// <para>The boundary the answer is defined at is the watermark store, and this method
@@ -840,6 +1027,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     public MetricWalCommit CommitFlush(ulong flushedGeneration)
     {
+        lock (_resizeLock)   // the commit may shrink, i.e. replace the mapping; see _resizeLock
         lock (_writeLock)
         {
             // Not the flush that is writing: reclaims nothing AND leaves the open flush alone,
@@ -875,9 +1063,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // moves inside this method's own success path — where it is set to the generation
             // that is open and the flush is closed in the same critical section. So an open flush
             // is always ABOVE the watermark. The dead-log test is dead in a different way: it can
-            // be reached (dispose or a failed Grow between BeginFlush and here), but a log in
+            // be reached (dispose or a failed shrink-and-restore between BeginFlush and here), but a log in
             // either state refuses the next BeginFlush on its own account and can never leave it
-            // — Append does not re-map and Grow is only called from Append — so a stuck flag has
+            // — growth never unmaps before it has a new mapping — so a stuck flag has
             // nothing left to wedge.
             //
             // It stays above them anyway, and is worth a paragraph rather than a shrug, because
@@ -887,7 +1075,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // handed, makes the first reachable; and BeginFlush throwing forever is a failure
             // both flush paths merely LOG — the periodic loop catches it at Error once a tick,
             // the threshold continuation once per crossing — while no .mts is written again and
-            // the log grows by doubling until Grow throws into ingest.
+            // the log grows until GrowTo throws into ingest.
             _openFlush = 0;
 
             // Nothing left to reclaim: the watermark already names this generation or a later
@@ -897,7 +1085,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // points are covered.
             if (flushedGeneration <= _committedGeneration) return MetricWalCommit.Committed;
 
-            // The log cannot record anything: closed, or left without a mapping by a Grow that
+            // The log cannot record anything: closed, or left without a mapping by a resize that
             // could neither extend the file nor restore what it had. Both leave the watermark
             // where it was, so this generation's records stay in the log, uncompacted — the
             // reclaim below is the only thing that removes them and it is not reached. The
@@ -984,6 +1172,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             _seriesIndex.Clear();
             _nextSeriesIndex = 0;
+
+            // Every index any thread resolved without the lock is void from here: the pool
+            // records behind them are about to be truncated and the next registration re-issues
+            // index 0. See _seriesEpoch.
+            Volatile.Write(ref _seriesEpoch, _seriesEpoch + 1);
             try
             {
                 _poolStream?.SetLength(0);
@@ -1018,23 +1211,24 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             if (_ptr is null) return result;
 
-            var pool = LoadPool();
-            long pos = 0;
             long end = _writeOffset;
 
-            while (pos + EntryHeaderSize <= end)
+            // Two passes over the same entries, stepped by the same stride so they stop at the same
+            // place: the first names the series a surviving entry references, and only those are
+            // read out of the pool — see LoadPool.
+            var referenced = new HashSet<uint>();
+            for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
+            {
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+                if (eh.Generation > _committedGeneration) referenced.Add(eh.SeriesIndex);
+            }
+
+            var pool = LoadPool(referenced);
+
+            for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
                 byte* src = _ptr + FileHeaderSize + pos;
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(src);
-
-                long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
-                if (total <= 0 || pos + total > end) break;   // torn tail
-                if (eh.Generation == 0) break;                // end of real data
-                // No append can stamp a generation far above the header counter — such an
-                // entry is torn/corrupt, and its fields are garbage: stop instead of
-                // replaying them into the hot tier (from where a flush writes them into
-                // permanent files). Margin semantics: see Compact.
-                if (eh.Generation > _generation + GenerationSanityMargin) break;
 
                 if (eh.Generation > _committedGeneration)
                 {
@@ -1060,26 +1254,107 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                     }
                     else unresolved++;
                 }
-
-                pos += total;
             }
         }
 
         return result;
     }
 
+    /// <summary>
+    /// The replay's stride: the size of the complete entry at <paramref name="pos"/>, or 0 where
+    /// the real data ends before <paramref name="end"/>. Both passes of <see cref="ReadAll"/> step
+    /// with it, so the pass that decides which series to load and the pass that replays them
+    /// cannot disagree about which entries exist. Caller holds the lock.
+    /// </summary>
+    private long ReplayStrideLocked(long pos, long end)
+    {
+        if (pos + EntryHeaderSize > end) return 0;
+        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+
+        long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
+        if (total <= 0 || pos + total > end) return 0;   // torn tail
+        if (eh.Generation == 0) return 0;                // end of real data
+        // No append can stamp a generation far above the header counter — such an
+        // entry is torn/corrupt, and its fields are garbage: stop instead of
+        // replaying them into the hot tier (from where a flush writes them into
+        // permanent files). Margin semantics: see Compact.
+        if (eh.Generation > _generation + GenerationSanityMargin) return 0;
+        return total;
+    }
+
     private readonly record struct PoolEntry(
         string Name, MetricKind Kind, string Unit, LabelSet Labels, double[]? Bounds);
 
     /// <summary>
-    /// Reads the companion pool. Later records win for a given index, which is what makes a
-    /// reset that failed to truncate the file harmless.
+    /// The series <paramref name="referenced"/> names, read out of the companion pool. Later
+    /// records win for a given index, which is what makes a reset that failed to truncate the
+    /// file harmless.
+    ///
+    /// <para><b>ONLY WHAT A SURVIVING ENTRY REFERENCES IS INTERNED.</b> The replay goes through
+    /// <see cref="Interner"/> — <see cref="MetricLabelInterner.Shared"/>, which holds 16 384
+    /// strings for the life of the process and never evicts — so a replayed series holds the very
+    /// strings and label set the live path builds for it. But the pool is truncated only when a
+    /// commit empties the log or an empty log is opened, so after a crash or an OOM kill it holds
+    /// every series registered since the log was last empty: under continuous ingest, the whole
+    /// previous run's, churned pod and container ids included. Interning every record filled the
+    /// shared pool at boot with dead values, and every series started after the restart was then
+    /// ingested at the uninterned cost for the life of the process — issue #88's failure mode, the
+    /// one WP7 removed from <c>MetricReader</c>. A record no surviving entry references is not
+    /// decoded at all, because nothing reads it: the replay resolves only referenced indices, and
+    /// the seeding in <see cref="OpenOrCreate"/> needs only the indices, which the walk reads from
+    /// the record heads.</para>
+    ///
+    /// <para>Chosen over rewriting the pool down to the referenced records at open: the same boot,
+    /// and no second file to write, fsync and swap under a log that is mid-recovery. The dead
+    /// records stay in the file until the next commit that empties the log truncates it, as they
+    /// always did.</para>
     /// </summary>
-    private Dictionary<uint, PoolEntry> LoadPool() => LoadPool(out _);
+    private Dictionary<uint, PoolEntry> LoadPool(HashSet<uint> referenced)
+    {
+        var bodies = ReadPoolRecords(referenced, out _, out _);
+        var map    = new Dictionary<uint, PoolEntry>(bodies.Count);
+        var interner = Interner;
+        foreach (var (index, body) in bodies)
+            map[index] = DecodePoolRecord(body, interner);
+        return map;
+    }
 
     /// <summary>
-    /// <see cref="LoadPool()"/>, and also reports where the clean records stop:
-    /// <paramref name="cleanEnd"/> is the offset just past the LAST record that parsed whole,
+    /// Through the same interner the OTLP parsers use, so a replayed series holds the very strings
+    /// — and, when they are all pooled, the very label set — that the live path builds for it: its
+    /// SeriesKey then matches the next live point by reference, and the process does not keep a
+    /// second copy of every label.
+    /// </summary>
+    private static PoolEntry DecodePoolRecord(byte[] body, MetricLabelInterner interner)
+    {
+        var r = new SpanCursor(body);
+        var kind = (MetricKind)r.ReadByte();
+        string name = r.ReadString(interner, out _);
+        string unit = r.ReadString(interner, out _);
+
+        int labelCount = r.ReadUInt16();
+        var kv  = new string[labelCount * 2];
+        var ids = new int[labelCount * 2];
+        for (int i = 0; i < kv.Length; i++)
+            kv[i] = r.ReadString(interner, out ids[i]);
+
+        int boundsLen = r.ReadUInt16();
+        double[]? bounds = null;
+        if (boundsLen > 0)
+        {
+            bounds = new double[boundsLen];
+            for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
+        }
+
+        return new PoolEntry(name, kind, unit, interner.GetLabelSet(kv, ids), bounds);
+    }
+
+    /// <summary>
+    /// Walks the companion pool's records: the body of the LAST record of each index in
+    /// <paramref name="keep"/> comes back undecoded, and every other body is stepped over unread
+    /// (<paramref name="keep"/> null: all of them). Also reports <paramref name="indexCeiling"/>,
+    /// one past the largest index of any record that parsed whole, and where the clean records
+    /// stop: <paramref name="cleanEnd"/> is the offset just past the LAST record that parsed whole,
     /// which is 0 for a pool whose very first record is torn and the file length for an intact
     /// one. The loop already stops at a torn head or body; this only says WHERE it stopped, so
     /// that <see cref="OpenOrCreate"/> can append the next record at that boundary instead of
@@ -1087,16 +1362,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// width of the garbage, which breaks pool parsing for every series registered afterwards,
     /// not just the one that was lost.
     /// </summary>
-    private Dictionary<uint, PoolEntry> LoadPool(out long cleanEnd)
+    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling)
     {
-        var map = new Dictionary<uint, PoolEntry>();
-        cleanEnd = 0;
-        if (!File.Exists(_poolPath)) return map;
+        var bodies = new Dictionary<uint, byte[]>();
+        cleanEnd     = 0;
+        indexCeiling = 0;
+        if (!File.Exists(_poolPath)) return bodies;
 
         try
         {
             _poolStream?.Flush();
             using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long length = fs.Length;
             Span<byte> head = stackalloc byte[8];
 
             // ReadAtLeast/ReadExactly, never a bare Read: Stream.Read may legally return fewer
@@ -1110,74 +1387,249 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 uint len   = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
                 if (len == 0 || len > 8 * 1024 * 1024) break;    // torn or bogus record
 
-                var body = new byte[len];
-                try { fs.ReadExactly(body); }
-                catch (EndOfStreamException) { break; }          // genuinely truncated tail
-
-                var r = new SpanCursor(body);
-                var kind = (MetricKind)r.ReadByte();
-                string name = r.ReadString();
-                string unit = r.ReadString();
-
-                int labelCount = r.ReadUInt16();
-                var pairs = new KeyValuePair<string, string>[labelCount];
-                for (int i = 0; i < labelCount; i++)
+                if (keep is not null && keep.Contains(index))
                 {
-                    string k = r.ReadString();
-                    string v = r.ReadString();
-                    pairs[i] = new KeyValuePair<string, string>(k, v);
+                    var body = new byte[len];
+                    try { fs.ReadExactly(body); }
+                    catch (EndOfStreamException) { break; }      // genuinely truncated tail
+                    bodies[index] = body;                        // later records win
+                }
+                else
+                {
+                    // Stepped over, not read — but a body that runs past the end of the file is the
+                    // same truncated tail the read above would have thrown on.
+                    if (len > length - fs.Position) break;
+                    fs.Seek(len, SeekOrigin.Current);
                 }
 
-                int boundsLen = r.ReadUInt16();
-                double[]? bounds = null;
-                if (boundsLen > 0)
-                {
-                    bounds = new double[boundsLen];
-                    for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
-                }
-
-                map[index]  = new PoolEntry(name, kind, unit, new LabelSet(pairs), bounds);
-                cleanEnd    = fs.Position;   // this record parsed whole; the boundary is here
+                if (index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                cleanEnd = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
         catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
 
-        return map;
+        return bodies;
     }
 
     // ── Grow ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Doubles the mapped capacity. Windows refuses to resize a mapped file, so the old
-    /// mapping must go first — which means a failure here (a full disk, i.e. exactly when a
-    /// log grows) could leave the object alive with no mapping, silently refusing every
-    /// later append. The old mapping is therefore restored before the exception escapes.
+    /// Where growth stops doubling and starts adding. Doubling a 64 MiB log to 128 MiB, then 256,
+    /// 512 … reserves as much disk again as the log holds, on exactly the host whose flushes have
+    /// fallen behind; past this size the log grows by this much at a time instead.
     /// </summary>
-    private void Grow()
-    {
-        long oldFileSize = FileHeaderSize + _capacity;
-        long newCapacity = _capacity * 2;
-        long newFileSize = FileHeaderSize + newCapacity;
+    internal const long GrowthStepBytes = 64L * 1024 * 1024;
 
-        Unmap();
+    /// <summary>The growth ladder: doubling up to <see cref="GrowthStepBytes"/>, then linear.</summary>
+    internal static long NextCapacity(long capacity) =>
+        capacity < GrowthStepBytes ? capacity * 2 : capacity + GrowthStepBytes;
+
+    /// <summary>
+    /// Serialises everything that REPLACES the mapping — <see cref="GrowTo"/>, the commit-time
+    /// shrink (<see cref="CommitFlush"/>) and <see cref="Dispose"/> — WITHOUT holding
+    /// <c>_writeLock</c> while the new mapping is built. Lock order: this, then
+    /// <c>_writeLock</c>; nothing holding <c>_writeLock</c> ever waits for this.
+    /// </summary>
+    private readonly Lock _resizeLock = new();
+
+    /// <summary>
+    /// <see cref="PreGrowNone"/>, <see cref="PreGrowClaimed"/> (an append crossed the mark, under
+    /// <c>_writeLock</c>) or <see cref="PreGrowRunning"/> (one caller took the claim in
+    /// <see cref="PreGrowIfClaimed"/> and is running it). Only that caller clears it, and no new
+    /// claim is made until it has. See <see cref="WantsPreGrowLocked"/>.
+    /// </summary>
+    private int _preGrowQueued;
+
+    private const int PreGrowNone    = 0;
+    private const int PreGrowClaimed = 1;
+    private const int PreGrowRunning = 2;
+
+    /// <summary>
+    /// The capacity a pre-grow last FAILED at, so a full disk is tried once per
+    /// capacity rather than once per append; the synchronous path still tries, and throws, when a
+    /// batch genuinely does not fit. -1 = none. Under <c>_writeLock</c>.
+    /// </summary>
+    private long _preGrowFailedAt = -1;
+
+    /// <summary>
+    /// Test seam fired by <see cref="GrowTo"/> with the new mapping built and the old one still in
+    /// use — the window in which other appends must keep going. Null in production.
+    /// </summary>
+    internal Action? OnGrowMappedForTest;
+
+    /// <summary>
+    /// Test seam fired on the calling thread as it enters the pre-grow, before
+    /// <c>_resizeLock</c> — i.e. by the one call that owns a claimed growth, and by nobody else.
+    /// Null in production.
+    /// </summary>
+    internal Action? OnPreGrowForTest;
+
+    /// <summary>
+    /// Grows the mapped capacity to at least <paramref name="needed"/> bytes of data. <b>Caller
+    /// holds <c>_resizeLock</c> and NOT <c>_writeLock</c>.</b>
+    ///
+    /// <para><b>It used to run inside the append's <c>lock (_writeLock)</c></b> and unmap, resize
+    /// and re-map there, so every ingest thread in the process queued behind one file resize —
+    /// measured ~35 ms per growth for every thread appending at the time
+    /// (<c>MetricWalGrowthProbe</c>). Now the new, larger mapping is built beside the old one,
+    /// outside the write lock — two mappings of one file are coherent — and the write lock is
+    /// held only to swap the pointer. Every entry is written under the write lock through
+    /// <c>_ptr</c>, so after the swap nothing can still be using the old view — which is RETIRED,
+    /// not unmapped, because unmapping a big dirty view stalls every thread's page faults; see
+    /// <see cref="_retired"/>.</para>
+    ///
+    /// <para><b>A failure leaves the log as it was.</b> The old mapping is never unmapped until a
+    /// new one exists, so a full disk (the moment a log grows) now fails the append that needed
+    /// the room and nothing else — where the unmap-first shape could lose the mapping altogether
+    /// and leave the log refusing every later append. <see cref="BeforeResize"/> fires with the
+    /// target size before anything is touched.</para>
+    /// </summary>
+    private void GrowTo(long needed)
+    {
+        long capacity;
+        lock (_writeLock)
+        {
+            if (_disposed || _ptr is null) return;         // the retry will say why, honestly
+            capacity = _capacity;
+        }
+        if (capacity >= needed) return;                     // somebody else grew it meanwhile
+
+        long target = capacity;
+        while (target < needed) target = NextCapacity(target);
+        long newFileSize = FileHeaderSize + target;
+
+        MemoryMappedFile?         mmf  = null;
+        MemoryMappedViewAccessor? view = null;
+        bool                      acquired = false;
         try
         {
             BeforeResize?.Invoke(newFileSize);
-            _file!.SetLength(newFileSize);
-            Map(newFileSize);
-            _capacity = newCapacity;
-        }
-        catch
-        {
-            try
+
+            // A capacity past the file's length extends the file (both platforms) — with the old
+            // mapping still in place, which an explicit SetLength could not be sure of on Windows.
+            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, newFileSize, MemoryMappedFileAccess.ReadWrite,
+                                                   HandleInheritability.None, leaveOpen: true);
+            view = mmf.CreateViewAccessor(0, newFileSize, MemoryMappedFileAccess.ReadWrite);
+            byte* ptr = null;
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+            acquired = true;
+
+            OnGrowMappedForTest?.Invoke();
+
+            lock (_writeLock)
             {
-                BeforeResize?.Invoke(oldFileSize);
-                if (_file!.Length < oldFileSize) _file.SetLength(oldFileSize);
-                Map(oldFileSize);
+                if (_disposed) return;                      // finally releases the new mapping
+
+                // The old mapping is RETIRED, not released: see _retired for what unmapping it
+                // here cost every other thread.
+                if (_mmf is not null && _accessor is not null)
+                    (_retired ??= []).Add((_mmf, _accessor));
+                _mmf      = mmf;
+                _accessor = view;
+                _ptr      = ptr;
+                _capacity = target;
+                mmf  = null;                                // owned by the log now
+                view = null;
             }
-            catch { /* nothing left to restore to — the throw below is the honest signal */ }
-            throw;
         }
+        finally
+        {
+            if (view is not null)
+            {
+                if (acquired) try { view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                view.Dispose();
+            }
+            mmf?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A quarter of the log left: CLAIM a growth, to be run while there is still room for the
+    /// appends that arrive meanwhile — so under steady ingest ONE call pays for a growth, after
+    /// its own batch is down, and every other thread keeps appending into the quarter that is
+    /// left. Caller holds <c>_writeLock</c>. The claim is taken and run by
+    /// <see cref="PreGrowIfClaimed"/>, which the public appends call on their way out and the
+    /// engine calls once it has left its snapshot read lock; see there for why "one" needed the
+    /// claim to be taken rather than just read.
+    ///
+    /// <para>On the caller's thread and outside every lock, deliberately. On the thread pool it
+    /// was background work racing the log's disposal and competing with the engine's own
+    /// threshold flush for pool threads, and it made the file's size after a burst depend on
+    /// scheduling; under the engine's snapshot read lock it would hold the flush's write lock off
+    /// for the length of a file extension. What it does NOT change: on a CPU-starved box a
+    /// single-threaded ingest loop that never blocks can outrun the scheduled flush, and a growth
+    /// is one of the few places such a loop used to block — by accident of the log's size, never
+    /// as a bound. MetricBudgetWiringTests' histogram fact read the point at which the tier
+    /// drained and leaned on that accident; it now stops at the crossing the engine reports
+    /// (<c>MetricStorageEngine.OnThresholdFlushScheduledForTest</c>).</para>
+    /// </summary>
+    private void WantsPreGrowLocked()
+    {
+        long cap = _capacity;
+        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != PreGrowNone) return;
+        _preGrowQueued = PreGrowClaimed;
+    }
+
+    /// <summary>
+    /// Runs a growth an append claimed (<see cref="WantsPreGrowLocked"/>), if there is one and
+    /// nobody has taken it yet. Call holding NO lock of your own. A failure is logged, once per
+    /// capacity, and never thrown: the appends that claimed it are already down.
+    ///
+    /// <para><b>Taken, not merely seen.</b> This read "a growth is wanted" and went to run it, so
+    /// while one call was inside the growth — holding <c>_resizeLock</c> for the length of a file
+    /// extension — every other append on its way out read the same flag, entered the pre-grow
+    /// and queued on that lock, only to find the room already made. The call that crossed the
+    /// mark was meant to be the only one that paid; every call that finished during the growth
+    /// paid too. Now the claim moves 1 → 2 by compare-exchange and only the call that moved it
+    /// runs the growth and clears it; the rest read 2, or lose the exchange, and walk past.
+    /// Which call wins is whichever gets here first after the claim — normally the claimant
+    /// itself, and exactly one either way.</para>
+    /// </summary>
+    public void PreGrowIfClaimed()
+    {
+        if (Volatile.Read(ref _preGrowQueued) == PreGrowClaimed
+            && Interlocked.CompareExchange(ref _preGrowQueued, PreGrowRunning, PreGrowClaimed) == PreGrowClaimed)
+            PreGrow();
+    }
+
+    private void PreGrow()
+    {
+        try
+        {
+            OnPreGrowForTest?.Invoke();
+            lock (_resizeLock)
+            {
+                long needed;
+                lock (_writeLock)
+                {
+                    if (_disposed || _ptr is null) return;
+                    if (_capacity - _writeOffset >= _capacity / 4) return;   // a commit emptied it
+                    needed = _capacity + 1;                                   // one rung up
+                }
+
+                try { GrowTo(needed); }
+                catch (Exception ex)
+                {
+                    lock (_writeLock) _preGrowFailedAt = _capacity;
+                    _logger?.LogWarning(ex,
+                        "Metric WAL could not grow ahead of need; appends that do not fit will retry the growth " +
+                        "themselves and fail if it still cannot be done.");
+                }
+            }
+        }
+        finally { Volatile.Write(ref _preGrowQueued, PreGrowNone); }   // the owner's to clear, and only the owner runs this
+    }
+
+    /// <summary>
+    /// Test hook: drops the mapping the way a failed shrink-and-restore does, leaving the log
+    /// alive and refusing appends. Growth can no longer produce that state (see
+    /// <see cref="GrowTo"/>), and the dead-log paths it exercises still exist.
+    /// </summary>
+    internal void LoseMappingForTest()
+    {
+        lock (_resizeLock)
+        lock (_writeLock)
+            Unmap();
     }
 
     private void Unmap()
@@ -1191,12 +1643,37 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         _accessor = null;
         _mmf      = null;
         _ptr      = null;
+        ReleaseRetired();
+    }
+
+    /// <summary>
+    /// The mappings <see cref="GrowTo"/> swapped out, still mapped. Unmapping a large dirty view
+    /// is the expensive half of a growth — measured 3 ms at 16 MiB rising to 27 ms at 192 MiB —
+    /// and it stalls every OTHER thread's page faults in the process for its length, the new
+    /// view's included, so doing it at the swap put the whole stall back. They cost address
+    /// space and page tables only (their pages ARE the new view's pages: one file), and they go
+    /// in <see cref="Unmap"/> — at the commit that empties and shrinks the log, which already
+    /// stops ingest to remap, or at disposal. Under <c>_writeLock</c>.
+    /// </summary>
+    private List<(MemoryMappedFile Mmf, MemoryMappedViewAccessor View)>? _retired;
+
+    private void ReleaseRetired()
+    {
+        if (_retired is null) return;
+        foreach (var (mmf, view) in _retired)
+        {
+            try { view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            view.Dispose();
+            mmf.Dispose();
+        }
+        _retired = null;
     }
 
     // ── Dispose ──────────────────────────────────────────────────────────────
 
     public void Dispose()
     {
+        lock (_resizeLock)   // waits out a growth in flight, which is using the file handle
         lock (_writeLock)
         {
             if (_disposed) return;
@@ -1273,11 +1750,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             return v;
         }
 
-        public string ReadString()
+        /// <summary>The string, resolved through <paramref name="interner"/> (which decodes
+        /// exactly as <c>Encoding.UTF8.GetString</c> did); <paramref name="id"/> is its interner id.</summary>
+        public string ReadString(MetricLabelInterner interner, out int id)
         {
             int n = ReadUInt16();
-            if (n == 0 || _pos + n > _data.Length) { _pos = Math.Min(_pos + n, _data.Length); return string.Empty; }
-            var s = Encoding.UTF8.GetString(_data.Slice(_pos, n));
+            if (n == 0 || _pos + n > _data.Length)
+            {
+                _pos = Math.Min(_pos + n, _data.Length);
+                id   = MetricLabelInterner.EmptyStringId;
+                return string.Empty;
+            }
+            id = interner.Intern(_data.Slice(_pos, n), out string s);
             _pos += n;
             return s;
         }

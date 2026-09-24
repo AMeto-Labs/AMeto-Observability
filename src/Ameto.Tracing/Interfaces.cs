@@ -13,8 +13,70 @@ public interface ISpanIngester
 }
 
 /// <summary>
+/// THE RAW SPAN SINK (TI#3): a parser hands each span over as spans of its own request buffer —
+/// ids and times as values, the name, the service and the msgpack attribute blob as UTF-8 /
+/// msgpack bytes — and the sink copies them into the ingest ring's arena. No
+/// <see cref="SpanIngestItem"/>, no name string, no attribute array per span.
+///
+/// <para><b>It is the only way into the ring.</b> <see cref="ISpanIngester"/>, which takes items,
+/// is implemented over the same ring by transcoding each item into this shape, so the ring holds
+/// one form whichever door a span came through.</para>
+///
+/// <para><b>The contract.</b> <see cref="InternService"/> is called once per resource block and
+/// its index passed with every span under it. <see cref="TryIngestRaw"/> answers false when the
+/// span was refused (back-pressure: the ring's slots or its byte budget) — and once one span of a
+/// batch is refused, the rest of that batch is too, so a batch lands as a PREFIX, exactly as
+/// <see cref="ISpanIngester.TryIngest"/> always has. <see cref="EndBatch"/> must be called when the
+/// batch is over, however it ends (a <c>finally</c>): the calling thread holds a piece of the arena
+/// between spans, and that is what gives it back. The name and service must be valid UTF-8.</para>
+///
+/// <para><b>Partial batches.</b> A parser that throws part-way (a malformed tail) leaves the spans
+/// it had already handed over in the ring — the same as the log path's streaming parsers — and
+/// the receiver answers 400, which OTLP defines as not retryable. Nothing needs a separate
+/// "batch done" wake-up: the ring signals the drainer per span.</para>
+/// </summary>
+public interface ISpanSink
+{
+    /// <summary>
+    /// Interns a resource block's <c>service.name</c> ONCE and returns its pool index, so the
+    /// spans under it do not each re-hash the same name. -1 when there is nothing to intern or
+    /// the pool is full — the span's bytes then carry it alone, and nothing is lost.
+    /// </summary>
+    int InternService(ReadOnlySpan<byte> serviceUtf8);
+
+    /// <summary>
+    /// Takes one span into the ring. <paramref name="serviceIdx"/> is what
+    /// <see cref="InternService"/> returned for <paramref name="serviceUtf8"/> (or -1).
+    /// </summary>
+    bool TryIngestRaw(
+        TraceId            traceId,
+        SpanId             spanId,
+        SpanId             parentSpanId,
+        long               startTimeUnixNano,
+        long               durationNanos,
+        ReadOnlySpan<byte> nameUtf8,
+        int                serviceIdx,
+        ReadOnlySpan<byte> serviceUtf8,
+        SpanKind           kind,
+        SpanStatusCode     status,
+        short              httpStatusCode,
+        ReadOnlySpan<byte> msgpackAttributes);
+
+    /// <summary>
+    /// The batch is over: gives back the arena the calling thread held for it, and reports what
+    /// the batch had refused. Call it from a <c>finally</c>.
+    /// </summary>
+    void EndBatch();
+}
+
+/// <summary>
 /// A single decoded span ready for ingestion.
 /// Heap-allocated to carry variable-length fields (name, service, attributes bytes).
+///
+/// <para>Still the WAL's replay type (<c>SpanWriteAheadLog.ReadAll</c>) and the shape the item
+/// APIs take — <see cref="ISpanIngester"/> and the parsers' list-returning <c>Parse</c> overloads,
+/// which the gRPC receiver and the tests use. It never reaches the ring: an item is turned into
+/// the raw form on the way in (<see cref="ISpanSink"/>).</para>
 /// </summary>
 public sealed class SpanIngestItem
 {

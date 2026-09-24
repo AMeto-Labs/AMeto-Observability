@@ -227,4 +227,69 @@ public sealed class TraceCatalogLifecycleTests : IDisposable
         Assert.Equal(30, seg.SpanCount);
         Assert.NotEqual(0UL, seg.SegmentId);                     // re-adopted under a fresh name
     }
+
+    /// <summary>
+    /// A SEGMENT ADOPTED WHILE A MERGE HAS IT IN HAND LEAVES WITH THE MERGE (PR #84 review, #4).
+    /// Adoption runs on the index worker, beside the compaction worker, and REPLACES the snapshot
+    /// entry of the segment it names. The swap used to drop the merged sources by reference, so the
+    /// adopted entry stayed in the snapshot with its files deleted, and the catalog kept the adopted
+    /// id, because the pass had planned the segment at id 0.
+    ///
+    /// <para>Driven at the seam: one segment's flush-time registration fails (id 0, queued), a second
+    /// is ordinary, and adoption runs on the compaction thread at one of three points — before the
+    /// pass claims its sources (it must then be retired with them, by the id resolved after the
+    /// claim), just after the claim, and after the catalog has already retired the sources but before
+    /// the snapshot swap (in both it must leave the path alone, and the next adoption pass must drop
+    /// it from the queue).</para>
+    ///
+    /// <para>Reverted (the swap by reference, the plan's ids, no claim): at <c>Merged</c> and
+    /// <c>Claimed</c> the snapshot keeps the adopted entry — two cold segments, one of them a deleted
+    /// file — and the catalog names two segments, one of them the deleted file. Reverting ONLY the
+    /// claim fails <c>Catalogued</c>: the catalog is left naming the deleted file.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("Merged")]
+    [InlineData("Claimed")]
+    [InlineData("Catalogued")]
+    public void A_segment_adopted_during_a_merge_leaves_the_catalog_and_the_snapshot_with_it(string stage)
+    {
+        var adoptAt = Enum.Parse<TraceStorageEngine.CompactionStage>(stage);
+        string dir = Dir("adopt-mid-merge-" + adoptAt);
+        using var e = Engine(dir);
+
+        e._beforeCatalogRegistrationForTest = () => throw new IOException("injected: the manifest write failed");
+        for (int k = 0; k < 100; k++) Write(e, 8_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        e._beforeCatalogRegistrationForTest = null;
+        for (int k = 0; k < 100; k++) Write(e, 9_000 + (ulong)k, _baseNano + (200 + k) * Ms);
+        e.FlushHotTier();
+
+        Assert.Equal(2, e.ColdSegmentsForTest.Length);
+        Assert.Single(e.ColdSegmentsForTest, s => s.SegmentId == 0);    // the unnamed one, queued
+        Assert.Equal(1, e.CatalogCountsForTest.Segments);
+
+        int adoptions = 0;
+        e._compactionStageForTest = stage =>
+        {
+            if (stage != adoptAt) return;
+            adoptions++;
+            e.AdoptUnnamedSegments();                                    // the index worker, landing here
+        };
+        e.CompactSmallSegments();
+        e._compactionStageForTest = null;
+        Assert.Equal(1, adoptions);
+
+        e.AdoptUnnamedSegments();                                        // the worker's next pass
+
+        var cold = e.ColdSegmentsForTest;
+        _out.WriteLine($"adopt at {adoptAt}: cold [{string.Join(", ", cold.Select(s => $"{s.SegmentId}:{Path.GetFileName(s.FilePath)}"))}], "
+                     + $"catalog [{string.Join(", ", e.CatalogPathsForTest.Select(Path.GetFileName))}]");
+
+        var merged = Assert.Single(cold);
+        Assert.True(File.Exists(merged.FilePath));
+        Assert.NotEqual(0UL, merged.SegmentId);
+        Assert.Equal(merged.FilePath, Assert.Single(e.CatalogPathsForTest));
+        Assert.Equal(1, e.CatalogCountsForTest.Segments);
+        Assert.Equal(200, merged.SpanCount);                             // both sources' spans, once
+    }
 }

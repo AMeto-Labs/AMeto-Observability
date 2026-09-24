@@ -197,7 +197,7 @@ Search budgets, and the cross-query cache of decoded segment indexes.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `IndexCacheBytes` | long | *unset* → `min(256 MB, 15 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~57 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
+| `IndexCacheBytes` | long | *unset* → `min(256 MB, 12 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~46 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
 | `IndexCacheIdleEvict` | TimeSpan | `"00:10:00"` | Drop cached segment indexes that no query has read for this long. Without it the only thing that ever removes an entry is budget pressure, so a server that answers one wide query and then goes quiet keeps those postings and bloom bits resident for the rest of its life. `0` turns it off (budget pressure only); the first wide query after an eviction pays to re-read and re-decode. |
 | `Timeout` | TimeSpan | `"00:01:00"` | Wall-clock budget for one search. A query that exceeds it is stopped and the client told so, rather than occupying a core until the browser tab is closed. Zero or negative removes the budget. |
 | `MaxConcurrent` | int | `0` | Searches allowed to run at once — each memory-maps segments and decompresses blocks in parallel. `0` = auto (processor count, clamped 2–16); negative = unlimited. Past the limit a request is refused quickly (`503` + `Retry-After`) instead of everything crawling. |
@@ -205,7 +205,55 @@ Search budgets, and the cross-query cache of decoded segment indexes.
 
 **The cache has a second, native ceiling — not settable.** An entry is not all one kind of memory: its decoded postings are managed, but the bloom filter's bits are native (4–8 % of an entry — the postings expand 3–4× when decoded and the bloom's bits do not, so its share of a cached entry is far smaller than its share of the packed sections on disk), so they sit outside the GC heap limit that `IndexCacheBytes` is a share of when unset. That native share is bounded separately at `min(96 MB, 5 % of the physical limit)` — 25.6 MB in a 512 MB container — and whichever ceiling is reached first evicts from the least-recently-used end. Setting `IndexCacheBytes` explicitly raises it too, to `max(that ceiling, min(20 % of the budget you set, 10 % of the physical limit))` — **a budget you set may raise this ceiling, but never past 10 % of what the host has**, because a budget says how much memory this component may hold and only the host says how much of it may be pinned where no collection can reach it. It never moves *down*: a small configured cache keeps the derived ceiling, and in a 512 MB container the ceiling stops at 51 MB however large the budget. Both figures are reported by `GET /api/diagnostics` as `indexCacheNativeBytes` and `indexCacheNativeBudgetBytes`, and `indexCacheNativeEvicted` counts the entries this ceiling has dropped while the total budget still had room — if that number climbs, the cache is bounded by its bloom bits rather than by `IndexCacheBytes`. Under RAM pressure (see `RamTargetPercent`) the whole cache is now dropped along with the hot-tier flush — queries re-read what they need — and `indexCacheShedEvicted` counts how many entries that has cost.
 
-**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~153 MB on a 1 GB VM, ~57 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"` — note that in a 512 MB container that budget also raises the native ceiling above, from 25.6 MB to 51.2 MB, where the host clamp rather than the 20 % is what stops it. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
+**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~123 MB on a 1 GB VM, ~46 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"` — note that in a 512 MB container that budget also raises the native ceiling above, from 25.6 MB to 51.2 MB, where the host clamp rather than the 20 % is what stops it. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
+
+---
+
+## Metrics options (`Ameto:Metrics`)
+
+The metric hot tier is the in-RAM point buffer; it is flushed to `.mts` files on size, on age, or under memory pressure, and every point in it is already durable in `metrics.wal` before the flush happens.
+
+Every ceiling here is a quantity of **bytes** or of objects, and the ones left unset derive from the memory this process may actually use rather than being the same number on a 512 MB container and a 64 GB host. Managed shares are taken of the GC's own heap hard limit, which in a 512 MB container is 384 MB — not 512. An explicit value always wins. The effective figures — what the engine enforces after all of that — are printed once at startup on the `Metric budgets:` line and reported by `GET /api/diagnostics` as `metricsHotTierBudgetBytes`, `metricsMinFlushBytes`, `metricsWalInitialBytes`, `metricsExemplarsPerMetric` and `metricsMaxExemplarMetrics`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `HotTierBytes` | long | *unset* → `min(32 MB, 5 % of the managed-heap limit)` | Bytes the hot tier may hold before a flush is forced — ~19 MB in a 512 MB container, 32 MB anywhere with room. **Points are not the unit:** a 16-bucket histogram point carries its own `long[]` and weighs 3.4× a gauge point, so the flat 500 000-*point* threshold this replaces was 20 MB of one or 84 MB of the other, decided without asking the host anything. The 32 MB cap *is* that old threshold restated in bytes (500 000 × the 64 B a scalar point costs), so a host large enough for it flushes on exactly the cadence it always did. |
+| `MinFlushBytes` | long | *unset* → a tenth of `HotTierBytes` | The bar a **periodic** flush tick has to clear to write files at all. Below it the tier keeps accumulating: the points are already in the write-ahead log, and a file per metric name is not worth writing for a handful of them. The forced flush at `HotTierBytes` ignores this. |
+| `WalInitialBytes` | long | *unset* → `min(HotTierBytes, 8 MB)`, floored at 1 MB | Initial capacity of `metrics.wal`. Deriving it can only make the file **smaller** than the 8 MB it has always been, never larger, because a log never shrinks below the capacity it was opened with and a pre-sized one would leave every quiet install a 20–32 MB file at rest for ever. Set it explicitly to pre-size the log and save two unmap/remap cycles under the append lock on a busy host. |
+| `MaxHotAge` | TimeSpan | `"01:00:00"` (1 h) | Flush a non-empty tier at least this often whatever its size. Matches the rollup's own first cutoff, so nothing waits longer because of this. |
+| `FlushCheckInterval` | TimeSpan | `"00:01:00"` (60 s) | How often the flush loop **asks** whether the tier has earned its files. A check interval, not a flush interval — durability belongs to the log, not to this. |
+| `ExemplarsPerMetric` | int | *unset* → derived so `MaxExemplarMetrics` full rings fit half the tier budget, clamped to `[64, 4000]` | Exemplars kept per metric name, for metric-to-trace jumps. **A value set here is bought out of the ring count, not out of the budget:** 1 000 slots on a 512 MB stand's ~19 MB tier admits 48 rings rather than the 256 the cap names, and names past the 48th get no exemplars at all. Lower it, or raise `HotTierBytes`, to get the count back. Past the point where even one ring of that depth would not fit, the depth itself gives way instead. Was a flat `4000`, which is the one default that does not survive on a large host. |
+| `MaxExemplarMetrics` | int | `256` | How many metric names may own an exemplar ring. Past it, exemplars for further names are dropped — a correlation hint, never data; `GET /api/diagnostics` counts the refusals as `metricsExemplarMetricsRefused`. Raising it makes every ring proportionally **shallower** rather than claiming more memory; lowering it makes them deeper. |
+| `MaxLabelValuesPerKey` | int | `2000` | Distinct values remembered per label key, per metric, for the Explore catalog. |
+| `MaxTrackedSeriesPerMetric` | int | `50000` | Distinct label-set hashes counted per metric before the reported cardinality stops rising. |
+
+**The exemplar rings are the one piece of metric memory nothing takes back.** A ring is allocated at full depth the first time a metric name carries an exemplar, and it is never pruned, never aged out, invisible to the tier's byte accounting and out of reach of the RAM-pressure shed — so `MaxExemplarMetrics` × `ExemplarsPerMetric` × 208 B is resident for the life of the process. That is why the two knobs trade against each other inside one budget (half the hot tier) instead of multiplying freely: at the old defaults, 4 000 slots × 256 names was 213 MB pinned inside a 384 MB heap limit. If a deployment wants deeper rings, it lowers the count.
+
+**Upgrading — the flush cadence is now a byte budget.** An install that never set anything keeps the same cadence on a host with room (32 MB *is* the old 500 000 points at 64 B a point) and flushes earlier on a constrained one, which is the point. `ExemplarsPerMetric` is the exception that changes everywhere: it derives now, to ~300 slots at the 32 MB tier. To pin the old behaviour, set `HotTierBytes: 32000000`, `MinFlushBytes: 3200000` and `ExemplarsPerMetric: 4000` — and on a 512 MB host, expect the exemplar rings to claim the heap that the derivation exists to protect.
+
+---
+
+## Traces options (`Ameto:Traces`)
+
+The trace hot tier is the in-RAM span buffer; it is flushed to `.trc` segments on size, on age (1 h), or at shutdown, and every span in it is already durable in `traces/spans.wal`. Small segments are merged in the background by compaction passes. Spans arrive through the **ingest ring**, a native buffer between the OTLP receivers and the one drainer thread.
+
+Like the metrics options, every memory ceiling is a quantity of **bytes** derived from what this process may use — `min(the old constant, a share of the managed-heap limit)`, never below a floor — so a host with room behaves exactly as before and a small one gets ceilings it can honour. An explicit value always wins; **`0`, a negative value or leaving the key out all mean "derive it"**. The effective figures are printed once at startup on the `Trace budgets:` line and reported by `GET /api/diagnostics` as `tracesHotTierBudgetBytes`, `tracesMergeBudgetBytes`, `tracesRingCapacity` and `tracesRingMaxBytes`; the ring's refusals are counted by cause as `tracesRingRefusedForBytes`, `tracesRingRefusedNoSlot` and `tracesRingRefusedNoArena`, and a full intern pool as `tracesInternPoolSaturations`, `tracesUnpooledSpanNames` and `tracesUnpooledServiceNames`. The figures below are for the 512 MB container (a 384 MB GC heap limit) and for any host with room. **Every other figure in this section is in decimal megabytes** (1 MB = 1 000 000 B); where a quantity is a power of two its binary size is given beside it, e.g. 16 MiB (16.8 MB). The container and its heap limit are named as they are configured — `512m` and 75 % of it, binary sizes: the heap limit is 402.7 MB.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `HotTierMaxBytes` | long | *unset* → `min(27 MB, 5 % of the managed-heap limit)`, never below 8 MiB (8.4 MB — the floor binds under a ~168 MB heap limit): **20.1 MB** in a 512 MB container, 27 MB with room | Bytes the hot tier may hold before a flush is forced, counted as 160 B + the attribute blob per span (an ordinary eight-attribute span is ~535 B). The tier flushes on this **or** on 50 000 spans, whichever comes first. **A span count is not the unit:** the flat 50 000 this replaces was 27 MB of ordinary spans or ~500 MB of spans carrying a SQL statement or a stack. 27 MB *is* 50 000 ordinary spans, so a host with room flushes on exactly the cadence it always did; the 512 MB container flushes at ~37 600 of them. |
+| `MergeBudgetBytes` | long | *unset* → `min(73 MB, 6 % of the managed-heap limit)`, never below 16 MiB (16.8 MB — the floor binds under a ~280 MB heap limit): **24.2 MB** in a 512 MB container, 73 MB with room | What one compaction pass may hold in memory — the spans of every segment it merges, read back. A segment is a merge **candidate** below half of it (12.1 MB / 36.5 MB), so the two largest candidates always fit one pass, and a pass never writes a merged segment heavier than the budget. 73 MB *is* the 120 000 ordinary spans a pass always held. |
+| `RingCapacity` | int | *unset* → `65536` | Slots in the ingest ring, rounded up to a power of two and clamped to `[1024, 4194304]`. The slot array is **native** memory, 80 B a slot — **5.2 MB** at the default, resident once the ring has cycled. (This used to be unreachable: the ring was built with its parameterless constructor.) |
+| `RingMaxBytes` | long | *unset* → `RingCapacity × 560 B`, scaled by the host's hot-tier share: **27.4 MB** in a 512 MB container, 36.7 MB with room | The most the spans **waiting in the ring** may weigh (their name, service and attribute bytes); past it a span is refused whatever slots are free, and the exporter is told how many were rejected (OTLP partial success). The default is the old full ring of 65 536 ordinary spans restated in bytes, so a host with room absorbs exactly the burst it always did — and a burst of heavy spans no longer buys eighteen times that. **Payloads of 32–64 KB reach less of it:** the arena is cut into 64 KiB chunks and a payload is never split across two, so a 32–64 KB payload takes a chunk to itself, and a stream of such spans runs out of chunks at about *payload* ÷ 64 KiB of the budget — roughly **half** of `RingMaxBytes` for spans just over 32 KB. Those refusals are counted as `tracesRingRefusedNoArena` in `GET /api/diagnostics`, not as `tracesRingRefusedForBytes`. (A payload over 64 KiB is kept on the managed heap instead and is charged only its bytes.) |
+| `IndexBackfill` | string | `Idle` | `Off`, `Idle` or `Eager`: whether segments written before the trace-id index existed are brought into it, and how fast. |
+| `SegmentFormatV4` | bool | `false` | Write the ~40 % smaller v4 segment format. A one-way door: a binary older than the one that wrote them deletes v4 segments. |
+| `IndexEnabled` | bool | `true` | The trace-id index's off switch; `false` plus a restart withdraws every coverage claim and lookups scan the cold segments. |
+
+**The ring's native memory, resting and at peak.** None of it is under a managed-heap share. The slot array is fixed (`RingCapacity` × 80 B, 5.2 MB at the default). The payload arena is cut into 64 KiB chunks and reserved at `RingMaxBytes` plus 64 slack chunks (4.2 MB — the part-filled chunks producers hold, and the tail a chunk loses when the next span does not fit), and it is **committed only as deep as a backlog actually reaches** — so a burst holds at most `RingMaxBytes` + 4.2 MB of arena: 31.6 MB in a 512 MB container, 40.9 MB with room. (A span whose payload is larger than a chunk is kept on the managed heap instead, still counted against `RingMaxBytes`.) The drainer gives everything above the first 16 chunks (1 MiB, 1.05 MB) back once it finds the ring idle — at most once every 30 s, from the wake it already takes — and it does so under steady traffic too, as long as what is in flight at that moment fits in those 16 chunks. Measured on the 512 MB container's budget with 10 KB spans (`SpanRingBytesProbe`): 35.1 MB native during the burst, slots included, and **6.3 MB at rest** (the slots and 1.05 MB).
+
+**More cold segments at rest on a small host.** On the 512 MB container a compaction pass can afford 1.2 tiers read back, not the two a pair of full flushes needs, so **a full flush is not a compaction candidate there**: segments stay at one flush each (~37 600 ordinary spans) instead of pairing up to ~100 000 as they do on a host with room — about **2.7× as many cold segments** for the same data. What still merges there is the small segments a quiet hour's timed flushes leave. Shrinking the tier so that full flushes could pair would give the same number of segments at rest and rewrite every span once more. The trace-id index keeps a lookup from paying for the extra segments; raise `MergeBudgetBytes` above ~2.3 × `HotTierMaxBytes` (a full tier weighs ~1.14 × its budget read back, and a candidate must be under half a pass) to have full flushes merge again.
+
+**Upgrading.** An install that never set anything keeps its cadence, its compaction pairs and its ring on a host with room. After a restart, segments are priced from their span count and their file size until a pass has read them; a heavy one that turns out larger than the budget is weighed once and left alone rather than read again every hour.
 
 ---
 
@@ -313,6 +361,16 @@ The certificate is hot-reloaded on every new TLS handshake — replace the `.pfx
 
 ---
 
+## Upgrading and rolling back: on-disk formats
+
+### Span write-ahead log (`traces/spans.wal`), v1 → v2
+
+The span WAL gained a CRC32C per entry (format v2). The first start of a release that writes v2 **upgrades** an existing v1 log in place — every span it holds is kept and replayed. If that upgrade cannot complete (a full disk, or an antivirus scanner holding the copy open), the server still starts: the log stays v1 for that run, an Error is logged, and the upgrade is retried at the next start.
+
+**Rolling back is not symmetric.** A release older than v2 does not know the v2 layout: it treats `spans.wal` as a foreign file and **re-initialises it**. That costs nothing only after a *clean* stop **whose log has no Error containing `final span flush`** — i.e. neither `The final span flush did not finish within 30s — the WAL replays the tier on the next start` nor `Final span flush failed — the WAL replays the tier next start`: then the final flush drained the log into a segment. A stop that logged either of those (the flush overran its 30-second shutdown budget, or failed) left the hot tier in the log, and so does an *unclean* stop (crash, kill, power loss); in both cases the spans the log held and no segment did are **lost** by the rollback. To roll back safely, stop the newer release first and search its log for `final span flush`; if the stop was unclean or either Error is there, start it once more and stop it again until it stops without one, then downgrade.
+
+---
+
 ## Full `config.yml` reference
 
 ```yaml
@@ -341,11 +399,31 @@ Ameto:
     # PayloadPoolBytes:           # unset = max(8192 slabs, 15% of physical), capped at 512 MB; set it under a container or job memory limit
 
   Query:
-    # IndexCacheBytes:            # unset = min(256 MB, 15% of the managed-heap limit); 0 disables
+    # IndexCacheBytes:            # unset = min(256 MB, 12% of the managed-heap limit); 0 disables
     # IndexCacheIdleEvict: "00:10:00"   # 0 = off (budget pressure only)
     Timeout: "00:01:00"
     MaxConcurrent: 0              # 0 = auto (cores, 2-16); negative = unlimited
     QueueWait: "00:00:05"
+
+  Metrics:
+    # HotTierBytes:               # unset = min(32 MB, 5% of the managed-heap limit)
+    # MinFlushBytes:              # unset = a tenth of the tier budget
+    # WalInitialBytes:            # unset = the tier budget, capped at 8 MB
+    MaxHotAge: "01:00:00"
+    FlushCheckInterval: "00:01:00"
+    # ExemplarsPerMetric:         # unset = derived to fit half the tier, clamped [64, 4000]
+    MaxExemplarMetrics: 256       # names that may own an exemplar ring
+    MaxLabelValuesPerKey: 2000
+    MaxTrackedSeriesPerMetric: 50000
+
+  Traces:
+    # HotTierMaxBytes:            # unset/0 = min(27 MB, 5% of the managed-heap limit), at least 8 MiB
+    # MergeBudgetBytes:           # unset/0 = min(73 MB, 6% of the managed-heap limit), at least 16 MiB
+    # RingCapacity:               # unset/0 = 65536 slots (80 B native each)
+    # RingMaxBytes:               # unset/0 = RingCapacity x 560 B, scaled by the host's tier share
+    IndexBackfill: "Idle"         # Off | Idle | Eager
+    SegmentFormatV4: false        # one-way door — see the Traces section
+    IndexEnabled: true
 
   Retention:
     VerboseDays: 90

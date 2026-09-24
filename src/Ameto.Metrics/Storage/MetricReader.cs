@@ -1,5 +1,6 @@
 using Ameto.Core;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
 using MessagePack;
 
@@ -54,39 +55,151 @@ internal static class MetricReader
         };
     }
 
+    /// <summary>
+    /// The series of <paramref name="metricName"/> in one file whose labels pass
+    /// <paramref name="labelMatchers"/>, each carrying only its points in
+    /// <c>[fromNano, toNano]</c>; a series left with none is not returned.
+    ///
+    /// <para><b>The range is applied WHILE the points are decoded, not after.</b> This used to
+    /// decode every point of every series into a list and then copy the in-range ones into a
+    /// second list with <c>Where().ToList()</c> — a full copy of every series even when the whole
+    /// series was in range, and a full decode of every point that was not. Now an out-of-range
+    /// point is walked (its timestamp delta has to be summed) but never stored, its bucket array is
+    /// skipped rather than built (see <see cref="ReadPointsV3"/>), the list the caller gets is the
+    /// one the decoder filled, and the label filter is applied as soon as the labels are read —
+    /// before the points, which the writer puts after them — so a series the filter rejects costs
+    /// its labels and a structural skip, not a decode.</para>
+    ///
+    /// <para>The name test is made once per file: every series in a <c>.mts</c> carries the one
+    /// name in its index, which is what the per-series test compared.</para>
+    /// </summary>
+    public static IAsyncEnumerable<MetricSeries> ReadAsync(
+        string filePath,
+        string metricName,
+        long   fromNano,
+        long   toNano,
+        IReadOnlyDictionary<string, string>? labelMatchers,
+        CancellationToken ct) =>
+        ReadAsync(filePath, metricName, fromNano, toNano, labelMatchers, buckets: true, ct);
+
+    /// <summary>
+    /// As the overload above; with <paramref name="buckets"/> false, histogram points come back
+    /// without their bucket arrays (<see cref="MetricPointFields.NoBuckets"/>).
+    /// </summary>
     public static async IAsyncEnumerable<MetricSeries> ReadAsync(
         string filePath,
         string metricName,
         long   fromNano,
         long   toNano,
         IReadOnlyDictionary<string, string>? labelMatchers,
+        bool   buckets,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        foreach (var series in ReadAllSync(filePath))
-        {
-            ct.ThrowIfCancellationRequested();
-            if (!series.Name.Equals(metricName, StringComparison.OrdinalIgnoreCase)) continue;
-            if (labelMatchers is not null && !MatchesLabels(series.Labels, labelMatchers)) continue;
-
-            var filtered = series.Points
-                .Where(p => p.TimestampUnixNano >= fromNano && p.TimestampUnixNano <= toNano)
-                .ToList();
-            if (filtered.Count == 0) continue;
-
-            yield return new MetricSeries
-            {
-                Name         = series.Name,
-                Kind         = series.Kind,
-                Unit         = series.Unit,
-                Labels       = series.Labels,
-                BucketBounds = series.BucketBounds,
-                Points       = filtered,
-            };
-        }
+        foreach (var series in Read(filePath, metricName, new ReadWindow(fromNano, toNano, labelMatchers, buckets), ct))
+            if (series.Points.Count > 0) yield return series;
         await Task.CompletedTask;
     }
 
-    public static IEnumerable<MetricSeries> ReadAllSync(string filePath)
+    /// <summary>Every series in the file, every point, labels unfiltered — the rollup's and the catalog seed's read.</summary>
+    public static IEnumerable<MetricSeries> ReadAllSync(string filePath) =>
+        Read(filePath, metricName: null, ReadWindow.All, CancellationToken.None);
+
+    /// <summary>As <see cref="ReadAllSync(string)"/>, with label text looked up in <paramref name="interner"/> — for tests.</summary>
+    internal static IEnumerable<MetricSeries> ReadAllSync(string filePath, MetricLabelInterner interner) =>
+        Read(filePath, metricName: null, new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, interner: interner), CancellationToken.None);
+
+    // ── The rewrite's reads (RewriteMetricInChunks) ───────────────────────────
+
+    /// <summary>
+    /// The rewrite's first pass over one source: every series in file order, each with its
+    /// POSITION (where <see cref="ReadAt"/> finds it again) and its key index from
+    /// <paramref name="keyOf"/>, which numbers keys as they are met. Only a series whose key index
+    /// is below <paramref name="pointsBelow"/> has its points decoded — the rewrite's first chunk,
+    /// gathered in the same pass; every other series is decoded up to its identity and bucket
+    /// bounds, and its points are walked past.
+    /// </summary>
+    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadForRewrite(
+        string filePath, Func<SeriesKey, int> keyOf, int pointsBelow) =>
+        ReadCore(filePath, metricName: null,
+                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow),
+                 at: null, CancellationToken.None);
+
+    /// <summary>
+    /// The series at <paramref name="positions"/> (as <see cref="ReadForRewrite"/> reported them,
+    /// ascending), in that order, with their points and bucket bounds — and NOT their labels or
+    /// unit, which the rewrite already holds from its first pass. A v3 file is inflated once and
+    /// each series decoded where it starts; a v2 file's other series are not even inflated.
+    /// </summary>
+    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadAt(string filePath, List<long> positions) =>
+        ReadCore(filePath, metricName: null,
+                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: false),
+                 at: positions, CancellationToken.None);
+
+    /// <summary>
+    /// What a read keeps: points in <c>[FromNano, ToNano]</c> (inclusive, as the range test always
+    /// was), from series whose labels pass <see cref="Matchers"/> when there are any.
+    /// </summary>
+    internal readonly struct ReadWindow(
+        long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets,
+        bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue,
+        MetricLabelInterner? interner = null)
+    {
+        public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
+
+        public long FromNano { get; } = fromNano;
+        public long ToNano   { get; } = toNano;
+        public IReadOnlyDictionary<string, string>? Matchers { get; } = matchers;
+
+        /// <summary>Whether histogram points get their bucket arrays. False for a caller that said it
+        /// will not read them (<see cref="MetricPointFields.NoBuckets"/>): the arrays are walked past
+        /// with every check a build makes, and nothing is built.</summary>
+        public bool Buckets { get; } = buckets;
+
+        /// <summary>Whether labels and unit are decoded. False only for <see cref="ReadAt"/>.</summary>
+        public bool Labels { get; } = labels;
+
+        /// <summary>The rewrite's key numbering (<see cref="ReadForRewrite"/>); null for every other read.</summary>
+        public Func<SeriesKey, int>? KeyOf { get; } = keyOf;
+
+        /// <summary>With <see cref="KeyOf"/>: points are decoded only for key indices below this.</summary>
+        public int PointsBelow { get; } = pointsBelow;
+
+        /// <summary>Where label text is looked up (never added): <see cref="MetricLabelInterner.Shared"/>
+        /// unless a test hands its own.</summary>
+        public MetricLabelInterner Interner { get; } = interner ?? MetricLabelInterner.Shared;
+
+        public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
+
+        /// <summary>
+        /// The share of a file spanning [min, max] (its header's range) that the window keeps: 1 when
+        /// it covers the file, else the overlapping fraction of the span. A SIZING HINT for a series'
+        /// point list and nothing else — a v3 point reads back up to a millisecond below the header's
+        /// min, and a series may span less than its file — so no answer depends on it.
+        /// </summary>
+        public double Share(long minNano, long maxNano)
+        {
+            if (FromNano == long.MinValue ? ToNano >= maxNano : FromNano <= minNano - 1_000_000 && ToNano >= maxNano) return 1;
+            if (maxNano <= minNano) return 1;
+            long lo = Math.Max(FromNano, minNano), hi = Math.Min(ToNano, maxNano);
+            if (hi < lo) return 0;
+            return ((double)hi - lo + 1) / ((double)maxNano - minNano + 1);
+        }
+    }
+
+    private static IEnumerable<MetricSeries> Read(string filePath, string? metricName, ReadWindow window, CancellationToken ct)
+    {
+        foreach (var (_, _, series) in ReadCore(filePath, metricName, window, at: null, ct))
+            yield return series;
+    }
+
+    /// <summary>
+    /// The one reading loop: every series of the file in order (<paramref name="at"/> null), or the
+    /// series at the given positions — for v3 an offset in the inflated block, for v2 the file
+    /// offset of the series' own block. Each series comes with its position and its rewrite key
+    /// index (-1 outside a rewrite read).
+    /// </summary>
+    private static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadCore(
+        string filePath, string? metricName, ReadWindow window, List<long>? at, CancellationToken ct)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -98,8 +211,8 @@ internal static class MetricReader
         if (version is not (2 or 3)) yield break; // v1 — incompatible, skipped (deleted on load)
         br.ReadByte();   // granularity
         int seriesCount = (int)br.ReadUInt32();
-        br.ReadInt64();  // minNano
-        br.ReadInt64();  // maxNano
+        long minNano = br.ReadInt64();
+        long maxNano = br.ReadInt64();
         br.ReadByte();   // flags
 
         long nameIdxOffset = ReadNameIdxOffset(fs, br);
@@ -108,7 +221,14 @@ internal static class MetricReader
         fs.Seek(nameIdxOffset, SeekOrigin.Begin);
         br.ReadUInt32(); // nameCount
         ushort nameLen = br.ReadUInt16();
-        string metricName = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+        string fileMetric = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+
+        // One name per file, so the per-series name test is a per-file one. (The engine only asks
+        // for a file its catalog already matched by this name; a direct caller asking for another
+        // gets the same nothing, without the file being inflated to find that out.)
+        if (metricName is not null && !fileMetric.Equals(metricName, StringComparison.OrdinalIgnoreCase)) yield break;
+
+        double share = window.Share(minNano, maxNano);
 
         // Reset to after header (28 bytes)
         fs.Seek(28, SeekOrigin.Begin);
@@ -141,11 +261,27 @@ internal static class MetricReader
                 raw = ArrayPool<byte>.Shared.Rent(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
 
-                int offset = 0;
-                for (int i = 0; i < seriesCount && offset < rawLen; i++)
+                if (at is null)
                 {
-                    var series = DeserializeNext(metricName, raw, offset, rawLen, deltaMs: true, out offset);
-                    if (series is not null) yield return series;
+                    int offset = 0;
+                    for (int i = 0; i < seriesCount && offset < rawLen; i++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        int start  = offset;
+                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, share, out offset, out int key);
+                        if (series is not null) yield return (start, key, series);
+                    }
+                }
+                else
+                {
+                    foreach (long position in at)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (position < 0 || position >= rawLen)
+                            throw new InvalidDataException($"Series position {position} is outside the block of {filePath}");
+                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, share, out _, out int key);
+                        if (series is not null) yield return (position, key, series);
+                    }
                 }
             }
             finally
@@ -156,9 +292,25 @@ internal static class MetricReader
         }
         else
         {
-            // v2: per-series LZ4 blocks.
-            for (int i = 0; i < seriesCount && fs.Position < nameIdxOffset; i++)
+            // v2: per-series LZ4 blocks — walked in order, or sought one by one.
+            int visited = 0;
+            while (true)
             {
+                long position;
+                if (at is null)
+                {
+                    if (visited >= seriesCount || fs.Position >= nameIdxOffset) break;
+                    position = fs.Position;
+                }
+                else
+                {
+                    if (visited >= at.Count) break;
+                    position = at[visited];
+                    fs.Seek(position, SeekOrigin.Begin);
+                }
+                int i = visited++;
+                ct.ThrowIfCancellationRequested();
+
                 br.ReadUInt32(); // uncompSize
                 uint compSize = br.ReadUInt32();
                 FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
@@ -166,6 +318,7 @@ internal static class MetricReader
                 byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
                 byte[]? raw = null;
                 MetricSeries? series;
+                int key;
                 try
                 {
                     fs.ReadExactly(comp, 0, (int)compSize);
@@ -173,7 +326,7 @@ internal static class MetricReader
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
                     raw = ArrayPool<byte>.Shared.Rent(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                    series = DeserializeNext(metricName, raw, 0, rawLen, deltaMs: false, out _);
+                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, share, out _, out key);
                 }
                 finally
                 {
@@ -181,7 +334,7 @@ internal static class MetricReader
                     if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
                 }
 
-                if (series is not null) yield return series;
+                if (series is not null) yield return (position, key, series);
             }
         }
     }
@@ -192,18 +345,21 @@ internal static class MetricReader
     /// Decodes the series starting at <paramref name="offset"/> and reports where the next
     /// one begins. Non-iterator by necessity: <see cref="MessagePackReader"/> is a ref struct
     /// and cannot live across a <c>yield</c>, so the cursor is carried out as a plain int and
-    /// the reader is rebuilt per call (it is a span wrapper — no allocation).
+    /// the reader is rebuilt per call (it is a span wrapper — no allocation). Null when the
+    /// window's label filter rejects the series.
     /// </summary>
     private static MetricSeries? DeserializeNext(
-        string metricName, byte[] raw, int offset, int length, bool deltaMs, out int next)
+        string metricName, byte[] raw, int offset, int length, bool deltaMs,
+        in ReadWindow window, double share, out int next, out int key)
     {
         var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
-        var series = DeserializeSeries(metricName, ref r, deltaMs);
+        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, share, out key);
         next = offset + (int)r.Consumed;
         return series;
     }
 
-    private static MetricSeries? DeserializeSeries(string metricName, ref MessagePackReader r, bool deltaMs)
+    private static MetricSeries? DeserializeSeries(
+        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, double share, out int keyIndex)
     {
         int fields = r.ReadMapHeader();
 
@@ -211,27 +367,68 @@ internal static class MetricReader
         string     unit    = string.Empty;
         LabelSet   labels  = LabelSet.Empty;
         double[]?  bounds  = null;
-        var        points  = new List<MetricDataPoint>();
+        List<MetricDataPoint>? points = null;
+        keyIndex = -1;
+
+        // The rewrite's key can be taken once kind, unit and labels are in hand — which, in the
+        // order the writer emits a series (k, u, lbs, bnds, pts, cnt), is before its points. A map
+        // in any other order is still read correctly: its points are decoded and its key is taken
+        // at the end.
+        const int HaveKind = 1, HaveUnit = 2, HaveLabels = 4, HaveIdentity = HaveKind | HaveUnit | HaveLabels;
+        int have = 0;
 
         for (int i = 0; i < fields; i++)
         {
-            var key = r.ReadString();
-            switch (key)
+            // The map key compared as the UTF-8 bytes it is on disk. ReadString() materialised a
+            // string per key — six per series (k, u, lbs, bnds, pts, cnt), every one garbage the
+            // moment the switch had looked at it. A nil key read as null there and matched no
+            // case; here it is the empty span and matches none either — its value is skipped.
+            ReadOnlySpan<byte> key = ReadKey(ref r);
+            if (key.SequenceEqual("k"u8))
             {
-                case "k":    kind   = (MetricKind)r.ReadByte(); break;
-                case "u":    unit   = r.ReadString() ?? string.Empty; break;
-                case "lbs":  labels = ReadLabels(ref r); break;
-                case "bnds": bounds = ReadBounds(ref r); break;
-                case "pts":  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r); break;
-                default:     r.Skip(); break;
+                kind  = (MetricKind)r.ReadByte();
+                have |= HaveKind;
             }
+            else if (key.SequenceEqual("u"u8))
+            {
+                if (window.Labels) unit = ReadPooled(ref r, window.Interner, out _);
+                else               r.Skip();
+                have |= HaveUnit;
+            }
+            else if (key.SequenceEqual("lbs"u8))
+            {
+                if (!window.Labels) { r.Skip(); continue; }
+                labels = ReadLabels(ref r, window.Interner);
+                have  |= HaveLabels;
+                // Rejected here, before the points the writer puts after the labels: the rest of
+                // the map is walked, not decoded, so the reader ends where the next series starts.
+                if (window.Matchers is not null && !MatchesLabels(labels, window.Matchers))
+                {
+                    for (int j = i + 1; j < fields; j++) { r.Skip(); r.Skip(); }
+                    return null;
+                }
+            }
+            else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
+            else if (key.SequenceEqual("pts"u8))
+            {
+                if (window.KeyOf is { } keyOf && (have & HaveIdentity) == HaveIdentity)
+                {
+                    keyIndex = keyOf(new SeriesKey(metricName, kind, unit, labels));
+                    if (keyIndex >= window.PointsBelow) { r.Skip(); continue; }   // not this pass's
+                }
+                points = deltaMs ? ReadPointsV3(ref r, in window, share) : ReadPointsV2(ref r, in window, share);
+            }
+            else r.Skip();
         }
+        points ??= [];
+        if (window.KeyOf is { } lateKeyOf && keyIndex < 0)
+            keyIndex = lateKeyOf(new SeriesKey(metricName, kind, unit, labels));
 
         // v3 stores idle histogram points (count=0, sum=0, all buckets 0) in the
         // slim scalar shape; reconstruct their all-zero bucket arrays here so the
         // roundtrip is lossless and delta chains in the aggregator stay intact.
         // One shared array per series — nothing downstream mutates BucketCounts.
-        if (deltaMs && kind == MetricKind.Histogram && bounds is not null && points.Count > 0)
+        if (deltaMs && window.Buckets && kind == MetricKind.Histogram && bounds is not null && points.Count > 0)
         {
             long[]? zeros = null;
             for (int i = 0; i < points.Count; i++)
@@ -259,6 +456,19 @@ internal static class MetricReader
         };
     }
 
+    /// <summary>
+    /// A map key's UTF-8 bytes, in place in the decompressed block — no string. Nil answers the
+    /// empty span (ReadString's null). A key that is not a string throws, as ReadString did. The
+    /// block is one contiguous buffer, so the span read always succeeds; the copy below is only
+    /// for a reader over a segmented sequence, which nothing here builds.
+    /// </summary>
+    private static ReadOnlySpan<byte> ReadKey(ref MessagePackReader r)
+    {
+        if (r.TryReadNil()) return default;
+        if (r.TryReadStringSpan(out ReadOnlySpan<byte> key)) return key;
+        return r.ReadStringSequence() is { } seq ? seq.ToArray() : default;
+    }
+
     private static double[]? ReadBounds(ref MessagePackReader r)
     {
         int count = r.ReadArrayHeader();
@@ -278,7 +488,7 @@ internal static class MetricReader
         return b;
     }
 
-    private static LabelSet ReadLabels(ref MessagePackReader r)
+    private static LabelSet ReadLabels(ref MessagePackReader r, MetricLabelInterner interner)
     {
         int count = r.ReadMapHeader();
         // THE SAME RULE AS EVERY OTHER READER HERE, and this site went four rounds without it for a
@@ -294,6 +504,44 @@ internal static class MetricReader
         // whole and asked for 2.1 billion slots, 34 GB of references, before one pair was read.
         FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
             fileBytesPerElement: 2, "Label set", "the series block");
+        if (count > MaxInternedLabelStrings / 2) return ReadLabelsUninterned(ref r, count);
+
+        // RESOLVED AGAINST THE SHARED INTERNER, LOOKUP ONLY. The OTLP parsers and the WAL replay
+        // put live text into MetricLabelInterner.Shared; the series a query reads back are, almost
+        // always, series ingest is still sending, so their strings and label sets are already
+        // there, and a read that finds them hands back those instances and allocates nothing for
+        // them. A read that does NOT find them builds its own — and adds nothing: the pool never
+        // evicts, and a cold read is the one reader that meets every DEAD value of the retention
+        // window (the catalog seed reads every .mts at startup), so interning here filled the
+        // pool at boot and left every series started afterwards to be ingested uninterned.
+        // Equal by value either way.
+        int n        = count * 2;
+        var kv       = ArrayPool<string>.Shared.Rent(MaxInternedLabelStrings);
+        Span<int> ids = stackalloc int[MaxInternedLabelStrings];
+        try
+        {
+            for (int i = 0; i < n; i++) kv[i] = ReadPooled(ref r, interner, out ids[i]);
+            return interner.LookupLabelSet(kv.AsSpan(0, n), ids[..n]);
+        }
+        finally
+        {
+            kv.AsSpan(0, n).Clear();
+            ArrayPool<string>.Shared.Return(kv);
+        }
+    }
+
+    /// <summary>
+    /// Strings in the largest label set this reader resolves through the interner. A set bigger
+    /// than that — legal, never seen from a real exporter — is decoded the way every set used to
+    /// be, so the scratch the common case rents stays a constant.
+    /// </summary>
+    private const int MaxInternedLabelStrings = 128;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LabelSet ReadLabelsUninterned(ref MessagePackReader r, int count)
+    {
+        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 2, "Label set", "the series block");
         int cap   = FileBounds.PreallocFor(count, heapBytesPerElement: 16);
         var pairs = new List<KeyValuePair<string, string>>(cap);
         for (int i = 0; i < count; i++)
@@ -306,54 +554,89 @@ internal static class MetricReader
     }
 
     /// <summary>
+    /// A msgpack string looked up in <paramref name="interner"/> from its UTF-8 bytes in place —
+    /// the pooled instance and its id when the text is live, else a fresh string and -1, and
+    /// nothing added (see <see cref="MetricLabelInterner.Lookup"/>). The text is what
+    /// <c>ReadString() ?? string.Empty</c> gave; nil is the empty string, as it was.
+    /// </summary>
+    private static string ReadPooled(ref MessagePackReader r, MetricLabelInterner interner, out int id)
+    {
+        if (r.TryReadNil()) { id = MetricLabelInterner.EmptyStringId; return string.Empty; }
+        string value;
+        if (r.TryReadStringSpan(out ReadOnlySpan<byte> utf8)) id = interner.Lookup(utf8, out value);
+        else { value = r.ReadString() ?? string.Empty; id = -1; }   // a segmented sequence: never built here
+        return value;
+    }
+
+    /// <summary>
     /// v3 points: ms-delta timestamps; a 2-element (slim) point inherits the
     /// previous point's histogram state (count / sum / buckets) — for scalar
     /// series that state is always zero, for histograms it run-length-encodes
     /// idle stretches losslessly.
+    ///
+    /// <para><b>Only the points in the window are stored.</b> Every point is still walked — a
+    /// timestamp is a running sum of deltas, and a slim point's state is the last full point's —
+    /// but one outside the window is not added, and its bucket array is not BUILT: its position
+    /// is remembered instead, and it is materialised only if a later slim point that IS in the
+    /// window inherits it. So the kept points see exactly the state they always did, sharing one
+    /// array per full point as they always did, and a point nobody asked for costs no
+    /// allocation.</para>
     /// </summary>
-    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r)
+    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, double share)
     {
         // A MessagePack array header is a number out of the file like any other: the block it
         // lives in is bounded, but the header can still claim far more points than the block
         // holds, and a capacity is reserved before a single one is read. Reserve modestly and
-        // let the list grow into whatever is really there.
+        // let the list grow into whatever is really there — scaled by the share of the file the
+        // window keeps (ReadWindow.Share): the header counts every point, and a window that
+        // keeps a third of the file reserving for all of it wastes two thirds, while reserving
+        // nothing pays the list's doubling copies instead.
         int count  = r.ReadArrayHeader();
-        var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
+        var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         long ms    = 0;
         long    cnt = 0;
         double  sum = 0;
-        long[]? buckets = null;
+        long[]? buckets   = null;
+        long    pendingAt = -1;   // the state's bucket array, walked past but not yet built
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 2 = slim (state unchanged), 5 = full
             ms = i == 0 ? r.ReadInt64() : ms + r.ReadInt64();
+            long ts   = ms * 1_000_000;
+            bool keep = window.Keeps(ts);
 
             double val = r.ReadDouble(); // transparently accepts msgpack ints
             if (n >= 5)
             {
                 cnt = r.ReadInt64();
                 sum = r.ReadDouble();
+                pendingAt = -1;
                 if (r.TryReadNil())
                 {
                     buckets = null; // state set but no buckets recorded
                 }
+                else if (keep && window.Buckets)
+                {
+                    buckets = ReadBuckets(ref r);
+                }
                 else
                 {
-                    int bn = r.ReadArrayHeader();
-                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
-                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
-                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
-                    for (int j = 0; j < bn; j++)
-                    {
-                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
-                        bk[j] = r.ReadInt64();
-                    }
-                    buckets = bk;
+                    buckets   = null;
+                    pendingAt = window.Buckets ? r.Consumed : -1;
+                    SkipBuckets(ref r);
                 }
+            }
+            if (!keep) continue;
+
+            if (pendingAt >= 0)
+            {
+                var at  = new MessagePackReader(r.Sequence.Slice(pendingAt));
+                buckets = ReadBuckets(ref at);
+                pendingAt = -1;
             }
             pts.Add(new MetricDataPoint
             {
-                TimestampUnixNano = ms * 1_000_000,
+                TimestampUnixNano = ts,
                 Value             = val,
                 Count             = cnt,
                 Sum               = sum,
@@ -363,11 +646,11 @@ internal static class MetricReader
         return pts;
     }
 
-    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields.</summary>
-    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r)
+    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields. Only the window's are stored.</summary>
+    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, double share)
     {
         int count = r.ReadArrayHeader();
-        var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
+        var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 5 fields in v2
@@ -375,6 +658,7 @@ internal static class MetricReader
             double val = r.ReadDouble();
             long   cnt = r.ReadInt64();
             double sum = r.ReadDouble();
+            bool   keep = window.Keeps(ts);
             long[]? buckets = null;
             if (n >= 5)
             {
@@ -382,20 +666,16 @@ internal static class MetricReader
                 {
                     // scalar point — no buckets
                 }
+                else if (keep && window.Buckets)
+                {
+                    buckets = ReadBuckets(ref r);
+                }
                 else
                 {
-                    int bn = r.ReadArrayHeader();
-                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
-                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
-                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
-                    for (int j = 0; j < bn; j++)
-                    {
-                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
-                        bk[j] = r.ReadInt64();
-                    }
-                    buckets = bk;
+                    SkipBuckets(ref r);
                 }
             }
+            if (!keep) continue;
             pts.Add(new MetricDataPoint
             {
                 TimestampUnixNano = ts,
@@ -408,25 +688,109 @@ internal static class MetricReader
         return pts;
     }
 
-    private static bool MatchesLabels(
-        LabelSet labels,
-        IReadOnlyDictionary<string, string> matchers)
+    /// <summary>A point's bucket-count array, built.</summary>
+    private static long[] ReadBuckets(ref MessagePackReader r)
     {
-        var dict = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
-        foreach (var (k, v) in matchers)
+        int bn = r.ReadArrayHeader();
+        FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Histogram buckets", "the series block");
+        var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
+        for (int j = 0; j < bn; j++)
         {
-            if (!dict.TryGetValue(k, out var actual)) return false;
-            // Exact, or '|'-delimited OR (e.g. service.name=A|B|C) for multi-select.
-            if (v.IndexOf('|') < 0) { if (actual != v) return false; }
-            else
-            {
-                bool any = false;
-                foreach (var opt in v.Split('|')) if (actual == opt) { any = true; break; }
-                if (!any) return false;
-            }
+            if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
+            bk[j] = r.ReadInt64();
         }
+        return bk;
+    }
+
+    /// <summary>
+    /// A point's bucket-count array, walked past with every check <see cref="ReadBuckets"/> makes —
+    /// the count against the block, each element read as the integer it must be — and nothing
+    /// kept, so a torn array fails a skipped point exactly as it fails a built one.
+    /// </summary>
+    private static void SkipBuckets(ref MessagePackReader r)
+    {
+        int bn = r.ReadArrayHeader();
+        FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Histogram buckets", "the series block");
+        for (int j = 0; j < bn; j++) r.ReadInt64();
+    }
+
+    /// <summary>
+    /// Whether <paramref name="labels"/> satisfies every matcher: the key present, and its value
+    /// equal to the matcher's — or to one of its '|'-separated options (multi-select, e.g.
+    /// <c>service.name=A|B|C</c>). Ordinal throughout. The ONE matcher for the cold reader, the hot
+    /// tier and the exemplar ring; callers decide, as they always did, whether a null or empty
+    /// matcher set reaches it at all.
+    ///
+    /// <para><b>A scan of the sorted pairs, not a dictionary per series.</b> Both call sites used to
+    /// build <c>labels.Pairs.ToDictionary(...)</c> — a dictionary, its buckets and entries, a pair
+    /// view and a LINQ iterator, per series per query — to look up two or three keys in a set of
+    /// five. The pairs are already sorted by key (ordinal), so a walk that stops at the first key
+    /// past the one sought answers the same lookup with no allocation at all.</para>
+    ///
+    /// <para><b>A repeated key still throws, deliberately.</b> <c>ToDictionary</c> threw
+    /// <see cref="ArgumentException"/> on a label set with a key twice (the OTLP parser can build
+    /// one — a point attribute named <c>service.name</c>, a duplicate attribute) before any matcher
+    /// was looked at, failing the whole query. That is a latent bug, but this change is a
+    /// performance change and the answer is part of what it must keep: a query that failed still
+    /// fails, the same way (<c>MetricQueryGoldenTests</c> pins it). Repeats are adjacent in the
+    /// sorted pairs, so finding one is a compare per pair.</para>
+    /// </summary>
+    internal static bool MatchesLabels(LabelSet labels, IReadOnlyDictionary<string, string> matchers)
+    {
+        ReadOnlySpan<string> kv = labels.Interleaved;
+        for (int i = 2; i < kv.Length; i += 2)
+            if (string.Equals(kv[i], kv[i - 2])) ThrowRepeatedKey(kv[i]);
+
+        // The concrete dictionary's struct enumerator, when that is what came in (it is, from every
+        // endpoint and the alert rules): the interface's would be a boxed enumerator per series.
+        if (matchers is Dictionary<string, string> dict)
+        {
+            foreach (var (k, v) in dict)
+                if (!Matches(kv, k, v)) return false;
+            return true;
+        }
+        foreach (var (k, v) in matchers)
+            if (!Matches(kv, k, v)) return false;
         return true;
     }
+
+    /// <summary>The value under <paramref name="key"/> in canonically sorted pairs, tested against the matcher.</summary>
+    private static bool Matches(ReadOnlySpan<string> kv, string key, string matcher)
+    {
+        for (int i = 0; i < kv.Length; i += 2)
+        {
+            int c = string.CompareOrdinal(kv[i], key);
+            if (c < 0) continue;
+            return c == 0 && LabelValueMatches(kv[i + 1], matcher);   // past it: the key is absent
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Exact match, or OR-match when the matcher value is '|'-delimited (e.g.
+    /// <c>service.name=A|B|C</c>) — lets the multi-service filter merge several series server-side
+    /// so quantiles aggregate over the union. The options are walked in place: <c>Split('|')</c>
+    /// allocated an array and a string per option per series, for the same answer — empty options
+    /// included (<c>"A||B"</c> and <c>"A|"</c> both accept the empty value).
+    /// </summary>
+    internal static bool LabelValueMatches(string actual, string matcher)
+    {
+        if (matcher.IndexOf('|') < 0) return actual == matcher;
+        ReadOnlySpan<char> rest = matcher;
+        while (true)
+        {
+            int bar = rest.IndexOf('|');
+            if ((bar < 0 ? rest : rest[..bar]).SequenceEqual(actual)) return true;
+            if (bar < 0) return false;
+            rest = rest[(bar + 1)..];
+        }
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowRepeatedKey(string key) =>
+        throw new ArgumentException($"An item with the same key has already been added. Key: {key}");
 
     private static long ReadNameIdxOffset(FileStream fs, BinaryReader br)
     {

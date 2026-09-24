@@ -707,11 +707,13 @@ internal static class SpanReader
         // segment's whole span count.
         //
         // That is not a rounding error at this engine's segment sizes. SpanSearchBoundTests
-        // measures 1,749 bytes per span for an ordinary eight-attribute OTel span, so an
-        // ordinary flushed segment (HotFlushThreshold = 50,000) is ~83 MB and a compacted one
-        // (MaxSpansPerPass = 200,000) ~334 MB, live all at once — the query this bound was
+        // measures 607 bytes per span for an ordinary eight-attribute OTel span — it measured
+        // 1,749 B while the decoder inflated the attribute map into a dictionary here — so an
+        // ordinary flushed segment (HotFlushThreshold = 50,000) is ~29 MB and a compacted one
+        // (MaxSpansPerPass = 200,000) ~116 MB, live all at once. The query this bound was
         // written for, { .db.system = "mssql" && duration > 1s } over a month on a 512 MB
-        // server, still died on a single compacted segment.
+        // server, died on a single compacted segment even at the old figure, and the bound is
+        // what keeps the new one from being a reason to stop streaming.
         //
         // A block is 4096 spans, so the peak is now one block plus the caller's page instead of
         // one segment: decode a block, filter it, hand the survivors over, drop it, take the
@@ -1684,26 +1686,30 @@ internal static class SpanReader
         // positional field. Everything the scalar predicate needs is already in hand.
         bool keep = filter.Matches(ts, dur, name, svc, status, httpSC);
 
-        IReadOnlyDictionary<string, object?>? attrs = null;
+        // THE MAP IS TAKEN AS BYTES, NOT AS A DICTIONARY. Inflating it here cost 1 749 B of
+        // retained heap per span, which is what made ReadAll of one 50 000-span segment 83 MB and
+        // a MaxSpansPerPass compaction 199 MB — for a merge that copies the attributes straight
+        // back out again, and for TraceQL predicates that read one key. SpanRecord.Attributes
+        // decodes on demand for the callers that really do want a map.
+        ReadOnlyMemory<byte> attrBlob = default;
         if (r.TryReadNil())
         {
             // no attributes
         }
         else if (!keep)
         {
-            // Rejected: step over the map whole. No dictionary, no keys, no boxed values.
+            // Rejected: step over the map whole. No copy, no keys, no boxed values.
             r.Skip();
         }
         else
         {
-            int cnt = r.ReadMapHeader();
-            var dict = new Dictionary<string, object?>(cnt, StringComparer.Ordinal);
-            for (int i = 0; i < cnt; i++)
-            {
-                var key = r.ReadString() ?? string.Empty;
-                dict[key] = ReadAttrValue(ref r);
-            }
-            attrs = dict;
+            // COPIED, NOT SLICED, and that is the reviewer's line: the block buffer these bytes
+            // live in is ArrayPool-rented and returned as soon as the block is drained, so a slice
+            // of it handed to a record that outlives the block is a use-after-return. 375 B against
+            // 1 749 B is still 4,7x, and it is 4,7x that cannot alias a recycled buffer.
+            var start = r.Position;
+            r.Skip();
+            attrBlob = System.Buffers.BuffersExtensions.ToArray(r.Sequence.Slice(start, r.Position));
         }
 
         // Consume any fields a future minor revision might append.
@@ -1723,23 +1729,9 @@ internal static class SpanReader
             Kind              = kind,
             Status            = status,
             HttpStatusCode    = httpSC,
-            Attributes        = attrs,
+            AttributesBytes   = attrBlob,
         };
     }
-
-    private static object? ReadAttrValue(ref MessagePackReader r) =>
-        r.NextMessagePackType switch
-        {
-            MessagePackType.String  => r.ReadString(),
-            MessagePackType.Integer => r.ReadInt64(),
-            MessagePackType.Float   => r.ReadDouble(),
-            MessagePackType.Boolean => r.ReadBoolean(),
-            MessagePackType.Nil     => ReadNil(ref r),
-            _                       => SkipUnknown(ref r),
-        };
-
-    private static object? ReadNil(ref MessagePackReader r) { r.ReadNil(); return null; }
-    private static object? SkipUnknown(ref MessagePackReader r) { r.Skip(); return null; }
 
     private static void CopyFixed(in System.Buffers.ReadOnlySequence<byte> seq, Span<byte> dest)
     {
@@ -1812,7 +1804,7 @@ internal static class SpanReader
             Kind              = kind,
             Status            = status,
             HttpStatusCode    = httpSC,
-            Attributes        = attrBytes is { Length: > 0 } ? DeserializeAttributes(attrBytes) : null,
+            AttributesBytes   = attrBytes,
         };
     }
 
@@ -1836,12 +1828,6 @@ internal static class SpanReader
             pos += seg.Length;
         }
         return arr;
-    }
-
-    private static IReadOnlyDictionary<string, object?>? DeserializeAttributes(byte[] bytes)
-    {
-        try { return MessagePackSerializer.Deserialize<Dictionary<string, object?>>(bytes); }
-        catch { return null; }
     }
 
     private static FileStream OpenRead(string path) =>

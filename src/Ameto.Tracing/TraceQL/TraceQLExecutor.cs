@@ -188,14 +188,19 @@ public static class TraceQLExecutor
         // Fetch spans using indexed filters; multiply limit for grouping headroom.
         //
         // WHAT THIS RETAINS, MEASURED, because ten times a caller-supplied number is worth
-        // writing down. A SpanRecord with an ordinary eight-attribute OTel attribute map weighs
-        // about 1,800 bytes once decoded (SpanSearchBoundTests measures 1,749 B on its fixture),
-        // so this list peaks at spanLimit × ~1.8 KB:
+        // writing down. A SpanRecord carrying an ordinary eight-attribute OTel attribute map
+        // weighs about 607 bytes — the 375-byte msgpack blob, two strings and the record
+        // (SpanSearchBoundTests measures it on its fixture) — so this list peaks at
+        // spanLimit × ~0.6 KB:
         //   * the SSE route (GET /api/traces/query/stream) pages at QlStreamPageSize = 200, so
-        //     2 000 spans ≈ 3.6 MB per connected client, and the stream is one page at a time;
-        //   * POST /api/traces/query clamps limit to 1 000, so 10 000 spans ≈ 17 MB — PER
+        //     2 000 spans ≈ 1.2 MB per connected client, and the stream is one page at a time;
+        //   * POST /api/traces/query clamps limit to 1 000, so 10 000 spans ≈ 5.8 MB — PER
         //     CONCURRENT REQUEST, and the trace endpoints take no slot from QueryGuard by
         //     design, so nothing serialises them.
+        //
+        // It was 1,749 B, 3.6 MB and 17 MB until the attribute map stopped being decoded into a
+        // dictionary for every span a scan touched; the predicate now reads its one key straight
+        // out of the bytes (AttributePredicate.Evaluate).
         //
         // LEFT AS IT IS, deliberately. The peak is proportional to what the caller asked for and
         // bounded by it — this is not the unbounded-in-the-match-count shape that killed the
@@ -309,6 +314,15 @@ public static class TraceQLExecutor
         }
         root ??= spans.MinBy(s => s.StartTimeUnixNano)!;
 
+        // OUT OF THE BLOB, NOT OUT OF THE MEMOISED DICTIONARY — the same walk the trace list
+        // makes, for the same reason and over the same records. `root.Attributes` was the FIRST
+        // touch of a hot-tier record's blob here, so the lazy decode ran per page: a Dictionary,
+        // a key string and a box per attribute (~987 B against the blob's 375 B for an ordinary
+        // eight-attribute span), MEMOISED on the record, so the tier stayed that much heavier
+        // until it flushed. Every TraceQL page put back onto the live tier exactly what
+        // MergeSpanInto was rewritten to stop putting there.
+        HttpSemconvKeys.Resolve(root, out string httpMethod, out string httpPath);
+
         return new TraceRowDto
         {
             TraceId           = root.TraceId.ToString(),
@@ -317,8 +331,8 @@ public static class TraceQLExecutor
             ServiceName       = root.ServiceName,
             Services          = [.. services],
             Status            = hasErr ? "Error" : root.Status.ToString(),
-            HttpMethod        = GetAttr(root.Attributes, "http.request.method", "http.method"),
-            HttpPath          = GetAttr(root.Attributes, "url.path", "http.target", "http.route"),
+            HttpMethod        = httpMethod,
+            HttpPath          = httpPath,
             HttpStatusCode    = root.HttpStatusCode != 0 ? root.HttpStatusCode : null,
             StartTimeUnixNano = root.StartTimeUnixNano,
             DurationNanos     = root.DurationNanos,
@@ -326,12 +340,25 @@ public static class TraceQLExecutor
         };
     }
 
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, params string[] keys)
-    {
-        if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
+    /// <summary>
+    /// The semconv key lists, allocated ONCE for the process rather than once per returned row.
+    /// A <c>params string[]</c> parameter with literal arguments is a fresh <c>string[]</c> on
+    /// every call, and this is called twice per row of every TraceQL page — the arrays were the
+    /// row's own allocation, not the caller's, and no caller could see them to hoist them out.
+    ///
+    /// <para>They are <see cref="HttpSemconvKeys"/>' lists and not this file's own: the trace list
+    /// reads the same two attributes of the same span through
+    /// <c>TraceStorageEngine.MergeSpanInto</c>, and a second copy here had already drifted two path
+    /// keys short of the engine's.</para>
+    /// </summary>
+    internal static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
+    internal static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
+
+    /// <summary>
+    /// First key that is present with a value, as text — <see cref="HttpSemconvKeys.GetAttr"/>,
+    /// which is where the rule now lives for all three readers of these lists. Kept as a name in
+    /// this file because the probes and the parity tests reach it by this one.
+    /// </summary>
+    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys) =>
+        HttpSemconvKeys.GetAttr(attrs, keys);
 }

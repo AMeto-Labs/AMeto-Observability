@@ -363,7 +363,26 @@ Server health snapshot.
   "ingestArenaBytes": 80530636,
   "ingestArenaResidentBytes": 655360,
   "indexBuildPooledBytes": 8388608,
-  "indexMalformedExceptionPayloads": 0
+  "indexMalformedExceptionPayloads": 0,
+
+  "metricsHotTierBudgetBytes": 20132659,
+  "metricsMinFlushBytes": 2013265,
+  "metricsWalInitialBytes": 8388608,
+  "metricsExemplarsPerMetric": 189,
+  "metricsMaxExemplarMetrics": 256,
+  "metricsExemplarMetricsRefused": 0,
+
+  "tracesHotTierBudgetBytes": 20132659,
+  "tracesMergeBudgetBytes": 24159191,
+  "tracesRingCapacity": 65536,
+  "tracesRingMaxBytes": 27396096,
+  "tracesRingBytesInFlight": 0,
+  "tracesRingRefusedForBytes": 0,
+  "tracesRingRefusedNoSlot": 0,
+  "tracesRingRefusedNoArena": 0,
+  "tracesUnpooledSpanNames": 0,
+  "tracesUnpooledServiceNames": 0,
+  "tracesInternPoolSaturations": 0
 }
 ```
 
@@ -372,6 +391,8 @@ The response carries more fields than are shown here (disk, GC, per-signal stora
 The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the decoded-index cache (the budget is what the cache was BUILT with, not a fresh derivation), `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — the deepest slab ever used times the slab size, never given back, so it is a resting level rather than a peak. On Windows that figure is the arena's commit charge (what a job object's memory limit counts). On Linux it is an upper bound on the arena's resident memory, not a measurement of it: pages become resident only when written, and a small event writes only the first page of its slab. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
 
 `indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — the segment bloom filters' bits, 4–8 % of a cached entry — with its own ceiling. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-decode indexes on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves.
+
+The `metrics*` and `traces*` budget fields are the **effective** figures the engines enforce — after an explicit `Ameto:Metrics` / `Ameto:Traces` value, the derivation from the memory limits and the floors — so they are what to read after tuning those knobs; each signal also prints them once at startup (`Metric budgets:`, `Trace budgets:`). They are `null` when the signal is disabled. `metricsExemplarMetricsRefused` counts exemplars dropped because `metricsMaxExemplarMetrics` names already own a ring (a correlation hint, never data). The span ring's refusals are counted by cause, because they are different problems: `tracesRingRefusedForBytes` is a burst heavier than `tracesRingMaxBytes`, `tracesRingRefusedNoSlot` a drainer that fell behind, and `tracesRingRefusedNoArena` a payload mix the ring's 64 KiB chunks pack badly (see `RingMaxBytes` in CONFIGURATION.md). `tracesInternPoolSaturations`, `tracesUnpooledSpanNames` and `tracesUnpooledServiceNames` say a span-name or service intern pool filled up: nothing is dropped, but each span past that point keeps its own string.
 
 `indexMalformedExceptionPayloads` counts exception payloads a merge could not read as an exception map. Those rows are written but their `@x.*` terms are not indexed, so `@x.type` filters and free-text search over the merged segment miss them — a non-zero value means a producer is writing exception maps this reader cannot read. It counts **encounters, not distinct rows**: the raw payload survives into the merged segment, so the same row is counted again at every later merge level and again on a retried merge, and the counter resets on restart. Watch whether it moves, not how large it is.
 
