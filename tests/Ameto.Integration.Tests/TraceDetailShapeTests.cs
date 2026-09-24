@@ -300,6 +300,61 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
         Write(t, 0x40, 0x40,   a + 13 * Ms, 1 * Ms,    "self-parent", "x", SpanKind.Internal, SpanStatusCode.Ok,  0, none);
     }
 
+    /// <summary>
+    /// EXACTLY 32 LEVELS — the deepest tree the host serialiser would write at all: a level is a
+    /// node object plus its <c>children</c> array, two of its 64 JSON levels (issue #91). Captured
+    /// on the unchanged endpoint, so the rewrite that lifts the limit is held to the old bytes over
+    /// the whole depth the old code could answer, not only over the shallow trees above. Its names
+    /// also pin what the host's relaxed encoder does with the characters it does NOT relax: a
+    /// surrogate pair, the C0 and C1 controls, and U+2028 / U+2029 all go out as <c>\uXXXX</c>.
+    /// </summary>
+    private static readonly TraceId FlameDeep32 = new(0xF1A3E00000000004UL, 0x00000000000000DDUL);
+
+    private void WriteDeepFlameTrace()
+    {
+        long a = Anchor + 180_000 * Ms;   // three minutes after the detail trace
+        var  t = FlameDeep32;
+        byte[] none = [];
+
+        // A root candidate EARLIER than the real root in start order: the later one wins.
+        Write(t, 0x0301, 0xDEAD, a, 5 * Ms, "early orphan", "x", SpanKind.Internal, SpanStatusCode.Ok, 0, none);
+        Write(t, 0x0101, 0, a + 1 * Ms, 123_456_789_012_345, "root <&> 'q' +p", "фронт", SpanKind.Server, SpanStatusCode.Ok, 0, none);
+
+        // The chain: level L is span 0x100 + L, child of level L - 1.
+        for (int level = 2; level <= 32; level++)
+        {
+            ulong id = 0x0100UL + (ulong)level;
+            string name = level switch
+            {
+                5  => "emoji 😀 outside the BMP",
+                7  => "line\u2028separator\u2029paragraph",
+                9  => "control \u0001\t\n\r next-line\u0085 end",
+                11 => "кириллица ü 日本",
+                13 => "quote \" backslash \\ slash /",
+                _  => "lvl-" + level.ToString(CultureInfo.InvariantCulture),
+            };
+            long dur = level switch
+            {
+                20 => -100,          // rounds to -0
+                21 => 0,
+                25 => 2_000_500,     // a half-microsecond part
+                32 => 1,             // a nanosecond: rounds to 0
+                _  => (64 - level) * Ms + level * 1_111L + (level % 3) * 500L,
+            };
+            Write(t, id, id - 1, a + (1 + level) * Ms, dur, name,
+                  level == 11 ? "сервис" : level == 13 ? "日本" : "svc",
+                  level == 17 ? (SpanKind)9       : (SpanKind)(level % 6),
+                  level == 17 ? (SpanStatusCode)7 : (SpanStatusCode)(level % 3),
+                  0, none);
+        }
+
+        // Later in start order than the whole chain, so each closes its parent's child list.
+        Write(t, 0x0201, 0x0101, a + 100 * Ms, 3_333_333, "sibling at level 2",      "svc", SpanKind.Client,   SpanStatusCode.Error, 0, none);
+        Write(t, 0x0202, 0x011E, a + 101 * Ms, 1_000_500, "sibling at level 31",     "svc", SpanKind.Internal, SpanStatusCode.Ok,    0, none);
+        Write(t, 0x0203, 0x011F, a + 102 * Ms, 2_000_500, "second leaf at level 32", "svc", SpanKind.Producer, SpanStatusCode.Unset, 0, none);
+        Write(t, 0,      0x010F, a + 103 * Ms, 999,       "no id at level 16",       "svc", SpanKind.Consumer, SpanStatusCode.Ok,    0, none);
+    }
+
     // ── Plumbing ─────────────────────────────────────────────────────────────
 
     private async Task<(HttpStatusCode Status, string? ContentType, byte[] Body)> GetAsync(
@@ -451,6 +506,22 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
     }
 
     [Fact]
+    public async Task The_flamegraph_of_a_32_level_trace_is_byte_for_byte_what_it_was_hot_and_cold()
+    {
+        WriteDeepFlameTrace();
+        string path = $"/api/traces/{Id(FlameDeep32)}/flamegraph";
+
+        foreach (var c in new[] { CultureInfo.InvariantCulture, Odd })
+            await AssertBodyAsync(path, c, Joined(FlameDeep32Body), $"hot, 32 levels, {Label(c)}");
+
+        _traces.FlushHotTier();
+        Assert.True(_traces.ColdSegmentCountForTest > 0, "the flush wrote no segment");
+
+        foreach (var c in new[] { CultureInfo.InvariantCulture, Odd })
+            await AssertBodyAsync(path, c, Joined(FlameDeep32Body), $"cold, 32 levels, {Label(c)}");
+    }
+
+    [Fact]
     public async Task The_flamegraph_of_an_unknown_trace_is_a_bare_404_and_a_malformed_id_a_bare_400()
     {
         var (status, _, body) = await GetAsync(
@@ -580,6 +651,45 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
     private const string FlameEarlyOrphanBody = """
         {"spanId":"0000000000000031","name":"real root <&>","service":"сервис","kind":"Server","status":"Ok","totalMs":20,"selfMs":7.654,"children":[
         {"spanId":"0000000000000032","name":"only child","service":"x","kind":"Client","status":"Error","totalMs":12.346,"selfMs":12.346,"children":[]}]}
+        """;
+
+    private const string FlameDeep32Body = """
+        {"spanId":"0000000000000101","name":"root <&> 'q' +p","service":"фронт","kind":"Server","status":"Ok","totalMs":123456789.012,"selfMs":123456723.676,"children":[
+        {"spanId":"0000000000000102","name":"lvl-2","service":"svc","kind":"Server","status":"Error","totalMs":62.003,"selfMs":1,"children":[
+        {"spanId":"0000000000000103","name":"lvl-3","service":"svc","kind":"Client","status":"Unset","totalMs":61.003,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000104","name":"lvl-4","service":"svc","kind":"Producer","status":"Ok","totalMs":60.005,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000105","name":"emoji \uD83D\uDE00 outside the BMP","service":"svc","kind":"Consumer","status":"Error","totalMs":59.007,"selfMs":1,"children":[
+        {"spanId":"0000000000000106","name":"lvl-6","service":"svc","kind":"Unspecified","status":"Unset","totalMs":58.007,"selfMs":0.999,"children":[
+        {"spanId":"0000000000000107","name":"line\u2028separator\u2029paragraph","service":"svc","kind":"Internal","status":"Ok","totalMs":57.008,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000108","name":"lvl-8","service":"svc","kind":"Server","status":"Error","totalMs":56.01,"selfMs":1,"children":[
+        {"spanId":"0000000000000109","name":"control \u0001\t\n\r next-line\u0085 end","service":"svc","kind":"Client","status":"Unset","totalMs":55.01,"selfMs":0.998,"children":[
+        {"spanId":"000000000000010a","name":"lvl-10","service":"svc","kind":"Producer","status":"Ok","totalMs":54.012,"selfMs":0.999,"children":[
+        {"spanId":"000000000000010b","name":"кириллица ü 日本","service":"сервис","kind":"Consumer","status":"Error","totalMs":53.013,"selfMs":1,"children":[
+        {"spanId":"000000000000010c","name":"lvl-12","service":"svc","kind":"Unspecified","status":"Unset","totalMs":52.013,"selfMs":0.998,"children":[
+        {"spanId":"000000000000010d","name":"quote \" backslash \\ slash /","service":"日本","kind":"Internal","status":"Ok","totalMs":51.015,"selfMs":0.998,"children":[
+        {"spanId":"000000000000010e","name":"lvl-14","service":"svc","kind":"Server","status":"Error","totalMs":50.017,"selfMs":1,"children":[
+        {"spanId":"000000000000010f","name":"lvl-15","service":"svc","kind":"Client","status":"Unset","totalMs":49.017,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000110","name":"lvl-16","service":"svc","kind":"Producer","status":"Ok","totalMs":48.018,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000111","name":"lvl-17","service":"svc","kind":"9","status":"7","totalMs":47.02,"selfMs":1,"children":[
+        {"spanId":"0000000000000112","name":"lvl-18","service":"svc","kind":"Unspecified","status":"Unset","totalMs":46.02,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000113","name":"lvl-19","service":"svc","kind":"Internal","status":"Ok","totalMs":45.022,"selfMs":45.022,"children":[
+        {"spanId":"0000000000000114","name":"lvl-20","service":"svc","kind":"Server","status":"Error","totalMs":-0,"selfMs":0,"children":[
+        {"spanId":"0000000000000115","name":"lvl-21","service":"svc","kind":"Client","status":"Unset","totalMs":0,"selfMs":0,"children":[
+        {"spanId":"0000000000000116","name":"lvl-22","service":"svc","kind":"Producer","status":"Ok","totalMs":42.025,"selfMs":0.998,"children":[
+        {"spanId":"0000000000000117","name":"lvl-23","service":"svc","kind":"Consumer","status":"Error","totalMs":41.027,"selfMs":1,"children":[
+        {"spanId":"0000000000000118","name":"lvl-24","service":"svc","kind":"Unspecified","status":"Unset","totalMs":40.027,"selfMs":38.026,"children":[
+        {"spanId":"0000000000000119","name":"lvl-25","service":"svc","kind":"Internal","status":"Ok","totalMs":2.001,"selfMs":0,"children":[
+        {"spanId":"000000000000011a","name":"lvl-26","service":"svc","kind":"Server","status":"Error","totalMs":38.03,"selfMs":1,"children":[
+        {"spanId":"000000000000011b","name":"lvl-27","service":"svc","kind":"Client","status":"Unset","totalMs":37.03,"selfMs":0.998,"children":[
+        {"spanId":"000000000000011c","name":"lvl-28","service":"svc","kind":"Producer","status":"Ok","totalMs":36.032,"selfMs":0.999,"children":[
+        {"spanId":"000000000000011d","name":"lvl-29","service":"svc","kind":"Consumer","status":"Error","totalMs":35.033,"selfMs":1,"children":[
+        {"spanId":"000000000000011e","name":"lvl-30","service":"svc","kind":"Unspecified","status":"Unset","totalMs":34.033,"selfMs":0,"children":[
+        {"spanId":"000000000000011f","name":"lvl-31","service":"svc","kind":"Internal","status":"Ok","totalMs":33.035,"selfMs":31.034,"children":[
+        {"spanId":"0000000000000120","name":"lvl-32","service":"svc","kind":"Server","status":"Error","totalMs":0,"selfMs":0,"children":[]},
+        {"spanId":"0000000000000203","name":"second leaf at level 32","service":"svc","kind":"Producer","status":"Unset","totalMs":2.001,"selfMs":2.001,"children":[]}]},
+        {"spanId":"0000000000000202","name":"sibling at level 31","service":"svc","kind":"Internal","status":"Ok","totalMs":1,"selfMs":1,"children":[]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]},
+        {"spanId":"0000000000000000","name":"no id at level 16","service":"svc","kind":"Consumer","status":"Ok","totalMs":0.001,"selfMs":0.001,"children":[]}]}]}]}]}]}]}]}]}]}]}]}]}]}]},
+        {"spanId":"0000000000000201","name":"sibling at level 2","service":"svc","kind":"Client","status":"Error","totalMs":3.333,"selfMs":3.333,"children":[]}]}
         """;
 
     private const string CompareInvariant = """
