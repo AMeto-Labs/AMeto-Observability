@@ -346,9 +346,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal Action? _beforeMergeSwap;
     /// <summary>
     /// Test hook: called by <see cref="CommitMerge"/> once the catalog has swapped the output in
-    /// for the sources and before any source file is unlinked, under <c>_importLock</c> and
-    /// <see cref="_scanDeleteGate"/> — the window the merge's old publish-then-delete order left
-    /// open for readers to count the batch twice. A throw from it is a crash between the two.
+    /// for the sources and the sources are parked, before any source file is unlinked, with no
+    /// lock held — the window the merge's old publish-then-delete order left open for readers to
+    /// count the batch twice. A throw from it is a crash between the two.
     /// </summary>
     internal Action? _afterMergeSwap;
     /// <summary>
@@ -1668,7 +1668,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// What taking an entry out of the catalog owes everything else that tracks it, for
     /// <see cref="DeleteSegmentAsync"/> and a merge's commit (<see cref="CommitMerge"/>). The
     /// caller holds <c>_importLock</c> and <see cref="_scanDeleteGate"/>, has just removed the
-    /// entry, and calls <see cref="UnlinkRemovedSegment"/> before it lets go of either lock.
+    /// entry, and before it lets go of either lock either unlinks the file
+    /// (<see cref="UnlinkRemovedSegment"/>, the delete) or parks it (the merge).
     /// </summary>
     private void ForgetRemovedSegment(SegmentKey key, string path)
     {
@@ -1909,21 +1910,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         if (_pendingSegmentDeletes.Count >= PendingSegmentDeleteCap)
         {
-            if (Interlocked.Exchange(ref _pendingSegmentDeleteCapWarned, 1) == 0)
-                _logger.LogWarning(
-                    "{Count} segment files are already waiting to be deleted, the most that are retried. A segment " +
-                    "file whose delete fails from now on is not retried: each is logged at Information and stays on " +
-                    "disk until the next start's catalog scan and retention pass find it. This many failing at once " +
-                    "usually means the volume refuses deletes (read-only, permissions), not that queries hold the files.",
-                    _pendingSegmentDeletes.Count);
-            _logger.LogInformation(ex,
-                "Segment file {File} could not be deleted and is not retried: the pending-delete set is full", path);
+            LogNotRetried(path, ex);
             return;
         }
 
         _pendingSegmentDeletes.TryAdd(path, new PendingSegmentDelete(key, System.Diagnostics.Stopwatch.GetTimestamp()));
         _logger.LogDebug(ex, "Segment {Key} could not be deleted (still open?) — its file delete is retried in the background", key);
         EnsureSegmentDeleteRetryLoop();
+    }
+
+    /// <summary>
+    /// Says that a segment file whose delete failed is left on disk unretried because the
+    /// pending-delete set is full: once at Warning per episode, then per file at Information.
+    /// </summary>
+    private void LogNotRetried(string path, Exception? error)
+    {
+        if (Interlocked.Exchange(ref _pendingSegmentDeleteCapWarned, 1) == 0)
+            _logger.LogWarning(
+                "{Count} segment files are already waiting to be deleted, the most that are retried. A segment " +
+                "file whose delete fails from now on is not retried: each is logged at Information and stays on " +
+                "disk until the next start's catalog scan and retention pass find it. This many failing at once " +
+                "usually means the volume refuses deletes (read-only, permissions), not that queries hold the files.",
+                _pendingSegmentDeletes.Count);
+        _logger.LogInformation(error,
+            "Segment file {File} could not be deleted and is not retried: the pending-delete set is full", path);
     }
 
     /// <summary>Starts the background retry loop unless one is running or shutdown has begun.</summary>
@@ -3304,17 +3314,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// live tail, <c>/api/events/counts</c>, <c>ListSegments</c> (#85). A file on disk that no
     /// entry names is served by nobody, so the unlinks can come after the swap.</para>
     ///
-    /// <para>Under <c>_importLock</c> and <see cref="_scanDeleteGate"/>, the two locks
-    /// <see cref="DeleteSegmentAsync"/> takes, and for the same reasons: an import publishes its
-    /// entry before it lands its file, and the boot catalog scan must see each source either
-    /// still named, or gone from the catalog with its path recorded and its file unlinked or
-    /// parked. The hold covers the unlinks too, which is what keeps that last promise: a scan
-    /// starting between a release after the swap and the unlinks would find a source's file on
-    /// disk (its own merge recovery deletes it first, unless a reader holds it), neither parked
-    /// nor recorded for it, and register it beside the output. So an import
-    /// or a retention delete waits for up to <see cref="MergeMaxSources"/> unlinks, which is the
-    /// same work the per-source deletes did under the same lock, now without letting one in
-    /// between.</para>
+    /// <para>The swap is made under <c>_importLock</c> and <see cref="_scanDeleteGate"/>, the two
+    /// locks <see cref="DeleteSegmentAsync"/> takes, and for the same reasons: an import publishes
+    /// its entry before it lands its file, and the boot catalog scan must find each source either
+    /// still named, or gone from the catalog with its path recorded for it or parked. So each
+    /// removed source is recorded AND PARKED in the same hold, whatever the pending-delete cap
+    /// says: the park is what keeps a scan that starts after the hold off a file still on disk
+    /// (its own merge recovery deletes such a file first, unless a reader holds it).</para>
+    ///
+    /// <para>The unlinks come after, outside that hold, one file per take of <c>_importLock</c>
+    /// (<see cref="SettleMergedSources"/>). Held across all of them, the commit made every import
+    /// (a replication POST), every retention delete and every header scan that met a missing file
+    /// (<see cref="OpenForHeaderScan"/>) wait for up to <see cref="MergeMaxSources"/> unlinks —
+    /// seconds on NTFS with an on-access scanner, every 15 s while a backlog drains.</para>
     ///
     /// <para>A source the swap finds already gone (retention removed it after the planner read
     /// the catalog) is left alone: its file is the remover's, unlinked or parked by it.</para>
@@ -3330,17 +3342,64 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             displaced = _segments.Swap(output, sources, removed);
             PublishMergedAwayMark();
 
+            long parkedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             for (int i = 0; i < removed.Length; i++)
-                if (removed[i] is { } gone) ForgetRemovedSegment(sources[i], gone.FilePath);
-
-            _afterMergeSwap?.Invoke();
-
-            for (int i = 0; i < removed.Length; i++)
-                if (removed[i] is { } gone) UnlinkRemovedSegment(sources[i], gone.FilePath);
+            {
+                if (removed[i] is not { } gone) continue;
+                ForgetRemovedSegment(sources[i], gone.FilePath);
+                // Past PendingSegmentDeleteCap too: this park is not a failed delete waiting for a
+                // retry but the scan's guard until the unlink below, and the cap is applied to
+                // what is still parked once that has been tried (see SettleMergedSources).
+                _pendingSegmentDeletes.TryAdd(gone.FilePath, new PendingSegmentDelete(sources[i], parkedAt));
+            }
         }
 
         if (displaced is not null && !IsTheSameSegment(displaced, output))
             LogDisplacedLocalSegment(output, displaced);
+
+        _afterMergeSwap?.Invoke();
+
+        SettleMergedSources(sources, removed);
+    }
+
+    /// <summary>
+    /// Unlinks the sources <see cref="CommitMerge"/> parked, each through
+    /// <see cref="TryCompletePendingSegmentDelete"/>: under <c>_importLock</c> for that one file,
+    /// re-checking that no entry names the path again (a re-push of a replicated source may have
+    /// landed there since), and recording the path for a running catalog scan before it leaves
+    /// the park.
+    ///
+    /// <para>A source that cannot be unlinked yet — on Windows, a query still maps it — stays
+    /// parked for the background retry, as a failed delete does, and the manifest keeps it for
+    /// the recovery sweep as well. Only up to <see cref="PendingSegmentDeleteCap"/>: past it, a
+    /// path is let go as a failed delete past the cap is (logged, left on disk, the park's record
+    /// handed to a running scan), and the recovery sweep retries it from the manifest. The commit
+    /// parked past the cap only for the moment between its hold and this attempt.</para>
+    /// </summary>
+    private void SettleMergedSources(SegmentKey[] sources, SegmentInfo?[] removed)
+    {
+        bool anyLeft = false;
+        for (int i = 0; i < removed.Length; i++)
+        {
+            if (removed[i] is not { } gone) continue;
+            if (TryCompletePendingSegmentDelete(gone.FilePath)) removed[i] = null;
+            else anyLeft = true;
+        }
+        if (!anyLeft) return;
+
+        lock (_importLock)
+        lock (_scanDeleteGate)
+        {
+            for (int i = 0; i < removed.Length && _pendingSegmentDeletes.Count > PendingSegmentDeleteCap; i++)
+            {
+                if (removed[i] is not { } gone) continue;
+                if (!_pendingSegmentDeletes.TryGetValue(gone.FilePath, out var pending) || pending.Key != sources[i]) continue;
+                _deletedDuringCatalogScan?.Add(gone.FilePath);
+                Unpark(gone.FilePath);
+                LogNotRetried(gone.FilePath, error: null);
+            }
+        }
+        EnsureSegmentDeleteRetryLoop();
     }
 
     /// <summary>

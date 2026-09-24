@@ -353,6 +353,10 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.Equal(output.FilePath + ".mergemanifest", manifest);
         AssertSameEvents(before, ReadEverything());
 
+        // The commit parked the sources, and shutdown makes one last attempt at every parked
+        // delete. A killed process makes none, so neither may this one: the restart's recovery is
+        // what this test is about.
+        _engine._deleteSegmentFile = static _ => throw new IOException("the process is dead");
         await RestartAsync();
 
         foreach (var path in sources) Assert.False(File.Exists(path), $"{path} survived recovery");
@@ -459,6 +463,138 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         for (int round = 10; round < 20; round++)
             await WriteSegmentAsync(round, 60);
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the merge gate was never let go");
+    }
+
+    /// <summary>A replicated segment's file, as a peer pushes it: another node's id, four events.</summary>
+    private string WritePeerSegment(ulong segId)
+    {
+        var peer = new NodeId(7);
+        var pool = new StringInternPool();
+        using var hot = new HotTierSegment(16, 1L << 20);
+        long now = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < 4; i++)
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(peer.Value, (uint)i).RawValue,
+                TimestampUtcTicks        = now + i * TimeSpan.TicksPerMillisecond,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = pool.Intern("peer {n}"),
+            }, Props(i), "peer {n}"));
+        hot.Freeze();
+
+        string path = Path.Combine(SegDir, $"{peer.Value}-{segId}.seg");
+        using (var writer = new SegmentWriter(path))
+        {
+            writer.WriteEvents(hot, pool);
+            writer.Finalise(peer, new SegmentId(segId));
+        }
+        return path;
+    }
+
+    /// <summary>
+    /// The commit holds <c>_importLock</c> and the scan gate for the swap, not for the unlinks
+    /// after it. Held across up to 512 of them, it stalled every replication POST, every
+    /// retention delete and every header scan that met a missing file (all three take
+    /// <c>_importLock</c>) for the whole of a commit — seconds on NTFS with an on-access scanner,
+    /// every 15 s while a backlog drains. From the window after the swap and before the first
+    /// unlink, an import and a delete run on another thread and must finish while the merge
+    /// waits there. Each unlink still takes <c>_importLock</c> for its one file.
+    /// </summary>
+    [Fact]
+    public async Task BetweenTheSwapAndTheUnlinks_AnImportAndADeleteDoNotWaitForTheCommit()
+    {
+        await _engine.CatalogLoaded;   // the peer file below is the import's, not the boot scan's
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var peerPath = WritePeerSegment(900);
+
+        SegmentImportOutcome? imported = null;
+        bool finishedInside = false, sourcesOnDisk = false;
+        var sources = _engine.ListSegments().Select(s => s.FilePath).ToList();
+        _engine._afterMergeSwap = () =>
+        {
+            sourcesOnDisk = sources.All(File.Exists);
+            var other = Task.Run(async () =>
+            {
+                imported = _engine.ImportSegment(peerPath);
+                await _engine.DeleteSegmentAsync(new SegmentKey(new NodeId(7), new SegmentId(900)));
+            });
+            // Bounded, and only the failing case waits it out: blocked, the two cannot finish
+            // until this hook returns.
+            finishedInside = other.Wait(TimeSpan.FromSeconds(10));
+        };
+        bool merged;
+        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        finally { _engine._afterMergeSwap = null; }
+
+        Assert.True(merged, "setup: the merge merged nothing");
+        Assert.True(sourcesOnDisk, "setup: the hook did not run before the unlinks");
+        Assert.True(finishedInside, "an import and a delete waited for the merge's commit to finish its unlinks");
+        Assert.Equal(SegmentImportOutcome.Registered, imported);
+        Assert.False(File.Exists(peerPath));
+        Assert.Single(_engine.ListSegments());
+        foreach (var path in sources) Assert.False(File.Exists(path), $"{path} survived the merge");
+    }
+
+    /// <summary>
+    /// With the unlinks out of the commit's hold, a catalog scan can START between the two. It
+    /// runs merge recovery first, which deletes the sources, except one a reader holds open: that
+    /// one it lists, and the park the commit made in its hold is what keeps it from registering
+    /// the file beside the output. Windows-only: elsewhere the held file is deleted anyway.
+    /// </summary>
+    [Fact]
+    public async Task ACatalogScanStartingBetweenTheSwapAndTheUnlinks_RegistersNoHeldSource()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var victim = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).First().FilePath;
+
+        using (new FileStream(victim, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            _engine._afterMergeSwap = _engine.LoadSegmentCatalog;
+            bool merged;
+            try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+            finally { _engine._afterMergeSwap = null; }
+
+            Assert.True(merged, "setup: the merge merged nothing");
+            Assert.True(File.Exists(victim), "setup: the held source should have survived its unlink");
+            var output = Assert.Single(_engine.ListSegments());   // 2: the scan registered the held source
+            Assert.NotEqual(victim, output.FilePath);
+            AssertSameEvents(before, ReadEverything());
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // parked for the retry
+        }
+    }
+
+    /// <summary>
+    /// The commit parks every source past <see cref="StorageEngine.PendingSegmentDeleteCap"/>,
+    /// because that park guards a scan, not a retry. What is still parked once the unlinks have
+    /// been tried is held to the cap again: the rest is let go as a failed delete past the cap is
+    /// (logged, left on disk), and the manifest keeps it for the recovery sweep. Here every
+    /// source's unlink fails and the cap is 2.
+    /// </summary>
+    [Fact]
+    public async Task SourcesThatCannotBeUnlinked_StayParkedOnlyUpToTheCap()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var sources = _engine.ListSegments().Select(s => s.FilePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _engine.PendingSegmentDeleteCap = 2;
+        _engine._deleteSegmentFile = path =>
+        {
+            if (sources.Contains(path)) throw new IOException("the volume refuses deletes");
+            File.Delete(path);
+        };
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+
+        Assert.Equal(2, _engine.PendingSegmentDeleteCount);   // 10: every source parked past the cap for good
+        Assert.Equal(8, _log.Entries.Count(e => e.Message.Contains("is not retried: the pending-delete set is full", StringComparison.Ordinal)));
+        foreach (var path in sources) Assert.True(File.Exists(path), "setup: an unlink that was meant to fail succeeded");
+        Assert.Single(Directory.GetFiles(SegDir, "*.mergemanifest"));   // the recovery sweep's copy of the list
+        Assert.Single(_engine.ListSegments());
     }
 
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>
