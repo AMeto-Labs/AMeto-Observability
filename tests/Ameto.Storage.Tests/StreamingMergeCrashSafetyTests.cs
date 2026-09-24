@@ -324,6 +324,93 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         AssertSameEvents(before, ReadEverything());
     }
 
+    /// <summary>
+    /// Killed between the catalog swap and the first unlink — the window #85 moved the source
+    /// deletes into. The catalog already names the output and no source, so the process serves
+    /// every event exactly once while the source files sit on disk unnamed; the manifest names
+    /// them, and the restart's recovery removes them before its catalog scan can register any.
+    /// The crash is a throw from the hook in that window: nothing after it runs, as after a kill.
+    /// </summary>
+    [Fact]
+    public async Task CrashAfterTheSwap_BeforeTheUnlinks_ServesEachEventOnce_AndRecoveryRemovesTheSources()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before  = ReadEverything();
+        var sources = _engine.ListSegments().Select(s => s.FilePath).ToList();
+        Assert.Equal(10, sources.Count);
+
+        _engine._afterMergeSwap = static () => throw new IOException("killed between the swap and the unlinks");
+        await Assert.ThrowsAsync<IOException>(() => _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        _engine._afterMergeSwap = null;
+
+        // In process: the output alone is served, the sources are on disk and named by nothing
+        // but the manifest.
+        var output = Assert.Single(_engine.ListSegments());
+        Assert.Same(output, Assert.Single(_engine.GetSegments(null, null)));
+        foreach (var path in sources) Assert.True(File.Exists(path), $"{path} was unlinked before the crash point");
+        var manifest = Assert.Single(Directory.GetFiles(SegDir, "*.mergemanifest"));
+        Assert.Equal(output.FilePath + ".mergemanifest", manifest);
+        AssertSameEvents(before, ReadEverything());
+
+        await RestartAsync();
+
+        foreach (var path in sources) Assert.False(File.Exists(path), $"{path} survived recovery");
+        Assert.Empty(Directory.GetFiles(SegDir, "*.mergemanifest"));
+        Assert.Equal(output.FilePath, Assert.Single(_engine.ListSegments()).FilePath);
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// A catalog scan that has read a source before the merge commits must not register it after.
+    /// The scan registers a file it read unless a delete recorded the path for it or parked it,
+    /// and the merge's sources no longer go through <c>DeleteSegmentAsync</c>: its commit has to
+    /// record them itself, under the same gate, or the scan puts a source back beside the output
+    /// — an entry for a file the commit unlinks, counted on top of the output that holds its
+    /// events. The scan is held where it has read and closed the first source and not yet taken
+    /// the gate; the whole merge runs there; the scan then finishes.
+    /// </summary>
+    [Fact]
+    public async Task ACatalogScanRunningAcrossTheCommit_RegistersNoSource()
+    {
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before  = ReadEverything();
+        var sources = _engine.ListSegments().Select(s => s.FilePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        using var atFile   = new ManualResetEventSlim();
+        using var released = new ManualResetEventSlim();
+        string? held = null;
+        // Nothing in this hook may throw: the scan's quarantine catch would swallow it.
+        _engine._beforeScanRegistersSegment = file =>
+        {
+            if (held is not null || !sources.Contains(file)) return;
+            held = file;
+            atFile.Set();
+            released.Wait(TimeSpan.FromSeconds(30));
+        };
+
+        var scan = Task.Run(_engine.LoadSegmentCatalog);
+        try
+        {
+            Assert.True(atFile.Wait(TimeSpan.FromSeconds(30)), "setup: the scan never reached a source");
+            Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        }
+        finally
+        {
+            released.Set();
+            await scan.WaitAsync(TimeSpan.FromSeconds(30));
+            _engine._beforeScanRegistersSegment = null;
+        }
+
+        Assert.False(File.Exists(held!), "setup: the held source survived the merge");
+        var output = Assert.Single(_engine.ListSegments());   // 2: the scan put the source it had read back
+        Assert.DoesNotContain(output.FilePath, sources);
+        AssertSameEvents(before, ReadEverything());
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("Quarantining", StringComparison.Ordinal));
+    }
+
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>
     [Fact]
     public async Task CrashMidDeletion_FinishesTheRemainingSources()
