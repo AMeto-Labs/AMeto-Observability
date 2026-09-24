@@ -85,8 +85,10 @@ public static class AlertEndpointMapper
         {
             if (!TryBuildRule(req.Id, req, null, out var rule, out var error))
                 return Results.BadRequest(new { error });
-            double v  = await ev.PreviewAsync(rule, ct);
-            bool fires = Compare(v, rule.Comparator, rule.Threshold);
+            // value null: the window holds no finite value, so there is no verdict — as the
+            // evaluator, which leaves such a rule's state alone (#92). The client prints "—".
+            double? v  = await ev.PreviewAsync(rule, ct);
+            bool fires = v is { } value && Compare(value, rule.Comparator, rule.Threshold);
             return Results.Ok(new { value = v, threshold = rule.Threshold, wouldFire = fires });
         });
 

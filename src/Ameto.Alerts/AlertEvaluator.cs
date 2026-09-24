@@ -198,14 +198,16 @@ public sealed class AlertEvaluator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Evaluate a rule's value right now without affecting state (for the editor preview). A metric
-    /// window with no finite point answers 0, as it did before such a window became "no value" to
-    /// the evaluator: the preview is serialized as a JSON number, and NaN has none.
+    /// Evaluate a rule's value right now without affecting state (for the editor preview) — or
+    /// <c>null</c> when there is none to compare: a metric window with points and not one finite
+    /// (#92). The evaluator leaves such a rule's state alone, so the preview must not claim a
+    /// verdict either; it used to answer 0 here, and "&lt; 5" then previewed as "would fire" for a
+    /// rule the evaluator would never fire. An EMPTY window is still 0, as the evaluator reads it.
     /// </summary>
-    public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
+    public async Task<double?> PreviewAsync(AlertRule rule, CancellationToken ct = default)
     {
         double value = await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
-        return double.IsNaN(value) ? 0 : value;
+        return double.IsNaN(value) ? null : value;
     }
 
     /// <summary>

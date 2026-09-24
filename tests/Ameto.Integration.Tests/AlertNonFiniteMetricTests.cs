@@ -86,8 +86,8 @@ public sealed class AlertNonFiniteMetricTests
         Assert.NotEqual(AlertState.Firing, rig.State().State);
         Assert.DoesNotContain(rig.Evaluator.GetHistory(), h => h.State == AlertState.Firing);
 
-        // The preview answers a number — its JSON has no NaN — and the "empty window" one, as before.
-        Assert.Equal(0, await rig.Evaluator.PreviewAsync(rig.Rule));
+        // The preview claims no value either — it answered 0 here, and "0 < 5" previewed as "would fire".
+        Assert.Null(await rig.Evaluator.PreviewAsync(rig.Rule));
     }
 
     [Fact]
@@ -116,6 +116,7 @@ public sealed class AlertNonFiniteMetricTests
         rig.Metrics.Points = [];
         await rig.Evaluator.EvaluateOnceAsync();                 // an EMPTY window is still 0
         Assert.Equal(AlertState.Ok, rig.State().State);
+        Assert.Equal(0, await rig.Evaluator.PreviewAsync(rig.Rule));
         Assert.Equal(0, rig.Warnings(undetermined: false) + rig.Warnings(undetermined: true));
     }
 
