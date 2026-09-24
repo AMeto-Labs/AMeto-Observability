@@ -15,7 +15,8 @@ namespace Ameto.Integration.Tests;
 /// key once; the label MATCHER — the one scan behind the cold reader, the hot tier and the exemplar
 /// ring — still threw on it, so any filter that touched the series was a 500 on /query, /heatmap and
 /// /exemplars, and a metric alert rule with labels failed every tick while the series was in its
-/// window. Now the key is matched on the last value of its run: the value the answer writes.</para>
+/// window. Now the key is matched on its ordinal-greatest value (the last of its sorted run): the
+/// value the answer writes.</para>
 ///
 /// <para>The series is filed through the real engine exactly as the pre-fix parser left it: a label
 /// set built with the key twice.</para>

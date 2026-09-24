@@ -138,7 +138,7 @@ public sealed class MetricSeriesJsonTests
 
     /// <summary>
     /// A label set with a repeated key — stored before ingest collapsed them (#92), or built by hand —
-    /// is written with the key ONCE, the last value of its run, where the DTO path threw and failed
+    /// is written with the key ONCE, its ordinal-greatest value (the last of its sorted run), where the DTO path threw and failed
     /// the whole answer. The value is the one <c>JSON.parse</c> keeps for a key sent twice; the
     /// series around it are written exactly as before.
     /// </summary>

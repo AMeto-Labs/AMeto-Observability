@@ -20,7 +20,7 @@ namespace Ameto.Storage.Tests;
 /// a v2 file. The goldens hash every bit of every answer; the facts below them state the edge
 /// behaviours in words. One was a latent bug kept on purpose by the rewrite — a repeated label key
 /// threw, exactly as <c>ToDictionary</c> did — and is fixed since (#92): such a key is matched on
-/// the last value of its run.</para>
+/// its ordinal-greatest value, the last of its sorted run.</para>
 /// </summary>
 public sealed class MetricQueryGoldenTests : IDisposable
 {
@@ -246,7 +246,7 @@ public sealed class MetricQueryGoldenTests : IDisposable
         Assert.Equal("577180AA7A46C4CF", Finish(h));
     }
 
-    // ── A repeated label key: matched on the last value of its run (#92) ──────
+    // ── A repeated label key: matched on its ordinal-greatest value (#92) ─────
     //
     // The latent bug this class used to pin — kept by the rewrite, not fixed by it — is fixed now:
     // a set with a key twice (stored before ingest collapsed repeats) failed ANY filtered read with
