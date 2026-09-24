@@ -28,7 +28,9 @@ namespace Ameto.Integration.Tests;
 /// <c>exemplars-dup-key</c> were 500 and are 200 — and a NaN or an infinity is written as
 /// <c>null</c> — <c>raw-nan</c>, <c>raw-infinity</c>, <c>query-nan</c>, <c>expr-sub-default-name</c>
 /// and <c>expr-unknown-op</c> (whose arithmetic overflows) were 500 and are 200, as are the new
-/// <c>exemplars-nan</c> and <c>heatmap-infinite-bound</c>. Nothing else moved.</para>
+/// <c>exemplars-nan</c> and <c>heatmap-infinite-bound</c>. And a group with a NaN member is reduced
+/// over its finite members — the new <c>query-nan-fleet-sum</c> / <c>-last</c> answered null where a
+/// member was NaN. Nothing else moved.</para>
 ///
 /// <para><b>The escaping is not STJ's default, and this test is how that was found.</b> ASP.NET
 /// Core's <c>JsonOptions</c> sets <c>JavaScriptEncoder.UnsafeRelaxedJsonEscaping</c>: <c>&lt;</c>,
@@ -114,6 +116,8 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         { "query-unknown-metric",   "POST", "/api/metrics/query", """{"metric":"nope"}""" },
         { "query-nan",              "POST", "/api/metrics/query", """{"metric":"shape.nan"}""" },
         { "query-dup-key",          "POST", "/api/metrics/query", """{"metric":"shape.dup"}""" },
+        { "query-nan-fleet-sum",    "POST", "/api/metrics/query", """{"metric":"shape.nanfleet","aggregation":"sum","groupBy":["service.name"]}""" },
+        { "query-nan-fleet-last",   "POST", "/api/metrics/query", """{"metric":"shape.nanfleet","aggregation":"last","groupBy":["service.name"]}""" },
         { "query-bad-json",         "POST", "/api/metrics/query", """{"metric":""" },
         { "query-no-metric",        "POST", "/api/metrics/query", """{"aggregation":"rate"}""" },
         { "query-blank-metric",     "POST", "/api/metrics/query", """{"metric":"  "}""" },
@@ -339,7 +343,9 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         ["query-max-missing-key"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":0,\"sum\":0}]}]",
         ["query-min"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
         ["query-nan"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.nan\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"k\":\"v\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0},{\"ts\":1784800801000000000,\"value\":null,\"count\":0,\"sum\":0}]}]",   // was 500 (#92)
-        ["query-dup-key"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.dup\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"k\":\"v2\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0}]}]",   // was 500 (#92)
+        ["query-nan-fleet-sum"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.nanfleet\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"fleet\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":2,\"count\":0,\"sum\":0}]}]",   // the NaN member skipped; was null, null (#92)
+        ["query-nan-fleet-last"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.nanfleet\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"fleet\"},\"points\":[{\"ts\":1784800815000000000,\"value\":3,\"count\":0,\"sum\":0}]}]",   // each pod's last finite value; was null (#92)
+        ["query-dup-key"] ="200 application/json; charset=utf-8\n[{\"name\":\"shape.dup\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"k\":\"v2\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0}]}]",   // was 500 (#92)
         ["query-no-content-type"] = "400 application/json; charset=utf-8\n\"Invalid JSON\"",
         ["query-no-metric"] = "400 application/json; charset=utf-8\n\"'metric' is required\"",
         ["query-none"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
@@ -466,6 +472,15 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
 
                 case "shape.inf":
                     yield return Series("shape.inf", MetricKind.Gauge, "", L("k", "v"), null, P(T0, double.PositiveInfinity));
+                    break;
+
+                case "shape.nanfleet":
+                    // Two pods of one service, each with a NaN where the other has a value: the group
+                    // is answered from the finite member at every timestamp.
+                    yield return Series("shape.nanfleet", MetricKind.Gauge, "", L("service.name", "fleet", "pod", "a"), null,
+                        P(T0, 1), P(T0 + 15 * S, double.NaN));
+                    yield return Series("shape.nanfleet", MetricKind.Gauge, "", L("service.name", "fleet", "pod", "b"), null,
+                        P(T0, double.NaN), P(T0 + 15 * S, 2));
                     break;
 
                 case "shape.dup":

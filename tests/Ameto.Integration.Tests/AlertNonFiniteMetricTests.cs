@@ -119,6 +119,69 @@ public sealed class AlertNonFiniteMetricTests
         Assert.Equal(0, rig.Warnings(undetermined: false) + rig.Warnings(undetermined: true));
     }
 
+    /// <summary>
+    /// THROUGH THE REAL AGGREGATOR: two pods of one service, one exporting NaN. A rule over the
+    /// service — grouped, as fleet rules are, with the default instant "last" or a grouped max —
+    /// used to see the group's value as NaN at every timestamp (the aggregator folded the NaN into
+    /// the sum / the max before the evaluator could skip it), so it was never evaluated while that
+    /// pod lived. It is evaluated on the finite pod.
+    /// </summary>
+    [Theory]
+    [InlineData(null,  4.0)]      // the default: last — pod a's 4 (pod b has no finite value)
+    [InlineData("max", 4.0)]
+    [InlineData("sum", 4.0)]
+    public async Task A_rule_over_a_group_with_a_NaN_member_is_evaluated_on_the_finite_one(string? aggregation, double expected)
+    {
+        var fleet = new Fleet(
+            new MetricSeries { Name = "queue.depth", Kind = MetricKind.Gauge, Labels = Pod("a"),
+                               Points = [P(T0, 3), P(T0 + S, 4)] },
+            new MetricSeries { Name = "queue.depth", Kind = MetricKind.Gauge, Labels = Pod("b"),
+                               Points = [P(T0, double.NaN), P(T0 + S, double.NaN)] });
+        var rule = new AlertRule
+        {
+            Id = "fleet-rule", Name = "fleet rule", Source = AlertSource.Metric, Metric = "queue.depth",
+            Aggregation = aggregation, GroupBy = ["service.name"],
+            Comparator = AlertComparator.GreaterThan, Threshold = 3.5,
+            Window = TimeSpan.FromMinutes(5), For = TimeSpan.Zero, Cooldown = TimeSpan.Zero,
+        };
+        await using var rig = new Rig(rule, new MetricAggregator(fleet));
+
+        await rig.Evaluator.EvaluateOnceAsync();
+
+        var state = rig.State();
+        Assert.Equal(AlertState.Firing, state.State);
+        Assert.Equal(expected, state.LastValue);
+        Assert.Equal(0, rig.Warnings(undetermined: true));
+    }
+
+    private static LabelSet Pod(string pod) =>
+        new([new("service.name", "checkout"), new("pod", pod)]);
+
+    private static MetricDataPoint P(long ts, double v) => new() { TimestampUnixNano = ts, Value = v };
+
+    /// <summary>Storage as the aggregator sees it: these series, for any metric and window.</summary>
+    private sealed class Fleet(params MetricSeries[] series) : IMetricQuery
+    {
+        public IEnumerable<string> GetMetricNames(string? prefix = null) => [];
+
+        public async IAsyncEnumerable<MetricSeries> QueryAsync(
+            string metricName, DateTimeOffset? from = null, DateTimeOffset? to = null, TimeSpan? step = null,
+            IReadOnlyDictionary<string, string>? labelMatchers = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            foreach (var s in series) yield return s;
+        }
+
+        public async IAsyncEnumerable<MetricSeries> GetLatestAsync(
+            string metricName, IReadOnlyDictionary<string, string>? labelMatchers = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
     // ── Rig ───────────────────────────────────────────────────────────────────
 
     private static AlertRule Rule(AlertComparator comparator, double threshold) => new()
@@ -144,7 +207,9 @@ public sealed class AlertNonFiniteMetricTests
         public AlertEvaluator Evaluator { get; }
         public AlertRule      Rule      { get; }
 
-        public Rig(AlertRule rule)
+        /// <param name="aggregator">What the evaluator queries: <see cref="Metrics"/>' single fixed
+        /// series unless a test hands it the real aggregator.</param>
+        public Rig(AlertRule rule, IMetricAggregator? aggregator = null)
         {
             Directory.CreateDirectory(_dir);
             var store = new AlertRuleStore(_dir, new NoopProtector(), NullLogger<AlertRuleStore>.Instance);
@@ -154,7 +219,7 @@ public sealed class AlertNonFiniteMetricTests
                 new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance),
                 AlertHeaderCountTests.ThrowingProxy.For<Ameto.Core.IQueryExecutor>(),
                 null!,   // the log engine: a metric rule never reaches it
-                Metrics,
+                aggregator ?? Metrics,
                 AlertHeaderCountTests.ThrowingProxy.For<ITraceStatsProvider>(),
                 _log);
             Rule = rule;

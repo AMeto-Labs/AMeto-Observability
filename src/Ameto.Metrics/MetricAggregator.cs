@@ -117,7 +117,10 @@ public sealed class MetricAggregator : IMetricAggregator
     /// <summary>
     /// Reduces a multi-series result to (ts → summed value) pairs ordered by time. Each timestamp's
     /// sum starts at 0.0 and adds its values in series order, then point order, as
-    /// <c>GetValueOrDefault(ts) + value</c> into a sorted dictionary did.
+    /// <c>GetValueOrDefault(ts) + value</c> into a sorted dictionary did — its FINITE values (#92):
+    /// a NaN or ±Infinity is skipped, as <c>Accumulate</c> skips it, and a timestamp with no finite
+    /// value sums to NaN (a gap), not 0. NaN marks "nothing added yet": finite additions cannot make
+    /// one (an overflow is an infinity, and nothing finite adds the opposite infinity to it).
     /// </summary>
     private static List<(long Ts, double Value)> SumToSingle(IReadOnlyList<MetricSeries> series)
     {
@@ -131,8 +134,10 @@ public sealed class MetricAggregator : IMetricAggregator
                 for (int i = 0; i < points.Count; i++)
                 {
                     int slot = slots.SlotOf(points[i].TimestampUnixNano, out bool added);
-                    if (added) { Grow(ref sums, slots.Count, clear: false); sums[slot] = 0.0; }
-                    sums[slot] += points[i].Value;
+                    if (added) { Grow(ref sums, slots.Count, clear: false); sums[slot] = double.NaN; }
+                    double v = points[i].Value;
+                    if (!double.IsFinite(v)) continue;
+                    sums[slot] = double.IsNaN(sums[slot]) ? 0.0 + v : sums[slot] + v;
                 }
             }
 
@@ -223,28 +228,45 @@ public sealed class MetricAggregator : IMetricAggregator
         {
             var pts = s.Points;
             if (pts.Count < 2) continue;
+            bool useCount = s.Kind == MetricKind.Histogram;
             var outPts = new List<MetricDataPoint>(pts.Count - 1);
-            for (int i = 1; i < pts.Count; i++)
-                outPts.Add(new MetricDataPoint
-                {
-                    TimestampUnixNano = pts[i].TimestampUnixNano,
-                    Value             = RateAt(pts, i, s.Kind == MetricKind.Histogram, perSecond),
-                });
+            int prev = -1;
+            for (int i = 0; i < pts.Count; i++)
+            {
+                if (!HasRateInput(pts[i], useCount)) continue;
+                if (prev >= 0)
+                    outPts.Add(new MetricDataPoint
+                    {
+                        TimestampUnixNano = pts[i].TimestampUnixNano,
+                        Value             = RateBetween(pts[prev], pts[i], useCount, perSecond),
+                    });
+                prev = i;
+            }
             rateSeries.Add(new MetricSeries { Name = s.Name, Kind = s.Kind, Unit = s.Unit, Labels = s.Labels, Points = outPts });
         }
         return rateSeries;
     }
 
-    /// <summary>The rate (or increase) that point <paramref name="i"/> contributes, from point i - 1.</summary>
-    private static double RateAt(IReadOnlyList<MetricDataPoint> pts, int i, bool useCount, bool perSecond)
+    /// <summary>
+    /// Whether a point takes part in a rate: always for a histogram (its cumulative count is an
+    /// integer), and for a counter when its value is finite. A NaN or ±Infinity counter value is no
+    /// measurement (#92): the rate runs from the last finite point to the next one, as if it were not
+    /// there. Taken as a value, a NaN read as a counter RESET on the point after it (x &gt;= NaN is
+    /// false), and that point's whole cumulative value became one step's increase — a spike of the
+    /// counter's lifetime total in every rate panel and every rate alert.
+    /// </summary>
+    private static bool HasRateInput(in MetricDataPoint p, bool useCount) => useCount || double.IsFinite(p.Value);
+
+    /// <summary>The rate (or increase) from point <paramref name="prev"/> to point <paramref name="curr"/>.</summary>
+    private static double RateBetween(in MetricDataPoint prev, in MetricDataPoint curr, bool useCount, bool perSecond)
     {
-        double prev = useCount ? pts[i - 1].Count : pts[i - 1].Value;
-        double curr = useCount ? pts[i].Count     : pts[i].Value;
-        double delta = ResetAwareDelta(prev, curr);
+        double p = useCount ? prev.Count : prev.Value;
+        double c = useCount ? curr.Count : curr.Value;
+        double delta = ResetAwareDelta(p, c);
         double v = delta;
         if (perSecond)
         {
-            double dtSec = (pts[i].TimestampUnixNano - pts[i - 1].TimestampUnixNano) / 1e9;
+            double dtSec = (curr.TimestampUnixNano - prev.TimestampUnixNano) / 1e9;
             v = dtSec > 0 ? delta / dtSec : 0;
         }
         return v;
@@ -266,21 +288,35 @@ public sealed class MetricAggregator : IMetricAggregator
 
         if (op == ScalarReduce.Last)
         {
-            // Instant: one point per group = sum of each series' latest value.
+            // Instant: one point per group = sum of each series' latest value — its latest FINITE
+            // value (#92): a NaN or ±Infinity is no measurement, so a series whose newest point is
+            // one reads as its last real value, and one with none contributes nothing. Summed as it
+            // was, one such series made the whole group's value NaN — the alert default aggregation,
+            // so the rule was never evaluated again while the series lived.
             var groups  = Grouping.Of(raw, req.GroupBy);
             var outList = new List<MetricSeries>(groups.Count);
             for (int g = 0; g < groups.Count; g++)
             {
                 var members = groups.MembersOf(g);
-                long ts = 0; double sum = 0;
+                long ts = 0, tsAny = 0; double sum = 0;
+                bool counted = false, anyPoint = false;
                 foreach (int m in members)
                 {
                     var points = raw[m].Points;
                     if (points.Count == 0) continue;
-                    var last = points[^1];
+                    anyPoint = true;
+                    if (points[^1].TimestampUnixNano > tsAny) tsAny = points[^1].TimestampUnixNano;
+                    int j = points.Count - 1;
+                    while (j >= 0 && !double.IsFinite(points[j].Value)) j--;
+                    if (j < 0) continue;
+                    var last = points[j];
                     sum += last.Value;
+                    counted = true;
                     if (last.TimestampUnixNano > ts) ts = last.TimestampUnixNano;
                 }
+                // Points, and not one finite: no value — NaN (null, and "no value" to an alert),
+                // never the 0 the empty sum reads as. A group with no points at all keeps its 0.
+                if (anyPoint && !counted) { sum = double.NaN; ts = tsAny; }
                 var first = raw[members[0]];
                 outList.Add(new MetricSeries
                 {
@@ -463,9 +499,15 @@ public sealed class MetricAggregator : IMetricAggregator
                     else
                     {
                         bool useCount = s.Kind == MetricKind.Histogram;
-                        for (int i = 1; i < points.Count; i++)
-                            Accumulate(slots, ref acc, points[i].TimestampUnixNano,
-                                       RateAt(points, i, useCount, rate == RateMode.PerSecond));
+                        int  prev     = -1;
+                        for (int i = 0; i < points.Count; i++)
+                        {
+                            if (!HasRateInput(points[i], useCount)) continue;
+                            if (prev >= 0)
+                                Accumulate(slots, ref acc, points[i].TimestampUnixNano,
+                                           RateBetween(points[prev], points[i], useCount, rate == RateMode.PerSecond));
+                            prev = i;
+                        }
                     }
                 }
 
@@ -474,7 +516,7 @@ public sealed class MetricAggregator : IMetricAggregator
                 foreach (int slot in sorted)
                 {
                     ref readonly var a = ref acc[slot];
-                    double v = op switch
+                    double v = a.N == 0 ? double.NaN : op switch   // no member finite here: a gap
                     {
                         ScalarReduce.Sum => a.Sum,
                         ScalarReduce.Min => a.Min,
@@ -500,8 +542,15 @@ public sealed class MetricAggregator : IMetricAggregator
     }
 
     /// <summary>
-    /// One value into its timestamp's accumulator: the first seeds sum, min and max with itself
-    /// (not 0 + v — a lone -0.0 sums to -0.0), every later one adds, in the order offered.
+    /// One value into its timestamp's accumulator: the first FINITE one seeds sum, min and max with
+    /// itself (not 0 + v — a lone -0.0 sums to -0.0), every later one adds, in the order offered.
+    ///
+    /// <para><b>A NaN or ±Infinity is no measurement and is not accumulated</b> (#92) — the rule the
+    /// response writer (<c>null</c>) and the alert evaluator (skipped) already apply to a point. Folded
+    /// in, one exporter's NaN made the whole group's sum, average, min and max NaN at every timestamp
+    /// it touched: a fleet panel went blank for one pod, and an alert rule over it saw no value at
+    /// all. Its timestamp still gets a slot: a timestamp where no member has a finite value is
+    /// answered as NaN (<c>null</c>, a gap), not dropped and not 0.</para>
     /// </summary>
     private static void Accumulate(TimestampSlots slots, ref Accumulator[] acc, long ts, double v)
     {
@@ -509,10 +558,15 @@ public sealed class MetricAggregator : IMetricAggregator
         if (added)
         {
             Grow(ref acc, slots.Count, clear: false);
-            acc[slot] = new Accumulator { Sum = v, Min = v, Max = v, N = 1 };
+            acc[slot] = default;                          // N = 0: no finite value yet
+        }
+        if (!double.IsFinite(v)) return;
+        ref var a = ref acc[slot];
+        if (a.N == 0)
+        {
+            a = new Accumulator { Sum = v, Min = v, Max = v, N = 1 };
             return;
         }
-        ref var a = ref acc[slot];
         a.Sum += v;
         a.Min  = Math.Min(a.Min, v);
         a.Max  = Math.Max(a.Max, v);
@@ -611,8 +665,18 @@ public sealed class MetricAggregator : IMetricAggregator
         }
     }
 
+    /// <summary>
+    /// The value top-K ranks a series by: its latest FINITE value (#92) — a series whose newest point
+    /// is NaN ranks by its last real value instead of below every other series — or 0 when it has
+    /// none, as an empty series always ranked.
+    /// </summary>
     private static double LastValue(MetricSeries s)
-        => s.Points.Count > 0 ? s.Points[^1].Value : 0;
+    {
+        var pts = s.Points;
+        for (int j = pts.Count - 1; j >= 0; j--)
+            if (double.IsFinite(pts[j].Value)) return pts[j].Value;
+        return 0;
+    }
 
     // ── Rented per-slot storage ───────────────────────────────────────────────
 
