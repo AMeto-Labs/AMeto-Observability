@@ -238,6 +238,76 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
     }
 
+    /// <summary>
+    /// PR #96 follow-up review: the gRPC receiver gave its slot — and the inflated buffer — back in
+    /// its outer finally, AFTER writing the response. A client that stops reading (an HTTP/2
+    /// window of 0) held both until Kestrel timed the write out, and two such streams on the
+    /// stand's two slots made every other compressed batch wait its second and get
+    /// 503 / UNAVAILABLE. Here the response write is held open at a seam: the slot must already
+    /// be back, and a second compressed call must get through while the first is still stuck.
+    /// </summary>
+    [Fact]
+    public async Task A_grpc_call_gives_its_slot_back_before_it_writes_the_response()
+    {
+        var gate    = new OtlpInflateGate(1, TimeSpan.Zero);
+        byte[] gz   = OtlpGzipTests.Gzip(EmptyExport("/v1/logs", protobuf: true));
+        var stalled = new StalledResponseBody();
+
+        var first = GrpcCall(Frame(gz, compressed: true));
+        first.Response.Body = stalled;
+        Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog,
+            static (_, _) => (true, 0, null));
+
+        await stalled.Writing.Task.WaitAsync(TimeSpan.FromSeconds(15));   // decoded; the response is stuck
+        try
+        {
+            Assert.Equal(gate.Capacity, gate.Available);
+
+            var second = GrpcCall(Frame(gz, compressed: true));
+            await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog,
+                static (_, _) => (true, 0, null));
+            Assert.Equal("0", second.Response.Headers["grpc-status"].ToString());
+        }
+        finally
+        {
+            stalled.Release();
+        }
+
+        await handling.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal("0", first.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(gate.Capacity, gate.Available);
+    }
+
+    /// <summary>A response body whose first write does not complete until the test says so: a client that stopped reading.</summary>
+    private sealed class StalledResponseBody : Stream
+    {
+        private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Writing { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Release() => _released.TrySetResult();
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            Writing.TrySetResult();
+            await _released.Task.WaitAsync(ct);
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+            => WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+
+        public override bool CanRead  => false;
+        public override bool CanSeek  => false;
+        public override bool CanWrite => true;
+        public override long Length   => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int  Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────
 
     /// <summary>

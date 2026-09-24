@@ -159,7 +159,8 @@ public static class OtlpGrpcEndpointMapper
             // A message that will be inflated waits for a slot of the gate the HTTP receivers
             // share (OtlpInflateGate); an identity frame never does. Full past the wait is
             // UNAVAILABLE, the code an exporter retries with backoff — the batch is delayed, not
-            // refused. The slot is given back with the inflated buffer, in the finally below.
+            // refused. The slot is given back with the inflated buffer — as soon as nothing reads
+            // it any more, and always BEFORE a response is written (see ReleaseInflate).
             if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
             {
                 if (!await inflateGate.TryEnterAsync(ctx.RequestAborted))
@@ -174,6 +175,8 @@ public static class OtlpGrpcEndpointMapper
                                                       out var message, out inflated, out int inflatedLen);
             if (unframed != UnframeResult.Ok)
             {
+                // A refused unframe leaves no inflated buffer, but it may hold a slot.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 switch (unframed)
                 {
                     case UnframeResult.UnsupportedEncoding:
@@ -213,12 +216,23 @@ public static class OtlpGrpcEndpointMapper
             }
             catch (Exception ex)
             {
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 ctx.RequestServices.GetRequiredService<ILoggerFactory>()
                    .CreateLogger("Ameto.Otel.Grpc")
                    .LogWarning(ex, "OTLP/gRPC: failed to decode {Bytes} bytes", segment.Count);
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
             }
+
+            // The decoder has returned, and the sinks copy what they keep: nothing reads the
+            // inflated message any more. Its buffer and its slot go back NOW, before a byte of the
+            // response is written — not after. A client that stops reading (an HTTP/2 stream
+            // window of 0 is enough) would otherwise hold both until Kestrel timed the stalled
+            // write out, and on the stand's two slots two such streams turned every other
+            // compressed batch, HTTP or gRPC, into a one-second wait and a 503 / UNAVAILABLE.
+            // The HTTP receivers release theirs in the parse finally, before WriteJsonOk, for the
+            // same reason.
+            ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
 
             if (!ok)
             {
@@ -237,8 +251,25 @@ public static class OtlpGrpcEndpointMapper
         finally
         {
             IngestBufferPool.Return(body);
-            if (inflated is not null) IngestBufferPool.Return(inflated);
-            if (holdsSlot) inflateGate.Exit();
+            ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
+        }
+    }
+
+    /// <summary>
+    /// Gives back the inflated buffer and the gate slot it holds, if either is still held — and
+    /// clears both, so the finally that calls it again after an earlier release does nothing.
+    /// </summary>
+    private static void ReleaseInflate(ref byte[]? inflated, ref bool holdsSlot, OtlpInflateGate gate)
+    {
+        if (inflated is not null)
+        {
+            IngestBufferPool.Return(inflated);
+            inflated = null;
+        }
+        if (holdsSlot)
+        {
+            gate.Exit();
+            holdsSlot = false;
         }
     }
 
