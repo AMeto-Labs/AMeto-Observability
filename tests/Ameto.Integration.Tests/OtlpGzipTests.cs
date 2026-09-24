@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
+using System.Numerics;
 using Ameto.Core;
 using Ameto.Otel;
 using Xunit.Abstractions;
@@ -136,6 +137,29 @@ public sealed class OtlpGzipTests
 
         Assert.True(ledger.LargestRent <= Limit,
             $"a trailer claiming {int.MaxValue:N0} bytes had the inflate rent {ledger.LargestRent:N0} — past the {Limit:N0} limit");
+        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
+    }
+
+    [Fact]
+    public void A_tiny_body_claiming_gigabytes_rents_only_what_it_could_inflate_to()
+    {
+        // The amplification the limit clamp alone allowed: ~30 bytes on the wire, a 2 GiB claim
+        // in the trailer, and a whole limit-sized buffer rented for it — 8 MiB at the default, a
+        // fresh large-object array whenever the pool is drained, per request, for anyone holding
+        // an ingest key. Deflate cannot beat 1032:1, so that is all the claim is believed for.
+        byte[] body = Gzip("tiny"u8);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(body.Length - 4), int.MaxValue);
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        Assert.Equal(InflateResult.Malformed, Inflate(body, out _));
+
+        long believable = Math.Max((long)body.Length * OtlpGzip.MaxDeflateRatio, OtlpGzip.MinInflateBuffer);
+        long bucket     = (long)BitOperations.RoundUpToPowerOf2((ulong)believable);
+        _out.WriteLine($"{body.Length} B body claiming {int.MaxValue:N0} B: largest rent {ledger.LargestRent:N0} B "
+                     + $"(believable {believable:N0} B, limit {Limit:N0} B)");
+        Assert.True(ledger.LargestRent <= bucket,
+            $"a {body.Length}-byte body rented {ledger.LargestRent:N0} B; it cannot inflate past {believable:N0} B");
+        Assert.True(ledger.LargestRent < Limit, "the trailer's claim still sized a whole limit-sized buffer");
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
     }
 

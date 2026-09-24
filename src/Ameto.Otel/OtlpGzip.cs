@@ -34,6 +34,13 @@ internal static class OtlpGzip
     internal const int MinInflateBuffer = 64 * 1024;
 
     /// <summary>
+    /// Deflate's ceiling: a 258-byte match coded in two bits is the most one input byte can
+    /// buy, 4 x 258 = 1032 output bytes per input byte. No stream inflates further, so no
+    /// honest ISIZE can exceed its payload's length times this.
+    /// </summary>
+    internal const int MaxDeflateRatio = 1032;
+
+    /// <summary>
     /// Inflates <paramref name="payload"/> into a buffer from <see cref="IngestBufferPool"/>,
     /// refusing the moment the output would pass <paramref name="maxInflatedBytes"/> — decided
     /// from bytes ALREADY written, so a bomb is stopped after at most one limit's worth of output
@@ -61,10 +68,16 @@ internal static class OtlpGzip
         // hold what is usually a few hundred KB, and made the pool keep 8 MiB arrays around for
         // it. The gzip trailer says how big the output will be; failing that, 4:1 is the guess.
         // Either way it grows by doubling if the guess was low, and the limit check below is
-        // unchanged. A trailer that LIES high buys one rent of at most the limit — the clamp is
-        // what keeps a four-byte claim from sizing anything past it.
+        // unchanged.
+        //
+        // The trailer is the CLIENT's claim, so it is believed only as far as the payload could
+        // make it true: deflate cannot beat MaxDeflateRatio, so a body of N bytes inflates to at
+        // most N x 1032 whatever its last four bytes say. Clamped to the limit alone, a 30-byte
+        // body claiming 2 GiB rented a whole limit-sized buffer — 8 MiB, a fresh large-object
+        // array whenever the pool was drained — for a request that could never fill 31 KB of it.
         int hint     = InflatedSizeHint(payload.Span);
-        long want    = Math.Max(hint > 0 ? hint : (long)payload.Length * 4, MinInflateBuffer);
+        long ceiling = (long)payload.Length * MaxDeflateRatio;
+        long want    = Math.Max(hint > 0 ? Math.Min(hint, ceiling) : (long)payload.Length * 4, MinInflateBuffer);
         int capacity = (int)Math.Min(want, Math.Max(maxInflatedBytes, 1));
         rented       = IngestBufferPool.Rent(capacity);
 
