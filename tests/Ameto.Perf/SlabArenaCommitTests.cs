@@ -303,11 +303,6 @@ public sealed class SlabArenaCommitTests
     }
 
     /// <summary>
-    /// Finding a mapping's flags by address in smaps text is plain parsing, so it is checked on
-    /// every platform against a canned snippet: inside a range, outside every range, and on a
-    /// boundary between two adjacent mappings (a range's end is exclusive).
-    /// </summary>
-    /// <summary>
     /// THE SPAN RING'S IDLE TRIM GIVES BACK A TAIL, AND NOT ONE BYTE BELOW IT — on the path each
     /// platform really takes: VirtualFree(MEM_DECOMMIT) on Windows, madvise(MADV_DONTNEED) on the
     /// plain Linux allocation. The tail starts at an UNALIGNED offset 100 bytes past a 1 MB
@@ -351,6 +346,11 @@ public sealed class SlabArenaCommitTests
                 Assert.Fail($"byte {i:N0} changed after the tail was reused");
     }
 
+    /// <summary>
+    /// Finding a mapping's flags by address in smaps text is plain parsing, so it is checked on
+    /// every platform against a canned snippet: inside a range, outside every range, and on a
+    /// boundary between two adjacent mappings (a range's end is exclusive).
+    /// </summary>
     [Fact]
     public void The_smaps_lookup_finds_the_flags_of_the_mapping_that_contains_an_address()
     {
