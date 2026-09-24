@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using Ameto.Alerts;
 using Ameto.Core;
 using Ameto.Indexing;
+using Ameto.Server;
 using Ameto.Storage;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 using EventId  = Microsoft.Extensions.Logging.EventId;
@@ -178,26 +179,83 @@ public sealed class LogStoreUnavailableTests
         await storage.DisposeAsync();   // the store closes; the host is not stopping
         Assert.Equal(QueryAvailability.Closed, storage.Availability);
 
+        var wrong = new List<string>();
         foreach (var req in Requests())
         {
             using var res = await SendAsync(client, req);
             string body = await res.Content.ReadAsStringAsync();
-            Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable,
-                $"{req.Method} {req.Url}: {(int)res.StatusCode} after the close — {body}");
-            Assert.Contains(req.Url.StartsWith("/api/alerts", StringComparison.Ordinal) ? "shut down" : "log store has shut down", body);
-            Assert.Equal("5", res.Headers.RetryAfter?.ToString());
+            // Collected, not asserted one by one: the answer is a list of endpoints, and a gate
+            // removed from one of them should name that one, not stop at the first in the list.
+            string expected = req.Url.StartsWith("/api/alerts", StringComparison.Ordinal) ? "shut down" : "log store has shut down";
+            if (res.StatusCode != HttpStatusCode.ServiceUnavailable || !body.Contains(expected)
+                || res.Headers.RetryAfter?.ToString() != "5")
+                wrong.Add($"{req.Method} {req.Url}: {(int)res.StatusCode} after the close — {Clip(body)}");
         }
+        Assert.True(wrong.Count == 0, string.Join(Environment.NewLine, wrong));
     }
 
+    private static string Clip(string s) => s.Length <= 120 ? s : s[..120] + "…";
+
+    /// <summary>
+    /// Every endpoint that reads the log store's data — the two the evaluator stands behind, and
+    /// every other: an aggregation, the property and service lists, the live tail, and the log
+    /// lists of one trace and of one span. Each answered with a 500 or a stream that died once the
+    /// store had closed.
+    /// </summary>
     private static IEnumerable<(string Method, string Url, object? Body)> Requests() =>
     [
         ("GET",  "/api/events/counts", null),
         ("GET",  "/api/events",        null),
+        ("GET",  "/api/events/aggregate?filter=" + Uri.EscapeDataString("select count(*)"), null),
+        ("GET",  "/api/events/props",    null),
+        ("GET",  "/api/events/services", null),
+        ("GET",  "/api/events/live",     null),
+        ("GET",  "/api/traces/0123456789abcdef0123456789abcdef/logs", null),
+        ("GET",  "/api/spans/0123456789abcdef/logs",                  null),
         ("POST", "/api/alerts/preview", new
         {
             name = "preview", source = "Log", comparator = "GreaterThan", threshold = 1, windowSeconds = 3600,
         }),
     ];
+
+    /// <summary>
+    /// THE SEARCH THAT QUEUED THROUGH THE CLOSE. The only search slot is taken; a search arrives,
+    /// passes the check made before the queue — the store is open — and waits; the store closes;
+    /// the slot frees. Asked only before the queue, that search opened a 200 stream over a closed
+    /// store and died inside it. It is refused after the queue instead. The seam is the guard's own
+    /// entry, so the search is known to be past the first check, not merely sent.
+    /// </summary>
+    [Fact]
+    public async Task A_search_queued_while_the_store_closes_is_refused_after_the_queue()
+    {
+        using var factory = new OneSlotFactory();
+        var client  = factory.CreateClient();
+        var storage = factory.Services.GetRequiredService<StorageEngine>();
+        var guard   = factory.Services.GetRequiredService<QueryGuard>();
+
+        var held = await guard.TryEnterAsync(CancellationToken.None);
+        Assert.NotNull(held);
+        var queued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        guard._onEnteringForTest = () => queued.TrySetResult();
+
+        var search = client.GetAsync("/api/events", HttpCompletionOption.ResponseHeadersRead);
+        await queued.Task.WaitAsync(TimeSpan.FromSeconds(60));   // past the pre-queue check, waiting for the slot
+        guard._onEnteringForTest = null;
+
+        await storage.DisposeAsync();
+        held.Value.Dispose();
+
+        using var res = await search.WaitAsync(TimeSpan.FromSeconds(60));
+        string body = await res.Content.ReadAsStringAsync();
+        Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable, $"{(int)res.StatusCode} — {body}");
+        Assert.Contains("log store has shut down", body);
+    }
+
+    /// <summary>One search slot, and a queue long enough that a queued search waits for the test, not the clock.</summary>
+    private sealed class OneSlotFactory : AmetoWebAppFactory
+    {
+        protected override QueryOptions ConfiguredQuery => new() { MaxConcurrent = 1, QueueWait = TimeSpan.FromMinutes(5) };
+    }
 
     /// <summary>Headers only for the search stream: the status line is the whole question.</summary>
     private static Task<HttpResponseMessage> SendAsync(HttpClient client, (string Method, string Url, object? Body) req) =>
