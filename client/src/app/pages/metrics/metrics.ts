@@ -17,6 +17,7 @@ import {
 } from '../../core/models/metric.model';
 import { TraceRowDto } from '../../core/models/span.model';
 import { serviceColor } from '../../shared/utils/service-color';
+import { unavailableMessage } from '../../shared/utils/unavailable';
 import { HeatmapComponent } from './heatmap/heatmap';
 import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
 import { SearchHistoryComponent } from '../../shared/components/search-history/search-history';
@@ -88,6 +89,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
   topk        = signal(12);
   series      = signal<MetricSeriesDto[]>([]);
   loading     = signal(false);
+  /** The server's sentence when the last query was refused with 503 (the store shut down or loading) — shown instead of "No data". */
+  unavailable = signal<string | null>(null);
 
   // Modes / views
   mode          = signal<'query' | 'expr'>('query');
@@ -290,6 +293,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const m = this.selected();
     if (!m) return;
     this.loading.set(true);
+    this.unavailable.set(null);
     this.syncUrl();
 
     const from = this.fromIso(), to = this.toIso(), step = this.stepStr();
@@ -300,7 +304,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     // Heatmap: histogram + heatmap view + no group-by.
     if (histogram && this.viewMode() === 'heatmap' && noGroup) {
       this.api.getMetricHeatmap(m.name, from, to, step, filters)
-        .pipe(catchError(() => of(null as unknown as HeatmapDto)))
+        .pipe(catchError(err => this.orEmpty(err, null as unknown as HeatmapDto)))
         .subscribe(h => { this.heatmap.set(h); this.cdr.markForCheck(); });
     } else {
       this.heatmap.set(null);
@@ -322,7 +326,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     };
 
     forkJoin({
-      series:    this.api.queryMetricAgg(req).pipe(catchError(() => of([] as MetricSeriesDto[]))),
+      series:    this.api.queryMetricAgg(req).pipe(catchError(err => this.orEmpty(err, [] as MetricSeriesDto[]))),
       exemplars: ex$,
     }).subscribe(r => {
       this.exemplars = r.exemplars;
@@ -333,6 +337,17 @@ export class MetricsComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * A failed query still answers `empty` — the chart has to draw something — but a 503 also records
+   * the server's sentence, so the page says the store cannot answer instead of "No data in this
+   * window" (#95). Any other error keeps its old, quiet empty.
+   */
+  private orEmpty<T>(err: unknown, empty: T) {
+    const message = unavailableMessage(err);
+    if (message) this.unavailable.set(message);
+    return of(empty);
+  }
+
   /** Expression mode: evaluate left op right and graph the single result series. */
   runExpr() {
     this.heatmap.set(null);
@@ -340,6 +355,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.exemplarCount.set(0);
     if (!this.exprLeft.metric || !this.exprRight.metric) { this.series.set([]); return; }
     this.loading.set(true);
+    this.unavailable.set(null);
 
     const from = this.fromIso(), to = this.toIso(), step = this.stepStr();
     const side = (s: ExprSide): MetricQueryRequest =>
@@ -348,7 +364,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.api.queryMetricExpr({
       left: side(this.exprLeft), right: side(this.exprRight),
       op: this.exprOp(), scale: this.exprScale(), name: 'expr',
-    }).pipe(catchError(() => of(null as unknown as MetricSeriesDto))).subscribe(res => {
+    }).pipe(catchError(err => this.orEmpty(err, null as unknown as MetricSeriesDto))).subscribe(res => {
       this.series.set(res ? [res] : []);
       this.loading.set(false);
       this.cdr.markForCheck();
