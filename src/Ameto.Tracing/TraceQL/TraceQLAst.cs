@@ -135,14 +135,18 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// <c>.foo = "bar"</c>, and folding that into <c>false</c> made <c>{ !(.foo = "bar") }</c>
     /// select every span in the system that had never heard of <c>.foo</c>.
     ///
-    /// <para>PRESENT BUT INCOMPARABLE STAYS FALSE, deliberately and narrowly. A string attribute
-    /// met by a numeric comparison (<c>{ .foo &gt; 5 }</c> where <c>.foo</c> is "bananas") is a
-    /// span that HAS the field, so "unknown" would be the wrong word for it, and changing that
-    /// answer is a separate semantic decision from the one this class was fixed for. It leaves a
-    /// smaller version of the same asymmetry standing on type mismatch alone, pinned by
-    /// <c>TraceQLThreeValuedTests.A_type_mismatch_is_still_two_valued</c> and carried as issue #76
-    /// — a docstring is read only by somebody already in this file, which is how the original
-    /// defect lasted as long as it did.</para>
+    /// <para>PRESENT BUT INCOMPARABLE IS UNKNOWN TOO — issue #76, decided. A numeric comparison
+    /// met by a value that is not a number (<c>{ .tenant &gt; 5 }</c> where <c>.tenant</c> is
+    /// "bananas", a boolean, or a double that is NaN) is a question that does not apply to this
+    /// span, which is exactly what <c>null</c> means here. Answering <c>false</c> instead left the
+    /// #66 shape standing on type mismatch alone: <c>{ !(.tenant &gt; 5) }</c> selected every span
+    /// whose tenant was text, which nobody writing that query wants. One consequence to know when
+    /// reading it: a span now needs a COMPARABLE value, not merely the key, to be selected by
+    /// either a comparison or its negation.</para>
+    ///
+    /// <para>A DELIBERATE DEVIATION FROM TEMPO, whose TraceQL answers a type mismatch with false
+    /// (and so selects the span under <c>!</c>). The TraceQL reference page says so. A string
+    /// QUERY met by a number is NOT a mismatch: it compares the number's text, and always has.</para>
     /// </summary>
     /// <summary>
     /// The key as UTF-8, encoded ONCE per parsed query rather than once per span. A TraceQL page
@@ -195,7 +199,10 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
                     System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : double.NaN,
                 _                       => double.NaN,   // Boolean: present but incomparable
             };
-            if (double.IsNaN(attrNum)) return false;
+            // Unknown, not false — issue #76; see the class docstring. NaN covers all three ways
+            // in: a string that does not parse, a boolean, and a double that IS NaN (which no
+            // ordering can place either).
+            if (double.IsNaN(attrNum)) return null;
             return CompareOp(attrNum, op, qv.Number);
         }
 
@@ -270,7 +277,7 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
                     System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
                 _ => double.NaN,
             };
-            if (double.IsNaN(attrNum)) return false;
+            if (double.IsNaN(attrNum)) return null;   // present but incomparable: unknown (#76)
             return CompareOp(attrNum, op, qv.Number);
         }
 

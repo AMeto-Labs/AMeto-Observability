@@ -138,7 +138,8 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     [InlineData("{ .net.peer.port = \"1433\" }",       true)]   // a number met by a string query: long.ToString()
     [InlineData("{ .cpu.ratio = \"banana\" }",         false)]  // a double met by a string query it cannot be
     [InlineData("{ .cache.hit = \"true\" }",           true)]   // bool.ToString() is "True"
-    [InlineData("{ .cache.hit > 0 }",                  false)]  // present but incomparable stays false
+    [InlineData("{ .cache.hit > 0 }",                  null)]   // present but incomparable: unknown (#76)
+    [InlineData("{ !(.cache.hit > 0) }",               null)]   // and so is its negation
     [InlineData("{ .numeric.text > 41 }",              true)]   // a numeric string parses
     [InlineData("{ .numeric.text > 43 }",              false)]
     [InlineData("{ .missing = \"x\" }",                null)]   // absent: unknown
