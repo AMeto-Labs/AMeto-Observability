@@ -85,13 +85,39 @@ internal sealed class MetricLabelSetBuilder
             Append(ref _kv, ref _ids, ref _used, _serviceNameKey, service);
     }
 
-    /// <summary>One of the point's own attributes.</summary>
-    public void Add(InternedText key, InternedText value) =>
-        Append(ref _kv, ref _ids, ref _used, key, value);
+    /// <summary>
+    /// One of the point's own attributes. <b>A key the point already carries is overwritten: the last
+    /// value wins</b> — over an earlier attribute of the point, and over the resource's service name.
+    ///
+    /// <para>OTLP says an attribute key MUST be unique, and exporters break it anyway: an attribute
+    /// set twice on the point, or <c>service.name</c> set on the point as well as the resource. A
+    /// label set carrying a key twice is a series no answer can write (a JSON object cannot hold the
+    /// key twice — every metrics response failed on it, #92), so none may reach storage. Last wins
+    /// because that is what an OTel SDK's own attribute set does with a repeated key (Go's
+    /// <c>attribute.NewSet</c>, a Java/.NET builder's later <c>put</c>) and what protobuf does with a
+    /// repeated map key — and what <c>DedupeByTimestamp</c> does with a repeated timestamp here. A
+    /// point attribute winning over the resource's service name is the rule every other resource
+    /// label already followed (see <see cref="Build"/>).</para>
+    ///
+    /// <para>A linear scan: a point carries a handful of labels, and the merge in
+    /// <see cref="Build"/> already scans the same way per resource label.</para>
+    /// </summary>
+    public void Add(InternedText key, InternedText value)
+    {
+        int at = IndexOfKey(key.Text);
+        if (at < 0)
+        {
+            Append(ref _kv, ref _ids, ref _used, key, value);
+            return;
+        }
+        _kv[at + 1]  = value.Text;
+        _ids[at + 1] = value.Id;
+    }
 
     /// <summary>
     /// The point's label set: what <see cref="BeginPoint"/> and <see cref="Add"/> gathered, then every
-    /// resource label whose key is not already present — point attributes win on key collision.
+    /// resource label whose key is not already present — point attributes win on key collision. So
+    /// no key is ever in the set twice.
     /// </summary>
     public LabelSet Build()
     {
@@ -99,7 +125,9 @@ internal sealed class MetricLabelSetBuilder
         for (int i = 0; i < _resUsed; i += 2)
         {
             // Against everything added so far, resource labels included: a resource that repeats a
-            // key keeps its first value, as the pair-list shape always did.
+            // key keeps its first value, as the pair-list shape always did. Deliberately NOT "last
+            // wins" like a point's own attributes: that set was always storable, and changing its
+            // rule would re-key the series of every exporter that sends one.
             if (IndexOfKey(res[i]) < 0)
                 Append(ref _kv, ref _ids, ref _used,
                        new InternedText(res[i], _resIds[i]), new InternedText(res[i + 1], _resIds[i + 1]));

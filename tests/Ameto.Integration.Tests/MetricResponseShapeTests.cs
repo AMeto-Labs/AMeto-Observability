@@ -23,6 +23,10 @@ namespace Ameto.Integration.Tests;
 /// NaN, an infinity or a repeated label key does to a request (it fails it, 500, before a byte is
 /// sent — kept, not fixed, by the switch).</para>
 ///
+/// <para><b>Changed on purpose since, and only for those series (#92):</b> a repeated label key is
+/// written once, with the last value of its run — <c>raw-dup-key</c>, <c>query-dup-key</c> and
+/// <c>exemplars-dup-key</c> were 500 and are 200 — and nothing else moved.</para>
+///
 /// <para><b>The escaping is not STJ's default, and this test is how that was found.</b> ASP.NET
 /// Core's <c>JsonOptions</c> sets <c>JavaScriptEncoder.UnsafeRelaxedJsonEscaping</c>: <c>&lt;</c>,
 /// <c>&amp;</c>, <c>'</c>, <c>+</c> and Cyrillic go out raw, and only quotes, backslashes, control
@@ -106,6 +110,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         { "query-echo-timespan",    "POST", "/api/metrics/query", """{"metric":"shape.echo","step":"00:00:15","from":"not a date"}""" },
         { "query-unknown-metric",   "POST", "/api/metrics/query", """{"metric":"nope"}""" },
         { "query-nan",              "POST", "/api/metrics/query", """{"metric":"shape.nan"}""" },
+        { "query-dup-key",          "POST", "/api/metrics/query", """{"metric":"shape.dup"}""" },
         { "query-bad-json",         "POST", "/api/metrics/query", """{"metric":""" },
         { "query-no-metric",        "POST", "/api/metrics/query", """{"aggregation":"rate"}""" },
         { "query-blank-metric",     "POST", "/api/metrics/query", """{"metric":"  "}""" },
@@ -126,6 +131,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         { "exemplars-echo",         "GET",  "/api/metrics/shape.echo/exemplars?from=2026-07-23T10:00:00Z&to=2026-07-23T12:00:00%2B01:00&filters=a:b&limit=5000", null },
         { "exemplars-limit-bad",    "GET",  "/api/metrics/shape.echo/exemplars?limit=abc",                  null },
         { "exemplars-none",         "GET",  "/api/metrics/nope/exemplars",                                  null },
+        { "exemplars-dup-key",      "GET",  "/api/metrics/shape.dup/exemplars",                             null },
     };
 
     [Theory]
@@ -205,31 +211,46 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
             Name   = s.Name,
             Kind   = s.Kind.ToString(),
             Unit   = s.Unit,
-            Labels = s.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
+            Labels = LastValueWins(s.Labels),
             Points = s.Points.Select(p => new MetricPointDto { Ts = p.TimestampUnixNano, Value = p.Value, Count = p.Count, Sum = p.Sum }).ToList(),
         }).ToList();
         return System.Text.Json.JsonSerializer.Serialize(dtos, options);
     }
 
     /// <summary>
-    /// A repeated label key far past the first flush (WP7 review, F4). Before the switch every
-    /// endpoint built its whole DTO list — ToDictionary per series — before a byte was written, so
-    /// the request failed as a clean 500 however large the answer. The list answers (POST query,
-    /// expr) must still: they are checked whole before the first byte. The streamed raw answer
-    /// cannot know about a series storage has not produced yet; it checks each series before that
-    /// series' first byte, which fails cleanly while nothing has been sent — and aborts the
-    /// response once the first ~14.7 KB flush has gone, as a NaN past the serializer's own flush
-    /// threshold always did. Pinned both ways.
+    /// The DTO's label dictionary as the old endpoints built it (<c>Pairs.ToDictionary</c>), except
+    /// that a repeated key keeps the last value of its run where ToDictionary threw (#92) — for a
+    /// valid set, the same dictionary in the same order.
+    /// </summary>
+    private static Dictionary<string, string> LastValueWins(LabelSet labels)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (k, v) in labels.Pairs) dict[k] = v;
+        return dict;
+    }
+
+    /// <summary>
+    /// A repeated label key far past the first flush (WP7 review, F4; #92). It used to fail the
+    /// request: a clean 500 from the list answers, which checked every series before the first
+    /// byte, and a DROPPED CONNECTION from the streamed raw answer once its first ~14.7 KB had gone —
+    /// the browser saw status 0. The key is now written once, last value of its run, so both
+    /// complete, and every series around it is written exactly as before.
     /// </summary>
     [Theory]
-    [InlineData("POST", "/api/metrics/query", """{"metric":"shape.big.dup"}""", "500 text/plain; charset=utf-8")]
-    [InlineData("GET",  "/api/metrics/shape.big.dup", null,                     "EXCEPTION HttpRequestException")]
-    public async Task A_repeated_label_key_past_the_first_flush_fails_as_the_endpoint_can(string method, string url, string? body, string expected)
+    [InlineData("POST", "/api/metrics/query", """{"metric":"shape.big.dup"}""")]
+    [InlineData("GET",  "/api/metrics/shape.big.dup", null)]
+    public async Task A_repeated_label_key_past_the_first_flush_no_longer_fails_the_answer(string method, string url, string? body)
     {
-        // An abort after the response started reaches this client as the send failing (it reads the
-        // whole body before it returns); a browser sees the connection drop, status 0.
-        Assert.Equal(expected, await Exchange(method, url, body));
+        string actual   = await Exchange(method, url, body);
+        string expected = "200 application/json; charset=utf-8\n" + OracleOf(BigAnswer().Append(BigDup));
+        Assert.Contains("\"labels\":{\"k\":\"v2\"}", expected);
+        Assert.Equal(expected.Length, actual.Length);
+        Assert.Equal(expected, actual);
     }
+
+    /// <summary>The series with a repeated label key that <c>shape.big.dup</c> answers after <see cref="BigAnswer"/>.</summary>
+    private static readonly MetricSeries BigDup =
+        Series("shape.big", MetricKind.Gauge, "", L("k", "v1", "k", "v2"), null, P(T0, 1));
 
     [Theory]
     [InlineData("GET",  "/api/metrics/shape.big", null)]
@@ -257,6 +278,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         ["exemplars-echo"] = "200 application/json; charset=utf-8\n[{\"ts\":1784800800000000000,\"value\":1000,\"traceId\":\"from=2026-07-23T10:00:00.0000000+00:00;to=2026-07-23T12:00:00.0000000+01:00;step=null;filters=[a=b]\",\"spanId\":\"1000\",\"labels\":{\"k\":\"v\"}}]",
         ["exemplars-limit-bad"] = "200 application/json; charset=utf-8\n[{\"ts\":1784800800000000000,\"value\":200,\"traceId\":\"from=null;to=null;step=null;filters=null\",\"spanId\":\"200\",\"labels\":{\"k\":\"v\"}}]",
         ["exemplars-none"] = "200 application/json; charset=utf-8\n[]",
+        ["exemplars-dup-key"] = "200 application/json; charset=utf-8\n[{\"ts\":1784800800000000000,\"value\":2,\"traceId\":\"0af7651916cd43dd8448eb211c80319c\",\"spanId\":\"b7ad6b7169203331\",\"labels\":{\"a\":\"first\",\"k\":\"v2\",\"z\":\"last\"}}]",   // was 500 (#92)
         ["expr-bad-json"] = "400 application/json; charset=utf-8\n\"Invalid JSON\"",
         ["expr-div"] = "200 application/json; charset=utf-8\n{\"name\":\"ratio\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":6.666666666666667,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":6.666666666666667,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":6.666666666666667,\"count\":0,\"sum\":0},{\"ts\":1784800861000000000,\"value\":6.25,\"count\":0,\"sum\":0},{\"ts\":1784800890000000000,\"value\":3.4482758620689653,\"count\":0,\"sum\":0}]}",
         ["expr-no-right"] = "400 application/json; charset=utf-8\n\"'left' and 'right' are required\"",
@@ -284,6 +306,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         ["query-max-missing-key"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":0,\"sum\":0}]}]",
         ["query-min"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
         ["query-nan"] = "500 text/plain; charset=utf-8",
+        ["query-dup-key"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.dup\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"k\":\"v2\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0}]}]",   // was 500 (#92)
         ["query-no-content-type"] = "400 application/json; charset=utf-8\n\"Invalid JSON\"",
         ["query-no-metric"] = "400 application/json; charset=utf-8\n\"'metric' is required\"",
         ["query-none"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
@@ -296,7 +319,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         ["query-unknown-agg"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
         ["query-unknown-metric"] = "200 application/json; charset=utf-8\n[]",
         ["raw-counter"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.counter\",\"kind\":\"Counter\",\"unit\":\"{req}\",\"labels\":{\"route\":\"/x\",\"service.name\":\"a\"},\"points\":[{\"ts\":1784800800000000000,\"value\":10,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":25,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":5,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":20,\"count\":0,\"sum\":0},{\"ts\":1784800861000000000,\"value\":21.5,\"count\":0,\"sum\":0}]},{\"name\":\"shape.counter\",\"kind\":\"Counter\",\"unit\":\"{req}\",\"labels\":{\"route\":\"/x\",\"service.name\":\"b\"},\"points\":[{\"ts\":1784800800000000000,\"value\":100,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":100,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":160,\"count\":0,\"sum\":0}]},{\"name\":\"shape.counter\",\"kind\":\"Counter\",\"unit\":\"{req}\",\"labels\":{\"route\":\"/y\",\"service.name\":\"a\"},\"points\":[{\"ts\":1784800815000000000,\"value\":1,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":3,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":3.5,\"count\":0,\"sum\":0}]},{\"name\":\"shape.counter\",\"kind\":\"Counter\",\"unit\":\"{req}\",\"labels\":{\"route\":\"/x\",\"service.name\":\"a\"},\"points\":[{\"ts\":1784800845000000000,\"value\":22,\"count\":0,\"sum\":0},{\"ts\":1784800890000000000,\"value\":40,\"count\":0,\"sum\":0}]},{\"name\":\"shape.counter\",\"kind\":\"Counter\",\"unit\":\"{req}\",\"labels\":{\"service.name\":\"c\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0}]}]",
-        ["raw-dup-key"] = "500 text/plain; charset=utf-8",
+        ["raw-dup-key"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.dup\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"k\":\"v2\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":0,\"sum\":0}]}]",   // was 500 (#92)
         ["raw-gauge"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"route\":\"/a?b=<c>&d='e'\",\"service.name\":\"Svc\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.1,\"count\":0,\"sum\":0},{\"ts\":1784800815000000000,\"value\":1E+300,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":-0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":5E-324,\"count\":0,\"sum\":0},{\"ts\":1784800860000000000,\"value\":123456789.123,\"count\":0,\"sum\":0},{\"ts\":1784800875000000000,\"value\":-42,\"count\":0,\"sum\":0},{\"ts\":9223372036854775807,\"value\":1.5,\"count\":9223372036854775807,\"sum\":-1.25}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{\"emoji\":\"\\uD83D\\uDE00 \\u0001 \\t \\\\ /\",\"service.name\":\"Сервис\"},\"points\":[{\"ts\":1784800800000000000,\"value\":2.5,\"count\":9007199254740993,\"sum\":0.30000000000000004},{\"ts\":1784800815000000000,\"value\":1.7976931348623157E+308,\"count\":0,\"sum\":0}]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"\",\"labels\":{\"service.name\":\"Empty\"},\"points\":[]},{\"name\":\"shape.gauge\",\"kind\":\"Gauge\",\"unit\":\"By\",\"labels\":{},\"points\":[{\"ts\":1784800815000000000,\"value\":7,\"count\":0,\"sum\":0},{\"ts\":1784800830000000000,\"value\":8,\"count\":0,\"sum\":0}]}]",
         ["raw-hist"] = "200 application/json; charset=utf-8\n[{\"name\":\"shape.hist\",\"kind\":\"Histogram\",\"unit\":\"s\",\"labels\":{\"service.name\":\"a\"},\"points\":[{\"ts\":1784800800000000000,\"value\":0.02,\"count\":10,\"sum\":0.2},{\"ts\":1784800815000000000,\"value\":0.03,\"count\":20,\"sum\":0.6},{\"ts\":1784800830000000000,\"value\":0,\"count\":0,\"sum\":0},{\"ts\":1784800845000000000,\"value\":0.05,\"count\":5,\"sum\":0.25},{\"ts\":1784800860000000000,\"value\":0.1,\"count\":9007199254740993,\"sum\":1000000000000000}]},{\"name\":\"shape.hist\",\"kind\":\"Histogram\",\"unit\":\"s\",\"labels\":{\"service.name\":\"b\"},\"points\":[{\"ts\":1784800815000000000,\"value\":0.5,\"count\":2,\"sum\":1},{\"ts\":1784800830000000000,\"value\":0.9,\"count\":4,\"sum\":3.6}]},{\"name\":\"shape.hist\",\"kind\":\"Histogram\",\"unit\":\"s\",\"labels\":{\"service.name\":\"no-bounds\"},\"points\":[{\"ts\":1784800800000000000,\"value\":1,\"count\":1,\"sum\":1}]}]",
         ["raw-infinity"] = "500 text/plain; charset=utf-8",
@@ -424,7 +447,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
                     // The large answer, then a series with a repeated label key: the failure lies far past
                     // the first flush.
                     foreach (var s in BigAnswer()) yield return s;
-                    yield return Series("shape.big", MetricKind.Gauge, "", L("k", "v1", "k", "v2"), null, P(T0, 1));
+                    yield return BigDup;
                     break;
             }
         }
@@ -490,6 +513,12 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
                         new() { TimestampUnixNano = T0, Value = limit,
                                 TraceId = EchoText(from, to, null, filters), SpanId = limit.ToString(CultureInfo.InvariantCulture),
                                 Labels = L("k", "v") },
+                    ];
+                case "shape.dup":
+                    return
+                    [
+                        new() { TimestampUnixNano = T0, Value = 2, TraceId = "0af7651916cd43dd8448eb211c80319c",
+                                SpanId = "b7ad6b7169203331", Labels = L("z", "last", "k", "v2", "a", "first", "k", "v1") },
                     ];
                 default:
                     return [];

@@ -67,6 +67,40 @@ public sealed class OtlpMetricProtoParityTests
         Assert.Equal("0af7651916cd43dd8448eb211c80319c", span[0].Exemplars![0].TraceId);
     }
 
+    /// <summary>
+    /// A repeated label key never reaches storage, on either encoding, and both collapse it the
+    /// same way (#92): within the point the LAST value wins — over an earlier attribute, and over the
+    /// resource's service.name; a point attribute still shadows a resource label; a resource's own
+    /// repeat keeps its first value, as it always did. Before the fix both paths agreed too — on a
+    /// label set carrying the key twice, which every metrics response then failed on.
+    /// </summary>
+    [Fact]
+    public void MatchesDomPath_OnRepeatedLabelKeys()
+    {
+        byte[] payload = OtlpProtoPayloads.RepeatedLabelKeys();
+        var dom  = ViaDom(payload);
+        var span = ViaSpan(payload);
+        AssertSame(dom, span);
+        Assert.Equal(2, span.Count);
+
+        foreach (var items in new[] { dom, span })
+        {
+            AssertLabels(items[0].Labels,
+                ("deployment.environment", "Point"), ("http.route", "/last"), ("k", "2"),
+                ("region", "eu-1"), ("service.name", "Svc.Point"));
+            AssertLabels(items[1].Labels,
+                ("a", "y"), ("deployment.environment", "Res"), ("region", "eu-1"), ("service.name", "Svc.Resource"));
+        }
+    }
+
+    /// <summary>The set, exactly — its interleaved, canonically ordered pairs, so a key present twice fails.</summary>
+    private static void AssertLabels(LabelSet labels, params (string Key, string Value)[] expected)
+    {
+        Assert.Equal(expected, labels.Pairs.ToArray());
+        for (int i = 1; i < labels.Count; i++)
+            Assert.NotEqual(labels.KeyAt(i - 1), labels.KeyAt(i));
+    }
+
     private static void AssertSame(List<MetricIngestItem> expected, List<MetricIngestItem> actual)
     {
         Assert.Equal(expected.Count, actual.Count);

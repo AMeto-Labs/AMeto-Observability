@@ -136,13 +136,34 @@ public sealed class MetricSeriesJsonTests
         }
     }
 
+    /// <summary>
+    /// A label set with a repeated key — stored before ingest collapsed them (#92), or built by hand —
+    /// is written with the key ONCE, the last value of its run, where the DTO path threw and failed
+    /// the whole answer. The value is the one <c>JSON.parse</c> keeps for a key sent twice; the
+    /// series around it are written exactly as before.
+    /// </summary>
+    [Fact]
+    public void A_repeated_label_key_is_written_once_with_the_last_value()
+    {
+        var dup = new MetricSeries
+        {
+            Name   = "m",
+            Labels = new LabelSet([new("z", "0"), new("k", "2"), new("a", "a"), new("k", "1"), new("k", "3")]),
+            Points = [new MetricDataPoint { TimestampUnixNano = 1, Value = 1.5 }],
+        };
+        Assert.Throws<ArgumentException>(() => Oracle([dup]));   // what the endpoints used to do with it
+
+        var valid = new MetricSeries { Name = "v", Labels = new LabelSet([new("k", "1")]) };
+        Assert.Equal(
+            """[{"name":"v","kind":"Counter","unit":"","labels":{"k":"1"},"points":[]},"""
+          + """{"name":"m","kind":"Counter","unit":"","labels":{"a":"a","k":"3","z":"0"},"points":[{"ts":1,"value":1.5,"count":0,"sum":0}]},"""
+          + """{"name":"v","kind":"Counter","unit":"","labels":{"k":"1"},"points":[]}]""",
+            Written([valid, dup, valid]));
+    }
+
     [Fact]
     public void It_fails_where_the_DTO_path_failed()
     {
-        var dup = new MetricSeries { Name = "m", Labels = new LabelSet([new("k", "1"), new("k", "2")]) };
-        Assert.Throws<ArgumentException>(() => Oracle([dup]));
-        Assert.Throws<ArgumentException>(() => Written([dup]));
-
         foreach (double bad in new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity })
         {
             var valued = new MetricSeries { Name = "m", Points = [new MetricDataPoint { Value = bad }] };

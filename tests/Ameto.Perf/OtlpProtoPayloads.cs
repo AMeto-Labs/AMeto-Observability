@@ -141,6 +141,51 @@ internal static class OtlpProtoPayloads
             }));
         }))));
 
+    /// <summary>
+    /// Repeated label keys, every way an exporter produces them (#92): a gauge point that sets one
+    /// attribute twice, sets <c>service.name</c> although the resource has it, re-sets a resource
+    /// label, and sets one key first as an int and then as a string; a histogram point that repeats
+    /// a key; and a resource that repeats a key of its own. OTLP forbids all of it; exporters send it.
+    /// </summary>
+    public static byte[] RepeatedLabelKeys() => Request(Msg(res =>
+    {
+        Nested(res, 1, StringAttr("service.name", "Svc.Resource"));
+        Nested(res, 1, StringAttr("deployment.environment", "Res"));
+        Nested(res, 1, StringAttr("region", "eu-1"));
+        Nested(res, 1, StringAttr("region", "eu-2"));                       // the resource's own repeat
+    }), Msg(c =>
+    {
+        Nested(c, 2, Msg(metric =>
+        {
+            metric.WriteTag(1, WireFormat.WireType.LengthDelimited);
+            metric.WriteString("dup.gauge");
+            Nested(metric, 5, Msg(g => Nested(g, 1, Msg(dp =>                // field 5: gauge
+            {
+                dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64(1_785_300_060_000_000_000UL);
+                dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                Nested(dp, 7, StringAttr("http.route", "/first"));
+                Nested(dp, 7, StringAttr("service.name", "Svc.Point"));        // the resource has one
+                Nested(dp, 7, StringAttr("http.route", "/last"));
+                Nested(dp, 7, StringAttr("deployment.environment", "Point"));  // shadows a resource label
+                Nested(dp, 7, IntAttr("k", 1));
+                Nested(dp, 7, StringAttr("k", "2"));
+            }))));
+        }));
+        Nested(c, 2, Msg(metric =>
+        {
+            metric.WriteTag(1, WireFormat.WireType.LengthDelimited);
+            metric.WriteString("dup.hist");
+            Nested(metric, 9, Msg(h => Nested(h, 1, Msg(dp =>                // field 9: histogram
+            {
+                dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64(1_785_300_060_000_000_000UL);
+                dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteFixed64(1);
+                dp.WriteTag(5, WireFormat.WireType.Fixed64); dp.WriteDouble(2.5);
+                Nested(dp, 9, StringAttr("a", "x"));
+                Nested(dp, 9, StringAttr("a", "y"));
+            }))));
+        }));
+    }));
+
     /// <summary>Histogram whose exemplars exercise the "trace link required" filter.</summary>
     public static byte[] HistogramWithExemplars() => Request(StandardResource(), Msg(c =>
         Nested(c, 2, Msg(metric =>

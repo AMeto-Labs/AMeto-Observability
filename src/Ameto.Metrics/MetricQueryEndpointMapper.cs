@@ -156,13 +156,16 @@ public static class MetricQueryEndpointMapper
 
     /// <summary>
     /// A label set as the DTO's dictionary, in the set's order — what <c>Pairs.ToDictionary</c>
-    /// built, without the pair view and the LINQ iterator. <see cref="Dictionary{TKey, TValue}.Add"/>
-    /// refuses a repeated or null key exactly as it did inside ToDictionary.
+    /// built, without the pair view and the LINQ iterator. A repeated key keeps the last value of its
+    /// run and a null key is skipped, as <see cref="MetricSeriesJson.WriteLabels"/> writes them: a set
+    /// stored before ingest collapsed repeated keys (#92) must not fail the answer — ToDictionary
+    /// threw on it, a 500 for every exemplar of the metric.
     /// </summary>
     private static Dictionary<string, string> LabelDictionary(LabelSet labels)
     {
         var dict = new Dictionary<string, string>(labels.Count);
-        for (int i = 0; i < labels.Count; i++) dict.Add(labels.KeyAt(i), labels.ValueAt(i));
+        for (int i = 0; i < labels.Count; i++)
+            if (labels.KeyAt(i) is { } key) dict[key] = labels.ValueAt(i);
         return dict;
     }
 
