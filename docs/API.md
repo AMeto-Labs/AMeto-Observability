@@ -506,7 +506,7 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
 | `GET /api/traces/compare` | Compare two traces / time windows. |
 | `GET /api/traces/{traceId}` | Full span tree for one trace. |
-| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace. |
+| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace: the root node `{ spanId, name, service, kind, status, totalMs, selfMs, children: [ …nodes ] }` (`null` when no span qualifies as root, `404` for an unknown trace). Any depth up to 4 096 levels; a node on level 4 096 that still has children is sent with `children: []` and `"truncated": true` (the only node that ever carries the field), its own `totalMs` / `selfMs` still counting them. |
 | `GET /api/traces/{traceId}/logs` | Logs correlated to the trace (via `@tr`). |
 | `GET /api/spans/{spanId}/logs` | Logs correlated to a single span (via `@sp`). |
 
