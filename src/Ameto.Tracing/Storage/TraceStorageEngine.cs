@@ -3742,8 +3742,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // before it is retired too. See _adoptionGate.
             var processedPaths = new HashSet<string>(processed.Count, StringComparer.Ordinal);
             foreach (var s in processed) processedPaths.Add(s.FilePath);
-            lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
+            // Recorded BEFORE the union: a union that throws part-way (the set grows) must still be
+            // undone by the finally, or the paths it did add stay claimed for the life of the process
+            // and adoption skips them forever. ExceptWith of the whole set is safe either way.
             claimed = processedPaths;
+            lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
             _compactionStageForTest?.Invoke(CompactionStage.Claimed);
 
             // Swap the snapshot first (readers stop picking the old files up),
