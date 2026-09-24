@@ -41,7 +41,10 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
 
         int parks = 0;
         var cancelledWhileParking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var drainer = new SpanDrainer(ring, engine, NullLogger<SpanDrainer>.Instance, startLoop: true,
+        // `await using`, declared after the ring and the engine: on EVERY exit — a timed-out wait
+        // included — the drainer's loop is joined before `using` frees the ring's native memory, so
+        // a failure fails this test instead of killing the test host with an AccessViolation.
+        await using var drainer = new SpanDrainer(ring, engine, NullLogger<SpanDrainer>.Instance, startLoop: true,
             beforeParkForTest: cts =>
             {
                 if (Interlocked.Increment(ref parks) != 1) return;
@@ -110,7 +113,10 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
         };
 
         int parks = 0;
-        var drainer = new SpanDrainer(ring, engine, NullLogger<SpanDrainer>.Instance, startLoop: true,
+        // `await using`, declared after the ring and the engine: on EVERY exit — a timed-out wait
+        // included — the drainer's loop is joined before `using` frees the ring's native memory, so
+        // a failure fails this test instead of killing the test host with an AccessViolation.
+        await using var drainer = new SpanDrainer(ring, engine, NullLogger<SpanDrainer>.Instance, startLoop: true,
             beforeParkForTest: cts =>
             {
                 if (Interlocked.Increment(ref parks) != 1) return;
