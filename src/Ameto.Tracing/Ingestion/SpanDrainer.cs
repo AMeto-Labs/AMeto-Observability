@@ -50,6 +50,13 @@ internal sealed class SpanDrainer : IAsyncDisposable
     /// <summary>Test seam: the idle branch just asked the ring for a trim; the argument is what it gave back.</summary>
     private readonly Action<long>? _afterArenaTrimForTest;
 
+    /// <summary>
+    /// Test seam: the loop is about to park on the ring. Handed the loop's own token source, so a
+    /// test can land the shutdown exactly there — the one moment a cancellation surfaces as a throw
+    /// out of the park rather than as the loop's condition.
+    /// </summary>
+    private readonly Action<CancellationTokenSource>? _beforeParkForTest;
+
     // One drained run: the headers copied out of the ring, and the payloads kept apart from the
     // arena (larger than a chunk) — both reused batch after batch, both holding no reference to a
     // tier once the run is released.
@@ -71,14 +78,18 @@ internal sealed class SpanDrainer : IAsyncDisposable
     /// <param name="afterArenaTrimForTest">Test seam, called with what each trim gave back. A constructor
     /// argument, not a settable field: the loop starts here, and may reach its first trim before a
     /// field set afterwards is seen.</param>
+    /// <param name="beforeParkForTest">Test seam, called with the loop's token source each time the loop is
+    /// about to park. A constructor argument for the same reason as the trim seam.</param>
     internal SpanDrainer(SpanRingBuffer ring, TraceStorageEngine storage, ILogger<SpanDrainer> logger, bool startLoop,
-                         TimeSpan? arenaTrimInterval = null, Action<long>? afterArenaTrimForTest = null)
+                         TimeSpan? arenaTrimInterval = null, Action<long>? afterArenaTrimForTest = null,
+                         Action<CancellationTokenSource>? beforeParkForTest = null)
     {
         _ring    = ring;
         _storage = storage;
         _logger  = logger;
         _trimIntervalMs = (long)(arenaTrimInterval ?? ArenaTrimInterval).TotalMilliseconds;
         _afterArenaTrimForTest = afterArenaTrimForTest;
+        _beforeParkForTest     = beforeParkForTest;
         _drainTask = startLoop ? Task.Run(DrainLoopAsync) : Task.CompletedTask;
     }
 
@@ -134,7 +145,16 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 MaybeTrimArena();
                 // Park until a producer signals new spans. The 1 s timeout is only a
                 // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
-                await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false);
+                //
+                // A SHUTDOWN THAT LANDS WHILE PARKED IS A BREAK, NOT A THROW. The park throws
+                // OperationCanceledException then — even with a span published and signalled a
+                // moment before, since a cancelled token wins over a ready count — and letting it
+                // out skipped the final drain below: whatever was published after the last empty
+                // pass (a slot claimed before that pass and published after it included) stayed in
+                // the ring, acknowledged and never written.
+                _beforeParkForTest?.Invoke(_cts);
+                try { await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { break; }
                 continue;
             }
 
