@@ -82,8 +82,8 @@ public sealed class SpanRingBytesProbe : IDisposable
             _out.WriteLine("");
             _out.WriteLine($"FULL RING  {capacity:N0} slots, {label}");
             _out.WriteLine($"  accepted    {accepted,12:N0} spans   ({(accepted < capacity ? "refused by BYTES" : "every slot")})");
-            _out.WriteLine($"  managed     {retained / 1048576.0,12:N1} MB   {(accepted == 0 ? 0 : retained / accepted),8:N0} B/span held");
-            _out.WriteLine($"  native      {native / 1048576.0,12:N1} MB   (slots {ring.SlotBytes / 1048576.0:N1} MB + arena reached)");
+            _out.WriteLine($"  managed     {retained / 1e6,12:N1} MB   {(accepted == 0 ? 0 : retained / accepted),8:N0} B/span held");
+            _out.WriteLine($"  native      {native / 1e6,12:N1} MB   (slots {ring.SlotBytes / 1e6:N1} MB + arena reached)");
             _out.WriteLine($"  enqueue     {(accepted == 0 ? 0 : allocated / accepted),12:N0} B/span allocated (item door: the gRPC receiver's)");
         }
 
@@ -96,7 +96,7 @@ public sealed class SpanRingBytesProbe : IDisposable
         long given   = ring.TrimIdleArena();
         long resting = SpanRingBytesFixture.NativeBytes(ring);
         if (label is not null)
-            _out.WriteLine($"  after idle  {resting / 1048576.0,12:N1} MB   (the trim gave back {given / 1048576.0:N1} MB; slots {ring.SlotBytes / 1048576.0:N1} MB stay)");
+            _out.WriteLine($"  after idle  {resting / 1e6,12:N1} MB   (the trim gave back {given / 1e6:N1} MB; slots {ring.SlotBytes / 1e6:N1} MB stay)");
 
         GC.KeepAlive(endpoint);
         ring.Dispose();
@@ -171,8 +171,8 @@ public sealed class SpanRingBytesProbe : IDisposable
             _out.WriteLine($"RAW PATH  {label}");
             _out.WriteLine($"  producer    {produce.Elapsed.TotalNanoseconds / spans,10:N0} ns/span   {produceAlloc / (double)spans,8:N1} B/span allocated");
             _out.WriteLine($"  drainer     {drain.Elapsed.TotalNanoseconds / spans,10:N0} ns/span   {drainAlloc / (double)spans,8:N1} B/span allocated");
-            _out.WriteLine($"  tier        {retained / 1048576.0,10:N1} MB       {retained / spans,8:N0} B/span retained (engine + its tier)");
-            _out.WriteLine($"  ring native {native / 1048576.0,10:N1} MB       (slots {ring.SlotBytes / 1048576.0:N1} MB + arena reached {ring.ArenaHighWaterBytes / 1024.0:N0} KB)");
+            _out.WriteLine($"  tier        {retained / 1e6,10:N1} MB       {retained / spans,8:N0} B/span retained (engine + its tier)");
+            _out.WriteLine($"  ring native {native / 1e6,10:N1} MB       (slots {ring.SlotBytes / 1e6:N1} MB + arena reached {ring.ArenaHighWaterBytes / 1024.0:N0} KiB)");
         }
 
         GC.KeepAlive(drainer);

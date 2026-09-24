@@ -27,25 +27,27 @@ namespace Ameto.Tracing.Ingestion;
 /// residency is the deepest the backlog has ever been — cut into <see cref="ChunkBytes"/> chunks
 /// handed out LIFO by two versioned (ABA-safe) Treiber stacks — the first
 /// <see cref="LowWaterChunks"/> chunks, always popped first, and the rest (why two: see
-/// <c>AcquireChunk</c>). A producer thread packs consecutive spans of its batch into ITS chunk with a plain bump pointer (no CAS per span), and each chunk
-/// is reference-counted: +1 while a producer holds it, +1 per span in it; the consumer drops a
-/// span's reference when it releases the drained batch, and the last reference returns the chunk.
-/// A drainer that keeps up therefore touches one or two chunks, reused over and over. A payload
-/// larger than a chunk is PARKED apart in a pre-sized managed array — rare, and never dropped for its
-/// size.</para>
+/// <c>AcquireChunk</c>). A producer thread packs consecutive spans of its batch into ITS chunk
+/// with a plain bump pointer (no CAS per span), and each chunk is reference-counted: +1 while a
+/// producer holds it, +1 per span in it; the consumer drops a span's reference when it releases
+/// the drained batch, and the last reference returns the chunk. A drainer that keeps up therefore
+/// touches one or two chunks, reused over and over. A payload larger than a chunk is PARKED apart
+/// in a pre-sized managed array — rare, and never dropped for its size.</para>
 ///
 /// <para><b>Back-pressure</b> is by slots AND by bytes (TS#9): a span's payload bytes are reserved
 /// against <see cref="MaxBytes"/> before anything else, so a burst of heavy spans is refused at the
 /// budget with slots to spare.</para>
 ///
 /// <para><b>The native footprint, resting and at peak</b> (none of it is under a MemoryBudgets
-/// share — the physical shares were not re-cut this round): the slot array, <see cref="Capacity"/>
-/// x 80 B, is fixed and resident once the ring has cycled — 5.0 MB at the default 65 536 slots,
-/// sized by <c>Traces:RingCapacity</c>; the arena is reserved at <see cref="MaxBytes"/> plus 64
-/// slack chunks and committed only as deep as a backlog reaches — at most the budget plus the
-/// slack while a burst lasts (SpanRingBytesProbe on the 512 MB stand's budget: 33.5 MB with the
-/// slots) — and given back above <see cref="LowWaterChunks"/> (1 MB) by the drainer's idle trim
-/// (<see cref="TrimIdleArena"/>), so at rest the ring holds the slots and 1 MB: 6.0 MB.</para>
+/// share — the physical shares were not re-cut this round; decimal MB, 1 MB = 10^6 B, as in
+/// docs/CONFIGURATION.md): the slot array, <see cref="Capacity"/> x 80 B, is fixed and resident
+/// once the ring has cycled — 5.2 MB at the default 65 536 slots, sized by
+/// <c>Traces:RingCapacity</c>; the arena is reserved at <see cref="MaxBytes"/> plus 64 slack
+/// chunks (4.2 MB) and committed only as deep as a backlog reaches — at most the budget plus the
+/// slack while a burst lasts (SpanRingBytesProbe on the 512 MB stand's budget: 35.1 MB with the
+/// slots) — and given back above <see cref="LowWaterChunks"/> (1 MiB, 1.05 MB) by the drainer's
+/// idle trim (<see cref="TrimIdleArena"/>), so at rest the ring holds the slots and 1.05 MB:
+/// 6.3 MB.</para>
 ///
 /// <para><b>What the arena is NOT</b>: the storage behind anything a reader holds. The drainer
 /// copies each blob out and turns each name and service into a pool string before it releases the
@@ -511,7 +513,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     // as the traffic lasted, and the burst's high-water mark was the resting level again.
     //
     // The chunks below LowWaterChunks — never given back anyway — are now a list of their own, and
-    // a producer pops from it first. Steady traffic that fits in 1 MB never leaves it, so the high
+    // a producer pops from it first. Steady traffic that fits in 1 MiB never leaves it, so the high
     // list lies whole in the free list and the trim takes all of it; traffic deeper than that works
     // in the high list LIFO as before, and the trim gives back what lies above its deepest chunk.
 
@@ -580,12 +582,12 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     // THE ARENA'S HIGH-WATER MARK WAS A RESTING LEVEL. SlabArena never gave committed memory back —
     // right for the log ring, whose argument is that a LIFO free list asks for the same slabs again
     // on the next burst — so one burst to the byte budget left the span ring holding it for the
-    // life of the process: on the 512 MB stand ~27 MB of arena plus up to 64 slack chunks (4 MB),
+    // life of the process: on the 512 MB stand ~27 MB of arena plus up to 64 slack chunks (4.2 MB),
     // outside every MemoryBudgets share. The drainer now calls TrimIdleArena from the wake it
     // already takes when it finds the ring empty (at most once per TrimInterval), and everything
     // above a low-water mark that no span and no open batch is using goes back to the OS.
 
-    /// <summary>What the trim leaves committed: one 1 MB commit step — a drainer that keeps up works in one or two chunks.</summary>
+    /// <summary>What the trim leaves committed: one 1 MiB commit step (1.05 MB) — a drainer that keeps up works in one or two chunks.</summary>
     internal const int LowWaterChunks = 16;
 
     private int             _trimEpoch;   // odd while a trim holds the high free list; moves at both ends
