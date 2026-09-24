@@ -532,6 +532,83 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// EVERY BOXED TYPE IS ASKED AS THE FLUSH WILL STORE IT — review F-C. The writer stores
+    /// <c>int</c>/<c>short</c>/<c>byte</c> as integers, <c>float</c> as a double, and <c>sbyte</c>,
+    /// <c>uint</c>, <c>ulong</c>, <c>decimal</c> as invariant text; the hot tier used to answer from the
+    /// boxed type, so <c>{ .f = "0.1" }</c> matched <c>0.1f</c> before the flush and not after (stored
+    /// 0.10000000149011612), and <c>{ .s = 3 }</c> was unknown for a <c>short</c> before and true after.
+    /// For every query, the three-valued answers in the hot tier, after the flush, and the rows that
+    /// survive the bloom must be the same. Restore the boxed-type switch in
+    /// <c>AttributePredicate.CompareAttr(object)</c> and 11 of the 18 rows fail: every float row, and the
+    /// numeric ones for short, byte, sbyte, uint, ulong and decimal.
+    /// </summary>
+    [Theory]
+    [InlineData("ru-KZ")]
+    [InlineData("en-US")]
+    public async Task Every_boxed_type_answers_the_same_hot_and_flushed(string culture)
+    {
+        (string Key, object Hit, object Miss)[] values =
+        [
+            ("f",  0.1f,     0.5f),
+            ("s",  (short)3, (short)4),
+            ("b",  (byte)7,  (byte)8),
+            ("i",  4,        5),
+            ("sb", (sbyte)-5, (sbyte)5),
+            ("u",  9u,       10u),
+            ("ul", 11UL,     12UL),
+            ("m",  2.5m,     3.5m),
+        ];
+        string[] queries =
+        [
+            "{ .f = \"0.10000000149011612\" }", "{ .f = \"0.1\" }", "{ .f > 0.09 }", "{ .f = 0.1 }",
+            "{ .s = 3 }", "{ .s = \"3\" }", "{ .b = 7 }", "{ .b = \"7\" }", "{ .i = 4 }", "{ .i = \"4\" }",
+            "{ .sb < 0 }", "{ .sb = \"-5\" }", "{ .u = 9 }", "{ .u = \"9\" }", "{ .ul = 11 }",
+            "{ .m = 2.5 }", "{ .m = \"2.5\" }", "{ !(.m = 2.5) }",
+        ];
+
+        var corpus = new List<SpanRecord>(2 * Block);
+        for (int i = 0; i < 2 * Block; i++)
+        {
+            var attrs = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var (key, hit, miss) in values) attrs[key] = i < Block ? hit : miss;
+            corpus.Add(new SpanRecord
+            {
+                TraceId = new TraceId(0xFC, (ulong)i + 1), SpanId = new SpanId((ulong)i + 1),
+                StartTimeUnixNano = BaseNano + i * 1_000L, DurationNanos = 1_000_000,
+                Name = "op", ServiceName = "svc", Attributes = attrs,
+            });
+        }
+
+        await UnderCultureAsync(culture, async () =>
+        {
+            string path = SpanWriter.Write(NewDir("fc"), corpus).FilePath;
+            var flushed = SpanReader.ReadAll(path);
+            Assert.Equal(corpus.Count, flushed.Count);
+
+            var failures = new List<string>();
+            foreach (string q in queries)
+            {
+                var pred = TraceQLParser.Parse(q);
+                var (hot, cold) = (Tally(pred, corpus), Tally(pred, flushed));
+                var (_, found) = await Search(path, pred);
+                _out.WriteLine($"{culture} {q,-34} hot {hot}  flushed {cold}  bloom-filtered true {found}");
+
+                if (hot != cold)       failures.Add($"{q}: hot {hot}, flushed {cold}");
+                if (found != cold.True) failures.Add($"{q}: the bloom lost {cold.True - found} of {cold.True}");
+            }
+            Assert.True(failures.Count == 0, string.Join(Environment.NewLine, failures));
+        });
+
+        static (int True, int False, int Unknown) Tally(SpanPredicate pred, List<SpanRecord> spans)
+        {
+            int t = 0, f = 0, u = 0;
+            foreach (var s in spans)
+                switch (pred.Evaluate(s)) { case true: t++; break; case false: f++; break; default: u++; break; }
+            return (t, f, u);
+        }
+    }
+
     // ── The fold is the build's, not the host's ───────────────────────────────────────────────
 
     /// <summary>

@@ -266,30 +266,57 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
                                           queryText.AsSpan(), StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// The dictionary path — a record built from a dictionary (every fixture, the v2 migration), or
+    /// one whose blob would not decode.
+    ///
+    /// <para>ASKED AS A FLUSH WILL STORE IT, because the same span is asked the same question before
+    /// and after its flush. <c>SpanWriter.WriteAttributes</c> writes <c>int</c>/<c>short</c>/<c>byte</c>
+    /// as a msgpack integer, <c>float</c> as a double, and every type msgpack has no encoding for
+    /// (<c>sbyte</c>, <c>uint</c>, <c>ulong</c>, <c>decimal</c>, <c>DateTime</c>…) as its invariant text
+    /// (<see cref="SpanAttributeBlob.InvariantText"/>); the reader then boxes back only long, double,
+    /// bool and string. So this maps the boxed value onto exactly that shape and asks the blob twin
+    /// above (or, for text, the same string rules the blob twin applies to UTF-8). Answering from the
+    /// boxed type instead made <c>{ .x = "0.1" }</c> match a <c>0.1f</c> in the hot tier and not once
+    /// it was flushed as 0.10000000149011612, and <c>{ .retry = 3 }</c> unknown for a <c>short</c> in
+    /// the hot tier and true once it was a long (review F-C of #86).</para>
+    /// </summary>
     internal static bool? CompareAttr(object? raw, TraceQLOp op, in TraceQLValue qv)
     {
         if (raw is null) return null;
 
+        SpanAttrValue v = default;
+        switch (raw)
+        {
+            case string s: return CompareStoredText(s, op, in qv);
+            case bool b:   v.Kind = SpanAttrKind.Boolean; v.Boolean = b;  break;
+            case long l:   v.Kind = SpanAttrKind.Integer; v.Integer = l;  break;
+            case int n:    v.Kind = SpanAttrKind.Integer; v.Integer = n;  break;
+            case short sh: v.Kind = SpanAttrKind.Integer; v.Integer = sh; break;
+            case byte by:  v.Kind = SpanAttrKind.Integer; v.Integer = by; break;
+            case double d: v.Kind = SpanAttrKind.Float;   v.Float   = d;  break;
+            case float f:  v.Kind = SpanAttrKind.Float;   v.Float   = f;  break;
+            default:       return CompareStoredText(SpanAttributeBlob.InvariantText(raw), op, in qv);
+        }
+        return CompareAttr(in v, op, in qv);
+    }
+
+    /// <summary>
+    /// A text attribute — what the blob twin does with <see cref="SpanAttrKind.Utf8String"/>, on a
+    /// string: a numeric query parses it (invariant, unknown when it does not parse — #76), a string
+    /// query compares it ignoring case.
+    /// </summary>
+    private static bool? CompareStoredText(string attrStr, TraceQLOp op, in TraceQLValue qv)
+    {
         if (qv.IsNumber)
         {
-            double attrNum = raw switch
-            {
-                long   l => (double)l,
-                int    i => (double)i,
-                double d => d,
-                string str when double.TryParse(str,
-                    System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
-                _ => double.NaN,
-            };
-            if (double.IsNaN(attrNum)) return null;   // present but incomparable: unknown (#76)
+            if (!double.TryParse(attrStr, System.Globalization.NumberStyles.Any,
+                                 System.Globalization.CultureInfo.InvariantCulture, out double attrNum)
+                || double.IsNaN(attrNum))
+                return null;   // present but incomparable: unknown (#76)
             return CompareOp(attrNum, op, qv.Number);
         }
 
-        // Invariant for anything that formats (#86) — a long or a double is the text the blob path
-        // above compares and the bloom hashes, and any other type the text the writer stores for it;
-        // a string or a boolean has no culture to begin with. One definition for all three.
-        string attrStr = SpanAttributeBlob.InvariantText(raw);
         int cmp = string.Compare(attrStr, qv.StringVal, StringComparison.OrdinalIgnoreCase);
         return op switch
         {
