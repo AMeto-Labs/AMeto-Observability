@@ -3283,6 +3283,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
     }
 
+    /// <summary>Test hook: how many passes the last <see cref="CompactSmallSegments"/> run made (MaxPasses = 500 is the safety valve).</summary>
+    internal int LastCompactionPassesForTest { get; private set; }
+
     /// <summary>
     /// Merges small cold segments until the backlog is drained. Each pass stays
     /// memory-bounded (≤ MaxSegmentsPerPass files, ≤ MaxSpansPerPass spans), but
@@ -3304,6 +3307,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             const int MaxPasses = 500;   // safety valve, ~10k merged segments per run
             int passes = 0;
             while (CompactOnePass() && ++passes < MaxPasses) { }
+            LastCompactionPassesForTest = passes;
             if (passes > 0)
                 _logger.LogInformation("Compaction run finished: {Passes} pass(es), {Count} cold segments remain",
                     passes, _coldSegments.Length);
@@ -3480,7 +3484,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 int before = allSpans.Count;
                 allSpans.AddRange(SpanReader.ReadAll(seg.FilePath));
                 long measured = ReadBackBytesOf(CollectionsMarshal.AsSpan(allSpans)[before..]);
-                if (seg.WeightBytes <= 0) (weighed ??= []).Add((seg, measured));
+                // AT LEAST ONE BYTE (review L1): 0 is the "never measured" value, so a segment that reads
+                // back EMPTY (a footer whose trace-index offset points at the first block) recorded as 0
+                // looked unweighed on every pass — each one reported a change, re-planned it and read it
+                // again, to the run's 500-pass valve, on every run.
+                if (seg.WeightBytes <= 0) (weighed ??= []).Add((seg, Math.Max(1, measured)));
 
                 // A SEGMENT THAT WOULD TAKE THE KEPT SPANS PAST THE BUDGET IS PUT BACK, not merged:
                 // what a pass WRITES never weighs more than a pass may hold, so an underpriced

@@ -318,6 +318,52 @@ public sealed class TraceMemoryBudgetTests : IDisposable
     }
 
     /// <summary>
+    /// L1 — A SEGMENT THAT READS BACK EMPTY IS WEIGHED ONCE, NOT ON EVERY PASS. The writer never makes
+    /// an empty segment, but a damaged footer does: its trace-index offset pointing at the first
+    /// block, the reader walks no blocks and hands back no spans, without throwing. Two such
+    /// segments: a pass reads both, measures 0 bytes, merges nothing and writes the weights back.
+    /// A weight of 0 is the "never measured" value, so every pass saw a change, re-planned the same
+    /// two segments and read them again — until the run's 500-pass safety valve, on every run.
+    /// </summary>
+    [Fact]
+    public void Segments_that_read_back_empty_are_weighed_once_and_the_run_ends()
+    {
+        string dir = Dir("empty");
+        for (int s = 0; s < 2; s++)
+        {
+            var spans = new List<SpanRecord>();
+            for (int t = 0; t < 3; t++)
+                spans.Add(new SpanRecord
+                {
+                    TraceId = new TraceId(0xE3, (ulong)(s * 10 + t + 1)), SpanId = new SpanId((ulong)(s * 10 + t + 1)),
+                    StartTimeUnixNano = _baseNano + (s * 10 + t) * Ms, DurationNanos = Ms,
+                    Name = "op", ServiceName = "billing", Kind = SpanKind.Server,
+                });
+            var info = SpanWriter.Write(dir, spans);
+            // The footer's trace-index offset (its first 8 of 28 bytes) moved back to the first
+            // block (offset 27, just past the header): the reader now finds no blocks before it.
+            using var fs = new FileStream(info.FilePath, FileMode.Open, FileAccess.ReadWrite);
+            fs.Seek(-28, SeekOrigin.End);
+            fs.Write(BitConverter.GetBytes(27UL));
+        }
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        e.LoadColdSegments();
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+        Assert.All(e.ColdSegmentsForTest, static s => Assert.Empty(SpanReader.ReadAll(s.FilePath)));
+        Assert.Equal(2, TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest).Count);
+
+        e.CompactSmallSegments();
+        _out.WriteLine($"two empty segments: {e.LastCompactionPassesForTest} pass(es)");
+        Assert.True(e.LastCompactionPassesForTest <= 2,
+            $"the run made {e.LastCompactionPassesForTest} passes over two empty segments");
+        Assert.All(e.ColdSegmentsForTest, static s => Assert.True(s.WeightBytes > 0, "an empty segment was left unweighed"));
+
+        e.CompactSmallSegments();                                          // the next run: nothing new to learn
+        Assert.Equal(0, e.LastCompactionPassesForTest);
+    }
+
+    /// <summary>
     /// AN UNWEIGHED SEGMENT IS NEVER PRICED BELOW ITS OWN FILE. Five thousand spans are 3 MB by the
     /// count; a 40 MB file of them cannot weigh less than 40 MB read back, so it is not a candidate —
     /// it is kept out of the plan before anything has had to read it to find that out. The file floor
