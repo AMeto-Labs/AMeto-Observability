@@ -118,6 +118,28 @@ internal static class TraceFlamegraphJson
     }
 
     /// <summary>
+    /// The whole flame graph, but stopping every <paramref name="stepBytes"/> or so: the writer is
+    /// flushed and the walk resumed where it stopped — what <see cref="WriteAsync"/> does at its
+    /// flush threshold, at a step small enough to stop between any two nodes. For the parity tests,
+    /// which hold the resumed walk to the one-shot bytes. Returns how many times it resumed.
+    /// </summary>
+    internal static int WriteInSteps(Utf8JsonWriter json, List<SpanRecord> spans, int stepBytes)
+    {
+        var walk = new Walk(spans);
+        try
+        {
+            int resumes = 0;
+            while (!walk.WriteSome(json, json.BytesCommitted + json.BytesPending + stepBytes))
+            {
+                json.Flush();
+                resumes++;
+            }
+            return resumes;
+        }
+        finally { walk.Dispose(); }
+    }
+
+    /// <summary>
     /// The tree's index and the walk's position in it — pooled arrays and ints, so the walk can
     /// stop at a flush and carry on after it. A struct: it lives in the caller's frame (or the
     /// state machine of <see cref="WriteAsync"/>) and is never copied once built.

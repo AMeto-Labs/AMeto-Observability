@@ -149,12 +149,27 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
         return unbounded;
     }
 
-    /// <summary>What the endpoint writes, through the writer settings it uses.</summary>
+    /// <summary>
+    /// What the endpoint writes, through the writer settings it uses — in one go, and ALSO resumed
+    /// after every node (a 1-byte step), which must be the same bytes: the endpoint stops the walk at
+    /// every flush and resumes it, and nothing else would compare that path byte for byte.
+    /// </summary>
     private static string Written(List<SpanRecord> spans)
     {
         var buffer = new ArrayBufferWriter<byte>();
         using (var w = new Utf8JsonWriter(buffer, TraceFlamegraphJson.WithRoom(TraceDetailJson.WriterOptions(Host))))
             TraceFlamegraphJson.Write(w, spans);
+        string once = Encoding.UTF8.GetString(buffer.WrittenSpan);
+        Assert.Equal(once, WrittenInSteps(spans, 1, out _));
+        return once;
+    }
+
+    /// <summary>The walk stopped every <paramref name="stepBytes"/> and resumed (<c>WriteInSteps</c>).</summary>
+    private static string WrittenInSteps(List<SpanRecord> spans, int stepBytes, out int resumes)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var w = new Utf8JsonWriter(buffer, TraceFlamegraphJson.WithRoom(TraceDetailJson.WriterOptions(Host))))
+            resumes = TraceFlamegraphJson.WriteInSteps(w, spans, stepBytes);
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 
@@ -164,15 +179,20 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
         const int Traces = 4_000;
         var rng = new Random(20260923);
         int nulls = 0, refusedBefore = 0, roundingMattered = 0;
+        long resumes = 0;
 
         for (int t = 0; t < Traces; t++)
         {
             var spans = RandomTrace(rng);
             string want = Reference(spans, out bool refused);
-            string got  = Written(spans);
+            string got  = Written(spans);                                   // one go, and every node
             if (want != got)
                 output.WriteLine($"trace {t}: {spans.Count} spans");
             Assert.Equal(want, got);
+
+            // Resumed at uneven points too, in the middle of a node's bytes as often as not.
+            Assert.Equal(want, WrittenInSteps(spans, 16 + t % 97, out int r));
+            resumes += r;
 
             if (want == "null") nulls++;
             if (refused) refusedBefore++;
@@ -181,8 +201,8 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
 
         output.WriteLine($"{Traces:N0} traces identical: {nulls:N0} with no root, {refusedBefore:N0} too deep "
                        + $"for the old serialiser (a 500 before #91, now written), {roundingMattered:N0} where "
-                       + "rounded and raw child sums differ");
-        Assert.True(nulls > 0 && refusedBefore > 0 && roundingMattered > Traces / 4,
+                       + $"rounded and raw child sums differ; the uneven-step walks resumed {resumes:N0} times");
+        Assert.True(nulls > 0 && refusedBefore > 0 && roundingMattered > Traces / 4 && resumes > Traces,
             "the generator stopped producing one of the shapes this test exists for");
     }
 
