@@ -54,8 +54,9 @@ internal static class TraceStoreGate
 
     private static Task WriteClosedAsync(HttpContext ctx)
     {
+        // No Retry-After: Closed is final for this process, and "in 5 s" would promise an answer
+        // only a restart can give. (The alert preview's Loading 503 does carry one — that ends.)
         ctx.Response.StatusCode         = StatusCodes.Status503ServiceUnavailable;
-        ctx.Response.Headers.RetryAfter = "5";
         ctx.Response.ContentType        = "application/json; charset=utf-8";
         return ctx.Response.Body.WriteAsync(ClosedBody, 0, ClosedBody.Length, ctx.RequestAborted);
     }

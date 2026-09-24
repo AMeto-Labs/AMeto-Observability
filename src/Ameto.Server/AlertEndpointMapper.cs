@@ -91,7 +91,9 @@ public static class AlertEndpointMapper
             // tier. A preview of 0 would say "would not fire" about a number nobody measured.
             if (!value.IsAvailable)
             {
-                ctx.Response.Headers.RetryAfter = "5";
+                // Retry-After only for Loading, which ends by itself; Closed ends with a restart.
+                if (value.Availability == Ameto.Core.QueryAvailability.Loading)
+                    ctx.Response.Headers.RetryAfter = "5";
                 return Results.Json(
                     new { error = value.Availability == Ameto.Core.QueryAvailability.Loading
                         ? $"The {rule.Source.ToString().ToLowerInvariant()} store is still loading its data, so the rule cannot be previewed yet. Try again in a moment."

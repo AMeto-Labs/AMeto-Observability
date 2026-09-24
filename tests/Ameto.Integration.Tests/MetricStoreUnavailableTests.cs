@@ -208,7 +208,7 @@ public sealed class MetricStoreUnavailableTests
             Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable,
                 $"{req.Method} {req.Url}: {(int)res.StatusCode} after the close — {body}");
             Assert.Contains(req.Url.StartsWith("/api/alerts", StringComparison.Ordinal) ? "shut down" : "metric store has shut down", body);
-            Assert.Equal("5", res.Headers.RetryAfter?.ToString());
+            Assert.Null(res.Headers.RetryAfter);   // Closed is final: nothing to retry until a restart
         }
 
         // Metadata, not data: the teardown does not close it, and the whole name list is still in it.

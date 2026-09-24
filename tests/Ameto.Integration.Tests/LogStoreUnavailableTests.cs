@@ -249,7 +249,7 @@ public sealed class LogStoreUnavailableTests
             // removed from one of them should name that one, not stop at the first in the list.
             string expected = req.Url.StartsWith("/api/alerts", StringComparison.Ordinal) ? "shut down" : "log store has shut down";
             if (res.StatusCode != HttpStatusCode.ServiceUnavailable || !body.Contains(expected)
-                || res.Headers.RetryAfter?.ToString() != "5")
+                || res.Headers.RetryAfter is not null)   // Closed is final: nothing to retry until a restart
                 wrong.Add($"{req.Method} {req.Url}: {(int)res.StatusCode} after the close — {Clip(body)}");
         }
         Assert.True(wrong.Count == 0, string.Join(Environment.NewLine, wrong));
@@ -278,6 +278,41 @@ public sealed class LogStoreUnavailableTests
             name = "preview", source = "Log", comparator = "GreaterThan", threshold = 1, windowSeconds = 3600,
         }),
     ];
+
+    /// <summary>
+    /// The one 503 that DOES say when to come back: the preview of a rule over a store still
+    /// LOADING, which ends by itself. (Every Closed 503 carries no Retry-After — Closed ends only
+    /// with a restart.) The host is started with the log engine's catalog scan held open.
+    /// </summary>
+    [Fact]
+    public async Task The_preview_over_a_loading_store_is_a_503_that_says_when_to_retry()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var factory = new AmetoWebAppFactory();
+        HttpClient    client;
+        StorageEngine storage;
+        StorageEngine.HoldCatalogScanForTest.Value = hold.Task;
+        try
+        {
+            client  = factory.CreateClient();
+            storage = factory.Services.GetRequiredService<StorageEngine>();
+        }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+
+        try
+        {
+            Assert.Equal(QueryAvailability.Loading, storage.Availability);
+            using var res = await client.PostAsJsonAsync("/api/alerts/preview", new
+            {
+                name = "preview", source = "Log", comparator = "GreaterThan", threshold = 1, windowSeconds = 3600,
+            });
+            string body = await res.Content.ReadAsStringAsync();
+            Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable, $"{(int)res.StatusCode} — {body}");
+            Assert.Contains("still loading", body);
+            Assert.Equal("5", res.Headers.RetryAfter?.ToString());
+        }
+        finally { hold.TrySetResult(); }
+    }
 
     /// <summary>
     /// THE SEARCH THAT QUEUED THROUGH THE CLOSE. The only search slot is taken; a search arrives,

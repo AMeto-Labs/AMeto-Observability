@@ -175,7 +175,7 @@ public sealed class TraceStoreUnavailableTests
                 $"{req.Method} {req.Url}: {(int)res.StatusCode} after the close — {body}");
             Assert.Contains("\"error\":", body);
             Assert.Contains(req.Url.StartsWith("/api/alerts", StringComparison.Ordinal) ? "shut down" : "trace store has shut down", body);
-            Assert.Equal("5", res.Headers.RetryAfter?.ToString());
+            Assert.Null(res.Headers.RetryAfter);   // Closed is final: nothing to retry until a restart
         }
     }
 

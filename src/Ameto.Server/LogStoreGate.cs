@@ -45,8 +45,8 @@ internal static class LogStoreGate
 
         public Task ExecuteAsync(HttpContext ctx)
         {
+            // No Retry-After: Closed is final for this process — see TraceStoreGate.
             ctx.Response.StatusCode         = StatusCodes.Status503ServiceUnavailable;
-            ctx.Response.Headers.RetryAfter = "5";
             ctx.Response.ContentType        = "application/json; charset=utf-8";
             return ctx.Response.Body.WriteAsync(Body, 0, Body.Length, ctx.RequestAborted);
         }
