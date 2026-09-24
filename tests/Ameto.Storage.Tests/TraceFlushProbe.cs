@@ -88,41 +88,45 @@ public sealed class TraceFlushProbe : IDisposable
 
     // ── The golden constants ────────────────────────────────────────────────────
     //
-    // SHA-256 of each file SpanWriter.Write produced for BuildCorpus() at cb5780e — the merge of
-    // wave 1, the writer as WP5 found it. Recomputed by running this test against those sources
-    // (at 4cb9686, which is cb5780e's writer plus this file) under the INVARIANT culture; the two
-    // .trc constants were first recorded under ru-KZ and read D1BD639A… and FBFA3819….
+    // THE TWO .trc CONSTANTS WERE RE-RECORDED FOR #86, DELIBERATELY, AND ONLY THOSE TWO. The bloom
+    // index changed format: its values are hashed from a culture-invariant, case-folded text taken
+    // straight off the blob's bytes (SpanBloom), and the section is now empty legacy slots, the
+    // "RDB2" marker, then the blooms. Nothing else in the file moved, and that is proved rather than
+    // hoped: The_flush_changes_nothing_but_the_bloom_index splices the PRE-#86 bloom section
+    // (LegacySpanBloom, the old writer's feed) into today's file and gets the old constants below
+    // back, byte for byte. The three sidecars do not carry a bloom and did not move at all.
+    //
+    // History of the old constants: SHA-256 of each file SpanWriter.Write produced for
+    // BuildCorpus() at cb5780e — the merge of wave 1, the writer as WP5 found it — recomputed at
+    // 4cb9686 under the INVARIANT culture; the two .trc constants were first recorded under ru-KZ
+    // and read D1BD639A… and FBFA3819…, because the old bloom hashed `value.ToString()` in the
+    // CURRENT culture.
 
-    private const string V3Trc      = "81564E1FC2731519ABB87046EAB30D2EE23DDF5B7C96839261009FFDB992AA11";
+    private const string V3Trc      = "2196470F07516881B8C6F63200B4DB92C7DAF86CFF7C9CB6DBD19F97D23C8E69";
     private const string V3Stats    = "FAF48AB485397E0F3B65E3ADCE5413D6B8702E8AB8E3A044214D5CD0CB79C423";
     private const string V3SvcGraph = "44BE43D931468E9C74F5177BA89CAA5D252FA87FDF744AA98BA4F848C56C5A9F";
     private const string V3TraceSum = "BB5C2FD272B3D86F3DB50870847F530601D234AE373A33D4AD0FD524FA54C773";
-    private const string V4Trc      = "7D35320374B43D8BB9F8F3314B2B55A4137583772D5C182C927B9CA5C2868880";
+    private const string V4Trc      = "C0E6962B37E0EFF95019275BCC4EB6570CDA05453F5CE132311DB4C0DA6E3AD5";
 
-    // THE HASHES ARE OVER BYTES THAT DEPEND ON THE MACHINE'S CULTURE, and that is why every golden
-    // fact runs twice, under two ambient cultures that disagree about the decimal separator.
-    //
-    // The .trc carries a bloom per block, and SpanBloom hashes `value.ToString()` — the CURRENT
-    // culture's ToString. The corpus has doubles (`sampling.ratio`, `latency.ms`) and floats
-    // (`backoff.seconds`), so on a ru-KZ box 0.375 enters the bloom as "0,375" and on an en-US
-    // one as "0.375": the same corpus, two different files. The constants above were first
-    // recorded on a ru-KZ machine, and CI asserts them on windows-latest, which is en-US — red
-    // there for a writer nobody had touched. The sidecars do not format a number through the
-    // culture and hashed the same under both.
-    //
-    // FlushAndHash therefore pins the invariant culture around the write, and the constants are
-    // the invariant ones, recorded again from the writer at 4cb9686 (cb5780e's writer, before
-    // WP5) with that pin in place. Running each fact under both ambient cultures is what keeps
-    // the pin honest: take it out and the ru-KZ case goes red on every machine, CI included,
-    // instead of only on the machines that happen to disagree with whoever recorded last.
-    //
-    // This pins the TEST, not the product. The server's own flush still formats with whatever
-    // culture its host runs under — see SpanBloom.
+    /// <summary>The pre-#86 <c>.trc</c> constants, as recorded under the invariant culture.</summary>
+    private const string Pre86V3Trc = "81564E1FC2731519ABB87046EAB30D2EE23DDF5B7C96839261009FFDB992AA11";
+    private const string Pre86V4Trc = "7D35320374B43D8BB9F8F3314B2B55A4137583772D5C182C927B9CA5C2868880";
+
+    // THE HASHES NO LONGER DEPEND ON THE MACHINE'S CULTURE, and every golden fact runs under four
+    // ambient cultures to say so: ru-KZ and sv-SE (a decimal comma; sv-SE's minus is U+2212), en-US
+    // and the invariant one. The corpus has doubles (`sampling.ratio`, `latency.ms`), floats
+    // (`backoff.seconds`) and negative integers (`clock.skew.ns`) — every value whose
+    // `ToString()` differs between those cultures. Until #86 the flush had to be PINNED to the
+    // invariant culture here, and the comment said "this pins the TEST, not the product"; the pin
+    // is gone because the product no longer needs it. Put `value.ToString()` back into SpanBloom
+    // and the ru-KZ and sv-SE rows go red.
 
     [Theory]
     [InlineData("ru-KZ")]
     [InlineData("en-US")]
-    public void The_flush_still_produces_the_pre_change_bytes_v3(string ambientCulture)
+    [InlineData("sv-SE")]
+    [InlineData("")]
+    public void The_flush_produces_the_recorded_bytes_v3(string ambientCulture)
     {
         // The literal, not SpanWriter.DefaultVersion: this fact pins the v3 file, and a change to
         // the default must not quietly turn it into a second v4 fact.
@@ -146,11 +150,39 @@ public sealed class TraceFlushProbe : IDisposable
     [Theory]
     [InlineData("ru-KZ")]
     [InlineData("en-US")]
-    public void The_flush_still_produces_the_pre_change_bytes_v4(string ambientCulture)
+    [InlineData("sv-SE")]
+    [InlineData("")]
+    public void The_flush_produces_the_recorded_bytes_v4(string ambientCulture)
     {
         var h = UnderCulture(ambientCulture, () => FlushAndHash(4, "golden-v4"));
         _out.WriteLine($".trc      {h.TrcLength,10:N0} B  {h.Trc}");
         Assert.Equal(V4Trc, h.Trc);
+    }
+
+    /// <summary>
+    /// #86 CHANGED THE BLOOM INDEX AND NOTHING ELSE, and this is where that sentence is a fact. Take
+    /// today's file, replace its bloom section with the one the pre-#86 writer produced for the same
+    /// corpus (<see cref="LegacySpanBloom"/>, under the invariant culture the old constants were
+    /// recorded in), and the result is the pre-#86 file — its original SHA-256. So the span blocks,
+    /// the trace and service indices and the footer are the old bytes, which means the blob walk
+    /// that now feeds the bloom accepted and rejected every blob of the corpus (the truncated one
+    /// included) exactly as the one it replaced: a different verdict copies different bytes into the
+    /// block. It also certifies <see cref="LegacySpanBloom"/> as the old writer, which is what the
+    /// legacy-read tests in <c>SpanBloomCanonicalTests</c> stand on.
+    /// </summary>
+    [Theory]
+    [InlineData(3, Pre86V3Trc)]
+    [InlineData(4, Pre86V4Trc)]
+    public void The_flush_changes_nothing_but_the_bloom_index(ushort version, string pre86)
+    {
+        string dir  = NewDir($"pre86-v{version}");
+        var corpus  = BuildCorpus();
+        string trc  = UnderCulture("ru-KZ", () => SpanWriter.Write(dir, corpus, version: version).FilePath);
+
+        LegacySpanBloom.Rewrite(trc, corpus, culture: "");
+        string sha = Sha(trc);
+        _out.WriteLine($"v{version} with the pre-#86 bloom section: {sha}");
+        Assert.Equal(pre86, sha);
     }
 
     /// <summary>
@@ -904,17 +936,16 @@ public sealed class TraceFlushProbe : IDisposable
         string TraceSum, long TraceSumLength);
 
     /// <summary>
-    /// Writes the corpus and hashes the four files, with the INVARIANT culture pinned around the
-    /// write — the bloom inside the .trc hashes culture-formatted numbers (see the note above the
-    /// golden facts). <c>SpanWriter.Write</c> runs start to finish on the calling thread (no task,
-    /// no pool hop), so pinning this thread's culture covers every format it performs.
+    /// Writes the corpus and hashes the four files UNDER WHATEVER CULTURE THE CALLER SET — no pin
+    /// any more; see the note above the golden facts. <c>SpanWriter.Write</c> runs start to finish
+    /// on the calling thread (no task, no pool hop), so the caller's culture is the one every
+    /// format inside it would see.
     /// </summary>
     private Hashes FlushAndHash(ushort version, string label)
     {
         string dir  = NewDir(label);
         var corpus  = BuildCorpus();
-        string trc  = UnderCulture(CultureInfo.InvariantCulture.Name,
-                                   () => SpanWriter.Write(dir, corpus, version: version).FilePath);
+        string trc  = SpanWriter.Write(dir, corpus, version: version).FilePath;
         string bas  = Path.Combine(dir, Path.GetFileNameWithoutExtension(trc));
 
         return new Hashes(

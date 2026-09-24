@@ -178,7 +178,9 @@
         <code>&#123; .tenant &gt; 5 &#125;</code> and <code>&#123; !(.tenant &gt; 5) &#125;</code> both
         leave out a span whose <code>.tenant</code> is <code>"acme"</code>. <b>This differs from
         Grafana Tempo</b>, where a type mismatch is <i>false</i> and so its negation selects the
-        span. A quoted string against a number is not a mismatch: it compares the number's text.</span>
+        span. A quoted string against a number is not a mismatch: it compares the number's text —
+        always the invariant one, <code>"0.375"</code>, <code>"-3"</code>, <code>"1E+21"</code>, whatever
+        locale the server runs under (never <code>"0,375"</code>).</span>
       </div>
       <h3>Examples</h3>
       <div class="examples">

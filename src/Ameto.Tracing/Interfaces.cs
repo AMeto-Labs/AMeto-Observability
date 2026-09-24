@@ -366,8 +366,9 @@ public sealed class TraceVolume
 /// <summary>
 /// A necessary attribute condition extracted from a TraceQL AND-chain, used to
 /// skip storage blocks via their attribute blooms. <see cref="LowerValue"/> is the
-/// lowercased string value for equality predicates, or null for key-presence-only
-/// (any other operator still requires the key to exist on the span).
+/// lowercased (<c>ToLowerInvariant</c>) string value for equality predicates, or null for
+/// key-presence-only (any other operator still requires the key to exist on the span). The bloom
+/// probe folds it further — see <c>SpanBloom</c>.
 /// </summary>
 public readonly record struct AttrHint(string Key, string? LowerValue);
 

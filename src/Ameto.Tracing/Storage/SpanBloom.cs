@@ -1,22 +1,64 @@
+using System.Buffers;
+using System.Globalization;
 using System.Text;
+using MessagePack;
 
 namespace Ameto.Tracing.Storage;
 
 /// <summary>
-/// Per-block bloom filter over span attribute keys and string values, used by the
-/// TraceQL executor to skip blocks that cannot match an attribute predicate.
+/// Per-block bloom filter over span attribute keys and values, used by the TraceQL executor to
+/// skip blocks that cannot match an attribute predicate.
 ///
 /// <para>Entries inserted per span attribute:</para>
 /// <list type="bullet">
-///   <item><c>key</c> (ordinal bytes) — key presence; a valid necessary condition
+///   <item><c>key</c> — the key's UTF-8 bytes, as stored: key presence, a valid necessary condition
 ///     for EVERY attribute operator, since a span without the key never matches.</item>
-///   <item><c>key 0x1F lowercase(value.ToString())</c> — equality probes. Values are
-///     lowercased because TraceQL string comparison is OrdinalIgnoreCase, and
-///     non-string values use the same <c>ToString()</c> the evaluator compares with.</item>
+///   <item><c>key 0x1F fold(text(value))</c> — equality probes, for every value that has a text
+///     (string, integer, double, boolean; not nil, arrays, maps or binary).</item>
 /// </list>
 ///
-/// <para>k = 3 probes via double hashing over an FNV-1a 64 hash; the bit length is
-/// a power of two chosen at ~12 bits/entry (min 512, cap 32768 bits = 4 KB).</para>
+/// <para>THE BLOOM IS A PROMISE ABOUT THE EVALUATOR, and both halves of that entry are defined by
+/// it rather than by anything convenient to hash. <c>AttributePredicate</c> answers
+/// <c>{ .k = "q" }</c> with <c>text(value)</c> equal to <c>q</c> under
+/// <see cref="StringComparison.OrdinalIgnoreCase"/>, so the bloom must hold, for every value, a
+/// hash that every such <c>q</c> reproduces — one missed case is a block skipped that held the
+/// answer, and a TraceQL page that silently returns fewer rows.</para>
+///
+/// <para><b>text(value) is CULTURE-INDEPENDENT</b> (issue #86): a string is itself; an integer its
+/// invariant decimal (<c>-3</c>, never sv-SE's <c>−3</c>); a double its invariant shortest
+/// round-trip form (<c>0.375</c>, <c>1E+21</c>, <c>-0</c>, <c>NaN</c>, <c>-Infinity</c>, never
+/// ru-KZ's <c>0,375</c> or <c>∞</c>); a boolean <c>True</c>/<c>False</c>. The evaluator formats
+/// with the same rules, so a segment written under one culture and queried under another agrees
+/// with itself. It used to hash <c>value.ToString()</c> in the process culture, and a segment
+/// written on a ru-KZ box answered <c>{ .sampling.ratio = "0.375" }</c> with zero blocks on an
+/// en-US one.</para>
+///
+/// <para><b>fold is <c>ToUpperInvariant(ToLowerInvariant(rune))</c> per BMP scalar</b>, U+017F
+/// excepted and every astral scalar collapsed to U+FFFD (see <see cref="Fold"/>), and NOT the
+/// lowercase the pre-#86 bloom used. Lowercase is not the equivalence
+/// <c>OrdinalIgnoreCase</c> uses: it keeps <c>ς</c> apart from <c>σ</c>, <c>µ</c> from <c>μ</c>,
+/// and the archaic Cyrillic forms U+1C80–U+1C88 from <c>в д о с т ъ ѣ ꙋ</c> — 44 BMP pairs that
+/// the evaluator calls equal and the old bloom called different. Upper-of-lower merges every one
+/// of them (proved over every code point in <c>SpanBloomCanonicalTests</c>), and it can be
+/// computed from the hint's already-lowercased literal. U+017F (ſ) folds to itself because
+/// <c>OrdinalIgnoreCase</c> refuses to fold it and the ICU and invariant-globalization builds
+/// disagree about its uppercase — without the exception a segment moved between the two would
+/// disagree on it.</para>
+///
+/// <para><b>From the blob's bytes, with nothing decoded to a string</b> (TS#12): a string value is
+/// folded straight off its UTF-8, a number formatted into the stack. The flush used to box every
+/// value and allocate every key and every number's text to feed the old hash.</para>
+///
+/// <para><b>ON DISK the canonical blooms follow <see cref="CanonicalMarker"/></b>, behind one
+/// EMPTY legacy slot per block — see <c>SpanWriter</c>'s layout. An empty slot is "no bloom, never
+/// skip" to every older reader, so a build that predates this hash reads a new segment in full
+/// rather than probing canonical bits with the old hash, which would be a false-negative source
+/// on exactly the values #86 is about. A segment written before this change has no marker and is
+/// probed with the LEGACY functions below, permissively wherever the legacy text could have
+/// differed (<see cref="LegacyValueProbeIsExact"/>).</para>
+///
+/// <para>k = 3 probes via double hashing over an FNV-1a 64 hash; the bit length is a power of two
+/// chosen at ~12 bits/entry (min 512, cap 32768 bits = 4 KB).</para>
 /// </summary>
 internal static class SpanBloom
 {
@@ -25,12 +67,168 @@ internal static class SpanBloom
     private const int MaxBits      = 32_768;
     private const int Probes       = 3;
 
-    /// <summary>Collects the two hash entries for one attribute into <paramref name="hashes"/>.</summary>
+    /// <summary>
+    /// Written between the legacy slots and the canonical blooms of a <c>.trc</c> bloom index:
+    /// "RDB2", the second bloom hash. Its presence is what tells a reader which hash the bits were
+    /// built with; its absence means the pre-#86 culture-formatted hash.
+    /// </summary>
+    internal const uint CanonicalMarker = 0x52_44_42_32; // "RDB2"
+
+    private const ulong FnvOffset = 14695981039346656037UL;
+    private const ulong FnvPrime  = 1099511628211UL;
+    private const byte  Separator = 0x1F;
+
+    // ── Writer: from the blob ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Feeds one span's msgpack attribute map to the block bloom straight from its bytes — no key
+    /// string, no boxed value, no formatted number on the heap — and says whether the blob is safe
+    /// to copy through verbatim.
+    ///
+    /// <para>ACCEPTS AND REJECTS EXACTLY WHAT <see cref="SpanAttributeBlob.TryWalk{TState}"/> DOES,
+    /// because the answer decides the span's bytes on disk, not only its bloom: the same reader
+    /// calls in the same order (a map header; a string or nil key; <c>ReadInt64</c>, which throws on
+    /// a uint64 past <see cref="long.MaxValue"/>; <c>ReadDouble</c>; <c>ReadBoolean</c>;
+    /// <c>ReadNil</c>; <c>Skip</c>), and "one map" means the whole blob. Pinned by
+    /// <c>SpanBloomCanonicalTests</c> against <c>TryWalk</c> over the rejection shapes, and by
+    /// <c>TraceFlushProbe</c>, whose span blocks are still the pre-change bytes.</para>
+    ///
+    /// <para>A partial walk leaves the hashes it already added. Extra bits only ever make a block
+    /// MORE likely to be read, so a blob that dies half way costs a wasted block read and never a
+    /// missing row.</para>
+    /// </summary>
+    public static bool TryAddBlob(HashSet<ulong> hashes, ReadOnlyMemory<byte> blob)
+    {
+        // Outside the loop: stackalloc in a loop is not freed per iteration (CA2014).
+        Span<byte> scratch = stackalloc byte[32];
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            for (int i = 0; i < count; i++)
+            {
+                ulong key = ReadKeyHash(ref reader);
+                AddValue(hashes, key, ref reader, scratch);
+            }
+            return reader.End;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// FNV of the key's bytes as stored. A nil key is the empty key — what <c>ReadString() ?? ""</c>
+    /// made of it. <c>TryReadStringSpan</c> declines only nil (and a string split across segments,
+    /// which a reader over one <see cref="ReadOnlyMemory{T}"/> cannot meet); anything that is not a
+    /// string throws, as <c>ReadString</c> did.
+    /// </summary>
+    private static ulong ReadKeyHash(ref MessagePackReader reader)
+    {
+        if (reader.TryReadStringSpan(out var key)) return Fnv(FnvOffset, key);
+        if (reader.TryReadNil())                   return FnvOffset;
+
+        var seq = reader.ReadStringSequence();
+        ulong h = FnvOffset;
+        if (seq is { } s)
+            foreach (var segment in s) h = Fnv(h, segment.Span);
+        return h;
+    }
+
+    private static void AddValue(HashSet<ulong> hashes, ulong key, ref MessagePackReader reader, scoped Span<byte> scratch)
+    {
+        switch (reader.NextMessagePackType)
+        {
+            case MessagePackType.String:
+            {
+                ulong h = ValuePrefix(key);
+                if (reader.TryReadStringSpan(out var utf8))
+                {
+                    h = FoldUtf8(h, utf8);
+                }
+                else
+                {
+                    // Unreachable over one ReadOnlyMemory (see ReadKeyHash); a split string is
+                    // copied together rather than folded across a rune the split may have cut.
+                    var seq = reader.ReadStringSequence()!.Value;
+                    byte[] rented = ArrayPool<byte>.Shared.Rent((int)seq.Length);
+                    try
+                    {
+                        seq.CopyTo(rented);
+                        h = FoldUtf8(h, rented.AsSpan(0, (int)seq.Length));
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(rented);
+                    }
+                }
+                hashes.Add(key);
+                hashes.Add(h);
+                return;
+            }
+            case MessagePackType.Integer:
+            {
+                long v = reader.ReadInt64();
+                hashes.Add(key);
+                hashes.Add(HashInteger(ValuePrefix(key), v, scratch));
+                return;
+            }
+            case MessagePackType.Float:
+            {
+                double v = reader.ReadDouble();
+                hashes.Add(key);
+                hashes.Add(HashFloat(ValuePrefix(key), v, scratch));
+                return;
+            }
+            case MessagePackType.Boolean:
+            {
+                bool v = reader.ReadBoolean();
+                hashes.Add(key);
+                hashes.Add(HashBoolean(ValuePrefix(key), v));
+                return;
+            }
+            case MessagePackType.Nil:
+                reader.ReadNil();
+                hashes.Add(key);
+                return;
+            default:
+                // Array, map, binary, extension: the decoder boxes these to null, so the evaluator
+                // sees an absent value and only the key is a necessary condition.
+                reader.Skip();
+                hashes.Add(key);
+                return;
+        }
+    }
+
+    // ── Writer: from a dictionary ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The dictionary path — a record with no blob, or one whose blob failed
+    /// <see cref="TryAddBlob"/>. Hashes the value AS <c>SpanWriter.WriteAttributes</c> WRITES IT, which
+    /// is what a reader of the segment will evaluate: <c>int</c>/<c>short</c>/<c>byte</c> become an
+    /// integer, <c>float</c> a double, and any other type the string its <c>ToString()</c> wrote.
+    /// </summary>
     public static void AddAttr(HashSet<ulong> hashes, string key, object? value)
     {
-        hashes.Add(HashKey(key));
-        if (value is not null)
-            hashes.Add(HashKeyValue(key, value.ToString() ?? string.Empty));
+        ulong k = HashKey(key);
+        hashes.Add(k);
+
+        Span<byte> scratch = stackalloc byte[32];
+        ulong p = ValuePrefix(k);
+        switch (value)
+        {
+            case null:     return;
+            case string s: hashes.Add(FoldUtf16(p, s));                       return;
+            case bool b:   hashes.Add(HashBoolean(p, b));                     return;
+            case long l:   hashes.Add(HashInteger(p, l, scratch));            return;
+            case int n:    hashes.Add(HashInteger(p, n, scratch));            return;
+            case short sh: hashes.Add(HashInteger(p, sh, scratch));           return;
+            case byte by:  hashes.Add(HashInteger(p, by, scratch));           return;
+            case double d: hashes.Add(HashFloat(p, d, scratch));              return;
+            case float f:  hashes.Add(HashFloat(p, f, scratch));              return;
+            default:       hashes.Add(FoldUtf16(p, value.ToString() ?? "")); return;
+        }
     }
 
     /// <summary>Builds the bitset from collected entry hashes.</summary>
@@ -44,9 +242,35 @@ internal static class SpanBloom
         return bitset;
     }
 
-    public static ulong HashKey(string key) => Fnv1a64(key, suffix: null);
+    // ── Query: canonical ──────────────────────────────────────────────────────────────────────
 
-    public static ulong HashKeyValue(string key, string value) => Fnv1a64(key, value);
+    /// <summary>Key-presence probe: FNV of the key's UTF-8, the bytes the writer stored it as.</summary>
+    public static ulong HashKey(string key)
+    {
+        ulong h = FnvOffset;
+        Span<byte> buf = stackalloc byte[4];
+        int i = 0;
+        while (i < key.Length)
+        {
+            char c = key[i];
+            if (c < 0x80) { h = (h ^ c) * FnvPrime; i++; continue; }
+            // Invalid UTF-16 (a lone surrogate) decodes to U+FFFD, consuming one char — the same
+            // EF BF BD that Encoding.UTF8, and so the msgpack writer, puts on disk for it.
+            Rune.DecodeFromUtf16(key.AsSpan(i), out var r, out int used);
+            int n = r.EncodeToUtf8(buf);
+            h = Fnv(h, buf[..n]);
+            i += used;
+        }
+        return h;
+    }
+
+    /// <summary>
+    /// Equality probe for <c>{ .key = "value" }</c>. <paramref name="lowerValue"/> is the hint's
+    /// lowercased literal (<c>AttrHint.LowerValue</c>); the fold makes that and the original literal
+    /// the same probe, since upper-of-lower of a lowercase letter is upper-of-lower of the letter.
+    /// </summary>
+    public static ulong HashKeyValue(string key, string lowerValue) =>
+        FoldUtf16(ValuePrefix(HashKey(key)), lowerValue);
 
     /// <summary>May-contain test; an empty bitset never rejects (unknown blooms are permissive).</summary>
     public static bool MayContain(ReadOnlySpan<byte> bitset, ulong hash)
@@ -73,20 +297,199 @@ internal static class SpanBloom
         }
     }
 
-    /// <summary>
-    /// FNV-1a 64 over UTF-8 of the key, optionally followed by 0x1F and the
-    /// LOWERCASED value (TraceQL string equality is case-insensitive).
-    /// </summary>
-    private static ulong Fnv1a64(string key, string? suffix)
-    {
-        const ulong Offset = 14695981039346656037UL;
-        const ulong Prime  = 1099511628211UL;
+    // ── The canonical text and its fold ───────────────────────────────────────────────────────
 
-        ulong h = Offset;
+    private static ulong ValuePrefix(ulong keyHash) => (keyHash ^ Separator) * FnvPrime;
+
+    /// <summary>
+    /// The fold, one scalar at a time. See the type docstring for why upper-of-lower and why
+    /// U+017F is left alone.
+    ///
+    /// <para>EVERY SCALAR OUTSIDE THE BMP FOLDS TO U+FFFD, because no casing table this process can
+    /// reach agrees with <c>OrdinalIgnoreCase</c> there. The comparer folds astral letters from
+    /// .NET's own Unicode data (Unicode 16 in .NET 10), while <see cref="Rune.ToUpperInvariant"/>
+    /// under ICU asks the HOST's ICU, which may be older: measured on the dev box, the 22 Garay
+    /// case pairs (U+10D50–U+10D65 against U+10D70–U+10D85) are equal under the comparer and unmapped by ICU —
+    /// a folded bloom would have been a false-negative source on every one of them. Collapsing the
+    /// astral planes costs selectivity only (the bloom cannot tell 👍 from 👎 and reads a block too
+    /// many), never a row, and it cannot depend on which host or globalization mode wrote the
+    /// segment. The BMP has no such gap: there the comparer's table IS the casing table of the
+    /// mode it runs in, and <c>SpanBloomCanonicalTests</c> checks every pair.</para>
+    /// </summary>
+    internal static Rune Fold(Rune r) =>
+        !r.IsBmp           ? AstralFold
+      : r.Value == 0x017F  ? r
+      : Rune.ToUpperInvariant(Rune.ToLowerInvariant(r));
+
+    private static readonly Rune AstralFold = Rune.ReplacementChar;
+
+    /// <summary>ASCII fast path of <see cref="Fold"/>: a-z to A-Z, everything else as is.</summary>
+    private static byte FoldAscii(byte b) => (uint)(b - 'a') <= 'z' - 'a' ? (byte)(b - 0x20) : b;
+
+    /// <summary>
+    /// Folds UTF-8 as it is hashed. An ill-formed sequence is one U+FFFD per maximal invalid
+    /// subsequence — <see cref="Rune.DecodeFromUtf8"/>'s rule, which is also the one
+    /// <c>Encoding.UTF8.GetChars</c> applies when the evaluator decodes the same bytes.
+    /// </summary>
+    private static ulong FoldUtf8(ulong h, ReadOnlySpan<byte> utf8)
+    {
+        Span<byte> buf = stackalloc byte[4];
+        int i = 0;
+        while (i < utf8.Length)
+        {
+            byte b = utf8[i];
+            if (b < 0x80) { h = (h ^ FoldAscii(b)) * FnvPrime; i++; continue; }
+            Rune.DecodeFromUtf8(utf8[i..], out var r, out int used);
+            int n = Fold(r).EncodeToUtf8(buf);
+            h = Fnv(h, buf[..n]);
+            i += used;
+        }
+        return h;
+    }
+
+    /// <summary><see cref="FoldUtf8"/> over the UTF-8 the text encodes to, without encoding it.</summary>
+    private static ulong FoldUtf16(ulong h, string s)
+    {
+        Span<byte> buf = stackalloc byte[4];
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c < 0x80) { h = (h ^ FoldAscii((byte)c)) * FnvPrime; i++; continue; }
+            Rune.DecodeFromUtf16(s.AsSpan(i), out var r, out int used);
+            int n = Fold(r).EncodeToUtf8(buf);
+            h = Fnv(h, buf[..n]);
+            i += used;
+        }
+        return h;
+    }
+
+    /// <summary>Invariant decimal: digits and an ASCII minus, nothing to fold.</summary>
+    private static ulong HashInteger(ulong h, long v, Span<byte> scratch)
+    {
+        v.TryFormat(scratch, out int n, default, CultureInfo.InvariantCulture);
+        return Fnv(h, scratch[..n]);
+    }
+
+    /// <summary>
+    /// Invariant shortest round-trip (the default format since .NET Core 3.0, the same text
+    /// <c>ToString("R")</c> gives) — at most 24 bytes, e.g. <c>-2.2250738585072014E-308</c> — folded,
+    /// because <c>NaN</c>, <c>Infinity</c> and the exponent's <c>E</c> are letters a query may spell
+    /// in either case.
+    /// </summary>
+    private static ulong HashFloat(ulong h, double v, Span<byte> scratch)
+    {
+        v.TryFormat(scratch, out int n, default, CultureInfo.InvariantCulture);
+        for (int i = 0; i < n; i++) h = (h ^ FoldAscii(scratch[i])) * FnvPrime;
+        return h;
+    }
+
+    private static ulong HashBoolean(ulong h, bool v) =>
+        Fnv(h, v ? "TRUE"u8 : "FALSE"u8);   // fold("True"), fold("False")
+
+    private static ulong Fnv(ulong h, ReadOnlySpan<byte> bytes)
+    {
+        foreach (byte b in bytes) h = (h ^ b) * FnvPrime;
+        return h;
+    }
+
+    // ── Query: legacy blooms (segments written before #86) ────────────────────────────────────
+
+    /// <summary>Key probe for a pre-#86 bloom. Differs from <see cref="HashKey"/> only for a key
+    /// holding a character outside the BMP, which the old hash encoded one surrogate at a time.</summary>
+    public static ulong LegacyHashKey(string key) => LegacyFnv(key, suffix: null);
+
+    /// <summary>Equality probe for a pre-#86 bloom — only where <see cref="LegacyValueProbeIsExact"/>.</summary>
+    public static ulong LegacyHashKeyValue(string key, string lowerValue) => LegacyFnv(key, lowerValue);
+
+    /// <summary>
+    /// WHETHER A PRE-#86 BLOOM CAN BE TRUSTED TO HOLD <paramref name="lowerValue"/> FOR EVERY VALUE
+    /// THE EVALUATOR WOULD MATCH IT WITH. The old bloom hashed <c>lowercase(value.ToString())</c> in
+    /// the WRITER's culture, and two things make that disagree with today's evaluator:
+    /// <list type="bullet">
+    ///   <item><b>A number's text.</b> A literal that is the invariant text of some number can
+    ///     match an integer or a double whose writer-culture text was different: <c>0.375</c> is
+    ///     <c>0,375</c> under ru-KZ, <c>-3</c> is <c>−3</c> under sv-SE, <c>NaN</c> and
+    ///     <c>Infinity</c> have localised symbols, an exponent carries a sign. Only a run of ASCII
+    ///     digits is the same text in every culture, so a literal that parses as a number and is not
+    ///     one is not exact.</item>
+    ///   <item><b>The case fold.</b> The old bloom lowercased, and 44 BMP pairs are equal under
+    ///     <c>OrdinalIgnoreCase</c> with different lowercases (<c>ς</c>/<c>σ</c>, <c>µ</c>/<c>μ</c>,
+    ///     U+1C80–U+1C88 against <c>в д о с т ъ ѣ ꙋ</c>, …). A literal holding a lowercase that such a
+    ///     pair produces is not exact either.</item>
+    /// </list>
+    /// For those the reader probes the key alone, which the old bloom holds exactly: the block
+    /// skip degrades to key presence, and no row is lost. Query-side only, once per hint.
+    /// </summary>
+    public static bool LegacyValueProbeIsExact(string lowerValue)
+    {
+        bool allDigits = true;
+        foreach (char c in lowerValue)
+        {
+            if ((uint)(c - '0') > 9) allDigits = false;
+            if (LegacyFoldUnsafe.Contains(c)) return false;
+        }
+        if (allDigits) return true;
+        return !double.TryParse(lowerValue, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
+    }
+
+    /// <summary>
+    /// The lowercases that a pre-#86 bloom and <c>OrdinalIgnoreCase</c> disagree about, computed
+    /// ONCE from this process's own casing tables rather than written down, so the set is right for
+    /// the globalization mode the query runs under. A class of <see cref="Fold"/> (which contains
+    /// every <c>OrdinalIgnoreCase</c> class) whose members lowercase to more than one character
+    /// contributes all of those lowercases.
+    /// </summary>
+    private static class LegacyFoldUnsafe
+    {
+        private static readonly ulong[] Bits = Compute();
+
+        public static bool Contains(char c) => (Bits[c >> 6] & (1UL << (c & 63))) != 0;
+
+        private static ulong[] Compute()
+        {
+            const int Bmp = 0x1_0000;
+            var firstLower = new int[65_536];
+            var mixed      = new bool[65_536];
+            Array.Fill(firstLower, -1);
+
+            for (int c = 0; c < Bmp; c++)
+            {
+                if (c is >= 0xD800 and <= 0xDFFF) continue;
+                int g = Fold(new Rune(c)).Value;
+                int l = char.ToLowerInvariant((char)c);
+                // A BMP character folding outside the BMP: none exists, and the old hash could not
+                // tell such a scalar from any other (it encoded each surrogate half as U+FFFD).
+                if (g >= Bmp) continue;
+                if (firstLower[g] < 0) firstLower[g] = l;
+                else if (firstLower[g] != l) mixed[g] = true;
+            }
+
+            var bits = new ulong[65_536 / 64];
+            for (int c = 0; c < Bmp; c++)
+            {
+                if (c is >= 0xD800 and <= 0xDFFF) continue;
+                int g = Fold(new Rune(c)).Value;
+                if (g >= Bmp || !mixed[g]) continue;
+                int l = char.ToLowerInvariant((char)c);
+                bits[l >> 6] |= 1UL << (l & 63);
+            }
+            return bits;
+        }
+    }
+
+    /// <summary>
+    /// THE PRE-#86 HASH, verbatim: FNV-1a 64 over UTF-8 of the key, optionally followed by 0x1F and
+    /// the value lowercased one UTF-16 unit at a time (so a surrogate half encodes as U+FFFD).
+    /// Kept for reading segments written before the canonical hash; nothing writes it any more.
+    /// </summary>
+    private static ulong LegacyFnv(string key, string? suffix)
+    {
+        ulong h = FnvOffset;
         h = HashUtf8(h, key, lower: false);
         if (suffix is not null)
         {
-            h = (h ^ 0x1F) * Prime;
+            h = (h ^ Separator) * FnvPrime;
             h = HashUtf8(h, suffix, lower: true);
         }
         return h;
@@ -106,13 +509,13 @@ internal static class SpanBloom
                 if (lower) c = char.ToLowerInvariant(c);
                 if (c < 0x80)
                 {
-                    h = (h ^ (byte)c) * Prime;
+                    h = (h ^ (byte)c) * FnvPrime;
                 }
                 else
                 {
                     one[0] = c;
                     int n  = Encoding.UTF8.GetBytes(one, buf);
-                    for (int j = 0; j < n; j++) h = (h ^ buf[j]) * Prime;
+                    for (int j = 0; j < n; j++) h = (h ^ buf[j]) * FnvPrime;
                 }
             }
             return h;

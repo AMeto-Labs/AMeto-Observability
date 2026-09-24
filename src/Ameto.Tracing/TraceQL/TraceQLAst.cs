@@ -178,8 +178,8 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// and the same span read back out of a segment are asked the same question by the same page.
     ///
     /// <para>Nothing here allocates. A string attribute is compared as UTF-8 decoded into the
-    /// stack; a number met by a string query is formatted into the stack with the same current-
-    /// culture <c>ToString()</c> the boxed path would have used; and a value no dictionary could
+    /// stack; a number met by a string query is formatted into the stack with the same INVARIANT
+    /// text the boxed path uses and the block bloom hashes (#86); and a value no dictionary could
     /// hold answers null exactly as the boxed path's <c>null</c> does.</para>
     /// </summary>
     internal static bool? CompareAttr(in SpanAttrValue v, TraceQLOp op, in TraceQLValue qv)
@@ -247,14 +247,19 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
             return string.Compare(v.Boolean ? bool.TrueString : bool.FalseString,
                                   queryText, StringComparison.OrdinalIgnoreCase);
 
-        // long.ToString() and double.ToString() with the ambient culture — the same text
-        // `raw.ToString()` produced on the boxed path, written into the stack instead of the heap.
+        // THE INVARIANT TEXT, NOT THE AMBIENT CULTURE'S — issue #86. `{ .ratio = "0.375" }` has one
+        // answer whatever locale the server was started under, and it is the answer the block
+        // bloom promises (SpanBloom hashes exactly this text): under ru-KZ the culture's text was
+        // "0,375", so the evaluator and a bloom written on another box disagreed, and a server that
+        // moved between locales answered the same query differently for fresh and flushed spans.
+        // The same text the boxed path below produces, written into the stack instead of the heap.
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
         bool ok = v.Kind == SpanAttrKind.Integer
-            ? v.Integer.TryFormat(stack, out int len)
-            : v.Float.TryFormat(stack, out len);
+            ? v.Integer.TryFormat(stack, out int len, default, inv)
+            : v.Float.TryFormat(stack, out len, default, inv);
         if (!ok) return string.Compare(v.Kind == SpanAttrKind.Integer
-                                           ? v.Integer.ToString()
-                                           : v.Float.ToString(),
+                                           ? v.Integer.ToString(inv)
+                                           : v.Float.ToString(inv),
                                        queryText, StringComparison.OrdinalIgnoreCase);
 
         return MemoryExtensions.CompareTo((ReadOnlySpan<char>)stack[..len],
@@ -281,7 +286,11 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
             return CompareOp(attrNum, op, qv.Number);
         }
 
-        string attrStr = raw.ToString() ?? string.Empty;
+        // Invariant for anything that formats (#86) — a long or a double is the text the blob path
+        // above compares and the bloom hashes; a string or a boolean has no culture to begin with.
+        string attrStr = raw is IFormattable f
+            ? f.ToString(null, System.Globalization.CultureInfo.InvariantCulture)
+            : raw.ToString() ?? string.Empty;
         int cmp = string.Compare(attrStr, qv.StringVal, StringComparison.OrdinalIgnoreCase);
         return op switch
         {

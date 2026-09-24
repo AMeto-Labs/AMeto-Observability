@@ -151,10 +151,11 @@ public static class TraceQLExecutor
 
     private static void AddAttrHint(SearchHints h, AttributePredicate attr)
     {
-        // Equality on a string value → key+value probe (bloom stores lowercased
-        // values because TraceQL string comparison is OrdinalIgnoreCase). Numeric
-        // equality matches across representations (long/double/numeric string),
-        // so only the key-presence probe is safe there.
+        // Equality on a string value → key+value probe. The bloom stores a case-folded,
+        // culture-invariant text of every value because TraceQL string comparison is
+        // OrdinalIgnoreCase over that text (SpanBloom, #86); the literal travels lowercased and
+        // the probe folds it the same way. Numeric equality matches across representations
+        // (long/double/numeric string), so only the key-presence probe is safe there.
         string? lower = attr.Op == TraceQLOp.Eq && !attr.Value.IsNumber
             ? attr.Value.StringVal?.ToLowerInvariant()
             : null;
