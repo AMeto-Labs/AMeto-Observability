@@ -530,13 +530,17 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         var spin = new SpinWait();
         while (true)
         {
+            int epoch = Volatile.Read(ref _trimEpoch);
             int c = TryPop(ref _cursors[LowFree].Value);
             if (c == PopEmpty) c = TryPop(ref _cursors[HighFree].Value);
             if (c != PopEmpty) return c == PopNoCommit ? -1 : c;
+            _afterListsFoundEmptyForTest?.Invoke();
 
             // Both lists empty. A trim holds the whole high list for a moment (microseconds, plus
-            // one decommit call): an empty list then means "wait", not "full".
-            if (Volatile.Read(ref _trimming) == 0) return -1;
+            // one decommit call): an empty list then means "wait", not "full". Full only if no trim
+            // was running at any point while we looked — the epoch is odd during one, and moves at
+            // either end, so a trim that finished between the look and this check is seen too.
+            if ((epoch & 1) == 0 && Volatile.Read(ref _trimEpoch) == epoch) return -1;
 
             // Wait, never refuse — with SpinWait's DEFAULT escalation (spin, then yield, then
             // Sleep(1)), not a pure spin: if the drainer is descheduled mid-trim, a pure spin burns
@@ -584,7 +588,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// <summary>What the trim leaves committed: one 1 MB commit step — a drainer that keeps up works in one or two chunks.</summary>
     internal const int LowWaterChunks = 16;
 
-    private int             _trimming;    // set while a trim holds the high free list
+    private int             _trimEpoch;   // odd while a trim holds the high free list; moves at both ends
     private readonly byte[] _trimTaken;   // one mark per chunk: "in the free list the trim holds"
 
     /// <summary>Test seam: the trim holds the whole high free list, before it has decommitted anything.</summary>
@@ -592,6 +596,9 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
 
     /// <summary>Test seam: a producer found both free lists empty while a trim holds the high one, and is waiting.</summary>
     internal Action? _onWaitingForTrimForTest;
+
+    /// <summary>Test seam: a producer has just found both free lists empty, and has not yet decided whether to wait.</summary>
+    internal Action? _afterListsFoundEmptyForTest;
 
     /// <summary>
     /// Gives back the arena above the highest chunk still in use (and above <see cref="LowWaterChunks"/>)
@@ -614,7 +621,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         if (Volatile.Read(ref _disposed) != 0) return 0;
         ref long headRef = ref _cursors[HighFree].Value;
 
-        Volatile.Write(ref _trimming, 1);
+        Interlocked.Increment(ref _trimEpoch);                           // odd: holding
         long taken;
         while (true)
         {
@@ -679,7 +686,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
                     if (Interlocked.CompareExchange(ref headRef, newHead, head) == head) break;
                 }
             }
-            Volatile.Write(ref _trimming, 0);
+            Interlocked.Increment(ref _trimEpoch);                       // even: done
         }
         return given;
     }

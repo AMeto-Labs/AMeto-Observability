@@ -510,6 +510,59 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
+    /// A PRODUCER THAT LOOKED DURING A TRIM AND DECIDES AFTER IT ENDED RETRIES — IT DOES NOT REFUSE.
+    /// The producer finds both lists empty because the trim holds the high one, and is parked (seam)
+    /// before it decides; the trim then finishes and puts the list back. Deciding by "is a trim
+    /// running NOW?" answered no, and the span was refused with the list full of free chunks. The
+    /// decision now asks whether a trim ran at any point while it looked (an epoch, odd during a
+    /// trim, moved at both ends), and a producer that cannot rule that out looks again.
+    /// </summary>
+    [Fact]
+    public async Task A_producer_that_looked_during_a_trim_and_decides_after_it_ends_retries_instead_of_refusing()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+        var held = DrainHoldingTheLowChunks(ring);                       // a producer must go to the high list
+
+        var sawEmpty = new TaskCompletionSource();
+        var trimDone = new TaskCompletionSource();
+        using var _ = Seam.ReleasedOnExit(trimDone);
+        int looks = 0;
+        ring._afterListsFoundEmptyForTest = () =>
+        {
+            if (Interlocked.Increment(ref looks) != 1) return;
+            sawEmpty.TrySetResult();
+            trimDone.Task.WaitAsync(HangGuard).GetAwaiter().GetResult(); // the trim ends between the look and the decision
+        };
+        Task<bool>? producer = null;
+        ring._whileTrimmingForTest = () =>
+        {
+            producer = Task.Run(() =>
+            {
+                var h = Fields(500);
+                bool ok = ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(500));
+                ring.EndBatch();
+                return ok;
+            });
+            sawEmpty.Task.WaitAsync(HangGuard).GetAwaiter().GetResult();
+        };
+
+        ring.TrimIdleArena();
+        ring._whileTrimmingForTest = null;
+        trimDone.SetResult();
+
+        bool taken = await producer!.WaitAsync(HangGuard);
+        ring._afterListsFoundEmptyForTest = null;
+        _out.WriteLine($"looked {looks} time(s); taken: {taken}; refused for want of arena: {ring.RefusedNoArena}");
+        Assert.True(taken, "the span was refused: the producer decided after the trim ended that the lists were really empty");
+        Assert.Equal(0, ring.RefusedNoArena);
+        Assert.Equal(1, ring.TryDequeueMany(headers, apart));
+        ring.Release(headers.AsSpan(0, 1));
+        ring.Release(held);
+    }
+
+    /// <summary>
     /// A CHUNK IS REUSED ONLY WHEN EVERY SPAN IN IT IS DRAINED, AND THEN FIRST. Three spans in one chunk,
     /// one drained: a new batch must NOT be packed into that chunk. All drained: the next batch gets it
     /// back (LIFO), so a drainer that keeps up works in one chunk forever — the arena's residency is
