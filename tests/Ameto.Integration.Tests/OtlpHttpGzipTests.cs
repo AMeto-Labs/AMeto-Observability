@@ -55,23 +55,45 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
         /// <summary>What the host logs — for the one refusal that is logged as well as answered.</summary>
         public CapturedLog Log { get; } = new();
 
+        /// <summary>The clock the too-large warning is throttled by: it moves only when a test says so.</summary>
+        internal Ameto.Testing.ManualTimeProvider Clock { get; } = new();
+
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            builder.ConfigureServices(services => services.AddSingleton<ILoggerProvider>(Log));
+            builder.ConfigureServices(services =>
+            {
+                services.AddSingleton<ILoggerProvider>(Log);
+                services.AddSingleton(sp => new OtlpGzipTooLargeLog(
+                    sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), Clock));
+            });
         }
     }
 
-    /// <summary>Counts log entries by event name. The class's tests run one at a time, so a before/after delta is this test's.</summary>
+    /// <summary>
+    /// Log entries by event name, with their structured values. The class's tests run one at a
+    /// time, so a before/after difference is the test's own.
+    /// </summary>
     public sealed class CapturedLog : ILoggerProvider
     {
-        private readonly ConcurrentQueue<(string? Event, LogLevel Level)> _entries = new();
+        private readonly ConcurrentQueue<(string? Event, LogLevel Level, IReadOnlyList<KeyValuePair<string, object?>>? State)> _entries = new();
 
         public int Count(string eventName, LogLevel level)
         {
             int n = 0;
-            foreach (var (name, lvl) in _entries) if (name == eventName && lvl == level) n++;
+            foreach (var (name, lvl, _) in _entries) if (name == eventName && lvl == level) n++;
             return n;
+        }
+
+        /// <summary>The named values of the latest entry with this event name.</summary>
+        public Dictionary<string, object?> Last(string eventName)
+        {
+            IReadOnlyList<KeyValuePair<string, object?>>? last = null;
+            foreach (var (name, _, state) in _entries) if (name == eventName) last = state;
+            Assert.NotNull(last);
+            var values = new Dictionary<string, object?>();
+            foreach (var (key, value) in last) values[key] = value;
+            return values;
         }
 
         public ILogger CreateLogger(string categoryName) => new Sink(this);
@@ -83,7 +105,7 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
             public bool IsEnabled(LogLevel logLevel) => true;
             public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
                                     Func<TState, Exception?, string> formatter)
-                => log._entries.Enqueue((eventId.Name, logLevel));
+                => log._entries.Enqueue((eventId.Name, logLevel, state as IReadOnlyList<KeyValuePair<string, object?>>));
         }
     }
 
@@ -237,13 +259,15 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
         byte[] gz = OtlpGzipTests.Gzip(over.Message);
         Assert.True(gz.Length < Limit, $"the compressed body ({gz.Length:N0} B) must pass the wire check for this to test the inflated one");
 
-        int warned = _factory.Log.Count("OtlpHttpGzipTooLarge", LogLevel.Warning);
+        _factory.Clock.Advance(OtlpGzipTooLargeLog.Interval);                      // a new second: this one is written
+        int warned = _factory.Log.Count("OtlpGzipTooLarge", LogLevel.Warning);
         using var refused = await PostAsync(route, gz, protobuf, "gzip");
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
         Assert.Empty(await refused.Content.ReadAsByteArrayAsync());                    // the wire 413's body: none
-        // And logged, unlike the wire 413: the client is told, and so is whoever runs the server.
-        Assert.Equal(warned + 1, _factory.Log.Count("OtlpHttpGzipTooLarge", LogLevel.Warning));
+        // And logged, unlike the wire 413 — once in its second: the client is told, and so is
+        // whoever runs the server (the throttle itself is pinned below).
+        Assert.Equal(warned + 1, _factory.Log.Count("OtlpGzipTooLarge", LogLevel.Warning));
 
         var after = Batch.Of(SignalOf(route), protobuf, count: 1);
         using var accepted = await PostAsync(route, OtlpGzipTests.Gzip(after.Message), protobuf, "gzip");
@@ -251,6 +275,49 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
         await after.AssertReadableAsync(_client);
         await over.AssertAbsentAsync(_client);
     }
+
+    /// <summary>
+    /// PR #96 review, finding 3: the warning for an inflated 413 is written at most once a second,
+    /// carries the count since the last one, and names the latest sender — its API key as the key
+    /// list shows it (the first eight hex digits of its SHA-256, never the key) and its address.
+    /// It used to be one line per refusal, naming nobody, with a logger created per request.
+    /// </summary>
+    [Fact]
+    public async Task The_inflated_413_warning_is_once_a_second_with_the_count_and_the_sender()
+    {
+        byte[] bomb = GzipBomb.Payload;
+
+        // A new second, and whatever the earlier tests left pending written out with it.
+        _factory.Clock.Advance(OtlpGzipTooLargeLog.Interval);
+        using (var flush = await PostAsync("/v1/logs", bomb, protobuf: true, "gzip"))
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, flush.StatusCode);
+        int warned = _factory.Log.Count("OtlpGzipTooLarge", LogLevel.Warning);
+
+        // Two more in the same second: refused, counted, not written.
+        for (int i = 0; i < 2; i++)
+        {
+            using var refused = await PostAsync("/v1/traces", bomb, protobuf: true, "gzip");
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
+        }
+        Assert.Equal(warned, _factory.Log.Count("OtlpGzipTooLarge", LogLevel.Warning));
+
+        // The next second: one line, for all three, naming the one that tripped it.
+        _factory.Clock.Advance(OtlpGzipTooLargeLog.Interval);
+        var last = await SendRawAsync("/v1/metrics", bomb, protobuf: true, new StringValues("gzip"),
+                                      from: IPAddress.Parse("203.0.113.7"));
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, last.Response.StatusCode);
+        Assert.Equal(warned + 1, _factory.Log.Count("OtlpGzipTooLarge", LogLevel.Warning));
+
+        var line = _factory.Log.Last("OtlpGzipTooLarge");
+        Assert.Equal(3L, line["Count"]);
+        Assert.Equal(Limit, line["Limit"]);
+        Assert.Equal(KeyListPreview(AmetoWebAppFactory.TestApiKey), line["KeyPreview"]);
+        Assert.Equal("203.0.113.7", line["RemoteAddress"]);
+    }
+
+    /// <summary>What <c>GET /api/auth/keys</c> shows for a key: <c>KeyHash[..8]</c>, the hash being AuthStore's.</summary>
+    private static string KeyListPreview(string key)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant()[..8];
 
     /// <summary>
     /// THE BOMB, through the receiver: ~250 KB that inflate to 256 MiB, on every route. 413, and
@@ -511,7 +578,8 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
     /// header — <c>Accept-Encoding</c> — that HttpClient's typed collections have no place for
     /// on a response.
     /// </summary>
-    private async Task<HttpContext> SendRawAsync(string route, byte[] body, bool protobuf, StringValues encoding)
+    private async Task<HttpContext> SendRawAsync(string route, byte[] body, bool protobuf, StringValues encoding,
+                                                 IPAddress? from = null)
     {
         var ctx = await _factory.Server.SendAsync(c =>
         {
@@ -521,6 +589,7 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
             c.Request.ContentLength = body.Length;
             c.Request.Body          = new MemoryStream(body);
             c.Request.Headers["X-Seq-ApiKey"] = AmetoWebAppFactory.TestApiKey;
+            c.Connection.RemoteIpAddress      = from;
             if (encoding.Count > 0)
                 c.Request.Headers.ContentEncoding = encoding;
         }).WaitAsync(Patience);

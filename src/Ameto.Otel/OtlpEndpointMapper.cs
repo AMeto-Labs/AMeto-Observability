@@ -45,13 +45,17 @@ public static class OtlpEndpointMapper
 
     /// <summary>
     /// What the OTLP receivers — HTTP and gRPC — share across requests: the gate that bounds how
-    /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>). TryAdd, so a
-    /// host that already registered one — a test with a smaller gate — keeps it.
+    /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>), and the
+    /// throttled warning for one that inflated past the limit (<see cref="OtlpGzipTooLargeLog"/>).
+    /// TryAdd, so a host that already registered either — a test with a smaller gate or a clock
+    /// of its own — keeps it.
     /// </summary>
     public static IServiceCollection AddOtlpReceivers(this IServiceCollection services)
     {
         services.TryAddSingleton(static sp => OtlpInflateGate.For(
             sp.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes));
+        services.TryAddSingleton(static sp => new OtlpGzipTooLargeLog(
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
         return services;
     }
 
@@ -77,12 +81,16 @@ public static class OtlpEndpointMapper
         // startup rather than on its first compressed batch.
         OtlpInflateGate inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
 
+        // Likewise the throttled warning for a gzip batch that inflated past the limit — one
+        // instance, its logger created once, shared with the gRPC receiver.
+        OtlpGzipTooLargeLog tooLargeLog = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
+
         // ── Traces ────────────────────────────────────────────────────────────
         var traces = async (HttpContext ctx, ISpanSink sink) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
             if (body is null) return;
 
             int ingested, refused;
@@ -118,7 +126,7 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
             if (body is null) return;
 
             List<Ameto.Metrics.MetricIngestItem> points;
@@ -153,7 +161,7 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
             if (body is null) return;
 
             int ingested = 0, dropped = 0;
@@ -235,17 +243,6 @@ public static class OtlpEndpointMapper
     internal static void LogTracesDecodeFailed(ILogger logger, int bytes, string? contentType, Exception ex)
         => _tracesDecodeFailed(logger, bytes, contentType, ex);
 
-    /// <summary>
-    /// A gzip body that inflated past the limit — logged, not swallowed, as the gRPC receiver
-    /// does: it is either a misconfigured exporter or someone probing, and both are worth being
-    /// able to see afterwards. The 413 alone would tell the client and nobody else.
-    /// </summary>
-    private static readonly Action<ILogger, int, Exception?> _gzipTooLarge =
-        LoggerMessage.Define<int>(
-            Microsoft.Extensions.Logging.LogLevel.Warning,
-            new Microsoft.Extensions.Logging.EventId(3, "OtlpHttpGzipTooLarge"),
-            "OTLP/HTTP: a gzip body inflated past {Limit} bytes and was refused");
-
     // ── API-key authorization ───────────────────────────────────────────────────
 
     /// <summary>
@@ -297,7 +294,7 @@ public static class OtlpEndpointMapper
     /// <see cref="OtlpInflateGate"/> for why the slot lives as long as the buffer.</para>
     /// </summary>
     private static async ValueTask<(byte[]? Buffer, int Length, OtlpInflateGate? Slot)> ReadBodyAsync(
-        HttpContext ctx, OtlpInflateGate gate)
+        HttpContext ctx, OtlpInflateGate gate, OtlpGzipTooLargeLog tooLargeLog)
     {
         // Decided before the body is read: bytes in a coding this receiver cannot undo could
         // only be refused after a buffer had been spent on them.
@@ -338,7 +335,7 @@ public static class OtlpEndpointMapper
             return default;
         }
 
-        return InflateBody(ctx, buffer, length, maxBytes, gate);
+        return InflateBody(ctx, buffer, length, maxBytes, gate, tooLargeLog);
     }
 
     /// <summary>
@@ -358,7 +355,8 @@ public static class OtlpEndpointMapper
     /// accepted compressed batch allocates nothing but the inflater itself.</para>
     /// </summary>
     private static (byte[]? Buffer, int Length, OtlpInflateGate? Slot) InflateBody(
-        HttpContext ctx, byte[] compressed, int compressedLength, int maxBytes, OtlpInflateGate gate)
+        HttpContext ctx, byte[] compressed, int compressedLength, int maxBytes, OtlpInflateGate gate,
+        OtlpGzipTooLargeLog tooLargeLog)
     {
         InflateResult result;
         byte[]? inflated;
@@ -384,8 +382,9 @@ public static class OtlpEndpointMapper
         {
             // The same answer as a body that was too big on the wire — to the client they are
             // one condition, "this batch is over the limit", and one remedy: split it.
-            _gzipTooLarge(ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Http"),
-                          maxBytes, null);
+            // And logged — at most once a second, with the count and the latest sender: a 413
+            // alone would tell the client and nobody else (OtlpGzipTooLargeLog).
+            tooLargeLog.Note(ctx, maxBytes);
             ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
         }
         else if (result == InflateResult.Unavailable)

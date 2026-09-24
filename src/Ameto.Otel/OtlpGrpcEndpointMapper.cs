@@ -50,10 +50,11 @@ public static class OtlpGrpcEndpointMapper
     {
         // The SAME gate the HTTP receivers inflate under — one bound on inflated buffers for the
         // process, whichever port a compressed batch arrived on.
-        OtlpInflateGate inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
+        OtlpInflateGate     inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
+        OtlpGzipTooLargeLog tooLargeLog = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
 
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, static (c, msg) =>
+            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, static (c, msg) =>
             {
                 var (_, dropped) = OtlpLogProtoParser.Parse(
                     msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
@@ -62,12 +63,12 @@ public static class OtlpGrpcEndpointMapper
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, tooLargeLog, static (c, msg) =>
                     IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, static (c, msg) =>
                 {
                     var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
                     int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
@@ -105,6 +106,7 @@ public static class OtlpGrpcEndpointMapper
         HttpContext ctx,
         ApiKeyPermissions required,
         OtlpInflateGate inflateGate,
+        OtlpGzipTooLargeLog tooLargeLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
@@ -183,10 +185,9 @@ public static class OtlpGrpcEndpointMapper
                     case UnframeResult.TooLarge:
                         // Logged, not swallowed: a compressed batch that inflates past the limit
                         // is either a misconfigured exporter or someone probing, and both are
-                        // worth being able to see afterwards.
-                        ctx.RequestServices.GetRequiredService<ILoggerFactory>()
-                           .CreateLogger("Ameto.Otel.Grpc")
-                           .LogWarning("OTLP/gRPC: a compressed batch inflated past {Limit} bytes and was refused", maxBytes);
+                        // worth being able to see afterwards — at most once a second, with the
+                        // count and the latest sender, in the line the HTTP receiver writes too.
+                        tooLargeLog.Note(ctx, maxBytes);
                         await FinishAsync(ctx, StatusResourceExhausted, "batch exceeds the configured OTLP limit");
                         break;
                     case UnframeResult.Unavailable:

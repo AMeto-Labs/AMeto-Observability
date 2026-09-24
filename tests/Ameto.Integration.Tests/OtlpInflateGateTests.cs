@@ -41,6 +41,10 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         }
     }
 
+    /// <summary>The too-large warning, discarded: these tests are about the gate.</summary>
+    private static readonly OtlpGzipTooLargeLog NoLog =
+        new(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+
     private readonly Factory    _factory;
     private readonly HttpClient _client;
 
@@ -194,7 +198,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         Assert.True(await gate.TryEnterAsync(default));
         var full = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, NoLog, decode);
 
         Assert.Equal("14", full.Response.Headers["grpc-status"].ToString());
         Assert.Equal(OtlpGrpcEndpointMapper.GateFullMessage, full.Response.Headers["grpc-message"].ToString());
@@ -202,13 +206,13 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal(0, gate.Available);                                       // released nothing it did not take
 
         var identity = GrpcCall(Frame(message, compressed: false));
-        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, NoLog, decode);
         Assert.Equal("0", identity.Response.Headers["grpc-status"].ToString());
         Assert.Equal(1, decoded);
 
         gate.Exit();
         var freed = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, NoLog, decode);
         Assert.Equal("0", freed.Response.Headers["grpc-status"].ToString());
         Assert.Equal(2, decoded);
         Assert.Equal(1, gate.Available);                                       // and the slot came back
@@ -225,7 +229,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         using var ledger = IngestBufferPoolLedger.Open();
         ledger.FailRent(2, new OutOfMemoryException());
-        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate,
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate, NoLog,
             static (_, _) => throw new InvalidOperationException("nothing should reach the decoder"));
 
         Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
