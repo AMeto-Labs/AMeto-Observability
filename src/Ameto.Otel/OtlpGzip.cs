@@ -172,11 +172,14 @@ internal static class OtlpGzip
     /// <para>The trailer settles it instead. A complete stream ends with its last member's ISIZE,
     /// which can never exceed everything inflated: it EQUALS it for the single member every
     /// exporter sends (and zlib has already verified it did), and is smaller for a multi-member
-    /// stream. A cut-off stream ends in deflate data or half a trailer, and those four bytes read
-    /// as a length exceed the output all but (total + 1) / 2^32 of the time — at the 8 MiB
-    /// default, fewer than one truncation in 500 slips past, and then the parser still sees a
-    /// message cut short, which it refuses as it always has. Zero padding after a member, which
-    /// some tools add, reads as 0 and passes.</para>
+    /// stream. A cut-off stream ends in deflate data or half a trailer, and those four bytes
+    /// usually read as a length far past the output. USUALLY, not always: compressed data looks
+    /// random, and then a cut slips past about (total + 1) / 2^32 of the time — fewer than one in
+    /// 500 at the 8 MiB default — but a STORED block carries the message raw, and a cut that ends
+    /// on four zero bytes (an empty field, the low half of a <c>1.0</c> double) reads as a size
+    /// of 0 and passes. Then the parser sees a message cut short and refuses it as it would any
+    /// malformed body. Zero padding after a member, which some tools add, reads as 0 and passes
+    /// too — on purpose.</para>
     /// </summary>
     internal static bool TrailerFits(ReadOnlySpan<byte> payload, int inflated)
         => payload.Length >= HeaderAndTrailerBytes

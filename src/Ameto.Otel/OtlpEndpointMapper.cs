@@ -313,8 +313,11 @@ public static class OtlpEndpointMapper
     ///
     /// <para>What the ceiling means here is what #57 established for gRPC and what this issue
     /// (#82) had to keep: it bounds the INFLATED size and is decided on bytes already written,
-    /// so a body of a few hundred KB that would inflate at ~1032:1 costs at most one
-    /// limit-sized buffer before the 413 — never the gigabytes it describes. Both buffers are
+    /// so a body of a few hundred KB that would inflate at ~1032:1 is stopped after one limit
+    /// of output — never the gigabytes it describes. No rent passes the limit; held at once,
+    /// the request is the compressed body plus one limit of inflate buffer when the trailer is
+    /// honest, one and a half when it understates and the buffer doubles into the limit
+    /// (about 20 MiB at the 8 MiB default). Both buffers are
     /// from <see cref="IngestBufferPool"/>, so at the steady state an accepted compressed batch
     /// allocates nothing but the inflater itself.</para>
     /// </summary>

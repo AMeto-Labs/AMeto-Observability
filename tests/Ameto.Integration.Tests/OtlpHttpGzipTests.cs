@@ -22,7 +22,7 @@ namespace Ameto.Integration.Tests;
 /// and every batch from a collector left on its defaults was a 400. What is pinned here: a gzip
 /// body is ingested and can be read back (logs searched, a trace fetched by id, a metric queried);
 /// the ceiling is the INFLATED size, so a batch that only fits compressed is a 413 with nothing
-/// ingested, and a bomb costs at most a limit-sized buffer; any other coding is a 415 that names
+/// ingested, and a bomb never gets a buffer past the limit; any other coding is a 415 that names
 /// what would have worked; gzip that does not inflate is a 400 with nothing ingested, never a 500;
 /// and gzip over an empty body answers exactly what an empty body does.</para>
 ///
