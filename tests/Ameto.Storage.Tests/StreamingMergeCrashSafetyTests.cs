@@ -597,6 +597,26 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.Single(_engine.ListSegments());
     }
 
+    /// <summary>
+    /// A maintenance pass that throws after taking the merge gate and before its merge takes the
+    /// gate over lets go of it. The sweeps catch their own failures but not a throw from the
+    /// logging in those catches; left taken, the gate made every later pass and merge report
+    /// "nothing merged" for the life of the process, and compaction stopped in silence.
+    /// </summary>
+    [Fact]
+    public async Task APassThatThrowsBeforeItsMerge_LetsGoOfTheGate()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+
+        _engine._beforeMaintenanceSweeps = static () => throw new InvalidOperationException("a sweep's logger threw");
+        try     { await Assert.ThrowsAsync<InvalidOperationException>(() => _engine.RunColdMaintenancePassAsync(CancellationToken.None)); }
+        finally { _engine._beforeMaintenanceSweeps = null; }
+
+        Assert.True(await _engine.RunColdMaintenancePassAsync(CancellationToken.None), "the next pass merged nothing: the gate stayed taken");
+        Assert.Single(_engine.ListSegments());
+    }
+
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>
     [Fact]
     public async Task CrashMidDeletion_FinishesTheRemainingSources()

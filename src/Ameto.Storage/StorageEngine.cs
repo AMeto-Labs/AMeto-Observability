@@ -953,18 +953,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // manifest beside an output at its final name. Only the gate keeps it off a live one.
         if (!TryEnterMergeGate()) return NothingMerged;
 
-        // Finish any merge whose source deletion was blocked by an open reader
-        // (the manifest survives until every source file is gone).
-        try { RecoverInterruptedMerges(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
+        try
+        {
+            _beforeMaintenanceSweeps?.Invoke();
 
-        // Segment files whose delete outlasted the background retry (see DeleteSegmentAsync).
-        try { RetryPendingSegmentDeletes(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
+            // Finish any merge whose source deletion was blocked by an open reader
+            // (the manifest survives until every source file is gone).
+            try { RecoverInterruptedMerges(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
+
+            // Segment files whose delete outlasted the background retry (see DeleteSegmentAsync).
+            try { RetryPendingSegmentDeletes(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
+        }
+        catch
+        {
+            // Until MergeUnderGateAsync takes it over, the gate is this method's to let go. The
+            // sweeps catch their own failures, but not a throw from the logging in those catches,
+            // nor anything else between here and the hand-over; escaping with the gate taken, it
+            // stayed taken for the life of the process — every later pass and merge reporting
+            // "nothing merged", and compaction stopped without another word.
+            Volatile.Write(ref _mergeGate, 0);
+            throw;
+        }
 
         // Handed back, not awaited: MergeUnderGateAsync lets go of the gate when the merge ends.
         return MergeUnderGateAsync(ct);
     }
+
+    /// <summary>
+    /// Test hook: called by <see cref="RunColdMaintenancePassAsync"/> with the merge gate taken,
+    /// before its sweeps. A throw from it is anything escaping the pass before the merge.
+    /// </summary>
+    internal Action? _beforeMaintenanceSweeps;
 
     /// <summary>
     /// Returns the memory a maintenance burst just used. The TRIGGER is background,
