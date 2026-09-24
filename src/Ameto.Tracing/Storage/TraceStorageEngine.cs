@@ -263,6 +263,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     internal Action? _inCatalogNotYetInSnapshotForTest;
 
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> just before the segment is registered in the
+    /// catalog. Throwing from it is the manifest write that fails there (a File.Move over the live
+    /// manifest meeting an antivirus's sharing violation, on Windows): the segment is published with
+    /// id 0 and queued for adoption — the one way a segment reaches <see cref="AdoptUnnamedSegments"/>
+    /// without a restart, and on every OS.
+    /// </summary>
+    internal Action? _beforeCatalogRegistrationForTest;
+
     /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
     internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
         _manifest.Segments.Keys.Where(_manifest.IsCovered).ToList();
@@ -2618,6 +2627,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             try
             {
+                _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
                 ulong segId = _manifest.AllocateSegmentId();
 
                 // The run goes to disk BEFORE the coverage claim, and the claim is what AddSegment
@@ -3058,11 +3068,32 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal void AdoptUnnamedSegments()
     {
         if (!TryBeginHeavyPhase()) return;
-        try { AdoptUnnamedSegments(_coldSegments); }
+        try { AdoptUnnamedSegmentsCore(); }
         finally { EndHeavyPhase(); }
     }
 
-    private void AdoptUnnamedSegments(SpanSegmentInfo[] segs)
+    /// <summary>
+    /// Paths a running compaction pass has CLAIMED: it is about to retire them from the catalog and
+    /// unlink them. Under <see cref="_adoptionGate"/>.
+    /// </summary>
+    private readonly HashSet<string> _mergingPaths = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Makes "claimed by a merge" and "registered by adoption" mutually exclusive: adoption holds it
+    /// across its check of <see cref="_mergingPaths"/> AND its registration, and a compaction pass
+    /// takes it to claim its sources, then resolves their ids. So either the adoption finished first
+    /// — and the pass, resolving after its claim, retires the id adoption gave — or the pass claimed
+    /// first and adoption leaves the path queued, to find it gone on a later pass.
+    ///
+    /// <para><b>Why both halves.</b> Resolving the ids alone left a window: an adoption landing after
+    /// the resolution registered a file the merge was about to delete, and the catalog named it for
+    /// good. Skipping claimed paths alone left the other one: an adoption that finished between the
+    /// merge's plan and its claim gave an id the plan never saw. Lock order: this, then the engine
+    /// lock (the rename); nothing takes them the other way round.</para>
+    /// </summary>
+    private readonly Lock _adoptionGate = new();
+
+    private void AdoptUnnamedSegmentsCore()
     {
         string[] pending;
         lock (_unnamedSegments)
@@ -3073,37 +3104,50 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         foreach (string path in pending)
         {
-            var seg = Array.Find(segs, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
-            if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+            lock (_adoptionGate)
             {
-                lock (_unnamedSegments) _unnamedSegments.Remove(path);
-                continue;
-            }
-            try
-            {
-                ulong id = _manifest.AllocateSegmentId();
-                _manifest.AddSegment(new TraceSegmentEntry(
-                    id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
-                RenameSegmentInSnapshot(seg, seg.WithSegmentId(id));
-                lock (_unnamedSegments) _unnamedSegments.Remove(path);
-                _logger.LogInformation(
-                    "Trace catalog adopted {File}, whose flush-time registration had failed", path);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+                // A merge has claimed it: it is leaving the catalog and the disk. Left queued; the
+                // next pass finds it gone from the snapshot (or its file gone) and drops it.
+                if (_mergingPaths.Contains(path)) continue;
+
+                var seg = Array.Find(_coldSegments, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
+                if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+                {
+                    lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                    continue;
+                }
+                try
+                {
+                    ulong id = _manifest.AllocateSegmentId();
+                    _manifest.AddSegment(new TraceSegmentEntry(
+                        id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+                    RenameSegmentInSnapshot(path, id);
+                    lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                    _logger.LogInformation(
+                        "Trace catalog adopted {File}, whose flush-time registration had failed", path);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+                }
             }
         }
     }
 
-    /// <summary>Swaps one entry of the cold snapshot for an updated copy, under the write lock.</summary>
-    private void RenameSegmentInSnapshot(SpanSegmentInfo oldSeg, SpanSegmentInfo newSeg)
+    /// <summary>
+    /// Gives the cold snapshot's entry for <paramref name="path"/> its catalog id, under the write
+    /// lock. Matched by PATH, like <see cref="WriteBackWeights"/>: the entry read before the lock may
+    /// have been replaced since (a pass writing back a weight), and a reference match then renamed
+    /// nothing while the catalog had already named the file.
+    /// </summary>
+    private void RenameSegmentInSnapshot(string path, ulong segmentId)
     {
         _lock.EnterWriteLock();
         try
         {
             var next = new List<SpanSegmentInfo>(_coldSegments.Length);
-            foreach (var s in _coldSegments) next.Add(ReferenceEquals(s, oldSeg) ? newSeg : s);
+            foreach (var s in _coldSegments)
+                next.Add(string.Equals(s.FilePath, path, StringComparison.Ordinal) ? s.WithSegmentId(segmentId) : s);
             _coldSegments = SortedByMaxStartDesc(next);
         }
         finally { _lock.ExitWriteLock(); }
@@ -3578,6 +3622,37 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         return s;
     }
 
+    /// <summary>Test seam: the points of a compaction pass at which the index worker's adoption can land.</summary>
+    internal enum CompactionStage { Merged, Claimed, Catalogued }
+
+    /// <summary>
+    /// Test seam, on the compaction thread: <see cref="CompactionStage.Merged"/> once the merged file
+    /// is written and before the pass claims its sources, <see cref="CompactionStage.Claimed"/> right
+    /// after the claim, <see cref="CompactionStage.Catalogued"/> after the catalog has retired the
+    /// sources and before the snapshot swap. Running <see cref="AdoptUnnamedSegments"/> from it is
+    /// the race the claim exists for. Null in production.
+    /// </summary>
+    internal Action<CompactionStage>? _compactionStageForTest;
+
+    /// <summary>
+    /// The catalog ids of a pass's sources, resolved AFTER the claim: every id the plan saw, and every
+    /// id the catalog holds for one of their paths — an adoption that finished between the plan and
+    /// the claim gave one the plan never saw.
+    /// </summary>
+    private List<ulong> CatalogIdsOfSources(List<SpanSegmentInfo> processed, HashSet<string> paths)
+    {
+        var ids = new List<ulong>(processed.Count);
+        foreach (var s in processed)
+            if (s.SegmentId != 0) ids.Add(s.SegmentId);
+        foreach (var (id, entry) in _manifest.Segments)
+            if (paths.Contains(entry.FilePath) && !ids.Contains(id)) ids.Add(id);
+        return ids;
+    }
+
+    /// <summary>Test hook: the files the catalog names — every one must exist once a pass is over.</summary>
+    internal IReadOnlyCollection<string> CatalogPathsForTest =>
+        _manifest.Segments.Values.Select(static s => s.FilePath).ToList();
+
     private bool CompactOnePass()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
@@ -3643,6 +3718,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             return WriteBackWeights(weighed);
         }
 
+        HashSet<string>? claimed = null;   // the sources this pass has claimed from adoption
         try
         {
             // recoverable:false — the sources are still on disk until the swap below, so a
@@ -3655,6 +3731,20 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
+            _compactionStageForTest?.Invoke(CompactionStage.Merged);
+
+            // THE SOURCES ARE KNOWN BY PATH FROM HERE ON, NOT BY THE REFERENCES THE PLAN HELD. The
+            // index worker's adoption (AdoptUnnamedSegments) runs beside this pass and REPLACES the
+            // snapshot entry of a segment it names; matched by reference, the swap below then kept
+            // that entry while its files were deleted, and the catalog went on naming the adopted id,
+            // because the plan had seen id 0. Claimed now, so adoption leaves these paths alone until
+            // the files are gone; the ids are resolved AFTER the claim, so one adoption finished
+            // before it is retired too. See _adoptionGate.
+            var processedPaths = new HashSet<string>(processed.Count, StringComparer.Ordinal);
+            foreach (var s in processed) processedPaths.Add(s.FilePath);
+            lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
+            claimed = processedPaths;
+            _compactionStageForTest?.Invoke(CompactionStage.Claimed);
 
             // Swap the snapshot first (readers stop picking the old files up),
             // delete the merged-away files after. An in-flight reader that still
@@ -3676,7 +3766,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (run is { } fresh && !_index.Add(fresh)) run = null;
 
                 var orphaned = _manifest.ReplaceSegments(
-                    processed.Select(static s => s.SegmentId).Where(static id => id != 0).ToList(),
+                    CatalogIdsOfSources(processed, processedPaths),
                     new TraceSegmentEntry(mergedId, merged.FilePath,
                                           merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
                     run);
@@ -3717,12 +3807,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     merged.FilePath);
             }
 
+            _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
             _lock.EnterWriteLock();
             try
             {
                 var next = new List<SpanSegmentInfo>(_coldSegments.Length);
-                foreach (var s in _coldSegments)
-                    if (!processed.Contains(s)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
+                foreach (var s in _coldSegments)   // by path: see the claim above
+                    if (!processedPaths.Contains(s.FilePath)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
                 next.Add(merged);
                 _coldSegments = SortedByMaxStartDesc(next);
             }
@@ -3736,6 +3827,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             _logger.LogError(ex, "Compaction: failed to write merged segment");
             return false;
+        }
+        finally
+        {
+            // After the unlink, not before: an adoption let in between would still find the file on
+            // disk, and would register a path the next instant makes a dangling one.
+            if (claimed is not null) lock (_adoptionGate) _mergingPaths.ExceptWith(claimed);
         }
     }
 
