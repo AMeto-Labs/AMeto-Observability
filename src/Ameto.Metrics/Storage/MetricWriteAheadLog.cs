@@ -1864,7 +1864,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 uint len      = v2 ? lenField & PoolLengthMask : lenField;
                 if (len == 0 || len > MaxPoolRecordBytes) break;             // torn or bogus record
                 if (v2 && fs.ReadAtLeast(head[PoolHeadV1..], 4, throwOnEndOfStream: false) != 4) break;
-                if (len > length - fs.Position) break;                       // truncated tail
+                if (!FileBounds.LengthFits(len, length - fs.Position)) break;  // truncated tail
 
                 bool kept = keep is not null && keep.Contains(index);
                 if (kept || v2)

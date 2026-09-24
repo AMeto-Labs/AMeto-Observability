@@ -83,8 +83,6 @@ public sealed class FileBoundsConventionTests
             "kept is Math.Min(orphaned, 4 MiB) on the line above — already clamped by a literal",
         ["MetricWriteAheadLog.cs:buckets = new long[eh.BucketCount]"] =
             "the entry header check above rejects BucketCount that runs past the mapped end",
-        ["MetricWriteAheadLog.cs:var body = new byte[len]"] =
-            "len is refused above 8 MiB two lines above, and one record is read at a time",
         ["MetricStorageEngine.cs:: new HashSet<SeriesKey>(keys.GetRange(off, take))"] =
             "a slice of an in-memory list",
         // Found the moment the scan learned to read nested generics — the SECOND site that shape
