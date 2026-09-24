@@ -79,7 +79,8 @@ internal enum MetricWalCommit
 /// both passes of <see cref="ReadAll"/> — stops at the first entry that does not verify. The
 /// judgement checks stay, ahead of it: they still classify what they catch as corruption (an
 /// Error and a quarantine copy) where a checksum failure is reported as the torn write an
-/// unclean stop leaves, and they are all a v1 log has (see <see cref="Open"/>).</para>
+/// unclean stop leaves, and they are all a log that could not be upgraded has (see
+/// <see cref="Open"/>).</para>
 ///
 /// <para><b>Durability, stated because it is a choice.</b> Nothing msyncs this log: not an
 /// append, not a timer — THERE IS NO PERIODIC FSYNC BETWEEN FLUSHES — and not a commit either.
@@ -191,8 +192,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>A v2 entry header: the checksummed 48 bytes, then the CRC32C over them and the bucket counts.</summary>
     private const int    EntryHeaderSize   = ChecksummedHeaderBytes + sizeof(uint);
 
-    /// <summary>A v1 entry header: no checksum. Read and appended only by a log that is v1 on disk; see <see cref="Open"/>.</summary>
+    /// <summary>A v1 entry header: no checksum. Read, and appended only by a log whose upgrade could not commit.</summary>
     private const int    EntryHeaderSizeV1 = ChecksummedHeaderBytes;
+
+    /// <summary>Where a v1 log is rewritten as v2 before it replaces the original. See <see cref="Open"/>.</summary>
+    internal const string UpgradeSuffix = ".upgrade.tmp";
 
     /// <summary>
     /// How far above the recovered header counter an entry's generation may run and still
@@ -241,8 +245,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     ///
     /// <para><see cref="Reserved"/> is the two bytes v1 left as padding and never wrote. A v2
     /// append writes it as zero, because the checksum covers it and may be computed from the
-    /// point in hand rather than from the map (see <see cref="PrecomputeChecksums"/>); a v1
-    /// entry's padding holds whatever the region held before it.</para>
+    /// point in hand rather than from the map (see <see cref="PrecomputeChecksums"/>); an
+    /// upgraded v1 entry keeps whatever its padding held, checksummed as it is.</para>
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = ChecksummedHeaderBytes)]
     private struct MetricWalEntryHeader
@@ -292,12 +296,16 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>
     /// The entry stride this log reads and appends, and whether its entries and pool records
     /// carry checksums: v2 (<see cref="EntryHeaderSize"/>, checksummed) unless the file on disk
-    /// is a v1 log (<see cref="EntryHeaderSizeV1"/>, no checksum), which stays v1 for the life of
-    /// the process (see <see cref="Open"/>). Set by <see cref="OpenOrCreate"/> before the first
-    /// walk and never again, so the lock-free size pass of an append may read it.
+    /// is a v1 log (<see cref="EntryHeaderSizeV1"/>, no checksum) — which <see cref="Open"/>
+    /// upgrades, and which stays v1 for the life of the process only when that upgrade cannot
+    /// commit. Set by <see cref="OpenOrCreate"/> before the first walk and never again, so the
+    /// lock-free size pass of an append may read it.
     /// </summary>
     private int  _entryHeaderSize = EntryHeaderSize;
     private bool _checksummed     = true;
+
+    /// <summary>Set by <see cref="OpenOrCreate"/> when the file on disk is a v1 log; <see cref="Open"/> upgrades it.</summary>
+    private bool _legacyV1;
 
     /// <summary>
     /// The generation handed out by <see cref="BeginFlush"/> that has not yet been committed or
@@ -378,23 +386,93 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// Opens the log, creating it if absent, and reconciles what a crash left (see
     /// <see cref="OpenOrCreate"/>).
     ///
-    /// <para><b>A v1 LOG IS READ IN ITS OWN LAYOUT, NOT DISCARDED.</b> The release before this one
-    /// wrote v1, and an unknown version is re-initialised as a foreign file — which, for the v1 log
-    /// the first start of this release finds, would silently drop every point the previous process
-    /// logged and never flushed. So a v1 file is opened with the v1 stride, reconciled exactly as
-    /// that release would have (the #59 repairs are version-blind), and kept v1 for the life of the
-    /// process: every point it holds replays, new points are appended in the v1 layout, and its
-    /// pool gets v1 records. That is exactly the log the previous release ran with, and so exactly
-    /// the file a rollback to it can still read. What it does not get is a checksum.</para>
+    /// <para><b>A v1 LOG IS UPGRADED, NOT DISCARDED.</b> The release before this one wrote v1, and
+    /// an unknown version is re-initialised as a foreign file — which, for the v1 log the first
+    /// start of this release finds, would silently drop every point the previous process logged
+    /// and never flushed. So a v1 file is opened with the v1 stride, reconciled exactly as that
+    /// release would have (the #59 repairs are version-blind), rewritten entry for entry as v2
+    /// into <c>metrics.wal.upgrade.tmp</c> (each entry's 48 header bytes and buckets verbatim, now
+    /// with a checksum), fsynced, and moved over the original. The move is the commit point: a
+    /// crash before it leaves the v1 file authoritative and the next start upgrades it again; a
+    /// crash after it leaves a complete v2 file. A stale copy from an upgrade that died before
+    /// its move is deleted beside a v2 log and overwritten beside a v1 one.</para>
+    ///
+    /// <para><b>The pool is not rewritten.</b> Its records say their own version (see
+    /// <see cref="WritePoolRecord"/>), so v1 records stay readable beside the v2 ones appended
+    /// after them, and nothing forces a second file through a second atomic swap that could land
+    /// without the first. Rewriting them would buy nothing either: a checksum computed now, over
+    /// bytes read back from the disk, vouches for whatever those bytes are, torn or not. The same
+    /// is true of the upgraded entries — the upgrade cannot detect damage that happened before it
+    /// — and they are rewritten only because the stride changed. The v1 records go the first time
+    /// a commit empties the log.</para>
+    ///
+    /// <para><b>AN UPGRADE THAT CANNOT COMPLETE DOES NOT STOP THE SERVER.</b> This runs in the
+    /// metric engine's constructor, where a throw fails the host — once, on every existing
+    /// install, at the first start of the release. The move is retried briefly (an antivirus
+    /// scanner holding the fresh copy open is the sharing violation seen on Windows); if the copy
+    /// cannot be written (a full disk) or the move still fails, the log is opened AS v1, in place:
+    /// every point it holds replays, new points are appended in the v1 layout, the pool gets v1
+    /// records, the error is logged, and the upgrade is tried again at the next start. That is
+    /// exactly the log the previous release ran with, for one more process lifetime — and so
+    /// exactly the file a rollback to it can still read.</para>
     ///
     /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
     /// foreign file and re-initialises it, which empties it and, with it, the pool. That costs
     /// nothing only when the log held nothing unflushed — after a clean stop whose final flush
-    /// ran and no point arrived behind it.</para>
+    /// ran and no point arrived behind it; docs/CONFIGURATION.md ("Upgrading and rolling back")
+    /// tells operators how to get there.</para>
     /// </summary>
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
                                            ILogger? logger = null, Action<long>? beforeResize = null,
-                                           MetricLabelInterner? interner = null)
+                                           MetricLabelInterner? interner = null) =>
+        Open(filePath, initialCapacity, logger, beforeResize, interner, io: null);
+
+    /// <summary>As the public <see cref="Open(string, long, ILogger, Action{long}, MetricLabelInterner)"/>, with the upgrade's I/O a test can replace.</summary>
+    internal static MetricWriteAheadLog Open(string filePath, long initialCapacity, ILogger? logger,
+                                             Action<long>? beforeResize, MetricLabelInterner? interner,
+                                             UpgradeIo? io)
+    {
+        io ??= UpgradeIo.Default;
+        string tmp = filePath + UpgradeSuffix;
+
+        var wal = OpenInstance(filePath, initialCapacity, logger, beforeResize, interner);
+        if (!wal._legacyV1)
+        {
+            // A STALE COPY from an upgrade that died before its move. Never the only copy of
+            // anything: until the move the v1 log is authoritative, and the move is atomic.
+            DeleteQuietly(tmp);
+            return wal;
+        }
+
+        try { wal.WriteUpgradedCopy(tmp); }
+        catch (Exception ex)
+        {
+            DeleteQuietly(tmp);
+            logger?.LogError(ex,
+                "The metric WAL at {Path} is a v1 log and its v2 copy could not be written; it stays v1 "
+              + "(no per-entry checksum) for this run, every point in it replays, and the upgrade is "
+              + "retried at the next start", filePath);
+            return wal;                                  // already open, in the v1 layout
+        }
+        wal.Dispose();                                   // the mapping has to go before the file can
+
+        // THE COMMIT POINT of the upgrade.
+        if (TryMoveWithRetry(tmp, filePath, io) is { } moveFailure)
+        {
+            DeleteQuietly(tmp);
+            logger?.LogError(moveFailure,
+                "The metric WAL at {Path} could not be replaced by its v2 copy after {Attempts} attempts; "
+              + "it stays v1 (no per-entry checksum) for this run, every point in it replays, and the "
+              + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
+        }
+
+        // Whatever is at the path now: the v2 copy, or — the move is atomic — the v1 log as it was,
+        // which opens in the v1 layout by itself.
+        return OpenInstance(filePath, initialCapacity, logger, beforeResize, interner);
+    }
+
+    private static MetricWriteAheadLog OpenInstance(string filePath, long initialCapacity, ILogger? logger,
+                                                    Action<long>? beforeResize, MetricLabelInterner? interner)
     {
         var wal = new MetricWriteAheadLog(filePath, logger, interner)
         {
@@ -405,6 +483,106 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         try { wal.OpenOrCreate(initialCapacity); }
         catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
         return wal;
+    }
+
+    /// <summary>
+    /// The pauses between the move's attempts: six attempts over ~0.8 s. Long enough for a scanner
+    /// to let go of a file it opened on creation, short enough that a move which will never succeed
+    /// costs a start less than a second. The span WAL's, for the same reason.
+    /// </summary>
+    private static readonly TimeSpan[] MoveRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>The move, retried on the I/O failures a transient holder causes. Null on success, else the last failure.</summary>
+    private static Exception? TryMoveWithRetry(string from, string to, UpgradeIo io)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                io.Move(from, to);
+                return null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= MoveRetryDelays.Length) return ex;
+                io.Wait(MoveRetryDelays[attempt]);
+            }
+        }
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort: an upgrade truncates it, and it replays nothing */ }
+    }
+
+    /// <summary>
+    /// The upgrade's move and the pause between its attempts, as a seam: a test fails the move
+    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>.
+    /// </summary>
+    internal sealed class UpgradeIo
+    {
+        public static readonly UpgradeIo Default = new();
+
+        public Action<string, string> Move { get; init; } = static (from, to) => File.Move(from, to, overwrite: true);
+        public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
+    }
+
+    /// <summary>
+    /// Rewrites this (v1) log as v2 at <paramref name="tmpPath"/> and fsyncs it. Every entry the
+    /// open-time walk accepted — everything below <c>_writeOffset</c>, committed generations
+    /// included, exactly as the v1 file holds them — is copied: its 48 header bytes and its bucket
+    /// counts verbatim, the checksum computed over them. The upgraded log therefore replays exactly
+    /// what the v1 log would have, under the same watermark, and seeds the same series indices. It
+    /// is sized along the same capacity ladder a reopen at this log's floor would fit it to, so
+    /// the reopen neither grows nor shrinks it.
+    /// </summary>
+    private void WriteUpgradedCopy(string tmpPath)
+    {
+        lock (_writeLock)
+        {
+            if (_ptr is null) throw new InvalidOperationException("Metric WAL has no mapping to upgrade from.");
+
+            using var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                                          bufferSize: 64 * 1024);
+            Span<byte> fileHeader = stackalloc byte[FileHeaderSize];
+            fileHeader.Clear();
+            fs.Write(fileHeader);                        // placeholder; the real one goes in last
+
+            byte* data = _ptr + FileHeaderSize;
+            Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
+            long pos = 0, written = 0, total;
+            while ((total = EntryAt(data, pos, _writeOffset, verify: false, out _)) > 0)
+            {
+                var header  = new ReadOnlySpan<byte>(data + pos, ChecksummedHeaderBytes);
+                var buckets = new ReadOnlySpan<byte>(data + pos + EntryHeaderSizeV1, (int)(total - EntryHeaderSizeV1));
+                BinaryPrimitives.WriteUInt32LittleEndian(crcBytes, Crc32c.Append(Crc32c.Append(0, header), buckets));
+
+                fs.Write(header);
+                fs.Write(crcBytes);
+                fs.Write(buckets);
+                written += EntryHeaderSize + buckets.Length;
+                pos     += total;
+            }
+
+            fs.SetLength(FileHeaderSize + FitCapacity(written));
+
+            var hdr = new WalFileHeader
+            {
+                Magic               = MagicNumber,
+                Version             = WalVersion,
+                WriteOffset         = FileHeaderSize + written,
+                Generation          = _generation,
+                CommittedGeneration = _committedGeneration,
+            };
+            MemoryMarshal.Write(fileHeader, in hdr);
+            fs.Position = 0;
+            fs.Write(fileHeader);
+            fs.Flush(flushToDisk: true);
+        }
     }
 
     private void OpenOrCreate(long initialCapacity)
@@ -432,7 +610,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         if (known && hdr.Version == WalVersionV1)
         {
             // Left in the v1 layout, and read with it — BEFORE the walk below, which has to step
-            // with the file's own stride. See Open.
+            // with the file's own stride. Open upgrades it once it is open (see there).
+            _legacyV1        = true;
             _entryHeaderSize = EntryHeaderSizeV1;
             _checksummed     = false;
         }
@@ -1133,8 +1312,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>
     /// The top byte of a v2 pool record's length field. A v1 length never reaches it — records
     /// over <see cref="MaxPoolRecordBytes"/> are refused as torn by every reader — so each record
-    /// says which shape it is, one file can hold both, and a reader never takes the pool's version
-    /// from the log beside it: the two files reach the disk independently.
+    /// says which shape it is, and one file can hold both: the v1 records of the release before,
+    /// and the v2 records appended after the upgrade (see <see cref="Open"/> for why the pool is
+    /// not rewritten).
     /// </summary>
     private const uint PoolRecordTagV2   = 0xC5u << 24;
     private const uint PoolLengthMask    = 0x00FF_FFFF;

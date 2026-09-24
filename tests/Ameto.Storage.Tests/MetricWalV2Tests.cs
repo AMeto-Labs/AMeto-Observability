@@ -44,6 +44,7 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
 
     private string WalPath  => Path.Combine(_dir, "metrics.wal");
     private string PoolPath => WalPath + ".pool";
+    private string TmpPath  => WalPath + MetricWriteAheadLog.UpgradeSuffix;
 
     private const int  FileHeader = 32;
     private const int  V1Entry    = 48;          // the header, no checksum
@@ -54,6 +55,13 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     private MetricWriteAheadLog Open(ILogger? logger = null, string? path = null)
     {
         var wal = MetricWriteAheadLog.Open(path ?? WalPath, Capacity, logger);
+        _wals.Add(wal);
+        return wal;
+    }
+
+    private MetricWriteAheadLog OpenWith(MetricWriteAheadLog.UpgradeIo io, ILogger? logger = null)
+    {
+        var wal = MetricWriteAheadLog.Open(WalPath, Capacity, logger, beforeResize: null, interner: null, io);
         _wals.Add(wal);
         return wal;
     }
@@ -328,9 +336,10 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
 
     /// <summary>
     /// What the same head did in v1 — and still does in a log that is v1 on disk: a v1 entry
-    /// carries no checksum, so the torn head replays as a point with a garbage value. This is the
-    /// fact the v2 facts above are the fix for, kept so that fix is measured against the old
-    /// behaviour rather than asserted into existence.
+    /// carries no checksum, so the torn head replays as a point with a garbage value, and an
+    /// upgrade (see <see cref="A_v1_log_opens_replays_and_is_upgraded_in_place"/>) checksums what
+    /// it finds. This is the fact the v2 facts above are the fix for, kept so that fix is measured
+    /// against the old behaviour rather than asserted into existence.
     /// </summary>
     [Fact]
     public void The_same_head_in_a_v1_log_replays_as_a_garbage_point()
@@ -467,38 +476,199 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         Assert.Equal([1.0, 3.0], replayed.Select(static r => r.Point.Value));
     }
 
-    // ── v1 still replays ─────────────────────────────────────────────────────
+    // ── v1 still replays, and is upgraded ────────────────────────────────────
 
     /// <summary>
     /// A v1 LOG LEFT BY THE PREVIOUS RELEASE REPLAYS — every field, under the same watermark (the
-    /// committed entry stays dead) — and stays v1: a point appended to it goes down as a 48-byte
-    /// entry with no checksum and its new series as a v1 pool record, both of which the release a
-    /// rollback goes back to can read, and a second open replays all of it. Treating version 1 as
-    /// unknown, the way a foreign file is, re-initialises it and replays nothing: every point the
-    /// old process acknowledged and never flushed, silently gone.
+    /// committed entry stays dead) — and is a v2 log from then on: a second open replays the same
+    /// points, and a point appended after the upgrade survives, its NEW series recorded in the v2
+    /// pool shape right behind the v1 records, both read back. Treating version 1 as unknown, the
+    /// way a foreign file is, re-initialises it and replays nothing: every point the old process
+    /// acknowledged and never flushed, silently gone.
     /// </summary>
     [Fact]
-    public void A_v1_log_opens_replays_and_keeps_its_own_layout()
+    public void A_v1_log_opens_replays_and_is_upgraded_in_place()
     {
         WriteV1Log();
 
         using (var wal = Open())
         {
-            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            var first = wal.ReadAll(out int unresolved);
+            AssertTheV1Points(first, unresolved);
             wal.Append([Gauge("fresh", 9, 9.0)]);
         }
 
-        byte[] file = File.ReadAllBytes(WalPath);
-        Assert.Equal((ushort)1, VersionOnDisk(WalPath));
-        Assert.Equal(FileHeader + 5 * V1Entry + 4 * 8 + V1Entry, BinaryPrimitives.ReadInt64LittleEndian(file.AsSpan(8)));
         byte[] pool = File.ReadAllBytes(PoolPath);
         int v1Records = 8 + CpuBody.Length + 8 + LatencyBody.Length;
-        Assert.Equal(0x00, pool[v1Records + 7]);                                 // the new record is v1 too
+        Assert.Equal(0xC5, pool[v1Records + 7]);                                 // the new record is v2
 
         var again = Open().ReadAll(out int unresolvedAgain);
         Assert.Equal(0, unresolvedAgain);
         Assert.Equal([1.0, 2.5, 3.0, 4.0, 9.0], again.Select(static r => r.Point.Value));
         Assert.Equal("fresh", again[4].Name);
+        Assert.False(File.Exists(TmpPath));
+    }
+
+    /// <summary>
+    /// AN UPGRADE THAT CANNOT WRITE ITS COPY LEAVES THE v1 LOG EXACTLY AS IT WAS — and OPENS IT, as
+    /// v1: it neither re-initialises the file to make the open succeed nor throws out of it, which
+    /// would be a throw out of the metric engine's constructor. The copy is blocked by a directory
+    /// squatting on its path (the full disk of production, reproducibly). Once the obstacle is gone
+    /// the next open upgrades and replays everything.
+    /// </summary>
+    [Fact]
+    public void A_failed_upgrade_copy_leaves_the_v1_log_untouched_and_opens_it_as_v1()
+    {
+        WriteV1Log();
+        byte[] walBefore  = File.ReadAllBytes(WalPath);
+        byte[] poolBefore = File.ReadAllBytes(PoolPath);
+        Directory.CreateDirectory(TmpPath);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+        {
+            var replayed = wal.ReadAll(out int unresolved);
+            AssertTheV1Points(replayed, unresolved);
+        }
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("could not be written"));
+
+        Assert.Equal(walBefore,  File.ReadAllBytes(WalPath));                   // byte for byte
+        Assert.Equal(poolBefore, File.ReadAllBytes(PoolPath));
+
+        Directory.Delete(TmpPath);
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+    }
+
+    /// <summary>
+    /// THE SERVER COMES UP. The same blocked upgrade, one level up: the metric engine's constructor
+    /// — the call a host start makes — succeeds, replays the v1 points into the hot tier, and takes
+    /// new points.
+    /// </summary>
+    [Fact]
+    public void An_engine_over_a_v1_log_that_cannot_be_upgraded_still_starts_and_replays_it()
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        WriteLog(1, generation: 3, committed: 2,
+                 [EntryBytes(new RawEntry(3, 0, now - 2_000_000_000L, 1.0), v2: false),
+                  EntryBytes(new RawEntry(3, 0, now - 1_000_000_000L, 2.0), v2: false)],
+                 [PoolRecord(0, CpuBody, v2: false)]);
+        Directory.CreateDirectory(TmpPath);
+
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        _engines.Add(engine);
+
+        Assert.Equal(2, engine.HotPointCount);
+        engine.Ingest([Gauge("cpu", 0, 3.0)]);
+        Assert.Equal(3, engine.HotPointCount);
+        Assert.Equal((ushort)1, VersionOnDisk(WalPath));
+    }
+
+    /// <summary>
+    /// A MOVE THAT NEVER SUCCEEDS — the antivirus scanner that will not let go of the fresh copy —
+    /// is retried a bounded number of times and then given up on: the log opens AS v1, in place,
+    /// replays every live point, and takes appends in the v1 layout — entries AND pool records,
+    /// which is what the release a rollback goes back to can read. The copy is removed and the
+    /// failure logged as an Error. The next plain open upgrades, and the v1-era append comes along.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_move_keeps_failing_opens_as_v1_and_loses_nothing()
+    {
+        WriteV1Log();
+        int moves = 0, waits = 0;
+        var io = new MetricWriteAheadLog.UpgradeIo
+        {
+            Move = (_, _) => { moves++; throw new IOException("The process cannot access the file because it is being used by another process."); },
+            Wait = _ => waits++,
+        };
+        var logger = new CapturingLogger();
+
+        using (var wal = OpenWith(io, logger))
+        {
+            Assert.Equal((ushort)1, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+            wal.Append([Gauge("fresh", 9, 9.0)]);
+        }
+
+        Assert.Equal(6, moves);                                                  // bounded: five pauses, six attempts
+        Assert.Equal(5, waits);
+        Assert.False(File.Exists(TmpPath));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Error is IOException);
+
+        // Appended as v1: a 48-byte entry, and a pool record a v1 reader can walk.
+        byte[] wal1 = File.ReadAllBytes(WalPath);
+        Assert.Equal(FileHeader + 5 * V1Entry + 4 * 8 + V1Entry, BinaryPrimitives.ReadInt64LittleEndian(wal1.AsSpan(8)));
+        byte[] pool = File.ReadAllBytes(PoolPath);
+        int v1Records = 8 + CpuBody.Length + 8 + LatencyBody.Length;
+        Assert.Equal(0x00, pool[v1Records + 7]);
+
+        // The next start, with the scanner gone: upgraded, and the point appended as v1 came along.
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            Assert.Equal([1.0, 2.5, 3.0, 4.0, 9.0], wal.ReadAll(out _).Select(static r => r.Point.Value));
+        }
+    }
+
+    /// <summary>
+    /// A MOVE THAT FAILS TWICE AND THEN SUCCEEDS is an upgrade, not a v1 fallback: the retry is the
+    /// point. No timer decides it — the seam's pause is a counter.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_move_fails_transiently_is_upgraded_on_a_retry()
+    {
+        WriteV1Log();
+        int moves = 0, waits = 0;
+        var io = new MetricWriteAheadLog.UpgradeIo
+        {
+            Move = (from, to) =>
+            {
+                if (++moves <= 2) throw new UnauthorizedAccessException("Access to the path is denied.");
+                File.Move(from, to, overwrite: true);
+            },
+            Wait = _ => waits++,
+        };
+        var logger = new CapturingLogger();
+
+        using (var wal = OpenWith(io, logger))
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+
+        Assert.Equal(3, moves);
+        Assert.Equal(2, waits);
+        Assert.False(File.Exists(TmpPath));
+        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A STALE COPY from an upgrade that died before its move is removed. Beside a v2 log it is
+    /// garbage that nothing else would ever delete; beside a v1 log the upgrade overwrites it.
+    /// </summary>
+    [Fact]
+    public void A_stale_upgrade_copy_from_an_earlier_crash_is_removed()
+    {
+        using (var wal = Open()) wal.Append([Gauge("cpu", 0, 1.0)]);
+        File.WriteAllBytes(TmpPath, new byte[4096]);
+
+        Assert.Single(Open().ReadAll(out _));
+        Assert.False(File.Exists(TmpPath));
+
+        // …and beside a v1 log, a half-written copy does not stop the upgrade.
+        foreach (var w in _wals) w.Dispose();
+        WriteV1Log();
+        File.WriteAllBytes(TmpPath, [1, 2, 3]);
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+        Assert.False(File.Exists(TmpPath));
     }
 
     private sealed class CapturingLogger : ILogger
