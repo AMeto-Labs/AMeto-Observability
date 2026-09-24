@@ -76,6 +76,65 @@ public sealed class OtlpTraceProtoParityTests
     }
 
     /// <summary>
+    /// A RESOURCE BLOCK WITH NO SPANS TAKES NO SERVICE-POOL SLOT (PR #84 review, #6). The service pool
+    /// holds 4 096 entries for the life of the process; an exporter that sends a block per pod, most
+    /// of them empty, filled it over protobuf — interned per block, before any span was seen — and
+    /// never over JSON, which interns at the block's first span. Five blocks with a service and no
+    /// spans (one with an empty ScopeSpans), then one block with a span: ONE intern call, for the
+    /// block that had a span, on both encodings.
+    ///
+    /// <para>Reverted (interned per block): 7 calls over protobuf, one per block.</para>
+    /// </summary>
+    [Fact]
+    public void RawSink_AResourceBlockWithNoSpansInternsNothing()
+    {
+        static byte[] Resource(string service) => OtlpProtoPayloads.Msg(res =>
+            OtlpProtoPayloads.Nested(res, 1, RawStringAttr("service.name"u8.ToArray(), System.Text.Encoding.UTF8.GetBytes(service))));
+
+        byte[] payload = OtlpProtoPayloads.Msg(c =>
+        {
+            for (int i = 0; i < 5; i++)                                          // no ScopeSpans at all
+                OtlpProtoPayloads.Nested(c, 1, OtlpProtoPayloads.Msg(rs => OtlpProtoPayloads.Nested(rs, 1, Resource($"pod-{i}"))));
+            OtlpProtoPayloads.Nested(c, 1, OtlpProtoPayloads.Msg(rs =>          // a ScopeSpans with no span
+            {
+                OtlpProtoPayloads.Nested(rs, 1, Resource("pod-empty-scope"));
+                OtlpProtoPayloads.Nested(rs, 2, OtlpProtoPayloads.Msg(static _ => { }));
+            }));
+            OtlpProtoPayloads.Nested(c, 1, OtlpProtoPayloads.Msg(rs =>
+            {
+                OtlpProtoPayloads.Nested(rs, 1, Resource("checkout"));
+                OtlpProtoPayloads.Nested(rs, 2, OtlpProtoPayloads.Msg(ss => OtlpProtoPayloads.Nested(ss, 2, OtlpProtoPayloads.Msg(sp =>
+                {
+                    sp.WriteTag(1, Google.Protobuf.WireFormat.WireType.LengthDelimited);
+                    sp.WriteBytes(Google.Protobuf.ByteString.CopyFrom(Convert.FromHexString("0af7651916cd43dd8448eb211c80319c")));
+                    sp.WriteTag(2, Google.Protobuf.WireFormat.WireType.LengthDelimited);
+                    sp.WriteBytes(Google.Protobuf.ByteString.CopyFrom(Convert.FromHexString("b7ad6b7169203331")));
+                    RawString(sp, 5, "GET /cart"u8.ToArray());
+                }))));
+            }));
+        });
+
+        var proto = new CapturingSpanSink();
+        var (ingested, _) = OtlpTraceProtoParser.Parse(payload, proto);
+        Assert.Equal(1, ingested);
+        Assert.Equal(1, proto.InternCalls);
+        Assert.Equal("checkout"u8.ToArray(), Assert.Single(proto.Interned));
+
+        // The JSON parser, on the same blocks: the behaviour the protobuf route now matches.
+        string empty = string.Concat(Enumerable.Range(0, 5).Select(i =>
+            $"{{\"resource\":{{\"attributes\":[{{\"key\":\"service.name\",\"value\":{{\"stringValue\":\"pod-{i}\"}}}}]}}}},"));
+        string json = "{\"resourceSpans\":[" + empty
+            + "{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"pod-empty-scope\"}}]},\"scopeSpans\":[{\"spans\":[]}]},"
+            + "{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"checkout\"}}]},"
+            + "\"scopeSpans\":[{\"spans\":[{\"traceId\":\"0af7651916cd43dd8448eb211c80319c\",\"spanId\":\"b7ad6b7169203331\",\"name\":\"GET /cart\"}]}]}]}";
+        var viaJson = new CapturingSpanSink();
+        var (jsonIngested, _) = OtlpTraceStreamParser.Parse(System.Text.Encoding.UTF8.GetBytes(json), viaJson);
+        Assert.Equal(1, jsonIngested);
+        Assert.Equal(1, viaJson.InternCalls);
+        Assert.Equal("checkout"u8.ToArray(), Assert.Single(viaJson.Interned));
+    }
+
+    /// <summary>
     /// THE SINK IS ONLY EVER HANDED VALID UTF-8. A name and a service carrying invalid sequences
     /// reach the sink as the bytes of the text the DOM path stored (U+FFFD per invalid sequence) —
     /// the capturing sink asserts validity on every call, and the bytes are compared with the DOM's.
