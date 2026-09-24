@@ -15,47 +15,22 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpMetricMapper
 {
-    /// <summary>One point's labels, interleaved, with their interner ids — see
-    /// <see cref="MetricLabelInterner.GetLabelSet"/>. Per <see cref="Map"/> call.</summary>
-    private sealed class LabelScratch(MetricLabelInterner interner)
-    {
-        public readonly MetricLabelInterner Interner = interner;
-        public string[] Kv  = new string[32];
-        public int[]    Ids = new int[32];
-        public int      Used;
-
-        public void Add(string key, int keyId, string value, int valueId)
-        {
-            if (Used + 2 > Kv.Length)
-            {
-                Array.Resize(ref Kv,  Kv.Length * 2);
-                Array.Resize(ref Ids, Ids.Length * 2);
-            }
-            Kv[Used] = key;   Ids[Used] = keyId;   Used++;
-            Kv[Used] = value; Ids[Used] = valueId; Used++;
-        }
-
-        public void Add(string key, string value)
-        {
-            int keyId   = Interner.Intern(key,   out key);
-            int valueId = Interner.Intern(value, out value);
-            Add(key, keyId, value, valueId);
-        }
-    }
-
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request) =>
         Map(request, MetricLabelInterner.Shared);
 
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner)
     {
-        var result  = new List<MetricIngestItem>();
-        var scratch = new LabelScratch(interner);
+        var result = new List<MetricIngestItem>();
+        // The label rule is the protobuf parser's too — one builder, so the two encodings cannot
+        // disagree on a series' identity.
+        var labels = new MetricLabelSetBuilder(interner);
 
         foreach (var rm in request.ResourceMetrics ?? [])
         {
-            string? serviceName = ExtractServiceName(rm.Resource?.Attributes);
-            if (serviceName is not null) serviceName = interner.Intern(serviceName);
-            var resLabels       = ExtractResourceLabels(rm.Resource?.Attributes);
+            labels.BeginResource();
+            if (ExtractServiceName(rm.Resource?.Attributes) is { } serviceName)
+                labels.SetServiceName(labels.Intern(serviceName));
+            AddResourceLabels(rm.Resource?.Attributes, labels);
             foreach (var sm in rm.ScopeMetrics ?? [])
             foreach (var metric in sm.Metrics ?? [])
             {
@@ -64,17 +39,15 @@ public static class OtlpMetricMapper
                 string unit = interner.Intern(metric.Unit ?? "");
 
                 if (metric.Gauge is not null)
-                    MapNumberPoints(name, unit, MetricKind.Gauge,
-                        metric.Gauge.DataPoints, serviceName, resLabels, scratch, result);
+                    MapNumberPoints(name, unit, MetricKind.Gauge, metric.Gauge.DataPoints, labels, result);
 
                 else if (metric.Sum is not null)
                     MapNumberPoints(name, unit,
                         metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
-                        metric.Sum.DataPoints, serviceName, resLabels, scratch, result);
+                        metric.Sum.DataPoints, labels, result);
 
                 else if (metric.Histogram is not null)
-                    MapHistogramPoints(name, unit,
-                        metric.Histogram.DataPoints, serviceName, resLabels, scratch, result);
+                    MapHistogramPoints(name, unit, metric.Histogram.DataPoints, labels, result);
             }
         }
 
@@ -92,13 +65,12 @@ public static class OtlpMetricMapper
     /// mints a fresh GUID per process start, so keeping it as a label forks every
     /// series of every metric on every restart (the dominant cardinality driver).
     /// Logs and traces keep it — there it annotates records instead of multiplying
-    /// series. Point attributes win on key collision.
+    /// series. Point attributes win on key collision (<see cref="MetricLabelSetBuilder.Build"/>).
     /// </summary>
-    private static List<KeyValuePair<string, string>>? ExtractResourceLabels(List<OtlpKeyValue>? attrs)
+    private static void AddResourceLabels(List<OtlpKeyValue>? attrs, MetricLabelSetBuilder labels)
     {
-        if (attrs is null || attrs.Count == 0) return null;
+        if (attrs is null) return;
 
-        List<KeyValuePair<string, string>>? result = null;
         for (int i = 0; i < attrs.Count; i++)
         {
             var kv = attrs[i];
@@ -108,10 +80,8 @@ public static class OtlpMetricMapper
                 kv.Key.StartsWith("telemetry.distro.", StringComparison.Ordinal)) continue;
             var sv = FormatLabelValue(kv.Value);
             if (sv is not null)
-                (result ??= new List<KeyValuePair<string, string>>(attrs.Count))
-                    .Add(new KeyValuePair<string, string>(kv.Key, sv));
+                labels.AddResourceLabel(labels.Intern(kv.Key), labels.Intern(sv));
         }
-        return result;
     }
 
     private static string? FormatLabelValue(OtlpAnyValue v) =>
@@ -137,9 +107,7 @@ public static class OtlpMetricMapper
         string                                   unit,
         MetricKind                               kind,
         List<OtlpNumberDataPoint>?               points,
-        string?                                  serviceName,
-        List<KeyValuePair<string, string>>?      resLabels,
-        LabelScratch                             scratch,
+        MetricLabelSetBuilder                    labels,
         List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
@@ -152,7 +120,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels, scratch),
+                Labels            = ExtractLabels(dp.Attributes, labels),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 ScalarValue       = value,
             });
@@ -163,9 +131,7 @@ public static class OtlpMetricMapper
         string                                   name,
         string                                   unit,
         List<OtlpHistogramDataPoint>?            points,
-        string?                                  serviceName,
-        List<KeyValuePair<string, string>>?      resLabels,
-        LabelScratch                             scratch,
+        MetricLabelSetBuilder                    labels,
         List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
@@ -215,7 +181,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels, scratch),
+                Labels            = ExtractLabels(dp.Attributes, labels),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 HistogramCount    = count,
                 HistogramSum      = dp.Sum ?? 0,
@@ -226,13 +192,10 @@ public static class OtlpMetricMapper
         }
     }
 
-    private static LabelSet ExtractLabels(
-        List<OtlpKeyValue>? attrs, string? serviceName,
-        List<KeyValuePair<string, string>>? resLabels, LabelScratch scratch)
+    /// <summary>The point's label set through the builder the protobuf parser uses too.</summary>
+    private static LabelSet ExtractLabels(List<OtlpKeyValue>? attrs, MetricLabelSetBuilder labels)
     {
-        scratch.Used = 0;
-        if (serviceName is not null)
-            scratch.Add("service.name", serviceName);
+        labels.BeginPoint();
         if (attrs is not null)
         for (int i = 0; i < attrs.Count; i++)
         {
@@ -240,25 +203,9 @@ public static class OtlpMetricMapper
             if (kv.Key is null || kv.Value is null) continue;
             var sv = FormatLabelValue(kv.Value);
             if (sv is not null)
-                scratch.Add(kv.Key, sv);
+                labels.Add(labels.Intern(kv.Key), labels.Intern(sv));
         }
 
-        // Allow-listed resource labels — point attributes win on key collision.
-        if (resLabels is not null)
-        {
-            for (int i = 0; i < resLabels.Count; i++)
-            {
-                // Against everything added so far, resource labels included: a resource that
-                // repeats a key keeps its first value, as the pair-list shape always did.
-                bool exists = false;
-                for (int j = 0; j < scratch.Used; j += 2)
-                    if (scratch.Kv[j] == resLabels[i].Key) { exists = true; break; }
-                if (!exists) scratch.Add(resLabels[i].Key, resLabels[i].Value);
-            }
-        }
-
-        return scratch.Used == 0
-            ? LabelSet.Empty
-            : scratch.Interner.GetLabelSet(scratch.Kv.AsSpan(0, scratch.Used), scratch.Ids.AsSpan(0, scratch.Used));
+        return labels.Build();
     }
 }
