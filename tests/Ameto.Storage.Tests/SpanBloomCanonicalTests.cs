@@ -728,6 +728,42 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// THE HOST CHECK DESCRIBES THIS HOST AGAINST THE COMPILED TABLE, whoever asks first — review F-B.
+    /// The set is computed once per process; built from the swappable table, a first use inside
+    /// <see cref="SpanBloomFold.UseTableForTest"/> would have cached the substitute's differences
+    /// (here: <c>ё</c>/<c>Ё</c> unfolded) and judged every later probe in the process against them.
+    /// Build it from <c>s_table</c> again and this fails on <c>ё</c>.
+    /// </summary>
+    [Fact]
+    public void The_host_check_is_against_the_compiled_table_even_when_first_built_under_a_swap()
+    {
+        UnderCulture("en-US", () =>
+        {
+            int compiled = SpanBloomFold.HostDisagreementCount;
+            var other = SpanBloomFold.CopyOfTable();
+            foreach (char c in "ёЁ") other[c] = c;
+
+            SpanBloomFold.ForgetHostDriftForTest();
+            try
+            {
+                using (SpanBloomFold.UseTableForTest(other))
+                {
+                    // First built HERE, under the swap.
+                    _out.WriteLine($"host disagreements first built under a swap: {SpanBloomFold.HostDisagreementCount}, compiled: {compiled}");
+                    Assert.Equal(compiled, SpanBloomFold.HostDisagreementCount);
+                    Assert.False(SpanBloomFold.HostDisagrees('ё'));
+                }
+                Assert.False(SpanBloomFold.HostDisagrees('ё'));
+                Assert.Equal(compiled, SpanBloomFold.HostDisagreementCount);
+            }
+            finally
+            {
+                SpanBloomFold.ForgetHostDriftForTest();
+            }
+        });
+    }
+
     internal static readonly string[] FoldProbeQueries =
         ["{ .x = \"ɤ-report\" }", "{ .y = \"ЁЛКА\" }", "{ .y = \"ёлка\" }", "{ .db = \"mssql\" }"];
 

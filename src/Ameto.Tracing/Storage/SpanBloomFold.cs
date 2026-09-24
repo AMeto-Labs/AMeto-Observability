@@ -264,10 +264,10 @@ internal static class SpanBloomFold
     /// comparer-equal pair the table folds apart marked together with its lowercases, and every
     /// scalar whose host lowercase the table folds elsewhere marked with that lowercase.
     /// </summary>
-    internal static bool HostDisagrees(char c) => (HostDrift.Bits[c >> 6] & (1UL << (c & 63))) != 0;
+    internal static bool HostDisagrees(char c) => (Drift.Bits[c >> 6] & (1UL << (c & 63))) != 0;
 
     /// <summary>How many characters <see cref="HostDisagrees"/> — printed by the tests.</summary>
-    internal static int HostDisagreementCount => HostDrift.Count;
+    internal static int HostDisagreementCount => Drift.Count;
 
     /// <summary>
     /// TEST SEAM: fold with <paramref name="table"/> (65 536 entries) until disposed — the shape of a
@@ -317,58 +317,77 @@ internal static class SpanBloomFold
         return h;
     }
 
-    /// <summary>The host-drift set, built on first use — see <see cref="HostDisagrees"/>.</summary>
-    private static class HostDrift
+    /// <summary>
+    /// The host-drift set: which characters this host treats differently from the COMPILED table.
+    /// Built on first use and kept for the process. It is a property of the host and the build, so it
+    /// is computed from <see cref="Runs"/> itself and never from <c>s_table</c>, which
+    /// <see cref="UseTableForTest"/> swaps: a set first built under a swap would describe the
+    /// substitute, and every later probe in the process would be judged against the wrong table
+    /// (review F-B of #86).
+    /// </summary>
+    private sealed class DriftSet(ulong[] bits, int count)
     {
-        public static readonly int     Count;
-        public static readonly ulong[] Bits = Compute(out Count);
+        public readonly ulong[] Bits  = bits;
+        public readonly int     Count = count;
+    }
 
-        private static ulong[] Compute(out int count)
+    private static DriftSet? s_drift;
+
+    private static DriftSet Drift => Volatile.Read(ref s_drift) ?? BuildDrift();
+
+    private static DriftSet BuildDrift()
+    {
+        var built = ComputeDrift(Expand(Runs));
+        return Interlocked.CompareExchange(ref s_drift, built, null) ?? built;
+    }
+
+    /// <summary>TEST SEAM: forget the host-drift set, so the next use computes it again.</summary>
+    internal static void ForgetHostDriftForTest() => Volatile.Write(ref s_drift, null);
+
+    private static DriftSet ComputeDrift(char[] table)
+    {
+        var bits = new ulong[65_536 / 64];
+
+        // Scalars whose host lowercase the table folds elsewhere: the reader only ever sees the
+        // host-lowercased literal (AttrHint.LowerValue).
+        for (int c = 0; c < 65_536; c++)
         {
-            var table = s_table;
-            var bits  = new ulong[65_536 / 64];
-
-            // Scalars whose host lowercase the table folds elsewhere: the reader only ever sees the
-            // host-lowercased literal (AttrHint.LowerValue).
-            for (int c = 0; c < 65_536; c++)
-            {
-                if (c is >= 0xD800 and <= 0xDFFF) continue;
-                char l = char.ToLowerInvariant((char)c);
-                if (table[l] != table[c]) { Mark(bits, (char)c); Mark(bits, l); }
-            }
-
-            // Pairs the host's comparer calls equal and the table keeps apart.
-            var keyed = new List<ulong>(65_536);
-            Span<char> one = stackalloc char[1];
-            for (int c = 0; c < 65_536; c++)
-            {
-                if (c is >= 0xD800 and <= 0xDFFF) continue;
-                one[0] = (char)c;
-                uint h = (uint)string.GetHashCode(one, StringComparison.OrdinalIgnoreCase);
-                keyed.Add(((ulong)h << 32) | (uint)c);
-            }
-            keyed.Sort();
-            for (int i = 0; i < keyed.Count; )
-            {
-                int j = i + 1;
-                while (j < keyed.Count && keyed[j] >> 32 == keyed[i] >> 32) j++;
-                for (int a = i; a < j; a++)
-                for (int b = a + 1; b < j; b++)
-                {
-                    char ca = (char)keyed[a], cb = (char)keyed[b];
-                    if (table[ca] == table[cb]) continue;
-                    if (!string.Equals(ca.ToString(), cb.ToString(), StringComparison.OrdinalIgnoreCase)) continue;
-                    Mark(bits, ca); Mark(bits, cb);
-                    Mark(bits, char.ToLowerInvariant(ca)); Mark(bits, char.ToLowerInvariant(cb));
-                }
-                i = j;
-            }
-
-            count = 0;
-            foreach (ulong w in bits) count += System.Numerics.BitOperations.PopCount(w);
-            return bits;
+            if (c is >= 0xD800 and <= 0xDFFF) continue;
+            char l = char.ToLowerInvariant((char)c);
+            if (table[l] != table[c]) { Mark(bits, (char)c); Mark(bits, l); }
         }
 
-        private static void Mark(ulong[] bits, char c) => bits[c >> 6] |= 1UL << (c & 63);
+        // Pairs the host's comparer calls equal and the table keeps apart.
+        var keyed = new List<ulong>(65_536);
+        Span<char> one = stackalloc char[1];
+        for (int c = 0; c < 65_536; c++)
+        {
+            if (c is >= 0xD800 and <= 0xDFFF) continue;
+            one[0] = (char)c;
+            uint h = (uint)string.GetHashCode(one, StringComparison.OrdinalIgnoreCase);
+            keyed.Add(((ulong)h << 32) | (uint)c);
+        }
+        keyed.Sort();
+        for (int i = 0; i < keyed.Count; )
+        {
+            int j = i + 1;
+            while (j < keyed.Count && keyed[j] >> 32 == keyed[i] >> 32) j++;
+            for (int a = i; a < j; a++)
+            for (int b = a + 1; b < j; b++)
+            {
+                char ca = (char)keyed[a], cb = (char)keyed[b];
+                if (table[ca] == table[cb]) continue;
+                if (!string.Equals(ca.ToString(), cb.ToString(), StringComparison.OrdinalIgnoreCase)) continue;
+                Mark(bits, ca); Mark(bits, cb);
+                Mark(bits, char.ToLowerInvariant(ca)); Mark(bits, char.ToLowerInvariant(cb));
+            }
+            i = j;
+        }
+
+        int count = 0;
+        foreach (ulong w in bits) count += System.Numerics.BitOperations.PopCount(w);
+        return new DriftSet(bits, count);
     }
+
+    private static void Mark(ulong[] bits, char c) => bits[c >> 6] |= 1UL << (c & 63);
 }
