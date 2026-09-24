@@ -1783,16 +1783,17 @@ internal static class TraceDetailJson
         // Open addressing at no more than half full: a power of two at least twice the pair count.
         int slots = Math.Max(8, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)count * 2));
 
+        // Both rentals sit inside the try, so a second Rent that throws still returns the first.
         AttrPair[]? rented = null;
         int[]?      rentedSlots = null;
-        Span<AttrPair> pairs = count <= StackPairs
-            ? stackalloc AttrPair[StackPairs]
-            : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
-        Span<int> table = slots <= StackSlots
-            ? stackalloc int[StackSlots]
-            : (rentedSlots = ArrayPool<int>.Shared.Rent(slots));
         try
         {
+            Span<AttrPair> pairs = count <= StackPairs
+                ? stackalloc AttrPair[StackPairs]
+                : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
+            Span<int> table = slots <= StackSlots
+                ? stackalloc int[StackSlots]
+                : (rentedSlots = ArrayPool<int>.Shared.Rent(slots));
             pairs = pairs[..count];
             table = table[..slots];
             var bytes = blob.Span;
