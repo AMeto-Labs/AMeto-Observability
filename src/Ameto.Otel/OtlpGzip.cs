@@ -9,7 +9,7 @@ namespace Ameto.Otel;
 internal enum InflateResult
 {
     Ok,
-    /// <summary>Not gzip, or its trailer does not match what it inflated to.</summary>
+    /// <summary>Not gzip, cut off before its trailer, or a trailer that does not match what it inflated to.</summary>
     Malformed,
     /// <summary>It inflates past the batch limit.</summary>
     TooLarge,
@@ -114,6 +114,13 @@ internal static class OtlpGzip
                 total += read;
             }
 
+            if (!payload.IsEmpty && !TrailerFits(payload.Span, total))
+            {
+                IngestBufferPool.Return(rented);
+                rented = null;
+                return InflateResult.Malformed;
+            }
+
             length = total;
             return InflateResult.Ok;
         }
@@ -123,6 +130,34 @@ internal static class OtlpGzip
             return InflateResult.Malformed;
         }
     }
+
+    /// <summary>A gzip member's fixed header (10 bytes) and trailer (CRC-32 and ISIZE, 8 bytes): nothing shorter is one.</summary>
+    internal const int HeaderAndTrailerBytes = 18;
+
+    /// <summary>
+    /// Whether the stream could have ENDED where it did, rather than been cut off.
+    ///
+    /// <para><c>GZipStream</c> is strict about everything but one thing, and that one thing
+    /// matters here: input that simply stops. zlib checks a member's CRC-32 and ISIZE only when
+    /// it reaches the trailer, and a stream that runs out before then is reported as an ordinary
+    /// end — so a body cut short mid-member inflated to a clean-looking PREFIX, and the parser
+    /// ingested whatever records that prefix held. (The runtime's
+    /// <c>System.IO.Compression.UseStrictValidation</c> switch would catch it, but it is
+    /// process-wide and latched on the first <c>DeflateStream</c> anyone touches, so it cannot
+    /// be relied on from here.)</para>
+    ///
+    /// <para>The trailer settles it instead. A complete stream ends with its last member's ISIZE,
+    /// which can never exceed everything inflated: it EQUALS it for the single member every
+    /// exporter sends (and zlib has already verified it did), and is smaller for a multi-member
+    /// stream. A cut-off stream ends in deflate data or half a trailer, and those four bytes read
+    /// as a length exceed the output all but (total + 1) / 2^32 of the time — at the 8 MiB
+    /// default, fewer than one truncation in 500 slips past, and then the parser still sees a
+    /// message cut short, which it refuses as it always has. Zero padding after a member, which
+    /// some tools add, reads as 0 and passes.</para>
+    /// </summary>
+    internal static bool TrailerFits(ReadOnlySpan<byte> payload, int inflated)
+        => payload.Length >= HeaderAndTrailerBytes
+        && BinaryPrimitives.ReadUInt32LittleEndian(payload[^4..]) <= (uint)inflated;
 
     /// <summary>
     /// The uncompressed length a gzip member declares in its last four bytes (ISIZE, little

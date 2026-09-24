@@ -199,7 +199,9 @@ on the main port would stop the UI, every `/api` call, the live tail and the con
 check from working, since no browser does HTTP/2 without TLS.
 
 **Encodings:** uncompressed and `gzip`. Anything else is answered `UNIMPLEMENTED` (12) with
-`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed.
+`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed. A gzip
+message is held to `Ingestion.MaxOtlpBatchBytes` once inflated, and one cut off before its gzip
+trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 
 **Status is in the trailers, not the HTTP status line** — every call answers HTTP 200:
 

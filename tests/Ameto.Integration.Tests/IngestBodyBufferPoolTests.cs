@@ -447,7 +447,17 @@ internal sealed class IngestBufferPoolLedger : IDisposable
     public int Rents           { get { lock (_gate) return _rents; } }
     public int PeakOutstanding { get { lock (_gate) return _peak; } }
     public int LargestRent     { get { lock (_gate) return _largest; } }
+
+    /// <summary>
+    /// Most bytes this flow held from the pool at one moment — the sum of the lengths of the
+    /// buffers out together. What a gzip bomb has to be held to: a doubling ladder is two buffers
+    /// alive at the copy, and the compressed body is a third, so the largest single rent alone
+    /// does not say what the request cost.
+    /// </summary>
+    public long PeakOutstandingBytes { get { lock (_gate) return _peakBytes; } }
+
     private int _rents, _returns, _peak, _largest;
+    private long _outBytes, _peakBytes;
 
     public static IngestBufferPoolLedger Open()
     {
@@ -471,6 +481,8 @@ internal sealed class IngestBufferPoolLedger : IDisposable
             if (!_out.Add(array))
                 _faults.Add($"a {array.Length:N0}-byte buffer was handed out while still out: it had been returned twice");
             _peak = Math.Max(_peak, _out.Count);
+            _outBytes += array.Length;
+            _peakBytes = Math.Max(_peakBytes, _outBytes);
         }
     }
 
@@ -481,6 +493,8 @@ internal sealed class IngestBufferPoolLedger : IDisposable
             _returns++;
             if (!_out.Remove(array))
                 _faults.Add($"a {array.Length:N0}-byte buffer came back that IngestBufferPool did not hand out (rented elsewhere, or returned twice)");
+            else
+                _outBytes -= array.Length;
         }
     }
 
