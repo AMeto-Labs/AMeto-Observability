@@ -504,7 +504,8 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         await _engine.CatalogLoaded;
         var (path, key) = ParkThroughTheSeam(17);
 
-        Assert.False(await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // setup: nothing to merge
+        // setup: the pass RAN (a Busy pass skips its sweeps too) and had nothing to merge
+        Assert.Equal(MergeOutcome.NothingToMerge, await _engine.RunColdMaintenancePassAsync(CancellationToken.None));
 
         Assert.Equal(0, _engine.PendingSegmentDeleteCount);
         Assert.False(File.Exists(path), "a maintenance pass left a parked segment file on disk");

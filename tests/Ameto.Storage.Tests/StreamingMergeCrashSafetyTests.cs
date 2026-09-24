@@ -434,23 +434,25 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         var before  = ReadEverything();
         var sources = _engine.ListSegments().Select(s => s.FilePath).ToList();
 
-        bool? secondMerged = null, passMerged = null;
-        bool  sourcesOnDisk = false;
-        int   commits = 0;
+        MergeOutcome? second = null, pass = null;
+        bool sourcesOnDisk = false;
+        int  commits = 0;
         _engine._beforeMergeSwap = () =>
         {
             if (Interlocked.Increment(ref commits) != 1) return;   // a second merge's own commit
-            secondMerged  = Task.Run(() => _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)).GetAwaiter().GetResult();
-            passMerged    = Task.Run(() => _engine.RunColdMaintenancePassAsync(CancellationToken.None)).GetAwaiter().GetResult();
+            second        = Task.Run(() => _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None)).GetAwaiter().GetResult();
+            pass          = Task.Run(() => _engine.RunColdMaintenancePassAsync(CancellationToken.None)).GetAwaiter().GetResult();
             sourcesOnDisk = sources.All(File.Exists);
         };
-        bool merged;
-        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        MergeOutcome first;
+        try     { first = await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None); }
         finally { _engine._beforeMergeSwap = null; }
 
-        Assert.True(merged, "setup: the first merge merged nothing");
-        Assert.False(secondMerged, "a second merge ran beside the first");    // true: it merged the same batch again
-        Assert.False(passMerged,   "a maintenance pass ran beside the merge");
+        Assert.Equal(MergeOutcome.Merged, first);   // setup
+        // Busy, not NothingToMerge: the call learnt nothing about what is left to merge. Merged:
+        // it merged the same batch again.
+        Assert.Equal(MergeOutcome.Busy, second);
+        Assert.Equal(MergeOutcome.Busy, pass);
         Assert.True(sourcesOnDisk, "a sweep deleted the sources of a merge that had not committed");
         Assert.Equal(1, commits);
         Assert.Single(_engine.ListSegments());
@@ -459,10 +461,24 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         // The gate is let go when a merge ends and when a pass ends: after one of each, a fresh
         // batch merges.
-        Assert.False(await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // one segment: nothing to merge
+        Assert.Equal(MergeOutcome.NothingToMerge, await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // one segment
         for (int round = 10; round < 20; round++)
             await WriteSegmentAsync(round, 60);
-        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the merge gate was never let go");
+        Assert.Equal(MergeOutcome.Merged, await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None));   // Busy: the gate was never let go
+    }
+
+    /// <summary>
+    /// The maintenance loop's pause after each outcome. A pass that lost the gate to a running
+    /// merge (a test's, a manual trigger's) takes the backlog pause, not the idle one: the gate
+    /// says nothing about whether more is waiting, and read as "nothing to merge" it cost ten
+    /// minutes of compaction every time.
+    /// </summary>
+    [Fact]
+    public void TheMaintenanceLoopPausesShortAfterABusyPass()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(15),  StorageEngine.PauseAfter(MergeOutcome.Merged));
+        Assert.Equal(TimeSpan.FromSeconds(15),  StorageEngine.PauseAfter(MergeOutcome.Busy));   // 600 when Busy read as idle
+        Assert.Equal(TimeSpan.FromSeconds(600), StorageEngine.PauseAfter(MergeOutcome.NothingToMerge));
     }
 
     /// <summary>A replicated segment's file, as a peer pushes it: another node's id, four events.</summary>
@@ -613,7 +629,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         try     { await Assert.ThrowsAsync<InvalidOperationException>(() => _engine.RunColdMaintenancePassAsync(CancellationToken.None)); }
         finally { _engine._beforeMaintenanceSweeps = null; }
 
-        Assert.True(await _engine.RunColdMaintenancePassAsync(CancellationToken.None), "the next pass merged nothing: the gate stayed taken");
+        Assert.Equal(MergeOutcome.Merged, await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // Busy: the gate stayed taken
         Assert.Single(_engine.ListSegments());
     }
 

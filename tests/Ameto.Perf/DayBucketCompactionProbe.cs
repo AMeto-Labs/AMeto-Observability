@@ -136,13 +136,16 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         var  sw = System.Diagnostics.Stopwatch.StartNew();
         int  merges = 0;
         long written = 0;
-        while (await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None))
+        MergeOutcome outcome;
+        while ((outcome = await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None)) == MergeOutcome.Merged)
         {
             merges++;
             Assert.True(merges < 3000, "compaction did not converge");
             written += _engine.ListSegments().OrderByDescending(s => s.Id.Value).First().UncompressedBytes;
         }
         sw.Stop();
+        // A fixpoint, not a merge gate someone else held: Busy would stop the loop just as short.
+        Assert.Equal(MergeOutcome.NothingToMerge, outcome);
 
         var    after = _engine.ListSegments();
         double amp   = written / (double)Math.Max(1, before.Sum(s => s.UncompressedBytes));

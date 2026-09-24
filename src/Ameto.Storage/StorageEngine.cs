@@ -838,16 +838,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <see cref="TryMergeSmallSegmentsOnceAsync"/> itself and then counts the events its
     /// segments serve is only meaningful while this reads 0. The merge gate
     /// (<see cref="_mergeGate"/>) keeps a background pass from merging a batch a second time,
-    /// but not from holding the gate when the test calls, and the test's merge then merges
-    /// nothing. Asserting on it means a settle delay that quietly came back cannot pass itself
-    /// off as a flake.
+    /// but not from holding the gate when the test calls, and the test's merge is then
+    /// <see cref="MergeOutcome.Busy"/> and merges nothing. Asserting on it means a settle delay
+    /// that quietly came back cannot pass itself off as a flake.
     /// </summary>
     internal int ColdMaintenancePassesStarted => Volatile.Read(ref _coldMaintenancePasses);
 
     /// <summary>
     /// 1 while a merge, or a maintenance pass around one, runs; a compare-exchange from 0 is what
     /// starts either (<see cref="TryEnterMergeGate"/>), and a caller that loses it does nothing
-    /// and reports that nothing was merged.
+    /// and reports <see cref="MergeOutcome.Busy"/>.
     ///
     /// <para>The planner is deterministic, oldest bucket first, so two merges started together
     /// pick the SAME batch, both write an output, both commit, and the batch's events are then on
@@ -862,13 +862,29 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// by the flush slots anyway, so a second one in parallel would buy nothing.</para>
     ///
     /// <para>Not a wait: the loser returns at once with no queued work, no semaphore and no
-    /// cancellation to thread through. In production the maintenance loop is the only caller;
-    /// a pass that loses reads as an idle one and sleeps its long pause.</para>
+    /// cancellation to thread through. It says Busy, not "nothing to merge": a caller that runs
+    /// merges to a fixpoint would otherwise stop short, and the maintenance loop would take a
+    /// lost gate for an idle catalog and sleep its long pause (see <see cref="PauseAfter"/>).</para>
     /// </summary>
     private int _mergeGate;
 
-    /// <summary>The answer of a merge or pass that found the gate taken.</summary>
-    private static readonly Task<bool> NothingMerged = Task.FromResult(false);
+    /// <summary>The answer of a merge or pass that found the gate taken; cached, since it carries no state.</summary>
+    private static readonly Task<MergeOutcome> BusyOutcome = Task.FromResult(MergeOutcome.Busy);
+
+    /// <summary>Pause after a pass that merged a batch, or lost the gate to one that is merging: a backlog may be waiting.</summary>
+    internal static readonly TimeSpan BacklogPause = TimeSpan.FromSeconds(15);
+
+    /// <summary>Pause after a pass that found nothing to merge.</summary>
+    internal static readonly TimeSpan IdlePause = TimeSpan.FromSeconds(600);
+
+    /// <summary>
+    /// How long the maintenance loop waits after a pass that ended with
+    /// <paramref name="outcome"/>. Busy is a backlog pause, not an idle one: the gate was taken
+    /// by a merge (a test's, or a manual trigger's), which says nothing about whether more is
+    /// waiting, and ten minutes is a long time to find out.
+    /// </summary>
+    internal static TimeSpan PauseAfter(MergeOutcome outcome) =>
+        outcome == MergeOutcome.NothingToMerge ? IdlePause : BacklogPause;
 
     private bool TryEnterMergeGate() => Interlocked.CompareExchange(ref _mergeGate, 1, 0) == 0;
 
@@ -904,12 +920,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         while (!ct.IsCancellationRequested)
         {
             // One batch per iteration, short pause while a backlog exists.
-            bool merged;
+            MergeOutcome outcome;
             Interlocked.Increment(ref _coldMaintenancePasses);
-            try { merged = await RunColdMaintenancePassAsync(ct); }
+            try { outcome = await RunColdMaintenancePassAsync(ct); }
             catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
-            if (merged)
+            catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); outcome = MergeOutcome.NothingToMerge; }
+            if (outcome == MergeOutcome.Merged)
             {
                 // A merge briefly holds the batch, its native tier copy and the
                 // index builders. Hand that back to the OS instead of letting the
@@ -925,33 +941,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
                 // there is nothing to release and no floor to test.
                 ReleaseMaintenanceMemory();
-                try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
-                catch (OperationCanceledException) { break; }
-                continue;
             }
 
-            try { await Task.Delay(TimeSpan.FromSeconds(600), ct); }
+            try { await Task.Delay(PauseAfter(outcome), ct); }
             catch (OperationCanceledException) { break; }
         }
     }
 
     /// <summary>
-    /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge batch.
-    /// True when a batch was merged. The merge's exceptions, cancellation included, reach the
-    /// loop; the sweeps log their own and never stop the merge behind them.
+    /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge
+    /// batch; the outcome is the merge's. The merge's exceptions, cancellation included,
+    /// reach the loop; the sweeps log their own and never stop the merge behind them.
     ///
     /// <para>Internal so a test can run a pass without the loop's three-minute settle. Past the
     /// background retry's window the deferred-delete sweep below and retention's are the only
     /// retries a parked file gets, so dropping either must fail a test and not only a stand.</para>
     ///
     /// <para>Under the merge gate (<see cref="_mergeGate"/>), sweeps included: a pass that finds
-    /// a merge or another pass running does nothing and returns false.</para>
+    /// a merge or another pass running does nothing and returns <see cref="MergeOutcome.Busy"/>.</para>
     /// </summary>
-    internal Task<bool> RunColdMaintenancePassAsync(CancellationToken ct)
+    internal Task<MergeOutcome> RunColdMaintenancePassAsync(CancellationToken ct)
     {
         // The recovery sweep below cannot tell a crashed merge from one in flight: both are a
         // manifest beside an output at its final name. Only the gate keeps it off a live one.
-        if (!TryEnterMergeGate()) return NothingMerged;
+        if (!TryEnterMergeGate()) return BusyOutcome;
 
         try
         {
@@ -3027,22 +3040,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// halves: merged file present ⇒ finish deleting, absent ⇒ the merge never committed.</para>
     ///
     /// <para>One at a time, under the merge gate (<see cref="_mergeGate"/>): a call that finds a
-    /// merge or a maintenance pass running merges nothing and returns false, since it would pick
-    /// the very batch the running one is merging.</para>
-    ///
-    /// Returns true when a batch was merged.
+    /// merge or a maintenance pass running merges nothing and returns
+    /// <see cref="MergeOutcome.Busy"/>, since it would pick the very batch the running one is
+    /// merging.</para>
     /// </summary>
-    internal Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct) =>
-        TryEnterMergeGate() ? MergeUnderGateAsync(ct) : NothingMerged;
+    internal Task<MergeOutcome> MergeSmallSegmentsOnceAsync(CancellationToken ct) =>
+        TryEnterMergeGate() ? MergeUnderGateAsync(ct) : BusyOutcome;
+
+    /// <summary>
+    /// <see cref="MergeSmallSegmentsOnceAsync"/> for a caller that only asks whether a batch was
+    /// merged. False folds "nothing to merge" and <see cref="MergeOutcome.Busy"/> together, so a
+    /// caller that runs merges to a fixpoint, or reads false as "the pass ran", asks for the
+    /// outcome instead.
+    /// </summary>
+    internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct) =>
+        await MergeSmallSegmentsOnceAsync(ct).ConfigureAwait(false) == MergeOutcome.Merged;
 
     /// <summary>One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.</summary>
-    private async Task<bool> MergeUnderGateAsync(CancellationToken ct)
+    private async Task<MergeOutcome> MergeUnderGateAsync(CancellationToken ct)
     {
-        try { return await MergeOneBatchAsync(ct).ConfigureAwait(false); }
+        try { return await MergeOneBatchAsync(ct).ConfigureAwait(false) ? MergeOutcome.Merged : MergeOutcome.NothingToMerge; }
         finally { Volatile.Write(ref _mergeGate, 0); }
     }
 
-    /// <summary>The body of <see cref="TryMergeSmallSegmentsOnceAsync"/>; the caller holds the merge gate.</summary>
+    /// <summary>The body of <see cref="MergeSmallSegmentsOnceAsync"/>: true when a batch was merged; the caller holds the merge gate.</summary>
     private async Task<bool> MergeOneBatchAsync(CancellationToken ct)
     {
         // Never produce index-less segments: the builder is wired by a hosted
