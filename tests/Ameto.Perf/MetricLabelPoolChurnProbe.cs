@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Ameto.Metrics;
 using Ameto.Otel;
 using Google.Protobuf;
@@ -92,6 +93,94 @@ public sealed class MetricLabelPoolChurnProbe
         Assert.True(late.Bytes > pooled.Bytes, $"late {late.Bytes} B/point, pooled {pooled.Bytes}");
         Assert.Equal(1, resets);
         Assert.True(lateAfterReset.Bytes < late.Bytes, $"after the reset {lateAfterReset.Bytes} B/point, before {late.Bytes}");
+    }
+
+    /// <summary>
+    /// What a reset costs the series that stay LIVE across it (#88 review, finding 6). The hot tier
+    /// and the WAL's series index keep the key each series was first filed under — its label set and
+    /// strings from the OLD pool. After a reset the parser hands out re-interned instances, so every
+    /// point's lookup meets a value-equal key with different references and compares strings where
+    /// it compared pointers, until the series goes stale and is re-filed. Measured on the ingest
+    /// alone: the same export's items, parsed before the reset (the instances the keys hold) and
+    /// after it (value-equal, new instances), into one real engine, interleaved, best of five.
+    /// </summary>
+    [Fact]
+    public async Task Probe_ingest_of_live_series_before_and_after_a_reset()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-reset-probe-" + System.Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var clock    = new Ameto.Testing.ManualTimeProvider();
+            var interner = new MetricLabelInterner(MetricLabelInterner.DefaultMaxStrings,
+                                                   MetricLabelInterner.DefaultLabelSetSlots, clock);
+            long cap = Ameto.Core.MemoryBudgets.MetricHotTierCapBytes;
+            await using var engine = new Ameto.Metrics.Storage.MetricStorageEngine(dir,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<Ameto.Metrics.Storage.MetricStorageEngine>.Instance,
+                new Ameto.Core.MetricsOptions { HotTierBytes = cap, MinFlushBytes = cap, WalInitialBytes = 64L << 20 });
+
+            // Ten live pods, one export each: 500 points, filed — the keys now hold these instances.
+            var live = new List<MetricIngestItem>();
+            for (int s = 0; s < 10; s++) live.AddRange(OtlpMetricProtoParser.Parse(PodBatch(s, 0, 0), interner));
+            engine.Ingest(CollectionsMarshal.AsSpan(live));
+
+            // Churn fills the pool; an hour on, a miss resets it; the live pods export again.
+            for (int g = 1; interner.Strings.ClaimedCount < interner.Strings.MaxPoolSize; g++)
+                OtlpMetricProtoParser.Parse(PodBatch(g % Services, g, 1), interner);
+            clock.Advance(MetricLabelInterner.ResetInterval);
+            OtlpMetricProtoParser.Parse(PodBatch(0, 1_000_000, 2), interner);
+            Assert.Equal(1, interner.Resets);
+            var reinterned = new List<MetricIngestItem>();
+            for (int s = 0; s < 10; s++) reinterned.AddRange(OtlpMetricProtoParser.Parse(PodBatch(s, 0, 0), interner));
+            Assert.Equal(live[0].Labels, reinterned[0].Labels);
+            Assert.Same(live[0].Name, reinterned[0].Name);                       // carried over the bridge
+            for (int k = 0; k < live[0].Labels.Count; k++) Assert.Same(live[0].Labels.ValueAt(k), reinterned[0].Labels.ValueAt(k));
+
+            // What the reset cost without the bridge: every string a new, value-equal instance.
+            var copies = new List<MetricIngestItem>(live.Count);
+            foreach (var i in live)
+                copies.Add(new MetricIngestItem
+                {
+                    Name = new string(i.Name.AsSpan()), Kind = i.Kind, Unit = new string(i.Unit.AsSpan()),
+                    Labels = CopyOf(i.Labels), TimestampUnixNano = i.TimestampUnixNano, ScalarValue = i.ScalarValue,
+                });
+
+            var best = new (double Ns, double Bytes)[3];
+            Array.Fill(best, (double.MaxValue, double.MaxValue));
+            for (int run = 0; run < 7; run++)
+            {
+                var r = new[] { IngestCost(engine, live), IngestCost(engine, reinterned), IngestCost(engine, copies) };
+                for (int v = 0; v < 3; v++) best[v] = (Math.Min(best[v].Ns, r[v].Ns), Math.Min(best[v].Bytes, r[v].Bytes));
+            }
+
+            _out.WriteLine($"INGEST OF LIVE SERIES ({live.Count} points per export, 10 pods), engine only, best of 7, interleaved");
+            _out.WriteLine($"  the stored keys' own instances            : {best[0].Ns,6:N0} ns | {best[0].Bytes,4:N0} B per point");
+            _out.WriteLine($"  re-interned after a reset, over the bridge: {best[1].Ns,6:N0} ns | {best[1].Bytes,4:N0} B per point");
+            _out.WriteLine($"  new instances (a reset with no bridge)    : {best[2].Ns,6:N0} ns | {best[2].Bytes,4:N0} B per point");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    private static LabelSet CopyOf(LabelSet labels)
+    {
+        var pairs = new List<KeyValuePair<string, string>>(labels.Count);
+        foreach (var (k, v) in labels) pairs.Add(new(new string(k.AsSpan()), new string(v.AsSpan())));
+        return new LabelSet(pairs);
+    }
+
+    private static (double Ns, double Bytes) IngestCost(Ameto.Metrics.Storage.MetricStorageEngine engine, List<MetricIngestItem> items)
+    {
+        const int iters = 100;
+        for (int i = 0; i < 5; i++) engine.Ingest(CollectionsMarshal.AsSpan(items));      // warm
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        long t0 = Stopwatch.GetTimestamp();
+        for (int i = 0; i < iters; i++) engine.Ingest(CollectionsMarshal.AsSpan(items));
+        double ns = Stopwatch.GetElapsedTime(t0).TotalNanoseconds / (iters * (double)items.Count);
+        double bytes = (GC.GetAllocatedBytesForCurrentThread() - b0) / (iters * (double)items.Count);
+        return (ns, bytes);
     }
 
     // ── Measurement ───────────────────────────────────────────────────────────

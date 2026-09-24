@@ -14,7 +14,8 @@ namespace Ameto.Storage.Tests;
 /// has passed since the last reset — and live traffic re-interns.
 ///
 /// <para>Time is a <see cref="ManualTimeProvider"/>: it moves only in <c>Advance</c>, and the
-/// interner reads it only on a miss against a full pool — no timer, nothing racing the asserts.</para>
+/// interner reads it only on a miss against a full pool, or on text new to both pools while a reset's
+/// bridge is up — no timer, nothing racing the asserts.</para>
 /// </summary>
 public sealed class MetricLabelPoolResetTests : IAsyncLifetime
 {
@@ -101,6 +102,40 @@ public sealed class MetricLabelPoolResetTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE BRIDGE (#88 review, finding 6). A string still sent after a reset re-enters the new pool
+    /// as its OLD instance — the one the hot tier's and the WAL index's keys hold — so a live series
+    /// is matched by reference, not by a string compare per label per point. A string nobody sends
+    /// is not carried over, and the bridge ends after an interval: what comes back later is new.
+    /// </summary>
+    [Fact]
+    public void A_string_sent_again_after_a_reset_keeps_its_instance_for_one_interval()
+    {
+        var clock    = new ManualTimeProvider();
+        var interner = new MetricLabelInterner(maxStrings: 8, labelSetSlots: 16, clock);
+        Intern(interner, "live", out string live);
+        Intern(interner, "dead", out string dead);
+        Fill(interner, "churn-");
+        clock.Advance(MetricLabelInterner.ResetInterval);
+        Assert.Equal(-1, interner.Intern("trigger", out _));
+        Assert.Equal(1, interner.Resets);
+
+        // Sent again: its old instance, claimed into the new pool (and the JSON path's string overload too).
+        Assert.True(Intern(interner, "live", out string again) >= 0);
+        Assert.Same(live, again);
+        Assert.True(interner.Intern(new string("live".AsSpan()), out string viaString) >= 0);
+        Assert.Same(live, viaString);
+        Assert.Equal(1, interner.Strings.ClaimedCount);                       // nothing else came over
+        Assert.False(interner.Strings.TryGet("dead".AsSpan(), out _, out _));
+
+        // An interval on, text new to both pools ends the bridge; what returns after that is new.
+        clock.Advance(MetricLabelInterner.ResetInterval);
+        Intern(interner, "brand-new", out _);
+        Intern(interner, "dead", out string deadAgain);
+        Assert.Equal("dead", deadAgain);
+        Assert.NotSame(dead, deadAgain);
+    }
+
+    /// <summary>
     /// NO SPLIT: a series ingested before the reset and after it — its label set built from the old
     /// epoch's strings, then from the new epoch's — is ONE series in storage and in the catalog. The
     /// two label sets are different instances holding different string instances, and equal by value,
@@ -129,8 +164,14 @@ public sealed class MetricLabelPoolResetTests : IAsyncLifetime
         Assert.Equal(1, interner.Resets);
 
         var after = Labels(interner, ("k8s.pod.name", "checkout-7d9f-abcde"), ("service.name", "checkout"));
-        Assert.NotSame(before, after);
-        Assert.NotSame(before.ValueAt(0), after.ValueAt(0));                   // re-interned: a new instance
+        // Carried over the bridge: its strings, and then the set itself from the old table — the very
+        // instance the stored key holds, so every later point matches it by reference.
+        for (int i = 0; i < before.Count; i++)
+        {
+            Assert.Same(before.KeyAt(i),   after.KeyAt(i));
+            Assert.Same(before.ValueAt(i), after.ValueAt(i));
+        }
+        Assert.Same(before, after);
         Assert.Equal(before, after);
         Assert.Equal(before.GetHashCode(), after.GetHashCode());
         Assert.Same(after, Labels(interner, ("service.name", "checkout"), ("k8s.pod.name", "checkout-7d9f-abcde")));   // cached again
