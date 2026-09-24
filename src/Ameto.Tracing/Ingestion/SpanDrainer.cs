@@ -44,7 +44,11 @@ internal sealed class SpanDrainer : IAsyncDisposable
     /// </summary>
     internal static readonly TimeSpan ArenaTrimInterval = TimeSpan.FromSeconds(30);
 
+    private readonly long _trimIntervalMs;
     private long _lastTrimTicks = Environment.TickCount64;
+
+    /// <summary>Test seam: the idle branch just asked the ring for a trim; the argument is what it gave back.</summary>
+    private readonly Action<long>? _afterArenaTrimForTest;
 
     // One drained run: the headers copied out of the ring, and the payloads kept apart from the
     // arena (larger than a chunk) — both reused batch after batch, both holding no reference to a
@@ -62,11 +66,19 @@ internal sealed class SpanDrainer : IAsyncDisposable
     }
 
     /// <param name="startLoop">False for a test that drives <see cref="DrainOnce"/> itself.</param>
-    internal SpanDrainer(SpanRingBuffer ring, TraceStorageEngine storage, ILogger<SpanDrainer> logger, bool startLoop)
+    /// <param name="arenaTrimInterval">Null: <see cref="ArenaTrimInterval"/>. A test passes zero to have the
+    /// first idle wake after a burst trim, instead of waiting out 30 s.</param>
+    /// <param name="afterArenaTrimForTest">Test seam, called with what each trim gave back. A constructor
+    /// argument, not a settable field: the loop starts here, and may reach its first trim before a
+    /// field set afterwards is seen.</param>
+    internal SpanDrainer(SpanRingBuffer ring, TraceStorageEngine storage, ILogger<SpanDrainer> logger, bool startLoop,
+                         TimeSpan? arenaTrimInterval = null, Action<long>? afterArenaTrimForTest = null)
     {
         _ring    = ring;
         _storage = storage;
         _logger  = logger;
+        _trimIntervalMs = (long)(arenaTrimInterval ?? ArenaTrimInterval).TotalMilliseconds;
+        _afterArenaTrimForTest = afterArenaTrimForTest;
         _drainTask = startLoop ? Task.Run(DrainLoopAsync) : Task.CompletedTask;
     }
 
@@ -161,12 +173,13 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private void MaybeTrimArena()
     {
         long now = Environment.TickCount64;
-        if (now - _lastTrimTicks < (long)ArenaTrimInterval.TotalMilliseconds) return;
+        if (now - _lastTrimTicks < _trimIntervalMs) return;
         _lastTrimTicks = now;
         if (_ring.ArenaHighWaterBytes <= (long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes) return;
         try
         {
             long given = _ring.TrimIdleArena();
+            _afterArenaTrimForTest?.Invoke(given);
             if (given > 0)
                 _logger.LogDebug("SpanDrainer: gave back {Bytes} B of span-ring arena after a burst", given);
         }

@@ -167,6 +167,8 @@ jobs:
 
           for t in A_burst_is_given_back_once_the_ring_is_idle_and_the_ring_still_works \
                    The_trim_never_gives_back_a_chunk_a_span_still_uses \
+                   A_trim_under_steady_single_batch_traffic_gives_the_burst_back \
+                   The_drainer_trims_the_arena_once_it_finds_the_ring_idle_after_a_burst \
                    A_producer_that_meets_a_trim_waits_for_it_instead_of_refusing \
                    A_payload_goes_through_the_ring_and_comes_back_byte_for_byte; do
             if ! grep -q "Passed Ameto.Storage.Tests.SpanRingRawTests.$t" ring-output.txt; then

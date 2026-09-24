@@ -192,6 +192,30 @@ public sealed class SpanRingRawTests : IDisposable
         return count;
     }
 
+    /// <summary>
+    /// A drained 32-chunk burst whose spans in the LOW chunks (below <see cref="SpanRingBuffer.LowWaterChunks"/>)
+    /// are still in use: the low free list is empty, so a producer that needs a chunk must go to the
+    /// high list — the one a trim takes. Returns the held spans, to be released by the caller.
+    /// </summary>
+    private SpanHeader[] DrainHoldingTheLowChunks(SpanRingBuffer ring)
+    {
+        var headers = new SpanHeader[64];
+        var apart   = new byte[]?[64];
+        EnqueueChunkSpans(ring, 0, 32);
+        ring.EndBatch();
+        int n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(32, n);
+
+        var held = new List<SpanHeader>();
+        for (int i = 0; i < n; i++)
+        {
+            if (headers[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes < SpanRingBuffer.LowWaterChunks) held.Add(headers[i]);
+            else ring.Release(headers.AsSpan(i, 1));
+        }
+        Assert.Equal(SpanRingBuffer.LowWaterChunks, held.Count);
+        return held.ToArray();
+    }
+
     /// <summary>A payload whose bytes say which span it is, so a chunk given back under a span shows.</summary>
     private static byte[] Stamp(int i)
     {
@@ -304,8 +328,100 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
-    /// A PRODUCER THAT MEETS A TRIM WAITS FOR IT, IT DOES NOT REFUSE. The trim holds the whole free
-    /// list; a producer that needs a chunk in that moment finds the list empty. Parked inside the
+    /// L2 — A TRIM UNDER STEADY TRAFFIC STILL GIVES THE BURST BACK. A 64-chunk burst, drained, frees
+    /// its chunks in order, so with one LIFO free list the chunk on top was the HIGHEST the burst
+    /// reached: steady single-batch traffic then lived in chunk 63, and a trim that met a batch open
+    /// there (as one will, under steady traffic) could give back nothing above it — the burst stayed
+    /// resident for as long as the traffic lasted. The low chunks are now popped first: the traffic
+    /// lives below the low-water mark, and the trim that meets its open batch gives back 16..63.
+    /// </summary>
+    [Fact]
+    public void A_trim_under_steady_single_batch_traffic_gives_the_burst_back()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+
+        EnqueueChunkSpans(ring, 0, 64);
+        ring.EndBatch();
+        int n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(64, n);
+        ring.Release(headers.AsSpan(0, n));                               // the burst, drained in order
+
+        for (int round = 0; round < 100; round++)                         // steady traffic, drained as it comes
+        {
+            Enqueue(ring, 100 + round);
+            ring.EndBatch();
+            Assert.Equal(1, ring.TryDequeueMany(headers, apart));
+            ring.Release(headers.AsSpan(0, 1));
+        }
+
+        // The trim meets the traffic mid-batch: a request is being parsed, its span in the ring.
+        Enqueue(ring, 1_000);
+        Assert.Equal(1, ring.TryDequeueMany(headers, apart));
+        int inUse = headers[0].PayloadArenaOffset / SpanRingBuffer.ChunkBytes;
+
+        long given = ring.TrimIdleArena();
+        _out.WriteLine($"steady traffic lives in chunk {inUse}; a trim meeting its open batch gave back {given:N0} B, high water now {ring.ArenaHighWaterBytes:N0} B");
+        Assert.True(inUse < SpanRingBuffer.LowWaterChunks, $"steady traffic after a burst lives in chunk {inUse}, above the low-water mark");
+        if (TrimGivesBack)
+        {
+            Assert.True(given >= (64 - SpanRingBuffer.LowWaterChunks) * (long)SpanRingBuffer.ChunkBytes - Environment.SystemPageSize,
+                $"a trim under steady traffic gave back {given:N0} B of a 64-chunk burst");
+            Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        }
+
+        var batch = ring.Drained(headers.AsSpan(0, 1), apart.AsSpan(0, 1), new ServiceIndexCache());
+        Assert.True(Blob("/r/1000", "GET").AsSpan().SequenceEqual(batch.Attributes(0)), "the span in use did not read back whole");
+        ring.EndBatch();
+        ring.Release(headers.AsSpan(0, 1));
+    }
+
+    /// <summary>
+    /// THE DRAINER TRIMS THE ARENA WHEN IT FINDS THE RING IDLE — the wiring, not the trim. A 64-chunk
+    /// burst is waiting when a real drain loop starts (trim interval zero, so the first idle wake
+    /// qualifies): the loop drains it into the engine, finds the ring empty, and must call the trim
+    /// (seam, with what it gave back) — and the ring's high-water mark must be back at the low-water mark.
+    /// </summary>
+    [Fact]
+    public async Task The_drainer_trims_the_arena_once_it_finds_the_ring_idle_after_a_burst()
+    {
+        var pools = new SpanStringPools();
+        using var ring   = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024, pools);
+        using var engine = new TraceStorageEngine(Dir("trim"), NullLogger<TraceStorageEngine>.Instance,
+                                                  false, true, null, pools);
+
+        string wide = new('x', 39_000);                                    // one span per chunk
+        for (int i = 0; i < 64; i++)
+        {
+            var h = Fields(i);
+            Assert.True(ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Blob(wide, "GET")));
+        }
+        ring.EndBatch();
+        Assert.Equal(64L * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+
+        var trimmed = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drainer = new SpanDrainer(ring, engine, NullLogger<SpanDrainer>.Instance, startLoop: true,
+                                      arenaTrimInterval: TimeSpan.Zero,
+                                      afterArenaTrimForTest: given => trimmed.TrySetResult(given));
+        try
+        {
+            long given = await trimmed.Task.WaitAsync(HangGuard);
+            _out.WriteLine($"the drain loop's first idle wake trimmed {given:N0} B; high water now {ring.ArenaHighWaterBytes:N0} B");
+            Assert.Equal(64, engine.HotSpansForTest.Count);
+            if (TrimGivesBack)
+            {
+                Assert.True(given >= (64 - SpanRingBuffer.LowWaterChunks) * (long)SpanRingBuffer.ChunkBytes - Environment.SystemPageSize);
+                Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+            }
+        }
+        finally { await drainer.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// A PRODUCER THAT MEETS A TRIM WAITS FOR IT, IT DOES NOT REFUSE. The trim holds the whole high
+    /// free list; with every low chunk in use, a producer that needs a chunk in that moment finds
+    /// both lists empty. Parked inside the
     /// trim (seam), a producer on another thread asks for a chunk: it must be seen WAITING, and once
     /// the trim is done its span must be taken — not counted as refused for want of arena.
     /// </summary>
@@ -315,9 +431,7 @@ public sealed class SpanRingRawTests : IDisposable
         using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
         var headers = new SpanHeader[128];
         var apart   = new byte[]?[128];
-        EnqueueChunkSpans(ring, 0, 32);
-        ring.EndBatch();
-        ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+        var held = DrainHoldingTheLowChunks(ring);                       // a producer must go to the high list
 
         var waiting = new TaskCompletionSource();
         ring._onWaitingForTrimForTest = () => waiting.TrySetResult();
@@ -344,6 +458,7 @@ public sealed class SpanRingRawTests : IDisposable
         Assert.Equal(0, ring.RefusedNoArena);
         Assert.Equal(1, ring.TryDequeueMany(headers, apart));
         ring.Release(headers.AsSpan(0, 1));
+        ring.Release(held);
     }
 
     /// <summary>
@@ -361,9 +476,7 @@ public sealed class SpanRingRawTests : IDisposable
         using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
         var headers = new SpanHeader[128];
         var apart   = new byte[]?[128];
-        EnqueueChunkSpans(ring, 0, 32);
-        ring.EndBatch();
-        ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+        var held = DrainHoldingTheLowChunks(ring);                       // a producer must go to the high list
 
         long waits = 0, duringHold = 0;
         var waiting = new TaskCompletionSource();
@@ -393,6 +506,7 @@ public sealed class SpanRingRawTests : IDisposable
         Assert.True(duringHold < 2_000,
             $"the producer went round its wait {duringHold:N0} times in 200 ms: it spins instead of sleeping");
         ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+        ring.Release(held);
     }
 
     /// <summary>

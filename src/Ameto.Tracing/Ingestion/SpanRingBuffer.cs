@@ -25,8 +25,9 @@ namespace Ameto.Tracing.Ingestion;
 ///
 /// <para><b>The arena</b> is a <see cref="SlabArena"/> — reserved, committed as it is reached, so
 /// residency is the deepest the backlog has ever been — cut into <see cref="ChunkBytes"/> chunks
-/// handed out LIFO by a versioned (ABA-safe) Treiber stack. A producer thread packs consecutive
-/// spans of its batch into ITS chunk with a plain bump pointer (no CAS per span), and each chunk
+/// handed out LIFO by two versioned (ABA-safe) Treiber stacks — the first
+/// <see cref="LowWaterChunks"/> chunks, always popped first, and the rest (why two: see
+/// <c>AcquireChunk</c>). A producer thread packs consecutive spans of its batch into ITS chunk with a plain bump pointer (no CAS per span), and each chunk
 /// is reference-counted: +1 while a producer holds it, +1 per span in it; the consumer drops a
 /// span's reference when it releases the drained batch, and the last reference returns the chunk.
 /// A drainer that keeps up therefore touches one or two chunks, reused over and over. A payload
@@ -83,7 +84,13 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     private readonly int         _capacity;
     private readonly long        _mask;
     private readonly Slot*       _slots;
-    private readonly PaddedLong* _cursors;       // [0] enqueue, [1] dequeue, [2] free-chunk head (version:hi32 | index:lo32)
+    private readonly PaddedLong* _cursors;       // [0] enqueue, [1] dequeue, [2] low and [3] high free-chunk heads (version:hi32 | index:lo32)
+
+    /// <summary>The free list of the chunks below <see cref="LowWaterChunks"/> — always popped first.</summary>
+    private const int LowFree  = 2;
+
+    /// <summary>The free list of every chunk above them — the only one the trim takes.</summary>
+    private const int HighFree = 3;
 
     private readonly SlabArena   _arena;
     private readonly byte*       _base;
@@ -162,16 +169,18 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         // Zeroed IS the initial state (relative sequences), so neither array is walked here and no
         // page of either is touched until a span reaches it.
         _slots   = (Slot*)NativeMemory.AllocZeroed((nuint)capacity, (nuint)sizeof(Slot));
-        _cursors = (PaddedLong*)NativeMemory.AllocZeroed(3, (nuint)sizeof(PaddedLong));
+        _cursors = (PaddedLong*)NativeMemory.AllocZeroed(4, (nuint)sizeof(PaddedLong));
 
         _arena = SlabArena.Create((nuint)((long)_chunkCount * ChunkBytes), (nuint)CommitChunkBytes);
         _base  = _arena.Base;
 
+        // Two chains, each in ascending order: 0 .. LowWaterChunks-1, and LowWaterChunks .. the end.
+        int low = Math.Min(LowWaterChunks, _chunkCount);
         _chunkNext = (int*)NativeMemory.Alloc((nuint)_chunkCount, sizeof(int));
-        for (int i = 0; i < _chunkCount - 1; i++) _chunkNext[i] = i + 1;
-        _chunkNext[_chunkCount - 1] = -1;
+        for (int i = 0; i < _chunkCount; i++) _chunkNext[i] = i + 1 == low || i + 1 == _chunkCount ? -1 : i + 1;
         _chunkRefs = (int*)NativeMemory.AllocZeroed((nuint)_chunkCount, sizeof(int));
-        // Free head: chunk 0, version 0 — the zeroed value.
+        // Low head: chunk 0, version 0 — the zeroed value. High head: the first chunk above, or empty.
+        _cursors[HighFree].Value = low < _chunkCount ? low : 0xFFFF_FFFFL;
 
         _parked        = new byte[]?[_chunkCount];
         _parkFree      = new int[_chunkCount];
@@ -492,38 +501,64 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         lock (_parkLock) _parkFree[_parkFreeCount++] = park;
     }
 
-    // ── Chunks (lock-free Treiber stack, ABA-safe via a versioned head) ─────────
+    // ── Chunks (two lock-free Treiber stacks, ABA-safe via versioned heads) ──────
+    //
+    // WHY TWO (review L2). One LIFO list hands the LAST chunk freed out first, and a drained burst
+    // frees its chunks in order — so the chunk on top afterwards is the HIGHEST one the burst
+    // reached. Steady traffic then lives up there: each batch pops it, each drain pushes it back.
+    // The trim can only give back a run of free chunks reaching the top, and a batch open at that
+    // moment holds the top chunk — so under steady traffic the trim gave back nothing, for as long
+    // as the traffic lasted, and the burst's high-water mark was the resting level again.
+    //
+    // The chunks below LowWaterChunks — never given back anyway — are now a list of their own, and
+    // a producer pops from it first. Steady traffic that fits in 1 MB never leaves it, so the high
+    // list lies whole in the free list and the trim takes all of it; traffic deeper than that works
+    // in the high list LIFO as before, and the trim gives back what lies above its deepest chunk.
+
+    /// <summary>What <see cref="TryPop"/> found instead of a chunk.</summary>
+    private const int PopEmpty = -1, PopNoCommit = -2;
 
     /// <summary>
-    /// Pops a free chunk whose pages are writable, or -1. The commit happens BEFORE the pop, so a
-    /// chunk that cannot be committed never leaves the free list (the log ring's rule, for the
-    /// reason given there): LIFO reuse keeps every committed free chunk above every uncommitted one.
+    /// Pops a free chunk whose pages are writable, or -1 — the low list first, then the high one.
+    /// The commit happens BEFORE the pop, so a chunk that cannot be committed never leaves the free
+    /// list (the log ring's rule, for the reason given there): LIFO reuse keeps every committed free
+    /// chunk above every uncommitted one. The low list is committed in one step on first use, and a
+    /// failed commit there means the high list's chunks, higher still, cannot be committed either.
     /// </summary>
     private int AcquireChunk()
     {
-        ref long headRef = ref _cursors[2].Value;
         var spin = new SpinWait();
+        while (true)
+        {
+            int c = TryPop(ref _cursors[LowFree].Value);
+            if (c == PopEmpty) c = TryPop(ref _cursors[HighFree].Value);
+            if (c != PopEmpty) return c == PopNoCommit ? -1 : c;
+
+            // Both lists empty. A trim holds the whole high list for a moment (microseconds, plus
+            // one decommit call): an empty list then means "wait", not "full".
+            if (Volatile.Read(ref _trimming) == 0) return -1;
+
+            // Wait, never refuse — with SpinWait's DEFAULT escalation (spin, then yield, then
+            // Sleep(1)), not a pure spin: if the drainer is descheduled mid-trim, a pure spin burns
+            // every waiting producer's CPU quota in a CPU-limited container for as long as that
+            // lasts (review L3).
+            _onWaitingForTrimForTest?.Invoke();
+            spin.SpinOnce();
+        }
+    }
+
+    private int TryPop(ref long headRef)
+    {
         while (true)
         {
             long head = Volatile.Read(ref headRef);
             int  idx  = unchecked((int)head);
-            if (idx < 0)
-            {
-                // The trim holds the whole free list for a moment (microseconds, plus one
-                // decommit call): an empty list then means "wait", not "full". Wait, never refuse — and
-                // with SpinWait's DEFAULT escalation (spin, then yield, then Sleep(1)), not a pure spin:
-                // if the drainer is descheduled mid-trim, a pure spin burns every waiting producer's CPU
-                // quota in a CPU-limited container for as long as that lasts (review L3).
-                if (Volatile.Read(ref _trimming) == 0) return -1;
-                _onWaitingForTrimForTest?.Invoke();
-                spin.SpinOnce();
-                continue;
-            }
+            if (idx < 0) return PopEmpty;
 
             if (!_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * ChunkBytes)))
             {
                 if (Volatile.Read(ref headRef) != head) continue;
-                return -1;
+                return PopNoCommit;
             }
 
             int  next    = _chunkNext[idx];
@@ -549,33 +584,35 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// <summary>What the trim leaves committed: one 1 MB commit step — a drainer that keeps up works in one or two chunks.</summary>
     internal const int LowWaterChunks = 16;
 
-    private int             _trimming;
+    private int             _trimming;    // set while a trim holds the high free list
     private readonly byte[] _trimTaken;   // one mark per chunk: "in the free list the trim holds"
 
-    /// <summary>Test seam: the trim holds the whole free list, before it has decommitted anything.</summary>
+    /// <summary>Test seam: the trim holds the whole high free list, before it has decommitted anything.</summary>
     internal Action? _whileTrimmingForTest;
 
-    /// <summary>Test seam: a producer found the free list empty because a trim holds it, and is waiting.</summary>
+    /// <summary>Test seam: a producer found both free lists empty while a trim holds the high one, and is waiting.</summary>
     internal Action? _onWaitingForTrimForTest;
 
     /// <summary>
     /// Gives back the arena above the highest chunk still in use (and above <see cref="LowWaterChunks"/>)
     /// — every chunk it can PROVE is free. Returns the bytes given back. Single caller: the drainer.
     ///
-    /// <para><b>Safe against producers without stopping them.</b> The trim first takes the WHOLE free
-    /// list with one CAS on the versioned head, so no chunk it examines can be popped under it — a
-    /// pop already in flight fails its own CAS and retries, and a producer that finds the list empty
-    /// while <c>_trimming</c> is set waits (spin, yield, then sleep) instead of refusing. Only chunks in the list it took are
-    /// candidates, and only a contiguous run of them reaching the top of the committed range is given
-    /// back, so a chunk a producer holds, or one a drained span still references, stops the run below
-    /// it. The chunks go back on the list afterwards — the ones kept first, lowest index on top — and
-    /// a chunk above the new committed mark is committed again by <c>AcquireChunk</c>'s
-    /// commit-before-pop, exactly as a never-used one always was.</para>
+    /// <para><b>Safe against producers without stopping them.</b> The trim first takes the WHOLE high
+    /// free list (every free chunk at or above <see cref="LowWaterChunks"/>) with one CAS on the
+    /// versioned head, so no chunk it examines can be popped under it — a pop already in flight fails
+    /// its own CAS and retries. Producers keep popping the low list meanwhile, and one that finds
+    /// both lists empty while the trim holds the high one waits (spin, yield, then sleep) instead of
+    /// refusing. Only chunks in the list it took are candidates, and only a contiguous run of them
+    /// reaching the top of the committed range is given back, so a chunk a producer holds, or one a
+    /// drained span still references, stops the run below it. The chunks go back on the high list
+    /// afterwards — the ones kept first, lowest index on top — and a chunk above the new committed
+    /// mark is committed again by <c>AcquireChunk</c>'s commit-before-pop, exactly as a never-used
+    /// one always was.</para>
     /// </summary>
     public long TrimIdleArena()
     {
         if (Volatile.Read(ref _disposed) != 0) return 0;
-        ref long headRef = ref _cursors[2].Value;
+        ref long headRef = ref _cursors[HighFree].Value;
 
         Volatile.Write(ref _trimming, 1);
         long taken;
@@ -670,11 +707,11 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         }
     }
 
-    /// <summary>Drops one reference; the last one returns the chunk to the free list.</summary>
+    /// <summary>Drops one reference; the last one returns the chunk to its free list — low or high by its index.</summary>
     private void ReleaseChunk(int idx)
     {
         if (Interlocked.Decrement(ref _chunkRefs[idx]) != 0) return;
-        ref long headRef = ref _cursors[2].Value;
+        ref long headRef = ref _cursors[idx < LowWaterChunks ? LowFree : HighFree].Value;
         while (true)
         {
             long head = Volatile.Read(ref headRef);
