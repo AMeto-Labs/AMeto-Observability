@@ -367,12 +367,17 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
     /// <summary>
     /// A catalog scan that has read a source before the merge commits must not register it after.
-    /// The scan registers a file it read unless a delete recorded the path for it or parked it,
-    /// and the merge's sources no longer go through <c>DeleteSegmentAsync</c>: its commit has to
-    /// record them itself, under the same gate, or the scan puts a source back beside the output
-    /// — an entry for a file the commit unlinks, counted on top of the output that holds its
-    /// events. The scan is held where it has read and closed the first source and not yet taken
-    /// the gate; the whole merge runs there; the scan then finishes.
+    /// The scan registers a file it read unless its path is parked or recorded for it, and the
+    /// merge's sources no longer go through <c>DeleteSegmentAsync</c>, so the merge has to do one
+    /// of the two itself, or the scan puts a source back beside the output — an entry for a file
+    /// the merge unlinks, counted on top of the output that holds its events. Three things do it,
+    /// any one enough here: the commit parks each source in its hold, the unlink records the path
+    /// before the park goes (<c>TryCompletePendingSegmentDelete</c>), and the commit records it
+    /// too (<c>ForgetRemovedSegment</c>) — the last redundant with the first two. So this pins the
+    /// contract, not the commit's own record: it goes red when the commit neither records nor
+    /// parks and unlinks directly, as a <c>DeleteSegmentAsync</c> without its record would. The
+    /// scan is held where it has read and closed the first source and not yet taken the gate;
+    /// the whole merge runs there; the scan then finishes.
     /// </summary>
     [Fact]
     public async Task ACatalogScanRunningAcrossTheCommit_RegistersNoSource()
