@@ -443,13 +443,13 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // possible. The saturating cast parks the counter at uint.MaxValue instead, where the
         // next registration reuses that index — a log with 4 billion live series has run out of
         // index space by any route, and reuse at the ceiling beats reuse from zero.
+        //
+        // THE INDICES ONLY. Seeding needs the largest index of every record, dead or alive, and
+        // nothing about their text: the walk reads each record's head and steps over its body, so
+        // opening the log interns nothing (see LoadPool for why that matters).
         if (_writeOffset > 0)
         {
-            ulong poolMaxPlusOne = 0;
-            var   pool           = LoadPool(out long cleanPoolEnd);
-            foreach (var index in pool.Keys)
-                if (index + 1UL > poolMaxPlusOne)
-                    poolMaxPlusOne = index + 1UL;
+            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne);
 
             _nextSeriesIndex = (uint)Math.Min(uint.MaxValue,
                                               Math.Max(poolMaxPlusOne, _survivorSeriesSeed));
@@ -1211,23 +1211,24 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             if (_ptr is null) return result;
 
-            var pool = LoadPool();
-            long pos = 0;
             long end = _writeOffset;
 
-            while (pos + EntryHeaderSize <= end)
+            // Two passes over the same entries, stepped by the same stride so they stop at the same
+            // place: the first names the series a surviving entry references, and only those are
+            // read out of the pool — see LoadPool.
+            var referenced = new HashSet<uint>();
+            for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
+            {
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+                if (eh.Generation > _committedGeneration) referenced.Add(eh.SeriesIndex);
+            }
+
+            var pool = LoadPool(referenced);
+
+            for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
                 byte* src = _ptr + FileHeaderSize + pos;
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(src);
-
-                long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
-                if (total <= 0 || pos + total > end) break;   // torn tail
-                if (eh.Generation == 0) break;                // end of real data
-                // No append can stamp a generation far above the header counter — such an
-                // entry is torn/corrupt, and its fields are garbage: stop instead of
-                // replaying them into the hot tier (from where a flush writes them into
-                // permanent files). Margin semantics: see Compact.
-                if (eh.Generation > _generation + GenerationSanityMargin) break;
 
                 if (eh.Generation > _committedGeneration)
                 {
@@ -1253,26 +1254,107 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                     }
                     else unresolved++;
                 }
-
-                pos += total;
             }
         }
 
         return result;
     }
 
+    /// <summary>
+    /// The replay's stride: the size of the complete entry at <paramref name="pos"/>, or 0 where
+    /// the real data ends before <paramref name="end"/>. Both passes of <see cref="ReadAll"/> step
+    /// with it, so the pass that decides which series to load and the pass that replays them
+    /// cannot disagree about which entries exist. Caller holds the lock.
+    /// </summary>
+    private long ReplayStrideLocked(long pos, long end)
+    {
+        if (pos + EntryHeaderSize > end) return 0;
+        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+
+        long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
+        if (total <= 0 || pos + total > end) return 0;   // torn tail
+        if (eh.Generation == 0) return 0;                // end of real data
+        // No append can stamp a generation far above the header counter — such an
+        // entry is torn/corrupt, and its fields are garbage: stop instead of
+        // replaying them into the hot tier (from where a flush writes them into
+        // permanent files). Margin semantics: see Compact.
+        if (eh.Generation > _generation + GenerationSanityMargin) return 0;
+        return total;
+    }
+
     private readonly record struct PoolEntry(
         string Name, MetricKind Kind, string Unit, LabelSet Labels, double[]? Bounds);
 
     /// <summary>
-    /// Reads the companion pool. Later records win for a given index, which is what makes a
-    /// reset that failed to truncate the file harmless.
+    /// The series <paramref name="referenced"/> names, read out of the companion pool. Later
+    /// records win for a given index, which is what makes a reset that failed to truncate the
+    /// file harmless.
+    ///
+    /// <para><b>ONLY WHAT A SURVIVING ENTRY REFERENCES IS INTERNED.</b> The replay goes through
+    /// <see cref="Interner"/> — <see cref="MetricLabelInterner.Shared"/>, which holds 16 384
+    /// strings for the life of the process and never evicts — so a replayed series holds the very
+    /// strings and label set the live path builds for it. But the pool is truncated only when a
+    /// commit empties the log or an empty log is opened, so after a crash or an OOM kill it holds
+    /// every series registered since the log was last empty: under continuous ingest, the whole
+    /// previous run's, churned pod and container ids included. Interning every record filled the
+    /// shared pool at boot with dead values, and every series started after the restart was then
+    /// ingested at the uninterned cost for the life of the process — issue #88's failure mode, the
+    /// one WP7 removed from <c>MetricReader</c>. A record no surviving entry references is not
+    /// decoded at all, because nothing reads it: the replay resolves only referenced indices, and
+    /// the seeding in <see cref="OpenOrCreate"/> needs only the indices, which the walk reads from
+    /// the record heads.</para>
+    ///
+    /// <para>Chosen over rewriting the pool down to the referenced records at open: the same boot,
+    /// and no second file to write, fsync and swap under a log that is mid-recovery. The dead
+    /// records stay in the file until the next commit that empties the log truncates it, as they
+    /// always did.</para>
     /// </summary>
-    private Dictionary<uint, PoolEntry> LoadPool() => LoadPool(out _);
+    private Dictionary<uint, PoolEntry> LoadPool(HashSet<uint> referenced)
+    {
+        var bodies = ReadPoolRecords(referenced, out _, out _);
+        var map    = new Dictionary<uint, PoolEntry>(bodies.Count);
+        var interner = Interner;
+        foreach (var (index, body) in bodies)
+            map[index] = DecodePoolRecord(body, interner);
+        return map;
+    }
 
     /// <summary>
-    /// <see cref="LoadPool()"/>, and also reports where the clean records stop:
-    /// <paramref name="cleanEnd"/> is the offset just past the LAST record that parsed whole,
+    /// Through the same interner the OTLP parsers use, so a replayed series holds the very strings
+    /// — and, when they are all pooled, the very label set — that the live path builds for it: its
+    /// SeriesKey then matches the next live point by reference, and the process does not keep a
+    /// second copy of every label.
+    /// </summary>
+    private static PoolEntry DecodePoolRecord(byte[] body, MetricLabelInterner interner)
+    {
+        var r = new SpanCursor(body);
+        var kind = (MetricKind)r.ReadByte();
+        string name = r.ReadString(interner, out _);
+        string unit = r.ReadString(interner, out _);
+
+        int labelCount = r.ReadUInt16();
+        var kv  = new string[labelCount * 2];
+        var ids = new int[labelCount * 2];
+        for (int i = 0; i < kv.Length; i++)
+            kv[i] = r.ReadString(interner, out ids[i]);
+
+        int boundsLen = r.ReadUInt16();
+        double[]? bounds = null;
+        if (boundsLen > 0)
+        {
+            bounds = new double[boundsLen];
+            for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
+        }
+
+        return new PoolEntry(name, kind, unit, interner.GetLabelSet(kv, ids), bounds);
+    }
+
+    /// <summary>
+    /// Walks the companion pool's records: the body of the LAST record of each index in
+    /// <paramref name="keep"/> comes back undecoded, and every other body is stepped over unread
+    /// (<paramref name="keep"/> null: all of them). Also reports <paramref name="indexCeiling"/>,
+    /// one past the largest index of any record that parsed whole, and where the clean records
+    /// stop: <paramref name="cleanEnd"/> is the offset just past the LAST record that parsed whole,
     /// which is 0 for a pool whose very first record is torn and the file length for an intact
     /// one. The loop already stops at a torn head or body; this only says WHERE it stopped, so
     /// that <see cref="OpenOrCreate"/> can append the next record at that boundary instead of
@@ -1280,16 +1362,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// width of the garbage, which breaks pool parsing for every series registered afterwards,
     /// not just the one that was lost.
     /// </summary>
-    private Dictionary<uint, PoolEntry> LoadPool(out long cleanEnd)
+    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling)
     {
-        var map = new Dictionary<uint, PoolEntry>();
-        cleanEnd = 0;
-        if (!File.Exists(_poolPath)) return map;
+        var bodies = new Dictionary<uint, byte[]>();
+        cleanEnd     = 0;
+        indexCeiling = 0;
+        if (!File.Exists(_poolPath)) return bodies;
 
         try
         {
             _poolStream?.Flush();
             using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long length = fs.Length;
             Span<byte> head = stackalloc byte[8];
 
             // ReadAtLeast/ReadExactly, never a bare Read: Stream.Read may legally return fewer
@@ -1303,41 +1387,28 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 uint len   = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
                 if (len == 0 || len > 8 * 1024 * 1024) break;    // torn or bogus record
 
-                var body = new byte[len];
-                try { fs.ReadExactly(body); }
-                catch (EndOfStreamException) { break; }          // genuinely truncated tail
-
-                // Through the same interner the OTLP parsers use, so a replayed series holds the
-                // very strings — and, when they are all pooled, the very label set — that the
-                // live path builds for it: its SeriesKey then matches the next live point by
-                // reference, and the process does not keep a second copy of every label.
-                var interner = Interner;
-                var r = new SpanCursor(body);
-                var kind = (MetricKind)r.ReadByte();
-                string name = r.ReadString(interner, out _);
-                string unit = r.ReadString(interner, out _);
-
-                int labelCount = r.ReadUInt16();
-                var kv  = new string[labelCount * 2];
-                var ids = new int[labelCount * 2];
-                for (int i = 0; i < kv.Length; i++)
-                    kv[i] = r.ReadString(interner, out ids[i]);
-
-                int boundsLen = r.ReadUInt16();
-                double[]? bounds = null;
-                if (boundsLen > 0)
+                if (keep is not null && keep.Contains(index))
                 {
-                    bounds = new double[boundsLen];
-                    for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
+                    var body = new byte[len];
+                    try { fs.ReadExactly(body); }
+                    catch (EndOfStreamException) { break; }      // genuinely truncated tail
+                    bodies[index] = body;                        // later records win
+                }
+                else
+                {
+                    // Stepped over, not read — but a body that runs past the end of the file is the
+                    // same truncated tail the read above would have thrown on.
+                    if (len > length - fs.Position) break;
+                    fs.Seek(len, SeekOrigin.Current);
                 }
 
-                map[index]  = new PoolEntry(name, kind, unit, interner.GetLabelSet(kv, ids), bounds);
-                cleanEnd    = fs.Position;   // this record parsed whole; the boundary is here
+                if (index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                cleanEnd = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
         catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
 
-        return map;
+        return bodies;
     }
 
     // ── Grow ─────────────────────────────────────────────────────────────────
