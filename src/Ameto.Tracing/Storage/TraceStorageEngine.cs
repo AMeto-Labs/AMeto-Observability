@@ -139,6 +139,36 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal bool WritesClosedForTest => Volatile.Read(ref _writesClosed) != 0;
 
     /// <summary>
+    /// Whether a read issued now gets a TRUE answer (#95) — the question every read path's
+    /// <see cref="TryEnterEngine"/> already asks, put where a caller that ACTS on the answer can ask
+    /// it too. A closed engine answers every read with an empty result, which is the right answer
+    /// for a request arriving late and the wrong one for the alert evaluator, which reads it as 0.
+    ///
+    /// <para><see cref="QueryAvailability.Closed"/> from the instant the teardown shuts the door
+    /// (<see cref="_writesClosed"/>) — the same instant from which <see cref="TryEnterEngine"/>
+    /// refuses. Not earlier: the final flush runs BEFORE that, with every read still whole.</para>
+    ///
+    /// <para><see cref="QueryAvailability.Loading"/> until the background cold scan
+    /// (<see cref="LoadColdSegments"/>) has published what it found — reads before that see the hot
+    /// tier and nothing on disk. The answer is published before this flips, so a caller that saw
+    /// Available and then reads cannot miss it. A scan that fails still ends the state: the
+    /// segments it could not reach stay missing for the life of the process either way, and
+    /// holding "loading" for ever would only stop every trace alert from ever being evaluated.</para>
+    ///
+    /// <para>Two volatile reads, no lock, no allocation — cheap enough to ask on every request.</para>
+    /// </summary>
+    public QueryAvailability Availability =>
+        Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted        ? QueryAvailability.Loading
+      :                                        QueryAvailability.Available;
+
+    /// <summary>Completed when the background cold scan has ended, however it ended. See <see cref="Availability"/>.</summary>
+    private readonly TaskCompletionSource _coldLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Test hook: completes once <see cref="LoadColdSegments"/> has ended.</summary>
+    internal Task ColdLoadCompleted => _coldLoaded.Task;
+
+    /// <summary>
     /// Test hook: true once the teardown has actually freed the lock, the index and the log.
     /// FALSE is the interesting value — it is how a test sees "left frozen" rather than
     /// inferring it from a file handle the OS may or may not have released yet.
@@ -2806,9 +2836,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     internal void LoadColdSegments()
     {
+        // Refused only by a teardown that has begun, and a closed engine answers Closed whatever
+        // this flag says — so the early return need not end the loading state.
         if (!TryBeginHeavyPhase()) return;
         try { LoadColdSegmentsCore(); }
-        finally { EndHeavyPhase(); }
+        finally
+        {
+            EndHeavyPhase();
+            // AFTER the core has swapped the discovered segments into _coldSegments (under the
+            // write lock, which publishes them): Availability reads Available only once a reader
+            // taking its snapshot next would see them.
+            _coldLoaded.TrySetResult();
+        }
     }
 
     private void LoadColdSegmentsCore()

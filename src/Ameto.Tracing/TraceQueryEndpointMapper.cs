@@ -38,6 +38,7 @@ public static class TraceQueryEndpointMapper
 
             const int Buckets = 20;
             var volume = await summaryProvider.GetTraceVolumeAsync(from, to, Buckets, ctx.RequestAborted);
+            if (TraceStoreGate.RefuseIfClosed(ctx, statsProvider, summaryProvider) is { } closed) { await closed; return; }
 
             double windowSeconds = Math.Max(1, (to - from).TotalSeconds);
 
@@ -67,6 +68,7 @@ public static class TraceQueryEndpointMapper
 
             var page = await FetchTracePageAsync(
                 summaryProvider, filter, from, to, limit, ctx.RequestAborted);
+            if (TraceStoreGate.RefuseIfClosed(ctx, summaryProvider) is { } closed) { await closed; return; }
 
             await ctx.Response.WriteAsJsonAsync(page.Rows);
         });
@@ -80,6 +82,7 @@ public static class TraceQueryEndpointMapper
             string? service   = NullIfEmpty(ctx.Request.Query["service"]);
 
             var allStats = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
+            if (TraceStoreGate.RefuseIfClosed(ctx, statsProvider) is { } closed) { await closed; return; }
 
             var result = allStats
                 .Where(s => service is null || s.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase))
@@ -106,7 +109,8 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/compare?a={traceId}&b={traceId}
-        group.MapGet("/api/traces/compare", static (HttpContext ctx) => WriteCompareAsync(ctx));
+        group.MapGet("/api/traces/compare", static (HttpContext ctx) =>
+            TraceStoreGate.RefuseIfClosed<ITraceProvider>(ctx) ?? WriteCompareAsync(ctx));
 
         // GET /api/traces/service-graph?from=&to=
         group.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
@@ -114,6 +118,7 @@ public static class TraceQueryEndpointMapper
             var graphProvider = ctx.RequestServices.GetRequiredService<IServiceGraphProvider>();
             var (from, to)    = ParseFromTo(ctx);
             var graph = await graphProvider.GetServiceGraphAsync(from, to, ctx.RequestAborted);
+            if (TraceStoreGate.RefuseIfClosed(ctx, graphProvider) is { } closed) { await closed; return; }
             await ctx.Response.WriteAsJsonAsync(graph);
         });
 
@@ -147,6 +152,7 @@ public static class TraceQueryEndpointMapper
 
             var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
             var page     = await TraceQLExecutor.ExecuteAsync(provider, predicate, from, to, limit, ctx.RequestAborted);
+            if (TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
             await ctx.Response.WriteAsJsonAsync(page.Rows);
         });
 
@@ -162,6 +168,7 @@ public static class TraceQueryEndpointMapper
             var (from, to) = ParseFromTo(ctx);
             int max        = ParseInt(ctx.Request.Query["max"], 2000, 1, 5000);
             string ql      = ctx.Request.Query["ql"].ToString();
+            if (TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
 
             await BeginEventStreamAsync(ctx);
             using var sse = new SseJsonWriter(ctx.Response.Body);
@@ -209,6 +216,7 @@ public static class TraceQueryEndpointMapper
             var (from, to)      = ParseFromTo(ctx);
             var filter          = ParseTraceFilter(ctx);
             int max             = ParseInt(ctx.Request.Query["max"], 2000, 1, 5000);
+            if (TraceStoreGate.RefuseIfClosed(ctx, summaryProvider) is { } closed) { await closed; return; }
 
             await BeginEventStreamAsync(ctx);
             using var sse = new SseJsonWriter(ctx.Response.Body);
@@ -230,7 +238,8 @@ public static class TraceQueryEndpointMapper
 
         // GET /api/traces/{traceId}/flamegraph
         group.MapGet("/api/traces/{traceId}/flamegraph",
-            static (HttpContext ctx, string traceId) => WriteFlamegraphAsync(ctx, traceId));
+            static (HttpContext ctx, string traceId) =>
+                TraceStoreGate.RefuseIfClosed<ITraceProvider>(ctx) ?? WriteFlamegraphAsync(ctx, traceId));
 
         // GET /api/traces/index — what the trace-id index is doing, and whether it is finished.
         //
@@ -248,7 +257,8 @@ public static class TraceQueryEndpointMapper
 
         // GET /api/traces/{traceId}
         group.MapGet("/api/traces/{traceId}",
-            static (HttpContext ctx, string traceId) => WriteTraceDetailAsync(ctx, traceId));
+            static (HttpContext ctx, string traceId) =>
+                TraceStoreGate.RefuseIfClosed<ITraceProvider>(ctx) ?? WriteTraceDetailAsync(ctx, traceId));
     }
 
     // ── Trace detail and flame graph ──────────────────────────────────────────
