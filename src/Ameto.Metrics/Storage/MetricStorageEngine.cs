@@ -2682,12 +2682,19 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         try
         {
             // Sized to the buckets the span can hold, when the ends say so; never above the point
-            // count, which is the most buckets there can be.
+            // count, which is the most buckets there can be. The span is taken UNSIGNED: two keys
+            // more than long.MaxValue apart (an OTLP timestamp with its top bit set is a long at or
+            // below -7.5e18, and ingest refuses only future ones) wrap a signed difference negative,
+            // and a negative capacity threw where GroupBy had answered. last >= first, so the
+            // unsigned difference is the true one.
             long firstKey = all[0].TimestampUnixNano / bucketNanos * bucketNanos;
             long lastKey  = all[^1].TimestampUnixNano / bucketNanos * bucketNanos;
             int  capacity = all.Length;
-            if (bucketNanos > 0 && lastKey >= firstKey && (lastKey - firstKey) / bucketNanos < all.Length)
-                capacity = (int)((lastKey - firstKey) / bucketNanos) + 1;
+            if (bucketNanos > 0 && lastKey >= firstKey)
+            {
+                ulong buckets = unchecked((ulong)(lastKey - firstKey)) / (ulong)bucketNanos;
+                if (buckets < (ulong)all.Length) capacity = (int)buckets + 1;
+            }
 
             var result = new List<MetricDataPoint>(Math.Min(capacity, all.Length));
             int start = 0;

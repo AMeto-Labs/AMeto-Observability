@@ -230,6 +230,95 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
         Assert.Equal(got.Select(p => p.TimestampUnixNano), negStep.Select(p => p.TimestampUnixNano));
     }
 
+    // ── Extreme spans (WP7 review, F2) ────────────────────────────────────────
+
+    /// <summary>
+    /// The LINQ chain <c>Downsample</c> was at <c>db5cdd1</c>, verbatim — the oracle for inputs the
+    /// seeded golden does not reach.
+    /// </summary>
+    private static List<MetricDataPoint> LinqDownsample(IReadOnlyList<MetricDataPoint> points, TimeSpan step, MetricKind kind)
+    {
+        long bucketNanos = (long)step.TotalMilliseconds * 1_000_000L;
+        bool takeLast = kind is MetricKind.Counter or MetricKind.Histogram;
+
+        return points
+            .GroupBy(p => p.TimestampUnixNano / bucketNanos * bucketNanos)
+            .Select(g =>
+            {
+                if (takeLast)
+                {
+                    var last = g.OrderBy(p => p.TimestampUnixNano).Last();
+                    return new MetricDataPoint
+                    {
+                        TimestampUnixNano = g.Key,
+                        Value             = last.Value,
+                        Count             = last.Count,
+                        Sum               = last.Sum,
+                        BucketCounts      = last.BucketCounts,
+                    };
+                }
+                return new MetricDataPoint
+                {
+                    TimestampUnixNano = g.Key,
+                    Value             = g.Average(p => p.Value),
+                    Count             = g.Sum(p => p.Count),
+                    Sum               = g.Sum(p => p.Sum),
+                };
+            })
+            .OrderBy(p => p.TimestampUnixNano)
+            .ToList();
+    }
+
+    /// <summary>
+    /// A series whose timestamps span more than half the long range. OTLP carries time_unix_nano
+    /// as an unsigned 64-bit field; one with its top bit set arrives as a long at or below
+    /// -7.5e18, and ingest refuses only FUTURE timestamps — so such a point sits in a series beside
+    /// ordinary ones, and every stepped query over the series and every rollup of its metric
+    /// downsamples it. The bucket-count arithmetic that sizes the answer overflowed there
+    /// (<c>lastKey - firstKey</c> wraps negative) and a negative capacity threw where GroupBy had
+    /// answered.
+    /// </summary>
+    [Fact]
+    public void A_series_spanning_most_of_the_long_range_downsamples_as_the_LINQ_chain_did()
+    {
+        long[][] shapes =
+        [
+            [-7_500_000_000_000_000_000L, T0],
+            [-7_500_000_000_000_000_000L, T0, T0 + 30 * S, T0 + 90 * S],
+            [long.MinValue, 0, long.MaxValue],
+            [long.MinValue + 1, long.MaxValue - 1],
+            [-1, 0, 1, long.MaxValue],
+            [long.MinValue, long.MinValue + 1_000_000, long.MinValue + 60 * S],
+        ];
+        TimeSpan[] steps = [TimeSpan.FromMilliseconds(1), Minute, TimeSpan.FromHours(1), -Minute, TimeSpan.FromDays(3650)];
+
+        int compared = 0;
+        foreach (var shape in shapes)
+            foreach (var step in steps)
+                foreach (var kind in new[] { MetricKind.Counter, MetricKind.Gauge, MetricKind.Histogram })
+                {
+                    var pts = new List<MetricDataPoint>();
+                    for (int i = 0; i < shape.Length; i++) pts.Add(P(shape[i], i + 0.5, count: i, sum: i * 0.25, buckets: [i]));
+                    Assert.Equal(Hash(LinqDownsample(pts, step, kind)), Hash(MetricStorageEngine.Downsample(pts, step, kind)));
+                    compared++;
+                }
+        Assert.Equal(6 * 5 * 3, compared);
+
+        // And seeded: points drawn from the whole long range, sorted, against the same oracle.
+        var rng = new GoldenRng(0xE7_7E_E3_E5);
+        for (int c = 0; c < 300; c++)
+        {
+            var pts = new List<MetricDataPoint>();
+            int n = 1 + rng.Next(20);
+            for (int i = 0; i < n; i++)
+                pts.Add(P(rng.Chance(30) ? T0 + rng.Next(1_000) * S : (long)rng.NextU64(), rng.NextDouble(), count: rng.Next(100), sum: rng.NextDouble()));
+            if (!rng.Chance(20)) pts.Sort(static (a, b) => a.TimestampUnixNano.CompareTo(b.TimestampUnixNano));
+            var kind = (MetricKind)(c % 3);
+            var step = steps[rng.Next(steps.Length)];
+            Assert.Equal(Hash(LinqDownsample(pts, step, kind)), Hash(MetricStorageEngine.Downsample(pts, step, kind)));
+        }
+    }
+
     // ── Seeded goldens ────────────────────────────────────────────────────────
 
     private static readonly TimeSpan[] Steps =
