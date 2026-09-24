@@ -106,6 +106,9 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     {
         if (!OperatingSystem.IsWindows()) return;
 
+        // The boot scan may still hold segment files open; a retry landing on its handle instead of
+        // the reader's is the flake this fact showed 2 in 20 on two cores (the other facts here wait).
+        await _engine.CatalogLoaded;
         var (path, key) = ImportPeerSegment(11);
 
         var reader = SegmentReader.Open(path);   // a query mid-flight
