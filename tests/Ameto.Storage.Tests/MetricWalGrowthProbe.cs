@@ -25,7 +25,7 @@ public sealed class MetricWalGrowthProbe
 
     private const int Threads        = 4;
     private const int BatchPoints    = 500;
-    private const int BatchesPerThread = 1_400;   // 4 x 1 400 x 500 x 48 B = 134 MB: 8 -> 16 -> 32 -> 64 -> 128 -> 256 MiB
+    private const int BatchesPerThread = 1_400;   // 4 x 1 400 x 500 x 52 B = 146 MB: 8 -> 16 -> 32 -> 64 -> 128 -> 192 MiB
 
     /// <summary>
     /// THE STALL ITSELF, JUDGED BY A SEAM. A batch that does not fit parks inside its growth with
@@ -42,7 +42,7 @@ public sealed class MetricWalGrowthProbe
         try
         {
             using var wal = MetricWriteAheadLog.Open(Path.Combine(dir, "metrics.wal"), 64 * 1024);
-            wal.Append(Batch("fill", 300));               // 14 400 B of 65 536: below the pre-grow mark
+            wal.Append(Batch("fill", 300));               // 15 600 B of 65 536: below the pre-grow mark
 
             using var parked  = new ManualResetEventSlim();
             using var release = new ManualResetEventSlim();
@@ -101,7 +101,7 @@ public sealed class MetricWalGrowthProbe
         try
         {
             using var wal = MetricWriteAheadLog.Open(Path.Combine(dir, "metrics.wal"), 64 * 1024);
-            wal.Append(Batch("fill", 1_000));             // 48 000 B of 65 536: 17 536 left, above the 16 384 mark
+            wal.Append(Batch("fill", 900));               // 46 800 B of 65 536: 18 736 left, above the 16 384 mark
 
             using var parked  = new ManualResetEventSlim();
             using var release = new ManualResetEventSlim();
@@ -122,7 +122,7 @@ public sealed class MetricWalGrowthProbe
                 release.Set();                             // never leave the reverted code hanging
             };
 
-            // 100 points: 52 800 B, 12 736 left — under the mark, so this call claims the growth
+            // 100 points: 52 000 B, 13 536 left — under the mark, so this call claims the growth
             // and, having claimed it, runs it and parks inside it.
             var crosser = Task.Factory.StartNew(() => wal.Append(Batch("cross", 100)),
                                                 TaskCreationOptions.LongRunning);
@@ -130,7 +130,7 @@ public sealed class MetricWalGrowthProbe
             {
                 Assert.True(parked.Wait(TimeSpan.FromSeconds(30)), "setup: the crossing batch never reached its pre-grow");
 
-                wal.Append(Batch("fits", 10));             // 53 280 B: fits, claims nothing
+                wal.Append(Batch("fits", 10));             // 52 520 B: fits, claims nothing
                 Assert.True(enteredHere == 0,
                     "an append that fitted and claimed nothing entered the pre-grow another call was running");
             }
@@ -143,11 +143,11 @@ public sealed class MetricWalGrowthProbe
 
             var all = wal.ReadAll(out int unresolved);
             Assert.Equal(0, unresolved);
-            Assert.Equal(1_110, all.Count);
-            Assert.Equal("fill",  all[999].Name);
-            Assert.Equal("cross", all[1_000].Name);
-            Assert.Equal("cross", all[1_099].Name);
-            Assert.Equal("fits",  all[1_100].Name);
+            Assert.Equal(1_010, all.Count);
+            Assert.Equal("fill",  all[899].Name);
+            Assert.Equal("cross", all[900].Name);
+            Assert.Equal("cross", all[999].Name);
+            Assert.Equal("fits",  all[1_000].Name);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -239,7 +239,7 @@ public sealed class MetricWalGrowthProbe
                 _out.WriteLine($"  thread {t}: slowest append {maxTicks[t] * 1000.0 / Stopwatch.Frequency,8:F2} ms, "
                              + $"{slow[t],4} appends over 1 ms, entered the pre-grow {preGrows[t],3} times");
 
-            Assert.True(wal.WrittenBytes >= points * 48);
+            Assert.True(wal.WrittenBytes >= points * 52);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

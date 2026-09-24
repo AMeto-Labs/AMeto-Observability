@@ -245,7 +245,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         long poolBytes = new FileInfo(PoolPath).Length;
 
-        Assert.Equal(500 * 48, walBytes);      // fixed 48-byte entries, no per-point labels
+        Assert.Equal(500 * 52, walBytes);      // fixed 52-byte entries (48 + the v2 checksum), no per-point labels
         Assert.True(poolBytes < 200, $"pool should hold one record, got {poolBytes} B");
 
         var reopened = OpenWal();
@@ -694,7 +694,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine(logger: logger);
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
-        // 48 bytes an entry against an 8 MB log: this leaves ~14 000 entries of room, and none
+        // 52 bytes an entry against an 8 MB log: this leaves ~1 300 entries of room, and none
         // of it is reclaimed before the commit that never happens.
         const int flushed = 160_000;
         var batch = new MetricIngestItem[10_000];
@@ -2095,7 +2095,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void Poisoned_head_is_reconciled_and_shrunk_at_open()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 32 KiB (the last rung pre-grown)
+        for (int i = 0; i < 300; i++)                       // ~15.6 KB of entries: grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
         Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
@@ -2156,7 +2156,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             "Metric WAL: discarding", out _));
         var replayed = reopened.ReadAll(out _);
         Assert.Equal(2, replayed.Count);                    // the real points are untouched
-        Assert.Equal(96, reopened.WrittenBytes);            // the phantom 4 000 bytes are gone
+        Assert.Equal(104, reopened.WrittenBytes);           // two 52-byte entries; the phantom 4 000 bytes are gone
     }
 
     /// <summary>
@@ -2168,7 +2168,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void A_grown_log_shrinks_back_when_a_commit_empties_it()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 120; i++)                       // ~5.8 KB: grows 4 → 8 KiB
+        for (int i = 0; i < 110; i++)                       // ~5.7 KB: grows 4 → 8 KiB, under its 3/4 mark
             Append(wal, Scalar("cpu", 1_000 + i, i));
         Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
 
@@ -2180,7 +2180,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         // Still a working log at the smaller size — the shrink remapped, it did not disable.
         Append(wal, Scalar("cpu", 9_000, 7.0));
-        Assert.Equal(48, wal.WrittenBytes);
+        Assert.Equal(52, wal.WrittenBytes);
     }
 
     /// <summary>
@@ -2317,7 +2317,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void Grow_after_a_commit_shrink_climbs_the_ladder_again()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 120; i++)                       // ~5.8 KB: grows 4 → 8 KiB
+        for (int i = 0; i < 110; i++)                       // ~5.7 KB: grows 4 → 8 KiB, under its 3/4 mark
             Append(wal, Scalar("cpu", 1_000 + i, i));
         Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
 
@@ -2326,14 +2326,14 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(0, wal.WrittenBytes);
         Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);      // shrunk back to the floor
 
-        for (int i = 0; i < 120; i++)                       // must re-Grow to 8 KiB, not overrun 4
+        for (int i = 0; i < 110; i++)                       // must re-Grow to 8 KiB, not overrun 4
             Append(wal, Scalar("cpu", 2_000 + i, i));
-        Assert.Equal(120 * 48, wal.WrittenBytes);
+        Assert.Equal(110 * 52, wal.WrittenBytes);
         Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
         wal.Dispose();
 
         var reopened = OpenWal(4 * 1024);
-        Assert.Equal(120, reopened.ReadAll(out _).Count);
+        Assert.Equal(110, reopened.ReadAll(out _).Count);
         reopened.Dispose();
     }
 
@@ -2375,9 +2375,10 @@ public sealed class MetricWalTests : IAsyncLifetime
         Append(wal, Scalar("beta",  2_000, 2.0));   // pool index 1 — its record is torn off next
         wal.Dispose();
 
+        // A v2 pool record: index, length tagged 0xC5 in its top byte, crc, body.
         byte[] poolBytes        = File.ReadAllBytes(PoolPath);
-        uint   firstBodyLen     = BitConverter.ToUInt32(poolBytes, 4);
-        int    firstRecordTotal = 8 + (int)firstBodyLen;
+        uint   firstBodyLen     = BitConverter.ToUInt32(poolBytes, 4) & 0x00FF_FFFF;
+        int    firstRecordTotal = 12 + (int)firstBodyLen;
         using (var fs = new FileStream(PoolPath, FileMode.Open, FileAccess.ReadWrite))
             fs.SetLength(firstRecordTotal + 4);      // alpha intact, 4 bytes of beta's head only
 
