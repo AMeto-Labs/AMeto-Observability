@@ -197,7 +197,7 @@ public struct SpanHeader
     /// <summary>The service's index in the service intern pool, or -1 when it has none (a full pool, an empty name).</summary>
     public int     ServiceNamePoolIndex;    // 4 bytes
 
-    /// <summary>Where the payload (name, service, attributes) starts in the ring's arena; -1 when it is held apart (larger than a chunk).</summary>
+    /// <summary>Where the payload (name, service, attributes) starts in the ring's arena; -1 when there is none; <c>-2 - n</c> when it is parked apart in place n (larger than a chunk).</summary>
     public int     PayloadArenaOffset;      // 4 bytes
 
     /// <summary>Byte length of the msgpack attributes blob — the last bytes of the payload.</summary>

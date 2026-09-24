@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -31,7 +30,7 @@ namespace Ameto.Tracing.Ingestion;
 /// is reference-counted: +1 while a producer holds it, +1 per span in it; the consumer drops a
 /// span's reference when it releases the drained batch, and the last reference returns the chunk.
 /// A drainer that keeps up therefore touches one or two chunks, reused over and over. A payload
-/// larger than a chunk is kept apart in a managed array — rare, and never dropped for its
+/// larger than a chunk is PARKED apart in a pre-sized managed array — rare, and never dropped for its
 /// size.</para>
 ///
 /// <para><b>Back-pressure</b> is by slots AND by bytes (TS#9): a span's payload bytes are reserved
@@ -87,8 +86,25 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     private readonly long        _maxBytes;
     private long                 _bytesInFlight;
 
-    /// <summary>Payloads larger than a chunk, keyed by ring position. Rare; written before the slot is published.</summary>
-    private readonly ConcurrentDictionary<long, byte[]> _oversize = new();
+    /// <summary>
+    /// Payloads larger than a chunk, PARKED here by index — a slot's header names its parking place
+    /// as <see cref="SpanHeader.PayloadArenaOffset"/> = <c>-2 - index</c>. Pre-sized (one place per
+    /// arena chunk, so the byte budget always binds before the parking lot does) and claimed, and
+    /// filled, BEFORE the ring slot is: nothing between a slot's claim and its publish may allocate.
+    /// It used to be a <c>ConcurrentDictionary</c> keyed by ring position and written AFTER the
+    /// claim — a node allocation in the one window where a throw wedges the ring (review F2).
+    /// </summary>
+    private readonly byte[]?[] _parked;
+    private readonly int[]     _parkFree;
+    private int                _parkFreeCount;
+    private readonly Lock      _parkLock = new();
+
+    /// <summary>
+    /// <see cref="SpanHeader.PayloadArenaOffset"/> of a TOMBSTONE: a slot whose producer faulted
+    /// after claiming it. Published anyway, so the consumer — which stops at a claimed-but-unwritten
+    /// slot and waits for it — steps over it instead of waiting forever.
+    /// </summary>
+    private const int TombstoneOffset = int.MinValue;
 
     private readonly SemaphoreSlim _signal = new(0, 1);
 
@@ -147,6 +163,11 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         _chunkNext[_chunkCount - 1] = -1;
         _chunkRefs = (int*)NativeMemory.AllocZeroed((nuint)_chunkCount, sizeof(int));
         // Free head: chunk 0, version 0 — the zeroed value.
+
+        _parked        = new byte[]?[_chunkCount];
+        _parkFree      = new int[_chunkCount];
+        for (int i = 0; i < _chunkCount; i++) _parkFree[i] = _chunkCount - 1 - i;
+        _parkFreeCount = _chunkCount;
     }
 
     /// <summary>The span-name and service pools; producers intern the service here once per resource block.</summary>
@@ -246,10 +267,20 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             return false;
         }
 
-        // 2. Where the payload will live.
-        int     offset = -1;
-        byte[]? apart  = null;
-        if (payload > ChunkBytes)       apart = new byte[payload];
+        // 2. Where the payload will live — decided, and for a parked payload ALLOCATED, before any
+        //    slot is claimed: from the claim to the publish nothing may allocate (see step 4).
+        int offset = -1;
+        int park   = -1;
+        if (payload > ChunkBytes)
+        {
+            if (!TryPark(payload, out park))
+            {
+                Interlocked.Add(ref _bytesInFlight, -payload);
+                Interlocked.Increment(ref _refusedNoArena);
+                return false;
+            }
+            offset = -2 - park;
+        }
         else if (payload > 0 && !TryReserve(ref st, payload, out offset))
         {
             Interlocked.Add(ref _bytesInFlight, -payload);
@@ -271,33 +302,46 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             }
             else if (diff < 0)
             {
-                if (offset >= 0) Unreserve(ref st, payload);
-                Interlocked.Add(ref _bytesInFlight, -payload);
+                GiveBack(ref st, payload, offset, park);
                 Interlocked.Increment(ref _refusedNoSlot);
                 return false;                                            // every slot unread
             }
             // diff > 0: another producer published past us; look again
         }
 
-        _afterSlotClaimedForTest?.Invoke(pos);
-
-        // 4. Write the payload, then the header, then PUBLISH.
-        if (payload > 0)
+        // 4. Write the payload, then the header, then PUBLISH. THE SLOT IS CLAIMED: from here to the
+        //    publish the consumer is stopped at it, waiting — so this window allocates nothing, and
+        //    if anything in it throws all the same, the slot is published as a TOMBSTONE the
+        //    consumer steps over, the reservations are given back, and the fault goes to the caller.
+        //    Without that, one throw here wedged the ring until a restart (review F2).
+        try
         {
-            var dst = apart is not null ? apart.AsSpan() : new Span<byte>(_base + offset, payload);
-            nameUtf8.CopyTo(dst);
-            serviceUtf8.CopyTo(dst[nameUtf8.Length..]);
-            attributes.CopyTo(dst[(nameUtf8.Length + serviceUtf8.Length)..]);
-            if (apart is not null) _oversize[pos] = apart;
-        }
+            _afterSlotClaimedForTest?.Invoke(pos);
 
-        ref var h = ref slot->Header;
-        h                      = fields;
-        h.NameByteLength       = nameUtf8.Length;
-        h.ServiceByteLength    = serviceUtf8.Length;
-        h.AttributesByteLength = attributes.Length;
-        h.ServiceNamePoolIndex = serviceIdx;
-        h.PayloadArenaOffset   = offset;
+            if (payload > 0)
+            {
+                var dst = park >= 0 ? _parked[park].AsSpan() : new Span<byte>(_base + offset, payload);
+                nameUtf8.CopyTo(dst);
+                serviceUtf8.CopyTo(dst[nameUtf8.Length..]);
+                attributes.CopyTo(dst[(nameUtf8.Length + serviceUtf8.Length)..]);
+            }
+
+            ref var h = ref slot->Header;
+            h                      = fields;
+            h.NameByteLength       = nameUtf8.Length;
+            h.ServiceByteLength    = serviceUtf8.Length;
+            h.AttributesByteLength = attributes.Length;
+            h.ServiceNamePoolIndex = serviceIdx;
+            h.PayloadArenaOffset   = offset;
+        }
+        catch
+        {
+            slot->Header = default;
+            slot->Header.PayloadArenaOffset = TombstoneOffset;
+            Volatile.Write(ref slot->Sequence, pos + 1 - (pos & _mask));
+            GiveBack(ref st, payload, offset, park);
+            throw;
+        }
 
         Volatile.Write(ref slot->Sequence, pos + 1 - (pos & _mask));
 
@@ -402,6 +446,42 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         ReleaseChunk(st.Chunk);                                          // the span's reference; the hold keeps it
     }
 
+    /// <summary>Everything a span reserved on its way in, given back: its arena bytes or its parking place, and its budget.</summary>
+    private void GiveBack(ref ProducerState st, int payload, int offset, int park)
+    {
+        if (park >= 0)        Unpark(park);
+        else if (offset >= 0) Unreserve(ref st, payload);
+        Interlocked.Add(ref _bytesInFlight, -payload);
+    }
+
+    /// <summary>
+    /// A parking place for a payload larger than a chunk, with the array for it allocated and stored
+    /// there — all before any slot is claimed. False when every place is taken, or when the
+    /// allocation itself fails: either is a refusal (back-pressure), never a wedge.
+    /// </summary>
+    private bool TryPark(int payload, out int park)
+    {
+        park = -1;
+        byte[] bytes;
+        try { bytes = new byte[payload]; }
+        catch (OutOfMemoryException) { return false; }
+
+        lock (_parkLock)
+        {
+            if (_parkFreeCount == 0) return false;
+            park = _parkFree[--_parkFreeCount];
+        }
+        _parked[park] = bytes;
+        return true;
+    }
+
+    /// <summary>Frees a parking place, and lets go of what was parked there.</summary>
+    private void Unpark(int park)
+    {
+        _parked[park] = null;
+        lock (_parkLock) _parkFree[_parkFreeCount++] = park;
+    }
+
     // ── Chunks (lock-free Treiber stack, ABA-safe via a versioned head) ─────────
 
     /// <summary>
@@ -479,13 +559,22 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             Slot* slot  = _slots + index;
             if (Volatile.Read(ref slot->Sequence) + index != pos + 1) break;   // empty, or claimed and unwritten
 
-            headers[count] = slot->Header;
-            apart[count]   = slot->Header.PayloadArenaOffset < 0 && slot->Header.PayloadByteLength > 0
-                             && _oversize.TryRemove(pos, out var bytes) ? bytes : null;
+            int offset = slot->Header.PayloadArenaOffset;
+            if (offset != TombstoneOffset)                                      // a faulted producer's slot carries nothing
+            {
+                headers[count] = slot->Header;
+                if (offset <= -2)
+                {
+                    int park = -2 - offset;
+                    apart[count] = _parked[park];                               // the drainer holds it now
+                    Unpark(park);
+                }
+                else apart[count] = null;
+                count++;
+            }
 
             Volatile.Write(ref slot->Sequence, pos + _capacity - index);        // the slot is free again
             pos++;
-            count++;
         }
         Volatile.Write(ref _cursors[1].Value, pos);
         return count;

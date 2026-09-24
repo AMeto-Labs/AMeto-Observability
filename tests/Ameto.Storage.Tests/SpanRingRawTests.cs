@@ -80,7 +80,7 @@ public sealed class SpanRingRawTests : IDisposable
             Assert.True(shapes[i].Attrs.AsSpan().SequenceEqual(batch.Attributes(i)), $"attributes of shape {i}");
         }
         Assert.NotNull(apart[3]);                                        // the big one never touched the arena
-        Assert.Equal(-1, headers[3].PayloadArenaOffset);
+        Assert.True(headers[3].PayloadArenaOffset <= -2);                // parked apart, by place
 
         ring.Release(headers.AsSpan(0, n));
         Assert.Equal(0, ring.BytesInFlight);
@@ -133,6 +133,49 @@ public sealed class SpanRingRawTests : IDisposable
         Assert.Equal(new SpanId(3), headers[1].SpanId);                  // then what was behind it
         ring.Release(headers.AsSpan(0, rest));
         ring.EndBatch();
+    }
+
+    /// <summary>
+    /// F2 — A FAULT BETWEEN CLAIM AND PUBLISH MUST NOT WEDGE THE RING. The consumer stops at a
+    /// claimed-but-unwritten slot and waits for it; a producer that throws in that window (the
+    /// oversize path used to allocate a dictionary node there — an OutOfMemoryException on a
+    /// 512 MB host) left the slot claimed forever, the consumer stopped at it forever, the ring
+    /// filled and every later span was refused until a restart. The seam throws at exactly that
+    /// point, for an ordinary span and for one kept apart from the arena: the spans after it must
+    /// still come out, and the budget must be whole again.
+    /// </summary>
+    [Theory]
+    [InlineData(100)]
+    [InlineData(SpanRingBuffer.ChunkBytes + 1_000)]
+    public void A_fault_between_claim_and_publish_does_not_wedge_the_ring(int blobBytes)
+    {
+        using var ring = new SpanRingBuffer(capacity: 16, maxBytes: 4 * 1024 * 1024);
+        ring._afterSlotClaimedForTest = pos => { if (pos == 1) throw new OutOfMemoryException("injected at the claim"); };
+
+        Enqueue(ring, 0);
+        var h = Fields(1);
+        Assert.Throws<OutOfMemoryException>(() => ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Filled(blobBytes)));
+        for (int i = 2; i < 5; i++) Enqueue(ring, i);
+        ring.EndBatch();
+        ring._afterSlotClaimedForTest = null;
+
+        var headers = new SpanHeader[16];
+        var apart   = new byte[]?[16];
+        int n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(4, n);                                              // 0, 2, 3, 4 — the faulted one is skipped, not waited for
+        Assert.Equal(new SpanId(1), headers[0].SpanId);
+        Assert.Equal(new SpanId(3), headers[1].SpanId);
+        Assert.Equal(new SpanId(5), headers[3].SpanId);
+        ring.Release(headers.AsSpan(0, n));
+        Assert.Equal(0, ring.BytesInFlight);                            // the faulted span gave its bytes back
+
+        for (int round = 0; round < 40; round++)                         // and the ring keeps flowing past the lap
+        {
+            Enqueue(ring, 100 + round);
+            ring.EndBatch();
+            Assert.Equal(1, ring.TryDequeueMany(headers, apart));
+            ring.Release(headers.AsSpan(0, 1));
+        }
     }
 
     /// <summary>
