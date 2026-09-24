@@ -282,8 +282,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// not allowed to turn a merge back into a silent low count: <see cref="_mergedAwayEvictedThrough"/>
     /// says how far it has reached, and a scan that may have lost a record to it reports the
     /// removal as a merge (see <see cref="MayHaveBeenMergedAway"/>). Everything here is under
-    /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge's cleanup and by a scan
-    /// that has already failed to read a segment.</para>
+    /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge — alone for its records, and
+    /// under <c>_importLock</c> and <see cref="_scanDeleteGate"/> to publish the mark in its commit —
+    /// and by a scan that has already failed to read a segment.</para>
     /// </summary>
     private readonly Dictionary<SegmentKey, MergedAwayRecord> _mergedAwaySegments = new();
     /// <summary>One entry of <see cref="_mergedAwaySegments"/>: which record named the source, and where its events went.</summary>
@@ -586,19 +587,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// incumbent's header and footer (never its blocks) to judge it — so the hold is bounded by
     /// metadata reads, not by file size.
     ///
-    /// <para>Taken by <c>ImportSegment</c> and by <c>DeleteSegmentAsync</c> — a delete
-    /// landing inside an import's publish-to-rename window would otherwise orphan the file the
-    /// rename lands — and it still excludes none of the other writers into the catalog: flush
-    /// publication holds <c>_frozenLock</c>, merge publication and WAL recovery hold nothing,
-    /// and the boot scan runs on a background task while the replication endpoint is already
-    /// serving. That is why the registration itself is a compare-and-swap
-    /// rather than a store: holding this lock says nothing about whether the value read at the top
-    /// of the section is still there at the bottom of it.</para>
+    /// <para>Taken by <c>ImportSegment</c>, by <c>DeleteSegmentAsync</c> — a delete landing
+    /// inside an import's publish-to-rename window would otherwise orphan the file the rename
+    /// lands — by the parked-delete retry (<see cref="TryCompletePendingSegmentDelete"/>), by a
+    /// merge's commit for its swap (<see cref="CommitMerge"/>) and, one source file at a time, by
+    /// the unlinks after it (<see cref="SettleMergedSources"/>, through the retry); and emptied
+    /// by the header scan's missing-file fallback (<see cref="OpenForHeaderScan"/>) to wait out
+    /// an import's rename. It still excludes none of the other writers into the catalog: flush
+    /// publication holds <c>_frozenLock</c>, WAL recovery holds nothing, and the boot scan runs
+    /// on a background task while the replication endpoint is already serving. That is why the
+    /// registration itself is a compare-and-swap rather than a store: holding this lock says
+    /// nothing about whether the value read at the top of the section is still there at the
+    /// bottom of it.</para>
     ///
-    /// <para>Nothing is taken under it — the allocator floor is raised before it is entered — so
-    /// it participates in no ordering. The section is a dictionary exchange and a rename; the
-    /// segment's contents were read before it, and the path is only ever reached once per
-    /// replicated segment.</para>
+    /// <para>Lock order: this, then <see cref="_scanDeleteGate"/>, then either of two leaves —
+    /// the catalog's build lock (<see cref="SegmentCatalog.Swap"/>) and
+    /// <see cref="_mergedAwayGate"/> (<see cref="PublishMergedAwayMark"/>), both taken only by a
+    /// merge's commit. Nothing that holds any of those three takes this one, and the allocator
+    /// floor is raised before an import enters, so <c>_segIdLock</c> is never taken under it.
+    /// Each hold is short: an import's is a dictionary exchange and a rename (the segment's
+    /// contents were read before it); a delete's, a removal and one unlink; a merge commit's, one
+    /// swap and a park per source, with no unlink at all.</para>
     /// </summary>
     private readonly System.Threading.Lock                _importLock = new();
 
@@ -1656,8 +1665,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // touched here. Both are plain collections owned lock-free by the maintenance
                 // thread, and this method also runs on retention's threads — a background
                 // service and an HTTP endpoint — where a Remove would be a concurrent mutation
-                // that _importLock does not cover (the merge side never takes it). Keys the
-                // delete orphans are pruned at the top of the next merge pass, on the owner.
+                // that _importLock does not cover: the merge takes it only for its commit and its
+                // unlinks, and touches the bookkeeping outside it. Keys the delete orphans are
+                // pruned at the top of the next merge pass, on the owner.
                 UnlinkRemovedSegment(key, info.FilePath);
             }
         }
@@ -1736,7 +1746,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// the next start's catalog scan and retention pass find it again.</para>
     ///
     /// <para>Added only under <c>_importLock</c> and <see cref="_scanDeleteGate"/>, and removed
-    /// only under <c>_importLock</c>, so the cap check and the add are one step.</para>
+    /// only under <c>_importLock</c>, so the cap check and the add are one step. A merge's commit
+    /// adds its sources past the cap on purpose, as a guard for the catalog scan until their
+    /// unlinks, and holds what is left to the cap once those are tried
+    /// (<see cref="SettleMergedSources"/>).</para>
     /// </summary>
     private readonly ConcurrentDictionary<string, PendingSegmentDelete> _pendingSegmentDeletes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1756,11 +1769,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Serialises the boot catalog scan's check-and-register with <see cref="DeleteSegmentAsync"/>'s
-    /// remove, record, unlink and park, and guards <see cref="_deletedDuringCatalogScan"/> and
+    /// remove, record, unlink and park, and with a merge commit's swap, record and park
+    /// (<see cref="CommitMerge"/>), and guards <see cref="_deletedDuringCatalogScan"/> and
     /// <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
     /// import holds that one across its publish and the scan must still be able to land inside
     /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
-    /// <c>_importLock</c> by the delete and by the parked retry's record; nothing is taken under it.
+    /// <c>_importLock</c> by the delete, the merge's commit and cap check, and the parked
+    /// retry's record; alone by the scan. Under it only the two leaves a merge's commit takes:
+    /// the catalog's build lock and <see cref="_mergedAwayGate"/> (see <c>_importLock</c> for the
+    /// whole order).
     /// </summary>
     private readonly System.Threading.Lock _scanDeleteGate = new();
 
@@ -3968,9 +3985,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 //   is what tells: File.Exists also says false when NFS or SMB fails the probe,
                 //   and a live segment skipped on that stayed unserved until the next restart.
                 //
-                // Under _scanDeleteGate, which DeleteSegmentAsync (and a merge's commit, for each
-                // of its sources) holds across removing the entry, recording the path, unlinking
-                // the file and parking a failed unlink. What that
+                // Under _scanDeleteGate, which DeleteSegmentAsync holds across removing the entry,
+                // recording the path, unlinking the file and parking a failed unlink, and a merge's
+                // commit across removing its sources' entries, recording their paths and parking
+                // every one of them until its unlink (see CommitMerge). What that
                 // gives is atomicity against a delete, not a fresh reading: the info above was
                 // read before the gate and says nothing about a delete since. A delete of this key
                 // is instead either wholly before these checks -- and left a park or a record,
@@ -4442,10 +4460,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // held disk for the life of the install, never served, never expired, never compacted.
         //
         // The lock is NOT what makes the decision safe, and the compare-and-swap below is not
-        // redundant with it. _importLock is taken here and in DeleteSegmentAsync, while four
-        // other writers reach this dictionary knowing nothing about it: flush publication (under _frozenLock),
-        // merge publication, the boot catalog scan and WAL recovery. A probe followed by a store
-        // therefore decides on a value that another writer can replace in between — and the
+        // redundant with it. _importLock is taken here, in DeleteSegmentAsync and in a merge's
+        // commit, while three other writers reach this dictionary knowing nothing about it: flush
+        // publication (under _frozenLock), the boot catalog scan and WAL recovery. A probe
+        // followed by a store therefore decides on a value that another writer can replace in
+        // between — and the
         // catalog scan is a BACKGROUND task, so a replication POST is live while it is still
         // walking the directory. The import finds the key free because the scan has not reached
         // the local {node}-{id}-{min}-{max}.seg yet; the scan then adds it; the store overwrites
