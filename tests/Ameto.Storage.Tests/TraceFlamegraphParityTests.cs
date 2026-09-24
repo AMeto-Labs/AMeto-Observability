@@ -262,6 +262,35 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
             Written(spans));
     }
 
+    /// <summary>
+    /// THE CUT BOUNDS SIZE AS WELL AS DEPTH. A repeated NON-empty span id with TWO spans naming it
+    /// as parent makes every copy the parent of both, so a walk bounded only by depth writes 2^level
+    /// nodes — 1 + 1 + 2 + 4 here, 2^4 096 at the level limit. The walk writes at most one node per
+    /// span of the trace — no tree the provider can hand over (span ids deduped) has more — and a
+    /// node whose remaining children it had no budget for is closed with <c>"truncated":true</c>.
+    /// </summary>
+    [Fact]
+    public void A_repeated_branching_span_id_writes_no_more_nodes_than_the_trace_has_spans()
+    {
+        List<SpanRecord> spans =
+        [
+            Span(1, 0, 1, 10_000_000, "R"),
+            Span(2, 1, 2,  5_000_000, "A"),
+            Span(2, 2, 3,  1_000_000, "B"),   // both name id 2 as parent: every copy of id 2
+            Span(2, 2, 4,  1_000_000, "C"),   // has children B and C
+        ];
+
+        string json = Written(spans);
+        Assert.Equal(spans.Count, CountOf(json, "\"spanId\""));
+        Assert.Equal(
+            "{\"spanId\":\"0000000000000001\",\"name\":\"R\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":10,\"selfMs\":5,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"A\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":5,\"selfMs\":3,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"B\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":1,\"selfMs\":0,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"B\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":1,\"selfMs\":0,\"children\":[],\"truncated\":true}"
+          + "],\"truncated\":true}],\"truncated\":true}]}",
+            json);
+    }
+
     private static int CountOf(string haystack, string needle)
     {
         int n = 0;

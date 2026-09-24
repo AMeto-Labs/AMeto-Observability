@@ -34,11 +34,18 @@ namespace Ameto.Tracing;
 ///
 /// <para>PAST <see cref="MaxLevels"/> THE TREE IS CUT, NEVER REFUSED. A node on the last level that
 /// still has children is written whole — its own <c>totalMs</c> and <c>selfMs</c> count them — with
-/// <c>"children":[]</c> followed by <c>"truncated":true</c>, and its subtree is not written. The
-/// same cut stops a walk that would open a span a second time, which only a trace repeating a
-/// NON-empty span id could make it do; the provider's dedupe rules that out, and the cut is what
-/// keeps it a bounded response rather than a stack overflow if that ever changes. The flag appears
-/// on no node of a tree that was not cut, so every body the old serialiser wrote is unchanged.</para>
+/// <c>"children":[]</c> followed by <c>"truncated":true</c>, and its subtree is not written.</para>
+///
+/// <para>THE WALK IS BOUNDED IN SIZE AS WELL AS DEPTH: at most <c>min(n, MaxLevels)</c> levels and at
+/// most <c>n</c> nodes for a trace of <c>n</c> spans. Of these only <see cref="MaxLevels"/> can cut a
+/// tree the provider hands over: it dedupes non-empty span ids, so every span is reached at most
+/// once, on a path of distinct spans — never more than <c>n</c> nodes, never deeper than <c>n</c>
+/// levels. Only a REPEATED non-empty id could make the walk revisit a span: a cycle (the old
+/// recursive builder overflowed the stack on one) or, with two spans naming the repeated id as
+/// parent, a tree that doubles at every level. Past either bound the node whose children are not
+/// all written is closed with <c>"truncated":true</c> — after an empty <c>children</c> array at the
+/// depth bound, after the children already written at the node bound. The flag appears on no node
+/// of a tree that was not cut, so every body the old serialiser wrote is unchanged.</para>
 ///
 /// <para>FLUSHED AS IT GOES, every <see cref="TraceDetailJson.FlushThresholdBytes"/>, as the
 /// detail page and the serialiser before it do; nothing is written until the spans are collected
@@ -123,7 +130,8 @@ internal static class TraceFlamegraphJson
     ///   <item><c>tail</c>: group → last child's span index (building only);</item>
     ///   <item><c>next</c>: span index → next sibling's span index, or -1;</item>
     ///   <item><c>stack</c>: open level − 1 → the next child of that level's node still to write, or
-    ///   -1 once they are all written. <c>min(n, MaxLevels)</c> slots.</item>
+    ///   -1 once they are all written, <see cref="Cut"/> once the node budget stopped them.
+    ///   <c>min(n, MaxLevels)</c> slots.</item>
     /// </list>
     /// </summary>
     private struct Walk : IDisposable
@@ -141,7 +149,11 @@ internal static class TraceFlamegraphJson
         private readonly int _levels;
 
         private int  _open;      // levels currently open: the stack's height
+        private int  _written;   // nodes opened so far — never more than n
         private bool _started;
+
+        /// <summary>A stack slot's value once its node's remaining children were cut; -1 is "all written".</summary>
+        private const int Cut = -2;
 
         public Walk(List<SpanRecord> spans)
         {
@@ -212,8 +224,16 @@ internal static class TraceFlamegraphJson
                 if (child < 0)
                 {
                     w.WriteEndArray();    // the node's children
+                    if (child == Cut) w.WriteBoolean(PTruncated, true);
                     w.WriteEndObject();   // the node
                     _open--;
+                    continue;
+                }
+                if (_written >= _n)
+                {
+                    // Every span has been written once and this node still has children: each of
+                    // them could only be a span written a second time. See the class remarks.
+                    cursor = Cut;
                     continue;
                 }
                 cursor = _scratch[4 * _n + child];                  // next[child]
@@ -228,6 +248,7 @@ internal static class TraceFlamegraphJson
         /// </summary>
         private void Open(Utf8JsonWriter w, int index, int level)
         {
+            _written++;
             int n       = _n;
             var groupOf = _scratch.AsSpan(n,     n);
             var head    = _scratch.AsSpan(2 * n, n);
