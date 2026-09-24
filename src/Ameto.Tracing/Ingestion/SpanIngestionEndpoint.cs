@@ -58,7 +58,9 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
         _ring   = ring;
         _logger = logger;
         _time   = time ?? TimeProvider.System;
-        _nextWarningAt = long.MinValue;
+        _nextWarningAt     = long.MinValue;
+        _nextPoolWarningAt = long.MinValue;
+        _ring.Pools.Saturated += OnPoolSaturated;
     }
 
     /// <summary>Requests that could not be taken whole since the process started.</summary>
@@ -66,6 +68,52 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
 
     /// <summary>Spans refused since the process started.</summary>
     public long RefusedSpans => Interlocked.Read(ref _refusedSpans);
+
+    /// <summary>Span-name strings built outside the (full) name pool since the process started.</summary>
+    public long UnpooledSpanNames => _ring.Pools.UnpooledNames;
+
+    /// <summary>Service strings built outside the (full) service pool — once per run of a block's spans.</summary>
+    public long UnpooledServiceNames => _ring.Pools.UnpooledServices;
+
+    /// <summary>How many times an intern pool has filled up: the service pool at most once, the name pool at most once per tier.</summary>
+    public long InternPoolSaturations => _ring.Pools.Saturations;
+
+    // ── A FULL INTERN POOL IS SAID OUT LOUD (review F4) ─────────────────────────
+    //
+    // A full pool drops nothing — every span keeps its own string — but past that point each span
+    // (or each block, for services) costs a string the tier used to share, and the pool never says
+    // so: a service.name per pod or a route with an id in it filled it silently. At most one
+    // warning a minute, the 6c614c5 rate limit: the service pool fills once for the life of the
+    // process, the name pool at most once per tier, which under a high-cardinality burst is every
+    // flush.
+
+    /// <summary>The shortest gap between two pool warnings.</summary>
+    internal static readonly TimeSpan PoolWarningInterval = TimeSpan.FromMinutes(1);
+
+    private long _nextPoolWarningAt;
+    private long _poolSaturationsSinceWarning;
+
+    private void OnPoolSaturated(SpanPoolKind kind, int cap)
+    {
+        Interlocked.Increment(ref _poolSaturationsSinceWarning);
+        long now  = _time.GetTimestamp();
+        long next = Volatile.Read(ref _nextPoolWarningAt);
+        if (now < next) return;
+        long step = (long)(PoolWarningInterval.TotalSeconds * _time.TimestampFrequency);
+        if (Interlocked.CompareExchange(ref _nextPoolWarningAt, now + step, next) != next) return;
+
+        long since = Interlocked.Exchange(ref _poolSaturationsSinceWarning, 0);
+        LogPoolSaturated(_logger, kind == SpanPoolKind.Services ? "service-name" : "span-name", cap, since,
+                         _ring.Pools.UnpooledNames, _ring.Pools.UnpooledServices);
+    }
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "The trace {Pool} intern pool is full ({Cap} distinct values; {Saturations} pool(s) filled since the last warning): "
+                + "past this, spans keep their own strings — nothing is dropped, but the hot tier holds more. "
+                + "Unpooled so far: {UnpooledNames} span name(s), {UnpooledServices} service string(s). "
+                + "A service.name per pod, or a span name carrying an id instead of a route template, does this")]
+    private static partial void LogPoolSaturated(ILogger logger, string pool, int cap, long saturations,
+                                                 long unpooledNames, long unpooledServices);
 
     /// <inheritdoc/>
     public bool TryIngest(ReadOnlySpan<SpanIngestItem> spans, out int accepted)
@@ -88,7 +136,7 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
 
     /// <inheritdoc/>
     public int InternService(ReadOnlySpan<byte> serviceUtf8) =>
-        serviceUtf8.IsEmpty ? -1 : _ring.Pools.Services.Intern(serviceUtf8);
+        _ring.Pools.ServiceIndex(serviceUtf8);
 
     /// <inheritdoc/>
     public bool TryIngestRaw(

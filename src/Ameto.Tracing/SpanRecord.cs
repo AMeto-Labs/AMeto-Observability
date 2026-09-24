@@ -218,6 +218,9 @@ public struct SpanHeader
     public static int SizeOf => Unsafe.SizeOf<SpanHeader>();
 }
 
+/// <summary>Which of <see cref="SpanStringPools"/>' two pools a notice is about.</summary>
+internal enum SpanPoolKind : byte { Names, Services }
+
 /// <summary>
 /// THE TWO INTERN POOLS SPAN TEXT GOES THROUGH on its way into the hot tier (TI#5): span names and
 /// service names, each held by the tier as ONE shared string per distinct value instead of one per
@@ -261,12 +264,49 @@ internal sealed class SpanStringPools
     private volatile Ameto.Core.StringInternPool _names;
     private long _unpooledNames;
     private long _unpooledServices;
+    private long _saturations;
 
     public SpanStringPools(int maxNames = DefaultMaxNames, int maxServices = DefaultMaxServices)
     {
         _maxNames = maxNames;
-        _names    = new Ameto.Core.StringInternPool(maxNames);
+        _names    = NewNamePool();
         Services  = new Ameto.Core.StringInternPool(maxServices);
+        Services.PoolExhausted += cap => OnSaturated(SpanPoolKind.Services, cap);
+    }
+
+    /// <summary>
+    /// Raised when a pool fills up (review F4): the service pool once for the life of the process
+    /// (it is never shed), the name pool at most once per tier. Past that point every span of the
+    /// kind keeps its own string, which used to happen in silence. The ingest endpoint subscribes and
+    /// turns it into a rate-limited warning.
+    /// </summary>
+    public event Action<SpanPoolKind, int>? Saturated;
+
+    /// <summary>How many times a pool has filled up since the process started.</summary>
+    public long Saturations => Interlocked.Read(ref _saturations);
+
+    private void OnSaturated(SpanPoolKind kind, int cap)
+    {
+        Interlocked.Increment(ref _saturations);
+        Saturated?.Invoke(kind, cap);
+    }
+
+    private Ameto.Core.StringInternPool NewNamePool()
+    {
+        var pool = new Ameto.Core.StringInternPool(_maxNames);
+        pool.PoolExhausted += cap => OnSaturated(SpanPoolKind.Names, cap);
+        return pool;
+    }
+
+    /// <summary>
+    /// A resource block's service interned for the ring — its pool index, or -1 when there is nothing
+    /// to intern or the pool is full. Not counted here: the drainer counts the string it then has to
+    /// build (<see cref="Service(ReadOnlySpan{byte}, out bool)"/>), once per run of spans.
+    /// </summary>
+    public int ServiceIndex(ReadOnlySpan<byte> serviceUtf8)
+    {
+        if (serviceUtf8.IsEmpty) return -1;
+        return Services.Intern(serviceUtf8);
     }
 
     /// <summary>The service pool — bounded, never shed. Its indices are safe to carry through the ring.</summary>
@@ -325,7 +365,7 @@ internal sealed class SpanStringPools
     /// strings already handed out stay valid (they are references, never indices); the next tier
     /// interns afresh, so a high-cardinality burst lives exactly as long as its tier.
     /// </summary>
-    public void ShedNames() => _names = new Ameto.Core.StringInternPool(_maxNames);
+    public void ShedNames() => _names = NewNamePool();
 
     /// <summary>What a string the pool could not share costs the tier: the object, header and chars.</summary>
     internal static long UnpooledStringBytes(string s) => (22L + 2L * s.Length + 7) & ~7L;

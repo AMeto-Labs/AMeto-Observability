@@ -382,7 +382,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             int n = Encoding.UTF8.GetBytes(name, buf);
             int s = Encoding.UTF8.GetBytes(service, buf[n..]);
             var svc = buf.Slice(n, s);
-            int idx = s == 0 ? -1 : Pools.Services.Intern(svc);
+            int idx = Pools.ServiceIndex(svc);
             var h   = TraceStorageEngine.HeaderOf(item);
             return TryEnqueueRaw(in h, buf[..n], idx, svc, item.AttributesBytes ?? []);
         }
@@ -803,8 +803,17 @@ internal sealed class ServiceIndexCache
 
     public string Resolve(int index, ReadOnlySpan<byte> serviceUtf8, SpanStringPools pools, out bool pooled)
     {
-        if (!ReferenceEquals(pools, _resolvedIn)) { Array.Clear(_byIndex); _resolvedIn = pools; }
+        if (!ReferenceEquals(pools, _resolvedIn)) { Array.Clear(_byIndex); _resolvedIn = pools; _lastUnpooled = null; }
         if ((uint)index < (uint)_byIndex.Length && _byIndex[index] is { } hit) { pooled = true; return hit; }
+
+        // A FULL SERVICE POOL, ONE STRING PER BLOCK, NOT PER SPAN (review F4). Spans of one resource
+        // block arrive together and carry the same service bytes, so the string built for the first
+        // is handed to the rest of the run — shared, and charged to the tier once.
+        if (index < 0 && _lastUnpooled is { } last && serviceUtf8.SequenceEqual(_lastUnpooledUtf8))
+        {
+            pooled = true;
+            return last;
+        }
 
         string s = pools.Service(serviceUtf8, out pooled);
         if (index >= 0 && pooled)
@@ -813,8 +822,16 @@ internal sealed class ServiceIndexCache
                 Array.Resize(ref _byIndex, Math.Max(index + 1, _byIndex.Length * 2));
             _byIndex[index] = s;
         }
+        else if (!pooled)
+        {
+            _lastUnpooledUtf8 = serviceUtf8.ToArray();
+            _lastUnpooled     = s;
+        }
         return s;
     }
+
+    private string? _lastUnpooled;
+    private byte[]  _lastUnpooledUtf8 = [];
 }
 
 /// <summary>
