@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using System.Buffers;
 using System.Buffers.Text;
 using System.Text.Json;
@@ -23,6 +24,10 @@ namespace Ameto.Otel;
 ///
 /// Both encodings are accepted: application/json and application/x-protobuf. Anything else
 /// is read as JSON.
+///
+/// Both content codings OTLP/HTTP names are accepted too: none (or identity), and gzip — the
+/// collector's otlphttp exporter compresses by default, so without it a collector left on its
+/// defaults could not deliver a single batch. Any other coding is 415.
 ///
 /// OTLP over gRPC lives in OtlpGrpcEndpointMapper.
 /// </summary>
@@ -212,6 +217,17 @@ public static class OtlpEndpointMapper
     internal static void LogTracesDecodeFailed(ILogger logger, int bytes, string? contentType, Exception ex)
         => _tracesDecodeFailed(logger, bytes, contentType, ex);
 
+    /// <summary>
+    /// A gzip body that inflated past the limit — logged, not swallowed, as the gRPC receiver
+    /// does: it is either a misconfigured exporter or someone probing, and both are worth being
+    /// able to see afterwards. The 413 alone would tell the client and nobody else.
+    /// </summary>
+    private static readonly Action<ILogger, int, Exception?> _gzipTooLarge =
+        LoggerMessage.Define<int>(
+            Microsoft.Extensions.Logging.LogLevel.Warning,
+            new Microsoft.Extensions.Logging.EventId(3, "OtlpHttpGzipTooLarge"),
+            "OTLP/HTTP: a gzip body inflated past {Limit} bytes and was refused");
+
     // ── API-key authorization ───────────────────────────────────────────────────
 
     /// <summary>
@@ -245,23 +261,242 @@ public static class OtlpEndpointMapper
     // ── Body reading ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Reads the full request body into a buffer from <see cref="IngestBufferPool"/>. The read
-    /// itself is <see cref="OtlpBodyReader"/>, which the gRPC receiver shares — a body over
-    /// <c>Ingestion.MaxOtlpBatchBytes</c> is refused there without ever renting past the ceiling.
+    /// Reads the full request body into a buffer from <see cref="IngestBufferPool"/> and undoes
+    /// its <c>Content-Encoding</c>, so every handler below gets the protobuf or JSON message
+    /// itself whichever way it travelled. The read is <see cref="OtlpBodyReader"/>, which the
+    /// gRPC receiver shares — a body over <c>Ingestion.MaxOtlpBatchBytes</c> is refused there
+    /// without ever renting past the ceiling — and the inflate is <see cref="OtlpGzip"/>, which
+    /// it shares too, under the SAME ceiling applied to the inflated size.
     ///
-    /// <para>Returns (null, 0) with the 413 already written, and nothing left rented, for a body
-    /// over that limit. On success the caller MUST return the buffer via
-    /// <see cref="IngestBufferPool.Return"/> — use a finally block.</para>
+    /// <para>Returns (null, 0) with the refusal already written, and nothing left rented: 415 for
+    /// a coding other than gzip or identity (before a byte of the body is read), 413 for a body
+    /// over the limit on the wire or once inflated, 400 for gzip that does not inflate. On success
+    /// the caller MUST return the buffer via <see cref="IngestBufferPool.Return"/> — use a
+    /// finally block. It is the inflated buffer when the body was compressed; the compressed one
+    /// has already gone back.</para>
     /// </summary>
     private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
     {
-        var body = await OtlpBodyReader.ReadAsync(
-            ctx, ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes);
+        // Decided before the body is read: bytes in a coding this receiver cannot undo could
+        // only be refused after a buffer had been spent on them.
+        ContentCoding coding = ClassifyContentEncoding(ctx.Request.Headers.ContentEncoding);
+        if (coding == ContentCoding.Unsupported)
+        {
+            WriteUnsupportedEncoding(ctx);
+            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
+            return (null, 0);
+        }
+
+        int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
+        var body = await OtlpBodyReader.ReadAsync(ctx, maxBytes);
 
         // The one thing the two receivers do differently with a refusal: this one has an HTTP
         // status to say it in. The gRPC receiver says it in trailers, as RESOURCE_EXHAUSTED.
-        if (body.Buffer is null) ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-        return body;
+        if (body.Buffer is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+            return body;
+        }
+
+        // gzip over NOTHING is an empty message, exactly as an uncompressed empty body is: there
+        // is no member to inflate, and GZipStream would read the same zero bytes after allocating
+        // itself to find that out. What an empty message answers is the parser's business.
+        if (coding == ContentCoding.Identity || body.Length == 0) return body;
+
+        return InflateBody(ctx, body.Buffer, body.Length, maxBytes);
+    }
+
+    /// <summary>
+    /// The gzip road: inflates into a second pooled buffer under the same
+    /// <c>MaxOtlpBatchBytes</c> ceiling the wire read used, then gives the compressed one back —
+    /// on every outcome, since nothing downstream reads compressed bytes.
+    ///
+    /// <para>What the ceiling means here is what #57 established for gRPC and what this issue
+    /// (#82) had to keep: it bounds the INFLATED size and is decided on bytes already written,
+    /// so a body of a few hundred KB that would inflate at ~1032:1 costs at most one
+    /// limit-sized buffer before the 413 — never the gigabytes it describes. Both buffers are
+    /// from <see cref="IngestBufferPool"/>, so at the steady state an accepted compressed batch
+    /// allocates nothing but the inflater itself.</para>
+    /// </summary>
+    private static (byte[]? Buffer, int Length) InflateBody(HttpContext ctx, byte[] compressed, int compressedLength, int maxBytes)
+    {
+        InflateResult result;
+        byte[]? inflated;
+        int inflatedLength;
+        try
+        {
+            result = OtlpGzip.Inflate(compressed.AsMemory(0, compressedLength), maxBytes, out inflated, out inflatedLength);
+        }
+        finally
+        {
+            IngestBufferPool.Return(compressed);
+        }
+
+        if (result == InflateResult.Ok) return (inflated, inflatedLength);
+
+        if (result == InflateResult.TooLarge)
+        {
+            // The same answer as a body that was too big on the wire — to the client they are
+            // one condition, "this batch is over the limit", and one remedy: split it.
+            _gzipTooLarge(ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Http"),
+                          maxBytes, null);
+            ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        }
+        else
+        {
+            // Not gzip, truncated, or a trailer that disagrees with what it inflated to: the
+            // client sent bytes nobody can read, which is a 400 — never a 500, and nothing was
+            // parsed, so unlike a malformed message there is no ingested prefix to warn about.
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+        }
+        return (null, 0);
+    }
+
+    // ── Content-Encoding ──────────────────────────────────────────────────────
+
+    /// <summary>What a request's Content-Encoding asks this receiver to undo.</summary>
+    internal enum ContentCoding
+    {
+        /// <summary>No header, an empty one, or only <c>identity</c>: the body is the message.</summary>
+        Identity,
+        /// <summary>Exactly one gzip (<c>x-gzip</c> is its registered alias).</summary>
+        Gzip,
+        /// <summary>Anything else — deflate, br, zstd, a typo, or gzip applied twice.</summary>
+        Unsupported,
+    }
+
+    /// <summary>
+    /// Reads the header as the list RFC 9110 says it is — comma-separated, in any case, over one
+    /// or several header lines — without allocating: the values are Kestrel's strings, walked as
+    /// spans. <c>identity</c> and empty members change nothing and are skipped.
+    ///
+    /// <para>Gzip applied TWICE is refused rather than inflated twice: no exporter does it, and
+    /// each pass would need its own limit-sized buffer. Refusing is the answer that keeps the
+    /// memory bound a single buffer.</para>
+    /// </summary>
+    internal static ContentCoding ClassifyContentEncoding(StringValues header)
+    {
+        int gzip = 0;
+        foreach (string? value in header)
+        {
+            ReadOnlySpan<char> list = value;
+            foreach (Range member in list.Split(','))
+            {
+                ReadOnlySpan<char> coding = list[member].Trim();
+                if (coding.IsEmpty || coding.Equals("identity", StringComparison.OrdinalIgnoreCase)) continue;
+                if (coding.Equals("gzip", StringComparison.OrdinalIgnoreCase)
+                 || coding.Equals("x-gzip", StringComparison.OrdinalIgnoreCase))
+                {
+                    gzip++;
+                    continue;
+                }
+                return ContentCoding.Unsupported;
+            }
+        }
+        return gzip switch
+        {
+            0 => ContentCoding.Identity,
+            1 => ContentCoding.Gzip,
+            _ => ContentCoding.Unsupported,
+        };
+    }
+
+    /// <summary>
+    /// The codings a 415 names as acceptable, in <c>Accept-Encoding</c> — which is how RFC 9110
+    /// (§15.5.16) says a server refusing a content coding should tell the client what would
+    /// have worked. One interned literal, so setting it allocates nothing.
+    /// </summary>
+    internal const string AcceptedContentEncodings = "gzip, identity";
+
+    /// <summary>
+    /// The 415, written without an await so the formatting can use spans: status,
+    /// <c>Accept-Encoding</c>, and a body that is the OTLP failure shape — a
+    /// <c>google.rpc.Status</c> whose <c>message</c> says in words what was refused, encoded
+    /// like the request (protobuf for protobuf, JSON otherwise), as the OTLP/HTTP specification
+    /// asks of every 4xx. The collector's exporter decodes exactly that and prints the message
+    /// in its own log, which is where an operator who left compression on something other than
+    /// gzip will be looking.
+    /// </summary>
+    private static void WriteUnsupportedEncoding(HttpContext ctx)
+    {
+        var response = ctx.Response;
+        bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+        response.StatusCode             = StatusCodes.Status415UnsupportedMediaType;
+        response.Headers.AcceptEncoding = AcceptedContentEncodings;
+        response.ContentType            = isProto ? ProtobufContentType : JsonContentType;
+
+        var writer = response.BodyWriter;
+        writer.Advance(FormatUnsupportedEncoding(
+            writer.GetSpan(UnsupportedEncodingMaxBytes), ctx.Request.Headers.ContentEncoding, isProto));
+    }
+
+    /// <summary>Longest stretch of the client's header echoed back — enough for any real coding list.</summary>
+    internal const int EchoMaxChars = 64;
+
+    /// <summary>The message, at its longest: both literals and a full echo. Under 128, so its protobuf length is one byte.</summary>
+    private const int UnsupportedMessageMaxBytes = 18 + EchoMaxChars + 41;
+
+    /// <summary>The body, at its longest: the JSON framing is the larger of the two.</summary>
+    internal const int UnsupportedEncodingMaxBytes = 12 + UnsupportedMessageMaxBytes + 2;
+
+    /// <summary>
+    /// Formats the 415 body into <paramref name="dest"/>; returns the byte count written.
+    ///
+    /// <para>The header is echoed so the text names what was actually sent — "deflate" and
+    /// "gzip, br" are different mistakes — but only as printable ASCII, capped at
+    /// <see cref="EchoMaxChars"/>, and with the quote and backslash that would end or escape
+    /// a JSON string replaced: it is the client's own input, and it goes into a body.</para>
+    /// </summary>
+    internal static int FormatUnsupportedEncoding(Span<byte> dest, StringValues contentEncoding, bool protobuf)
+    {
+        ReadOnlySpan<byte> head = "Content-Encoding '"u8;
+        ReadOnlySpan<byte> tail = "' is not supported; send gzip or identity"u8;
+
+        Span<byte> message = stackalloc byte[UnsupportedMessageMaxBytes];
+        head.CopyTo(message);
+        int n = head.Length;
+        n += Echo(message.Slice(n, EchoMaxChars), contentEncoding);
+        tail.CopyTo(message[n..]);
+        n += tail.Length;
+
+        int o = 0;
+        if (protobuf)
+        {
+            dest[o++] = 0x12;                                                  // Status.message = 2, length-delimited
+            dest[o++] = (byte)n;                                               // n < 128: a one-byte varint
+            message[..n].CopyTo(dest[o..]);
+            return o + n;
+        }
+
+        ReadOnlySpan<byte> open = "{\"message\":\""u8;
+        open.CopyTo(dest);
+        o = open.Length;
+        message[..n].CopyTo(dest[o..]);
+        o += n;
+        "\"}"u8.CopyTo(dest[o..]);
+        return o + 2;
+    }
+
+    /// <summary>The header's values joined by ", " into <paramref name="dest"/>, sanitised and cut at its length.</summary>
+    private static int Echo(Span<byte> dest, StringValues values)
+    {
+        int n = 0;
+        for (int v = 0; v < values.Count; v++)
+        {
+            ReadOnlySpan<char> text = values[v];
+            if (v > 0)
+            {
+                if (n < dest.Length) dest[n++] = (byte)',';
+                if (n < dest.Length) dest[n++] = (byte)' ';
+            }
+            for (int i = 0; i < text.Length && n < dest.Length; i++)
+            {
+                char c = text[i];
+                dest[n++] = c is >= ' ' and <= '~' and not '"' and not '\\' and not '\'' ? (byte)c : (byte)'?';
+            }
+        }
+        return n;
     }
 
     /// <summary>
