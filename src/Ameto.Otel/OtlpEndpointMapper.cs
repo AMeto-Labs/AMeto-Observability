@@ -388,6 +388,13 @@ public static class OtlpEndpointMapper
                           maxBytes, null);
             ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
         }
+        else if (result == InflateResult.Unavailable)
+        {
+            // Out of memory, ours or zlib's: the server's failure, not the batch's. The same
+            // retryable answer as a full gate — a 400 here would have the exporter drop a valid
+            // batch for good.
+            WriteRetryLater(ctx, MemoryShortMessage);
+        }
         else
         {
             // Not gzip, truncated, or a trailer that disagrees with what it inflated to: the
@@ -402,6 +409,9 @@ public static class OtlpEndpointMapper
 
     /// <summary>What a 503 says when every inflate slot stayed taken.</summary>
     internal static ReadOnlySpan<byte> GateFullMessage => "the server is inflating as many gzip batches as it can hold; retry"u8;
+
+    /// <summary>What a 503 says when the inflate ran out of memory.</summary>
+    internal static ReadOnlySpan<byte> MemoryShortMessage => "the server ran short of memory inflating this batch; retry"u8;
 
     /// <summary>
     /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and

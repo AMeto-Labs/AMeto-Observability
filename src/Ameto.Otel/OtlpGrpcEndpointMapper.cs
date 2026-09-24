@@ -43,6 +43,9 @@ public static class OtlpGrpcEndpointMapper
     /// <summary>What UNAVAILABLE says when every inflate slot stayed taken — retried by every OTLP exporter.</summary>
     internal const string GateFullMessage = "the server is inflating as many gzip batches as it can hold; retry";
 
+    /// <summary>What UNAVAILABLE says when the inflate ran out of memory.</summary>
+    internal const string MemoryShortMessage = "the server ran short of memory inflating this batch; retry";
+
     public static void MapOtlpGrpcEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
     {
         // The SAME gate the HTTP receivers inflate under — one bound on inflated buffers for the
@@ -185,6 +188,11 @@ public static class OtlpGrpcEndpointMapper
                            .CreateLogger("Ameto.Otel.Grpc")
                            .LogWarning("OTLP/gRPC: a compressed batch inflated past {Limit} bytes and was refused", maxBytes);
                         await FinishAsync(ctx, StatusResourceExhausted, "batch exceeds the configured OTLP limit");
+                        break;
+                    case UnframeResult.Unavailable:
+                        // Out of memory inflating it — the server's failure. UNAVAILABLE is retried;
+                        // INVALID_ARGUMENT, which this used to be, made the exporter drop the batch.
+                        await FinishAsync(ctx, StatusUnavailable, MemoryShortMessage);
                         break;
                     default:
                         await FinishAsync(ctx, StatusInvalidArgument, "malformed gRPC frame");

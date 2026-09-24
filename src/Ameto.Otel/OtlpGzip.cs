@@ -13,6 +13,11 @@ internal enum InflateResult
     Malformed,
     /// <summary>It inflates past the batch limit.</summary>
     TooLarge,
+    /// <summary>
+    /// The server could not inflate it NOW — out of memory, the runtime's or zlib's. Not the
+    /// client's fault, so answered as a retry (503 / UNAVAILABLE), never as a refusal.
+    /// </summary>
+    Unavailable,
 }
 
 /// <summary>
@@ -49,8 +54,10 @@ internal static class OtlpGzip
     /// <para>On <see cref="InflateResult.Ok"/> the CALLER owns <paramref name="rented"/> and returns
     /// it to <see cref="IngestBufferPool"/> in a finally; the message is its first
     /// <paramref name="length"/> bytes. On anything else <paramref name="rented"/> is null and
-    /// nothing is left rented. Never throws: a stream zlib cannot read is
-    /// <see cref="InflateResult.Malformed"/>, which the receivers answer as a client error.</para>
+    /// nothing is left rented. A stream zlib cannot read is <see cref="InflateResult.Malformed"/>
+    /// (the client's error); running out of memory — the runtime's or zlib's — is
+    /// <see cref="InflateResult.Unavailable"/> (the server's, and retryable); any other exception
+    /// is a bug and propagates, after the buffer has gone back.</para>
     /// </summary>
     /// <remarks>
     /// Takes the payload as <see cref="ReadOnlyMemory{T}"/>, not a span, for one reason:
@@ -79,10 +86,15 @@ internal static class OtlpGzip
         long ceiling = (long)payload.Length * MaxDeflateRatio;
         long want    = Math.Max(hint > 0 ? Math.Min(hint, ceiling) : (long)payload.Length * 4, MinInflateBuffer);
         int capacity = (int)Math.Min(want, Math.Max(maxInflatedBytes, 1));
-        rented       = IngestBufferPool.Rent(capacity);
+        rented       = null;
 
         try
         {
+            // Inside the try, like the grow below: the first rent is an allocation too, and an
+            // OutOfMemoryException from it used to escape as a 500 where the same failure one
+            // doubling later was a 400 — the answer depended on which rent ran out.
+            rented = IngestBufferPool.Rent(capacity);
+
             // No copy of the compressed bytes: the payload is a window onto the caller's request
             // buffer, and MemoryStream can wrap that array where it lies.
             using var input = AsStream(payload);
@@ -147,11 +159,37 @@ internal static class OtlpGzip
             length = total;
             return InflateResult.Ok;
         }
-        catch
+        catch (InvalidDataException)
         {
-            if (rented is not null) { IngestBufferPool.Return(rented); rented = null; }
+            // What zlib says about the BYTES — not deflate, a bad block, a CRC or length that
+            // disagrees: the one failure that is the client's, and not worth retrying.
+            ReturnRented(ref rented);
             return InflateResult.Malformed;
         }
+        catch (Exception ex) when (ex is OutOfMemoryException or IOException)
+        {
+            // The SERVER could not do it now: the runtime out of memory for a buffer, or zlib out
+            // of memory for its state (Z_MEM_ERROR surfaces as the runtime's internal
+            // ZLibException, an IOException — nothing else here throws one, the input is a
+            // MemoryStream). Answered as the gate's refusal is, 503 / UNAVAILABLE, which OTLP
+            // exporters retry. It used to be Malformed — 400 / INVALID_ARGUMENT, which they never
+            // retry — so under memory pressure a collector discarded a valid batch.
+            ReturnRented(ref rented);
+            return InflateResult.Unavailable;
+        }
+        catch
+        {
+            // Anything else is a bug here, and blaming the client for it would hide it: it
+            // propagates, with the buffer back where it belongs.
+            ReturnRented(ref rented);
+            throw;
+        }
+    }
+
+    private static void ReturnRented(ref byte[]? rented)
+    {
+        if (rented is not null) IngestBufferPool.Return(rented);
+        rented = null;
     }
 
     /// <summary>A gzip member's fixed header (10 bytes) and trailer (CRC-32 and ISIZE, 8 bytes): nothing shorter is one.</summary>

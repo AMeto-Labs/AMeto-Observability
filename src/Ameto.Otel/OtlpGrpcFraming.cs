@@ -14,6 +14,8 @@ internal enum UnframeResult
     UnsupportedEncoding,
     /// <summary>The message inflates past the batch limit.</summary>
     TooLarge,
+    /// <summary>The server ran out of memory inflating it: retryable, not the client's fault.</summary>
+    Unavailable,
 }
 
 /// <summary>
@@ -91,7 +93,12 @@ internal static class OtlpGrpcFraming
         var inflated = OtlpGzip.Inflate(body.Slice(HeaderBytes, (int)declared), maxInflatedBytes,
                                         out rented, out rentedLength);
         if (inflated != InflateResult.Ok)
-            return inflated == InflateResult.TooLarge ? UnframeResult.TooLarge : UnframeResult.Malformed;
+            return inflated switch
+            {
+                InflateResult.TooLarge    => UnframeResult.TooLarge,
+                InflateResult.Unavailable => UnframeResult.Unavailable,
+                _                         => UnframeResult.Malformed,
+            };
 
         message = rented.AsSpan(0, rentedLength);
         return UnframeResult.Ok;

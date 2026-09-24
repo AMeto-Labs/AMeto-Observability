@@ -188,6 +188,47 @@ public sealed class OtlpGzipTests
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
     }
 
+    // ── When the server fails, not the body ──────────────────────────────────
+
+    /// <summary>
+    /// Running out of memory is the SERVER's failure — the runtime's for a buffer, or zlib's for
+    /// its state (Z_MEM_ERROR, which the runtime raises as an IOException). It used to come back
+    /// Malformed, answered 400 / INVALID_ARGUMENT, which OTLP exporters never retry: under memory
+    /// pressure a valid batch was discarded. And the answer depended on WHICH rent failed — the
+    /// first one was outside the try and escaped as a 500. The trailer here lies low, so the
+    /// second rent is the grow.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false)]      // the first rent, out of memory
+    [InlineData(2, false)]      // the grow, out of memory
+    [InlineData(1, true)]       // zlib's own allocation failure
+    [InlineData(2, true)]
+    public void Running_out_of_memory_is_Unavailable_not_the_clients_fault(int failingRent, bool zlib)
+    {
+        byte[] body = (byte[])GzipBomb.Payload.Clone();
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(body.Length - 4), 1);
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        ledger.FailRent(failingRent, zlib ? new IOException("inflate_: not enough memory") : new OutOfMemoryException());
+
+        Assert.Equal(InflateResult.Unavailable, Inflate(body, out _));
+        ledger.AssertEveryBufferCameBackOnce(minRents: failingRent - 1);
+    }
+
+    [Fact]
+    public void Anything_else_is_a_bug_and_propagates_with_the_buffer_back()
+    {
+        // Neither the client's fault nor a shortage: blaming the client would hide it.
+        byte[] body = (byte[])GzipBomb.Payload.Clone();
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(body.Length - 4), 1);
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        ledger.FailRent(2, new InvalidOperationException("a bug in the inflate"));
+
+        Assert.Throws<InvalidOperationException>(() => OtlpGzip.Inflate(body, Limit, out _, out _));
+        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
+    }
+
     // ── The bomb ──────────────────────────────────────────────────────────────
 
     /// <summary>

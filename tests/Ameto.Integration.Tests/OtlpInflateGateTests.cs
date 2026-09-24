@@ -151,6 +151,32 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         }
     }
 
+    /// <summary>
+    /// PR #96 review, finding 2, through the receiver: an inflate that runs out of memory answers
+    /// the retryable 503 — not the 400 the grow used to earn, nor the 500 the first rent used to
+    /// escape as — and still gives back its slot and every buffer. Rent 1 is the compressed body;
+    /// rent 2 the inflate's first buffer; rent 3, with the trailer lying low, its grow.
+    /// </summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task An_inflate_that_runs_out_of_memory_is_503_not_400_and_gives_everything_back(int failingRent)
+    {
+        byte[] body = (byte[])GzipBomb.Payload.Clone();
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(body.Length - 4), 1);
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        ledger.FailRent(failingRent, new OutOfMemoryException());
+        using var response = await PostAsync("/v1/logs", body, protobuf: true, gzip: true);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal(TimeSpan.FromSeconds(1), response.Headers.RetryAfter?.Delta);
+        Assert.Equal("the server ran short of memory inflating this batch; retry",
+                     StatusMessage(await response.Content.ReadAsByteArrayAsync(), protobuf: true));
+        Assert.Equal(Slots, _factory.Gate.Available);
+        ledger.AssertEveryBufferCameBackOnce(minRents: failingRent - 1);
+    }
+
     // ── OTLP/gRPC: UNAVAILABLE ────────────────────────────────────────────────
 
     /// <summary>
@@ -186,6 +212,26 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal("0", freed.Response.Headers["grpc-status"].ToString());
         Assert.Equal(2, decoded);
         Assert.Equal(1, gate.Available);                                       // and the slot came back
+    }
+
+    [Fact]
+    public async Task A_grpc_inflate_that_runs_out_of_memory_is_UNAVAILABLE_not_INVALID_ARGUMENT()
+    {
+        // Rent 1 is the framed body, rent 2 the inflate's first buffer. It used to escape the
+        // handler (the first rent was outside the inflate's try); a failed grow was INVALID_ARGUMENT,
+        // which an exporter never retries.
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var call = GrpcCall(Frame(OtlpGzipTests.Gzip(EmptyExport("/v1/logs", protobuf: true)), compressed: true));
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        ledger.FailRent(2, new OutOfMemoryException());
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate,
+            static (_, _) => throw new InvalidOperationException("nothing should reach the decoder"));
+
+        Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(OtlpGrpcEndpointMapper.MemoryShortMessage, call.Response.Headers["grpc-message"].ToString());
+        Assert.Equal(1, gate.Available);
+        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
     }
 
     // ── Harness ───────────────────────────────────────────────────────────────

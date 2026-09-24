@@ -459,6 +459,23 @@ internal sealed class IngestBufferPoolLedger : IDisposable
     private int _rents, _returns, _peak, _largest;
     private long _outBytes, _peakBytes;
 
+    private int        _attempts, _failAt;
+    private Exception? _fault;
+
+    /// <summary>
+    /// Makes this flow's <paramref name="nth"/> rent from now on (1-based) throw
+    /// <paramref name="fault"/> instead of handing the array out — an allocation that failed, as
+    /// far as the caller can tell. The array the pool produced is dropped, never counted as out.
+    /// </summary>
+    public void FailRent(int nth, Exception fault)
+    {
+        lock (_gate)
+        {
+            _failAt = _attempts + nth;
+            _fault  = fault;
+        }
+    }
+
     public static IngestBufferPoolLedger Open()
     {
         var existing = Interlocked.CompareExchange(ref IngestBufferPool.Observer, Installed, null);
@@ -476,6 +493,11 @@ internal sealed class IngestBufferPoolLedger : IDisposable
     {
         lock (_gate)
         {
+            if (++_attempts == _failAt)
+            {
+                _failAt = 0;
+                throw _fault!;
+            }
             _rents++;
             _largest = Math.Max(_largest, array.Length);
             if (!_out.Add(array))
