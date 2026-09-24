@@ -55,6 +55,7 @@ public static class EndpointMapper
         app.MapGet("/api/events", async (
             HttpContext           ctx,
             IQueryExecutor        executor,
+            StorageEngine         storage,
             QueryGuard            guard,
             ILoggerFactory        loggerFactory,
             string?               filter   = null,
@@ -97,6 +98,10 @@ public static class EndpointMapper
                 AfterTimestampTicks = afterTs,
                 Levels              = levelSet,
             };
+
+            // A closed log store (#95), refused before the stream opens: once it has, the only
+            // answer left is a stream that dies.
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             QueryGuard.Lease? lease;
             try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
@@ -394,13 +399,26 @@ public static class EndpointMapper
 
             var svcFilter = string.IsNullOrEmpty(service) ? null : service;
 
+            // A closed log store (#95) — asked BEFORE the cache, so a closed store is refused rather
+            // than served the last answer it gave while open for as long as that stays cached.
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
             // Cache keyed on the bucket grid so drifting "now" bounds still hit within a TTL.
             var cacheKey = new CountsCacheKey(minB, maxB, bucketSeconds, svcFilter);
             if (cache.TryGet(cacheKey, out var cached))
                 return Results.Json(cached, EventCountsJsonContext.Default.EventCountsResponse);
 
-            var result = await storage.AggregateLogVolumeAsync(
-                fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+            // AND AFTER THE READ, before anything is cached: a store that closed during it either
+            // threw (its snapshot refuses once the teardown has collected its tiers) or answered
+            // from a teardown in progress. Neither is a count to serve, or to keep serving.
+            LogVolumeCounts result;
+            try
+            {
+                result = await storage.AggregateLogVolumeAsync(
+                    fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+            }
+            catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             var buckets = new long[nBuckets];
             for (int i = 0; i < nBuckets; i++)

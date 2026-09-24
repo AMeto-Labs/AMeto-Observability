@@ -448,11 +448,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// tick that began open and read after the close — the race #84 closed for the host stop.</item>
     /// </list>
     ///
-    /// <para><b>The log store is not asked.</b> It never answers a closed read with empty: once its
-    /// teardown has collected its hot tiers its reader snapshot THROWS, which reaches the catch in
-    /// <see cref="EvaluateAllAsync"/> and leaves the rule alone. It does not implement
-    /// <see cref="IQueryAvailability"/>, so the partial answer of its background catalog scan at
-    /// startup is not caught here — see the report on #95.</para>
+    /// <para><b>The log store differs in one way: closed, it THROWS.</b> Once its teardown has
+    /// collected its hot tiers, its reader snapshot raises <see cref="ObjectDisposedException"/>
+    /// instead of answering. The rule was never resolved by that, but every rule over it logged a
+    /// failure with a stack trace on every tick. A read the store's own close cut short is now the
+    /// Closed answer it is: skipped, and said once a minute. An ObjectDisposedException from a store
+    /// that is NOT closed is still a failure, and still reported as one.</para>
     /// </summary>
     private async ValueTask<AlertValue> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct)
     {
@@ -460,19 +461,27 @@ public sealed class AlertEvaluator : IAsyncDisposable
         {
             AlertSource.Metric => _metrics,
             AlertSource.Trace  => _traceStats,
-            _                  => null,
+            _                  => _storage,
         };
 
         var before = store?.Availability ?? QueryAvailability.Available;
         if (before != QueryAvailability.Available) return AlertValue.Unavailable(before);
 
         var from = now - rule.Window;
-        double value = rule.Source switch
+        double value;
+        try
         {
-            AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
-            AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
-            _                  => await LogValueAsync(rule, from, now, ct),
-        };
+            value = rule.Source switch
+            {
+                AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
+                AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
+                _                  => await LogValueAsync(rule, from, now, ct),
+            };
+        }
+        catch (ObjectDisposedException) when (store?.Availability == QueryAvailability.Closed)
+        {
+            return AlertValue.Unavailable(QueryAvailability.Closed);
+        }
 
         var after = store?.Availability ?? QueryAvailability.Available;
         if (after != QueryAvailability.Available) return AlertValue.Unavailable(after);

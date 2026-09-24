@@ -12,6 +12,9 @@
          several index groups out of a small file, and SegmentReader.PooledSectionRents, to
          assert a section is read once per group rather than once per phase. -->
     <InternalsVisibleTo Include="Ameto.Query.Tests" />
+    <!-- #95: the alert and API tests of the log store's availability hold its catalog scan open
+         (StorageEngine.HoldCatalogScanForTest) and wait for it (CatalogLoaded). -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
   </ItemGroup>
 
   <ItemGroup>
