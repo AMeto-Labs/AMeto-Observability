@@ -827,12 +827,41 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>
     /// How many passes <see cref="RunColdMaintenanceLoopAsync"/> has STARTED. A test that drives
     /// <see cref="TryMergeSmallSegmentsOnceAsync"/> itself and then counts the events its
-    /// segments serve is only meaningful while this reads 0: the planner is deterministic, so a
-    /// background pass running alongside such a test picks the batch the test is merging, and
-    /// both publish an output for it. Asserting on it means a settle delay that quietly came
-    /// back cannot pass itself off as a flake.
+    /// segments serve is only meaningful while this reads 0. The merge gate
+    /// (<see cref="_mergeGate"/>) keeps a background pass from merging a batch a second time,
+    /// but not from holding the gate when the test calls, and the test's merge then merges
+    /// nothing. Asserting on it means a settle delay that quietly came back cannot pass itself
+    /// off as a flake.
     /// </summary>
     internal int ColdMaintenancePassesStarted => Volatile.Read(ref _coldMaintenancePasses);
+
+    /// <summary>
+    /// 1 while a merge, or a maintenance pass around one, runs; a compare-exchange from 0 is what
+    /// starts either (<see cref="TryEnterMergeGate"/>), and a caller that loses it does nothing
+    /// and reports that nothing was merged.
+    ///
+    /// <para>The planner is deterministic, oldest bucket first, so two merges started together
+    /// pick the SAME batch, both write an output, both commit, and the batch's events are then on
+    /// disk twice for good (#85: +6 400 and +48 281 events when a test's merges met the
+    /// background loop's). Excluding the second CALL rather than the batch — an "in merge" mark
+    /// on its sources — because that is not the only thing two merges share: the planner's
+    /// bookkeeping (<see cref="_mergeSkip"/>, <c>_mergePassDeferred</c>, <c>_mergeDeferStrikes</c>)
+    /// is plain collections owned by one thread, the merged-away mark
+    /// (<see cref="MayHaveBeenMergedAway"/>) is argued for one merge at a time, and a pass's
+    /// recovery sweep reads an in-flight merge's manifest, with its output already moved into
+    /// place, as a crashed merge and deletes sources the catalog still names. Merges are bounded
+    /// by the flush slots anyway, so a second one in parallel would buy nothing.</para>
+    ///
+    /// <para>Not a wait: the loser returns at once with no queued work, no semaphore and no
+    /// cancellation to thread through. In production the maintenance loop is the only caller;
+    /// a pass that loses reads as an idle one and sleeps its long pause.</para>
+    /// </summary>
+    private int _mergeGate;
+
+    /// <summary>The answer of a merge or pass that found the gate taken.</summary>
+    private static readonly Task<bool> NothingMerged = Task.FromResult(false);
+
+    private bool TryEnterMergeGate() => Interlocked.CompareExchange(ref _mergeGate, 1, 0) == 0;
 
     /// <summary>
     /// Cold-tier maintenance: finish any interrupted merge, then MERGE small segments into
@@ -905,9 +934,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>Internal so a test can run a pass without the loop's three-minute settle. Past the
     /// background retry's window the deferred-delete sweep below and retention's are the only
     /// retries a parked file gets, so dropping either must fail a test and not only a stand.</para>
+    ///
+    /// <para>Under the merge gate (<see cref="_mergeGate"/>), sweeps included: a pass that finds
+    /// a merge or another pass running does nothing and returns false.</para>
     /// </summary>
     internal Task<bool> RunColdMaintenancePassAsync(CancellationToken ct)
     {
+        // The recovery sweep below cannot tell a crashed merge from one in flight: both are a
+        // manifest beside an output at its final name. Only the gate keeps it off a live one.
+        if (!TryEnterMergeGate()) return NothingMerged;
+
         // Finish any merge whose source deletion was blocked by an open reader
         // (the manifest survives until every source file is gone).
         try { RecoverInterruptedMerges(); }
@@ -917,9 +953,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { RetryPendingSegmentDeletes(); }
         catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
 
-        // Handed back, not awaited: the merge is already async, and a second state machine around
-        // it would add only its own allocation.
-        return TryMergeSmallSegmentsOnceAsync(ct);
+        // Handed back, not awaited: MergeUnderGateAsync lets go of the gate when the merge ends.
+        return MergeUnderGateAsync(ct);
     }
 
     /// <summary>
@@ -1306,9 +1341,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>"May have" is decided by the mark, not by whether anything was ever evicted — on a
     /// server that has merged more than <see cref="MergedAwaySegmentCap"/> sources in its life
     /// something always has been, and every retention delete racing a scan would then be called
-    /// a merge. Merges run one at a time, and each records ALL its sources and then takes them
-    /// out of the catalog in one swap; the mark scans read (<see cref="_mergedAwayMark"/>) moves
-    /// past a batch's records only after that swap. The scan read its mark before its snapshot
+    /// a merge. Merges run one at a time (<see cref="_mergeGate"/>), and each records ALL its
+    /// sources and then takes them out of the catalog in one swap; the mark scans read
+    /// (<see cref="_mergedAwayMark"/>) moves past a batch's records only after that swap. The
+    /// scan read its mark before its snapshot
     /// listed the key, so before the swap took the key's entry out, so before this batch's
     /// records were published: the mark is at most the previous batch's last record, and every
     /// record of this batch is above it. Eviction that has not reached the mark cannot have
@@ -2942,9 +2978,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// and a manifest never names sources that are not already duplicated. Recovery reads both
     /// halves: merged file present ⇒ finish deleting, absent ⇒ the merge never committed.</para>
     ///
+    /// <para>One at a time, under the merge gate (<see cref="_mergeGate"/>): a call that finds a
+    /// merge or a maintenance pass running merges nothing and returns false, since it would pick
+    /// the very batch the running one is merging.</para>
+    ///
     /// Returns true when a batch was merged.
     /// </summary>
-    internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
+    internal Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct) =>
+        TryEnterMergeGate() ? MergeUnderGateAsync(ct) : NothingMerged;
+
+    /// <summary>One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.</summary>
+    private async Task<bool> MergeUnderGateAsync(CancellationToken ct)
+    {
+        try { return await MergeOneBatchAsync(ct).ConfigureAwait(false); }
+        finally { Volatile.Write(ref _mergeGate, 0); }
+    }
+
+    /// <summary>The body of <see cref="TryMergeSmallSegmentsOnceAsync"/>; the caller holds the merge gate.</summary>
+    private async Task<bool> MergeOneBatchAsync(CancellationToken ct)
     {
         // Never produce index-less segments: the builder is wired by a hosted
         // service shortly after startup — if it isn't there yet, just wait.

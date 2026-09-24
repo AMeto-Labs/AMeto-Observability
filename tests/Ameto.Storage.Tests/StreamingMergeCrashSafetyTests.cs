@@ -411,6 +411,56 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("Quarantining", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// A merge, and a whole maintenance pass, started while another merge is in flight do
+    /// nothing (#85). The planner is deterministic, so a second merge picks the batch the first
+    /// is merging; both commit an output, and the batch's events are on disk twice for good. And
+    /// a pass's recovery sweep takes the first merge's manifest, beside an output already at its
+    /// final name, for a crashed merge's, and deletes sources the catalog still names.
+    ///
+    /// <para>Both are started from the first merge's last step before its commit — output moved
+    /// into place, sources still in the catalog — each on a pool thread, since a merge that is not
+    /// stopped awaits without ConfigureAwait and this hook runs on the test's context.</para>
+    /// </summary>
+    [Fact]
+    public async Task ASecondMergeOrPassDuringAMerge_DoesNothing()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before  = ReadEverything();
+        var sources = _engine.ListSegments().Select(s => s.FilePath).ToList();
+
+        bool? secondMerged = null, passMerged = null;
+        bool  sourcesOnDisk = false;
+        int   commits = 0;
+        _engine._beforeMergeSwap = () =>
+        {
+            if (Interlocked.Increment(ref commits) != 1) return;   // a second merge's own commit
+            secondMerged  = Task.Run(() => _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)).GetAwaiter().GetResult();
+            passMerged    = Task.Run(() => _engine.RunColdMaintenancePassAsync(CancellationToken.None)).GetAwaiter().GetResult();
+            sourcesOnDisk = sources.All(File.Exists);
+        };
+        bool merged;
+        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        finally { _engine._beforeMergeSwap = null; }
+
+        Assert.True(merged, "setup: the first merge merged nothing");
+        Assert.False(secondMerged, "a second merge ran beside the first");    // true: it merged the same batch again
+        Assert.False(passMerged,   "a maintenance pass ran beside the merge");
+        Assert.True(sourcesOnDisk, "a sweep deleted the sources of a merge that had not committed");
+        Assert.Equal(1, commits);
+        Assert.Single(_engine.ListSegments());
+        AssertSameEvents(before, ReadEverything());
+        Assert.Empty(Directory.GetFiles(SegDir, "*.mergemanifest"));
+
+        // The gate is let go when a merge ends and when a pass ends: after one of each, a fresh
+        // batch merges.
+        Assert.False(await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // one segment: nothing to merge
+        for (int round = 10; round < 20; round++)
+            await WriteSegmentAsync(round, 60);
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the merge gate was never let go");
+    }
+
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>
     [Fact]
     public async Task CrashMidDeletion_FinishesTheRemainingSources()
