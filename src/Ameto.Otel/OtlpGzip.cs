@@ -114,12 +114,22 @@ internal static class OtlpGzip
                 int room = Math.Min(rented.Length, maxInflatedBytes) - total;
                 if (room == 0)
                 {
+                    // Full — which is where an EXACT-FIT message ends, not only one that needs
+                    // more: a trailer naming a bucket size, and every rent above
+                    // IngestBufferPool.MaxPooledBytes (those are exact-length), fill the buffer
+                    // to the byte. Growing first meant doubling and copying just to learn the
+                    // stream was over — at a 16 MiB limit a 9 MiB message took 25 MiB of large-
+                    // object arrays. One byte asks the same question for nothing.
+                    int next = gzip.ReadByte();
+                    if (next < 0) break;
+
                     int target   = (int)Math.Min((long)rented.Length * 2, maxInflatedBytes);
                     byte[] grown = IngestBufferPool.Rent(target);
                     rented.AsSpan(0, total).CopyTo(grown);
                     IngestBufferPool.Return(rented);
                     rented = grown;
-                    room   = Math.Min(rented.Length, maxInflatedBytes) - total;
+                    rented[total++] = (byte)next;                    // total < limit here, so it fits
+                    continue;                                        // back past the limit check
                 }
 
                 int read = gzip.Read(rented, total, room);

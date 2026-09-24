@@ -163,6 +163,31 @@ public sealed class OtlpGzipTests
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
     }
 
+    /// <summary>
+    /// A message that fills its first buffer to the byte is WHOLE, and costs that one buffer.
+    /// It is the common shape, not a corner: the trailer is exact, so a message whose size is a
+    /// pool bucket fits exactly, and above <see cref="IngestBufferPool.MaxPooledBytes"/> every
+    /// rent is exact-length. The loop used to grow and copy before it learned the stream was
+    /// over — a second, doubled buffer each time, 16 MiB of large-object array for the 9 MiB
+    /// row below.
+    /// </summary>
+    [Theory]
+    [InlineData(256 * 1024,      Limit)]                 // the 256 KiB bucket, exactly
+    [InlineData(9 * 1024 * 1024, 16 * 1024 * 1024)]      // an exact unpooled rent under a raised limit
+    public void A_message_that_fits_its_buffer_exactly_is_inflated_in_that_one_buffer(int length, int limit)
+    {
+        byte[] data = Pattern(length);
+        byte[] body = Gzip(data);
+
+        using var ledger = IngestBufferPoolLedger.Open();
+        Assert.Equal(InflateResult.Ok, Inflate(body, out var message, limit));
+
+        Assert.Equal(data, message);
+        Assert.True(ledger.Rents == 1,
+            $"a {length:N0}-byte message that fits its first buffer took {ledger.Rents} rents, the largest {ledger.LargestRent:N0} B");
+        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
+    }
+
     // ── The bomb ──────────────────────────────────────────────────────────────
 
     /// <summary>
