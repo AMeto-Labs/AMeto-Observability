@@ -230,31 +230,39 @@ public sealed class MetricAggregator : IMetricAggregator
             if (pts.Count < 2) continue;
             bool useCount = s.Kind == MetricKind.Histogram;
             var outPts = new List<MetricDataPoint>(pts.Count - 1);
-            int prev = -1;
-            for (int i = 0; i < pts.Count; i++)
-            {
-                if (!HasRateInput(pts[i], useCount)) continue;
-                if (prev >= 0)
-                    outPts.Add(new MetricDataPoint
-                    {
-                        TimestampUnixNano = pts[i].TimestampUnixNano,
-                        Value             = RateBetween(pts[prev], pts[i], useCount, perSecond),
-                    });
-                prev = i;
-            }
+            int prev = HasRateInput(pts[0], useCount) ? 0 : -1;
+            for (int i = 1; i < pts.Count; i++)
+                outPts.Add(new MetricDataPoint
+                {
+                    TimestampUnixNano = pts[i].TimestampUnixNano,
+                    Value             = RateAt(pts, i, ref prev, useCount, perSecond),
+                });
             rateSeries.Add(new MetricSeries { Name = s.Name, Kind = s.Kind, Unit = s.Unit, Labels = s.Labels, Points = outPts });
         }
         return rateSeries;
     }
 
     /// <summary>
-    /// Whether a point takes part in a rate: always for a histogram (its cumulative count is an
-    /// integer), and for a counter when its value is finite. A NaN or ±Infinity counter value is no
-    /// measurement (#92): the rate runs from the last finite point to the next one, as if it were not
-    /// there. Taken as a value, a NaN read as a counter RESET on the point after it (x &gt;= NaN is
-    /// false), and that point's whole cumulative value became one step's increase — a spike of the
-    /// counter's lifetime total in every rate panel and every rate alert.
+    /// The rate (or increase) at point <paramref name="i"/> — one per point after the first, as
+    /// always — from the latest point before it that has a value (<paramref name="prev"/>, advanced
+    /// here). A NaN or ±Infinity counter value is no measurement (#92): its own timestamp answers NaN
+    /// (null on the wire, a gap), and the next finite point's rate runs from the last finite one
+    /// before it. Taken as a value, a NaN read as a counter RESET on the point after it
+    /// (x &gt;= NaN is false), and that point's whole cumulative value became one step's increase —
+    /// a spike of the counter's lifetime total in every rate panel and every rate alert. With no
+    /// finite point before it, a point's rate is NaN too. On finite points <paramref name="prev"/> is
+    /// always i - 1: the answer is the one it always was.
     /// </summary>
+    private static double RateAt(IReadOnlyList<MetricDataPoint> pts, int i, ref int prev, bool useCount, bool perSecond)
+    {
+        if (!HasRateInput(pts[i], useCount)) return double.NaN;
+        double v = prev >= 0 ? RateBetween(pts[prev], pts[i], useCount, perSecond) : double.NaN;
+        prev = i;
+        return v;
+    }
+
+    /// <summary>Whether a point has a value a rate can use: always for a histogram (its cumulative
+    /// count is an integer), and for a counter when its value is finite.</summary>
     private static bool HasRateInput(in MetricDataPoint p, bool useCount) => useCount || double.IsFinite(p.Value);
 
     /// <summary>The rate (or increase) from point <paramref name="prev"/> to point <paramref name="curr"/>.</summary>
@@ -288,35 +296,34 @@ public sealed class MetricAggregator : IMetricAggregator
 
         if (op == ScalarReduce.Last)
         {
-            // Instant: one point per group = sum of each series' latest value — its latest FINITE
-            // value (#92): a NaN or ±Infinity is no measurement, so a series whose newest point is
-            // one reads as its last real value, and one with none contributes nothing. Summed as it
-            // was, one such series made the whole group's value NaN — the alert default aggregation,
-            // so the rule was never evaluated again while the series lived.
+            // Instant: one point per group = sum of each series' LATEST point (#92). A series whose
+            // latest point is NaN or ±Infinity has no current value, and contributes nothing — NOT an
+            // older finite point, which may be minutes stale: an alert rule (this is its default
+            // aggregation) would go pending and fire on a value the series no longer reports. A group
+            // none of whose latest points is finite is NaN — null on the wire, and to the evaluator
+            // "no value", which leaves the rule's state alone and says so once. Summed as it was, one
+            // such series made the whole group NaN while the others had values.
             var groups  = Grouping.Of(raw, req.GroupBy);
             var outList = new List<MetricSeries>(groups.Count);
             for (int g = 0; g < groups.Count; g++)
             {
                 var members = groups.MembersOf(g);
-                long ts = 0, tsAny = 0; double sum = 0;
+                long ts = 0; double sum = 0;
                 bool counted = false, anyPoint = false;
                 foreach (int m in members)
                 {
                     var points = raw[m].Points;
                     if (points.Count == 0) continue;
                     anyPoint = true;
-                    if (points[^1].TimestampUnixNano > tsAny) tsAny = points[^1].TimestampUnixNano;
-                    int j = points.Count - 1;
-                    while (j >= 0 && !double.IsFinite(points[j].Value)) j--;
-                    if (j < 0) continue;
-                    var last = points[j];
+                    var last = points[^1];
+                    if (last.TimestampUnixNano > ts) ts = last.TimestampUnixNano;
+                    if (!double.IsFinite(last.Value)) continue;
                     sum += last.Value;
                     counted = true;
-                    if (last.TimestampUnixNano > ts) ts = last.TimestampUnixNano;
                 }
-                // Points, and not one finite: no value — NaN (null, and "no value" to an alert),
-                // never the 0 the empty sum reads as. A group with no points at all keeps its 0.
-                if (anyPoint && !counted) { sum = double.NaN; ts = tsAny; }
+                // Points, and no finite latest one: NaN, never the 0 the empty sum reads as. A group
+                // with no points at all keeps its 0, as it always did.
+                if (anyPoint && !counted) sum = double.NaN;
                 var first = raw[members[0]];
                 outList.Add(new MetricSeries
                 {
@@ -499,15 +506,10 @@ public sealed class MetricAggregator : IMetricAggregator
                     else
                     {
                         bool useCount = s.Kind == MetricKind.Histogram;
-                        int  prev     = -1;
-                        for (int i = 0; i < points.Count; i++)
-                        {
-                            if (!HasRateInput(points[i], useCount)) continue;
-                            if (prev >= 0)
-                                Accumulate(slots, ref acc, points[i].TimestampUnixNano,
-                                           RateBetween(points[prev], points[i], useCount, rate == RateMode.PerSecond));
-                            prev = i;
-                        }
+                        int  prev     = points.Count > 0 && HasRateInput(points[0], useCount) ? 0 : -1;
+                        for (int i = 1; i < points.Count; i++)
+                            Accumulate(slots, ref acc, points[i].TimestampUnixNano,
+                                       RateAt(points, i, ref prev, useCount, rate == RateMode.PerSecond));
                     }
                 }
 
@@ -667,16 +669,16 @@ public sealed class MetricAggregator : IMetricAggregator
     }
 
     /// <summary>
-    /// The value top-K ranks a series by: its latest FINITE value (#92) — a series whose newest point
-    /// is NaN ranks by its last real value instead of below every other series — or 0 when it has
-    /// none, as an empty series always ranked.
+    /// The value top-K ranks a series by: its latest point's value — as "last" reads it, never an
+    /// older one (#92). A non-finite latest value is no value and ranks below every value (NaN, which
+    /// the default comparer orders first, so a descending sort puts it last — where a NaN always
+    /// ranked; an infinity used to rank at the top). An empty series ranks as 0, as it always did.
     /// </summary>
     private static double LastValue(MetricSeries s)
     {
-        var pts = s.Points;
-        for (int j = pts.Count - 1; j >= 0; j--)
-            if (double.IsFinite(pts[j].Value)) return pts[j].Value;
-        return 0;
+        if (s.Points.Count == 0) return 0;
+        double v = s.Points[^1].Value;
+        return double.IsFinite(v) ? v : double.NaN;
     }
 
     // ── Rented per-slot storage ───────────────────────────────────────────────

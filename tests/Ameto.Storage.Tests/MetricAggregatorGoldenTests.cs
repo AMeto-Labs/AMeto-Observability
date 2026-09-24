@@ -141,19 +141,20 @@ public sealed class MetricAggregatorGoldenTests
         Assert.Equal(new[] { 1, double.NaN, 5 },   Values(await One("g", MetricAggregation.Max)));
         Assert.Equal(new[] { T0, T0 + 15 * S, T0 + 30 * S }, (await One("g", MetricAggregation.Sum)).Points.Select(p => p.TimestampUnixNano));
 
-        // Last: each member's last FINITE value; a group with points and none finite is NaN, not 0.
+        // Last: each member's latest point; a group with points and no finite latest one is NaN, not 0.
         var last = Assert.Single((await One("g", MetricAggregation.Last)).Points);
         Assert.Equal((T0 + 30 * S, 8.0), (last.TimestampUnixNano, last.Value));
         var none = Assert.Single((await One("g", MetricAggregation.Last, "y")).Points);
         Assert.Equal((T0 + 15 * S, double.NaN), (none.TimestampUnixNano, none.Value));
 
-        // Rate: from the last finite point to the next, never a "reset" at the NaN — 20 over 20 s for
-        // pod 1 (not 30 over 10 s), plus pod 2's 40 over 20 s.
+        // Rate: one point per point after the first, as always; the NaN's own timestamp has no rate
+        // (NaN, a gap), and the next runs from the last finite point — never a "reset" at the NaN: 20
+        // over 20 s for pod 1 (not 30 over 10 s), plus pod 2's 40 over 20 s.
         var rate = await One("c", MetricAggregation.Rate);
-        Assert.Equal(new[] { T0 + 20 * S }, rate.Points.Select(p => p.TimestampUnixNano));
-        Assert.Equal(new[] { 1.0 + 2.0 }, Values(rate));
+        Assert.Equal(new[] { T0 + 10 * S, T0 + 20 * S }, rate.Points.Select(p => p.TimestampUnixNano));
+        Assert.Equal(new[] { double.NaN, 1.0 + 2.0 }, Values(rate));
         var ungrouped = await agg.QueryAsync(new MetricQueryRequest { Metric = "c", Aggregation = MetricAggregation.Increase });
-        Assert.Equal(new[] { 20.0 }, Values(ungrouped[0]));
+        Assert.Equal(new[] { double.NaN, 20.0 }, Values(ungrouped[0]));
 
         // The expression sums series per timestamp the same way; top-K ranks by the last finite value.
         var expr = await agg.EvalExprAsync(new MetricExprRequest
@@ -164,7 +165,30 @@ public sealed class MetricAggregatorGoldenTests
         });
         Assert.Equal(new[] { 2, double.NaN, 16 }, Values(expr));
         var top = Assert.Single(await agg.QueryAsync(new MetricQueryRequest { Metric = "g", TopK = 1 }));
-        Assert.Equal("2", top.Labels.ValueAt(0));                                 // pod 2: last finite 5
+        Assert.Equal("2", top.Labels.ValueAt(0));                                 // pod 2: latest 5
+    }
+
+    /// <summary>
+    /// "last" reads each series' LATEST point, never an older one (#92): a series whose latest point is
+    /// NaN has no current value and contributes nothing — not the finite value it reported minutes
+    /// ago, on which an alert rule (this is its default aggregation) would go pending and fire. A
+    /// group with no finite latest point is NaN, which the evaluator treats as "no value".
+    /// </summary>
+    [Fact]
+    public async Task Last_reads_the_latest_point_and_never_a_stale_one()
+    {
+        var agg = new MetricAggregator(new Fragments(
+        [
+            F("h", MetricKind.Gauge, L("svc", "x", "pod", "1"), null, P(T0, 1), P(T0 + 15 * S, double.NaN)),
+            F("h", MetricKind.Gauge, L("svc", "x", "pod", "2"), null, P(T0, 2), P(T0 + 15 * S, 4)),
+            F("h", MetricKind.Gauge, L("svc", "z", "pod", "3"), null, P(T0, 7), P(T0 + 15 * S, double.NaN)),
+        ]));
+        var got = await agg.QueryAsync(new MetricQueryRequest { Metric = "h", Aggregation = MetricAggregation.Last, GroupBy = ["svc"] });
+
+        var x = Assert.Single(got.Single(s => s.Labels.ValueAt(0) == "x").Points);
+        Assert.Equal((T0 + 15 * S, 4.0), (x.TimestampUnixNano, x.Value));     // pod 1 adds nothing, not its stale 1
+        var z = Assert.Single(got.Single(s => s.Labels.ValueAt(0) == "z").Points);
+        Assert.Equal((T0 + 15 * S, double.NaN), (z.TimestampUnixNano, z.Value)); // not its stale 7
     }
 
     [Fact]
@@ -254,7 +278,7 @@ public sealed class MetricAggregatorGoldenTests
     /// </summary>
     [Fact]
     public async Task Every_aggregation_answers_what_it_answered_on_seeded_fragments() =>
-        Assert.Equal("293B31A7EBA530C8", await HashOfEveryAnswer(Corpus(0xA66_2E6A7E)));   // E828FB2EEAC92097 before #92
+        Assert.Equal("1F60FE1C800450E6", await HashOfEveryAnswer(Corpus(0xA66_2E6A7E)));   // E828FB2EEAC92097 before #92
 
     /// <summary>
     /// The same corpus with every NaN draw made finite, captured on the aggregator BEFORE #92 changed

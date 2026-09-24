@@ -155,6 +155,31 @@ public sealed class AlertNonFiniteMetricTests
         Assert.Equal(0, rig.Warnings(undetermined: true));
     }
 
+    /// <summary>
+    /// The default aggregation, "last", reads the series' LATEST point: when that is NaN the rule
+    /// has no value — its state is kept and the evaluator says so — rather than firing on the finite
+    /// value the series reported a minute earlier and no longer does.
+    /// </summary>
+    [Fact]
+    public async Task A_rule_on_last_is_not_decided_by_a_stale_value_behind_a_NaN()
+    {
+        var fleet = new Fleet(new MetricSeries { Name = "queue.depth", Kind = MetricKind.Gauge, Labels = Pod("a"),
+                                                 Points = [P(T0, 9), P(T0 + S, double.NaN)] });
+        var rule = new AlertRule
+        {
+            Id = "stale-rule", Name = "stale rule", Source = AlertSource.Metric, Metric = "queue.depth",
+            Comparator = AlertComparator.GreaterThan, Threshold = 3.5,
+            Window = TimeSpan.FromMinutes(5), For = TimeSpan.Zero, Cooldown = TimeSpan.Zero,
+        };
+        await using var rig = new Rig(rule, new MetricAggregator(fleet));
+
+        await rig.Evaluator.EvaluateOnceAsync();
+
+        Assert.NotEqual(AlertState.Firing, rig.State().State);                 // not on the stale 9
+        Assert.Equal(1, rig.Warnings(undetermined: true));
+        Assert.Null(await rig.Evaluator.PreviewAsync(rule));
+    }
+
     private static LabelSet Pod(string pod) =>
         new([new("service.name", "checkout"), new("pod", pod)]);
 
