@@ -71,8 +71,10 @@ public sealed class OtlpMetricProtoParityTests
     /// A repeated label key never reaches storage, on either encoding, and both collapse it the
     /// same way (#92): within the point the LAST value wins — over an earlier attribute, and over the
     /// resource's service.name; a point attribute still shadows a resource label; a resource's own
-    /// repeat keeps its first value, as it always did. Before the fix both paths agreed too — on a
-    /// label set carrying the key twice, which every metrics response then failed on.
+    /// repeat keeps its first value, as it always did — its service.name too, where the protobuf
+    /// parser used to keep the LAST and the JSON mapper the first, forking the series by encoding.
+    /// Before the fix both paths agreed on the point repeats too — on a label set carrying the key
+    /// twice, which every metrics response then failed on.
     /// </summary>
     [Fact]
     public void MatchesDomPath_OnRepeatedLabelKeys()

@@ -122,7 +122,8 @@ public static class OtlpMetricProtoParser
 
             if (keyUtf8.SequenceEqual("service.name"u8))
             {
-                if (value.IsString) st.Labels.SetServiceName(st.Intern(value.Utf8));   // mapper parity: string only
+                // Mapper parity: a string only, and the first one (see SetServiceName).
+                if (value.IsString && !st.Labels.HasServiceName) st.Labels.SetServiceName(st.Intern(value.Utf8));
                 continue;
             }
             if (keyUtf8.SequenceEqual("service.instance.id"u8)) continue;

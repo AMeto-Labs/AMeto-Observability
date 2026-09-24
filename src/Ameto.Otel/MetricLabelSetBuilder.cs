@@ -70,8 +70,16 @@ internal sealed class MetricLabelSetBuilder
         _resUsed     = 0;
     }
 
-    /// <summary>The resource's service name, stamped as <c>service.name</c> onto every point below it.</summary>
-    public void SetServiceName(InternedText value) => _serviceName = value;
+    /// <summary>
+    /// The resource's service name, stamped as <c>service.name</c> onto every point below it. A
+    /// resource that states it twice keeps the FIRST — the rule for every other key a resource repeats
+    /// (see <see cref="Build"/>). The two encodings used to disagree here, the JSON mapper keeping the
+    /// first and the protobuf parser the last, so one exporter's series forked by encoding.
+    /// </summary>
+    public void SetServiceName(InternedText value) => _serviceName ??= value;
+
+    /// <summary>Whether the resource already stated its service name — so a later statement is not even interned.</summary>
+    public bool HasServiceName => _serviceName is not null;
 
     /// <summary>A resource label, stamped onto every point below it that does not carry the key itself.</summary>
     public void AddResourceLabel(InternedText key, InternedText value) =>

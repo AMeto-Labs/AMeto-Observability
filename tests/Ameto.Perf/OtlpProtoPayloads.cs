@@ -153,6 +153,7 @@ internal static class OtlpProtoPayloads
         Nested(res, 1, StringAttr("deployment.environment", "Res"));
         Nested(res, 1, StringAttr("region", "eu-1"));
         Nested(res, 1, StringAttr("region", "eu-2"));                       // the resource's own repeat
+        Nested(res, 1, StringAttr("service.name", "Svc.Resource.Again"));   // …and of its service name
     }), Msg(c =>
     {
         Nested(c, 2, Msg(metric =>
