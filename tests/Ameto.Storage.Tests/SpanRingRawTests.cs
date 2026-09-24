@@ -347,6 +347,55 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
+    /// L3 — A PRODUCER WAITING FOR A TRIM SLEEPS, IT DOES NOT SPIN. The trim is held (seam) for a
+    /// fixed 200 ms after the producer is first seen waiting, standing in for a drainer descheduled
+    /// mid-trim in a CPU-limited container. A waiter that escalates to Sleep(1) goes round its loop
+    /// a few hundred times at most in that window (20 spins/yields, then one iteration per ≥ 0.5 ms
+    /// sleep); a pure spin goes round it tens of thousands of times, burning the quota the request
+    /// threads need. The verdict is the iteration count over the held window, with an order of
+    /// magnitude on each side of the bound.
+    /// </summary>
+    [Fact]
+    public async Task A_producer_waiting_for_a_trim_backs_off_to_sleeping_instead_of_spinning()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+        EnqueueChunkSpans(ring, 0, 32);
+        ring.EndBatch();
+        ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+
+        long waits = 0, duringHold = 0;
+        var waiting = new TaskCompletionSource();
+        ring._onWaitingForTrimForTest = () => { Interlocked.Increment(ref waits); waiting.TrySetResult(); };
+        Task<bool>? producer = null;
+        ring._whileTrimmingForTest = () =>
+        {
+            producer = Task.Run(() =>
+            {
+                var h = Fields(500);
+                bool ok = ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(500));
+                ring.EndBatch();
+                return ok;
+            });
+            waiting.Task.WaitAsync(HangGuard).GetAwaiter().GetResult();
+            long from = Interlocked.Read(ref waits);
+            Thread.Sleep(200);                                           // the descheduled drainer
+            duringHold = Interlocked.Read(ref waits) - from;
+        };
+
+        ring.TrimIdleArena();
+        ring._whileTrimmingForTest = null;
+        ring._onWaitingForTrimForTest = null;
+
+        _out.WriteLine($"a producer went round its wait {duringHold:N0} times while a trim was held for 200 ms");
+        Assert.True(await producer!.WaitAsync(HangGuard), "the span was refused because a trim held the free list");
+        Assert.True(duringHold < 2_000,
+            $"the producer went round its wait {duringHold:N0} times in 200 ms: it spins instead of sleeping");
+        ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+    }
+
+    /// <summary>
     /// A CHUNK IS REUSED ONLY WHEN EVERY SPAN IN IT IS DRAINED, AND THEN FIRST. Three spans in one chunk,
     /// one drained: a new batch must NOT be packed into that chunk. All drained: the next batch gets it
     /// back (LIFO), so a drainer that keeps up works in one chunk forever — the arena's residency is

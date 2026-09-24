@@ -510,10 +510,13 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             if (idx < 0)
             {
                 // The trim holds the whole free list for a moment (microseconds, plus one
-                // decommit call): an empty list then means "wait", not "full". Spin, never refuse.
+                // decommit call): an empty list then means "wait", not "full". Wait, never refuse — and
+                // with SpinWait's DEFAULT escalation (spin, then yield, then Sleep(1)), not a pure spin:
+                // if the drainer is descheduled mid-trim, a pure spin burns every waiting producer's CPU
+                // quota in a CPU-limited container for as long as that lasts (review L3).
                 if (Volatile.Read(ref _trimming) == 0) return -1;
                 _onWaitingForTrimForTest?.Invoke();
-                spin.SpinOnce(sleep1Threshold: -1);
+                spin.SpinOnce();
                 continue;
             }
 
@@ -562,7 +565,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// <para><b>Safe against producers without stopping them.</b> The trim first takes the WHOLE free
     /// list with one CAS on the versioned head, so no chunk it examines can be popped under it — a
     /// pop already in flight fails its own CAS and retries, and a producer that finds the list empty
-    /// while <c>_trimming</c> is set spins instead of refusing. Only chunks in the list it took are
+    /// while <c>_trimming</c> is set waits (spin, yield, then sleep) instead of refusing. Only chunks in the list it took are
     /// candidates, and only a contiguous run of them reaching the top of the committed range is given
     /// back, so a chunk a producer holds, or one a drained span still references, stops the run below
     /// it. The chunks go back on the list afterwards — the ones kept first, lowest index on top — and
