@@ -270,6 +270,33 @@ internal static class SpanBloomFold
     internal static int HostDisagreementCount => Drift.Count;
 
     /// <summary>
+    /// True when this host treats some ASCII character differently from the table — a comparer that
+    /// equated <c>ſ</c> with <c>s</c>, or <c>ı</c> with <c>I</c>, would mark <c>s</c> or <c>i</c>. The
+    /// readers' shortcut "ASCII folds the same everywhere" is then false, so EVERY literal probes its
+    /// key alone (review F-A of #86). No host this build runs on does it; the flag exists so that a
+    /// host that ever does is answered completely rather than quickly.
+    /// </summary>
+    internal static bool HostDisagreesOnAscii => Drift.Ascii;
+
+    /// <summary>
+    /// TEST SEAM: behave as a host that treats exactly <paramref name="marked"/> differently from the
+    /// table, until disposed.
+    /// </summary>
+    internal static DriftSwap UseHostDriftForTest(string marked)
+    {
+        var bits = new ulong[65_536 / 64];
+        foreach (char c in marked) Mark(bits, c);
+        var saved = Volatile.Read(ref s_drift);
+        Volatile.Write(ref s_drift, NewDriftSet(bits));
+        return new DriftSwap(saved);
+    }
+
+    internal readonly struct DriftSwap(object? saved) : IDisposable
+    {
+        public void Dispose() => Volatile.Write(ref s_drift, (DriftSet?)saved);
+    }
+
+    /// <summary>
     /// TEST SEAM: fold with <paramref name="table"/> (65 536 entries) until disposed — the shape of a
     /// segment written by a build whose fold differs. The test assemblies here run serially.
     /// </summary>
@@ -325,10 +352,11 @@ internal static class SpanBloomFold
     /// substitute, and every later probe in the process would be judged against the wrong table
     /// (review F-B of #86).
     /// </summary>
-    private sealed class DriftSet(ulong[] bits, int count)
+    private sealed class DriftSet(ulong[] bits, int count, bool ascii)
     {
         public readonly ulong[] Bits  = bits;
         public readonly int     Count = count;
+        public readonly bool    Ascii = ascii;
     }
 
     private static DriftSet? s_drift;
@@ -384,9 +412,15 @@ internal static class SpanBloomFold
             i = j;
         }
 
+        return NewDriftSet(bits);
+    }
+
+    /// <summary>Wraps a marked set with its count and whether it touches ASCII (U+0000–U+007F, the first two words).</summary>
+    private static DriftSet NewDriftSet(ulong[] bits)
+    {
         int count = 0;
         foreach (ulong w in bits) count += System.Numerics.BitOperations.PopCount(w);
-        return new DriftSet(bits, count);
+        return new DriftSet(bits, count, ascii: (bits[0] | bits[1]) != 0);
     }
 
     private static void Mark(ulong[] bits, char c) => bits[c >> 6] |= 1UL << (c & 63);

@@ -764,6 +764,44 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// A HOST THAT FOLDS INTO ASCII PROBES EVERY LITERAL BY KEY — review F-A. Both readers skip the
+    /// host check for ASCII characters ("ASCII folds the same everywhere"), which is true only while
+    /// no non-ASCII character is equal to an ASCII one under the host's comparer. A host that equated
+    /// <c>ſ</c> with <c>s</c> would mark <c>s</c>, and the mark would have been ignored:
+    /// <c>{ .db.system = "mssql" }</c> probed by value, and a span holding "mſſql" skipped. Seamed here
+    /// (no real host does it), on a canonical segment and on the legacy probe; drop the
+    /// <c>HostDisagreesOnAscii</c> check and the canonical probe reads one block and says exact.
+    /// </summary>
+    [Fact]
+    public async Task A_host_that_folds_into_ASCII_probes_every_literal_by_key()
+    {
+        string path = UnderCulture("en-US", () => SpanWriter.Write(NewDir("ascii-drift"), ThreeBlockCorpus()).FilePath);
+        var pred = TraceQLParser.Parse("{ .db.system = \"mssql\" }");
+
+        await UnderCultureAsync("en-US", async () =>
+        {
+            Assert.False(SpanBloomFold.HostDisagreesOnAscii);
+            var (normal, _) = await Search(path, pred);
+            Assert.Equal(Block, normal);
+
+            using (SpanBloomFold.UseHostDriftForTest("sſ"))
+            {
+                Assert.True(SpanBloomFold.HostDisagreesOnAscii);
+                Assert.False(SpanBloom.CanonicalValueProbeIsExact("mssql", sameFold: true));
+                Assert.False(SpanBloom.LegacyValueProbeIsExact("mssql"));
+
+                var (admitted, found) = await Search(path, pred);
+                _out.WriteLine($"with s marked: read {admitted / Block} block(s), {found} rows");
+                Assert.Equal(3 * Block, admitted);
+                Assert.True(found > 0);
+            }
+
+            Assert.False(SpanBloomFold.HostDisagreesOnAscii);
+            Assert.True(SpanBloom.CanonicalValueProbeIsExact("mssql", sameFold: true));
+        });
+    }
+
     internal static readonly string[] FoldProbeQueries =
         ["{ .x = \"ɤ-report\" }", "{ .y = \"ЁЛКА\" }", "{ .y = \"ёлка\" }", "{ .db = \"mssql\" }"];
 

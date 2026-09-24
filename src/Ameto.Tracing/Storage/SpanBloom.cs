@@ -426,6 +426,9 @@ internal static class SpanBloom
     /// </summary>
     public static bool LegacyValueProbeIsExact(string lowerValue)
     {
+        // The ASCII premise above — no non-ASCII character is equal to an ASCII one — is this host's
+        // comparer's to break, and SpanBloomFold notices if it does (review F-A).
+        if (SpanBloomFold.HostDisagreesOnAscii) return false;
         bool allDigits = true;
         foreach (char c in lowerValue)
         {
@@ -443,10 +446,13 @@ internal static class SpanBloom
     /// build's table and only an all-ASCII literal is trusted (ASCII folds identically in every
     /// table). When it does, a literal is trusted unless it holds a character this HOST's comparer
     /// treats differently from the table (<see cref="SpanBloomFold.HostDisagrees"/> — none on the
-    /// hosts this build runs on). Anything not trusted probes the key alone.
+    /// hosts this build runs on). Anything not trusted probes the key alone — and so does EVERY
+    /// literal on a host that treats an ASCII character differently
+    /// (<see cref="SpanBloomFold.HostDisagreesOnAscii"/>), where the ASCII shortcut below is false.
     /// </summary>
     public static bool CanonicalValueProbeIsExact(string lowerValue, bool sameFold)
     {
+        if (SpanBloomFold.HostDisagreesOnAscii) return false;
         foreach (char c in lowerValue)
         {
             if (c < 0x80) continue;
