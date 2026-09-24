@@ -2525,8 +2525,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         catch
         {
+            // Best effort — the original failure is what the caller must see. An output that cannot be
+            // deleted (a scanner holding it on Windows) is loaded beside its sources at the next start,
+            // so it is named here: the operator can remove it before then.
             foreach (var info in written)
-                try { File.Delete(info.FilePath); } catch { /* best effort — the original failure is what the caller must see */ }
+                try { File.Delete(info.FilePath); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete the partial rewrite output {File}; it duplicates its sources until removed", info.FilePath); }
             throw;
         }
         return written;
