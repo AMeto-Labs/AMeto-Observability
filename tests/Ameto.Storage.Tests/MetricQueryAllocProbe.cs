@@ -262,6 +262,40 @@ public sealed class MetricQueryAllocProbe
         Assert.Equal((10, 10L * 59), (rate.Series, rate.Points));
     }
 
+    /// <summary>
+    /// One large group, then many small ones: the timestamp table grows to the large group's size
+    /// and keeps it, and each later group's reset must cost that group, not the table.
+    /// </summary>
+    [Fact]
+    public void Probe_many_small_groups_after_a_large_one()
+    {
+        long t0 = 1_784_800_020_000_000_000L;
+        var fragments = new List<MetricSeries>();
+        var big = new List<MetricDataPoint>(200_000);
+        for (int p = 0; p < 200_000; p++) big.Add(new MetricDataPoint { TimestampUnixNano = t0 + p * S, Value = p });
+        fragments.Add(new MetricSeries { Name = Metric, Kind = MetricKind.Gauge, Labels = new LabelSet([new("g", "big")]), Points = big });
+        for (int g = 0; g < 2_000; g++)
+        {
+            var pts = new List<MetricDataPoint>(10);
+            for (int p = 0; p < 10; p++) pts.Add(new MetricDataPoint { TimestampUnixNano = t0 + p * S, Value = g });
+            fragments.Add(new MetricSeries
+            {
+                Name = Metric, Kind = MetricKind.Gauge,
+                Labels = new LabelSet([new("g", "g" + g.ToString(CultureInfo.InvariantCulture))]), Points = pts,
+            });
+        }
+        var agg = new MetricAggregator(new FixedFragments(fragments));
+
+        var sum = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest
+        {
+            Metric = Metric, Aggregation = MetricAggregation.Sum, GroupBy = ["g"],
+        })));
+
+        _out.WriteLine($"ONE LARGE GROUP (200 000 timestamps) THEN 2 000 SMALL ONES (10 each), Sum by g; best of {Runs}");
+        _out.WriteLine($"  {sum.Ms,8:N1} ms | {sum.Bytes / 1048576.0,7:N2} MB");
+        Assert.Equal((2_001, 200_000L + 2_000 * 10), (sum.Series, sum.Points));
+    }
+
     private void Print(string what, Cost c, long stored) =>
         _out.WriteLine($"  {what} {c.Ms,8:N1} ms | {c.Bytes / 1048576.0,7:N2} MB | {(double)c.Bytes / stored,7:N1} B/point | " +
                        $"{(double)c.Bytes / SeriesCount,8:N0} B/stored-series  ({c.Series} series, {c.Points:N0} points out)");

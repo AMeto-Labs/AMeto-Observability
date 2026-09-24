@@ -731,6 +731,7 @@ public sealed class MetricAggregator : IMetricAggregator
         private long[] _keys   = [];   // table: the timestamp in a used cell
         private int[]  _cells  = [];   // table: slot + 1 in a used cell, 0 when empty
         private long[] _bySlot = [];   // slot → timestamp
+        private int[]  _cellOf = [];   // slot → the table cell it occupies, so a reset clears only those
         private int[]  _sorted = [];   // Sorted()'s answer
         private long[] _sortKeys = [];
         private int    _mask   = -1;
@@ -740,10 +741,15 @@ public sealed class MetricAggregator : IMetricAggregator
 
         public long TimestampOf(int slot) => _bySlot[slot];
 
+        /// <summary>
+        /// Empties the table for the next group, clearing only the cells this group used. The table
+        /// keeps the size its largest group needed, so clearing all of it made every later group pay
+        /// for that one: a 200 000-point series followed by 2 000 small groups was a 4 MB memset
+        /// per group.
+        /// </summary>
         public void Reset()
         {
-            if (_count == 0) return;
-            _cells.AsSpan(0, _mask + 1).Clear();
+            for (int s = 0; s < _count; s++) _cells[_cellOf[s]] = 0;
             _count = 0;
         }
 
@@ -762,7 +768,9 @@ public sealed class MetricAggregator : IMetricAggregator
                     _keys[i]  = ts;
                     _cells[i] = slot + 1;
                     Grow(ref _bySlot, _count, clear: false);
+                    Grow(ref _cellOf, _count, clear: false);
                     _bySlot[slot] = ts;
+                    _cellOf[slot] = i;
                     added = true;
                     return slot;
                 }
@@ -804,6 +812,7 @@ public sealed class MetricAggregator : IMetricAggregator
                 while (_cells[i] != 0) i = (i + 1) & _mask;
                 _keys[i]  = ts;
                 _cells[i] = slot + 1;
+                _cellOf[slot] = i;
             }
         }
 
@@ -812,9 +821,10 @@ public sealed class MetricAggregator : IMetricAggregator
             Return(_keys, clear: false);
             Return(_cells, clear: false);
             Return(_bySlot, clear: false);
+            Return(_cellOf, clear: false);
             Return(_sorted, clear: false);
             Return(_sortKeys, clear: false);
-            _keys = []; _cells = []; _bySlot = []; _sorted = []; _sortKeys = [];
+            _keys = []; _cells = []; _bySlot = []; _cellOf = []; _sorted = []; _sortKeys = [];
             _mask = -1; _count = 0;
         }
     }
