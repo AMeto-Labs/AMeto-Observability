@@ -114,6 +114,9 @@ public static class OtlpTraceStreamParser
         if (_tAttr is { Capacity: > MaxKeptAttrScratch }) _tAttr = null;
         if (_tRes  is { Capacity: > MaxKeptAttrScratch }) _tRes  = null;
         if (_tOut  is { Capacity: > MaxKeptAttrScratch }) _tOut  = null;
+        if (_tName     is { Length: > MaxKeptAttrScratch }) _tName     = null;
+        if (_tSvcBlock is { Length: > MaxKeptAttrScratch }) _tSvcBlock = null;
+        if (_tSvcEntry is { Length: > MaxKeptAttrScratch }) _tSvcEntry = null;
 
         if (_tNest is not { } nest) return;
         for (int d = 0; d < nest.Length; d++)
@@ -166,23 +169,68 @@ public static class OtlpTraceStreamParser
     /// The <c>finally</c> is the point: <c>OtlpEndpointMapper</c> catches whatever this throws
     /// and answers 400, then the thread goes back into the pool — so a body that is refused must
     /// not be the one shape that keeps its scratch.
+    ///
+    /// <para>The list this returns is built by <see cref="SpanItemCollector"/> over the same streaming
+    /// core the receiver uses (<see cref="Parse(ReadOnlySpan{byte}, ISpanSink)"/>) — one parser.</para>
     /// </summary>
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> json)
     {
-        try { return ParseBatch(json); }
-        finally { ReleaseScratch(); }
+        var items = new SpanItemCollector();
+        Parse(json, items);
+        return items.Items;
     }
 
-    private static List<SpanIngestItem> ParseBatch(ReadOnlySpan<byte> json)
+    /// <summary>
+    /// Streams the batch into <paramref name="sink"/> (TI#3) and says how many spans it took and
+    /// how many it refused. A malformed body throws with its prefix already ingested; the sink's
+    /// batch is ended either way.
+    /// </summary>
+    public static (int Ingested, int Refused) Parse(ReadOnlySpan<byte> json, ISpanSink sink)
+    {
+        try { return ParseBatch(json, sink); }
+        finally
+        {
+            sink.EndBatch();
+            ReleaseScratch();
+        }
+    }
+
+    /// <summary>
+    /// The batch's running state: the sink, the counts, and the current resource block's service —
+    /// its UTF-8 (the block scratch, or the literal) and the index the sink interned it as, taken
+    /// once per block at its first span (<see cref="ServiceNotInterned"/> until then).
+    /// </summary>
+    private ref struct BatchState
+    {
+        public ISpanSink          Sink;
+        public int                Ingested;
+        public int                Refused;
+        public ReadOnlySpan<byte> Service;
+        public int                ServiceIdx;
+    }
+
+    private const int ServiceNotInterned = -2;
+
+    /// <summary>What a resource with no string <c>service.name</c> is called.</summary>
+    private static ReadOnlySpan<byte> UnknownServiceUtf8 => "unknown"u8;
+
+    // The chosen service of the current block, and the last stringValue of the service.name entry
+    // being read — two buffers, because an entry is read into the second before the first-wins
+    // rule decides whether it becomes the first. And a span name that had to be unescaped.
+    [ThreadStatic] private static byte[]? _tSvcBlock;
+    [ThreadStatic] private static byte[]? _tSvcEntry;
+    [ThreadStatic] private static byte[]? _tName;
+
+    private static (int Ingested, int Refused) ParseBatch(ReadOnlySpan<byte> json, ISpanSink sink)
     {
         var reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
-        var result  = new List<SpanIngestItem>();
         var attrBuf = _tAttr ??= new ArrayBufferWriter<byte>(4096);
         var resBuf  = _tRes  ??= new ArrayBufferWriter<byte>(1024);
         var outBuf  = _tOut  ??= new ArrayBufferWriter<byte>(4096);
+        var st      = new BatchState { Sink = sink, Service = UnknownServiceUtf8, ServiceIdx = ServiceNotInterned };
 
         if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
-            return result;
+            return (0, 0);
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -191,29 +239,30 @@ public static class OtlpTraceStreamParser
                 reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    ParseResourceSpans(ref reader, attrBuf, resBuf, outBuf, result);
+                    ParseResourceSpans(ref reader, attrBuf, resBuf, outBuf, ref st);
             }
             else
             {
                 reader.Skip();
             }
         }
-        return result;
+        return (st.Ingested, st.Refused);
     }
 
     // ── resourceSpans[] element ────────────────────────────────────────────────
     private static void ParseResourceSpans(
         ref Utf8JsonReader reader,
         ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, ArrayBufferWriter<byte> outBuf,
-        List<SpanIngestItem> result)
+        ref BatchState st)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
-        // One string per resource batch, shared by every span under it (same as the DOM path).
-        // Resource attributes (env, deployment id, …) are likewise serialised once as msgpack
-        // pairs and spliced into every span's attribute map.
-        string serviceName = "unknown";
-        int    resCount    = 0;
+        // One service per resource batch, shared by every span under it (same as the DOM path) —
+        // and interned ONCE for the block. Resource attributes (env, deployment id, …) are likewise
+        // serialised once as msgpack pairs and spliced into every span's attribute map.
+        st.Service    = UnknownServiceUtf8;
+        st.ServiceIdx = ServiceNotInterned;
+        int resCount  = 0;
         resBuf.ResetWrittenCount();
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -223,7 +272,14 @@ public static class OtlpTraceStreamParser
             if (reader.ValueTextEquals("resource"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    serviceName = ReadResourceAttributes(ref reader, resBuf, ref resCount) ?? serviceName;
+                {
+                    int svcLen = ReadResourceAttributes(ref reader, resBuf, ref resCount);
+                    if (svcLen >= 0)
+                    {
+                        st.Service    = _tSvcBlock.AsSpan(0, svcLen);
+                        st.ServiceIdx = ServiceNotInterned;
+                    }
+                }
                 else reader.Skip();
             }
             else if (reader.ValueTextEquals("scopeSpans"u8))
@@ -231,7 +287,7 @@ public static class OtlpTraceStreamParser
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                        ParseScopeSpans(ref reader, serviceName, attrBuf, resBuf, resCount, outBuf, result);
+                        ParseScopeSpans(ref reader, attrBuf, resBuf, resCount, outBuf, ref st);
                 }
                 else reader.Skip();
             }
@@ -243,15 +299,39 @@ public static class OtlpTraceStreamParser
     }
 
     /// <summary>
-    /// Walks resource.attributes: captures <c>service.name</c> (returned; kept out of the
-    /// pairs — it is the dedicated service column) and writes every other attribute into
+    /// A JSON string value's text as VALID UTF-8, copied into <paramref name="scratch"/>: the raw
+    /// bytes when they are unescaped and valid, else exactly what <c>GetString</c> makes of them —
+    /// including its throw on invalid UTF-8, which is how the list path refused such a body.
+    /// </summary>
+    private static int CaptureUtf8(ref Utf8JsonReader reader, ref byte[]? scratch)
+    {
+        if (!reader.ValueIsEscaped && !reader.HasValueSequence)
+        {
+            var raw = reader.ValueSpan;
+            if (System.Text.Unicode.Utf8.IsValid(raw))
+            {
+                if (scratch is null || scratch.Length < raw.Length) scratch = new byte[Math.Max(64, raw.Length)];
+                raw.CopyTo(scratch);
+                return raw.Length;
+            }
+        }
+        string text = reader.GetString() ?? string.Empty;
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(text.Length);
+        if (scratch is null || scratch.Length < max) scratch = new byte[Math.Max(64, max)];
+        return System.Text.Encoding.UTF8.GetBytes(text, scratch);
+    }
+
+    /// <summary>
+    /// Walks resource.attributes: captures <c>service.name</c> — the first entry whose value is a
+    /// string, into <see cref="_tSvcBlock"/>, returning its length (-1: none), and kept out of the
+    /// pairs, since it is the dedicated service column — and writes every other attribute into
     /// <paramref name="resBuf"/> as msgpack key + value pairs, counting them in
     /// <paramref name="resCount"/>.
     /// </summary>
-    private static string? ReadResourceAttributes(
+    private static int ReadResourceAttributes(
         ref Utf8JsonReader reader, ArrayBufferWriter<byte> resBuf, ref int resCount)
     {
-        string? service = null;
+        int service = -1;
         var w = new MessagePackWriter(resBuf);
         // Promotion capture is span-level only — dummies for the shared AnyValue writer.
         SpanPromotion none = default;   // a RESOURCE attribute promotes nothing
@@ -265,12 +345,12 @@ public static class OtlpTraceStreamParser
                 {
                     if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
                     bool isService = false, wroteKey = false, wroteValue = false;
-                    // Held per ENTRY, folded into `service` with ??= once the entry closes: the
+                    // Held per ENTRY (its length in _tSvcEntry), adopted into _tSvcBlock once the entry closes: the
                     // first STRING-valued service.name in the list wins, as OtlpTraceMapper's
                     // ExtractServiceName and OtlpTraceProtoParser do. Within one entry the last
                     // stringValue still wins, because that is a duplicate JSON property and
                     // JsonSerializer — the oracle — overwrites on those.
-                    string? entryService = null;
+                    int entryService = -1;
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                     {
                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -301,7 +381,7 @@ public static class OtlpTraceStreamParser
                                         {
                                             reader.Read();
                                             if (reader.TokenType == JsonTokenType.String)
-                                                entryService = reader.GetString();
+                                                entryService = CaptureUtf8(ref reader, ref _tSvcEntry);
                                         }
                                         else reader.Skip();
                                     }
@@ -322,7 +402,12 @@ public static class OtlpTraceStreamParser
                     }
                     if (wroteKey && !wroteValue) w.WriteNil();
                     if (wroteKey) resCount++;
-                    if (isService) service ??= entryService;
+                    if (isService && service < 0 && entryService >= 0)
+                    {
+                        if (_tSvcBlock is null || _tSvcBlock.Length < entryService) _tSvcBlock = new byte[Math.Max(64, entryService)];
+                        _tSvcEntry.AsSpan(0, entryService).CopyTo(_tSvcBlock);
+                        service = entryService;
+                    }
                 }
             }
             else reader.Skip();
@@ -333,10 +418,10 @@ public static class OtlpTraceStreamParser
 
     // ── scopeSpans[] element ───────────────────────────────────────────────────
     private static void ParseScopeSpans(
-        ref Utf8JsonReader reader, string serviceName,
+        ref Utf8JsonReader reader,
         ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, int resCount,
         ArrayBufferWriter<byte> outBuf,
-        List<SpanIngestItem> result)
+        ref BatchState st)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
@@ -346,18 +431,18 @@ public static class OtlpTraceStreamParser
             if (reader.ValueTextEquals("spans"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    ParseSpan(ref reader, serviceName, attrBuf, resBuf, resCount, outBuf, result);
+                    ParseSpan(ref reader, attrBuf, resBuf, resCount, outBuf, ref st);
             }
             else reader.Skip();
         }
     }
 
-    // ── one span → one SpanIngestItem ──────────────────────────────────────────
+    // ── one span → one call of the sink ────────────────────────────────────────
     private static void ParseSpan(
-        ref Utf8JsonReader reader, string serviceName,
+        ref Utf8JsonReader reader,
         ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, int resCount,
         ArrayBufferWriter<byte> outBuf,
-        List<SpanIngestItem> result)
+        ref BatchState st)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
@@ -366,7 +451,7 @@ public static class OtlpTraceStreamParser
         Span<byte> paHex = stackalloc byte[16];
         int trLen = 0, spLen = 0, paLen = 0;
 
-        string? name       = null;
+        int     nameLen    = 0;            // the name, valid UTF-8, in _tName
         int     kind       = 0;
         int     statusCode = 0;
         long    startNano  = 0, endNano = 0;
@@ -386,7 +471,7 @@ public static class OtlpTraceStreamParser
             if      (reader.ValueTextEquals("traceId"u8))           { reader.Read(); trLen = CopyFixed(ref reader, trHex); }
             else if (reader.ValueTextEquals("spanId"u8))            { reader.Read(); spLen = CopyFixed(ref reader, spHex); }
             else if (reader.ValueTextEquals("parentSpanId"u8))      { reader.Read(); paLen = CopyFixed(ref reader, paHex); }
-            else if (reader.ValueTextEquals("name"u8))              { reader.Read(); if (reader.TokenType == JsonTokenType.String) name = reader.GetString(); }
+            else if (reader.ValueTextEquals("name"u8))              { reader.Read(); if (reader.TokenType == JsonTokenType.String) nameLen = CaptureUtf8(ref reader, ref _tName); }
             else if (reader.ValueTextEquals("kind"u8))              { reader.Read(); reader.TryGetInt32(out kind); }
             else if (reader.ValueTextEquals("startTimeUnixNano"u8)) { reader.Read(); startNano = ReadUnixNano(ref reader); }
             else if (reader.ValueTextEquals("endTimeUnixNano"u8))   { reader.Read(); endNano   = ReadUnixNano(ref reader); }
@@ -426,13 +511,9 @@ public static class OtlpTraceStreamParser
             parentId = new SpanId(paRaw);
 
         // Final map = resource pairs first + span pairs after (span wins on collision).
-        int    totalAttrs = attrCount + resCount;
-        byte[] attrBytes;
-        if (totalAttrs == 0)
-        {
-            attrBytes = [];
-        }
-        else
+        int totalAttrs = attrCount + resCount;
+        ReadOnlySpan<byte> attrBytes = default;
+        if (totalAttrs > 0)
         {
             outBuf.ResetWrittenCount();
             var ow = new MessagePackWriter(outBuf);
@@ -440,23 +521,28 @@ public static class OtlpTraceStreamParser
             if (resCount > 0) ow.WriteRaw(resBuf.WrittenSpan);
             ow.WriteRaw(attrBuf.WrittenSpan);
             ow.Flush();
-            attrBytes = outBuf.WrittenSpan.ToArray();
+            attrBytes = outBuf.WrittenSpan;   // the sink copies it before the next span reuses the buffer
         }
 
-        result.Add(new SpanIngestItem
-        {
-            TraceId           = new TraceId(trHi, trLo),
-            SpanId            = new SpanId(spRaw),
-            ParentSpanId      = parentId,
-            StartTimeUnixNano = startNano,
-            DurationNanos     = endNano > startNano ? endNano - startNano : 0,
-            Name              = name ?? string.Empty,
-            ServiceName       = serviceName,
-            Kind              = (SpanKind)(kind & 0x07),
-            Status            = statusCode switch { 1 => SpanStatusCode.Ok, 2 => SpanStatusCode.Error, _ => SpanStatusCode.Unset },
-            AttributesBytes   = attrBytes,
-            HttpStatusCode    = promo.HttpStatus,
-        });
+        // Interned at the block's FIRST span, once: every later span of the block reuses the index.
+        if (st.ServiceIdx == ServiceNotInterned) st.ServiceIdx = st.Sink.InternService(st.Service);
+
+        bool taken = st.Sink.TryIngestRaw(
+            new TraceId(trHi, trLo),
+            new SpanId(spRaw),
+            parentId,
+            startNano,
+            endNano > startNano ? endNano - startNano : 0,
+            _tName.AsSpan(0, nameLen),
+            st.ServiceIdx,
+            st.Service,
+            (SpanKind)(kind & 0x07),
+            statusCode switch { 1 => SpanStatusCode.Ok, 2 => SpanStatusCode.Error, _ => SpanStatusCode.Unset },
+            promo.HttpStatus,
+            attrBytes);
+
+        if (taken) st.Ingested++;
+        else       st.Refused++;
     }
 
     // ── span attribute KeyValue with promotion hooks ───────────────────────────

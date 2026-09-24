@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Ameto.Otel;
 using Ameto.Otel.Models;
+using Ameto.Tracing;
 using Xunit;
 
 namespace Ameto.Perf;
@@ -19,6 +20,46 @@ public sealed class OtlpTraceStreamingParityTests
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         AllowTrailingCommas  = true,
     };
+
+    /// <summary>
+    /// RETARGETED AT THE RAW SINK (TI#3): the parser streams into <see cref="CapturingSpanSink"/>,
+    /// which records exactly what the ring would be handed — name, service and attributes as bytes —
+    /// and every one of them is compared with the DOM path byte for byte.
+    /// </summary>
+    [Fact]
+    public void RawSink_MatchesDom_ForRepresentativeBatch()
+    {
+        byte[] utf8 = Encoding.UTF8.GetBytes(SampleBatch);
+        var dom  = OtlpTraceMapper.Map(JsonSerializer.Deserialize<ExportTraceServiceRequest>(utf8, DomOptions)!);
+
+        var sink = new CapturingSpanSink();
+        var (ingested, refused) = OtlpTraceStreamParser.Parse(utf8, sink);
+
+        sink.AssertMatches(dom);
+        Assert.Equal((4, 0), (ingested, refused));
+        // ONCE PER RESOURCE BLOCK that has a span: two blocks, two interns — not one per span.
+        Assert.Equal(2, sink.InternCalls);
+        Assert.Equal(1, sink.EndBatches);
+    }
+
+    /// <summary>
+    /// A SINK THAT REFUSES leaves the batch a PREFIX and the counts say so; and a body that throws
+    /// part-way still ends the batch (the arena the thread held goes back) with its prefix taken.
+    /// </summary>
+    [Fact]
+    public void RawSink_RefusalsAreCounted_AndTheBatchIsEndedEvenOnAThrow()
+    {
+        byte[] utf8 = Encoding.UTF8.GetBytes(SampleBatch);
+        var refusing = new CapturingSpanSink { RefuseFrom = 1 };
+        Assert.Equal((1, 3), OtlpTraceStreamParser.Parse(utf8, refusing));
+        Assert.Single(refusing.Spans);
+
+        byte[] truncated = utf8.AsSpan(0, utf8.Length * 3 / 4).ToArray();
+        var sink = new CapturingSpanSink();
+        Assert.ThrowsAny<Exception>(() => OtlpTraceStreamParser.Parse(truncated, sink));
+        Assert.Equal(1, sink.EndBatches);
+        Assert.NotEmpty(sink.Spans);                                    // the prefix before the tear
+    }
 
     [Fact]
     public void Streaming_MatchesDom_ForRepresentativeBatch()
@@ -162,4 +203,100 @@ public sealed class OtlpTraceStreamingParityTests
       ]
     }
     """;
+}
+
+/// <summary>
+/// THE RAW SINK, RECORDED (TI#3): what a parser hands <see cref="ISpanSink"/> — the name, the service
+/// and the attribute blob as BYTES, the ids and times as values — kept so a parity test can compare
+/// them with the DOM path byte for byte. The capturing sink of <c>OtlpLogProtoParityTests</c>, for
+/// spans.
+///
+/// <para>It also checks the interning contract as it goes: every span's service index must be one
+/// this sink handed out, for EXACTLY the bytes the span carries, and <see cref="InternService"/>
+/// must be called once per resource block, not once per span — <see cref="InternCalls"/> is what
+/// the tests read to prove it.</para>
+/// </summary>
+internal sealed class CapturingSpanSink : ISpanSink
+{
+    internal readonly record struct Span(
+        TraceId TraceId, SpanId SpanId, SpanId ParentSpanId, long Start, long Duration,
+        byte[] Name, int ServiceIdx, byte[] Service, SpanKind Kind, SpanStatusCode Status,
+        short Http, byte[] Attrs);
+
+    public readonly List<Span>   Spans    = [];
+    public readonly List<byte[]> Interned = [];
+    public int InternCalls;
+    public int EndBatches;
+
+    /// <summary>Refuse every span from this one on (0-based), to exercise back-pressure. -1: take all.</summary>
+    public int RefuseFrom = -1;
+    private int _offered;
+
+    public int InternService(ReadOnlySpan<byte> serviceUtf8)
+    {
+        InternCalls++;
+        Interned.Add(serviceUtf8.ToArray());
+        return Interned.Count - 1;
+    }
+
+    public bool TryIngestRaw(TraceId traceId, SpanId spanId, SpanId parentSpanId, long startTimeUnixNano,
+        long durationNanos, ReadOnlySpan<byte> nameUtf8, int serviceIdx, ReadOnlySpan<byte> serviceUtf8,
+        SpanKind kind, SpanStatusCode status, short httpStatusCode, ReadOnlySpan<byte> msgpackAttributes)
+    {
+        Assert.True(System.Text.Unicode.Utf8.IsValid(nameUtf8),    "the sink was handed a name that is not valid UTF-8");
+        Assert.True(System.Text.Unicode.Utf8.IsValid(serviceUtf8), "the sink was handed a service that is not valid UTF-8");
+        Assert.InRange(serviceIdx, 0, Interned.Count - 1);
+        Assert.True(Interned[serviceIdx].AsSpan().SequenceEqual(serviceUtf8),
+            "a span's service index names other bytes than the service it carries");
+
+        if (RefuseFrom >= 0 && _offered++ >= RefuseFrom) return false;
+        Spans.Add(new Span(traceId, spanId, parentSpanId, startTimeUnixNano, durationNanos,
+                           nameUtf8.ToArray(), serviceIdx, serviceUtf8.ToArray(), kind, status,
+                           httpStatusCode, msgpackAttributes.ToArray()));
+        return true;
+    }
+
+    public void EndBatch() => EndBatches++;
+
+    /// <summary>
+    /// Compares every recorded span with the DOM path's item, field by field and the three byte
+    /// fields BYTE FOR BYTE, and hands back items built from the recording so a test's own
+    /// assertions read what the sink was actually given.
+    /// </summary>
+    public List<SpanIngestItem> AssertMatches(List<SpanIngestItem> dom)
+    {
+        Assert.Equal(dom.Count, Spans.Count);
+        var items = new List<SpanIngestItem>(Spans.Count);
+        for (int i = 0; i < dom.Count; i++)
+        {
+            var d = dom[i];
+            var s = Spans[i];
+            Assert.Equal(d.TraceId,           s.TraceId);
+            Assert.Equal(d.SpanId,            s.SpanId);
+            Assert.Equal(d.ParentSpanId,      s.ParentSpanId);
+            Assert.Equal(d.StartTimeUnixNano, s.Start);
+            Assert.Equal(d.DurationNanos,     s.Duration);
+            Assert.Equal(d.Kind,              s.Kind);
+            Assert.Equal(d.Status,            s.Status);
+            Assert.Equal(d.HttpStatusCode,    s.Http);
+            Assert.True(System.Text.Encoding.UTF8.GetBytes(d.Name).AsSpan().SequenceEqual(s.Name),
+                $"span {i} ({d.Name}): name bytes differ");
+            Assert.True(System.Text.Encoding.UTF8.GetBytes(d.ServiceName).AsSpan().SequenceEqual(s.Service),
+                $"span {i} ({d.Name}): service bytes differ");
+            Assert.True(d.AttributesBytes.AsSpan().SequenceEqual(s.Attrs),
+                $"span {i} ({d.Name}): attribute bytes differ\n"
+              + $"  dom: {Convert.ToHexString(d.AttributesBytes)}\n"
+              + $"  new: {Convert.ToHexString(s.Attrs)}");
+
+            items.Add(new SpanIngestItem
+            {
+                TraceId = s.TraceId, SpanId = s.SpanId, ParentSpanId = s.ParentSpanId,
+                StartTimeUnixNano = s.Start, DurationNanos = s.Duration,
+                Name = System.Text.Encoding.UTF8.GetString(s.Name),
+                ServiceName = System.Text.Encoding.UTF8.GetString(s.Service),
+                Kind = s.Kind, Status = s.Status, HttpStatusCode = s.Http, AttributesBytes = s.Attrs,
+            });
+        }
+        return items;
+    }
 }

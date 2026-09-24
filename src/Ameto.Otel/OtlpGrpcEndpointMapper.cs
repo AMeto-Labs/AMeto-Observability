@@ -52,13 +52,7 @@ public static class OtlpGrpcEndpointMapper
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, static (c, msg) =>
-                {
-                    var spans = OtlpTraceProtoParser.Parse(msg.AsSpan());
-                    if (spans.Count == 0) return (true, 0, null);
-                    c.RequestServices.GetRequiredService<ISpanIngester>()
-                     .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
-                    return (true, spans.Count - accepted, BufferFullReason);
-                }));
+                    IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
@@ -69,6 +63,26 @@ public static class OtlpGrpcEndpointMapper
                      .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
                     return (true, refused, "points stamped more than 24 h in the future were refused");
                 }));
+    }
+
+    /// <summary>
+    /// The trace Export's decode: the protobuf STREAMS into the raw span sink (TI#3) — no
+    /// <see cref="SpanIngestItem"/>, no name string and no attribute array per span — exactly as the
+    /// OTLP/HTTP route does. It used to build the whole list and hand it to
+    /// <see cref="ISpanIngester.TryIngest"/>, paying 566-622 B/span on the route every SDK
+    /// exporter and the collector use.
+    ///
+    /// <para><b>The answer is the one it always gave.</b> An empty batch is OK with nothing to
+    /// report; otherwise the spans the ring refused are reported as <c>rejected_spans</c> with the
+    /// buffer-full reason, and a refused batch is a PREFIX (the sink refuses the rest of a batch after
+    /// its first refusal, as <c>TryIngest</c>'s <c>break</c> did). The one difference is shared with
+    /// the HTTP route and the log route: a message that fails to parse part-way has its prefix
+    /// ingested before INVALID_ARGUMENT, which OTLP defines as not retryable.</para>
+    /// </summary>
+    internal static (bool Ok, int Rejected, string? Why) IngestTraces(ReadOnlySpan<byte> message, ISpanSink sink)
+    {
+        var (ingested, refused) = OtlpTraceProtoParser.Parse(message, sink);
+        return ingested + refused == 0 ? (true, 0, null) : (true, refused, BufferFullReason);
     }
 
     /// <summary>

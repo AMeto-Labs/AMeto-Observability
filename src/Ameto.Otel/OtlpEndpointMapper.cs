@@ -55,25 +55,27 @@ public static class OtlpEndpointMapper
         ILogger tracesLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Traces");
 
         // ── Traces ────────────────────────────────────────────────────────────
-        var traces = async (HttpContext ctx, ISpanIngester ingester) =>
+        var traces = async (HttpContext ctx, ISpanSink sink) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
 
-            List<Ameto.Tracing.SpanIngestItem> spans;
+            int ingested, refused;
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
 
-                // Both encodings parse straight to SpanIngestItems — no OTLP object graph, no
-                // parser object per nested message, no per-field hex/nano strings. Protobuf is
-                // what SDK exporters and the collector send, so it is the one that had to stop
-                // decoding to a DOM first (see OtlpTraceProtoParser).
-                spans = isProto
-                    ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen))
-                    : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
+                // Both encodings STREAM straight into the span ring (TI#3) — no OTLP object graph,
+                // no SpanIngestItem, no name string, no attribute array per span: the parser hands
+                // each span over as slices of this body and the sink copies them into the ring's
+                // arena. Protobuf is what SDK exporters and the collector send (see
+                // OtlpTraceProtoParser). A malformed tail leaves its prefix ingested and answers
+                // 400, which OTLP defines as not retryable — the log route's behaviour.
+                (ingested, refused) = isProto
+                    ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
+                    : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
             }
             catch (Exception ex)
             {
@@ -83,17 +85,8 @@ public static class OtlpEndpointMapper
             }
             finally { IngestBufferPool.Return(body); }
 
-            LogTracesDecoded(tracesLogger, spans.Count);
-
-            if (spans.Count > 0)
-            {
-                ingester.TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
-                await WriteJsonOk(ctx, accepted, spans.Count - accepted);
-            }
-            else
-            {
-                await WriteJsonOk(ctx, 0, 0);
-            }
+            LogTracesDecoded(tracesLogger, ingested + refused);
+            await WriteJsonOk(ctx, ingested, refused);
         };
 
         // ── Metrics ───────────────────────────────────────────────────────────

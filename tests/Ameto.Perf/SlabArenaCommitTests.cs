@@ -307,6 +307,50 @@ public sealed class SlabArenaCommitTests
     /// every platform against a canned snippet: inside a range, outside every range, and on a
     /// boundary between two adjacent mappings (a range's end is exclusive).
     /// </summary>
+    /// <summary>
+    /// THE SPAN RING'S IDLE TRIM GIVES BACK A TAIL, AND NOT ONE BYTE BELOW IT — on the path each
+    /// platform really takes: VirtualFree(MEM_DECOMMIT) on Windows, madvise(MADV_DONTNEED) on the
+    /// plain Linux allocation. The tail starts at an UNALIGNED offset 100 bytes past a 1 MB
+    /// boundary, so the page that straddles it holds live bytes: a start rounded DOWN would zero
+    /// them on Linux and make them unmapped on Windows (VirtualFree takes every page any byte of
+    /// the range touches). Afterwards the tail must be writable again and read back what was
+    /// written, and the live prefix must be untouched throughout.
+    /// </summary>
+    [Fact]
+    public unsafe void A_decommitted_tail_leaves_every_byte_below_it_intact_and_is_usable_again()
+    {
+        const long Total = 4 * MB;
+        using var arena = SlabArena.Create((nuint)(8 * MB), (nuint)MB);
+        Assert.True(arena.TryEnsureCommitted((nuint)Total));
+
+        var bytes = new Span<byte>(arena.Base, (int)Total);
+        for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i * 31 + 7);
+
+        long live = MB + 100;                                                // the caller vouches for what lies above
+        long given = arena.TryDecommitTail((nuint)live);
+        _out.WriteLine($"{(OperatingSystem.IsWindows() ? "Windows" : OperatingSystem.IsLinux() ? "Linux" : "other")}: "
+                     + $"gave back {given:N0} B above {live:N0}");
+
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+            Assert.True(given >= Total - live - Environment.SystemPageSize, $"only {given:N0} B given back");
+        else
+            Assert.Equal(0, given);                                           // nothing to give back with, elsewhere
+
+        for (int i = 0; i < live; i++)
+            if (bytes[i] != (byte)(i * 31 + 7))
+                Assert.Fail($"byte {i:N0}, below the decommitted tail, changed");
+
+        // Usable again: committed afresh where that is how it works, and read back as written.
+        Assert.True(arena.TryEnsureCommitted((nuint)Total));
+        for (long i = live; i < Total; i++) bytes[(int)i] = (byte)(i * 13 + 1);
+        for (long i = live; i < Total; i++)
+            if (bytes[(int)i] != (byte)(i * 13 + 1))
+                Assert.Fail($"byte {i:N0}, rewritten after the decommit, did not read back");
+        for (int i = 0; i < live; i++)
+            if (bytes[i] != (byte)(i * 31 + 7))
+                Assert.Fail($"byte {i:N0} changed after the tail was reused");
+    }
+
     [Fact]
     public void The_smaps_lookup_finds_the_flags_of_the_mapping_that_contains_an_address()
     {

@@ -233,6 +233,30 @@ Every ceiling here is a quantity of **bytes** or of objects, and the ones left u
 
 ---
 
+## Traces options (`Ameto:Traces`)
+
+The trace hot tier is the in-RAM span buffer; it is flushed to `.trc` segments on size, on age (1 h), or at shutdown, and every span in it is already durable in `traces/spans.wal`. Small segments are merged in the background by compaction passes. Spans arrive through the **ingest ring**, a native buffer between the OTLP receivers and the one drainer thread.
+
+Like the metrics options, every memory ceiling is a quantity of **bytes** derived from what this process may use — `min(the old constant, a share of the managed-heap limit)`, never below a floor — so a host with room behaves exactly as before and a small one gets ceilings it can honour. An explicit value always wins; **`0`, a negative value or leaving the key out all mean "derive it"**. The figures below are for the 512 MB container (a 384 MB GC heap limit) and for any host with room. **Every other figure in this section is in decimal megabytes** (1 MB = 1 000 000 B); where a quantity is a power of two its binary size is given beside it, e.g. 16 MiB (16.8 MB). The container and its heap limit are named as they are configured — `512m` and 75 % of it, binary sizes: the heap limit is 402.7 MB.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `HotTierMaxBytes` | long | *unset* → `min(27 MB, 5 % of the managed-heap limit)`, never below 8 MiB (8.4 MB — the floor binds under a ~168 MB heap limit): **20.1 MB** in a 512 MB container, 27 MB with room | Bytes the hot tier may hold before a flush is forced, counted as 160 B + the attribute blob per span (an ordinary eight-attribute span is ~535 B). The tier flushes on this **or** on 50 000 spans, whichever comes first. **A span count is not the unit:** the flat 50 000 this replaces was 27 MB of ordinary spans or ~500 MB of spans carrying a SQL statement or a stack. 27 MB *is* 50 000 ordinary spans, so a host with room flushes on exactly the cadence it always did; the 512 MB container flushes at ~37 600 of them. |
+| `MergeBudgetBytes` | long | *unset* → `min(73 MB, 6 % of the managed-heap limit)`, never below 16 MiB (16.8 MB — the floor binds under a ~280 MB heap limit): **24.2 MB** in a 512 MB container, 73 MB with room | What one compaction pass may hold in memory — the spans of every segment it merges, read back. A segment is a merge **candidate** below half of it (12.1 MB / 36.5 MB), so the two largest candidates always fit one pass, and a pass never writes a merged segment heavier than the budget. 73 MB *is* the 120 000 ordinary spans a pass always held. |
+| `RingCapacity` | int | *unset* → `65536` | Slots in the ingest ring, rounded up to a power of two and clamped to `[1024, 4194304]`. The slot array is **native** memory, 80 B a slot — **5.2 MB** at the default, resident once the ring has cycled. (This used to be unreachable: the ring was built with its parameterless constructor.) |
+| `RingMaxBytes` | long | *unset* → `RingCapacity × 560 B`, scaled by the host's hot-tier share: **27.4 MB** in a 512 MB container, 36.7 MB with room | The most the spans **waiting in the ring** may weigh (their name, service and attribute bytes); past it a span is refused whatever slots are free, and the exporter is told how many were rejected (OTLP partial success). The default is the old full ring of 65 536 ordinary spans restated in bytes, so a host with room absorbs exactly the burst it always did — and a burst of heavy spans no longer buys eighteen times that. |
+| `IndexBackfill` | string | `Idle` | `Off`, `Idle` or `Eager`: whether segments written before the trace-id index existed are brought into it, and how fast. |
+| `SegmentFormatV4` | bool | `false` | Write the ~40 % smaller v4 segment format. A one-way door: a binary older than the one that wrote them deletes v4 segments. |
+| `IndexEnabled` | bool | `true` | The trace-id index's off switch; `false` plus a restart withdraws every coverage claim and lookups scan the cold segments. |
+
+**The ring's native memory, resting and at peak.** None of it is under a managed-heap share. The slot array is fixed (`RingCapacity` × 80 B, 5.2 MB at the default). The payload arena is cut into 64 KiB chunks and reserved at `RingMaxBytes` plus 64 slack chunks (4.2 MB — the part-filled chunks producers hold, and the tail a chunk loses when the next span does not fit), and it is **committed only as deep as a backlog actually reaches** — so a burst holds at most `RingMaxBytes` + 4.2 MB of arena: 31.6 MB in a 512 MB container, 40.9 MB with room. (A span whose payload is larger than a chunk is kept on the managed heap instead, still counted against `RingMaxBytes`.) The drainer gives everything above the first 16 chunks (1 MiB, 1.05 MB) back once it finds the ring idle — at most once every 30 s, from the wake it already takes — and it does so under steady traffic too, as long as what is in flight at that moment fits in those 16 chunks. Measured on the 512 MB container's budget with 10 KB spans (`SpanRingBytesProbe`): 35.1 MB native during the burst, slots included, and **6.3 MB at rest** (the slots and 1.05 MB).
+
+**More cold segments at rest on a small host.** On the 512 MB container a compaction pass can afford 1.2 tiers read back, not the two a pair of full flushes needs, so **a full flush is not a compaction candidate there**: segments stay at one flush each (~37 600 ordinary spans) instead of pairing up to ~100 000 as they do on a host with room — about **2.7× as many cold segments** for the same data. What still merges there is the small segments a quiet hour's timed flushes leave. Shrinking the tier so that full flushes could pair would give the same number of segments at rest and rewrite every span once more. The trace-id index keeps a lookup from paying for the extra segments; raise `MergeBudgetBytes` above ~2.3 × `HotTierMaxBytes` (a full tier weighs ~1.14 × its budget read back, and a candidate must be under half a pass) to have full flushes merge again.
+
+**Upgrading.** An install that never set anything keeps its cadence, its compaction pairs and its ring on a host with room. After a restart, segments are priced from their span count and their file size until a pass has read them; a heavy one that turns out larger than the budget is weighed once and left alone rather than read again every hour.
+
+---
+
 ## Resource attributes (env, deployment id, …)
 
 Attach shared attributes to everything a service sends by setting OTLP **resource attributes** on the sender — one env var, no code:
@@ -391,6 +415,15 @@ Ameto:
     MaxExemplarMetrics: 256       # names that may own an exemplar ring
     MaxLabelValuesPerKey: 2000
     MaxTrackedSeriesPerMetric: 50000
+
+  Traces:
+    # HotTierMaxBytes:            # unset/0 = min(27 MB, 5% of the managed-heap limit), at least 8 MiB
+    # MergeBudgetBytes:           # unset/0 = min(73 MB, 6% of the managed-heap limit), at least 16 MiB
+    # RingCapacity:               # unset/0 = 65536 slots (80 B native each)
+    # RingMaxBytes:               # unset/0 = RingCapacity x 560 B, scaled by the host's tier share
+    IndexBackfill: "Idle"         # Off | Idle | Eager
+    SegmentFormatV4: false        # one-way door — see the Traces section
+    IndexEnabled: true
 
   Retention:
     VerboseDays: 90

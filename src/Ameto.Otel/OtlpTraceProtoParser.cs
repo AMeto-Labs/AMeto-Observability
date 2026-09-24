@@ -27,8 +27,8 @@ namespace Ameto.Otel;
 /// wire slice — there is no hex anywhere on the trace path, because unlike logs the ids are
 /// <em>columns</em>, not <c>@tr</c>/<c>@sp</c> map entries — and every key and string value is a
 /// span of the request buffer written once into the <c>[ThreadStatic]</c> msgpack scratch. What
-/// is left per span is what the JSON path already pays: the name string, the attribute blob and
-/// the item itself.</para>
+/// used to be left per span — the name string, the attribute blob and the item itself — is gone
+/// too since the raw sink (below).</para>
 ///
 /// <para>Attribute order matches <see cref="OtlpTraceMapper"/> byte for byte: resource pairs
 /// first, span pairs second, one <c>WriteMapHeader(resCount + spanCount)</c> in front, so a span
@@ -55,26 +55,40 @@ namespace Ameto.Otel;
 ///   metric paths.</item>
 /// </list>
 ///
-/// <para>The batch is materialised as a list and handed to <c>ISpanIngester.TryIngest</c> whole,
-/// exactly as the DOM path did, so a malformed tail still leaves nothing in the ring and the
-/// caller answers 400. When the raw span sink lands and this becomes a streaming parser, its
-/// prefix will already be in the ring on a throw — and that needs no batch-completion signal,
-/// because <c>SpanRingBuffer.TryEnqueue</c> releases the drainer's semaphore per item, not per
-/// batch. There is deliberately no <c>NotifyBatchEnqueued</c> equivalent here to add one to.</para>
+/// <para><b>It streams into a raw sink</b> (<see cref="ISpanSink"/>, TI#3): each span is handed over
+/// as slices of the request buffer — the name and service UTF-8 as they arrived (validated), the
+/// attribute map from the per-thread scratch — and the sink copies them into the ring's arena. No
+/// <see cref="SpanIngestItem"/>, no name string, no attribute array per span; the service is
+/// interned once per resource block (<see cref="ISpanSink.InternService"/>). The list-returning
+/// <see cref="Parse(ReadOnlySpan{byte})"/> survives for the gRPC receiver and the tests as an
+/// adapter over the SAME core (<see cref="SpanItemCollector"/>), so there is one parser and every
+/// parity test exercises it.</para>
+///
+/// <para><b>A malformed tail leaves its prefix in the ring</b> — the receiver still answers 400,
+/// which OTLP defines as not retryable, exactly like the log path's streaming parsers. The sink's
+/// <see cref="ISpanSink.EndBatch"/> runs in a <c>finally</c> either way: it is what gives back the
+/// arena the thread held for the batch. No drainer wake-up is needed; the ring signals per span.</para>
 ///
 /// <para><see cref="OtlpProtoDecoder.DecodeTraces"/> stays in the tree as the parity reference,
 /// exactly as <c>DecodeLogs</c> did.</para>
 /// </summary>
 public static class OtlpTraceProtoParser
 {
-    /// <summary>What a resource with no <c>service.name</c> is called (<c>OtlpTraceMapper</c>).</summary>
-    private const string UnknownService = "unknown";
 
     // Reused across requests on the same request thread (one request per thread at a time) so a
     // batch allocates no msgpack scratch at all — the whole point of the streaming path.
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tRes;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tSpan;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tOut;
+
+    // Where a name or a service whose wire bytes were NOT valid UTF-8 is re-encoded — with U+FFFD
+    // for each invalid sequence, the text CodedInputStream.ReadString() produced — so the sink is
+    // only ever handed valid UTF-8. Cold: conformant exporters never reach them.
+    [ThreadStatic] private static byte[]? _tName;
+    [ThreadStatic] private static byte[]? _tService;
+
+    /// <summary>What a resource with no <c>service.name</c> is called, as the sink takes it.</summary>
+    private static ReadOnlySpan<byte> UnknownServiceUtf8 => "unknown"u8;
 
     /// <summary>
     /// How deep an attribute value may nest before the payload is refused.
@@ -115,9 +129,12 @@ public static class OtlpTraceProtoParser
         public ArrayBufferWriter<byte> ResBuf;    // resource attrs (msgpack KV pairs), per resourceSpans
         public ArrayBufferWriter<byte> SpanBuf;   // span attrs (msgpack KV pairs), per span
         public ArrayBufferWriter<byte> OutBuf;    // assembled map: header + ResBuf + SpanBuf
-        public List<SpanIngestItem> Result;
+        public ISpanSink Sink;
+        public int Ingested;
+        public int Refused;
         public int ResKeyCount;
-        public string Service;                    // one string per resourceSpans block, as the mapper made
+        public ReadOnlySpan<byte> Service;        // one per resourceSpans block, valid UTF-8
+        public int ServiceIdx;                    // what the sink interned it as, once per block
         public bool ServiceSeen;
         public int Depth;                         // nested array_value / kvlist_value levels open
     }
@@ -133,8 +150,24 @@ public static class OtlpTraceProtoParser
     /// </summary>
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> payload)
     {
-        try { return ParseBatch(payload); }
-        finally { ReleaseScratch(); }
+        var items = new SpanItemCollector();
+        Parse(payload, items);
+        return items.Items;
+    }
+
+    /// <summary>
+    /// Streams the batch into <paramref name="sink"/> and says how many spans it took and how many
+    /// it refused (back-pressure). A malformed body throws, with its prefix already ingested; the
+    /// sink's batch is ended either way.
+    /// </summary>
+    public static (int Ingested, int Refused) Parse(ReadOnlySpan<byte> payload, ISpanSink sink)
+    {
+        try { return ParseBatch(payload, sink); }
+        finally
+        {
+            sink.EndBatch();
+            ReleaseScratch();
+        }
     }
 
     /// <summary>
@@ -151,17 +184,20 @@ public static class OtlpTraceProtoParser
         if (_tRes  is { Capacity: > MaxKeptAttrScratch }) _tRes  = null;
         if (_tSpan is { Capacity: > MaxKeptAttrScratch }) _tSpan = null;
         if (_tOut  is { Capacity: > MaxKeptAttrScratch }) _tOut  = null;
+        if (_tName    is { Length: > MaxKeptAttrScratch }) _tName    = null;
+        if (_tService is { Length: > MaxKeptAttrScratch }) _tService = null;
     }
 
-    private static List<SpanIngestItem> ParseBatch(ReadOnlySpan<byte> payload)
+    private static (int Ingested, int Refused) ParseBatch(ReadOnlySpan<byte> payload, ISpanSink sink)
     {
         var st = new ParseState
         {
-            ResBuf  = _tRes  ??= new ArrayBufferWriter<byte>(4096),
-            SpanBuf = _tSpan ??= new ArrayBufferWriter<byte>(8192),
-            OutBuf  = _tOut  ??= new ArrayBufferWriter<byte>(8192),
-            Result  = [],
-            Service = UnknownService,
+            ResBuf     = _tRes  ??= new ArrayBufferWriter<byte>(4096),
+            SpanBuf    = _tSpan ??= new ArrayBufferWriter<byte>(8192),
+            OutBuf     = _tOut  ??= new ArrayBufferWriter<byte>(8192),
+            Sink       = sink,
+            Service    = UnknownServiceUtf8,
+            ServiceIdx = -1,
         };
         // ResetWrittenCount, not Clear: Clear zeroes every byte written last time, and nothing
         // reads past WrittenSpan.
@@ -176,7 +212,7 @@ public static class OtlpTraceProtoParser
             if (tag == 10) ReadResourceSpans(r.ReadLengthDelimited(), ref st);   // field 1
             else r.SkipField(tag);
         }
-        return st.Result;
+        return (st.Ingested, st.Refused);
     }
 
     /// <summary>
@@ -187,7 +223,7 @@ public static class OtlpTraceProtoParser
     {
         st.ResBuf.ResetWrittenCount();
         st.ResKeyCount = 0;
-        st.Service     = UnknownService;
+        st.Service     = UnknownServiceUtf8;
         st.ServiceSeen = false;
 
         var pass1 = new ProtoReader(bytes);
@@ -197,6 +233,10 @@ public static class OtlpTraceProtoParser
             if (tag == 10) ReadResource(pass1.ReadLengthDelimited(), ref st);    // field 1
             else pass1.SkipField(tag);
         }
+
+        // ONCE PER BLOCK, not once per span: the service is a property of the resource, and every
+        // span under it is handed this index with the same bytes.
+        st.ServiceIdx = st.Sink.InternService(st.Service);
 
         var pass2 = new ProtoReader(bytes);
         while ((tag = pass2.ReadTag()) != 0)
@@ -281,12 +321,8 @@ public static class OtlpTraceProtoParser
         if (kind == 3 /* CLIENT */ && promo.AmetoInternal) return;
 
         int total = st.ResKeyCount + spanKeyCount;
-        byte[] attrBytes;
-        if (total == 0)
-        {
-            attrBytes = [];
-        }
-        else
+        ReadOnlySpan<byte> attrBytes = default;
+        if (total > 0)
         {
             st.OutBuf.ResetWrittenCount();
             var ow = new MessagePackWriter(st.OutBuf);
@@ -294,7 +330,7 @@ public static class OtlpTraceProtoParser
             if (st.ResKeyCount > 0) ow.WriteRaw(st.ResBuf.WrittenSpan);
             if (spanKeyCount  > 0) ow.WriteRaw(st.SpanBuf.WrittenSpan);
             ow.Flush();
-            attrBytes = st.OutBuf.WrittenSpan.ToArray();
+            attrBytes = st.OutBuf.WrittenSpan;   // the sink copies it before the next span reuses the buffer
         }
 
         // A fixed64 past long.MaxValue is not a timestamp: the mapper stringified it and
@@ -302,25 +338,49 @@ public static class OtlpTraceProtoParser
         long startNano = startRaw <= long.MaxValue ? (long)startRaw : 0;
         long endNano   = endRaw   <= long.MaxValue ? (long)endRaw   : 0;
 
-        st.Result.Add(new SpanIngestItem
-        {
-            TraceId           = TraceId.Parse(traceId),
-            SpanId            = SpanId.Parse(spanId),
-            ParentSpanId      = parentId.Length == 8 ? SpanId.Parse(parentId) : default,
-            StartTimeUnixNano = startNano,
-            DurationNanos     = endNano > startNano ? endNano - startNano : 0,
-            Name              = name.IsEmpty ? string.Empty : Encoding.UTF8.GetString(name),
-            ServiceName       = st.Service,
-            Kind              = (SpanKind)(kind & 0x07),
-            Status            = statusCode switch
+        bool taken = st.Sink.TryIngestRaw(
+            TraceId.Parse(traceId),
+            SpanId.Parse(spanId),
+            parentId.Length == 8 ? SpanId.Parse(parentId) : default,
+            startNano,
+            endNano > startNano ? endNano - startNano : 0,
+            ValidUtf8(name, ref _tName),
+            st.ServiceIdx,
+            st.Service,
+            (SpanKind)(kind & 0x07),
+            statusCode switch
             {
                 1 => SpanStatusCode.Ok,
                 2 => SpanStatusCode.Error,
                 _ => SpanStatusCode.Unset,
             },
-            AttributesBytes   = attrBytes,
-            HttpStatusCode    = promo.HttpStatus,
-        });
+            promo.HttpStatus,
+            attrBytes);
+
+        if (taken) st.Ingested++;
+        else       st.Refused++;
+    }
+
+    /// <summary>
+    /// The text a protobuf <c>string</c> field carried, as VALID UTF-8: the wire bytes themselves
+    /// when they are valid (every conformant exporter — one vectorised check), else the bytes of
+    /// what <c>Encoding.UTF8.GetString</c> made of them (U+FFFD per invalid sequence, the text the
+    /// DOM path stored), re-encoded into <paramref name="scratch"/>.
+    /// </summary>
+    private static ReadOnlySpan<byte> ValidUtf8(ReadOnlySpan<byte> wire, scoped ref byte[]? scratch)
+    {
+        if (System.Text.Unicode.Utf8.IsValid(wire)) return wire;
+        return Sanitize(wire, ref scratch);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static ReadOnlySpan<byte> Sanitize(ReadOnlySpan<byte> wire, scoped ref byte[]? scratch)
+    {
+        string text = Encoding.UTF8.GetString(wire);
+        int    max  = Encoding.UTF8.GetMaxByteCount(text.Length);
+        if (scratch is null || scratch.Length < max) scratch = new byte[Math.Max(256, max)];
+        int n = Encoding.UTF8.GetBytes(text, scratch);
+        return scratch.AsSpan(0, n);
     }
 
     /// <summary>Status.code (field 3); status.message (field 2) is never read by the mapper.</summary>
@@ -378,7 +438,7 @@ public static class OtlpTraceProtoParser
             if (!st.ServiceSeen && haveValue && TryStringValue(value, out var sv))
             {
                 st.ServiceSeen = true;
-                st.Service     = Encoding.UTF8.GetString(sv);
+                st.Service     = ValidUtf8(sv, ref _tService);
             }
             return false;
         }
@@ -579,4 +639,52 @@ public static class OtlpTraceProtoParser
             ArrayPool<char>.Shared.Return(chars);
         }
     }
+}
+
+/// <summary>
+/// A sink that builds <see cref="SpanIngestItem"/>s — the parsers' list-returning <c>Parse</c>
+/// overloads, which the gRPC receiver and the tests use, over the one streaming core. It rebuilds
+/// exactly what the list path always produced: the name decoded from its (valid) UTF-8, ONE service
+/// string per resource block shared by the spans under it (the index <see cref="InternService"/>
+/// hands out is a position in this collector's own list), and the attribute blob copied out of the
+/// parser's scratch — an empty array when the span has none.
+/// </summary>
+internal sealed class SpanItemCollector : ISpanSink
+{
+    public readonly List<SpanIngestItem> Items = [];
+    private readonly List<string> _services = [];
+
+    public int InternService(ReadOnlySpan<byte> serviceUtf8)
+    {
+        _services.Add(serviceUtf8.IsEmpty ? string.Empty : Encoding.UTF8.GetString(serviceUtf8));
+        return _services.Count - 1;
+    }
+
+    public bool TryIngestRaw(
+        TraceId traceId, SpanId spanId, SpanId parentSpanId,
+        long startTimeUnixNano, long durationNanos,
+        ReadOnlySpan<byte> nameUtf8, int serviceIdx, ReadOnlySpan<byte> serviceUtf8,
+        SpanKind kind, SpanStatusCode status, short httpStatusCode,
+        ReadOnlySpan<byte> msgpackAttributes)
+    {
+        Items.Add(new SpanIngestItem
+        {
+            TraceId           = traceId,
+            SpanId            = spanId,
+            ParentSpanId      = parentSpanId,
+            StartTimeUnixNano = startTimeUnixNano,
+            DurationNanos     = durationNanos,
+            Name              = nameUtf8.IsEmpty ? string.Empty : Encoding.UTF8.GetString(nameUtf8),
+            ServiceName       = (uint)serviceIdx < (uint)_services.Count
+                                    ? _services[serviceIdx]
+                                    : (serviceUtf8.IsEmpty ? string.Empty : Encoding.UTF8.GetString(serviceUtf8)),
+            Kind              = kind,
+            Status            = status,
+            AttributesBytes   = msgpackAttributes.IsEmpty ? [] : msgpackAttributes.ToArray(),
+            HttpStatusCode    = httpStatusCode,
+        });
+        return true;
+    }
+
+    public void EndBatch() { }
 }
