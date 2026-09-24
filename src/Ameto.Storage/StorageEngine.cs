@@ -1959,7 +1959,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Already parked: that entry's retries cover this failure too.
         if (_pendingSegmentDeletes.ContainsKey(path)) return;
 
-        if (_pendingSegmentDeletes.Count >= PendingSegmentDeleteCap)
+        // A merge's guard parks waiting for their unlink are not failed deletes, and do not fill
+        // the set for one (see _mergeGuardParks).
+        if (_pendingSegmentDeletes.Count - Volatile.Read(ref _mergeGuardParks) >= PendingSegmentDeleteCap)
         {
             LogNotRetried(path, ex);
             return;
@@ -3393,6 +3395,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private void CommitMerge(SegmentInfo output, SegmentKey[] sources)
     {
         var          removed = new SegmentInfo?[sources.Length];
+        var          guarded = new bool[sources.Length];
         SegmentInfo? displaced;
 
         lock (_importLock)
@@ -3402,6 +3405,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             PublishMergedAwayMark();
 
             long parkedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            int  guards   = 0;
             for (int i = 0; i < removed.Length; i++)
             {
                 if (removed[i] is not { } gone) continue;
@@ -3409,17 +3413,44 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // Past PendingSegmentDeleteCap too: this park is not a failed delete waiting for a
                 // retry but the scan's guard until the unlink below, and the cap is applied to
                 // what is still parked once that has been tried (see SettleMergedSources).
-                _pendingSegmentDeletes.TryAdd(gone.FilePath, new PendingSegmentDelete(sources[i], parkedAt));
+                if (_pendingSegmentDeletes.TryAdd(gone.FilePath, new PendingSegmentDelete(sources[i], parkedAt)))
+                {
+                    guarded[i] = true;
+                    guards++;
+                }
             }
+            // Counted out of the cap check a failed delete meets (ParkSegmentDelete) until each is
+            // tried: a retention delete landing between two of the unlinks below must not find the
+            // set "full" of the merge's guards and give up on its file.
+            Volatile.Write(ref _mergeGuardParks, guards);
         }
 
-        if (displaced is not null && !IsTheSameSegment(displaced, output))
-            LogDisplacedLocalSegment(output, displaced);
+        try
+        {
+            if (displaced is not null && !IsTheSameSegment(displaced, output))
+                LogDisplacedLocalSegment(output, displaced);
 
-        _afterMergeSwap?.Invoke();
+            _afterMergeSwap?.Invoke();
 
-        SettleMergedSources(sources, removed);
+            SettleMergedSources(sources, removed, guarded);
+        }
+        finally
+        {
+            // Whatever was not tried stays parked as an ordinary parked delete, retried by the
+            // background loop, the passes and shutdown, and from here on counts toward the cap.
+            Volatile.Write(ref _mergeGuardParks, 0);
+        }
     }
+
+    /// <summary>
+    /// Parks <see cref="CommitMerge"/> made as guards and has not tried to unlink yet; merges run
+    /// one at a time, so they are one merge's. <see cref="ParkSegmentDelete"/> leaves them out of
+    /// its cap check. Written under <c>_importLock</c> and <see cref="_scanDeleteGate"/> by the
+    /// commit, decremented without them as each is tried: read between an attempt's unpark and
+    /// its decrement, the check is lenient by one — the cap is a bound on retries, not a count
+    /// anything depends on.
+    /// </summary>
+    private int _mergeGuardParks;
 
     /// <summary>
     /// Unlinks the sources <see cref="CommitMerge"/> parked, each through
@@ -3433,9 +3464,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// the recovery sweep as well. Only up to <see cref="PendingSegmentDeleteCap"/>: past it, a
     /// path is let go as a failed delete past the cap is (logged, left on disk, the park's record
     /// handed to a running scan), and the recovery sweep retries it from the manifest. The commit
-    /// parked past the cap only for the moment between its hold and this attempt.</para>
+    /// parked past the cap only for the moment between its hold and this attempt, and those
+    /// guard parks do not count against a failed delete's park in the meantime
+    /// (<see cref="_mergeGuardParks"/>).</para>
     /// </summary>
-    private void SettleMergedSources(SegmentKey[] sources, SegmentInfo?[] removed)
+    private void SettleMergedSources(SegmentKey[] sources, SegmentInfo?[] removed, bool[] guarded)
     {
         bool anyLeft = false;
         for (int i = 0; i < removed.Length; i++)
@@ -3443,6 +3476,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (removed[i] is not { } gone) continue;
             if (TryCompletePendingSegmentDelete(gone.FilePath)) removed[i] = null;
             else anyLeft = true;
+            if (guarded[i]) Interlocked.Decrement(ref _mergeGuardParks);
         }
         if (!anyLeft) return;
 

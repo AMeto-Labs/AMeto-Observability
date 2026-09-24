@@ -633,6 +633,88 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.Single(_engine.ListSegments());
     }
 
+    /// <summary>
+    /// The commit's guard parks do not fill the pending-delete set for a failed delete that lands
+    /// among the merge's unlinks. Cap 4, a ten-source merge; from the window after the swap a
+    /// peer segment is imported and deleted with its unlink failing, as an open reader makes it
+    /// fail. The set then holds the merge's ten guards. Counted, they refused the peer's park as
+    /// "set full": nothing in this process retried its file, and after a restart the boot scan
+    /// served the expired segment again until the next retention pass.
+    /// </summary>
+    [Fact]
+    public async Task AFailedDeleteAmongTheMergesUnlinks_IsParkedPastItsGuards()
+    {
+        await _engine.CatalogLoaded;   // the peer file below is the import's, not the boot scan's
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var peerPath = WritePeerSegment(901);
+        var peerKey  = new SegmentKey(new NodeId(7), new SegmentId(901));
+
+        _engine.PendingSegmentDeleteCap = 4;
+        _engine._deleteSegmentFile = path =>
+        {
+            if (string.Equals(path, peerPath, StringComparison.OrdinalIgnoreCase)) throw new IOException("a query still maps it");
+            File.Delete(path);
+        };
+        int guardsSeen = -1;
+        SegmentImportOutcome? imported = null;
+        _engine._afterMergeSwap = () =>
+        {
+            // Values kept, not asserted: a throw here is the merge's, and ends it.
+            guardsSeen = _engine.PendingSegmentDeleteCount;
+            imported   = _engine.ImportSegment(peerPath);
+            _engine.DeleteSegmentAsync(peerKey).GetAwaiter().GetResult();
+        };
+        bool merged;
+        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        finally { _engine._afterMergeSwap = null; }
+
+        Assert.True(merged, "setup: the merge merged nothing");
+        Assert.Equal(10, guardsSeen);   // setup: the set was past the cap with the merge's guards alone
+        Assert.Equal(SegmentImportOutcome.Registered, imported);
+        Assert.True(File.Exists(peerPath), "setup: the peer's unlink was meant to fail");
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // 0: refused as "set full", never retried
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("is not retried: the pending-delete set is full", StringComparison.Ordinal));
+
+        // Parked, so retried: once the reader is gone the file goes.
+        _engine._deleteSegmentFile = File.Delete;
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(peerPath));
+    }
+
+    /// <summary>
+    /// A commit that throws before its unlinks leaves its guard parks as ordinary parked deletes,
+    /// and from then on they count toward the cap like any other: the guard count does not
+    /// outlive the commit. Cap 10, ten sources parked by a commit whose hook throws; a delete
+    /// failing afterwards finds the set full and is refused, where a guard count left at ten
+    /// would have let the set grow past its cap.
+    /// </summary>
+    [Fact]
+    public async Task AfterACommitThatThrows_ItsGuardParksCountTowardTheCap()
+    {
+        await _engine.CatalogLoaded;   // the peer file below is the import's, not the boot scan's
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var peerPath = WritePeerSegment(902);
+
+        _engine.PendingSegmentDeleteCap = 10;
+        _engine._afterMergeSwap = static () => throw new IOException("the commit failed before its unlinks");
+        await Assert.ThrowsAsync<IOException>(() => _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        _engine._afterMergeSwap = null;
+        Assert.Equal(10, _engine.PendingSegmentDeleteCount);   // setup: the guards stayed parked
+
+        _engine._deleteSegmentFile = path =>
+        {
+            if (string.Equals(path, peerPath, StringComparison.OrdinalIgnoreCase)) throw new IOException("a query still maps it");
+            File.Delete(path);
+        };
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(peerPath));
+        await _engine.DeleteSegmentAsync(new SegmentKey(new NodeId(7), new SegmentId(902)));
+
+        Assert.Equal(10, _engine.PendingSegmentDeleteCount);   // 11: the set grew past its cap
+        Assert.Contains(_log.Entries, e => e.Message.Contains("is not retried: the pending-delete set is full", StringComparison.Ordinal));
+    }
+
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>
     [Fact]
     public async Task CrashMidDeletion_FinishesTheRemainingSources()
