@@ -18,8 +18,9 @@ namespace Ameto.Storage.Tests;
 /// quietly move: an inclusive range bound, a histogram's reconstructed zero buckets past a
 /// pushed-down range, a '|' option list with an empty option, a key that differs only in case,
 /// a v2 file. The goldens hash every bit of every answer; the facts below them state the edge
-/// behaviours in words, including one that is a latent bug kept on purpose (a repeated label
-/// key throws, exactly as <c>ToDictionary</c> did).</para>
+/// behaviours in words. One was a latent bug kept on purpose by the rewrite — a repeated label key
+/// threw, exactly as <c>ToDictionary</c> did — and is fixed since (#92): such a key is matched on
+/// the last value of its run.</para>
 /// </summary>
 public sealed class MetricQueryGoldenTests : IDisposable
 {
@@ -245,13 +246,28 @@ public sealed class MetricQueryGoldenTests : IDisposable
         Assert.Equal("577180AA7A46C4CF", Finish(h));
     }
 
-    // ── The latent bug, kept: a repeated label key ────────────────────────────
+    // ── A repeated label key: matched on the last value of its run (#92) ──────
+    //
+    // The latent bug this class used to pin — kept by the rewrite, not fixed by it — is fixed now:
+    // a set with a key twice (stored before ingest collapsed repeats) failed ANY filtered read with
+    // the ArgumentException ToDictionary threw. It is matched instead, on the value the answer
+    // writes for the key: the last of its run, "v2".
 
     private static LabelSet Duplicated() =>
         new([new("k", "v1"), new("k", "v2"), new("z", "1")]);
 
+    private static IEnumerable<(Dictionary<string, string> Matchers, bool Matches)> DupFilters() =>
+    [
+        (new Dictionary<string, string>(),                              true),
+        (new Dictionary<string, string> { ["z"] = "1" },                true),
+        (new Dictionary<string, string> { ["k"] = "v2" },               true),
+        (new Dictionary<string, string> { ["k"] = "v1" },               false),   // not the value written
+        (new Dictionary<string, string> { ["k"] = "v1|v2" },            true),
+        (new Dictionary<string, string> { ["k"] = "v2", ["z"] = "2" },  false),
+    ];
+
     [Fact]
-    public async Task A_cold_series_with_a_repeated_key_fails_any_filtered_read_and_passes_an_unfiltered_one()
+    public async Task A_cold_series_with_a_repeated_key_is_matched_on_the_last_value_of_its_run()
     {
         var items = new List<(SeriesKey, HotSeries)>
         {
@@ -259,44 +275,39 @@ public sealed class MetricQueryGoldenTests : IDisposable
         };
         var file = Assert.Single(MetricWriter.Write(_dir, items, MetricGranularity.Raw)).FilePath;
 
-        // No matchers at all: the series comes back, both pairs intact.
+        // No matchers at all: the series comes back, both pairs intact — the stored set is not rewritten.
         var got = new List<MetricSeries>();
         await foreach (var s in MetricReader.ReadAsync(file, "golden.dup", long.MinValue, long.MaxValue, null, CancellationToken.None))
             got.Add(s);
         Assert.Equal(2 * 3, Assert.Single(got).Labels.Interleaved.Length);
 
-        // ANY matcher dictionary, even an empty one: the reader built a dictionary of the pairs,
-        // and ToDictionary throws on the second "k". Kept by the rewrite, not fixed by it.
-        foreach (var m in new[] { new Dictionary<string, string>(), new Dictionary<string, string> { ["z"] = "1" } })
-            await Assert.ThrowsAsync<ArgumentException>(async () =>
-            {
-                await foreach (var _ in MetricReader.ReadAsync(file, "golden.dup", long.MinValue, long.MaxValue, m, CancellationToken.None)) { }
-            });
+        foreach (var (m, matches) in DupFilters())
+        {
+            int n = 0;
+            await foreach (var _ in MetricReader.ReadAsync(file, "golden.dup", long.MinValue, long.MaxValue, m, CancellationToken.None)) n++;
+            Assert.Equal(matches ? 1 : 0, n);
+        }
     }
 
     [Fact]
-    public async Task A_hot_series_with_a_repeated_key_fails_a_filtered_query_and_passes_an_empty_filter()
+    public async Task A_hot_series_with_a_repeated_key_is_matched_on_the_last_value_of_its_run()
     {
         await using var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance,
                                                          new Ameto.Core.MetricsOptions { HotTierBytes = 1L << 30 });
         engine.Ingest([new MetricIngestItem { Name = "golden.dup", Kind = MetricKind.Gauge, Labels = Duplicated(),
                                               TimestampUnixNano = T0, ScalarValue = 1 }]);
 
-        // The hot tier's matcher answers "match" for null or empty BEFORE it builds anything.
-        foreach (var m in new IReadOnlyDictionary<string, string>?[] { null, new Dictionary<string, string>() })
-        {
-            int n = 0;
-            await foreach (var _ in engine.QueryAsync("golden.dup", labelMatchers: m)) n++;
-            Assert.Equal(1, n);
-        }
+        int unfiltered = 0;
+        await foreach (var _ in engine.QueryAsync("golden.dup", labelMatchers: null)) unfiltered++;
+        Assert.Equal(1, unfiltered);
 
-        await Assert.ThrowsAsync<ArgumentException>(async () =>
+        foreach (var (m, matches) in DupFilters())
         {
-            await foreach (var _ in engine.QueryAsync("golden.dup", labelMatchers: new Dictionary<string, string> { ["z"] = "1" })) { }
-        });
-        await Assert.ThrowsAsync<ArgumentException>(async () =>
-        {
-            await foreach (var _ in engine.GetLatestAsync("golden.dup", new Dictionary<string, string> { ["k"] = "v1" })) { }
-        });
+            int n = 0, latest = 0;
+            await foreach (var _ in engine.QueryAsync("golden.dup", labelMatchers: m)) n++;
+            await foreach (var _ in engine.GetLatestAsync("golden.dup", m)) latest++;
+            Assert.Equal(matches ? 1 : 0, n);
+            Assert.Equal(matches ? 1 : 0, latest);
+        }
     }
 }

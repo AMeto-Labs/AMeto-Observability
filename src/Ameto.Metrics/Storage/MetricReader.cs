@@ -729,19 +729,18 @@ internal static class MetricReader
     /// five. The pairs are already sorted by key (ordinal), so a walk that stops at the first key
     /// past the one sought answers the same lookup with no allocation at all.</para>
     ///
-    /// <para><b>A repeated key still throws, deliberately.</b> <c>ToDictionary</c> threw
-    /// <see cref="ArgumentException"/> on a label set with a key twice (the OTLP parser can build
-    /// one — a point attribute named <c>service.name</c>, a duplicate attribute) before any matcher
-    /// was looked at, failing the whole query. That is a latent bug, but this change is a
-    /// performance change and the answer is part of what it must keep: a query that failed still
-    /// fails, the same way (<c>MetricQueryGoldenTests</c> pins it). Repeats are adjacent in the
-    /// sorted pairs, so finding one is a compare per pair.</para>
+    /// <para><b>A repeated key is matched on the LAST value of its run</b> (#92) — the value the
+    /// answer writes for it (<c>MetricSeriesJson.WriteLabels</c>), so a filter selects exactly the
+    /// series whose written labels satisfy it. Ingest no longer builds such a set; one stored before
+    /// that fix (the WAL, an <c>.mts</c>) is matched, never refused. It used to throw
+    /// <see cref="ArgumentException"/> before any matcher was looked at, as the <c>ToDictionary</c>
+    /// this scan replaced did: any filter on /query, /heatmap or /exemplars that touched such a
+    /// series was a 500, and a metric alert rule with labels failed every tick while it was in the
+    /// window.</para>
     /// </summary>
     internal static bool MatchesLabels(LabelSet labels, IReadOnlyDictionary<string, string> matchers)
     {
         ReadOnlySpan<string> kv = labels.Interleaved;
-        for (int i = 2; i < kv.Length; i += 2)
-            if (string.Equals(kv[i], kv[i - 2])) ThrowRepeatedKey(kv[i]);
 
         // The concrete dictionary's struct enumerator, when that is what came in (it is, from every
         // endpoint and the alert rules): the interface's would be a boxed enumerator per series.
@@ -756,14 +755,19 @@ internal static class MetricReader
         return true;
     }
 
-    /// <summary>The value under <paramref name="key"/> in canonically sorted pairs, tested against the matcher.</summary>
+    /// <summary>
+    /// The value under <paramref name="key"/> in canonically sorted pairs — the last of its run when
+    /// the key repeats (see <see cref="MatchesLabels"/>) — tested against the matcher.
+    /// </summary>
     private static bool Matches(ReadOnlySpan<string> kv, string key, string matcher)
     {
         for (int i = 0; i < kv.Length; i += 2)
         {
             int c = string.CompareOrdinal(kv[i], key);
             if (c < 0) continue;
-            return c == 0 && LabelValueMatches(kv[i + 1], matcher);   // past it: the key is absent
+            if (c > 0) return false;                                   // past it: the key is absent
+            while (i + 2 < kv.Length && string.Equals(kv[i + 2], key)) i += 2;
+            return LabelValueMatches(kv[i + 1], matcher);
         }
         return false;
     }
@@ -787,10 +791,6 @@ internal static class MetricReader
             rest = rest[(bar + 1)..];
         }
     }
-
-    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    private static void ThrowRepeatedKey(string key) =>
-        throw new ArgumentException($"An item with the same key has already been added. Key: {key}");
 
     private static long ReadNameIdxOffset(FileStream fs, BinaryReader br)
     {

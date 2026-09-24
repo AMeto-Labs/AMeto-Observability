@@ -533,7 +533,7 @@ Metric query surface (points ingested via OTLP). All require JWT Bearer.
 
 **Values JSON cannot hold.** A point's `value` or `sum` that is NaN or ±Infinity — legal in OTLP (an exporter dividing by zero, an empty histogram's mean) — is answered as `null`, per point; the rest of the series and of the answer is unaffected. The same holds for an exemplar's `value` and a heatmap's `bounds` / `counts`. (These used to fail the whole request with a 500, or drop the connection part-way through a large `GET /api/metrics/{name}`.) A metric alert rule skips such points, and a window holding nothing else leaves the rule's state unchanged; the server logs it once per rule.
 
-**Label keys are unique within a series.** OTLP forbids an attribute key twice on one data point, but exporters send it — the same attribute twice, or `service.name` on the point as well as the resource. At ingest the last value of a repeated point attribute wins, and a point attribute wins over the resource's value for the same key, so a series never carries a key twice. A series stored before this rule is answered with the key once, the last value of its run.
+**Label keys are unique within a series.** OTLP forbids an attribute key twice on one data point, but exporters send it — the same attribute twice, or `service.name` on the point as well as the resource. At ingest the last value of a repeated point attribute wins, and a point attribute wins over the resource's value for the same key, so a series never carries a key twice. A series stored before this rule is answered with the key once, the last value of its run — and `filters`, `groupBy` and alert-rule `labels` match and group it on that same value.
 
 ---
 

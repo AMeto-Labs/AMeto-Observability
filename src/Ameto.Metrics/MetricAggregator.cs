@@ -580,11 +580,13 @@ public sealed class MetricAggregator : IMetricAggregator
     private static LabelSet ReduceLabels(LabelSet labels, string[] keep, string[] scratch)
     {
         // The pairs are in canonical order and a subset of them keeps it, so the reduced set is
-        // built straight from the kept strings — no pair list, no sort.
+        // built straight from the kept strings — no pair list, no sort. A key repeated in a set
+        // stored before ingest collapsed repeats (#92) keeps the LAST value of its run, the one the
+        // answer writes and a filter matches, so such a series groups with the series it reads as.
         var kv = labels.Interleaved;
         int n  = 0;
         for (int i = 0; i < kv.Length; i += 2)
-            if (Array.IndexOf(keep, kv[i]) >= 0)
+            if (Array.IndexOf(keep, kv[i]) >= 0 && !(i + 2 < kv.Length && string.Equals(kv[i], kv[i + 2])))
             {
                 scratch[n++] = kv[i];
                 scratch[n++] = kv[i + 1];
