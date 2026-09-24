@@ -211,7 +211,8 @@ internal static class SpanBloom
     /// The dictionary path — a record with no blob, or one whose blob failed
     /// <see cref="TryAddBlob"/>. Hashes the value AS <c>SpanWriter.WriteAttributes</c> WRITES IT, which
     /// is what a reader of the segment will evaluate: <c>int</c>/<c>short</c>/<c>byte</c> become an
-    /// integer, <c>float</c> a double, and any other type the string its <c>ToString()</c> wrote.
+    /// integer, <c>float</c> a double, and any other type the invariant string
+    /// (<see cref="SpanAttributeBlob.InvariantText"/>) it wrote.
     /// </summary>
     public static void AddAttr(HashSet<ulong> hashes, string key, object? value)
     {
@@ -231,7 +232,7 @@ internal static class SpanBloom
             case byte by:  hashes.Add(HashInteger(p, by, scratch));           return;
             case double d: hashes.Add(HashFloat(p, d, scratch));              return;
             case float f:  hashes.Add(HashFloat(p, f, scratch));              return;
-            default:       hashes.Add(FoldUtf16(p, value.ToString() ?? "")); return;
+            default:       hashes.Add(FoldUtf16(p, SpanAttributeBlob.InvariantText(value))); return;
         }
     }
 

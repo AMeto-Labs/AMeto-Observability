@@ -287,10 +287,9 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
         }
 
         // Invariant for anything that formats (#86) — a long or a double is the text the blob path
-        // above compares and the bloom hashes; a string or a boolean has no culture to begin with.
-        string attrStr = raw is IFormattable f
-            ? f.ToString(null, System.Globalization.CultureInfo.InvariantCulture)
-            : raw.ToString() ?? string.Empty;
+        // above compares and the bloom hashes, and any other type the text the writer stores for it;
+        // a string or a boolean has no culture to begin with. One definition for all three.
+        string attrStr = SpanAttributeBlob.InvariantText(raw);
         int cmp = string.Compare(attrStr, qv.StringVal, StringComparison.OrdinalIgnoreCase);
         return op switch
         {

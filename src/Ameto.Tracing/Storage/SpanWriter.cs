@@ -589,7 +589,7 @@ internal static class SpanWriter
                 case byte by:    w.Write((long)by);          break;
                 case double d:   w.Write(d);                 break;
                 case float f:    w.Write((double)f);         break;
-                default:         w.Write(v.ToString() ?? ""); break;
+                default:         w.Write(SpanAttributeBlob.InvariantText(v)); break;   // invariant, F2
             }
         }
     }

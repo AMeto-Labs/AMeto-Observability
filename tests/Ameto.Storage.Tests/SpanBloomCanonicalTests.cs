@@ -470,6 +470,68 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         static bool Bytes(byte[] b) => SpanBloom.TryAddBlob(new HashSet<ulong>(), b);
     }
 
+    /// <summary>
+    /// A VALUE msgpack HAS NO TYPE FOR ANSWERS THE SAME HOT AND FLUSHED — review F2. A dictionary-built
+    /// record may carry a <c>DateTime</c>, a <c>decimal</c>, a <c>ulong</c> past <c>long.MaxValue</c>, a
+    /// negative <c>sbyte</c>, a <c>uint</c>; the writer stores each as a string, the bloom hashes that
+    /// string, and the hot tier compares the boxed value's text. All three now use the invariant text
+    /// (<c>SpanAttributeBlob.InvariantText</c>). Under ru-KZ the writer used to store <c>0.5m</c> as
+    /// "0,5" and a date as "24.09.2026 12:00:00", while the hot tier compared the invariant text — so
+    /// the query below matched the span in the hot tier and nothing once it was flushed. Put
+    /// <c>ToString()</c> back in <c>WriteAttributes</c>' default branch and the flushed half finds 0.
+    /// </summary>
+    [Theory]
+    [InlineData("ru-KZ")]
+    [InlineData("sv-SE")]
+    public async Task A_value_msgpack_has_no_type_for_answers_the_same_hot_and_flushed(string culture)
+    {
+        (string Key, object Hit, object Miss)[] values =
+        [
+            ("when",   new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc), new DateTime(2025, 1, 2, 3, 4, 5, DateTimeKind.Utc)),
+            ("amount", 0.5m,                                                   1.5m),
+            ("big",    ulong.MaxValue,                                         1UL),
+            ("delta",  (sbyte)-5,                                              (sbyte)5),
+            ("count",  7u,                                                     9u),
+        ];
+
+        var corpus = new List<SpanRecord>(2 * Block);
+        for (int i = 0; i < 2 * Block; i++)
+        {
+            var attrs = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var (key, hit, miss) in values) attrs[key] = i < Block ? hit : miss;
+            corpus.Add(new SpanRecord
+            {
+                TraceId = new TraceId(0xF2, (ulong)i + 1), SpanId = new SpanId((ulong)i + 1),
+                StartTimeUnixNano = BaseNano + i * 1_000L, DurationNanos = 1_000_000,
+                Name = "op", ServiceName = "svc", Attributes = attrs,
+            });
+        }
+
+        await UnderCultureAsync(culture, async () =>
+        {
+            string path = SpanWriter.Write(NewDir("f2"), corpus).FilePath;
+            var flushed = SpanReader.ReadAll(path);
+
+            foreach (var (key, hit, _) in values)
+            {
+                // The literal a user would type: the BCL's invariant text, not the product's helper.
+                string literal = ((IFormattable)hit).ToString(null, CultureInfo.InvariantCulture);
+                var pred = new AttributePredicate(key, TraceQLOp.Eq, TraceQLValue.FromString(literal));
+
+                int hot = 0, cold = 0;
+                foreach (var s in corpus)  if (pred.Evaluate(s) == true) hot++;
+                foreach (var s in flushed) if (pred.Evaluate(s) == true) cold++;
+                var (admitted, found) = await Search(path, pred);
+                _out.WriteLine($"{culture} .{key} = \"{literal}\": hot {hot}, flushed {cold}, bloom-filtered {found}, read {admitted / Block} block(s)");
+
+                Assert.Equal(Block, hot);
+                Assert.True(cold == hot, $".{key} = \"{literal}\": {hot} hot, {cold} once flushed");
+                Assert.True(found == cold, $".{key} = \"{literal}\": the bloom lost {cold - found} of {cold}");
+                Assert.Equal(Block, admitted);
+            }
+        });
+    }
+
     // ── The fold is the build's, not the host's ───────────────────────────────────────────────
 
     /// <summary>
