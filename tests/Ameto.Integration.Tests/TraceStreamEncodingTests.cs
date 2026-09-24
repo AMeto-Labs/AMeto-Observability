@@ -214,6 +214,40 @@ public sealed class TraceStreamEncodingTests : IClassFixture<AmetoWebAppFactory>
         AssertSameBytes(rest, sse, "POST /api/traces/query vs /api/traces/query/stream");
     }
 
+    /// <summary>
+    /// A HOST THAT INDENTS ITS JSON (<c>WriteIndented</c>, common in Development) must still get
+    /// one-line row frames. The rows take the host's ENCODER and nothing else of its layout: an
+    /// indented row carries raw CR/LF, and the first of them ends the <c>data:</c> line — the client
+    /// would receive the row as fragments that do not parse. Driven through the row writer itself
+    /// over a context whose <c>JsonOptions</c> indent, since the shared test host does not.
+    /// </summary>
+    [Fact]
+    public async Task A_host_that_indents_its_json_still_gets_one_line_row_frames_in_its_encoding()
+    {
+        using var services = new ServiceCollection()
+            .Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(o => o.SerializerOptions.WriteIndented = true)
+            .BuildServiceProvider();
+        var ctx = new Microsoft.AspNetCore.Http.DefaultHttpContext { RequestServices = services };
+        Assert.True(TraceDetailJson.WriterOptions(ctx).Indented, "the fixture's host does not indent — the test proves nothing");
+
+        var row = new TraceRowDto
+        {
+            TraceId = "00000000000000930000000000009398", SpanId = "0000000000009398",
+            Name = HostileName, ServiceName = Service, Services = [Service, "billing"],
+            Status = "Ok", HttpMethod = "GET", HttpPath = HttpPath, HttpStatusCode = null,
+            StartTimeUnixNano = Anchor, DurationNanos = 2 * Ms, SpanCount = 3,
+        };
+        var body = new MemoryStream();
+        using (var sse     = new Ameto.Core.SseJsonWriter(body))
+        using (var rowJson = new TraceStreamRowJson(ctx))
+            await rowJson.WriteAsync(sse, row, CancellationToken.None);
+
+        var rows = RowPayloads(body.ToArray(), out _);          // one data line, no line breaker in it
+        string json = Encoding.UTF8.GetString(Assert.Single(rows));
+        Assert.StartsWith("{\"traceId\":\"00000000000000930000000000009398\",\"spanId\":", json);   // not indented
+        Assert.Contains("\"serviceName\":\"сервис-кодировка\"", json);                               // the host's encoder
+    }
+
     // ── What a row frame costs ───────────────────────────────────────────────
 
     /// <summary>A body that keeps nothing and completes every write synchronously.</summary>
