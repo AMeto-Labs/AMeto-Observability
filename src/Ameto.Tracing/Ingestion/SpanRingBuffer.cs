@@ -612,9 +612,9 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// refusing. Only chunks in the list it took are candidates, and only a contiguous run of them
     /// reaching the top of the committed range is given back, so a chunk a producer holds, or one a
     /// drained span still references, stops the run below it. The chunks go back on the high list
-    /// afterwards — the ones kept first, lowest index on top — and a chunk above the new committed
-    /// mark is committed again by <c>AcquireChunk</c>'s commit-before-pop, exactly as a never-used
-    /// one always was.</para>
+    /// afterwards — any released while it held the list on top, then the ones kept, lowest index
+    /// first, then the given-back ones — and a chunk above the new committed mark is committed again
+    /// by <c>AcquireChunk</c>'s commit-before-pop, exactly as a never-used one always was.</para>
     /// </summary>
     public long TrimIdleArena()
     {
@@ -665,12 +665,30 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         {
             if (first >= 0)
             {
+                // What was released while we held the list was in use, so it is COMMITTED: it goes
+                // back ABOVE the chain, not under the given-back chunks. Beneath them it broke the
+                // order AcquireChunk relies on — every committed free chunk above every uncommitted
+                // one — and on Windows, with commit charge exhausted, a failed commit at the head
+                // refused a span with committed chunks free underneath (review L4). So: take what
+                // was pushed meanwhile (versioned CAS, as the first take), link it on top of the
+                // chain, and push the whole — until the head is found empty.
+                _chunkNext[last] = -1;
                 while (true)
                 {
-                    long head = Volatile.Read(ref headRef);                // what was released meanwhile
-                    _chunkNext[last] = unchecked((int)head);
-                    long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)first);
-                    if (Interlocked.CompareExchange(ref headRef, newHead, head) == head) break;
+                    long head = Volatile.Read(ref headRef);
+                    int  idx  = unchecked((int)head);
+                    if (idx < 0)
+                    {
+                        long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)first);
+                        if (Interlocked.CompareExchange(ref headRef, newHead, head) == head) break;
+                        continue;
+                    }
+                    long empty = unchecked((((head >> 32) + 1) << 32) | 0xFFFF_FFFFL);
+                    if (Interlocked.CompareExchange(ref headRef, empty, head) != head) continue;
+                    int tail = idx;
+                    while (_chunkNext[tail] >= 0) tail = _chunkNext[tail];
+                    _chunkNext[tail] = first;
+                    first = idx;
                 }
             }
             else if (unchecked((int)taken) >= 0)

@@ -328,6 +328,56 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
+    /// L4 — A CHUNK RELEASED DURING A TRIM GOES BACK ABOVE THE GIVEN-BACK ONES. Sixty-four chunks
+    /// drained, the low sixteen and chunk 20 still in use; the trim takes the high list and, while it
+    /// holds it (seam), chunk 20 is released. The trim gives back 21..63. Chunk 20 was in use, so it
+    /// is committed — and it used to land UNDER the given-back chunks, breaking the order
+    /// AcquireChunk relies on (every committed free chunk above every uncommitted one): on Windows,
+    /// with commit charge exhausted, a failed commit at the head refused a span with chunk 20 free
+    /// underneath. Platform-independent claim: the next five chunks handed out are 16..20, all
+    /// committed, before any given-back one.
+    /// </summary>
+    [Fact]
+    public void A_chunk_released_during_a_trim_goes_back_above_the_given_back_ones()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+
+        EnqueueChunkSpans(ring, 0, 64);
+        ring.EndBatch();
+        int n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(64, n);
+        var held = new List<SpanHeader>();
+        int twenty = -1;
+        for (int i = 0; i < n; i++)
+        {
+            int chunk = headers[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes;
+            if (chunk == 20) twenty = i;
+            else if (chunk < SpanRingBuffer.LowWaterChunks) held.Add(headers[i]);   // producers must go to the high list
+            else ring.Release(headers.AsSpan(i, 1));
+        }
+        Assert.True(twenty >= 0);
+
+        ring._whileTrimmingForTest = () => ring.Release(headers.AsSpan(twenty, 1));   // released while the trim holds the list
+        long given = ring.TrimIdleArena();
+        ring._whileTrimmingForTest = null;
+
+        var next = new int[5];
+        var fresh = new SpanHeader[8];
+        EnqueueChunkSpans(ring, 2_000, next.Length);
+        ring.EndBatch();
+        Assert.Equal(next.Length, ring.TryDequeueMany(fresh, apart));
+        for (int i = 0; i < next.Length; i++) next[i] = fresh[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes;
+        _out.WriteLine($"trim gave back {given:N0} B; the next chunks handed out: {string.Join(", ", next)}");
+
+        Array.Sort(next);
+        Assert.Equal([16, 17, 18, 19, 20], next);
+        ring.Release(fresh.AsSpan(0, next.Length));
+        ring.Release(held.ToArray());
+    }
+
+    /// <summary>
     /// L2 — A TRIM UNDER STEADY TRAFFIC STILL GIVES THE BURST BACK. A 64-chunk burst, drained, frees
     /// its chunks in order, so with one LIFO free list the chunk on top was the HIGHEST the burst
     /// reached: steady single-batch traffic then lived in chunk 63, and a trim that met a batch open
