@@ -55,7 +55,11 @@ export class MetricSparkComponent {
   protected readonly PAD_Y = PAD_Y;
   protected readonly gradId = `msp-grad-${Math.random().toString(36).slice(2, 7)}`;
 
-  readonly pts = computed(() => this.series().points);
+  /**
+   * The points that carry a value. The server answers a NaN or ±Infinity as `null` (#92); kept, a
+   * null entered the min/max as 0 and drew the line down to it. The spark bridges the gap instead.
+   */
+  readonly pts = computed(() => this.series().points.filter(p => p.value != null));
 
   private bounds = computed(() => {
     const pts = this.pts();

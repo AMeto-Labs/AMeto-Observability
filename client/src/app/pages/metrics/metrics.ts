@@ -497,7 +497,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
       const color = this.seriesColor(s, i);
       return {
         label: this.seriesLabel(s),
-        data: s.points.map(p => ({ x: Math.round(p.ts / 1e6), y: p.value * scale })),
+        data: s.points.map(p => ({ x: Math.round(p.ts / 1e6), y: scaledValue(p.value, scale) })),
         borderColor: color, backgroundColor: color + '22',
         fill: single && !showEx, tension: 0.25, pointRadius: 0, borderWidth: 1.5,
       };
@@ -507,7 +507,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     if (showEx) {
       datasets.push({
         type: 'scatter', label: 'exemplars',
-        data: this.exemplars.map(e => ({ x: Math.round(e.ts / 1e6), y: e.value * scale })),
+        data: this.exemplars.map(e => ({ x: Math.round(e.ts / 1e6), y: scaledValue(e.value, scale) })),
         backgroundColor: '#f43f5e', borderColor: '#fff', borderWidth: 1,
         radius: 3.5, hoverRadius: 6, order: -1,
       });
@@ -556,6 +556,15 @@ export class MetricsComponent implements OnInit, OnDestroy {
 }
 
 // ── Module helpers ────────────────────────────────────────────────────────────
+
+/**
+ * A point's plotted y. The server answers a NaN or ±Infinity value as `null` (#92), and Chart.js
+ * draws a `null` y as a gap — but `null * scale` is 0, which drew every such point as a drop to zero.
+ */
+export function scaledValue(value: number | null, scale: number): number | null {
+  return value == null ? null : value * scale;
+}
+
 function defaultAgg(m: MetricCatalogDto): MetricAggregation {
   return m.type === 'Histogram' ? 'quantile' : m.type === 'Counter' ? 'rate' : 'avg';
 }
