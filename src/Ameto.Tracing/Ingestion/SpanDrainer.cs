@@ -35,6 +35,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
     // host shutdown (see DisposeAsync).
     private int _disposed;
 
+    // Completed when the one teardown has ended; every later DisposeAsync awaits it (see DisposeAsync).
+    private readonly TaskCompletionSource _disposeCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     private DateTime _lastFlush = DateTime.UtcNow;
 
     /// <summary>
@@ -215,22 +218,43 @@ internal sealed class SpanDrainer : IAsyncDisposable
         catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: periodic hot-tier flush failed"); }
     }
 
+    /// <summary>
+    /// Stops the loop, lets its final drain finish, and flushes the tier — ONCE; every other caller
+    /// waits for that one teardown to end.
+    ///
+    /// <para><b>A SECOND CALLER MUST NOT RETURN EARLY.</b> SpanDrainerService disposes this from both
+    /// StopAsync and its own DisposeAsync, a host stops on two chains at once (the stop the caller
+    /// asked for, and <c>app.Run()</c>'s once ApplicationStopping wakes it), and the DI container
+    /// disposes the singleton as well — and, because this was resolved after the ring, disposes the
+    /// RING right after it. Returning on the exchange let that happen while the first caller was
+    /// still joining a final drain: <see cref="SpanRingBuffer.Dispose"/> freed the slots, cursors,
+    /// chunk counts and arena under a loop still reading them (an AccessViolation in
+    /// <c>TryDequeueMany</c>, or a silent read of whatever reused the pages), and the other chain
+    /// tore the engine down under the drain it was still feeding. The engine's DisposeAsync hands
+    /// its later callers the same teardown for the same reason.</para>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        // Idempotent: SpanDrainerService disposes this from both StopAsync and its
-        // own DisposeAsync, and the DI container disposes the singleton as well.
-        // Cancelling/disposing the CTS twice throws ObjectDisposedException.
-        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
+            return;
+        }
 
-        _cts.Cancel();
-        try { await _drainTask.ConfigureAwait(false); }
-        catch (OperationCanceledException) { }
+        try
+        {
+            _cts.Cancel();
+            try { await _drainTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
 
-        // Final flush so spans drained from the ring buffer at shutdown reach disk
-        // even if the engine's own Dispose flush is cut short by the host timeout.
-        try { _storage.FlushHotTier(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: shutdown hot-tier flush failed"); }
+            // Final flush so spans drained from the ring buffer at shutdown reach disk
+            // even if the engine's own Dispose flush is cut short by the host timeout.
+            try { _storage.FlushHotTier(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: shutdown hot-tier flush failed"); }
 
-        _cts.Dispose();
+            // Cancelling/disposing the CTS twice throws ObjectDisposedException — one caller only.
+            _cts.Dispose();
+        }
+        finally { _disposeCompleted.TrySetResult(); }
     }
 }
