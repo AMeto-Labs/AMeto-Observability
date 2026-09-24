@@ -136,6 +136,37 @@ public sealed class MetricLabelPoolResetTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A STALE TAKE-DOWN LEAVES A NEWER BRIDGE STANDING. The bridge ends when text new to both pools
+    /// arrives an interval after the reset — a read of the reset time, then a store; between the two
+    /// another thread can reset again and raise a new bridge. The late take-down is replayed through
+    /// the seam with the bridge the late thread saw: it must not take down the one the reset raised.
+    /// </summary>
+    [Fact]
+    public void Ending_a_stale_bridge_leaves_a_newer_one_standing()
+    {
+        var clock    = new ManualTimeProvider();
+        var interner = new MetricLabelInterner(maxStrings: 8, labelSetSlots: 16, clock);
+        Fill(interner, "a-");
+        clock.Advance(MetricLabelInterner.ResetInterval);
+        Assert.Equal(-1, interner.Intern("reset-1", out _));
+        var first = interner.BridgeForTest;
+        Assert.NotNull(first);
+
+        Fill(interner, "b-");
+        clock.Advance(MetricLabelInterner.ResetInterval);
+        Assert.Equal(-1, interner.Intern("reset-2", out _));
+        Assert.Equal(2, interner.Resets);
+        var second = interner.BridgeForTest;
+        Assert.NotNull(second);
+        Assert.NotSame(first, second);
+
+        interner.EndBridge(first!);                                          // the late thread's store
+        Assert.Same(second, interner.BridgeForTest);
+        interner.EndBridge(second!);
+        Assert.Null(interner.BridgeForTest);
+    }
+
+    /// <summary>
     /// NO SPLIT: a series ingested before the reset and after it — its label set built from the old
     /// epoch's strings, then from the new epoch's — is ONE series in storage and in the catalog. The
     /// two label sets are different instances holding different string instances, and equal by value,

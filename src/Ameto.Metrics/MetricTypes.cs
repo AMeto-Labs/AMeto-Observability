@@ -360,7 +360,7 @@ public sealed class MetricLabelInterner
     /// stored keys instead would take a remove-and-add under concurrent appenders — a window in which
     /// a point could open a second series. Null outside the bridge window.
     /// </summary>
-    private volatile Bridge? _bridge;
+    private Bridge? _bridge;   // read with Volatile.Read, taken down by compare-exchange (EndBridge)
 
     private sealed class Bridge(StringInternPool strings, LabelSet?[] sets, int maxStrings)
     {
@@ -435,7 +435,7 @@ public sealed class MetricLabelInterner
         if (utf8.Length > MaxInternedUtf8Bytes) { value = Encoding.UTF8.GetString(utf8); return -1; }
         var pool = _strings;
         int id;
-        if (_bridge is not { } bridge) id = pool.Intern(utf8, out value);                    // no reset in flight
+        if (Volatile.Read(ref _bridge) is not { } bridge) id = pool.Intern(utf8, out value);                    // no reset in flight
         else
         {
             id = pool.InternOrCarry(utf8, out value, bridge.Strings, out int carriedFrom);   // a hit costs what Intern's does
@@ -453,7 +453,7 @@ public sealed class MetricLabelInterner
         if (!FitsPool(s)) { value = s; return -1; }
         var pool = _strings;
         int id;
-        if (_bridge is not { } bridge) id = pool.Intern(s, out value);
+        if (Volatile.Read(ref _bridge) is not { } bridge) id = pool.Intern(s, out value);
         else
         {
             id = pool.InternOrCarry(s, out value, bridge.Strings, out int carriedFrom);
@@ -478,8 +478,22 @@ public sealed class MetricLabelInterner
             if ((uint)id < (uint)bridge.OldIdOf.Length) Volatile.Write(ref bridge.OldIdOf[id], carriedFrom + 1);
             return;
         }
-        if (_time.GetElapsedTime(Volatile.Read(ref _lastReset)) >= ResetInterval) _bridge = null;
+        if (_time.GetElapsedTime(Volatile.Read(ref _lastReset)) >= ResetInterval) EndBridge(bridge);
     }
+
+    /// <summary>
+    /// Takes down <paramref name="observed"/> — and only it. The interval test above reads
+    /// <see cref="_lastReset"/> and the store follows; between them another thread can run a whole
+    /// reset and raise a NEW bridge, which an unconditional <c>_bridge = null</c> took down at once:
+    /// every live series of that reset then compared strings until it went stale, the cost the
+    /// bridge exists to avoid. A compare-exchange against the bridge this thread saw leaves a newer
+    /// one alone.
+    /// </summary>
+    internal void EndBridge(object observed) =>
+        Interlocked.CompareExchange(ref _bridge, null, observed as Bridge);
+
+    /// <summary>Test seam: the bridge in place, if any — opaque, for <see cref="EndBridge"/>.</summary>
+    internal object? BridgeForTest => Volatile.Read(ref _bridge);
 
     /// <summary>
     /// A miss the pool could not take: it is full (a length the pool refuses never reaches it) — and
@@ -500,7 +514,7 @@ public sealed class MetricLabelInterner
         if (!ReferenceEquals(_strings, full)) return;                          // reset already, by another thread
         if (Interlocked.CompareExchange(ref _lastReset, now, last) != last) return;
 
-        _bridge  = new Bridge(full, _sets, _maxStrings);   // first: a reader that meets the new pool meets it too
+        Volatile.Write(ref _bridge, new Bridge(full, _sets, _maxStrings));   // first: a reader that meets the new pool meets it too
         _sets    = new LabelSet?[_mask + 1];
         _strings = NewPool();
         Interlocked.Increment(ref _resets);
@@ -595,7 +609,7 @@ public sealed class MetricLabelInterner
 
         // A miss while a reset's bridge is up: the OLD table's set, when every string came over the
         // bridge — the instance the stored keys hold (see _bridge). Re-published below like a new one.
-        var created = (_bridge is { } bridge ? CarriedLabelSet(bridge, kv, ids) : null) ?? LabelSet.FromSorted(kv);
+        var created = (Volatile.Read(ref _bridge) is { } bridge ? CarriedLabelSet(bridge, kv, ids) : null) ?? LabelSet.FromSorted(kv);
         if (!publish) return created;                     // lookup only: a miss writes nothing
         // Two choices, no relocation: an empty slot if either is, else the first. A race here
         // costs a redundant label set, never a wrong one — a reader tests every string of a
