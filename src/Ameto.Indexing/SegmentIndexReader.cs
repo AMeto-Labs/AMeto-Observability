@@ -81,6 +81,13 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private Dictionary<string, bool>?            _bloomVerdicts;
     private long                                 _memoBytes;
 
+    /// <summary>
+    /// A test seam: runs after a question has been answered from a section and before the answer
+    /// is remembered — the window in which two queries that missed the same bucket race. Null in
+    /// production, where it costs one field read per miss.
+    /// </summary>
+    internal Action? BeforeRemember;
+
     private SegmentIndexReader(byte[]? inverted, byte[]? trigram, SegmentBloomFilter? bloom)
     {
         _inverted         = inverted;
@@ -229,6 +236,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             if (_bloomVerdicts is not null && _bloomVerdicts.TryGetValue(text, out bool known)) return known;
 
         bool verdict = src.BloomFilter().MightContain(text);
+        BeforeRemember?.Invoke();
         lock (_gate)
         {
             _bloomVerdicts ??= new Dictionary<string, bool>(StringComparer.Ordinal);
@@ -341,6 +349,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             if (_buckets is not null && _buckets.TryGetValue(key, out var known)) return known;
 
         var found = SegmentInvertedIndex.ScanBucket(src.InvertedSection(), codec, prop.Runs, form);
+        BeforeRemember?.Invoke();
         lock (_gate)
         {
             _buckets ??= [];
@@ -485,6 +494,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             decoded = ArrayPool<int[]>.Shared.Rent(m);
             for (int j = 0; j < m; j++)
                 decoded[j] = SegmentTrigramIndex.DecodePacked(section.Slice(offsets[j], lengths[j]), header.Kind);
+            BeforeRemember?.Invoke();
 
             lock (_gate)
             {

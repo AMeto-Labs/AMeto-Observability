@@ -15,7 +15,7 @@ using Xunit.Abstractions;
 namespace Ameto.Perf;
 
 /// <summary>
-/// Issue #80: the segment-index cache almost never hits, so a filtering query re-parses whole
+/// Issue #80: the segment-index cache almost never hit, so a filtering query re-parsed whole
 /// index sections that a query a moment earlier had already parsed.
 ///
 /// <para>THE STAND. 1.2 M events in 24 segments, written once by the current writer through the
@@ -23,17 +23,18 @@ namespace Ameto.Perf;
 /// <c>tools/loggen</c> sends — the generator the load runs of #79 used, so the sections have the
 /// shape the cache met there: request, payment and message ids, trace and span ids on a share of
 /// the rows, structured exceptions on the errors. Two filters: <c>@mt like '%timeout%'</c>,
-/// which has no equality hint and so reads the inverted AND trigram sections of every group, and
-/// <c>Provider = 'UnionPay'</c>, which the bloom gate narrows to the groups that could hold it
-/// (the Information segments) and the inverted index to 4 % of their rows.</para>
+/// which has no equality hint and so consults every group, and <c>Provider = 'UnionPay'</c>,
+/// which the bloom gate narrows to the groups that could hold it (the Information segments) and
+/// the inverted index to 4 % of their rows.</para>
 ///
 /// <para>THREE READINGS, because they answer different questions.</para>
 /// <list type="bullet">
 /// <item><see cref="PhaseBreakdown"/> walks the prefilter's steps one group at a time on the
-/// test thread — the same calls the executor makes, in its order — so every phase gets its own
-/// clock and its own per-thread allocation counter: section rent + index load, the search
-/// (narrowing and intersection), and the candidate scan. This is the miss path, the one the
-/// cache is there to skip.</item>
+/// test thread — the same calls the executor makes, in its order, through the same
+/// <see cref="SegmentIndexView"/> with a throwaway memo — so every phase gets its own clock and
+/// its own per-thread allocation counter: the bloom gate, the index (sections rented on need,
+/// lookups, intersection), and the candidate scan. This is the miss path, the one the cache is
+/// there to skip. Until #80 its index phase decoded every group's sections whole.</item>
 /// <item><see cref="RepeatedFilter"/> runs each filter five times through a
 /// <see cref="QueryExecutor"/> with the production cache budget (256 MB, 96 MB native) and
 /// reports what <c>/api/diagnostics</c> reports — the <c>indexCache*</c> counters — per run.
@@ -45,6 +46,26 @@ namespace Ameto.Perf;
 ///
 /// <para>Every executor run is checked against the uncached executor's result, row for row: a
 /// cache may only ever skip work.</para>
+///
+/// <para>WHAT IS ASSERTED, with margins wide enough for the Debug build on CI's two-core runner
+/// (timings there vary ~40 % run to run): hit rates, allocation, what the cache holds, and one
+/// time RATIO measured inside a single run. BEFORE (aa58efd, Release) and the bound each
+/// assertion sets:</para>
+/// <code>
+///                                         before      after      asserted
+///   LIKE walk, index phase allocation     782 MB     1.4 MB      &lt; 32 MB
+///   EQ walk, index phase allocation       218 MB     0.4 MB      &lt; 16 MB
+///   LIKE walk, index time / scan time       23x      1.6-3.6x    &lt; 8x
+///   LIKE warm hit rate, 256 MB             2.1 %      100 %      ≥ 95 %
+///   EQ warm hit rate, 256 MB              11.5 %      100 %      ≥ 95 %
+///   LIKE warm allocation per query        834 MB      33 MB      &lt; 150 MB
+///   cache bytes after both filters        255 MB     1.4 MB      &lt; 16 MB, none native
+///   hit rates at 46 MB, and alternating     0 %       100 %      ≥ 95 %
+/// </code>
+/// <para>What is left of the miss path's index phase is mostly reading the trigram sections out of
+/// the mapped file (<c>SegmentReader</c>'s section rent, a <c>ReadArray</c> at ~1.3 GB/s here):
+/// ~65 ms of the LIKE walk's index time for 101 MB of sections, against ~2 ms to find the five
+/// trigrams in them.</para>
 /// </summary>
 public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus>
 {
@@ -72,6 +93,7 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
     public void PhaseBreakdown()
     {
         _out.WriteLine(_corpus.Describe());
+        Phases like = default;
 
         foreach (var text in new[] { Like, Equality })
         {
@@ -83,18 +105,31 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
             for (int r = 0; r < Runs; r++) runs[r] = Walk(filter, printGroups: r == 0 && text == Like);
 
             var m = Phases.Median(runs);
+            if (text == Like) like = m;
             _out.WriteLine("");
-            _out.WriteLine($"── {text}: median of {Runs} single-threaded walks over {m.Groups} groups ({m.GroupsLoaded} loaded) ──");
+            _out.WriteLine($"── {text}: median of {Runs} single-threaded walks over {m.Groups} groups ({m.GroupsPassed} past the bloom gate) ──");
             _out.WriteLine($"  open segments          {m.OpenMs,9:F1} ms   {Mb(m.OpenBytes),9:F1} MB");
             _out.WriteLine($"  bloom gate             {m.BloomMs,9:F1} ms   {Mb(m.BloomBytes),9:F1} MB");
-            _out.WriteLine($"  rent + index load      {m.LoadMs,9:F1} ms   {Mb(m.LoadBytes),9:F1} MB");
-            _out.WriteLine($"  search / intersection  {m.SearchMs,9:F1} ms   {Mb(m.SearchBytes),9:F1} MB");
+            _out.WriteLine($"  index (rent on need,   {m.IndexMs,9:F1} ms   {Mb(m.IndexBytes),9:F1} MB");
+            _out.WriteLine($"    lookup, intersect)");
             _out.WriteLine($"  candidate scan         {m.ScanMs,9:F1} ms   {Mb(m.ScanBytes),9:F1} MB   ({m.Candidates} candidates, {m.Matches} matches)");
             _out.WriteLine($"  total                  {m.TotalMs,9:F1} ms   {Mb(m.TotalBytes),9:F1} MB");
-            _out.WriteLine($"  sections read          {Mb(m.PackedBytes),9:F1} MB packed -> {Mb(m.RetainedBytes),9:F1} MB charged to the cache (ApproxRetainedBytes)");
+            _out.WriteLine($"  what a cache would keep: {Mb(m.MemoBytes):F2} MB of memo for {m.Groups} groups, nothing native");
 
             Assert.True(m.Matches > 0, $"{text} matched nothing — the corpus lost its shape");
+
+            // The index phase is what #80 was about: it decoded every group's sections whole —
+            // 782 MB for the LIKE walk, 218 MB for the equality one. It now reads one bucket or a
+            // handful of trigrams per group.
+            long indexBound = text == Like ? 32L << 20 : 16L << 20;
+            Assert.True(m.IndexBytes < indexBound,
+                $"{text}: the index phase allocated {Mb(m.IndexBytes):F1} MB — something decodes whole sections again");
         }
+
+        // And its time, as a ratio to the scan it feeds, medians of the same walks so the host's
+        // speed cancels out: 23x before, when the index phase was a full decode.
+        Assert.True(like.IndexMs < 8 * like.ScanMs,
+            $"LIKE: index {like.IndexMs:F1} ms against a {like.ScanMs:F1} ms scan — the index costs more than the rows it selects");
     }
 
     // ── 2. The repeated filter at the production budget ──────────────────────
@@ -105,6 +140,7 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         var plain = NewExecutor(null);
         var expectLike = await DrainAsync(plain, Like);
         var expectEq   = await DrainAsync(plain, Equality);
+        await WarmJitAsync(plain);
 
         using var cache = new SegmentIndexCache(ProdBudget, ProdNative, TimeSpan.Zero);
         var cached = NewExecutor(cache);
@@ -112,11 +148,22 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         _out.WriteLine($"production budget: {Mb(ProdBudget):F0} MB total, {Mb(ProdNative):F0} MB native");
         var like = await RepeatAsync(cached, cache, Like, expectLike);
         var eq   = await RepeatAsync(cached, cache, Equality, expectEq);
-        var cold = await RepeatAsync(plain,  null,  Like, expectLike, label: "uncached");
+        var cold   = await RepeatAsync(plain,  null,  Like, expectLike, label: "uncached");
+        var coldEq = await RepeatAsync(plain,  null,  Equality, expectEq, label: "uncached");
 
         _out.WriteLine("");
         _out.WriteLine($"LIKE warm (runs 2..{Runs}): hit {like.WarmHitPct:F1} %, median {like.WarmMedianMs:F1} ms, {Mb(like.WarmMedianBytes):F1} MB   | uncached median {cold.WarmMedianMs:F1} ms, {Mb(cold.WarmMedianBytes):F1} MB");
-        _out.WriteLine($"EQ   warm (runs 2..{Runs}): hit {eq.WarmHitPct:F1} %, median {eq.WarmMedianMs:F1} ms, {Mb(eq.WarmMedianBytes):F1} MB");
+        _out.WriteLine($"EQ   warm (runs 2..{Runs}): hit {eq.WarmHitPct:F1} %, median {eq.WarmMedianMs:F1} ms, {Mb(eq.WarmMedianBytes):F1} MB   | uncached median {coldEq.WarmMedianMs:F1} ms, {Mb(coldEq.WarmMedianBytes):F1} MB");
+        _out.WriteLine($"cache after both: {Mb(cache.TotalBytes):F2} MB in {cache.EntryCount} entries, {Mb(cache.NativeBytes):F2} MB native");
+
+        // Before: 2.1 % and 11.5 %, two entries of 128 MB filling the whole budget.
+        Assert.True(like.WarmHitPct >= 95, $"LIKE warm hit rate {like.WarmHitPct:F1} %");
+        Assert.True(eq.WarmHitPct   >= 95, $"EQ warm hit rate {eq.WarmHitPct:F1} %");
+        Assert.True(like.WarmMedianBytes < 150L << 20,
+            $"a repeated LIKE allocated {Mb(like.WarmMedianBytes):F1} MB per query (834 MB before)");
+        Assert.True(cache.TotalBytes < 16L << 20,
+            $"the cache holds {Mb(cache.TotalBytes):F1} MB for two filters over 24 groups — it is keeping sections, not answers");
+        Assert.Equal(0, cache.NativeBytes);
     }
 
     // ── 3. Option 4: the 512 MB stand's budget, or no cache at all ───────────
@@ -127,6 +174,7 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         var plain = NewExecutor(null);
         var expectLike = await DrainAsync(plain, Like);
         var expectEq   = await DrainAsync(plain, Equality);
+        await WarmJitAsync(plain);
 
         using var cache = new SegmentIndexCache(StandBudgetB, StandNative, TimeSpan.Zero);
         var cached = NewExecutor(cache);
@@ -151,6 +199,13 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         _out.WriteLine("");
         _out.WriteLine($"LIKE at 46 MB: hit {like.WarmHitPct:F1} %, {like.WarmMedianMs:F1} ms, {Mb(like.WarmMedianBytes):F1} MB   | off: {offLike.WarmMedianMs:F1} ms, {Mb(offLike.WarmMedianBytes):F1} MB");
         _out.WriteLine($"EQ   at 46 MB: hit {eq.WarmHitPct:F1} %, {eq.WarmMedianMs:F1} ms, {Mb(eq.WarmMedianBytes):F1} MB   | off: {offEq.WarmMedianMs:F1} ms, {Mb(offEq.WarmMedianBytes):F1} MB");
+
+        // Before: no entry fit (one Information group decoded is 128 MB), so the stand's cache
+        // held nothing and hit nothing. A memo is kilobytes.
+        Assert.True(like.WarmHitPct >= 95, $"LIKE warm hit rate at 46 MB {like.WarmHitPct:F1} %");
+        Assert.True(eq.WarmHitPct   >= 95, $"EQ warm hit rate at 46 MB {eq.WarmHitPct:F1} %");
+        Assert.True(Pct(h, h + m)   >= 95, $"alternating hit rate at 46 MB {Pct(h, h + m):F1} %");
+        Assert.True(cache.TotalBytes <= StandBudgetB);
     }
 
     // ── Executor runs ─────────────────────────────────────────────────────────
@@ -189,6 +244,25 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         return new RepeatResult(Pct(warmHits, warmHits + warmMisses), ms[ms.Length / 2], bytes[bytes.Length / 2]);
     }
 
+    /// <summary>
+    /// Runs both filters through both executor paths until the JIT has promoted them, through a
+    /// THROWAWAY cache so the one being measured still starts cold. Without it, whichever side a
+    /// fact measures first runs tier-0 code: run alone, the stand fact had its cached runs at
+    /// 70-85 ms against 60-66 ms uncached, where the same cached query warm takes ~27 ms.
+    /// </summary>
+    private async Task WarmJitAsync(QueryExecutor plain)
+    {
+        using var scratch = new SegmentIndexCache(ProdBudget, ProdNative, TimeSpan.Zero);
+        var warm = NewExecutor(scratch);
+        for (int i = 0; i < 4; i++)
+        {
+            await DrainAsync(warm, Like);
+            await DrainAsync(warm, Equality);
+            await DrainAsync(plain, Like);
+            await DrainAsync(plain, Equality);
+        }
+    }
+
     private QueryExecutor NewExecutor(SegmentIndexCache? cache) =>
         new(_corpus.Engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
 
@@ -212,22 +286,21 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
 
     private struct Phases
     {
-        public double OpenMs, BloomMs, LoadMs, SearchMs, ScanMs;
-        public long   OpenBytes, BloomBytes, LoadBytes, SearchBytes, ScanBytes;
-        public long   PackedBytes, RetainedBytes, Candidates, Matches;
-        public int    Groups, GroupsLoaded;
+        public double OpenMs, BloomMs, IndexMs, ScanMs;
+        public long   OpenBytes, BloomBytes, IndexBytes, ScanBytes;
+        public long   MemoBytes, Candidates, Matches;
+        public int    Groups, GroupsPassed;
 
-        public readonly double TotalMs    => OpenMs + BloomMs + LoadMs + SearchMs + ScanMs;
-        public readonly long   TotalBytes => OpenBytes + BloomBytes + LoadBytes + SearchBytes + ScanBytes;
+        public readonly double TotalMs    => OpenMs + BloomMs + IndexMs + ScanMs;
+        public readonly long   TotalBytes => OpenBytes + BloomBytes + IndexBytes + ScanBytes;
 
         public static Phases Median(Phases[] runs)
         {
             var m = runs[0];
-            m.OpenMs   = Med(runs, static p => p.OpenMs);   m.OpenBytes   = (long)Med(runs, static p => p.OpenBytes);
-            m.BloomMs  = Med(runs, static p => p.BloomMs);  m.BloomBytes  = (long)Med(runs, static p => p.BloomBytes);
-            m.LoadMs   = Med(runs, static p => p.LoadMs);   m.LoadBytes   = (long)Med(runs, static p => p.LoadBytes);
-            m.SearchMs = Med(runs, static p => p.SearchMs); m.SearchBytes = (long)Med(runs, static p => p.SearchBytes);
-            m.ScanMs   = Med(runs, static p => p.ScanMs);   m.ScanBytes   = (long)Med(runs, static p => p.ScanBytes);
+            m.OpenMs  = Med(runs, static p => p.OpenMs);  m.OpenBytes  = (long)Med(runs, static p => p.OpenBytes);
+            m.BloomMs = Med(runs, static p => p.BloomMs); m.BloomBytes = (long)Med(runs, static p => p.BloomBytes);
+            m.IndexMs = Med(runs, static p => p.IndexMs); m.IndexBytes = (long)Med(runs, static p => p.IndexBytes);
+            m.ScanMs  = Med(runs, static p => p.ScanMs);  m.ScanBytes  = (long)Med(runs, static p => p.ScanBytes);
             return m;
         }
 
@@ -242,17 +315,18 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
 
     /// <summary>
     /// One prefilter + scan over the whole corpus, the executor's miss path step by step
-    /// (<c>QueryExecutor.PrefilterSegmentsAsync</c>, then <c>ScanSegmentAsync</c>), on this thread.
+    /// (<c>QueryExecutor.PrefilterSegmentsAsync</c>, then <c>ScanSegmentAsync</c>), on this thread:
+    /// each group through a <see cref="SegmentIndexView"/> with no cache, i.e. a memo that knows
+    /// nothing yet and is dropped with the group.
     /// </summary>
     private Phases Walk(CompiledFilter filter, bool printGroups)
     {
         var  factory      = new SegmentIndexReaderFactory();
-        bool needTrigram  = filter.GetTrigramHints().Count > 0;
         bool hasIndexHint = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
         var  p            = new Phases();
 
         if (printGroups)
-            _out.WriteLine($"{"segment id",10} {"g",2} {"level",-11} {"events",8} {"inverted",10} {"trigram",10} {"bloom",9} {"decoded",10}");
+            _out.WriteLine($"{"segment id",10} {"g",2} {"level",-11} {"events",8} {"inverted",10} {"trigram",10} {"bloom",9} {"memo kept",10}");
 
         foreach (var info in _corpus.Segments)
         {
@@ -269,40 +343,33 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
                 if (grp.EventCount == 0) continue;
                 p.Groups++;
 
+                using var index = factory.OpenGroup(null, info.FilePath, g, reader);
+
                 a = GC.GetAllocatedBytesForCurrentThread(); t = Stopwatch.GetTimestamp();
-                using var bloomSec = reader.RentBloomFilterBytes(g);
-                bool bloomPass = true;
-                if (hasIndexHint)
-                {
-                    using var bloom = SegmentBloomFilter.Deserialise(bloomSec.Span);
-                    bloomPass = QueryExecutor.PassesBloomGate(filter, bloom);
-                }
+                bool bloomPass = !hasIndexHint || QueryExecutor.PassesBloomGate(filter, index);
                 Charge(ref p.BloomMs, ref p.BloomBytes, a, t);
-                if (!bloomPass) continue;
-                p.GroupsLoaded++;
 
-                a = GC.GetAllocatedBytesForCurrentThread(); t = Stopwatch.GetTimestamp();
-                using var invSec = reader.RentInvertedIndexBytes(g);
-                using var triSec = needTrigram ? reader.RentTrigramIndexBytes(g) : default;
-                var idx = factory.Create(invSec.Span, triSec.Span, bloomSec.Span);
-                Charge(ref p.LoadMs, ref p.LoadBytes, a, t);
+                bool keep = false;
+                uint[]? groupCandidates = null;
+                bool everyRow = false;
+                if (bloomPass)
+                {
+                    p.GroupsPassed++;
+                    a = GC.GetAllocatedBytesForCurrentThread(); t = Stopwatch.GetTimestamp();
+                    keep = QueryExecutor.TryNarrowWithIndex(filter, index, null, grp.EventCount, out groupCandidates, out everyRow);
+                    Charge(ref p.IndexMs, ref p.IndexBytes, a, t);
+                }
+                p.MemoBytes += index.Index.ApproxRetainedBytes;
 
-                p.PackedBytes   += invSec.Span.Length + triSec.Span.Length + bloomSec.Span.Length;
-                p.RetainedBytes += idx.ApproxRetainedBytes;
                 if (printGroups)
                 {
-                    using var fullTri = reader.RentTrigramIndexBytes(g);
+                    using var inv = reader.RentInvertedIndexBytes(g);
+                    using var tri = reader.RentTrigramIndexBytes(g);
+                    using var blo = reader.RentBloomFilterBytes(g);
                     _out.WriteLine($"{info.Id.Value,10} {g,2} {info.MinLevel,-11} {grp.EventCount,8} " +
-                                   $"{Mb(invSec.Span.Length),7:F1} MB {Mb(fullTri.Span.Length),7:F1} MB {Mb(bloomSec.Span.Length),6:F1} MB {Mb(idx.ApproxRetainedBytes),7:F1} MB");
+                                   $"{Mb(inv.Span.Length),7:F1} MB {Mb(tri.Span.Length),7:F1} MB {Mb(blo.Span.Length),6:F1} MB " +
+                                   $"{index.Index.ApproxRetainedBytes / 1024.0,7:F1} KB");
                 }
-
-                a = GC.GetAllocatedBytesForCurrentThread(); t = Stopwatch.GetTimestamp();
-                bool keep;
-                uint[]? groupCandidates;
-                bool everyRow;
-                using (idx)
-                    keep = QueryExecutor.TryNarrowWithIndex(filter, idx, null, grp.EventCount, out groupCandidates, out everyRow);
-                Charge(ref p.SearchMs, ref p.SearchBytes, a, t);
                 if (!keep) continue;
 
                 anySurvived = true;

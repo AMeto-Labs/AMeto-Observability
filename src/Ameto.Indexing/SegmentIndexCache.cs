@@ -3,25 +3,33 @@ using Ameto.Core;
 namespace Ameto.Indexing;
 
 /// <summary>
-/// Cross-query LRU cache of deserialised per-group segment indexes.
+/// Cross-query LRU cache of per-group segment indexes.
 ///
-/// <para>Without it, every query fully re-read and re-decoded every surviving group's
-/// inverted (and trigram) sections — multi-MB managed structures, hundreds of thousands
-/// of strings and arrays per dashboard refresh — because the reader was created and
-/// disposed inside the prefilter loop. Segments are immutable and their file names carry
-/// never-reused ids, so a (path, group) key can never serve stale data; entries for
-/// files deleted by merge or retention are simply never requested again and age out of
-/// the LRU under budget pressure.</para>
+/// <para>Without it, every query re-read every surviving group's sections and re-derived what
+/// the query before it had derived. Segments are immutable and their file names carry
+/// never-reused ids, so a (path, group) key can never serve stale data; entries for files
+/// deleted by merge or retention are simply never requested again and age out of the LRU.</para>
 ///
-/// <para>Ownership: <see cref="SegmentIndexReader"/> holds NATIVE memory (the bloom
-/// bits), so an entry is disposed exactly once — on eviction if unreferenced, otherwise
-/// by the last <see cref="Lease"/> to release it. Callers interact only through leases;
-/// a leased reader is guaranteed alive until the lease is disposed.</para>
+/// <para><b>What an entry is.</b> On the query path (<see cref="AcquireOrAdd"/>, through
+/// <see cref="SegmentIndexView"/>) an entry is a MEMO: what queries worked out about the group —
+/// the postings of the buckets and trigrams they asked for, what was absent, the bloom's
+/// verdicts — kilobytes, grown as queries ask new things and charged as it grows. It holds no
+/// section and no native memory; the sections stay in the segment file, which the asking query
+/// has mapped anyway. Until #80 an entry was the group's index decoded whole — 128 MB for a
+/// prop-dense group against a 256 MB budget, which is why the cache held two groups and hit 2 %
+/// of the time. <see cref="Insert"/> still takes any reader, and <see cref="TryAcquire"/> still
+/// finds it, for callers and tests that build a reader themselves.</para>
 ///
-/// <para>Trigram sections are the largest thing in a segment (~43% of the file) and many
-/// queries never consult them, so an entry may be cached WITHOUT its trigram index. A
-/// query that needs trigrams treats such an entry as a miss and re-inserts the full
-/// reader in its place (upgrade); one that does not is happy with either.</para>
+/// <para>Ownership: a <see cref="SegmentIndexReader"/> made by <c>Load</c> holds NATIVE memory
+/// (the bloom bits), so an entry is disposed exactly once — on eviction if unreferenced,
+/// otherwise by the last <see cref="Lease"/> to release it. Callers interact only through leases;
+/// a leased reader is guaranteed alive until the lease is released. A memo has nothing native to
+/// free, and follows the same rule.</para>
+///
+/// <para>An inserted reader may lack its trigram section (the caller had no substring
+/// predicate); a <see cref="TryAcquire"/> that needs trigrams treats it as a miss, and an insert
+/// of the full reader replaces it (upgrade). A memo never lacks anything: it reads the trigram
+/// section through the view the moment a query needs it.</para>
 ///
 /// <para>Budget pressure is the only thing that used to remove an entry, so one wide
 /// dashboard query filled the cache and the process held those bytes — managed postings AND
@@ -31,16 +39,19 @@ namespace Ameto.Indexing;
 /// because the LRU is ordered by last touch, the sweep stops at the first entry that is still
 /// young and is therefore O(evicted), not O(entries).</para>
 ///
-/// <para><b>Two budgets, because an entry lives in two places.</b> Decoded postings are managed;
-/// the bloom bits behind them are <c>NativeMemory</c> — 4.1 % of a prop-dense entry and 8.3 % of a
-/// thin one by the repo's own <c>BloomSizingProbe</c>. (Their share of the PACKED sections is
-/// 15.6-26.6 %, a larger and different number: decoding expands the managed half 3-4x and leaves
-/// these bits alone.) One budget charged the whole thing against a share of the GC's hard
-/// limit, so the native part spent managed headroom on memory the GC never sees. The native share
-/// now has its own ceiling, taken of the PHYSICAL limit, and whichever is reached first evicts.
+/// <para><b>Two budgets, because an entry can live in two places.</b> A reader's sections and
+/// memo are managed; a loaded reader's bloom bits are <c>NativeMemory</c> — 15.6 % of a prop-dense
+/// group's sections and 26.6 % of a thin one's by the repo's own <c>BloomSizingProbe</c>, and so
+/// of a loaded reader, which keeps its sections packed. (Before #80 a reader decoded its sections
+/// 3-4x, and the bits were 4.1-8.3 % of it.) One budget charged the whole thing against a share
+/// of the GC's hard limit, so the native part spent managed headroom on memory the GC never sees.
+/// The native share now has its own ceiling, taken of the PHYSICAL limit, and whichever is
+/// reached first evicts.
 /// Both figures are reported (<c>/api/diagnostics</c>) rather than merged into one, and so is the
 /// eviction the native ceiling causes while the total still has room — the one an operator cannot
-/// otherwise see.</para>
+/// otherwise see. Since #80 the query path's memos keep the bloom's verdicts and not its bits, so
+/// on a server the native figure stays at zero and this ceiling is a backstop for readers
+/// inserted whole.</para>
 ///
 /// <para><b>Sheddable.</b> Neither budget helps when the pressure is elsewhere: the RAM-pressure
 /// loop flushes the hot tier, forces a collection and trims the working set, and none of that
@@ -145,7 +156,15 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// </summary>
     public long BudgetBytes => _budgetBytes;
 
+    /// <summary>
+    /// Group uses served without reading a section of the group — on the query path, a
+    /// <see cref="SegmentIndexView"/> whose memo answered everything; through
+    /// <see cref="TryAcquire"/>, an entry found.
+    /// </summary>
     public long HitCount   => Interlocked.Read(ref _hits);
+
+    /// <summary>Group uses that had to read a section: a question the memo had not seen, or an
+    /// entry evicted since. Through <see cref="TryAcquire"/>, an entry not found.</summary>
     public long MissCount  => Interlocked.Read(ref _misses);
     public long TotalBytes { get { lock (_lock) return _totalBytes; } }
     public int  EntryCount { get { lock (_lock) return _map.Count; } }
@@ -186,14 +205,68 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         public LinkedListNode<Entry>? Node;      // null once off the LRU
     }
 
-    /// <summary>Keeps the underlying reader alive until disposed. Dispose exactly once.</summary>
+    /// <summary>
+    /// Keeps the underlying reader alive until released. Release exactly once: by
+    /// <see cref="Dispose"/>, or — on the query path, where the lease decides the hit rate — by
+    /// <see cref="Complete"/>.
+    /// </summary>
     public readonly struct Lease : IDisposable
     {
         private readonly SegmentIndexCache _owner;
         private readonly Entry             _entry;
         internal Lease(SegmentIndexCache owner, Entry entry) { _owner = owner; _entry = entry; }
         public SegmentIndexReader Index => _entry.Reader;
-        public void Dispose() => _owner.Release(_entry);
+        public void Dispose() => _owner.Release(_entry, Outcome.None);
+
+        /// <summary>
+        /// Releases a lease taken by <see cref="AcquireOrAdd"/> and counts the use: a HIT when the
+        /// memo answered everything, a MISS when a section of the group had to be read.
+        /// </summary>
+        internal void Complete(bool readSections) =>
+            _owner.Release(_entry, readSections ? Outcome.Miss : Outcome.Hit);
+    }
+
+    private enum Outcome : byte { None, Hit, Miss }
+
+    /// <summary>
+    /// The query path's entry point: a lease on the group's memo, created empty when the group has
+    /// none. Never a miss by itself — whether the memo could answer is only known once the query
+    /// is done with the group, so the hit or miss is counted by <see cref="Lease.Complete"/>.
+    ///
+    /// <para>A new memo is a few hundred bytes. Charged at that and inserted at the LRU head, it
+    /// can only push out the tail; what it grows to is charged when the lease is released.</para>
+    /// </summary>
+    internal Lease AcquireOrAdd(string path, int group)
+    {
+        List<SegmentIndexReader>? toDispose = null;
+        Lease lease;
+        lock (_lock)
+        {
+            var key = (path, group);
+            if (_map.TryGetValue(key, out var e))
+            {
+                e.RefCount++;
+                e.LastTouched = _time.GetTimestamp();
+                _lru.Remove(e.Node!);
+                _lru.AddFirst(e.Node!);
+                return new Lease(this, e);
+            }
+
+            var reader = SegmentIndexReader.CreateMemo();
+            long size  = reader.ApproxRetainedBytes;
+            e = new Entry
+            {
+                Key = key, Reader = reader, HasTrigram = true,   // a memo reads any section it needs
+                Size = size, Charged = size, RefCount = 1, LastTouched = _time.GetTimestamp(),
+            };
+            e.Node       = _lru.AddFirst(e);
+            _map[key]    = e;
+            _totalBytes += size;
+            EvictLocked(toDispose = []);
+            lease = new Lease(this, e);
+        }
+        foreach (var r in toDispose) r.Dispose();
+        return lease;
     }
 
     /// <summary>
@@ -420,8 +493,11 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// longer fits by itself. An entry already unlisted is not charged: its bytes left the total
     /// when it was evicted, and its last lease frees it.</para>
     /// </summary>
-    private void Release(Entry e)
+    private void Release(Entry e, Outcome outcome)
     {
+        if      (outcome == Outcome.Hit)  Interlocked.Increment(ref _hits);
+        else if (outcome == Outcome.Miss) Interlocked.Increment(ref _misses);
+
         List<SegmentIndexReader>? toDispose = null;
         lock (_lock)
         {

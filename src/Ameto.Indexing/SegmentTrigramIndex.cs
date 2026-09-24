@@ -690,21 +690,31 @@ public sealed class SegmentTrigramIndex
         return new PackedHeader(PackedKind.Legacy, first, 4);
     }
 
-    /// <summary>A trigram as one ordered 48-bit number: the key a reader's memo files it under
-    /// and <see cref="Locate"/> searches for.</summary>
+    /// <summary>A trigram as one 48-bit number — its three UTF-16 units as a wide section stores
+    /// them, little-endian, so a bucket header's first six bytes ARE the key: the number a
+    /// reader's memo files the trigram under and <see cref="Locate"/> searches for.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static long PackedKey(char c0, char c1, char c2) => ((long)c0 << 32) | ((long)c1 << 16) | c2;
+    internal static long PackedKey(char c0, char c1, char c2) => c0 | ((long)c1 << 16) | ((long)c2 << 32);
 
     /// <summary>
     /// One pass over the bucket headers of <paramref name="data"/>: for each key of
     /// <paramref name="sortedKeys"/> (ascending, distinct), the offset and length of its LAST
     /// bucket's postings, or offset -1 when the section has no such bucket. Postings are skipped,
     /// not read. A bucket that overruns the section throws, as <see cref="Deserialise"/> does.
+    ///
+    /// <para>This runs over every bucket of a group on a cache miss — hundreds of thousands in a
+    /// prop-dense group — for the handful a search spells, so the per-bucket work is one 8-byte
+    /// read for a wide key and a 64-bit membership test that turns nearly every bucket away
+    /// before the binary search.</para>
     /// </summary>
     internal static void Locate(ReadOnlySpan<byte> data, PackedHeader header, ReadOnlySpan<long> sortedKeys,
                                 Span<int> offsets, Span<int> lengths)
     {
         offsets[..sortedKeys.Length].Fill(-1);
+
+        ulong wanted = 0;
+        for (int j = 0; j < sortedKeys.Length; j++) wanted |= 1UL << Bit(sortedKeys[j]);
+
         bool wide = header.Kind == PackedKind.Wide;
         int  pos  = header.BucketsStart;
         for (uint i = 0; i < header.Count; i++)
@@ -712,16 +722,15 @@ public sealed class SegmentTrigramIndex
             long key;
             if (wide)
             {
-                var k = data.Slice(pos, 6);
-                key = PackedKey((char)BinaryPrimitives.ReadUInt16LittleEndian(k),
-                                (char)BinaryPrimitives.ReadUInt16LittleEndian(k[2..]),
-                                (char)BinaryPrimitives.ReadUInt16LittleEndian(k[4..]));
+                // Six key bytes and the first two of the length: a header is ten bytes, so the
+                // read never leaves an intact section.
+                key  = (long)(BinaryPrimitives.ReadUInt64LittleEndian(data[pos..]) & 0xFFFF_FFFF_FFFFUL);
                 pos += 6;
             }
             else
             {
                 var k = data.Slice(pos, 3);
-                key = PackedKey((char)k[0], (char)k[1], (char)k[2]);
+                key  = PackedKey((char)k[0], (char)k[1], (char)k[2]);
                 pos += 3;
             }
 
@@ -729,11 +738,19 @@ public sealed class SegmentTrigramIndex
             if ((ulong)pos + len > (ulong)data.Length)
                 throw new InvalidDataException($"Trigram section overruns itself at byte {pos} of {data.Length}");
 
-            int at = IndexOf(sortedKeys, key);
-            if (at >= 0) { offsets[at] = pos; lengths[at] = (int)len; }
+            if ((wanted & (1UL << Bit(key))) != 0)
+            {
+                int at = IndexOf(sortedKeys, key);
+                if (at >= 0) { offsets[at] = pos; lengths[at] = (int)len; }
+            }
             pos += (int)len;
         }
     }
+
+    /// <summary>A key's bit in <see cref="Locate"/>'s membership mask: the top six bits of a
+    /// multiplicative hash, so keys that differ only in their low char still spread.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int Bit(long key) => (int)(((ulong)key * 0x9E3779B97F4A7C15UL) >> 58);
 
     /// <summary>Binary search without the <c>IComparable</c> box the span extension takes.</summary>
     internal static int IndexOf(ReadOnlySpan<long> sorted, long key)
