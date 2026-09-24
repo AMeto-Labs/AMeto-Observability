@@ -266,7 +266,7 @@ public sealed class LabelSet : IEquatable<LabelSet>
 ///
 /// <para><b>Bounded, and degrading rather than dropping.</b> The string pool holds at most
 /// <see cref="DefaultMaxStrings"/> distinct strings per epoch (see below) and does not
-/// intern one longer than <see cref="MaxInternedUtf8Bytes"/> — worst case ≈ 16 384 ×
+/// intern one longer than <see cref="MaxInternedUtf8Bytes"/> in UTF-8 — worst case ≈ 16 384 ×
 /// (≤ 278 B string + ~56 B of dictionary entry and slot) ≈ 5.5 MB, whatever the label
 /// cardinality. Past the cap every new string is a plain <c>new string</c>, exactly what the
 /// parser allocated before, and the epoch's <see cref="StringInternPool.PoolExhausted"/> fires once. The
@@ -312,12 +312,26 @@ public sealed class MetricLabelInterner
 
     /// <summary>
     /// Longer strings are materialised, not pooled: a value that long is an id or a message,
-    /// not a dimension that repeats, and the pool keeps what it holds for the life of the
-    /// process. Measured in UTF-8 bytes on the byte path and in chars on the string path; for
-    /// ASCII the two agree, and where they do not the only cost is one path pooling a string
-    /// the other does not — equality is by value either way.
+    /// not a dimension that repeats, and the pool keeps what it holds for the epoch.
+    ///
+    /// <para><b>Measured in UTF-8 bytes on every path</b> (#94) — a string by the bytes it encodes
+    /// to (<see cref="FitsPool"/>), which are the bytes the WAL and the <c>.mts</c> files write and a
+    /// cold read hands to <see cref="Lookup"/>. The string path used to count chars: a non-ASCII value
+    /// of 65–128 chars (Cyrillic is two bytes a char) was pooled by the JSON mapper and then never
+    /// found by a cold read, which measures bytes — a pool slot spent on a string no lookup could
+    /// match, and the protobuf parser, which also measures bytes, never pooled the same text.</para>
     /// </summary>
     public const int MaxInternedUtf8Bytes  = 128;
+
+    /// <summary>
+    /// Whether <paramref name="s"/> is short enough to pool: at most <see cref="MaxInternedUtf8Bytes"/>
+    /// in UTF-8. A UTF-16 char encodes to at most three bytes (a surrogate pair to four, two a char),
+    /// so up to 42 chars no count is needed, and past 128 chars none is either; in between the bytes
+    /// are counted — vectorised, no allocation.
+    /// </summary>
+    private static bool FitsPool(string s) =>
+        s.Length <= MaxInternedUtf8Bytes / 3
+        || (s.Length <= MaxInternedUtf8Bytes && Encoding.UTF8.GetByteCount(s) <= MaxInternedUtf8Bytes);
 
     /// <summary>The process-wide instance the OTLP parsers and the WAL replay share.</summary>
     public static readonly MetricLabelInterner Shared = new(DefaultMaxStrings, DefaultLabelSetSlots);
@@ -403,7 +417,7 @@ public sealed class MetricLabelInterner
     public int Intern(string s, out string value)
     {
         if (s.Length == 0) { value = string.Empty; return EmptyStringId; }
-        if (s.Length > MaxInternedUtf8Bytes) { value = s; return -1; }
+        if (!FitsPool(s)) { value = s; return -1; }
         var pool = _strings;
         int id = pool.Intern(s, out value);
         if (id < 0) OnPoolFull(pool);
