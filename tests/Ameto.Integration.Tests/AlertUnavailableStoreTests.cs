@@ -33,6 +33,7 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
     private readonly FakeTraceStore  _traces  = new();
     private readonly FakeMetricStore _metrics = new();
     private readonly CapturingLogger _log     = new();
+    private readonly Ameto.Testing.ManualTimeProvider _clock = new();
     private readonly ConcurrentQueue<AlertFiredEvent> _dispatched = new();
 
     private AlertRuleStore _store     = null!;
@@ -50,7 +51,8 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
             null!,   // the log engine: no rule here reads it
             _metrics,
             _traces,
-            _log);
+            _log,
+            _clock);
         _evaluator._onDispatchForTest = _dispatched.Enqueue;
         return Task.CompletedTask;
     }
@@ -212,6 +214,26 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
         var warnings = _log.Lines.Where(l => l.Level == LogLevel.Warning && l.Message.Contains("was not evaluated")).ToList();
         Assert.Single(warnings);
         Assert.Contains("Trace store is Closed", warnings[0].Message);
+    }
+
+    /// <summary>
+    /// ONCE A MINUTE, NOT ONCE: a store that stays closed is said again after the interval, on the
+    /// evaluator's clock. A minute less a tick is still the first line's; a minute is the second's.
+    /// </summary>
+    [Fact]
+    public async Task A_store_that_stays_closed_is_reported_again_after_a_minute()
+    {
+        TraceRule(AlertComparator.GreaterThan, 1);
+        _traces.Availability = QueryAvailability.Closed;
+
+        await _evaluator.EvaluateOnceAsync();
+        _clock.Advance(TimeSpan.FromMinutes(1) - TimeSpan.FromTicks(1));
+        await _evaluator.EvaluateOnceAsync();
+        Assert.Single(_log.Lines, l => l.Message.Contains("was not evaluated"));
+
+        _clock.Advance(TimeSpan.FromTicks(1));
+        await _evaluator.EvaluateOnceAsync();
+        Assert.Equal(2, _log.Lines.Count(l => l.Message.Contains("was not evaluated")));
     }
 
     /// <summary>The editor's preview says "cannot say" rather than 0 — "would not fire" about nothing.</summary>

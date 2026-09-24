@@ -101,6 +101,83 @@ public sealed class MetricStoreUnavailableTests
     }
 
     /// <summary>
+    /// THE METRIC ENGINE'S LOADING WINDOW, as a restart produces it: the final flush put every
+    /// point in a cold segment, and until the new engine's cold scan has run its queries answer from
+    /// an empty hot tier. The rule was Firing at 120; read then, it is 0, and a "&gt;" rule resolves
+    /// with an Ok. The engine says Loading until the scan ends, so the tick is skipped — and once the
+    /// scan has run the rule reads 120 again, still Firing, with no second notification.
+    /// </summary>
+    [Fact]
+    public async Task A_restart_does_not_resolve_a_firing_metric_rule_before_the_cold_tier_has_loaded()
+    {
+        using var dir = new TempDir();
+        string metrics = Path.Combine(dir.Path, "metrics"), alerts = Path.Combine(dir.Path, "alerts");
+        Directory.CreateDirectory(alerts);
+
+        var before = new MetricStorageEngine(metrics, NullLogger<MetricStorageEngine>.Instance);
+        await before.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+        Ingest(before);
+        var first = NewEvaluator(alerts, before, out _, out var store);
+        store.Upsert(Rule("above", AlertComparator.GreaterThan, Peak - 1));
+        await first.EvaluateOnceAsync();
+        Assert.Equal(AlertState.Firing, StateOf(first, "above"));
+        await first.DisposeAsync();
+        await before.DisposeAsync();   // the final flush: every point is now cold
+
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        MetricStorageEngine.HoldColdLoadForTest.Value = hold.Task;
+        MetricStorageEngine after;
+        try { after = new MetricStorageEngine(metrics, NullLogger<MetricStorageEngine>.Instance); }
+        finally { MetricStorageEngine.HoldColdLoadForTest.Value = null; }
+
+        var evaluator = NewEvaluator(alerts, after, out var dispatched, out _);
+        try
+        {
+            Assert.Equal(QueryAvailability.Loading, after.Availability);
+            Assert.Empty(await new MetricAggregator(after).QueryAsync(Request()));   // the part a loading store gives
+
+            await evaluator.EvaluateOnceAsync();
+            Assert.Equal(AlertState.Firing, StateOf(evaluator, "above"));
+            Assert.Empty(dispatched);
+
+            hold.SetResult();
+            await after.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+            await evaluator.EvaluateOnceAsync();
+
+            Assert.Equal(AlertState.Firing, StateOf(evaluator, "above"));
+            Assert.Equal(Peak, evaluator.GetStates().Single(s => s.RuleId == "above").LastValue);
+            Assert.Empty(dispatched);
+            Assert.DoesNotContain(evaluator.GetHistory(), h => h.State == AlertState.Ok);
+        }
+        finally
+        {
+            hold.TrySetResult();
+            await evaluator.DisposeAsync();
+            await after.DisposeAsync();
+        }
+    }
+
+    private static AlertEvaluator NewEvaluator(
+        string alerts, MetricStorageEngine engine,
+        out ConcurrentQueue<AlertFiredEvent> dispatched, out AlertRuleStore store)
+    {
+        store = new AlertRuleStore(alerts, new NoopProtector(), NullLogger<AlertRuleStore>.Instance);
+        var sent = new ConcurrentQueue<AlertFiredEvent>();
+        var evaluator = new AlertEvaluator(
+            store,
+            new AlertDispatcher(NullLogger<AlertDispatcher>.Instance),
+            new AlertPersistence(alerts, NullLogger<AlertPersistence>.Instance),
+            AlertHeaderCountTests.ThrowingProxy.For<IQueryExecutor>(),
+            null!,
+            new MetricAggregator(engine),
+            AlertHeaderCountTests.ThrowingProxy.For<Ameto.Tracing.ITraceStatsProvider>(),
+            NullLogger<AlertEvaluator>.Instance);
+        evaluator._onDispatchForTest = sent.Enqueue;
+        dispatched = sent;
+        return evaluator;
+    }
+
+    /// <summary>
     /// Every metric query the client makes answers 200 while the store is open and 503 — with a
     /// sentence — once it has closed, where it used to answer 200 with no series. The alert preview
     /// of a metric rule answers 503 too. The catalog and the name list are NOT refused: they are

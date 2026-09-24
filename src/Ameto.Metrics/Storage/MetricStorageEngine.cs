@@ -490,6 +490,14 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
       : !_coldLoaded.Task.IsCompleted      ? QueryAvailability.Loading
       :                                      QueryAvailability.Available;
 
+    /// <summary>
+    /// Test seam: an engine constructed while this holds a task starts its cold scan only once that
+    /// task completes — the only way to hold <see cref="QueryAvailability.Loading"/> open. An
+    /// <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into the flush
+    /// loop, so it reaches only the engines the setting test constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Task?> HoldColdLoadForTest = new();
+
     private readonly string                        _dataDir;
     private readonly ILogger<MetricStorageEngine>  _logger;
 
@@ -1627,6 +1635,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     private async Task FlushLoopAsync()
     {
         var ct = _cts.Token;
+
+        // Test seam (#95): hold the cold scan, so a test can see this engine Loading. Null in production.
+        if (HoldColdLoadForTest.Value is { } hold)
+        {
+            try { await hold.WaitAsync(ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* disposed while held: load and go on to the final flush */ }
+        }
 
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }

@@ -1030,8 +1030,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             }
             Interlocked.Increment(ref _activeReaders);
         }
+        _afterReaderSnapshotForTest?.Invoke();
         return (current, frozen, covered);
     }
+
+    /// <summary>
+    /// Test seam: called by <see cref="SnapshotTiers"/> once a reader holds its snapshot and before
+    /// it reads anything — the instant a read has begun on a store that can still close under it.
+    /// Null in production.
+    /// </summary>
+    internal Action? _afterReaderSnapshotForTest;
 
     /// <summary>
     /// Near-zero-allocation log-volume aggregation: buckets <c>(bucket, service, level)</c> event

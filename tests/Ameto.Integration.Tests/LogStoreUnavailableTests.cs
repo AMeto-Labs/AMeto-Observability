@@ -95,6 +95,67 @@ public sealed class LogStoreUnavailableTests
         Assert.Single(rig.Log.Lines, l => l.Message.Contains("Log store is Closed"));
     }
 
+    /// <summary>
+    /// THE OTHER SIDE OF THAT MAPPING. An <see cref="ObjectDisposedException"/> from a store that is
+    /// still OPEN is not the store's close — it is a bug somewhere under the scan — and must still
+    /// be reported as the failure it is, not filed as "the log store is Closed" and silenced for a
+    /// minute at a time.
+    /// </summary>
+    [Fact]
+    public async Task An_object_disposed_exception_from_an_open_store_is_still_a_failure()
+    {
+        using var dir = new TempDir();
+        var engine = await EngineWithEventsAsync(dir.Data);
+        try
+        {
+            await using var rig = new EvaluatorRig(dir.Alerts, engine, new ThrowingDisposedExecutor());
+            rig.Rule("scan", AlertComparator.GreaterOrEqual, 1, filter: "k = 0");
+
+            await rig.Evaluator.EvaluateOnceAsync();
+
+            Assert.Equal(QueryAvailability.Available, engine.Availability);
+            Assert.Single(rig.Log.Lines, l => l.Level == LogLevel.Warning && l.Message.Contains("Failed to evaluate"));
+            Assert.DoesNotContain(rig.Log.Lines, l => l.Message.Contains("was not evaluated"));
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// THE COUNTS' SECOND QUESTION, asked after the read. The store is open when the request asks
+    /// and when the read takes its snapshot, and closes while the read holds it — the teardown gets
+    /// as far as waiting for that reader, so the read finishes whole. The store has closed by the
+    /// time the answer would be written and cached, and the endpoint refuses rather than serve a
+    /// closed store's answer (or keep serving it from the cache for its TTL).
+    /// </summary>
+    [Fact]
+    public async Task Counts_read_while_the_store_closes_are_refused_after_the_read()
+    {
+        using var factory = new AmetoWebAppFactory();
+        var client  = factory.CreateClient();
+        var storage = factory.Services.GetRequiredService<StorageEngine>();
+        await storage.CatalogLoaded.WaitAsync(TimeSpan.FromSeconds(60));
+
+        var waitingForReader = new ManualResetEventSlim();
+        Task? closing = null;
+        storage._onWaitingForReaders = waitingForReader.Set;
+        storage._afterReaderSnapshotForTest = () =>
+        {
+            storage._afterReaderSnapshotForTest = null;
+            closing = Task.Run(async () => await storage.DisposeAsync());
+            // The teardown has shut the door and is waiting for THIS reader: the store is Closed,
+            // and the read about to run still sees its whole snapshot.
+            Assert.True(waitingForReader.Wait(TimeSpan.FromSeconds(60)), "the teardown never reached the reader wait");
+        };
+
+        using var res = await client.GetAsync("/api/events/counts?service=counts-after-read");
+        string body = await res.Content.ReadAsStringAsync();
+
+        Assert.NotNull(closing);
+        await closing!.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable, $"{(int)res.StatusCode} — {Clip(body)}");
+        Assert.Contains("log store has shut down", body);
+    }
+
     // ── Loading ───────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -363,6 +424,13 @@ public sealed class LogStoreUnavailableTests
             }
             for (int i = 0; i < Found; i++) yield return null!;   // the evaluator only counts
         }
+    }
+
+    /// <summary>A scan that fails with an ObjectDisposedException of its own — nothing to do with the store.</summary>
+    private sealed class ThrowingDisposedExecutor : IQueryExecutor
+    {
+        public IAsyncEnumerable<LogEvent> ExecuteAsync(QueryRequest request, CancellationToken ct = default) =>
+            throw new ObjectDisposedException("some-other-resource");
     }
 
     private sealed class UnusedExecutor : IQueryExecutor

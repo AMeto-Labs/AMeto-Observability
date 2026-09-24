@@ -37,6 +37,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private readonly ITraceStatsProvider   _traceStats;
     private readonly ILogger<AlertEvaluator> _logger;
 
+    /// <summary>
+    /// The clock the unavailable-store warning is rate-limited on. A seam, so that "a second line
+    /// after a minute" is a test that advances a clock rather than one that waits a minute.
+    /// </summary>
+    private readonly TimeProvider _time;
+
     private readonly ConcurrentDictionary<string, MutableState> _states = new();
     private readonly ConcurrentDictionary<string, AlertSilence> _silences = new();
     private readonly ConcurrentDictionary<string, MaintenanceWindow> _maintenance = new();
@@ -69,11 +75,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
         IQueryExecutor logQuery, StorageEngine storage,
         IMetricAggregator metrics, ITraceStatsProvider traceStats,
-        ILogger<AlertEvaluator> logger)
+        ILogger<AlertEvaluator> logger, TimeProvider? time = null)
     {
         _store = store; _dispatcher = dispatcher; _persist = persist;
         _logQuery = logQuery; _storage = storage; _metrics = metrics; _traceStats = traceStats;
         _logger = logger;
+        _time   = time ?? TimeProvider.System;
         LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
     }
@@ -497,9 +504,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private void WarnUnavailable(AlertRule rule, QueryAvailability why)
     {
         ref long slot = ref _unavailableWarnedAt[(int)rule.Source % _unavailableWarnedAt.Length];
-        long now  = Environment.TickCount64;
+        long now  = _time.GetTimestamp();
         long last = Volatile.Read(ref slot);
-        if (last != 0 && now - last < UnavailableWarnIntervalMs) return;
+        if (last != 0 && _time.GetElapsedTime(last, now) < UnavailableWarnInterval) return;
         if (Interlocked.CompareExchange(ref slot, now, last) != last) return;   // another tick said it
 
         _logger.LogWarning(
@@ -509,9 +516,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
             rule.Id, rule.Source, why, why == QueryAvailability.Loading ? "partial" : "empty");
     }
 
-    private const long UnavailableWarnIntervalMs = 60_000;
+    private static readonly TimeSpan UnavailableWarnInterval = TimeSpan.FromMinutes(1);
 
-    /// <summary>Last <see cref="Environment.TickCount64"/> a warning was logged, per <see cref="AlertSource"/>; 0 = never.</summary>
+    /// <summary>Last <see cref="_time"/> timestamp a warning was logged, per <see cref="AlertSource"/>; 0 = never.</summary>
     private readonly long[] _unavailableWarnedAt = new long[3];
 
     /// <summary>

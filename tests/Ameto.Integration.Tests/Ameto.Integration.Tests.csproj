@@ -23,4 +23,9 @@
     <ProjectReference Include="..\..\src\Ameto.Server\Ameto.Server.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- #95: the alert evaluator's once-a-minute warning, advanced a minute without waiting one. -->
+    <Compile Include="..\Shared\ManualTimeProvider.cs" Link="Shared\ManualTimeProvider.cs" />
+  </ItemGroup>
+
 </Project>
