@@ -31,7 +31,7 @@ namespace Ameto.Integration.Tests;
 ///   System.Text.Json default: <c>&lt;</c>, <c>&amp;</c>, <c>'</c> and every non-ASCII character
 ///   of the BMP pass through as UTF-8, and only control characters, <c>"</c>, <c>\</c> and
 ///   characters outside the BMP (a surrogate pair, as two <c>\uXXXX</c>) are escaped. The SSE rows
-///   of <c>TraceStreamJson</c> use the default encoder instead, which is a different shape;</item>
+///   of the trace streams carry the same encoding since issue #93 (<c>TraceStreamEncodingTests</c>);</item>
 ///   <item>every msgpack integer width: <c>long.ToString()</c>, so a uint64 at or below
 ///   <c>long.MaxValue</c> reads like any other integer;</item>
 ///   <item>a uint64 ABOVE <c>long.MaxValue</c>, at the top level of the map: the decode throws, so

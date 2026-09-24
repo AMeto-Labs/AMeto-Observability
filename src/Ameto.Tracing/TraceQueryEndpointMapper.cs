@@ -566,6 +566,10 @@ public static class TraceQueryEndpointMapper
         using var deadline = new DeadlineScope(ct, StreamDeadline);
         var scanCt = deadline.Token;
 
+        // Each row in the host's encoding, byte for byte what GET /api/traces and POST /api/traces/query
+        // send for it — not the SSE writer's default one (issue #93; see TraceStreamRowJson).
+        using var rowJson = new TraceStreamRowJson(ctx);
+
         // NOTHING HERE MAY GROW WITH THE NUMBER OF MATCHES IN THE WINDOW. The dedupe set is
         // capped by `max` and each page by `pageSize`; a month-wide query on a busy service is
         // the shape that killed a 512 MB server when a collection was allowed to track matches
@@ -705,7 +709,7 @@ public static class TraceQueryEndpointMapper
                 }
 
                 if (!seen.Add(row.TraceId)) continue;
-                await sse.WriteEventAsync(row, TraceStreamJson.Default.TraceRowDto, ct);
+                await rowJson.WriteAsync(sse, row, ct);   // the REST answers' bytes (issue #93)
                 if (row.StartTimeUnixNano < oldestEmitted) oldestEmitted = row.StartTimeUnixNano;
                 // Not Complete: the window was NOT read out, the ceiling was hit. Saying `done`
                 // for both makes a truncated list indistinguishable from an exhausted one for
@@ -1287,6 +1291,12 @@ public static class TraceQueryEndpointMapper
 /// options do, so they must not be borrowed here — would turn "no status" into "field missing" on
 /// the wire. JsonSourceGenerationOptions leaves DefaultIgnoreCondition at Never, so the property
 /// stays; TraceStreamEndpointTests pins it.
+///
+/// <para>NOT THE ENCODER. The options here only pre-escape the (ASCII) property names; every string
+/// VALUE is escaped by the writer the contract is serialised into, and <see cref="TraceStreamRowJson"/>
+/// hands it one over the host's options — so the rows go out in the REST answers' bytes (issue #93).
+/// A <c>Web</c> instance of this context with the relaxed encoder, the way <c>MetricJson.Web</c>
+/// serves the metrics answers, changes nothing on this route: measured.</para>
 /// </remarks>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(TraceRowDto))]
