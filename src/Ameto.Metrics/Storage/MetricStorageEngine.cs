@@ -2401,6 +2401,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private const int SeriesChunk = 512;
 
     /// <summary>
+    /// Test seam: invoked by <see cref="RewriteMetricInChunks"/> with a chunk's first key index the
+    /// moment that chunk's output is written — where retention deleting a source, or a later chunk
+    /// failing, would leave an output nothing publishes. Null in production.
+    /// </summary>
+    internal Action<int>? OnRewriteChunkWrittenForTest;
+
+    /// <summary>
     /// Rewrites ONE metric's source files, transforming each series' points, with the
     /// retained <em>point</em> volume bounded by <see cref="SeriesChunk"/> series. That
     /// is the bound that matters — points are what scale with time and dominate the
@@ -2478,32 +2485,49 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         if (keys.Count == 0) return [];
 
+        // ALL OR NOTHING ON DISK, like MetricWriter.Write itself. Chunk 0 is written before a later
+        // chunk's series are decoded — pass 0 walks past their points, and ReadAt meets them — so a
+        // later chunk can fail AFTER an output exists: a source corrupt past the first chunk, or one
+        // retention deleted mid-rewrite. The caller then keeps the sources and publishes nothing,
+        // and an output left behind would be loaded at the next start beside the sources it
+        // duplicates, one more per failed rewrite. So a failure takes back every output first.
         var written = new List<MetricSegmentInfo>();
-        WriteChunk(0, first);
-
-        // ── Every later chunk: only its series, at their positions ───────────────────────────
-        for (int off = SeriesChunk; off < keys.Count; off += SeriesChunk)
+        try
         {
-            int take = Math.Min(SeriesChunk, keys.Count - off);
-            var acc  = new List<MetricDataPoint>?[Math.Min(SeriesChunk, keys.Count - off)];
-            foreach (var (path, positions, keyOrder) in located)
-            {
-                var at    = new List<long>();
-                var atKey = new List<int>();
-                for (int j = 0; j < positions.Count; j++)
-                {
-                    int k = keyOrder[j];
-                    if (k < off || k >= off + take) continue;
-                    at.Add(positions[j]);
-                    atKey.Add(k);
-                }
-                if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
+            WriteChunk(0, first);
+            OnRewriteChunkWrittenForTest?.Invoke(0);
 
-                int n = 0;
-                foreach (var (_, _, s) in MetricReader.ReadAt(path, at))
-                    (acc[atKey[n++] - off] ??= []).AddRange(s.Points);
+            // ── Every later chunk: only its series, at their positions ───────────────────────
+            for (int off = SeriesChunk; off < keys.Count; off += SeriesChunk)
+            {
+                int take = Math.Min(SeriesChunk, keys.Count - off);
+                var acc  = new List<MetricDataPoint>?[Math.Min(SeriesChunk, keys.Count - off)];
+                foreach (var (path, positions, keyOrder) in located)
+                {
+                    var at    = new List<long>();
+                    var atKey = new List<int>();
+                    for (int j = 0; j < positions.Count; j++)
+                    {
+                        int k = keyOrder[j];
+                        if (k < off || k >= off + take) continue;
+                        at.Add(positions[j]);
+                        atKey.Add(k);
+                    }
+                    if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
+
+                    int n = 0;
+                    foreach (var (_, _, s) in MetricReader.ReadAt(path, at))
+                        (acc[atKey[n++] - off] ??= []).AddRange(s.Points);
+                }
+                WriteChunk(off, acc);
+                OnRewriteChunkWrittenForTest?.Invoke(off);
             }
-            WriteChunk(off, acc);
+        }
+        catch
+        {
+            foreach (var info in written)
+                try { File.Delete(info.FilePath); } catch { /* best effort — the original failure is what the caller must see */ }
+            throw;
         }
         return written;
 

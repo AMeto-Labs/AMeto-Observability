@@ -116,7 +116,8 @@ internal static class MetricGolden
     /// </summary>
     public static MetricSegmentInfo WriteV2File(
         string filePath, string metricName, MetricGranularity granularity,
-        List<(SeriesKey Key, List<MetricDataPoint> Points, double[]? Bounds)> items)
+        List<(SeriesKey Key, List<MetricDataPoint> Points, double[]? Bounds)> items,
+        Func<int, bool>? corrupt = null)
     {
         long minNano = long.MaxValue, maxNano = long.MinValue;
         foreach (var (_, pts, _) in items)
@@ -138,8 +139,10 @@ internal static class MetricGolden
             bw.Write((byte)0);
 
             long firstBlock = fs.Position;
-            foreach (var (key, pts, bounds) in items)
+            for (int item = 0; item < items.Count; item++)
             {
+                var (key, pts, bounds) = items[item];
+                bool bad = corrupt?.Invoke(item) == true;
                 var buf = new System.Buffers.ArrayBufferWriter<byte>();
                 var w = new MessagePackWriter(buf);
                 w.WriteMapHeader(6);
@@ -156,7 +159,9 @@ internal static class MetricGolden
                 foreach (var p in pts)
                 {
                     w.WriteArrayHeader(5);
-                    w.Write(p.TimestampUnixNano);
+                    // A CORRUPT series: the timestamp is a string. Structurally sound msgpack — a
+                    // reader walking past the point meets nothing wrong; one decoding it throws.
+                    if (bad) w.Write("not a timestamp"); else w.Write(p.TimestampUnixNano);
                     w.Write(p.Value);
                     w.Write(p.Count);
                     w.Write(p.Sum);
