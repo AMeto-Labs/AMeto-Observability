@@ -265,11 +265,11 @@ public sealed class LabelSet : IEquatable<LabelSet>
 /// set built the first time.</para>
 ///
 /// <para><b>Bounded, and degrading rather than dropping.</b> The string pool holds at most
-/// <see cref="DefaultMaxStrings"/> distinct strings for the life of the process and does not
+/// <see cref="DefaultMaxStrings"/> distinct strings per epoch (see below) and does not
 /// intern one longer than <see cref="MaxInternedUtf8Bytes"/> — worst case ≈ 16 384 ×
 /// (≤ 278 B string + ~56 B of dictionary entry and slot) ≈ 5.5 MB, whatever the label
 /// cardinality. Past the cap every new string is a plain <c>new string</c>, exactly what the
-/// parser allocated before, and <see cref="StringInternPool.PoolExhausted"/> fires once. The
+/// parser allocated before, and the epoch's <see cref="StringInternPool.PoolExhausted"/> fires once. The
 /// label-set cache is a fixed <see cref="DefaultLabelSetSlots"/>-slot table that overwrites on
 /// collision, so it never grows and a series nobody sends any more is simply displaced. A point
 /// is never refused by either: a miss costs its allocation, not its data.</para>
@@ -277,11 +277,38 @@ public sealed class LabelSet : IEquatable<LabelSet>
 /// <para>Its own pool, not <see cref="StringInternPool.Shared"/>: that one indexes log message
 /// templates, and a high-cardinality label saturating it would make every later log event
 /// carry its own template string.</para>
+///
+/// <para><b>Reset by epoch, because churn fills it (#88).</b> The pool never evicts, and a cluster
+/// whose pods churn puts ~3.3 new strings into it per replaced pod (<c>k8s.pod.name</c>,
+/// <c>k8s.pod.uid</c>, <c>container.id</c>, a share of <c>k8s.replicaset.name</c>):
+/// <c>MetricLabelPoolChurnProbe</c> fills it after 4 737 replaced pods — 32 rollouts of each of 50
+/// deployments. From then on every pod born later paid, on every export, a fresh string per identity
+/// label and a fresh label set per point — 436 B/point against 165 — until the process restarted,
+/// while the pool held the strings of pods long gone. So when a miss finds the pool FULL and at
+/// least <see cref="ResetInterval"/> has passed since the last reset (or since construction), the
+/// string pool and the label-set table are replaced by empty ones, whole, and live traffic
+/// re-interns what it still sends. Nothing else changes: a <see cref="LabelSet"/> built before the
+/// reset keeps its strings and stays equal BY VALUE to the one built after it (the hash is a value
+/// hash, see <see cref="LabelSet"/>), so a series is the same series across the reset — only
+/// reference equality with the new instances is lost, which costs a string compare where a pointer
+/// compare was, never a split. The interval bounds the thrash when the live set itself outgrows the
+/// pool: at most one reset — a re-intern of what is live, a few MB — per interval. A fixed policy,
+/// no knob: <see cref="Resets"/> and <see cref="Saturations"/> are reported by
+/// <c>/api/diagnostics</c>. Metric label ids are never persisted (the WAL and the <c>.mts</c> files
+/// keep text), which is what makes a reset safe here and never for the log-template pool, whose
+/// ids are on disk.</para>
 /// </summary>
 public sealed class MetricLabelInterner
 {
     public const int DefaultMaxStrings     = 16_384;
     public const int DefaultLabelSetSlots  = 8_192;
+
+    /// <summary>
+    /// The least time between two resets of a full pool (see the class remarks). An hour: churn fills
+    /// the pool over days, so the first reset after that comes within the hour, while a live set that
+    /// by itself outgrows the pool — where a reset buys little — costs at most one re-intern an hour.
+    /// </summary>
+    public static readonly TimeSpan ResetInterval = TimeSpan.FromHours(1);
 
     /// <summary>
     /// Longer strings are materialised, not pooled: a value that long is an id or a message,
@@ -295,20 +322,57 @@ public sealed class MetricLabelInterner
     /// <summary>The process-wide instance the OTLP parsers and the WAL replay share.</summary>
     public static readonly MetricLabelInterner Shared = new(DefaultMaxStrings, DefaultLabelSetSlots);
 
-    private readonly StringInternPool _strings;
-    private readonly LabelSet?[]      _sets;
+    /// <summary>
+    /// The epoch's string pool and label-set table. A reset replaces both — the table first — and a
+    /// reader may meet one of each epoch, or ids of two epochs in one label-set probe (a reset between
+    /// a key's intern and its value's): that costs a miss at most, because a hit is confirmed string
+    /// by string (<see cref="LabelSet.SameReferences"/>). Two fields rather than one epoch object, so
+    /// the hot path loads what it loaded before the reset existed — no extra indirection per string.
+    /// </summary>
+    private volatile StringInternPool _strings;
+    private volatile LabelSet?[]      _sets;
     private readonly int              _mask;
+    private readonly int              _maxStrings;
+    private readonly TimeProvider     _time;
+    /// <summary><see cref="TimeProvider.GetTimestamp"/> of the last reset, or of construction.</summary>
+    private long _lastReset;
+    private int  _resets;
+    private int  _saturations;
 
-    public MetricLabelInterner(int maxStrings, int labelSetSlots)
+    public MetricLabelInterner(int maxStrings, int labelSetSlots) : this(maxStrings, labelSetSlots, TimeProvider.System) { }
+
+    /// <param name="time">The clock <see cref="ResetInterval"/> is measured on — a seam for tests.</param>
+    public MetricLabelInterner(int maxStrings, int labelSetSlots, TimeProvider time)
     {
-        _strings = new StringInternPool(maxStrings);
-        int slots = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(labelSetSlots, 2));
-        _sets = new LabelSet?[slots];
-        _mask = slots - 1;
+        ArgumentNullException.ThrowIfNull(time);
+        int slots   = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(labelSetSlots, 2));
+        _maxStrings = maxStrings;
+        _mask       = slots - 1;
+        _time       = time;
+        _lastReset  = time.GetTimestamp();
+        _sets       = new LabelSet?[slots];
+        _strings    = NewPool();
     }
 
-    /// <summary>The underlying string pool — for its cap and its <c>PoolExhausted</c> event.</summary>
+    /// <summary>A pool for a new epoch, whose first saturation is counted in <see cref="Saturations"/>.</summary>
+    private StringInternPool NewPool()
+    {
+        var pool = new StringInternPool(_maxStrings);
+        pool.PoolExhausted += _ => Interlocked.Increment(ref _saturations);   // once per pool, by the pool's own guard
+        return pool;
+    }
+
+    /// <summary>
+    /// The CURRENT epoch's string pool — for its cap, its fill and its <c>PoolExhausted</c> event. A
+    /// reset replaces it: a subscriber to that event hears about this epoch only.
+    /// </summary>
     public StringInternPool Strings => _strings;
+
+    /// <summary>How many times the pool has been reset (see the class remarks).</summary>
+    public int Resets => Volatile.Read(ref _resets);
+
+    /// <summary>How many epochs' pools have filled up — one more than <see cref="Resets"/> while the current one is full.</summary>
+    public int Saturations => Volatile.Read(ref _saturations);
 
     /// <summary>
     /// The id <c>Intern</c> answers for the empty string. <see cref="string.Empty"/> is one
@@ -328,7 +392,10 @@ public sealed class MetricLabelInterner
     {
         if (utf8.IsEmpty) { value = string.Empty; return EmptyStringId; }
         if (utf8.Length > MaxInternedUtf8Bytes) { value = Encoding.UTF8.GetString(utf8); return -1; }
-        return _strings.Intern(utf8, out value);
+        var pool = _strings;
+        int id = pool.Intern(utf8, out value);
+        if (id < 0) OnPoolFull(pool);
+        return id;
     }
 
     /// <summary>As <see cref="Intern(ReadOnlySpan{byte}, out string)"/>, for a string the caller
@@ -337,7 +404,34 @@ public sealed class MetricLabelInterner
     {
         if (s.Length == 0) { value = string.Empty; return EmptyStringId; }
         if (s.Length > MaxInternedUtf8Bytes) { value = s; return -1; }
-        return _strings.Intern(s, out value);
+        var pool = _strings;
+        int id = pool.Intern(s, out value);
+        if (id < 0) OnPoolFull(pool);
+        return id;
+    }
+
+    /// <summary>
+    /// A miss the pool could not take: it is full (a length the pool refuses never reaches it) — and
+    /// its saturation has been counted, once, by the pool's own <c>PoolExhausted</c>. Resets when
+    /// <see cref="ResetInterval"/> has passed since the last reset. Every miss on a full pool comes
+    /// here, so the path only reads — a field and the clock — until the interval is up; the one
+    /// compare-exchange that claims the reset happens once per interval. The string at hand stays
+    /// unpooled; the NEXT miss meets the new epoch.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private void OnPoolFull(StringInternPool full)
+    {
+        if (full.ClaimedCount < full.MaxPoolSize) return;                    // not full: nothing to do
+
+        long last = Volatile.Read(ref _lastReset);
+        long now  = _time.GetTimestamp();
+        if (_time.GetElapsedTime(last, now) < ResetInterval) return;
+        if (!ReferenceEquals(_strings, full)) return;                          // reset already, by another thread
+        if (Interlocked.CompareExchange(ref _lastReset, now, last) != last) return;
+
+        _sets    = new LabelSet?[_mask + 1];
+        _strings = NewPool();
+        Interlocked.Increment(ref _resets);
     }
 
     /// <summary>
