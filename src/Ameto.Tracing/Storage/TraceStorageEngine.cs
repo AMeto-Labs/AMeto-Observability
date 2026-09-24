@@ -15,7 +15,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
+public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     // _hotSpans is SWAPPED at flush start (the snapshot goes to the writer, a fresh list
@@ -262,6 +262,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// there; reaching that window any other way is a matter of luck.
     /// </summary>
     internal Action? _inCatalogNotYetInSnapshotForTest;
+
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> just before the segment is registered in the
+    /// catalog. Throwing from it is the manifest write that fails there (a File.Move over the live
+    /// manifest meeting an antivirus's sharing violation, on Windows): the segment is published with
+    /// id 0 and queued for adoption — the one way a segment reaches <see cref="AdoptUnnamedSegments"/>
+    /// without a restart, and on every OS.
+    /// </summary>
+    internal Action? _beforeCatalogRegistrationForTest;
 
     /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
     internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
@@ -562,6 +571,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     /// <summary>Test hook: the live tier's bytes by <see cref="HotSpanBytes"/>.</summary>
     internal long HotBytesForTest { get { _lock.EnterReadLock(); try { return _hotBytes; } finally { _lock.ExitReadLock(); } } }
+
+    /// <summary>The byte half of the flush trigger this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
+    internal long HotTierBudgetBytes => _hotTierBudgetBytes;
+
+    /// <summary>One compaction pass's byte budget this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
+    internal long MergeBudgetBytes => _mergeBudgetBytes;
 
     /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
     internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;
@@ -974,6 +989,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         string[] services = System.Buffers.ArrayPool<string>.Shared.Rent(Math.Min(scratch, 4_096));
         var      blobs    = System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Rent(Math.Min(scratch, 4_096));
         bool[]   pooled   = System.Buffers.ArrayPool<bool>.Shared.Rent(Math.Min(2 * scratch, 8_192));
+        Exception? flushStartFault = null;
         try
         {
             while (taken < count)
@@ -1034,8 +1050,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     // max(spanCount ≥ N, hotBytes ≥ budget): whichever the tier reaches first. The
                     // count bounds what a span costs beyond its bytes; the bytes bound what a
                     // span carrying a SQL statement or a stack would otherwise make of 50 000.
+                    //
+                    // BEST-EFFORT, AS FAR AS THIS BATCH IS CONCERNED. This hold's spans are already
+                    // in the log and in the tier; a flush that cannot START changes nothing about
+                    // them (TryStartFlushLocked leaves the tier and the log as they were), and the
+                    // next hold or due check retries it. Letting the throw out of here ended the
+                    // batch after this hold, and the drainer then released the rest of what it had
+                    // drained — 384 of every 512 spans, already acknowledged to the exporter, gone.
                     if (_hotSpans.Count >= HotFlushThreshold || _hotBytes >= _hotTierBudgetBytes)
-                        TryStartFlushLocked();
+                    {
+                        try     { TryStartFlushLocked(); }
+                        catch (Exception ex) { flushStartFault = ex; }   // logged off the lock, below
+                    }
                     _insideWriteHoldForTest?.Invoke(taken);
                 }
                 finally
@@ -1043,6 +1069,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     _lock.ExitWriteLock();
                 }
                 LetQueuedWaitersIn();
+                if (flushStartFault is not null)
+                {
+                    NoteFlushStartFailure(flushStartFault);
+                    flushStartFault = null;
+                }
                 _afterWriteHoldForTest?.Invoke(taken);
             }
         }
@@ -1059,6 +1090,40 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         return taken;
     }
+
+    // ── A FLUSH THAT CANNOT START IS SAID, AT MOST ONCE A MINUTE ─────────────────
+    //
+    // The write path swallows it (see WriteBatch) because the batch must go on; the operator must
+    // still hear it, and under load every hold past the threshold retries — ten thousand warnings a
+    // second would bury the one line that matters. The ingest endpoint's pool warning is the model.
+
+    /// <summary>The shortest gap between two "could not start a flush" warnings.</summary>
+    internal static readonly TimeSpan FlushStartWarningInterval = TimeSpan.FromMinutes(1);
+
+    private long _nextFlushStartWarningAt = long.MinValue;   // Environment.TickCount64, ms
+    private long _flushStartFailuresSinceWarning;
+    private long _flushStartFailures;
+
+    /// <summary>Test hook: flush starts the write path caught and carried on past, since the engine was built.</summary>
+    internal long FlushStartFailuresForTest => Interlocked.Read(ref _flushStartFailures);
+
+    private void NoteFlushStartFailure(Exception ex)
+    {
+        Interlocked.Increment(ref _flushStartFailures);
+        Interlocked.Increment(ref _flushStartFailuresSinceWarning);
+        long now  = Environment.TickCount64;
+        long next = Volatile.Read(ref _nextFlushStartWarningAt);
+        if (now < next) return;
+        long step = (long)FlushStartWarningInterval.TotalMilliseconds;
+        if (Interlocked.CompareExchange(ref _nextFlushStartWarningAt, now + step, next) != next) return;
+
+        LogFlushStartFailed(_logger, ex, Interlocked.Exchange(ref _flushStartFailuresSinceWarning, 0));
+    }
+
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Could not start a hot-tier flush ({Failures} failed start(s) since the last warning) — the spans "
+                + "stay in the hot tier and in spans.wal, the batch carries on, and the next write hold or due check retries")]
+    private static partial void LogFlushStartFailed(ILogger logger, Exception ex, long failures);
 
     /// <summary>
     /// One span into a held log scope, from an ingest ITEM: the log takes UTF-8 and the item
@@ -2348,13 +2413,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (!_flushInProgress)
                 {
                     if (_hotSpans.Count == 0) return;
-                    snapshot = TakeSnapshotLocked();
                     // Publish the INLINE flush as the in-flight one as well. Without a task
                     // to wait on, a second caller (the drainer's dispose overlapping the
                     // engine's) saw _flushInProgress with _flushTask still null and spun the
                     // write lock flat out for the whole multi-second build.
-                    inlineDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    _flushTask = inlineDone.Task;
+                    // BUILT BEFORE THE SNAPSHOT IS TAKEN: allocated after it, a throw here left
+                    // _flushInProgress set with no task to wait on and nothing to complete it —
+                    // this very loop then spun on it for ever. See TakeSnapshotLocked.
+                    var done   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    snapshot   = TakeSnapshotLocked();
+                    inlineDone = done;
+                    _flushTask = done.Task;
                 }
             }
             finally { _lock.ExitWriteLock(); }
@@ -2393,16 +2462,37 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// Detaches the hot tier for a flush: the snapshot goes to the writer, a fresh list
     /// takes its place, and the WAL opens its two-generation window. Caller holds the
     /// write lock and MUST hand the snapshot to <see cref="CompleteFlush"/>.
+    ///
+    /// <para><b>NOTHING AFTER THE LOG OPENS ITS WINDOW MAY THROW</b> — every allocation the detach
+    /// needs is made before <see cref="SpanWriteAheadLog.BeginFlush"/>, and after it there are only
+    /// stores (<see cref="DetachTierLocked"/>). The name pool used to be built AFTER the window
+    /// opened and the tier was detached, and an <see cref="OutOfMemoryException"/> there (the 512 MB
+    /// stand runs a 384 MB heap hard limit, and has run out) left the snapshot referenced by
+    /// nothing — up to 50 000 spans invisible to every query until a restart — and the window open
+    /// for good: every later flush met "already open", so the tier and the log grew without bound.
+    /// Allocated first, a failure leaves the tier and the log exactly where they were.</para>
     /// </summary>
     private List<SpanRecord> TakeSnapshotLocked()
     {
-        // The log opens its window FIRST: if BeginFlush throws, the tier must still be
-        // where it was — detaching first would strand the snapshot with no flush to carry
-        // it and no caller holding a reference.
-        _wal.BeginFlush();
+        var nextTier  = new List<SpanRecord>();
+        var nextNames = _pools.CreateNamePool();
 
+        // The log opens its window only now, and first of the two: if BeginFlush throws, the tier
+        // must still be where it was — detaching first would strand the snapshot with no flush to
+        // carry it and no caller holding a reference.
+        _wal.BeginFlush();
+        return DetachTierLocked(nextTier, nextNames);
+    }
+
+    /// <summary>
+    /// The detach itself, once the log's window is open: stores and a <c>Clear</c>, nothing that
+    /// allocates or throws. <paramref name="nextTier"/> and <paramref name="nextNames"/> were built
+    /// by the caller before the window opened. Under _lock(write).
+    /// </summary>
+    private List<SpanRecord> DetachTierLocked(List<SpanRecord> nextTier, Ameto.Core.StringInternPool nextNames)
+    {
         var snapshot = _hotSpans;
-        _hotSpans = new List<SpanRecord>();
+        _hotSpans = nextTier;
         _traceIdx.Clear();
         _hotSince = null;
         _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
@@ -2410,12 +2500,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // SHED ON FLUSH: the next tier interns into an empty name pool, so the pool never holds
         // more than one tier's distinct names. Safe at any moment — the tier stores the shared
         // instances, never pool indices, so nothing that was handed out can change meaning.
-        _pools.ShedNames();
+        _pools.InstallNames(nextNames);
         _flushInProgress = true;
         _flushingSpans   = snapshot;
         _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey
         return snapshot;
     }
+
+    /// <summary>
+    /// Test seam: the background flush task is about to be started, with the log's window already
+    /// open and the tier not yet detached. Throwing from it is <c>Task.Start</c> failing — the
+    /// thread pool's queue could not take the work item. Null in production.
+    /// </summary>
+    internal Action? _beforeFlushTaskStartForTest;
 
     /// <summary>
     /// Starts a background flush unless one is already running — or the engine is shutting
@@ -2424,6 +2521,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// could start a flush that publishes its segment and then faults trying to commit the WAL,
     /// leaving a segment on disk whose spans the log still replays — permanent duplicates.
     /// Spans refused here stay in the hot tier AND in the WAL, so the next start replays them.
+    ///
+    /// <para><b>A START THAT THROWS CHANGES NOTHING, AND GIVES ITS SLOT BACK.</b> The slot used to
+    /// be released only from inside the task, so a throw before the task existed leaked one per
+    /// attempt — and every due check and every hold over the threshold is an attempt — until the
+    /// teardown spent its whole budget waiting for phases that would never end and left the engine
+    /// frozen. Now everything that can fail runs while nothing has been touched: the next tier, its
+    /// name pool and the task are built first; <c>BeginFlush</c> changes nothing when it throws; a
+    /// task that cannot be started closes the window it opened (<c>AbandonFlush</c>, which leaves the
+    /// log as a failed flush does: every entry still replays); and only a STARTED task is followed
+    /// by the detach, which is stores alone. The task may begin while the detach is still running
+    /// — it reads the snapshot list, which nothing appends to while this caller holds the write
+    /// lock, and it touches the engine's fields only under that lock.</para>
     /// </summary>
     private void TryStartFlushLocked()
     {
@@ -2432,12 +2541,38 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // instant in which the spans are in neither tier and nothing counts the task that holds
         // them — the one state the teardown must never mistake for quiet.
         if (!TryBeginHeavyPhase()) return;
-        var snapshot = TakeSnapshotLocked();
-        _flushTask = Task.Run(() =>
+        bool started = false;
+        try
         {
-            try     { CompleteFlush(snapshot); }
-            finally { EndHeavyPhase(); }
-        });
+            var snapshot  = _hotSpans;
+            var nextTier  = new List<SpanRecord>();
+            var nextNames = _pools.CreateNamePool();
+            var flush     = new Task(() =>
+            {
+                try     { CompleteFlush(snapshot); }
+                finally { EndHeavyPhase(); }
+            }, TaskCreationOptions.DenyChildAttach);            // what Task.Run passes
+
+            _wal.BeginFlush();
+            try
+            {
+                _beforeFlushTaskStartForTest?.Invoke();
+                flush.Start(TaskScheduler.Default);
+            }
+            catch
+            {
+                _wal.AbandonFlush();                            // flag-only, no I/O — fine under the lock
+                throw;
+            }
+            started = true;                                     // the slot is the task's to release now
+
+            DetachTierLocked(nextTier, nextNames);
+            _flushTask = flush;
+        }
+        finally
+        {
+            if (!started) EndHeavyPhase();
+        }
     }
 
     /// <summary>
@@ -2492,6 +2627,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         {
             try
             {
+                _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
                 ulong segId = _manifest.AllocateSegmentId();
 
                 // The run goes to disk BEFORE the coverage claim, and the claim is what AddSegment
@@ -2932,11 +3068,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal void AdoptUnnamedSegments()
     {
         if (!TryBeginHeavyPhase()) return;
-        try { AdoptUnnamedSegments(_coldSegments); }
+        try { AdoptUnnamedSegmentsCore(); }
         finally { EndHeavyPhase(); }
     }
 
-    private void AdoptUnnamedSegments(SpanSegmentInfo[] segs)
+    /// <summary>
+    /// Paths a running compaction pass has CLAIMED: it is about to retire them from the catalog and
+    /// unlink them. Under <see cref="_adoptionGate"/>.
+    /// </summary>
+    private readonly HashSet<string> _mergingPaths = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Makes "claimed by a merge" and "registered by adoption" mutually exclusive: adoption holds it
+    /// across its check of <see cref="_mergingPaths"/> AND its registration, and a compaction pass
+    /// takes it to claim its sources, then resolves their ids. So either the adoption finished first
+    /// — and the pass, resolving after its claim, retires the id adoption gave — or the pass claimed
+    /// first and adoption leaves the path queued, to find it gone on a later pass.
+    ///
+    /// <para><b>Why both halves.</b> Resolving the ids alone left a window: an adoption landing after
+    /// the resolution registered a file the merge was about to delete, and the catalog named it for
+    /// good. Skipping claimed paths alone left the other one: an adoption that finished between the
+    /// merge's plan and its claim gave an id the plan never saw. Lock order: this, then the engine
+    /// lock (the rename); nothing takes them the other way round.</para>
+    /// </summary>
+    private readonly Lock _adoptionGate = new();
+
+    private void AdoptUnnamedSegmentsCore()
     {
         string[] pending;
         lock (_unnamedSegments)
@@ -2947,37 +3104,50 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         foreach (string path in pending)
         {
-            var seg = Array.Find(segs, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
-            if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+            lock (_adoptionGate)
             {
-                lock (_unnamedSegments) _unnamedSegments.Remove(path);
-                continue;
-            }
-            try
-            {
-                ulong id = _manifest.AllocateSegmentId();
-                _manifest.AddSegment(new TraceSegmentEntry(
-                    id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
-                RenameSegmentInSnapshot(seg, seg.WithSegmentId(id));
-                lock (_unnamedSegments) _unnamedSegments.Remove(path);
-                _logger.LogInformation(
-                    "Trace catalog adopted {File}, whose flush-time registration had failed", path);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+                // A merge has claimed it: it is leaving the catalog and the disk. Left queued; the
+                // next pass finds it gone from the snapshot (or its file gone) and drops it.
+                if (_mergingPaths.Contains(path)) continue;
+
+                var seg = Array.Find(_coldSegments, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
+                if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+                {
+                    lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                    continue;
+                }
+                try
+                {
+                    ulong id = _manifest.AllocateSegmentId();
+                    _manifest.AddSegment(new TraceSegmentEntry(
+                        id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+                    RenameSegmentInSnapshot(path, id);
+                    lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                    _logger.LogInformation(
+                        "Trace catalog adopted {File}, whose flush-time registration had failed", path);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+                }
             }
         }
     }
 
-    /// <summary>Swaps one entry of the cold snapshot for an updated copy, under the write lock.</summary>
-    private void RenameSegmentInSnapshot(SpanSegmentInfo oldSeg, SpanSegmentInfo newSeg)
+    /// <summary>
+    /// Gives the cold snapshot's entry for <paramref name="path"/> its catalog id, under the write
+    /// lock. Matched by PATH, like <see cref="WriteBackWeights"/>: the entry read before the lock may
+    /// have been replaced since (a pass writing back a weight), and a reference match then renamed
+    /// nothing while the catalog had already named the file.
+    /// </summary>
+    private void RenameSegmentInSnapshot(string path, ulong segmentId)
     {
         _lock.EnterWriteLock();
         try
         {
             var next = new List<SpanSegmentInfo>(_coldSegments.Length);
-            foreach (var s in _coldSegments) next.Add(ReferenceEquals(s, oldSeg) ? newSeg : s);
+            foreach (var s in _coldSegments)
+                next.Add(string.Equals(s.FilePath, path, StringComparison.Ordinal) ? s.WithSegmentId(segmentId) : s);
             _coldSegments = SortedByMaxStartDesc(next);
         }
         finally { _lock.ExitWriteLock(); }
@@ -3452,6 +3622,37 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         return s;
     }
 
+    /// <summary>Test seam: the points of a compaction pass at which the index worker's adoption can land.</summary>
+    internal enum CompactionStage { Merged, Claimed, Catalogued }
+
+    /// <summary>
+    /// Test seam, on the compaction thread: <see cref="CompactionStage.Merged"/> once the merged file
+    /// is written and before the pass claims its sources, <see cref="CompactionStage.Claimed"/> right
+    /// after the claim, <see cref="CompactionStage.Catalogued"/> after the catalog has retired the
+    /// sources and before the snapshot swap. Running <see cref="AdoptUnnamedSegments"/> from it is
+    /// the race the claim exists for. Null in production.
+    /// </summary>
+    internal Action<CompactionStage>? _compactionStageForTest;
+
+    /// <summary>
+    /// The catalog ids of a pass's sources, resolved AFTER the claim: every id the plan saw, and every
+    /// id the catalog holds for one of their paths — an adoption that finished between the plan and
+    /// the claim gave one the plan never saw.
+    /// </summary>
+    private List<ulong> CatalogIdsOfSources(List<SpanSegmentInfo> processed, HashSet<string> paths)
+    {
+        var ids = new List<ulong>(processed.Count);
+        foreach (var s in processed)
+            if (s.SegmentId != 0) ids.Add(s.SegmentId);
+        foreach (var (id, entry) in _manifest.Segments)
+            if (paths.Contains(entry.FilePath) && !ids.Contains(id)) ids.Add(id);
+        return ids;
+    }
+
+    /// <summary>Test hook: the files the catalog names — every one must exist once a pass is over.</summary>
+    internal IReadOnlyCollection<string> CatalogPathsForTest =>
+        _manifest.Segments.Values.Select(static s => s.FilePath).ToList();
+
     private bool CompactOnePass()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
@@ -3517,6 +3718,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             return WriteBackWeights(weighed);
         }
 
+        HashSet<string>? claimed = null;   // the sources this pass has claimed from adoption
         try
         {
             // recoverable:false — the sources are still on disk until the swap below, so a
@@ -3529,6 +3731,23 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
+            _compactionStageForTest?.Invoke(CompactionStage.Merged);
+
+            // THE SOURCES ARE KNOWN BY PATH FROM HERE ON, NOT BY THE REFERENCES THE PLAN HELD. The
+            // index worker's adoption (AdoptUnnamedSegments) runs beside this pass and REPLACES the
+            // snapshot entry of a segment it names; matched by reference, the swap below then kept
+            // that entry while its files were deleted, and the catalog went on naming the adopted id,
+            // because the plan had seen id 0. Claimed now, so adoption leaves these paths alone until
+            // the files are gone; the ids are resolved AFTER the claim, so one adoption finished
+            // before it is retired too. See _adoptionGate.
+            var processedPaths = new HashSet<string>(processed.Count, StringComparer.Ordinal);
+            foreach (var s in processed) processedPaths.Add(s.FilePath);
+            // Recorded BEFORE the union: a union that throws part-way (the set grows) must still be
+            // undone by the finally, or the paths it did add stay claimed for the life of the process
+            // and adoption skips them forever. ExceptWith of the whole set is safe either way.
+            claimed = processedPaths;
+            lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
+            _compactionStageForTest?.Invoke(CompactionStage.Claimed);
 
             // Swap the snapshot first (readers stop picking the old files up),
             // delete the merged-away files after. An in-flight reader that still
@@ -3550,7 +3769,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (run is { } fresh && !_index.Add(fresh)) run = null;
 
                 var orphaned = _manifest.ReplaceSegments(
-                    processed.Select(static s => s.SegmentId).Where(static id => id != 0).ToList(),
+                    CatalogIdsOfSources(processed, processedPaths),
                     new TraceSegmentEntry(mergedId, merged.FilePath,
                                           merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
                     run);
@@ -3591,12 +3810,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     merged.FilePath);
             }
 
+            _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
             _lock.EnterWriteLock();
             try
             {
                 var next = new List<SpanSegmentInfo>(_coldSegments.Length);
-                foreach (var s in _coldSegments)
-                    if (!processed.Contains(s)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
+                foreach (var s in _coldSegments)   // by path: see the claim above
+                    if (!processedPaths.Contains(s.FilePath)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
                 next.Add(merged);
                 _coldSegments = SortedByMaxStartDesc(next);
             }
@@ -3610,6 +3830,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         {
             _logger.LogError(ex, "Compaction: failed to write merged segment");
             return false;
+        }
+        finally
+        {
+            // After the unlink, not before: an adoption let in between would still find the file on
+            // disk, and would register a path the next instant makes a dangling one.
+            if (claimed is not null) lock (_adoptionGate) _mergingPaths.ExceptWith(claimed);
         }
     }
 

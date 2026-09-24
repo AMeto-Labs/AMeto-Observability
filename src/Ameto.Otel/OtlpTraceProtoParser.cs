@@ -59,7 +59,7 @@ namespace Ameto.Otel;
 /// as slices of the request buffer — the name and service UTF-8 as they arrived (validated), the
 /// attribute map from the per-thread scratch — and the sink copies them into the ring's arena. No
 /// <see cref="SpanIngestItem"/>, no name string, no attribute array per span; the service is
-/// interned once per resource block (<see cref="ISpanSink.InternService"/>). The list-returning
+/// interned once per resource block, at its first span that reaches the sink (<see cref="ISpanSink.InternService"/>). The list-returning
 /// <see cref="Parse(ReadOnlySpan{byte})"/> survives for the gRPC receiver and the tests as an
 /// adapter over the SAME core (<see cref="SpanItemCollector"/>), so there is one parser and every
 /// parity test exercises it.</para>
@@ -89,6 +89,10 @@ public static class OtlpTraceProtoParser
 
     /// <summary>What a resource with no <c>service.name</c> is called, as the sink takes it.</summary>
     private static ReadOnlySpan<byte> UnknownServiceUtf8 => "unknown"u8;
+
+    /// <summary>The block's service has not been interned yet — no span of it has reached the sink.
+    /// Not -1, which is the sink's own "not pooled" answer.</summary>
+    private const int ServiceNotInterned = -2;
 
     /// <summary>
     /// How deep an attribute value may nest before the payload is refused.
@@ -134,7 +138,7 @@ public static class OtlpTraceProtoParser
         public int Refused;
         public int ResKeyCount;
         public ReadOnlySpan<byte> Service;        // one per resourceSpans block, valid UTF-8
-        public int ServiceIdx;                    // what the sink interned it as, once per block
+        public int ServiceIdx;                    // what the sink interned it as, at the block's first span; ServiceNotInterned until then
         public bool ServiceSeen;
         public int Depth;                         // nested array_value / kvlist_value levels open
     }
@@ -197,7 +201,7 @@ public static class OtlpTraceProtoParser
             OutBuf     = _tOut  ??= new ArrayBufferWriter<byte>(8192),
             Sink       = sink,
             Service    = UnknownServiceUtf8,
-            ServiceIdx = -1,
+            ServiceIdx = ServiceNotInterned,
         };
         // ResetWrittenCount, not Clear: Clear zeroes every byte written last time, and nothing
         // reads past WrittenSpan.
@@ -235,8 +239,11 @@ public static class OtlpTraceProtoParser
         }
 
         // ONCE PER BLOCK, not once per span: the service is a property of the resource, and every
-        // span under it is handed this index with the same bytes.
-        st.ServiceIdx = st.Sink.InternService(st.Service);
+        // span under it is handed one index with the same bytes. LAZILY, at the block's first span
+        // that reaches the sink (see ReadSpan), as the JSON parser does: the service pool holds
+        // 4 096 entries for the life of the process, and an exporter that sends per-pod resource
+        // blocks with no spans in them used to take permanent slots over protobuf, never over JSON.
+        st.ServiceIdx = ServiceNotInterned;
 
         var pass2 = new ProtoReader(bytes);
         while ((tag = pass2.ReadTag()) != 0)
@@ -337,6 +344,9 @@ public static class OtlpTraceProtoParser
         // long.TryParse refused it, landing 0. Duration then falls out of end > start.
         long startNano = startRaw <= long.MaxValue ? (long)startRaw : 0;
         long endNano   = endRaw   <= long.MaxValue ? (long)endRaw   : 0;
+
+        // Interned at the block's FIRST span, once: every later span of the block reuses the index.
+        if (st.ServiceIdx == ServiceNotInterned) st.ServiceIdx = st.Sink.InternService(st.Service);
 
         bool taken = st.Sink.TryIngestRaw(
             TraceId.Parse(traceId),

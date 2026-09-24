@@ -291,8 +291,16 @@ internal sealed class SpanStringPools
         Saturated?.Invoke(kind, cap);
     }
 
+    /// <summary>
+    /// Test seam: a name pool is about to be built — the allocation a flush start makes for the next
+    /// tier. Throwing from it is that allocation failing (an <see cref="OutOfMemoryException"/> under
+    /// the 512 MB stand's heap limit). Null in production.
+    /// </summary>
+    internal Action? _beforeNewNamePoolForTest;
+
     private Ameto.Core.StringInternPool NewNamePool()
     {
+        _beforeNewNamePoolForTest?.Invoke();
         var pool = new Ameto.Core.StringInternPool(_maxNames);
         pool.PoolExhausted += cap => OnSaturated(SpanPoolKind.Names, cap);
         return pool;
@@ -361,11 +369,26 @@ internal sealed class SpanStringPools
     }
 
     /// <summary>
-    /// Replaces the name pool with an empty one — called as the tier is detached for a flush. The
-    /// strings already handed out stay valid (they are references, never indices); the next tier
-    /// interns afresh, so a high-cardinality burst lives exactly as long as its tier.
+    /// Replaces the name pool with an empty one. The strings already handed out stay valid (they are
+    /// references, never indices); the next tier interns afresh, so a high-cardinality burst lives
+    /// exactly as long as its tier. The engine does this in two halves — see <see cref="CreateNamePool"/>.
     /// </summary>
-    public void ShedNames() => _names = NewNamePool();
+    public void ShedNames() => InstallNames(CreateNamePool());
+
+    /// <summary>
+    /// Builds the empty name pool the NEXT tier will intern into, without installing it. The half of
+    /// <see cref="ShedNames"/> that allocates, split off so a flush start can run it before it touches
+    /// anything it would have to undo: the pool is a dictionary, a slot array, a lock and a handler,
+    /// and building it after the log had opened its flush window and the tier was detached made an
+    /// <see cref="OutOfMemoryException"/> there strand the tier and wedge every later flush.
+    /// </summary>
+    public Ameto.Core.StringInternPool CreateNamePool() => NewNamePool();
+
+    /// <summary>
+    /// Installs a pool <see cref="CreateNamePool"/> built — the half of <see cref="ShedNames"/> that
+    /// cannot throw: one reference store.
+    /// </summary>
+    public void InstallNames(Ameto.Core.StringInternPool pool) => _names = pool;
 
     /// <summary>What a string the pool could not share costs the tier: the object, header and chars.</summary>
     internal static long UnpooledStringBytes(string s) => (22L + 2L * s.Length + 7) & ~7L;

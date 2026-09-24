@@ -86,9 +86,18 @@ public static class TracingServiceExtensions
         services.AddSingleton(static sp =>
         {
             var traces = TracesOptionsFrom(sp);
-            return new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes,
-                                      sp.GetRequiredService<SpanStringPools>());
+            var ring   = new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes,
+                                            sp.GetRequiredService<SpanStringPools>());
+            // The effective trace budgets, once, from what the ring and the engine were BUILT with.
+            // The engine is already constructed by now in the host (its hosted service is registered
+            // first, above), so resolving it here changes no construction order.
+            TraceDiagnostics.LogBudgets(sp.GetRequiredService<ILogger<TraceDiagnostics>>(),
+                                        sp.GetRequiredService<TraceStorageEngine>(), ring);
+            return ring;
         });
+        // What GET /api/diagnostics reads: the engine's budgets and the ring's refusals by cause.
+        services.AddSingleton(static sp => new TraceDiagnostics(sp.GetRequiredService<TraceStorageEngine>(),
+                                                                sp.GetRequiredService<SpanRingBuffer>()));
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
         // The raw sink the OTLP/HTTP parsers stream into — the same endpoint, the same ring.

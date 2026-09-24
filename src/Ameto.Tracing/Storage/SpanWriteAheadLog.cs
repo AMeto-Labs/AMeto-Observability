@@ -46,6 +46,12 @@ namespace Ameto.Tracing.Storage;
 /// desynchronises inside a half-relocated front (see <see cref="CommitFlush"/>) now ends the
 /// replay cleanly instead of manufacturing spans.</para>
 ///
+/// <para><b>Names and services longer than 65 535 bytes are logged EMPTY.</b> v2 kept v1's 16-bit
+/// <c>NameLength</c> and <c>ServiceLength</c>, and an append clamps such a field out of the log
+/// rather than truncating it mid-rune (see <c>AppendLocked</c>). The hot tier keeps the full text
+/// — the ring accepts such a span by parking it — so the span is named while it is live, but a
+/// crash before its segment is written replays it with an empty name or service.</para>
+///
 /// <para><b>Durability, stated because it is a choice.</b> Appends are not fsynced — not per
 /// span and not on a timer. There is NO PERIODIC FSYNC BETWEEN SEGMENT FLUSHES: the two
 /// flushes in <see cref="CommitFlush"/> are the only points at which this log is forced to
@@ -608,6 +614,13 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     // generation; Abandon leaves everything replayable for the retry.
 
     /// <summary>
+    /// Test seam: <see cref="BeginFlush"/> is about to open its window. Throwing from it is
+    /// BeginFlush failing before it changed anything — which is also what its "already open"
+    /// refusal is. Null in production.
+    /// </summary>
+    internal Action? _beforeBeginFlushForTest;
+
+    /// <summary>
     /// Opens a flush: appends from here on carry the NEXT generation; the entries being
     /// flushed keep the current one, and recovery accepts both until <see cref="CommitFlush"/>.
     /// The generation is bumped once per commit CYCLE — a Begin after an Abandon reuses the
@@ -615,6 +628,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// </summary>
     public void BeginFlush()
     {
+        _beforeBeginFlushForTest?.Invoke();
         lock (_writeLock)
         {
             if (_flushOpen)

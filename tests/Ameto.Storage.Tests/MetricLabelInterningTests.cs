@@ -198,4 +198,83 @@ public sealed class MetricLabelInterningTests : IDisposable
         Assert.Same(interner.Intern("replay-value"),    p.Labels.ValueAt(0));
         Assert.Same(ViaInterner(interner, ("replay.key", "replay-value")), p.Labels);
     }
+
+    /// <summary>
+    /// THE REPLAY INTERNS WHAT IT REPLAYS, AND NOTHING ELSE (PR #84 review, #3). The pool file is
+    /// truncated only when a commit empties the log, so after a crash it holds every series
+    /// registered since the log was last empty — here 200 dead ones, a churned pod each, behind a
+    /// commit that left 3 live series' points in the log. The interner the replay goes through is
+    /// <see cref="MetricLabelInterner.Shared"/> in production, 16 384 strings for the life of the
+    /// process: interning the dead records would fill it at boot with values nobody sends any more.
+    ///
+    /// <para>So: opening the log interns nothing (the seeding needs only indices), and the replay
+    /// claims exactly the six strings its three points reference — "live.metric", "ms", "pod" and
+    /// three pod values — while a dead record's text is not in the pool at all. The points and
+    /// label sets are the ones the replay always produced, the label sets still the interner's
+    /// published instances. A private interner of the production size, for the reason the fact
+    /// above gives: the rest of the assembly fills <c>Shared</c>, and what is counted here must not
+    /// depend on that.</para>
+    ///
+    /// <para>Reverted (every record decoded through the interner, at open and at replay): 406
+    /// strings are claimed before <c>ReadAll</c> is even called.</para>
+    /// </summary>
+    [Fact]
+    public void The_replay_interns_only_the_series_a_surviving_entry_references()
+    {
+        const int Dead = 200, Live = 3;
+        string walPath   = Path.Combine(_dir, "metrics.wal");
+        long   nano      = 1_785_300_000_000_000_000L;
+        var    writeSide = new MetricLabelInterner(MetricLabelInterner.DefaultMaxStrings,
+                                                   MetricLabelInterner.DefaultLabelSetSlots);
+
+        static MetricIngestItem Gauge(string name, string pod, long ts, double v) => new()
+        {
+            Name              = Fresh(name),
+            Unit              = Fresh("ms"),
+            Kind              = MetricKind.Gauge,
+            Labels            = Build((Fresh("pod"), Fresh(pod))),
+            TimestampUnixNano = ts,
+            ScalarValue       = v,
+        };
+
+        using (var wal = MetricWriteAheadLog.Open(walPath, 1L * 1024 * 1024, interner: writeSide))
+        {
+            for (int i = 0; i < Dead; i++)
+                wal.Append(Gauge($"dead.metric.{i}", $"dead-pod-{i}", nano + i, i),
+                           new MetricDataPoint { TimestampUnixNano = nano + i, Value = i });
+
+            ulong flushing = wal.BeginFlush();                   // the dead series' points go to files
+            for (int j = 0; j < Live; j++)                       // these arrive while they are written
+                wal.Append(Gauge("live.metric", $"live-pod-{j}", nano + 1_000 + j, 100 + j),
+                           new MetricDataPoint { TimestampUnixNano = nano + 1_000 + j, Value = 100 + j });
+            wal.CommitFlush(flushing);                           // the log keeps 3 entries: the pool is not truncated
+        }                                                        // and the process dies before the next commit
+
+        var replay = new MetricLabelInterner(MetricLabelInterner.DefaultMaxStrings,
+                                             MetricLabelInterner.DefaultLabelSetSlots);
+        using var reopened = MetricWriteAheadLog.Open(walPath, 1L * 1024 * 1024, interner: replay);
+        Assert.Equal(0, replay.Strings.ClaimedCount);           // opening interns nothing
+
+        var points = reopened.ReadAll(out int unresolved);
+        Assert.Equal(0, unresolved);
+        Assert.Equal(6, replay.Strings.ClaimedCount);           // live.metric, ms, pod, live-pod-0..2
+
+        foreach (string dead in new[] { "dead.metric.7", "dead-pod-7", $"dead-pod-{Dead - 1}" })
+            Assert.False(replay.Strings.TryGet(dead.AsSpan(), out _, out _), $"{dead} was interned");
+
+        Assert.Equal(Live, points.Count);
+        var byValue = points.OrderBy(p => p.Point.Value).ToArray();
+        for (int j = 0; j < Live; j++)
+        {
+            var p = byValue[j];
+            Assert.Equal(100.0 + j, p.Point.Value);
+            Assert.Equal(nano + 1_000 + j, p.Point.TimestampUnixNano);
+            Assert.Equal(MetricKind.Gauge, p.Kind);
+            Assert.Same(replay.Intern("live.metric"), p.Name);
+            Assert.Same(replay.Intern("ms"), p.Unit);
+            Assert.Equal(Build(("pod", $"live-pod-{j}")), p.Labels);
+            Assert.Same(ViaInterner(replay, ("pod", $"live-pod-{j}")), p.Labels);   // the published set
+        }
+        Assert.Equal(6, replay.Strings.ClaimedCount);           // the asserts above found, not added
+    }
 }

@@ -116,9 +116,16 @@ public sealed class SpanRingBackPressureTests
         services.AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance);
         services.AddSingleton(typeof(ILogger<>), typeof(Logger<>));
         services.AddSingleton(new ServerOptions { Traces = new TracesOptions { RingMaxBytes = 7 * MB } });
-        services.AddAmetoTracing(Path.Combine(Path.GetTempPath(), "ameto-ringbp-" + Guid.NewGuid().ToString("N")));
-        using var sp = services.BuildServiceProvider();
-        Assert.Equal(7 * MB, sp.GetRequiredService<SpanRingBuffer>().MaxBytes);
+        // The ring's factory resolves the engine (for its budgets), which opens an 8 MB spans.wal
+        // here: the directory goes once the provider — and with it the engine — is disposed.
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-ringbp-" + Guid.NewGuid().ToString("N"));
+        services.AddAmetoTracing(dir);
+        try
+        {
+            using var sp = services.BuildServiceProvider();
+            Assert.Equal(7 * MB, sp.GetRequiredService<SpanRingBuffer>().MaxBytes);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     private static SpanIngestItem Span(int i, int blobBytes) => new()

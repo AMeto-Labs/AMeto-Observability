@@ -30,7 +30,7 @@ namespace Ameto.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IMemoryShedder, IAsyncDisposable
+public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IMemoryShedder, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     //
@@ -337,8 +337,45 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private int _exemplarRingsFull;
 
-    /// <summary>Test hook: exemplars refused because the ring cap was reached.</summary>
-    internal long ExemplarMetricsRefused => Volatile.Read(ref _exemplarMetricsRefused);
+    /// <summary>
+    /// Exemplars refused because the ring cap was reached — a metric name that arrived after
+    /// <see cref="MaxExemplarMetrics"/> names already own a ring. Reported by GET /api/diagnostics
+    /// as <c>metricsExemplarMetricsRefused</c>: an exemplar is a correlation hint, never data, so the
+    /// refusal drops nothing else, and this counter is the only place it shows.
+    /// </summary>
+    public long ExemplarMetricsRefused => Volatile.Read(ref _exemplarMetricsRefused);
+
+    // ── The EFFECTIVE budgets, as this engine was built with them ────────────────
+    //
+    // config.yml and CONFIGURATION.md promise these at startup and in GET /api/diagnostics; before
+    // they were exposed here the promise had nothing behind it. What the engine ENFORCES, after the
+    // explicit-value, floor and budget rules — never a fresh derivation, which could disagree.
+
+    /// <summary>Bytes the hot tier may hold before a flush is forced (<c>Metrics:HotTierBytes</c>, effective).</summary>
+    public long HotTierBudgetBytes => _hotFlushBytes;
+
+    /// <summary>The bar a periodic flush tick must clear (<c>Metrics:MinFlushBytes</c>, effective).</summary>
+    public long MinFlushBytes => _minFlushBytes;
+
+    /// <summary>The capacity <c>metrics.wal</c> was opened with (<c>Metrics:WalInitialBytes</c>, effective).</summary>
+    public long WalInitialBytes => _walInitialBytes;
+
+    /// <summary>Slots per exemplar ring (<c>Metrics:ExemplarsPerMetric</c>, effective).</summary>
+    public int ExemplarsPerMetric => _exemplarsPerMetric;
+
+    /// <summary>Metric names that may own an exemplar ring (<c>Metrics:MaxExemplarMetrics</c>, after the budget).</summary>
+    public int MaxExemplarMetrics => _maxExemplarMetrics;
+
+    private readonly long _walInitialBytes;
+
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Information,
+        Message = "Metric budgets: hot tier {HotTierBytes} B (a flush is forced above it), periodic flush above {MinFlushBytes} B, "
+                + "metrics.wal opened at {WalInitialBytes} B, exemplars {ExemplarsPerMetric} per metric in at most "
+                + "{MaxExemplarMetrics} rings ({ExemplarRingBytes} B resident at most); derived from a {ManagedLimitMB} MB "
+                + "managed-heap limit, explicit Ameto:Metrics values win")]
+    private static partial void LogBudgets(ILogger logger, long hotTierBytes, long minFlushBytes, long walInitialBytes,
+                                           int exemplarsPerMetric, int maxExemplarMetrics, long exemplarRingBytes,
+                                           long managedLimitMB);
 
     private long _exemplarMetricsRefused;
 
@@ -505,12 +542,17 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // further ring is 13 KB of heap nothing can ever take back — so the ring count gives way
         // instead. See MetricsOptions.MaxExemplarMetricsFor.
         _maxExemplarMetrics        = _options.MaxExemplarMetricsFor(in budgets);
+        _walInitialBytes           = _options.WalInitialBytesFor(in budgets);
+
+        LogBudgets(_logger, _hotFlushBytes, _minFlushBytes, _walInitialBytes, _exemplarsPerMetric, _maxExemplarMetrics,
+                   (long)_exemplarsPerMetric * _maxExemplarMetrics * MetricsOptions.ExemplarBytes,
+                   budgets.ManagedLimitBytes / 1048576);
 
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
         // a sequential walk of one mmap'd file bounded by the flush thresholds.
         _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"),
-                                        _options.WalInitialBytesFor(in budgets), logger);
+                                        _walInitialBytes, logger);
         RecoverFromWal();
 
         // Leftover builds from a flush or rollup killed between the write and the rename. HERE,
