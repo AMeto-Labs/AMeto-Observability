@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
@@ -8,8 +9,12 @@ using Google.Protobuf;
 using Ameto.Core;
 using Ameto.Otel;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using Xunit.Abstractions;
+using EventId  = Microsoft.Extensions.Logging.EventId;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Integration.Tests;
 
@@ -46,6 +51,40 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
     public sealed class Factory : AmetoWebAppFactory
     {
         protected override IngestionOptions ConfiguredIngestion => new() { MaxOtlpBatchBytes = Limit };
+
+        /// <summary>What the host logs — for the one refusal that is logged as well as answered.</summary>
+        public CapturedLog Log { get; } = new();
+
+        protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(services => services.AddSingleton<ILoggerProvider>(Log));
+        }
+    }
+
+    /// <summary>Counts log entries by event name. The class's tests run one at a time, so a before/after delta is this test's.</summary>
+    public sealed class CapturedLog : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<(string? Event, LogLevel Level)> _entries = new();
+
+        public int Count(string eventName, LogLevel level)
+        {
+            int n = 0;
+            foreach (var (name, lvl) in _entries) if (name == eventName && lvl == level) n++;
+            return n;
+        }
+
+        public ILogger CreateLogger(string categoryName) => new Sink(this);
+        public void Dispose() { }
+
+        private sealed class Sink(CapturedLog log) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                    Func<TState, Exception?, string> formatter)
+                => log._entries.Enqueue((eventId.Name, logLevel));
+        }
     }
 
     private readonly Factory           _factory;
@@ -198,10 +237,13 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
         byte[] gz = OtlpGzipTests.Gzip(over.Message);
         Assert.True(gz.Length < Limit, $"the compressed body ({gz.Length:N0} B) must pass the wire check for this to test the inflated one");
 
+        int warned = _factory.Log.Count("OtlpHttpGzipTooLarge", LogLevel.Warning);
         using var refused = await PostAsync(route, gz, protobuf, "gzip");
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
         Assert.Empty(await refused.Content.ReadAsByteArrayAsync());                    // the wire 413's body: none
+        // And logged, unlike the wire 413: the client is told, and so is whoever runs the server.
+        Assert.Equal(warned + 1, _factory.Log.Count("OtlpHttpGzipTooLarge", LogLevel.Warning));
 
         var after = Batch.Of(SignalOf(route), protobuf, count: 1);
         using var accepted = await PostAsync(route, OtlpGzipTests.Gzip(after.Message), protobuf, "gzip");
@@ -365,9 +407,23 @@ public sealed class OtlpHttpGzipTests : IClassFixture<OtlpHttpGzipTests.Factory>
     [MemberData(nameof(EveryRouteBothEncodings))]
     public async Task Gzip_over_an_empty_body_answers_what_an_empty_body_answers(string route, bool protobuf)
     {
-        using var plain = await PostAsync(route, [], protobuf, encoding: null);
-        using var gzip  = await PostAsync(route, [], protobuf, "gzip");
+        HttpResponseMessage plain, gzip;
+        int plainRents, gzipRents;
+        using (var ledger = IngestBufferPoolLedger.Open())
+        {
+            plain      = await PostAsync(route, [], protobuf, encoding: null);
+            plainRents = ledger.Rents;
+        }
+        using (var ledger = IngestBufferPoolLedger.Open())
+        {
+            gzip      = await PostAsync(route, [], protobuf, "gzip");
+            gzipRents = ledger.Rents;
+        }
+        using var _ = plain;
+        using var __ = gzip;
 
+        // And costs what it does: nothing to inflate is no inflate buffer and no inflater.
+        Assert.Equal(plainRents, gzipRents);
         Assert.Equal(plain.StatusCode, gzip.StatusCode);
         Assert.Equal(await plain.Content.ReadAsStringAsync(), await gzip.Content.ReadAsStringAsync());
         if (protobuf)
