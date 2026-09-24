@@ -211,6 +211,26 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         return System.Text.Json.JsonSerializer.Serialize(dtos, options);
     }
 
+    /// <summary>
+    /// A repeated label key far past the first flush (WP7 review, F4). Before the switch every
+    /// endpoint built its whole DTO list — ToDictionary per series — before a byte was written, so
+    /// the request failed as a clean 500 however large the answer. The list answers (POST query,
+    /// expr) must still: they are checked whole before the first byte. The streamed raw answer
+    /// cannot know about a series storage has not produced yet; it checks each series before that
+    /// series' first byte, which fails cleanly while nothing has been sent — and aborts the
+    /// response once the first ~14.7 KB flush has gone, as a NaN past the serializer's own flush
+    /// threshold always did. Pinned both ways.
+    /// </summary>
+    [Theory]
+    [InlineData("POST", "/api/metrics/query", """{"metric":"shape.big.dup"}""", "500 text/plain; charset=utf-8")]
+    [InlineData("GET",  "/api/metrics/shape.big.dup", null,                     "EXCEPTION HttpRequestException")]
+    public async Task A_repeated_label_key_past_the_first_flush_fails_as_the_endpoint_can(string method, string url, string? body, string expected)
+    {
+        // An abort after the response started reaches this client as the send failing (it reads the
+        // whole body before it returns); a browser sees the connection drop, status 0.
+        Assert.Equal(expected, await Exchange(method, url, body));
+    }
+
     [Theory]
     [InlineData("GET",  "/api/metrics/shape.big", null)]
     [InlineData("POST", "/api/metrics/query",     """{"metric":"shape.big"}""")]
@@ -398,6 +418,13 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
 
                 case "shape.big":
                     foreach (var s in BigAnswer()) yield return s;
+                    break;
+
+                case "shape.big.dup":
+                    // The large answer, then a series with a repeated label key: the failure lies far past
+                    // the first flush.
+                    foreach (var s in BigAnswer()) yield return s;
+                    yield return Series("shape.big", MetricKind.Gauge, "", L("k", "v1", "k", "v2"), null, P(T0, 1));
                     break;
             }
         }

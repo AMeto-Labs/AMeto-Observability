@@ -64,6 +64,14 @@ internal partial class MetricJson : JsonSerializerContext
 /// A failure after a flush aborts the response mid-body, which is what a non-finite value past the
 /// serializer's flush threshold always did; what is new is only that a series is written before
 /// the next one is read.</para>
+///
+/// <para><b>A label set that cannot be written fails before any of the series is written.</b> The
+/// old endpoints built every DTO before the first byte, so a repeated label key failed the request
+/// as a clean 500 however large the answer. The list answers keep exactly that: they are checked
+/// whole before the first byte. The streamed raw answer cannot check a series storage has not
+/// produced yet: it checks each one before that series' first byte, which is still a clean 500
+/// while nothing has been flushed, and aborts the response after — the cost of not holding the
+/// whole answer, and the same abort a non-finite value past a flush always caused.</para>
 /// </summary>
 internal static class MetricSeriesJson
 {
@@ -100,6 +108,7 @@ internal static class MetricSeriesJson
     /// <summary>One series, as the DTO serialized it.</summary>
     public static void Write(Utf8JsonWriter w, MetricSeries s)
     {
+        ThrowIfUnwritable(s);                  // before the series' first byte, never part-way through it
         w.WriteStartObject();
         w.WriteString(NameProp, s.Name);
         w.WriteString(KindProp, KindName(s.Kind));
@@ -108,15 +117,7 @@ internal static class MetricSeriesJson
         w.WritePropertyName(LabelsProp);
         w.WriteStartObject();
         ReadOnlySpan<string> kv = s.Labels.Interleaved;
-        for (int i = 0; i < kv.Length; i += 2)
-        {
-            // What Dictionary.Add, inside ToDictionary, refused: a null key, a key twice (the pairs
-            // are sorted by key, so a repeat is the key just written).
-            if (kv[i] is null) throw new ArgumentNullException("key");
-            if (i > 0 && string.Equals(kv[i], kv[i - 2]))
-                throw new ArgumentException($"An item with the same key has already been added. Key: {kv[i]}");
-            w.WriteString(kv[i], kv[i + 1]);
-        }
+        for (int i = 0; i < kv.Length; i += 2) w.WriteString(kv[i], kv[i + 1]);
         w.WriteEndObject();
 
         w.WritePropertyName(PointsProp);
@@ -136,6 +137,26 @@ internal static class MetricSeriesJson
         }
         w.WriteEndArray();
         w.WriteEndObject();
+    }
+
+    /// <summary>
+    /// What <c>ToDictionary</c> refused when the old endpoints built a series' DTO: a null label key
+    /// (<see cref="ArgumentNullException"/>) and a repeated one (<see cref="ArgumentException"/>) —
+    /// the pairs are sorted by key, so a repeat is adjacent. Checked BEFORE anything of the series
+    /// is written: the old endpoints built every DTO before the first byte, so a label set they
+    /// could not serialize failed the request as a clean 500. A non-finite number is NOT checked
+    /// here — the serializer met that while writing, and <see cref="ThrowIfNotFinite"/> keeps it
+    /// where it was.
+    /// </summary>
+    internal static void ThrowIfUnwritable(MetricSeries s)
+    {
+        ReadOnlySpan<string> kv = s.Labels.Interleaved;
+        for (int i = 0; i < kv.Length; i += 2)
+        {
+            if (kv[i] is null) throw new ArgumentNullException("key");
+            if (i > 0 && string.Equals(kv[i], kv[i - 2]))
+                throw new ArgumentException($"An item with the same key has already been added. Key: {kv[i]}");
+        }
     }
 
     /// <summary>
@@ -200,6 +221,10 @@ internal static class MetricSeriesJson
     {
         public async Task ExecuteAsync(HttpContext ctx)
         {
+            // The whole answer is in hand: check all of it before the first byte, so a series that
+            // cannot be written fails the request cleanly wherever it sits, as building every DTO
+            // first did.
+            for (int i = 0; i < series.Count; i++) ThrowIfUnwritable(series[i]);
             Begin(ctx);
             var ct = ctx.RequestAborted;
             await using var w = new Utf8JsonWriter(ctx.Response.BodyWriter, WriterOptions);
