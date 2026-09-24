@@ -348,7 +348,6 @@ public sealed class SegmentTrigramIndex
 
             int k = n - 2;                                        // trigram count
             var posts = System.Buffers.ArrayPool<int[]>.Shared.Rent(k);
-            var order = System.Buffers.ArrayPool<int>.Shared.Rent(k);
             try
             {
                 for (int i = 0; i < k; i++)
@@ -368,44 +367,59 @@ public sealed class SegmentTrigramIndex
                         return [];                                // missing trigram → no candidates
                 }
 
-                // Rarest first. Insertion sort over k indices — k is the term's length, and a
-                // Comparison<T> delegate on this path is exactly what is being removed.
-                for (int i = 0; i < k; i++) order[i] = i;
-                for (int i = 1; i < k; i++)
-                {
-                    int cur = order[i], len = posts[cur].Length, j = i - 1;
-                    while (j >= 0 && posts[order[j]].Length > len) { order[j + 1] = order[j]; j--; }
-                    order[j + 1] = cur;
-                }
-
-                ReadOnlySpan<int> first = posts[order[0]];
-                if (first.Length == 0) return [];
-
-                var acc = System.Buffers.ArrayPool<uint>.Shared.Rent(first.Length);
-                try
-                {
-                    int count = first.Length;
-                    for (int i = 0; i < count; i++) acc[i] = (uint)first[i];
-
-                    for (int t = 1; t < k && count > 0; t++)
-                        count = IntersectInto(acc, count, posts[order[t]]);
-
-                    if (count == 0) return [];
-                    var result = new uint[count];
-                    acc.AsSpan(0, count).CopyTo(result);
-                    return result;
-                }
-                finally { System.Buffers.ArrayPool<uint>.Shared.Return(acc); }
+                return IntersectRarestFirst(posts, k);
             }
             finally
             {
                 // Cleared: the rented array holds references to the index's posting arrays, and
                 // a pooled array outlives the call.
                 System.Buffers.ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
-                System.Buffers.ArrayPool<int>.Shared.Return(order);
             }
         }
         finally { if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars); }
+    }
+
+    /// <summary>
+    /// The intersection of the first <paramref name="k"/> posting lists (every one ascending and
+    /// distinct, none null), rarest first, as a fresh array — the merge <see cref="Lookup"/> runs,
+    /// shared with <see cref="SegmentIndexReader"/>, whose lists come out of its memo. The lists
+    /// are only read.
+    /// </summary>
+    internal static uint[] IntersectRarestFirst(int[][] posts, int k)
+    {
+        var order = System.Buffers.ArrayPool<int>.Shared.Rent(k);
+        try
+        {
+            // Rarest first. Insertion sort over k indices — k is the term's length, and a
+            // Comparison<T> delegate on this path is exactly what is being removed.
+            for (int i = 0; i < k; i++) order[i] = i;
+            for (int i = 1; i < k; i++)
+            {
+                int cur = order[i], len = posts[cur].Length, j = i - 1;
+                while (j >= 0 && posts[order[j]].Length > len) { order[j + 1] = order[j]; j--; }
+                order[j + 1] = cur;
+            }
+
+            ReadOnlySpan<int> first = posts[order[0]];
+            if (first.Length == 0) return [];
+
+            var acc = System.Buffers.ArrayPool<uint>.Shared.Rent(first.Length);
+            try
+            {
+                int count = first.Length;
+                for (int i = 0; i < count; i++) acc[i] = (uint)first[i];
+
+                for (int t = 1; t < k && count > 0; t++)
+                    count = IntersectInto(acc, count, posts[order[t]]);
+
+                if (count == 0) return [];
+                var result = new uint[count];
+                acc.AsSpan(0, count).CopyTo(result);
+                return result;
+            }
+            finally { System.Buffers.ArrayPool<uint>.Shared.Return(acc); }
+        }
+        finally { System.Buffers.ArrayPool<int>.Shared.Return(order); }
     }
 
     /// <summary>
@@ -634,6 +648,110 @@ public sealed class SegmentTrigramIndex
 
         return idx;
     }
+
+    // ── Query side, lazily: the packed section read where it lies ─────────────
+    //
+    // Deserialise above decodes every bucket of a section to answer a search that spells a
+    // handful of trigrams: `%timeout%` needs five of the tens of thousands an Information group
+    // of the #80 stand holds, and paid for decoding all 15 MB of that section, every query,
+    // to get them. SegmentIndexReader finds the buckets it needs in one pass over the section's
+    // headers and decodes only those. The rules are Deserialise's: the same three key widths,
+    // and where a legacy section repeats a key (V1's truncated keys could), the LAST bucket wins,
+    // because that is what assigning into the dictionary kept.
+
+    /// <summary>The three layouts a trigram section has had.</summary>
+    internal enum PackedKind : byte
+    {
+        /// <summary>Count first, single-byte keys, RoaringBitmap postings.</summary>
+        Legacy,
+        /// <summary><see cref="CodecMagic"/>: single-byte keys, varint postings.</summary>
+        Codec,
+        /// <summary><see cref="CodecMagicV2"/>: three UTF-16 units per key, varint postings.</summary>
+        Wide,
+    }
+
+    /// <summary>What a packed section's header says: its layout, how many buckets follow, and
+    /// where the first one starts. A class so a reader can publish it with one reference write.</summary>
+    internal sealed class PackedHeader(PackedKind kind, uint count, int bucketsStart)
+    {
+        public static readonly PackedHeader Absent = new(PackedKind.Wide, 0, 0);
+
+        public readonly PackedKind Kind         = kind;
+        public readonly uint       Count        = count;
+        public readonly int        BucketsStart = bucketsStart;
+    }
+
+    internal static PackedHeader ReadPackedHeader(ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty) return PackedHeader.Absent;
+        uint first = BinaryPrimitives.ReadUInt32LittleEndian(data);
+        if (first == CodecMagicV2) return new PackedHeader(PackedKind.Wide,  BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8);
+        if (first == CodecMagic)   return new PackedHeader(PackedKind.Codec, BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8);
+        return new PackedHeader(PackedKind.Legacy, first, 4);
+    }
+
+    /// <summary>A trigram as one ordered 48-bit number: the key a reader's memo files it under
+    /// and <see cref="Locate"/> searches for.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static long PackedKey(char c0, char c1, char c2) => ((long)c0 << 32) | ((long)c1 << 16) | c2;
+
+    /// <summary>
+    /// One pass over the bucket headers of <paramref name="data"/>: for each key of
+    /// <paramref name="sortedKeys"/> (ascending, distinct), the offset and length of its LAST
+    /// bucket's postings, or offset -1 when the section has no such bucket. Postings are skipped,
+    /// not read. A bucket that overruns the section throws, as <see cref="Deserialise"/> does.
+    /// </summary>
+    internal static void Locate(ReadOnlySpan<byte> data, PackedHeader header, ReadOnlySpan<long> sortedKeys,
+                                Span<int> offsets, Span<int> lengths)
+    {
+        offsets[..sortedKeys.Length].Fill(-1);
+        bool wide = header.Kind == PackedKind.Wide;
+        int  pos  = header.BucketsStart;
+        for (uint i = 0; i < header.Count; i++)
+        {
+            long key;
+            if (wide)
+            {
+                var k = data.Slice(pos, 6);
+                key = PackedKey((char)BinaryPrimitives.ReadUInt16LittleEndian(k),
+                                (char)BinaryPrimitives.ReadUInt16LittleEndian(k[2..]),
+                                (char)BinaryPrimitives.ReadUInt16LittleEndian(k[4..]));
+                pos += 6;
+            }
+            else
+            {
+                var k = data.Slice(pos, 3);
+                key = PackedKey((char)k[0], (char)k[1], (char)k[2]);
+                pos += 3;
+            }
+
+            uint len = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
+            if ((ulong)pos + len > (ulong)data.Length)
+                throw new InvalidDataException($"Trigram section overruns itself at byte {pos} of {data.Length}");
+
+            int at = IndexOf(sortedKeys, key);
+            if (at >= 0) { offsets[at] = pos; lengths[at] = (int)len; }
+            pos += (int)len;
+        }
+    }
+
+    /// <summary>Binary search without the <c>IComparable</c> box the span extension takes.</summary>
+    internal static int IndexOf(ReadOnlySpan<long> sorted, long key)
+    {
+        int lo = 0, hi = sorted.Length - 1;
+        while (lo <= hi)
+        {
+            int mid = (int)((uint)(lo + hi) >> 1);
+            long v  = sorted[mid];
+            if (v == key) return mid;
+            if (v < key) lo = mid + 1; else hi = mid - 1;
+        }
+        return -1;
+    }
+
+    /// <summary>One bucket's postings, decoded the way <see cref="Deserialise"/> decodes them.</summary>
+    internal static int[] DecodePacked(ReadOnlySpan<byte> postings, PackedKind kind) =>
+        kind == PackedKind.Legacy ? DecodeRoaring(postings) : DecodeCodec(postings);
 
     private static int[] DecodeCodec(ReadOnlySpan<byte> bytes)
     {

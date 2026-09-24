@@ -179,6 +179,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         public required bool                     HasTrigram;
         public required long                     Size;
         public          long                     NativeSize;  // the part of Size that is NativeMemory
+        public          long                     Charged;     // Reader.ApproxRetainedBytes when Size last caught up with it
         public int  RefCount;                    // guarded by the cache lock
         public bool Doomed;                      // evicted/replaced — dispose at RefCount 0
         public long LastTouched;                 // the cache clock's timestamp of the last acquire
@@ -265,6 +266,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                     // Read off the reader rather than passed in: the caller charges one number,
                     // and only the reader knows how much of it the GC cannot see.
                     NativeSize = reader.ApproxNativeBytes,
+                    Charged    = reader.ApproxRetainedBytes,
                 };
                 e.Node        = _lru.AddFirst(e);
                 _map[key]     = e;
@@ -406,15 +408,43 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         return this;
     }
 
+    /// <summary>
+    /// Drops a lease, and charges the entry for whatever its reader learned while leased.
+    ///
+    /// <para>A reader decodes lazily and remembers what it decoded, so it grows while a query
+    /// holds it (<see cref="SegmentIndexReader.ApproxRetainedBytes"/>). The growth is charged
+    /// HERE, once the query is done with it, rather than per lookup: the reader's memo takes its
+    /// own lock and the cache's lock must never be held under it. Until then a leased entry may
+    /// run ahead of its charge by what one group's lookups decode. An entry the growth pushes over
+    /// budget is evicted like any other, from the LRU tail — which is only this entry when it no
+    /// longer fits by itself. An entry already unlisted is not charged: its bytes left the total
+    /// when it was evicted, and its last lease frees it.</para>
+    /// </summary>
     private void Release(Entry e)
     {
-        SegmentIndexReader? dispose = null;
+        List<SegmentIndexReader>? toDispose = null;
         lock (_lock)
         {
             e.RefCount--;
-            if (e.Doomed && e.RefCount == 0) dispose = e.Reader;
+            if (e.Node is not null)
+            {
+                long now   = e.Reader.ApproxRetainedBytes;
+                long grown = now - e.Charged;
+                if (grown != 0)
+                {
+                    e.Charged   = now;
+                    e.Size     += grown;
+                    _totalBytes += grown;
+                    if (grown > 0) EvictLocked(toDispose = []);
+                }
+            }
+            else if (e.Doomed && e.RefCount == 0)
+            {
+                (toDispose ??= []).Add(e.Reader);
+            }
         }
-        dispose?.Dispose();
+        if (toDispose is not null)
+            foreach (var r in toDispose) r.Dispose();
     }
 
     /// <summary>

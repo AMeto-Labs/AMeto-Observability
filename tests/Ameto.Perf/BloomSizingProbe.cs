@@ -49,14 +49,14 @@ namespace Ameto.Perf;
 /// one's, so rejecting in phase 1 is 6.4× and 3.8× cheaper. At the fixed 64 it was 62 % of a thin
 /// group's index and 1.6× — the split had nearly stopped paying for itself.</para>
 ///
-/// <para><b>That sections ratio is not the cache's ratio, and the two were being quoted for each
-/// other.</b> <c>SegmentIndexCache</c> charges an entry its <c>ApproxRetainedBytes</c> and bounds
-/// the native part of it separately, and an entry is not its sections: the inverted and trigram
-/// halves are DECODED into dictionaries and <c>int[]</c>, 3-4× their packed sections, while the
-/// bloom's bits are the same bytes decoded as on disk. So bloom is 4.1 % of a prop-dense ENTRY and
-/// 8.3 % of a thin one, against 15.6 % and 26.6 % of those shapes' SECTIONS. Sizing a host from
-/// the sections figure budgets 3-4× too much off-heap memory for this cache. Both are printed and
-/// both are asserted, each excluding the blind first group so they compare like for like.</para>
+/// <para><b>What a loaded index retains.</b> Until #80 a reader DECODED its inverted and trigram
+/// sections into dictionaries and <c>int[]</c>, 3-4× the packed bytes, while the bloom's bits stayed
+/// the bytes on disk — so bloom was 4.1 % of a prop-dense ENTRY and 8.3 % of a thin one, against
+/// 15.6 % and 26.6 % of those shapes' SECTIONS, and the two figures were not interchangeable. A
+/// reader now keeps its sections packed and decodes only what it is asked, so what it retains IS
+/// its sections, and the bloom's share of it is the sections share — which is also what the query
+/// cache is charged per entry. Both figures are still printed; what is asserted now is that they
+/// agree, each excluding the blind first group so they compare like for like.</para>
 /// </summary>
 public sealed class BloomSizingProbe : IDisposable
 {
@@ -170,10 +170,9 @@ public sealed class BloomSizingProbe : IDisposable
                            $"{steadyBloom * 100.0 / steadyIndex:F1}% of the index, " +
                            $"so rejecting there is {steadyIndex / (double)steadyBloom:F1}x cheaper than phase 2");
 
-        // And what the CACHE is charged for holding those same groups decoded, which is the other
-        // number the bloom share gets quoted for and is NOT the same number. SegmentIndexCache
-        // charges ApproxRetainedBytes per entry and bounds the native part of it separately; the
-        // sections ratio above belongs to the phase split and nothing else.
+        // And what a LOADED reader retains for those same groups. It used to decode them, which
+        // made its bloom share a different number from the sections share; it keeps them packed
+        // now, so the two should agree.
         long retained = 0, nativeRetained = 0, steadyRetained = 0, steadyNative = 0;
         for (int i = 0; i < groups.Count; i++)
         {
@@ -184,7 +183,7 @@ public sealed class BloomSizingProbe : IDisposable
             steadyNative   += groups[i].NativeRetainedBytes;
         }
         long sections = totalBloom + inv + tri;
-        _out.WriteLine($"  cache entries: retained {retained / 1048576.0:F2} MB " +
+        _out.WriteLine($"  loaded readers: retained {retained / 1048576.0:F2} MB " +
                        $"(managed {(retained - nativeRetained) / 1048576.0:F2} MB, native {nativeRetained / 1048576.0:F2} MB) " +
                        $"— expansion {retained / (double)sections:F1}x over the sections");
         _out.WriteLine($"  bloom is {nativeRetained * 100.0 / retained:F1}% of an ENTRY " +
@@ -198,8 +197,7 @@ public sealed class BloomSizingProbe : IDisposable
             _out.WriteLine($"  excluding the blind first group: bloom is " +
                            $"{steadyNative * 100.0 / steadyRetained:F1}% of an ENTRY " +
                            $"against {steadyBloom * 100.0 / steadyIndex:F1}% of the SECTIONS " +
-                           $"— entries expand {steadyRetained / (double)steadyIndex:F1}x, and only the " +
-                           $"managed half of them expands at all");
+                           $"— readers retain {steadyRetained / (double)steadyIndex:F2}x their sections");
 
         // The design point, as a two-sided bound rather than a printed number.
         //
@@ -228,23 +226,18 @@ public sealed class BloomSizingProbe : IDisposable
                 $"{shape} group {i}: {bitsPerTerm:F1} bits/term — the filter is sized for terms this group does not hold");
         }
 
-        // The share the CACHE is sized by, pinned as a band rather than a printed number, because
-        // it is the figure MemoryBudgets, SegmentIndexCache, SegmentIndexReader and both operator
-        // docs quote when they justify the native ceiling.
-        //
-        // The upper bound is what fails if the sections ratio is written back in its place: 15.6 %
-        // and 26.6 % are both outside it. The lower bound fails if it drifts the other way, to the
-        // "native is about 1 %, ignore it" premise an earlier review worked from — these bytes are
-        // a real share of an entry and no collection returns any of them.
-        double entryShare = steadyNative * 100.0 / steadyRetained;
-        Assert.InRange(entryShare, 2.0, 12.0);
+        // A loaded reader retains its sections and a small fixed cost — nothing is decoded until
+        // it is asked (#80). An expansion past 1.1x means something decodes eagerly again, which
+        // is the 3-4x the index cache used to be charged and could not afford.
+        double expansion = steadyRetained / (double)steadyIndex;
+        Assert.InRange(expansion, 0.99, 1.10);
 
-        // And the structural reason the two differ, which is what makes quoting one for the other
-        // a mistake rather than a rounding difference: decoding expands the managed half only.
-        Assert.True(steadyBloom * 100.0 / steadyIndex > entryShare * 1.5,
-            $"{shape}: bloom is {entryShare:F1}% of an entry and {steadyBloom * 100.0 / steadyIndex:F1}% of the " +
-            "sections — if these have converged, the entry is no longer expanding over its sections and every " +
-            "sizing argument built on the difference needs re-deriving");
+        // And so the bloom's share of what a reader retains is its share of the sections: the
+        // figure MemoryBudgets' native-share comments quote as "of an entry" (4.1 % / 8.3 %)
+        // describes the decoded reader and no longer applies to anything the cache holds.
+        double entryShare    = steadyNative * 100.0 / steadyRetained;
+        double sectionsShare = steadyBloom * 100.0 / steadyIndex;
+        Assert.InRange(entryShare, sectionsShare - 1.0, sectionsShare + 1.0);
     }
 
     private readonly record struct GroupCost(
@@ -282,12 +275,8 @@ public sealed class BloomSizingProbe : IDisposable
                 using var inv   = reader.RentInvertedIndexBytes(g);
                 using var tri   = reader.RentTrigramIndexBytes(g);
 
-                // What a CACHE ENTRY for this group weighs — a different question from what the
-                // sections weigh, and the one SegmentIndexCache's budgets are denominated in. Its
-                // inverted and trigram halves are DECODED into dictionaries and int[] several
-                // times their packed sections; the bloom's bits are the same bytes decoded as on
-                // disk. So the bloom's share of an entry is much smaller than its share of the
-                // sections, and the two must not be quoted for each other.
+                // What a loaded reader for this group retains: its three sections, packed, and a
+                // fixed few hundred bytes — nothing is decoded until a lookup asks for it.
                 using var entry = SegmentIndexReader.Load(inv.Span, tri.Span, bloom.Span);
 
                 // Readable after Dispose by contract — only the filter's bits are native.

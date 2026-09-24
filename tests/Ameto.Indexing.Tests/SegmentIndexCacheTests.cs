@@ -119,6 +119,57 @@ public sealed class SegmentIndexCacheTests
         Assert.Equal(0, cache.TotalBytes);
     }
 
+    /// <summary>A loaded reader over a small inverted section, and the bucket that grows it.</summary>
+    private static SegmentIndexReader NewLazyReader()
+    {
+        var b = new SegmentInvertedIndex();
+        for (uint o = 0; o < 200; o++) b.Add(o, "P", "v" + (o % 7));
+        return SegmentIndexReader.Load(b.Serialise(), [], []);
+    }
+
+    /// <summary>
+    /// A reader decodes lazily and remembers what it decoded, so it is bigger when a query lets
+    /// go of it than when it was inserted. The cache charges the difference at release, or it
+    /// would hold more than its budget says without knowing.
+    /// </summary>
+    [Fact]
+    public void Release_charges_what_the_reader_learned_while_leased()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var r = NewLazyReader();
+        long inserted = r.ApproxRetainedBytes;
+
+        using (var lease = cache.Insert("a.seg", 0, true, r, inserted))
+            Assert.NotNull(lease.Index.LookupIntersect([("P", "v3")]));
+
+        Assert.True(r.ApproxRetainedBytes > inserted, "the lookup should have grown the memo");
+        Assert.Equal(r.ApproxRetainedBytes, cache.TotalBytes);
+
+        // Asked again, it is answered from the memo: nothing new to charge.
+        long charged = cache.TotalBytes;
+        using (var hit = cache.TryAcquire("a.seg", 0, false)!.Value)
+            Assert.NotNull(hit.Index.LookupIntersect([("P", "v3")]));
+        Assert.Equal(charged, cache.TotalBytes);
+    }
+
+    [Fact]
+    public void Growth_past_the_budget_evicts_the_entry_at_release_and_frees_it()
+    {
+        var r = NewLazyReader();
+        long inserted = r.ApproxRetainedBytes;
+        var cache = new SegmentIndexCache(inserted + 16);   // room for the reader, not for what it learns
+
+        using (var lease = cache.Insert("a.seg", 0, true, r, inserted))
+        {
+            Assert.NotNull(lease.Index.LookupIntersect([("P", "v3")]));
+            Assert.Equal(1, cache.EntryCount);               // still listed while leased
+        }
+
+        Assert.Equal(0, cache.EntryCount);
+        Assert.Equal(0, cache.TotalBytes);
+        Assert.Throws<ObjectDisposedException>(() => r.Bloom.MightContain("v3"));
+    }
+
     [Fact]
     public void Disabled_cache_misses_and_leases_own_the_reader()
     {
