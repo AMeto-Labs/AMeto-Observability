@@ -91,10 +91,12 @@ public sealed class TraceFlushProbe : IDisposable
     // THE TWO .trc CONSTANTS WERE RE-RECORDED FOR #86, DELIBERATELY, AND ONLY THOSE TWO. The bloom
     // index changed format: its values are hashed from a culture-invariant, case-folded text taken
     // straight off the blob's bytes (SpanBloom), and the section is now empty legacy slots, the
-    // "RDB2" marker, then the blooms. Nothing else in the file moved, and that is proved rather than
-    // hoped: The_flush_changes_nothing_but_the_bloom_index splices the PRE-#86 bloom section
-    // (LegacySpanBloom, the old writer's feed) into today's file and gets the old constants below
-    // back, byte for byte. The three sidecars do not carry a bloom and did not move at all.
+    // "RDB3" marker, the fold table's fingerprint (SpanBloomFold), then the blooms. Nothing else in
+    // the file moved, and that is proved rather than hoped: The_flush_changes_nothing_but_the_bloom_index
+    // splices the PRE-#86 bloom section (LegacySpanBloom, the old writer's feed) into today's file
+    // and gets the old constants below back, byte for byte. The three sidecars do not carry a bloom
+    // and did not move at all. (Recorded twice on the branch: 2196470F…/C0E6962B… under the unshipped
+    // "RDB2" layout, then these, +8 bytes each for the fingerprint — the blooms themselves identical.)
     //
     // History of the old constants: SHA-256 of each file SpanWriter.Write produced for
     // BuildCorpus() at cb5780e — the merge of wave 1, the writer as WP5 found it — recomputed at
@@ -102,11 +104,11 @@ public sealed class TraceFlushProbe : IDisposable
     // and read D1BD639A… and FBFA3819…, because the old bloom hashed `value.ToString()` in the
     // CURRENT culture.
 
-    private const string V3Trc      = "2196470F07516881B8C6F63200B4DB92C7DAF86CFF7C9CB6DBD19F97D23C8E69";
+    private const string V3Trc      = "8B8066F8B9418B62903432641EADBEEDAAF4FD7F80996BD3236A260FB99E4178";
     private const string V3Stats    = "FAF48AB485397E0F3B65E3ADCE5413D6B8702E8AB8E3A044214D5CD0CB79C423";
     private const string V3SvcGraph = "44BE43D931468E9C74F5177BA89CAA5D252FA87FDF744AA98BA4F848C56C5A9F";
     private const string V3TraceSum = "BB5C2FD272B3D86F3DB50870847F530601D234AE373A33D4AD0FD524FA54C773";
-    private const string V4Trc      = "C0E6962B37E0EFF95019275BCC4EB6570CDA05453F5CE132311DB4C0DA6E3AD5";
+    private const string V4Trc      = "0FEAA5E8BD06A15F738E90580E2EB536E2022B40A83BD7C273007B59DABFAEB4";
 
     /// <summary>The pre-#86 <c>.trc</c> constants, as recorded under the invariant culture.</summary>
     private const string Pre86V3Trc = "81564E1FC2731519ABB87046EAB30D2EE23DDF5B7C96839261009FFDB992AA11";

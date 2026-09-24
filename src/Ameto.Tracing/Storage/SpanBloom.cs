@@ -33,28 +33,30 @@ namespace Ameto.Tracing.Storage;
 /// written on a ru-KZ box answered <c>{ .sampling.ratio = "0.375" }</c> with zero blocks on an
 /// en-US one.</para>
 ///
-/// <para><b>fold is <c>ToUpperInvariant(ToLowerInvariant(rune))</c> per BMP scalar</b>, U+017F
-/// excepted and every astral scalar collapsed to U+FFFD (see <see cref="Fold"/>), and NOT the
-/// lowercase the pre-#86 bloom used. Lowercase is not the equivalence
+/// <para><b>fold is upper-of-lower per BMP scalar, from a table COMPILED INTO THE BINARY</b>
+/// (<see cref="SpanBloomFold"/>), every astral scalar collapsed to U+FFFD (see <see cref="Fold"/>),
+/// and NOT the lowercase the pre-#86 bloom used. Lowercase is not the equivalence
 /// <c>OrdinalIgnoreCase</c> uses: it keeps <c>ς</c> apart from <c>σ</c>, <c>µ</c> from <c>μ</c>,
 /// and the archaic Cyrillic forms U+1C80–U+1C88 from <c>в д о с т ъ ѣ ꙋ</c> — 44 BMP pairs that
 /// the evaluator calls equal and the old bloom called different. Upper-of-lower merges every one
 /// of them (proved over every code point in <c>SpanBloomCanonicalTests</c>), and it can be
-/// computed from the hint's already-lowercased literal. U+017F (ſ) folds to itself because
-/// <c>OrdinalIgnoreCase</c> refuses to fold it and the ICU and invariant-globalization builds
-/// disagree about its uppercase — without the exception a segment moved between the two would
-/// disagree on it.</para>
+/// computed from the hint's already-lowercased literal. A TABLE, because asking the host made the
+/// bits depend on which host wrote them: ICU and invariant globalization (the Docker image)
+/// disagree on Unicode 16's pairs, and a segment the container wrote would have been probed wrong
+/// by a Windows host.</para>
 ///
 /// <para><b>From the blob's bytes, with nothing decoded to a string</b> (TS#12): a string value is
 /// folded straight off its UTF-8, a number formatted into the stack. The flush used to box every
 /// value and allocate every key and every number's text to feed the old hash.</para>
 ///
-/// <para><b>ON DISK the canonical blooms follow <see cref="CanonicalMarker"/></b>, behind one
-/// EMPTY legacy slot per block — see <c>SpanWriter</c>'s layout. An empty slot is "no bloom, never
-/// skip" to every older reader, so a build that predates this hash reads a new segment in full
-/// rather than probing canonical bits with the old hash, which would be a false-negative source
-/// on exactly the values #86 is about. A segment written before this change has no marker and is
-/// probed with the LEGACY functions below, permissively wherever the legacy text could have
+/// <para><b>ON DISK the canonical blooms follow <see cref="CanonicalMarker"/> and the fold table's
+/// <see cref="SpanBloomFold.Fingerprint"/></b>, behind one EMPTY legacy slot per block — see
+/// <c>SpanWriter</c>'s layout. An empty slot is "no bloom, never skip" to every older reader, so a
+/// build that predates this hash reads a new segment in full rather than probing canonical bits
+/// with the old hash, which would be a false-negative source on exactly the values #86 is about. A
+/// segment folded by another table is probed by value only for all-ASCII literals
+/// (<see cref="CanonicalValueProbeIsExact"/>). A segment written before this change has no marker
+/// and is probed with the LEGACY functions below, permissively wherever the legacy text could have
 /// differed (<see cref="LegacyValueProbeIsExact"/>).</para>
 ///
 /// <para>k = 3 probes via double hashing over an FNV-1a 64 hash; the bit length is a power of two
@@ -68,11 +70,13 @@ internal static class SpanBloom
     private const int Probes       = 3;
 
     /// <summary>
-    /// Written between the legacy slots and the canonical blooms of a <c>.trc</c> bloom index:
-    /// "RDB2", the second bloom hash. Its presence is what tells a reader which hash the bits were
-    /// built with; its absence means the pre-#86 culture-formatted hash.
+    /// Written between the legacy slots and the canonical blooms of a <c>.trc</c> bloom index, and
+    /// followed by the 8-byte <see cref="SpanBloomFold.Fingerprint"/>: "RDB3". Its presence is what
+    /// tells a reader which hash the bits were built with; its absence means the pre-#86
+    /// culture-formatted hash. ("RDB2" — the same section without a fingerprint — never left its
+    /// branch; a reader meets it as an unknown marker and reads the segment in full.)
     /// </summary>
-    internal const uint CanonicalMarker = 0x52_44_42_32; // "RDB2"
+    internal const uint CanonicalMarker = 0x52_44_42_33; // "RDB3"
 
     private const ulong FnvOffset = 14695981039346656037UL;
     private const ulong FnvPrime  = 1099511628211UL;
@@ -302,26 +306,17 @@ internal static class SpanBloom
     private static ulong ValuePrefix(ulong keyHash) => (keyHash ^ Separator) * FnvPrime;
 
     /// <summary>
-    /// The fold, one scalar at a time. See the type docstring for why upper-of-lower and why
-    /// U+017F is left alone.
+    /// The fold, one scalar at a time: a BMP scalar through <see cref="SpanBloomFold"/>'s compiled
+    /// table (upper-of-lower, U+017F kept — see there), never through the host's casing.
     ///
-    /// <para>EVERY SCALAR OUTSIDE THE BMP FOLDS TO U+FFFD, because no casing table this process can
-    /// reach agrees with <c>OrdinalIgnoreCase</c> there. The comparer folds astral letters from
-    /// .NET's own Unicode data (Unicode 16 in .NET 10), while <see cref="Rune.ToUpperInvariant"/>
-    /// under ICU asks the HOST's ICU, which may be older: measured on the dev box, the 22 Garay
-    /// case pairs (U+10D50–U+10D65 against U+10D70–U+10D85) are equal under the comparer and unmapped by ICU —
-    /// a folded bloom would have been a false-negative source on every one of them. Collapsing the
-    /// astral planes costs selectivity only (the bloom cannot tell 👍 from 👎 and reads a block too
-    /// many), never a row, and it cannot depend on which host or globalization mode wrote the
-    /// segment. The BMP has no such gap: there the comparer's table IS the casing table of the
-    /// mode it runs in, and <c>SpanBloomCanonicalTests</c> checks every pair.</para>
+    /// <para>EVERY SCALAR OUTSIDE THE BMP FOLDS TO U+FFFD. <c>OrdinalIgnoreCase</c> folds astral
+    /// letters from .NET's own Unicode data while ICU answers from the host's: measured on the dev
+    /// box, the 22 Garay case pairs (U+10D50–U+10D65 against U+10D70–U+10D85) are equal under the
+    /// comparer and unmapped by ICU. Collapsing the astral planes costs selectivity only (the bloom
+    /// cannot tell 👍 from 👎 and reads a block too many), never a row, and needs no table.</para>
     /// </summary>
     internal static Rune Fold(Rune r) =>
-        !r.IsBmp           ? AstralFold
-      : r.Value == 0x017F  ? r
-      : Rune.ToUpperInvariant(Rune.ToLowerInvariant(r));
-
-    private static readonly Rune AstralFold = Rune.ReplacementChar;
+        r.IsBmp ? new Rune(SpanBloomFold.Bmp((char)r.Value)) : Rune.ReplacementChar;
 
     /// <summary>ASCII fast path of <see cref="Fold"/>: a-z to A-Z, everything else as is.</summary>
     private static byte FoldAscii(byte b) => (uint)(b - 'a') <= 'z' - 'a' ? (byte)(b - 0x20) : b;
@@ -413,69 +408,50 @@ internal static class SpanBloom
     ///     <c>Infinity</c> have localised symbols, an exponent carries a sign. Only a run of ASCII
     ///     digits is the same text in every culture, so a literal that parses as a number and is not
     ///     one is not exact.</item>
-    ///   <item><b>The case fold.</b> The old bloom lowercased, and 44 BMP pairs are equal under
-    ///     <c>OrdinalIgnoreCase</c> with different lowercases (<c>ς</c>/<c>σ</c>, <c>µ</c>/<c>μ</c>,
-    ///     U+1C80–U+1C88 against <c>в д о с т ъ ѣ ꙋ</c>, …). A literal holding a lowercase that such a
-    ///     pair produces is not exact either.</item>
+    ///   <item><b>Any character outside ASCII.</b> The old bloom lowercased with the WRITER host's
+    ///     casing, which nobody recorded: ICU of whatever version, or .NET's own data under invariant
+    ///     globalization. Lowercase is not <c>OrdinalIgnoreCase</c>'s equivalence either — 44 BMP
+    ///     pairs (<c>ς</c>/<c>σ</c>, <c>µ</c>/<c>μ</c>, U+1C80–U+1C88 against <c>в д о с т ъ ѣ ꙋ</c>, …)
+    ///     are equal to the comparer and lowercase apart — and hosts disagree about the rest
+    ///     (Unicode 16 gave <c>ɤ</c> an uppercase that older ICU does not know). ASCII lowercases the
+    ///     same on every host there has ever been, and no non-ASCII character is equal to an ASCII
+    ///     one under the comparer, so an all-ASCII literal is the one case the old bits can be
+    ///     trusted for.</item>
     /// </list>
-    /// For those the reader probes the key alone, which the old bloom holds exactly: the block
-    /// skip degrades to key presence, and no row is lost. Query-side only, once per hint.
+    /// For everything else the reader probes the key alone, which the old bloom holds exactly: the
+    /// block skip degrades to key presence, and no row is lost. That includes every Cyrillic and
+    /// Greek literal, for as long as segments written before #86 are retained. Query-side only,
+    /// once per hint.
     /// </summary>
     public static bool LegacyValueProbeIsExact(string lowerValue)
     {
         bool allDigits = true;
         foreach (char c in lowerValue)
         {
+            if (c >= 0x80) return false;
             if ((uint)(c - '0') > 9) allDigits = false;
-            if (LegacyFoldUnsafe.Contains(c)) return false;
         }
         if (allDigits) return true;
         return !double.TryParse(lowerValue, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
     }
 
     /// <summary>
-    /// The lowercases that a pre-#86 bloom and <c>OrdinalIgnoreCase</c> disagree about, computed
-    /// ONCE from this process's own casing tables rather than written down, so the set is right for
-    /// the globalization mode the query runs under. A class of <see cref="Fold"/> (which contains
-    /// every <c>OrdinalIgnoreCase</c> class) whose members lowercase to more than one character
-    /// contributes all of those lowercases.
+    /// WHETHER A CANONICAL BLOOM CAN BE PROBED BY VALUE for <paramref name="lowerValue"/>.
+    /// <paramref name="sameFold"/> says the segment carries this build's
+    /// <see cref="SpanBloomFold.Fingerprint"/>; when it does not, the segment was folded by another
+    /// build's table and only an all-ASCII literal is trusted (ASCII folds identically in every
+    /// table). When it does, a literal is trusted unless it holds a character this HOST's comparer
+    /// treats differently from the table (<see cref="SpanBloomFold.HostDisagrees"/> — none on the
+    /// hosts this build runs on). Anything not trusted probes the key alone.
     /// </summary>
-    private static class LegacyFoldUnsafe
+    public static bool CanonicalValueProbeIsExact(string lowerValue, bool sameFold)
     {
-        private static readonly ulong[] Bits = Compute();
-
-        public static bool Contains(char c) => (Bits[c >> 6] & (1UL << (c & 63))) != 0;
-
-        private static ulong[] Compute()
+        foreach (char c in lowerValue)
         {
-            const int Bmp = 0x1_0000;
-            var firstLower = new int[65_536];
-            var mixed      = new bool[65_536];
-            Array.Fill(firstLower, -1);
-
-            for (int c = 0; c < Bmp; c++)
-            {
-                if (c is >= 0xD800 and <= 0xDFFF) continue;
-                int g = Fold(new Rune(c)).Value;
-                int l = char.ToLowerInvariant((char)c);
-                // A BMP character folding outside the BMP: none exists, and the old hash could not
-                // tell such a scalar from any other (it encoded each surrogate half as U+FFFD).
-                if (g >= Bmp) continue;
-                if (firstLower[g] < 0) firstLower[g] = l;
-                else if (firstLower[g] != l) mixed[g] = true;
-            }
-
-            var bits = new ulong[65_536 / 64];
-            for (int c = 0; c < Bmp; c++)
-            {
-                if (c is >= 0xD800 and <= 0xDFFF) continue;
-                int g = Fold(new Rune(c)).Value;
-                if (g >= Bmp || !mixed[g]) continue;
-                int l = char.ToLowerInvariant((char)c);
-                bits[l >> 6] |= 1UL << (l & 63);
-            }
-            return bits;
+            if (c < 0x80) continue;
+            if (!sameFold || SpanBloomFold.HostDisagrees(c)) return false;
         }
+        return true;
     }
 
     /// <summary>

@@ -42,7 +42,8 @@ namespace Ameto.Tracing.Storage;
 ///     blockCount uint32
 ///     per block: byteLen uint32 | bitset bytes (0 bytes ⇒ no bloom, never skip)
 ///       — the LEGACY slots. Written EMPTY since the canonical hash (#86): 0 per block.
-///     marker     uint32  "RDB2" (SpanBloom.CanonicalMarker)
+///     marker     uint32  "RDB3" (SpanBloom.CanonicalMarker)
+///     foldPrint  uint64  SpanBloomFold.Fingerprint — which case-fold table built the blooms
 ///     per block: byteLen uint32 | bitset bytes   — the CANONICAL blooms
 ///     A file without the marker ends at the legacy slots and was hashed the pre-#86 way.
 ///
@@ -340,11 +341,13 @@ internal static class SpanWriter
                 // 36c0c81 do not even check that the section ends at the footer. An empty slot is
                 // "no bloom, never skip" to every reader that has ever existed, so an older binary
                 // reads this segment in full: slower, and complete. This build sees the marker and
-                // probes the canonical blooms. Cost: four bytes a block and four for the marker.
+                // probes the canonical blooms, trusting a value probe only if the fold table that
+                // built them (the fingerprint) is its own. Cost: four bytes a block, twelve per file.
                 long bloomIdxOffset = fs.Position;
                 bw.Write((uint)blooms.Count);
                 for (int b = 0; b < blooms.Count; b++) bw.Write(0u);
                 bw.Write(SpanBloom.CanonicalMarker);
+                bw.Write(SpanBloomFold.Fingerprint);
                 foreach (var b in blooms)
                 {
                     bw.Write((uint)b.Length);

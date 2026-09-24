@@ -68,8 +68,8 @@ public sealed class SpanBloomCanonicalTests : IDisposable
     /// disagrees for a pair, <c>LegacyValueProbeIsExact</c> must say so, or the reader would trust a
     /// legacy bloom that cannot hold the answer.</para>
     ///
-    /// <para>Make <c>SpanBloom.Fold</c> a plain <c>ToLowerInvariant</c> — the pre-#86 rule — and this
-    /// fails on <c>ς</c>/<c>σ</c> first; empty the legacy fold-unsafe set and it fails on the same
+    /// <para>Make the fold a plain lowercase — the pre-#86 rule — and this fails on <c>ς</c>/<c>σ</c>
+    /// first; let <c>LegacyValueProbeIsExact</c> trust a non-ASCII literal and it fails on the same
     /// pair from the legacy side.</para>
     /// </summary>
     [Fact]
@@ -105,7 +105,8 @@ public sealed class SpanBloomCanonicalTests : IDisposable
                     foreach (var (value, literal) in (ReadOnlySpan<(string, string)>)[(sa, sb), (sb, sa)])
                     {
                         string lower = literal.ToLowerInvariant();   // what TraceQLExecutor hands the reader
-                        if (WriterValueHash(OneAttr("k", value), "k") != SpanBloom.HashKeyValue("k", lower))
+                        if (WriterValueHash(OneAttr("k", value), "k") != SpanBloom.HashKeyValue("k", lower)
+                            && SpanBloom.CanonicalValueProbeIsExact(lower, sameFold: true))   // a probe the reader would trust
                             failures.Add($"canonical: value U+{char.ConvertToUtf32(value, 0):X4} literal U+{char.ConvertToUtf32(literal, 0):X4}");
 
                         if (SpanBloom.LegacyHashKeyValue("k", value) == SpanBloom.LegacyHashKeyValue("k", lower)) continue;
@@ -118,7 +119,8 @@ public sealed class SpanBloomCanonicalTests : IDisposable
             }
 
             _out.WriteLine($"{keyed.Count:N0} scalars, {pairs:N0} OrdinalIgnoreCase pairs, "
-                         + $"{legacyDisagreements} directed pairs the pre-#86 lowercase disagreed on");
+                         + $"{legacyDisagreements} directed pairs the pre-#86 lowercase disagreed on, "
+                         + $"{SpanBloomFold.HostDisagreementCount} characters this host folds differently from the table");
             foreach (var f in failures.Take(40)) _out.WriteLine(f);
 
             Assert.True(pairs > 1_200, $"only {pairs} case pairs found — the bucketing stopped seeing them");
@@ -145,7 +147,9 @@ public sealed class SpanBloomCanonicalTests : IDisposable
                 if (cp > 0xFFFF && Rune.ToLowerInvariant(r) == r && Rune.ToUpperInvariant(r) == r) continue;
                 string s = r.ToString();
                 ulong writer = WriterValueHash(OneAttr("k", s), "k");
-                Assert.True(writer == SpanBloom.HashKeyValue("k", s.ToLowerInvariant()), $"U+{cp:X4} lowercased");
+                string lower = s.ToLowerInvariant();
+                Assert.True(writer == SpanBloom.HashKeyValue("k", lower) || !SpanBloom.CanonicalValueProbeIsExact(lower, sameFold: true),
+                            $"U+{cp:X4} lowercased, and the reader would trust the probe");
                 Assert.True(writer == SpanBloom.HashKeyValue("k", s),                    $"U+{cp:X4} as typed");
                 checkedScalars++;
             }
@@ -341,6 +345,7 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         }
         Assert.NotEqual(footerAt, fs.Position);                           // 36c0c81+: not an index it knows
         Assert.Equal(SpanBloom.CanonicalMarker, br.ReadUInt32());         // this build: the canonical half
+        Assert.Equal(SpanBloomFold.Fingerprint, br.ReadUInt64());         // …folded by this build's table
     }
 
     /// <summary>
@@ -465,6 +470,190 @@ public sealed class SpanBloomCanonicalTests : IDisposable
         static bool Bytes(byte[] b) => SpanBloom.TryAddBlob(new HashSet<ulong>(), b);
     }
 
+    // ── The fold is the build's, not the host's ───────────────────────────────────────────────
+
+    /// <summary>
+    /// The fold table's fingerprint, pinned: it is written into every segment, and a build whose
+    /// fingerprint differs probes other builds' segments by key for every non-ASCII literal. A
+    /// change here must be a decision — regenerate the table, bump nothing by accident.
+    /// </summary>
+    private const ulong FoldFingerprint = 0xE8EC_90FE_163C_9514UL;
+
+    /// <summary>
+    /// THE COMPILED TABLE IS THE RUNTIME'S INVARIANT FOLD, and the host-drift set is empty where it
+    /// must be. Under invariant globalization — the Docker image's mode, and the mode CI's Linux job
+    /// runs this class in (<c>AMETO_REQUIRE_INVARIANT_GLOBALIZATION=1</c> turns "not invariant here"
+    /// into a failure there instead of a silent pass) — every BMP scalar's
+    /// <c>ToUpperInvariant(ToLowerInvariant(c))</c> must equal the table, U+017F excepted. The day a
+    /// .NET update brings new Unicode casing this goes red, and that is the day to regenerate
+    /// <c>SpanBloomFold</c>: until then the reader already degrades safely on such a host, because the
+    /// drift set is non-empty there.
+    /// </summary>
+    [Fact]
+    public void The_embedded_fold_is_the_runtimes_invariant_fold()
+    {
+        _out.WriteLine($"fold fingerprint 0x{SpanBloomFold.Fingerprint:X16}, "
+                     + $"{SpanBloomFold.HostDisagreementCount} characters this host folds differently");
+        Assert.Equal(FoldFingerprint, SpanBloomFold.Fingerprint);
+
+        bool invariant = InvariantGlobalization();
+        if (!invariant)
+        {
+            Assert.True(Environment.GetEnvironmentVariable("AMETO_REQUIRE_INVARIANT_GLOBALIZATION") != "1",
+                "AMETO_REQUIRE_INVARIANT_GLOBALIZATION=1 but this process runs under ICU");
+            _out.WriteLine("ICU globalization: the table is checked against the runtime under invariant globalization (CI, Linux)");
+            return;
+        }
+
+        int differences = 0;
+        for (int c = 0; c < 65_536; c++)
+        {
+            if (c is >= 0xD800 and <= 0xDFFF) continue;
+            var r = new Rune(c);
+            int expected = c == 0x017F ? c : Rune.ToUpperInvariant(Rune.ToLowerInvariant(r)).Value;
+            int actual   = SpanBloom.Fold(r).Value;
+            if (expected != actual && differences++ < 20)
+                _out.WriteLine($"U+{c:X4}: runtime {expected:X4}, table {actual:X4}");
+        }
+        Assert.Equal(0, differences);
+        Assert.Equal(0, SpanBloomFold.HostDisagreementCount);
+    }
+
+    /// <summary>
+    /// F1 AS IT WOULD HAPPEN: a segment written by a process in the OTHER globalization mode — the
+    /// Docker image is invariant, a Windows host is ICU — read here. On this box the two modes fold
+    /// Unicode 16's pairs differently (<c>ɤ</c> has an uppercase, U+A7CB, only under invariant), and
+    /// before the fold was a compiled table the child's bits for <c>"ɤ-report"</c> were not the bits
+    /// this process probed: the block was skipped and the rows lost, the value byte-identical on both
+    /// sides. The child is this test assembly's own entry point (<see cref="ChildProcessEntry"/>).
+    /// </summary>
+    [Fact]
+    public async Task A_segment_written_under_the_other_globalization_mode_loses_no_row()
+    {
+        bool invariant = InvariantGlobalization();
+        string dir     = NewDir("other-mode");
+        string path    = RunFoldChild(dir, childInvariant: !invariant);
+        _out.WriteLine($"this process {(invariant ? "invariant" : "ICU")}, writer {(invariant ? "ICU" : "invariant")}: {path}");
+
+        await UnderCultureAsync("en-US", async () =>
+        {
+            foreach (string q in FoldProbeQueries)
+            {
+                var pred = TraceQLParser.Parse(q);
+                int truth = 0;
+                foreach (var s in SpanReader.ReadAll(path)) if (pred.Evaluate(s) == true) truth++;
+                var (admitted, found) = await Search(path, pred);
+                _out.WriteLine($"{q,-32} truth {truth,5}  found {found,5}  read {admitted / Block} block(s)");
+                Assert.True(truth > 0, $"{q}: the fixture holds no answer");
+                Assert.True(found == truth, $"{q}: the bloom lost {truth - found} of {truth} rows");
+                // One block: the same table on both sides. (A host whose comparer knows casing the
+                // table does not probes such literals by key — correct, and three blocks.)
+                if (SpanBloomFold.HostDisagreementCount == 0)
+                    Assert.True(admitted == Block, $"{q}: read {admitted / (double)Block:N2} blocks — the same table on both sides should read one");
+            }
+        });
+    }
+
+    /// <summary>
+    /// A SEGMENT FOLDED BY ANOTHER BUILD'S TABLE LOSES NO ROW — the fingerprint's reason to exist.
+    /// The writer here folds with a table that keeps <c>ɤ</c>, <c>Ɤ</c>, <c>ё</c> and <c>Ё</c> apart from
+    /// their other case (an older Unicode's view, or a build before a table update); the reader
+    /// folds with this build's. The fingerprints differ, so every non-ASCII literal probes its key
+    /// alone and finds its rows, while an ASCII literal still reads one block of three. Ignore the
+    /// fingerprint and the Cyrillic and Latin-extended queries find nothing.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_folded_by_another_table_loses_no_row()
+    {
+        var other = SpanBloomFold.CopyOfTable();
+        foreach (char c in "ɤꟋёЁ") other[c] = c;
+
+        string path;
+        using (SpanBloomFold.UseTableForTest(other))
+            path = UnderCulture("ru-KZ", () => SpanWriter.Write(NewDir("other-table"), FoldProbeCorpus()).FilePath);
+
+        await UnderCultureAsync("en-US", async () =>
+        {
+            foreach (var (q, blocks) in (ValueTuple<string, int>[])
+                     [("{ .x = \"ɤ-report\" }", 3), ("{ .y = \"ЁЛКА\" }", 3), ("{ .y = \"ёлка\" }", 3), ("{ .db = \"MSSQL\" }", 1)])
+            {
+                var pred = TraceQLParser.Parse(q);
+                int truth = 0;
+                foreach (var s in SpanReader.ReadAll(path)) if (pred.Evaluate(s) == true) truth++;
+                var (admitted, found) = await Search(path, pred);
+                _out.WriteLine($"{q,-24} truth {truth,5}  found {found,5}  read {admitted / Block} block(s)");
+                Assert.True(truth > 0, $"{q}: the fixture holds no answer");
+                Assert.True(found == truth, $"{q}: the bloom lost {truth - found} of {truth} rows");
+                Assert.True(admitted == blocks * Block, $"{q}: read {admitted / (double)Block:N2} blocks, expected {blocks}");
+            }
+        });
+    }
+
+    internal static readonly string[] FoldProbeQueries =
+        ["{ .x = \"ɤ-report\" }", "{ .y = \"ЁЛКА\" }", "{ .y = \"ёлка\" }", "{ .db = \"mssql\" }"];
+
+    /// <summary>
+    /// Three blocks; block 0 holds <c>x = "ɤ-report"</c>, <c>y = "ёлка"</c>, <c>db = "mssql"</c>, the
+    /// other two different values under the same keys. Deterministic — the child process builds it
+    /// too.
+    /// </summary>
+    internal static List<SpanRecord> FoldProbeCorpus()
+    {
+        var spans = new List<SpanRecord>(3 * Block);
+        var buf   = new ArrayBufferWriter<byte>(128);
+        for (int i = 0; i < 3 * Block; i++)
+        {
+            bool first = i < Block;
+            buf.ResetWrittenCount();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(3);
+            w.Write("x");  w.Write(first ? "ɤ-report" : "other-report");
+            w.Write("y");  w.Write(first ? "ёлка" : "сосна");
+            w.Write("db"); w.Write(first ? "mssql" : "pgsql");
+            w.Flush();
+            spans.Add(new SpanRecord
+            {
+                TraceId = new TraceId(0xF1, (ulong)i + 1), SpanId = new SpanId((ulong)i + 1),
+                StartTimeUnixNano = BaseNano + i * 1_000L, DurationNanos = 1_000_000,
+                Name = "op", ServiceName = "svc", AttributesBytes = buf.WrittenSpan.ToArray(),
+            });
+        }
+        return spans;
+    }
+
+    /// <summary>Writes <see cref="FoldProbeCorpus"/> into <paramref name="dir"/> from a child process.</summary>
+    private static string RunFoldChild(string dir, bool childInvariant)
+    {
+        string? hostPath = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+        var psi = new System.Diagnostics.ProcessStartInfo(hostPath is { Length: > 0 } && File.Exists(hostPath) ? hostPath : "dotnet")
+        {
+            UseShellExecute        = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+        };
+        psi.ArgumentList.Add("exec");
+        psi.ArgumentList.Add(typeof(SpanBloomCanonicalTests).Assembly.Location);
+        psi.ArgumentList.Add(ChildProcessEntry.WriteFoldSegmentCommand);
+        psi.ArgumentList.Add(dir);
+        psi.Environment["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = childInvariant ? "1" : "0";
+        psi.Environment["DOTNET_SYSTEM_GLOBALIZATION_PREDEFINED_CULTURES_ONLY"] = "false";
+
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        var stderr = proc.StandardError.ReadToEndAsync();
+        string stdout = proc.StandardOutput.ReadToEnd();
+        Assert.True(proc.WaitForExit(60_000), "child process did not exit");
+        if (proc.ExitCode != 0)
+            Assert.Fail($"child exited {proc.ExitCode}: {stderr.GetAwaiter().GetResult()}");
+
+        string path = stdout.Trim();
+        Assert.True(File.Exists(path), $"the child wrote no segment: '{path}'");
+        return path;
+    }
+
+    private static bool InvariantGlobalization() =>
+        Environment.GetEnvironmentVariable("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT") is { } v
+        && (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+
     // ── TS#12: nothing allocated per value ────────────────────────────────────────────────────
 
     /// <summary>
@@ -509,6 +698,52 @@ public sealed class SpanBloomCanonicalTests : IDisposable
                 }
                 return best;
             }
+        });
+    }
+
+    /// <summary>
+    /// WHAT FOLDING NON-ASCII TEXT COSTS THE FLUSH — a probe, not a gate. A block of spans whose
+    /// string values are Cyrillic (the ru-KZ deployment's ordinary data), fed to the bloom from the
+    /// blob; printed as nanoseconds per non-ASCII character, best of five passes.
+    /// </summary>
+    [Fact]
+    public void Folding_non_ASCII_text_costs()
+    {
+        UnderCulture("ru-KZ", () =>
+        {
+            const string text = "Платёж принят: Алматы, ул. Абая — квитанция №";
+            var blobs = new byte[Block][];
+            var buf   = new ArrayBufferWriter<byte>(512);
+            long nonAscii = 0;
+            for (int i = 0; i < Block; i++)
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(4);
+                for (int k = 0; k < 4; k++)
+                {
+                    string v = text + (i * 4 + k);
+                    w.Write("поле." + k);
+                    w.Write(v);
+                    foreach (char c in v) if (c >= 0x80) nonAscii++;
+                }
+                w.Flush();
+                blobs[i] = buf.WrittenSpan.ToArray();
+            }
+
+            var set = new HashSet<ulong>();
+            foreach (var b in blobs) SpanBloom.TryAddBlob(set, b);   // warm
+            double best = double.MaxValue;
+            for (int pass = 0; pass < 5; pass++)
+            {
+                set.Clear();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                foreach (var b in blobs) SpanBloom.TryAddBlob(set, b);
+                best = Math.Min(best, sw.Elapsed.TotalNanoseconds);
+            }
+            _out.WriteLine($"bloom feed over {Block:N0} spans, {nonAscii:N0} non-ASCII value chars: "
+                         + $"{best / 1e6:N2} ms, {best / nonAscii:N1} ns per non-ASCII char");
+            Assert.True(best > 0);
         });
     }
 

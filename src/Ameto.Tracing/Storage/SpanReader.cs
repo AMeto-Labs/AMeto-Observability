@@ -1414,33 +1414,24 @@ internal static class SpanReader
         long footerAt = fs.Length - (version >= 3 ? 28 : 20);
         fs.Seek(bloomIdxOffset, SeekOrigin.Begin);
 
-        // Pre-hash the hints once, BOTH WAYS, because which hash the bits were built with is only
-        // known once the legacy slots have been read (see the section's two halves below).
+        // Pre-hash the hints for the LEGACY half now; the canonical hashes wait for the fingerprint
+        // (see the section's two halves below) — which hash the bits were built with is only known
+        // once the legacy slots have been read.
         //
-        // A LEGACY bloom (pre-#86) hashed `value.ToString()` in the WRITER's culture and folded case
-        // by lowercasing; where a literal's text could have come out differently under either rule
-        // — a number's text, or a lowercase OrdinalIgnoreCase merges with another — its value probe
-        // degrades to the key alone, which the old bloom holds exactly. That costs those queries
-        // the value skip on old segments until retention or compaction replaces them; it costs no
-        // query a row. See SpanBloom.LegacyValueProbeIsExact.
+        // A LEGACY bloom (pre-#86) hashed `value.ToString()` in the WRITER's culture and lowercased
+        // with the WRITER host's casing; where a literal's text could have come out differently —
+        // a number's text, or any character outside ASCII — its value probe degrades to the key
+        // alone, which the old bloom holds exactly. That costs those queries the value skip on old
+        // segments until retention replaces them; it costs no query a row. See
+        // SpanBloom.LegacyValueProbeIsExact.
         int nHints = Math.Min(hints.Count, 16);
-        Span<ulong> canonical = stackalloc ulong[16];
-        Span<ulong> legacy    = stackalloc ulong[16];
+        Span<ulong> legacy = stackalloc ulong[16];
         for (int i = 0; i < nHints; i++)
         {
             var h = hints[i];
-            if (h.LowerValue is null)
-            {
-                canonical[i] = SpanBloom.HashKey(h.Key);
-                legacy[i]    = SpanBloom.LegacyHashKey(h.Key);
-            }
-            else
-            {
-                canonical[i] = SpanBloom.HashKeyValue(h.Key, h.LowerValue);
-                legacy[i]    = SpanBloom.LegacyValueProbeIsExact(h.LowerValue)
-                    ? SpanBloom.LegacyHashKeyValue(h.Key, h.LowerValue)
-                    : SpanBloom.LegacyHashKey(h.Key);
-            }
+            legacy[i] = h.LowerValue is not null && SpanBloom.LegacyValueProbeIsExact(h.LowerValue)
+                ? SpanBloom.LegacyHashKeyValue(h.Key, h.LowerValue)
+                : SpanBloom.LegacyHashKey(h.Key);
         }
 
         // BOUNDED BY THE BYTES THAT COULD HOLD IT. This runs on every TraceQL query carrying an
@@ -1470,11 +1461,25 @@ internal static class SpanReader
         // slots, probed above with the legacy hashes.
         if (fs.Position == footerAt) return allowed;
 
-        // THE CANONICAL HALF (#86): every legacy slot empty, then the marker, then one bloom per
-        // block, and then — exactly — the footer. Anything else is a section this build did not
-        // write, and the answer is the same null as any other unrecognised index.
-        if (!legacySlotsEmpty || footerAt - fs.Position < 4) return null;
+        // THE CANONICAL HALF (#86): every legacy slot empty, then the marker and the fingerprint of
+        // the fold table that built the bits, then one bloom per block, and then — exactly — the
+        // footer. Anything else is a section this build did not write, and the answer is the same
+        // null as any other unrecognised index.
+        if (!legacySlotsEmpty || footerAt - fs.Position < 12) return null;
         if (br.ReadUInt32() != SpanBloom.CanonicalMarker) return null;
+
+        // A value probe is trusted only where the segment's fold and this host's comparer both
+        // agree with this build's table; otherwise the hint probes its key alone. See
+        // SpanBloom.CanonicalValueProbeIsExact and SpanBloomFold.
+        bool sameFold = br.ReadUInt64() == SpanBloomFold.Fingerprint;
+        Span<ulong> canonical = stackalloc ulong[16];
+        for (int i = 0; i < nHints; i++)
+        {
+            var h = hints[i];
+            canonical[i] = h.LowerValue is not null && SpanBloom.CanonicalValueProbeIsExact(h.LowerValue, sameFold)
+                ? SpanBloom.HashKeyValue(h.Key, h.LowerValue)
+                : SpanBloom.HashKey(h.Key);
+        }
 
         allowed.Clear();
         ProbeBlooms(br, fs, blockCount, canonical[..nHints], allowed, filePath);
