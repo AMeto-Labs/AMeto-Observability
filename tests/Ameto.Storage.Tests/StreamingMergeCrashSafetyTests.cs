@@ -434,6 +434,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     [Fact]
     public async Task ASecondMergeOrPassDuringAMerge_DoesNothing()
     {
+        await _engine.CatalogLoaded;   // the outcome, unlike the bool merge, is Busy until the boot scan is done
         for (int round = 0; round < 10; round++)
             await WriteSegmentAsync(round, 60);
         var before  = ReadEverything();
@@ -627,6 +628,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     [Fact]
     public async Task APassThatThrowsBeforeItsMerge_LetsGoOfTheGate()
     {
+        await _engine.CatalogLoaded;   // a pass is Busy until the boot scan is done
         for (int round = 0; round < 10; round++)
             await WriteSegmentAsync(round, 60);
 
@@ -718,6 +720,42 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         Assert.Equal(10, _engine.PendingSegmentDeleteCount);   // 11: the set grew past its cap
         Assert.Contains(_log.Entries, e => e.Message.Contains("is not retried: the pending-delete set is full", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// No merge and no pass runs before the boot catalog scan has finished, whoever calls. The
+    /// scan does not take the merge gate, and it does what the gate keeps a pass from doing
+    /// beside a live merge: the same recovery sweep, and registering every <c>*.seg</c> it lists
+    /// — a merge output between its move and its swap among them. Only the maintenance loop's own
+    /// wait for the load kept them apart. With the scan held: a merge and a pass are Busy, and
+    /// the bool merge waits for the load and then merges.
+    /// </summary>
+    [Fact]
+    public async Task BeforeTheBootScanHasFinished_AMergeOrAPassIsBusy()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(release);   // a red assertion below must not strand the scan
+        await _engine.DisposeAsync();
+        _engine = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = _dir }),
+            new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
+            _log, Timeout.InfiniteTimeSpan, bootScanHeldUntil: release.Task)
+        {
+            _allowIndexlessMerge = true,
+        };
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);   // a flush publishes whether or not the scan has run
+        Assert.False(_engine.CatalogLoaded.IsCompleted, "setup: the boot scan was not held");
+
+        Assert.Equal(MergeOutcome.Busy, await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.Equal(MergeOutcome.Busy, await _engine.RunColdMaintenancePassAsync(CancellationToken.None));
+        var merged = _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        Assert.False(merged.IsCompleted, "the bool merge answered before the boot scan had finished");
+        Assert.Equal(10, _engine.ListSegments().Count);
+
+        release.SetResult();
+        Assert.True(await merged.WaitAsync(TimeSpan.FromSeconds(30)), "the bool merge did not merge once the scan had finished");
+        Assert.Single(_engine.ListSegments());
     }
 
     /// <summary>Killed halfway through deleting the sources — the rest must go on restart.</summary>

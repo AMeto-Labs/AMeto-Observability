@@ -638,11 +638,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// constructor returns, and on an empty data directory the catalog scan the loop waits on
     /// finishes in microseconds — so the loop can read the field before the test writes it. That
     /// is the race this seam exists to remove, so the seam may not contain one.</para>
+    ///
+    /// <para><paramref name="bootScanHeldUntil"/>, when given, holds the boot catalog scan until
+    /// it completes — for a test of what may and may not run before the catalog has loaded. A
+    /// constructor parameter for the same reason: the constructor starts that scan.</para>
     /// </summary>
     internal StorageEngine(
         IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
-        TimeSpan maintenanceStartDelay)
-        : this(options, retentionStore, logger, MemoryBudgets.Current(), maintenanceStartDelay)
+        TimeSpan maintenanceStartDelay, Task? bootScanHeldUntil = null)
+        : this(options, retentionStore, logger, MemoryBudgets.Current(), maintenanceStartDelay, bootScanHeldUntil)
     {
     }
 
@@ -653,7 +657,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal StorageEngine(
         IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
-        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null)
+        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null, Task? bootScanHeldUntil = null)
     {
         _maintenanceStartDelay = maintenanceStartDelay ?? DefaultMaintenanceStartDelay;
         _options        = options.Value;
@@ -808,7 +812,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 "Quarantined segments present: {Count} file(s), {Bytes:N0} bytes in {Dir} — " +
                 "unreadable at some earlier start, kept for an operator to inspect or remove.",
                 corrupt.Length, corrupt.Sum(static f => new FileInfo(f).Length), _segDir);
-        _catalogLoad = Task.Run(LoadSegmentCatalog);
+        _catalogLoad = bootScanHeldUntil is null
+            ? Task.Run(LoadSegmentCatalog)
+            : LoadSegmentCatalogOnceReleasedAsync(bootScanHeldUntil);
         ReplayOrphanedWals();
         var (bootWal, bootSegId) = OpenWalCore();
         _write = new WriteState(_write.Hot, bootWal, bootSegId);
@@ -865,6 +871,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// cancellation to thread through. It says Busy, not "nothing to merge": a caller that runs
     /// merges to a fixpoint would otherwise stop short, and the maintenance loop would take a
     /// lost gate for an idle catalog and sleep its long pause (see <see cref="PauseAfter"/>).</para>
+    ///
+    /// <para>Shut until the boot catalog scan has finished (<see cref="TryEnterMergeGate"/>).
+    /// The scan does not take the gate, and it does what the gate keeps a pass from doing beside
+    /// a live merge: it runs the same recovery sweep, and it registers every <c>*.seg</c> it
+    /// lists — a merge output between its move and its swap among them, beside the sources the
+    /// catalog still names, which is #85's double count by another road. The maintenance loop
+    /// waits for the load before its first pass; the gate makes that hold for every caller.
+    /// A scan a TEST runs by hand (<see cref="LoadSegmentCatalog"/>) is not covered.</para>
     /// </summary>
     private int _mergeGate;
 
@@ -886,7 +900,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal static TimeSpan PauseAfter(MergeOutcome outcome) =>
         outcome == MergeOutcome.NothingToMerge ? IdlePause : BacklogPause;
 
-    private bool TryEnterMergeGate() => Interlocked.CompareExchange(ref _mergeGate, 1, 0) == 0;
+    /// <summary>
+    /// Takes the merge gate, unless another merge or pass holds it or the boot catalog scan has
+    /// not finished yet (faulted counts as finished, as it does for the maintenance loop). The
+    /// load only ever goes from running to finished, so a check before the exchange cannot be
+    /// overtaken.
+    /// </summary>
+    private bool TryEnterMergeGate() =>
+        _catalogLoad.IsCompleted && Interlocked.CompareExchange(ref _mergeGate, 1, 0) == 0;
 
     /// <summary>
     /// Cold-tier maintenance: finish any interrupted merge, then MERGE small segments into
@@ -958,7 +979,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// retries a parked file gets, so dropping either must fail a test and not only a stand.</para>
     ///
     /// <para>Under the merge gate (<see cref="_mergeGate"/>), sweeps included: a pass that finds
-    /// a merge or another pass running does nothing and returns <see cref="MergeOutcome.Busy"/>.</para>
+    /// a merge or another pass running, or the boot catalog scan not yet finished, does nothing
+    /// and returns <see cref="MergeOutcome.Busy"/>.</para>
     /// </summary>
     internal Task<MergeOutcome> RunColdMaintenancePassAsync(CancellationToken ct)
     {
@@ -3044,7 +3066,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>One at a time, under the merge gate (<see cref="_mergeGate"/>): a call that finds a
     /// merge or a maintenance pass running merges nothing and returns
     /// <see cref="MergeOutcome.Busy"/>, since it would pick the very batch the running one is
-    /// merging.</para>
+    /// merging — and so does a call made before the boot catalog scan has finished.</para>
     /// </summary>
     internal Task<MergeOutcome> MergeSmallSegmentsOnceAsync(CancellationToken ct) =>
         TryEnterMergeGate() ? MergeUnderGateAsync(ct) : BusyOutcome;
@@ -3054,9 +3076,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// merged. False folds "nothing to merge" and <see cref="MergeOutcome.Busy"/> together, so a
     /// caller that runs merges to a fixpoint, or reads false as "the pass ran", asks for the
     /// outcome instead.
+    ///
+    /// <para>It waits for the boot catalog scan first (a fault counts as finished), rather than
+    /// answer false for a load still running: a caller asking only "merged?" cannot act on Busy,
+    /// and the tests that call it — seventy-odd sites — merge straight after building an engine,
+    /// where Busy would be a race against the engine's own background scan.</para>
     /// </summary>
-    internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct) =>
-        await MergeSmallSegmentsOnceAsync(ct).ConfigureAwait(false) == MergeOutcome.Merged;
+    internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
+    {
+        await _catalogLoad.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        return await MergeSmallSegmentsOnceAsync(ct).ConfigureAwait(false) == MergeOutcome.Merged;
+    }
 
     /// <summary>One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.</summary>
     private async Task<MergeOutcome> MergeUnderGateAsync(CancellationToken ct)
@@ -3962,6 +3992,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 try { File.Delete(tmp); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp segment {File}", tmp); }
             }
+    }
+
+    /// <summary>The boot scan of a test engine built to hold it (see the constructor's <c>bootScanHeldUntil</c>).</summary>
+    private async Task LoadSegmentCatalogOnceReleasedAsync(Task release)
+    {
+        await release.ConfigureAwait(false);
+        LoadSegmentCatalog();
     }
 
     /// <summary>

@@ -136,6 +136,7 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         var  sw = System.Diagnostics.Stopwatch.StartNew();
         int  merges = 0;
         long written = 0;
+        await _engine.CatalogLoaded;   // the outcome is Busy until the boot scan is done
         MergeOutcome outcome;
         while ((outcome = await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None)) == MergeOutcome.Merged)
         {
