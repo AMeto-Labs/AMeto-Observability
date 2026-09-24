@@ -563,6 +563,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <summary>Test hook: the live tier's bytes by <see cref="HotSpanBytes"/>.</summary>
     internal long HotBytesForTest { get { _lock.EnterReadLock(); try { return _hotBytes; } finally { _lock.ExitReadLock(); } } }
 
+    /// <summary>The byte half of the flush trigger this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
+    internal long HotTierBudgetBytes => _hotTierBudgetBytes;
+
+    /// <summary>One compaction pass's byte budget this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
+    internal long MergeBudgetBytes => _mergeBudgetBytes;
+
     /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
     internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;
 
