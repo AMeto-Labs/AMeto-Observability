@@ -371,32 +371,7 @@ public sealed class MetricLabelInterner
     /// publishing it — the same probe of the same two slots, and no write. See <see cref="Lookup"/>
     /// for why a cold read must not fill the table either.
     /// </summary>
-    public LabelSet LookupLabelSet(Span<string> kv, Span<int> ids)
-    {
-        if (kv.IsEmpty) return LabelSet.Empty;
-        if (ids.Length != kv.Length || (kv.Length & 1) != 0)
-            throw new ArgumentException("one id per string, and whole pairs", nameof(ids));
-        LabelSet.SortInterleaved(kv, ids);
-
-        uint h = 2166136261;
-        for (int i = 0; i < ids.Length; i++)
-        {
-            int id = ids[i];
-            if (id < 0) return LabelSet.FromSorted(kv);   // not all pooled: no identity to key on
-            h = (h ^ (uint)id) * 16777619;
-        }
-        h ^= h >> 15; h *= 0x2C1B3C6D; h ^= h >> 12;
-
-        var sets = _sets;
-        int a = (int)(h & (uint)_mask);
-        int b = (int)((h >> 16 | h << 16) & (uint)_mask);
-
-        var hit = Volatile.Read(ref sets[a]);
-        if (hit is not null && hit.SameReferences(kv)) return hit;
-        hit = Volatile.Read(ref sets[b]);
-        if (hit is not null && hit.SameReferences(kv)) return hit;
-        return LabelSet.FromSorted(kv);
-    }
+    public LabelSet LookupLabelSet(Span<string> kv, Span<int> ids) => ProbeLabelSet(kv, ids, publish: false);
 
     /// <summary>The canonical instance of <paramref name="s"/> (or <paramref name="s"/> itself when
     /// it is not pooled). For names and units, which a <c>SeriesKey</c> holds for the series'
@@ -417,7 +392,17 @@ public sealed class MetricLabelInterner
     /// re-sends the same series every interval. Otherwise, or on a miss, a new set is built; on a
     /// miss it is also published into the table, displacing whatever held the slot.</para>
     /// </summary>
-    public LabelSet GetLabelSet(Span<string> kv, Span<int> ids)
+    public LabelSet GetLabelSet(Span<string> kv, Span<int> ids) => ProbeLabelSet(kv, ids, publish: true);
+
+    /// <summary>
+    /// THE ONE PROBE behind <see cref="GetLabelSet"/> and <see cref="LookupLabelSet"/>: the argument
+    /// checks, the canonical sort, the hash of the ids and the two-slot probe are the same code for
+    /// both, and <paramref name="publish"/> decides only whether a miss is written into the table.
+    /// They used to be two copies — and if the hash or the slot choice of one had moved, a set
+    /// published by ingest would no longer be found by the cold reader's lookup: every cold read
+    /// would then build fresh label sets, silently, with no test failing.
+    /// </summary>
+    private LabelSet ProbeLabelSet(Span<string> kv, Span<int> ids, bool publish)
     {
         if (kv.IsEmpty) return LabelSet.Empty;
         if (ids.Length != kv.Length || (kv.Length & 1) != 0)
@@ -443,6 +428,7 @@ public sealed class MetricLabelInterner
         if (hit is not null && hit.SameReferences(kv)) return hit;
 
         var created = LabelSet.FromSorted(kv);
+        if (!publish) return created;                     // lookup only: a miss writes nothing
         // Two choices, no relocation: an empty slot if either is, else the first. A race here
         // costs a redundant label set, never a wrong one — a reader tests every string of a
         // candidate before it keeps it.

@@ -76,4 +76,43 @@ public sealed class MetricLabelLookupTests
         Assert.Same(published, interner.LookupLabelSet(new[] { key, value }, new[] { k, v }));   // a hit is shared
         Assert.Same(LabelSet.Empty, interner.LookupLabelSet([], []));
     }
+
+    /// <summary>
+    /// WHAT INGEST PUBLISHES, THE COLD READER FINDS (PR #84 review, #14) — across many shapes, not one.
+    /// <see cref="MetricLabelInterner.GetLabelSet"/> and <see cref="MetricLabelInterner.LookupLabelSet"/>
+    /// were two copies of one probe; a hash or slot change in either would make every cold read build
+    /// fresh label sets with no test failing. They are one probe now; this pins the agreement over a
+    /// thousand sets of one to four pairs, each looked up with its pairs in another order, right after
+    /// it was published (so no later publish can have displaced it).
+    /// </summary>
+    [Fact]
+    public void Every_set_ingest_publishes_is_the_one_a_lookup_finds()
+    {
+        var interner = new MetricLabelInterner(4_096, MetricLabelInterner.DefaultLabelSetSlots);
+        var rng = new Random(20260924);
+        for (int n = 0; n < 1_000; n++)
+        {
+            int pairs = 1 + n % 4;
+            var kv  = new string[2 * pairs];
+            var ids = new int[2 * pairs];
+            for (int p = 0; p < pairs; p++)
+            {
+                ids[2 * p]     = interner.Intern($"key-{p}-{rng.Next(8)}", out kv[2 * p]);
+                ids[2 * p + 1] = interner.Intern($"value-{rng.Next(512)}", out kv[2 * p + 1]);
+            }
+
+            // The lookup gets the pairs reversed: both sort in place, so the order must not matter.
+            var lkv  = new string[kv.Length];
+            var lids = new int[ids.Length];
+            for (int p = 0; p < pairs; p++)
+            {
+                int q = pairs - 1 - p;
+                (lkv[2 * q], lkv[2 * q + 1])   = (kv[2 * p], kv[2 * p + 1]);
+                (lids[2 * q], lids[2 * q + 1]) = (ids[2 * p], ids[2 * p + 1]);
+            }
+
+            var published = interner.GetLabelSet(kv, ids);
+            Assert.Same(published, interner.LookupLabelSet(lkv, lids));
+        }
+    }
 }
