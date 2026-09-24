@@ -12,6 +12,15 @@ import {
   TraceMetricKind, AlertPreviewResult, MaintenanceWindow,
 } from '../../core/models/alert.model';
 
+/**
+ * The preview's verdict. A `null` value means the window holds no finite value (every point NaN or
+ * infinite, #92): the server evaluates nothing and leaves the rule's state alone, so the preview
+ * claims no verdict either — "ok" there read as "this rule would resolve".
+ */
+export function previewVerdict(p: AlertPreviewResult): string {
+  return p.value == null ? 'no data' : p.wouldFire ? 'WOULD FIRE' : 'ok';
+}
+
 interface MaintDraft { name: string; days: boolean[]; startTime: string; durationMinutes: number; maxSeverity: string; }
 
 type Tab = 'rules' | 'history' | 'silences';
@@ -83,6 +92,7 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   editing  = signal<RuleDraft | null>(null);
   preview  = signal<AlertPreviewResult | null>(null);
   previewing = signal(false);
+  protected readonly previewVerdict = previewVerdict;
   testStatus = signal<string>('');
 
   readonly sources: AlertSource[] = ['Log', 'Metric', 'Trace'];
@@ -373,7 +383,7 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
     if (s % 60 === 0 && s >= 60) return s / 60 + 'm';
     return s + 's';
   }
-  fmtNum(v: number): string { return v == null ? '—' : (v === Math.floor(v) ? String(v) : v.toFixed(2)); }
+  fmtNum(v: number | null): string { return v == null ? '—' : (v === Math.floor(v) ? String(v) : v.toFixed(2)); }
   fmtTime(iso: string): string { return iso ? format(new Date(iso), 'dd/MM HH:mm:ss') : '—'; }
   fmtAgo(iso?: string): string {
     if (!iso) return '—';
