@@ -74,7 +74,7 @@ public sealed class MetricQueryAllocProbe
                     BucketCounts      = (long[])cum.Clone(),
                 });
             }
-            items.Add((new SeriesKey(Metric, MetricKind.Histogram, "s", labels), new HotSeries(pts, Bounds)));
+            items.Add((new SeriesKey(Metric, MetricKind.Histogram, LiveUnit, labels), new HotSeries(pts, Bounds)));
         }
         return MetricWriter.Write(dir, items, MetricGranularity.Raw);
     }
@@ -96,6 +96,16 @@ public sealed class MetricQueryAllocProbe
             Assert.True(ids[i] >= 0, $"the shared metric label pool could not pool '{kv[i]}' (full?) — the probe models live series");
         }
         return MetricLabelInterner.Shared.GetLabelSet(strings, ids);
+    }
+
+    /// <summary>The unit as a live series has it: pooled, as the OTLP parsers pool names and units.</summary>
+    private static string LiveUnit
+    {
+        get
+        {
+            Assert.True(MetricLabelInterner.Shared.Intern("s", out string unit) >= 0, "the shared metric label pool could not pool the unit (full?)");
+            return unit;
+        }
     }
 
     private readonly record struct Cost(long Bytes, double Ms, int Series, long Points);
