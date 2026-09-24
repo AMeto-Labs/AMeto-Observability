@@ -40,7 +40,7 @@ jobs:
     runs-on: windows-latest
     # The suite is ~11 minutes when its projects run one after another and ~20 when Storage and
     # Integration overlap on the two cores; the default is six hours. A test that hangs should cost
-    # a coffee, not a runner-day. 40, not 30: a hang late in a 20-25 minute run needs its 5-minute
+    # a coffee, not a runner-day. 40, not 30: a hang late in a ~20 minute run needs its 15-minute
     # blame timeout (below) to fire and report before the job limit cancels everything silently.
     timeout-minutes: 40
     steps:
@@ -70,17 +70,23 @@ jobs:
       # A HANG MUST NAME ITS TEST, NOT SPEND THE JOB. Run 35964432043 (PR #84) was cancelled at the
       # 30-minute limit with the integration suite simply silent: `-v minimal` prints nothing for a
       # test that never ends, and a cancelled job keeps no output of the test host. With a hang
-      # timeout the blame collector kills a test host that has sat on ONE test for 5 minutes (the
-      # timer is per test, not per project — whole projects take minutes, single tests do not),
-      # prints "The test running when the crash occurred: <name>", writes a mini dump of the
+      # timeout the blame collector kills a test host that has sat on ONE test for 15 minutes (the
+      # timer is per test, not per project), prints "The test running when the crash occurred:
+      # <name>", writes a mini dump of the
       # host under that project's TestResults, and the step fails through the exit-code check
       # below with the suite named — well inside the job's budget. The same collector also names
       # the test that was running when a test host crashes outright. The skip guard is unaffected:
       # blame adds "Data collector 'Blame' message" lines, none of which match `Skipped:`.
+      #
+      # 15, NOT 5: SINGLE TESTS DO TAKE MINUTES HERE. Run 35971819964 killed the Storage host after
+      # 5 minutes on SegmentBucketAdversarialProbe.OpenBucketAmplificationConverges — not hung: its
+      # dump shows the test thread inside CreateFile (4 000 flushes, each opening files on a runner
+      # whose real-time scanning slows file creation) and no Ameto thread waiting on anything. The
+      # test takes 41 s on a developer box and fitted inside the 11-13 minute Storage run before.
       - name: Test (Debug)
         shell: pwsh
         run: |
-          dotnet test -c Debug --nologo -v minimal --blame-hang-timeout 5m --blame-hang-dump-type mini 2>&1 | Tee-Object -FilePath test-output.txt
+          dotnet test -c Debug --nologo -v minimal --blame-hang-timeout 15m --blame-hang-dump-type mini 2>&1 | Tee-Object -FilePath test-output.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # A SKIPPED TEST READS AS A PASSING ONE. Nothing in a green report distinguishes "the
