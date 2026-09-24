@@ -37,6 +37,15 @@ namespace Ameto.Tracing.Ingestion;
 /// against <see cref="MaxBytes"/> before anything else, so a burst of heavy spans is refused at the
 /// budget with slots to spare.</para>
 ///
+/// <para><b>The native footprint, resting and at peak</b> (none of it is under a MemoryBudgets
+/// share — the physical shares were not re-cut this round): the slot array, <see cref="Capacity"/>
+/// x 80 B, is fixed and resident once the ring has cycled — 5.0 MB at the default 65 536 slots,
+/// sized by <c>Traces:RingCapacity</c>; the arena is reserved at <see cref="MaxBytes"/> plus 64
+/// slack chunks and committed only as deep as a backlog reaches — at most the budget plus the
+/// slack while a burst lasts (SpanRingBytesProbe on the 512 MB stand's budget: 33.5 MB with the
+/// slots) — and given back above <see cref="LowWaterChunks"/> (1 MB) by the drainer's idle trim
+/// (<see cref="TrimIdleArena"/>), so at rest the ring holds the slots and 1 MB: 6.0 MB.</para>
+///
 /// <para><b>What the arena is NOT</b>: the storage behind anything a reader holds. The drainer
 /// copies each blob out and turns each name and service into a pool string before it releases the
 /// batch (<c>TraceStorageEngine.WriteRaw</c>), so a chunk can be reused the instant its last span
@@ -168,6 +177,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         _parkFree      = new int[_chunkCount];
         for (int i = 0; i < _chunkCount; i++) _parkFree[i] = _chunkCount - 1 - i;
         _parkFreeCount = _chunkCount;
+        _trimTaken     = new byte[_chunkCount];
     }
 
     /// <summary>The span-name and service pools; producers intern the service here once per resource block.</summary>
@@ -492,11 +502,20 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     private int AcquireChunk()
     {
         ref long headRef = ref _cursors[2].Value;
+        var spin = new SpinWait();
         while (true)
         {
             long head = Volatile.Read(ref headRef);
             int  idx  = unchecked((int)head);
-            if (idx < 0) return -1;
+            if (idx < 0)
+            {
+                // The trim holds the whole free list for a moment (microseconds, plus one
+                // decommit call): an empty list then means "wait", not "full". Spin, never refuse.
+                if (Volatile.Read(ref _trimming) == 0) return -1;
+                _onWaitingForTrimForTest?.Invoke();
+                spin.SpinOnce(sleep1Threshold: -1);
+                continue;
+            }
 
             if (!_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * ChunkBytes)))
             {
@@ -511,6 +530,128 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
                 if (idx >= Volatile.Read(ref _chunkHighWater)) RaiseHighWater(idx);
                 return idx;
             }
+        }
+    }
+
+    // ── Idle trim (review F3) ────────────────────────────────────────────────────
+    //
+    // THE ARENA'S HIGH-WATER MARK WAS A RESTING LEVEL. SlabArena never gave committed memory back —
+    // right for the log ring, whose argument is that a LIFO free list asks for the same slabs again
+    // on the next burst — so one burst to the byte budget left the span ring holding it for the
+    // life of the process: on the 512 MB stand ~27 MB of arena plus up to 64 slack chunks (4 MB),
+    // outside every MemoryBudgets share. The drainer now calls TrimIdleArena from the wake it
+    // already takes when it finds the ring empty (at most once per TrimInterval), and everything
+    // above a low-water mark that no span and no open batch is using goes back to the OS.
+
+    /// <summary>What the trim leaves committed: one 1 MB commit step — a drainer that keeps up works in one or two chunks.</summary>
+    internal const int LowWaterChunks = 16;
+
+    private int             _trimming;
+    private readonly byte[] _trimTaken;   // one mark per chunk: "in the free list the trim holds"
+
+    /// <summary>Test seam: the trim holds the whole free list, before it has decommitted anything.</summary>
+    internal Action? _whileTrimmingForTest;
+
+    /// <summary>Test seam: a producer found the free list empty because a trim holds it, and is waiting.</summary>
+    internal Action? _onWaitingForTrimForTest;
+
+    /// <summary>
+    /// Gives back the arena above the highest chunk still in use (and above <see cref="LowWaterChunks"/>)
+    /// — every chunk it can PROVE is free. Returns the bytes given back. Single caller: the drainer.
+    ///
+    /// <para><b>Safe against producers without stopping them.</b> The trim first takes the WHOLE free
+    /// list with one CAS on the versioned head, so no chunk it examines can be popped under it — a
+    /// pop already in flight fails its own CAS and retries, and a producer that finds the list empty
+    /// while <c>_trimming</c> is set spins instead of refusing. Only chunks in the list it took are
+    /// candidates, and only a contiguous run of them reaching the top of the committed range is given
+    /// back, so a chunk a producer holds, or one a drained span still references, stops the run below
+    /// it. The chunks go back on the list afterwards — the ones kept first, lowest index on top — and
+    /// a chunk above the new committed mark is committed again by <c>AcquireChunk</c>'s
+    /// commit-before-pop, exactly as a never-used one always was.</para>
+    /// </summary>
+    public long TrimIdleArena()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return 0;
+        ref long headRef = ref _cursors[2].Value;
+
+        Volatile.Write(ref _trimming, 1);
+        long taken;
+        while (true)
+        {
+            taken = Volatile.Read(ref headRef);
+            long empty = unchecked((((taken >> 32) + 1) << 32) | 0xFFFF_FFFFL);
+            if (Interlocked.CompareExchange(ref headRef, empty, taken) == taken) break;
+        }
+
+        long given = 0;
+        int  first = -1, last = -1;                                      // the chain we will push back
+        try
+        {
+            _whileTrimmingForTest?.Invoke();
+
+            Array.Clear(_trimTaken);
+            for (int c = unchecked((int)taken); c >= 0; c = _chunkNext[c]) _trimTaken[c] = 1;
+
+            // The top of what can be resident: the committed mark where pages are committed on
+            // demand, else the whole arena (Linux, where DONTNEED on untouched pages is a no-op).
+            long committed = _arena.CommittedBytes;
+            int  top = committed < 0 ? _chunkCount : (int)Math.Min(_chunkCount, (committed + ChunkBytes - 1) / ChunkBytes);
+            int  cut = top;
+            while (cut > LowWaterChunks && _trimTaken[cut - 1] != 0) cut--;
+
+            if (cut < top)
+            {
+                given = _arena.TryDecommitTail((nuint)((long)cut * ChunkBytes));
+                if (given > 0) LowerHighWater(cut);
+            }
+
+            // Push back: kept (committed) chunks on top in index order, the given-back ones below.
+            for (int pass = 0; pass < 2; pass++)
+                for (int c = 0; c < _chunkCount; c++)
+                {
+                    if (_trimTaken[c] == 0 || (pass == 0) != (c < cut)) continue;
+                    if (first < 0) first = c; else _chunkNext[last] = c;
+                    last = c;
+                }
+        }
+        finally
+        {
+            if (first >= 0)
+            {
+                while (true)
+                {
+                    long head = Volatile.Read(ref headRef);                // what was released meanwhile
+                    _chunkNext[last] = unchecked((int)head);
+                    long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)first);
+                    if (Interlocked.CompareExchange(ref headRef, newHead, head) == head) break;
+                }
+            }
+            else if (unchecked((int)taken) >= 0)
+            {
+                // Faulted before the chain was built: put the list back as it was taken.
+                int tail = unchecked((int)taken);
+                while (_chunkNext[tail] >= 0) tail = _chunkNext[tail];
+                while (true)
+                {
+                    long head = Volatile.Read(ref headRef);
+                    _chunkNext[tail] = unchecked((int)head);
+                    long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)unchecked((int)taken));
+                    if (Interlocked.CompareExchange(ref headRef, newHead, head) == head) break;
+                }
+            }
+            Volatile.Write(ref _trimming, 0);
+        }
+        return given;
+    }
+
+    private void LowerHighWater(int mark)
+    {
+        long seen = Volatile.Read(ref _chunkHighWater);
+        while (seen > mark)
+        {
+            long prev = Interlocked.CompareExchange(ref _chunkHighWater, mark, seen);
+            if (prev == seen) return;
+            seen = prev;
         }
     }
 

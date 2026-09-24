@@ -37,6 +37,15 @@ internal sealed class SpanDrainer : IAsyncDisposable
 
     private DateTime _lastFlush = DateTime.UtcNow;
 
+    /// <summary>
+    /// How often, at most, the drainer asks the ring to give back arena memory above its low-water
+    /// mark (review F3). Only when it finds the ring EMPTY — the wake it already takes then — so
+    /// this adds no timer: an idle server trims once after a burst and is quiet after that.
+    /// </summary>
+    internal static readonly TimeSpan ArenaTrimInterval = TimeSpan.FromSeconds(30);
+
+    private long _lastTrimTicks = Environment.TickCount64;
+
     // One drained run: the headers copied out of the ring, and the payloads kept apart from the
     // arena (larger than a chunk) — both reused batch after batch, both holding no reference to a
     // tier once the run is released.
@@ -110,6 +119,7 @@ internal sealed class SpanDrainer : IAsyncDisposable
             if (count == 0)
             {
                 MaybeFlush();
+                MaybeTrimArena();
                 // Park until a producer signals new spans. The 1 s timeout is only a
                 // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
                 await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false);
@@ -142,6 +152,26 @@ internal sealed class SpanDrainer : IAsyncDisposable
         _logger.LogWarning(
             "SpanDrainer: the trace engine has closed its write path — {Dropped} span(s) from "
           + "this batch, and whatever is still in the ring, were not stored", dropped);
+
+    /// <summary>
+    /// Gives the ring's arena back above its low-water mark, at most once per
+    /// <see cref="ArenaTrimInterval"/>, from the idle branch of the loop. Cheap when there is
+    /// nothing to give: the ring's high-water mark is already at the low-water mark.
+    /// </summary>
+    private void MaybeTrimArena()
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastTrimTicks < (long)ArenaTrimInterval.TotalMilliseconds) return;
+        _lastTrimTicks = now;
+        if (_ring.ArenaHighWaterBytes <= (long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes) return;
+        try
+        {
+            long given = _ring.TrimIdleArena();
+            if (given > 0)
+                _logger.LogDebug("SpanDrainer: gave back {Bytes} B of span-ring arena after a burst", given);
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: span-ring arena trim failed"); }
+    }
 
     /// <summary>Asks the engine to flush if the hot tier is due, every <see cref="FlushCheckInterval"/>.</summary>
     private void MaybeFlush()

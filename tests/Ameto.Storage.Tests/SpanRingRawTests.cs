@@ -178,6 +178,141 @@ public sealed class SpanRingRawTests : IDisposable
         }
     }
 
+    // ── F3: the idle trim ────────────────────────────────────────────────────
+
+    private const int ChunkSpan = 40_000;   // one span per chunk: two would not fit in 64 KB
+
+    private int EnqueueChunkSpans(SpanRingBuffer ring, int first, int count)
+    {
+        for (int i = first; i < first + count; i++)
+        {
+            var h = Fields(i);
+            Assert.True(ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(i)));
+        }
+        return count;
+    }
+
+    /// <summary>A payload whose bytes say which span it is, so a chunk given back under a span shows.</summary>
+    private static byte[] Stamp(int i)
+    {
+        var a = new byte[ChunkSpan];
+        for (int k = 0; k < a.Length; k++) a[k] = (byte)(i * 7 + k);
+        return a;
+    }
+
+    /// <summary>
+    /// F3 — A BURST IS GIVEN BACK ONCE THE RING IS IDLE. Sixty-four chunks of backlog, drained: the
+    /// high-water mark used to be the arena's residency for the life of the process. The trim takes
+    /// it down to the low-water mark, and the ring works across the given-back range afterwards —
+    /// the chunks are committed again as they are reached, and every byte comes back as it went in.
+    /// </summary>
+    [Fact]
+    public void A_burst_is_given_back_once_the_ring_is_idle_and_the_ring_still_works()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+
+        EnqueueChunkSpans(ring, 0, 64);
+        ring.EndBatch();
+        int n = ring.TryDequeueMany(headers, apart);
+        ring.Release(headers.AsSpan(0, n));
+        long before = ring.ArenaHighWaterBytes;
+
+        long given = ring.TrimIdleArena();
+        _out.WriteLine($"burst reached {before:N0} B; trim gave back {given:N0} B; high water now {ring.ArenaHighWaterBytes:N0} B");
+        Assert.Equal(64L * SpanRingBuffer.ChunkBytes, before);
+        Assert.True(given >= (64 - SpanRingBuffer.LowWaterChunks) * (long)SpanRingBuffer.ChunkBytes);
+        Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+
+        // Across the given-back range again: committed afresh, byte for byte.
+        EnqueueChunkSpans(ring, 1_000, 64);
+        ring.EndBatch();
+        n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(64, n);
+        var batch = ring.Drained(headers.AsSpan(0, n), apart.AsSpan(0, n), new ServiceIndexCache());
+        for (int i = 0; i < n; i++)
+            Assert.True(Stamp(1_000 + i).AsSpan().SequenceEqual(batch.Attributes(i)), $"span {i} after the trim");
+        ring.Release(headers.AsSpan(0, n));
+        Assert.Equal(0, ring.RefusedNoArena);
+    }
+
+    /// <summary>
+    /// THE TRIM NEVER GIVES BACK A CHUNK SOMETHING STILL USES. Sixty-four chunks drained, but the span
+    /// in chunk 40 not yet released (the drainer is still copying it): the trim may give back only
+    /// what lies ABOVE it, and that span's bytes must read back whole. Released, the next trim takes
+    /// the rest down to the low-water mark.
+    /// </summary>
+    [Fact]
+    public void The_trim_never_gives_back_a_chunk_a_span_still_uses()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+
+        EnqueueChunkSpans(ring, 0, 64);
+        ring.EndBatch();
+        int n = ring.TryDequeueMany(headers, apart);
+        Assert.Equal(64, n);
+        int held = Array.FindIndex(headers, 0, n, static h => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes == 40);
+        ring.Release(headers.AsSpan(0, held));
+        ring.Release(headers.AsSpan(held + 1, n - held - 1));             // everything but chunk 40
+
+        long given = ring.TrimIdleArena();
+        Assert.Equal((64 - 41) * (long)SpanRingBuffer.ChunkBytes, given);
+        Assert.Equal(41L * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+
+        var batch = ring.Drained(headers.AsSpan(held, 1), apart.AsSpan(held, 1), new ServiceIndexCache());
+        Assert.True(Stamp(held).AsSpan().SequenceEqual(batch.Attributes(0)), "a chunk still in use was given back");
+        ring.Release(headers.AsSpan(held, 1));
+
+        Assert.True(ring.TrimIdleArena() > 0);
+        Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+    }
+
+    /// <summary>
+    /// A PRODUCER THAT MEETS A TRIM WAITS FOR IT, IT DOES NOT REFUSE. The trim holds the whole free
+    /// list; a producer that needs a chunk in that moment finds the list empty. Parked inside the
+    /// trim (seam), a producer on another thread asks for a chunk: it must be seen WAITING, and once
+    /// the trim is done its span must be taken — not counted as refused for want of arena.
+    /// </summary>
+    [Fact]
+    public async Task A_producer_that_meets_a_trim_waits_for_it_instead_of_refusing()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[128];
+        var apart   = new byte[]?[128];
+        EnqueueChunkSpans(ring, 0, 32);
+        ring.EndBatch();
+        ring.Release(headers.AsSpan(0, ring.TryDequeueMany(headers, apart)));
+
+        var waiting = new TaskCompletionSource();
+        ring._onWaitingForTrimForTest = () => waiting.TrySetResult();
+        Task<bool>? producer = null;
+        Task? first = null;
+        ring._whileTrimmingForTest = () =>
+        {
+            producer = Task.Run(() =>
+            {
+                var h = Fields(500);
+                bool ok = ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(500));
+                ring.EndBatch();
+                return ok;
+            });
+            first = Task.WhenAny(waiting.Task, producer).WaitAsync(HangGuard).GetAwaiter().GetResult();
+        };
+
+        ring.TrimIdleArena();
+        ring._whileTrimmingForTest = null;
+        ring._onWaitingForTrimForTest = null;
+
+        Assert.Same(waiting.Task, first);                                // it waited, rather than answering
+        Assert.True(await producer!.WaitAsync(HangGuard), "the span was refused because a trim held the free list");
+        Assert.Equal(0, ring.RefusedNoArena);
+        Assert.Equal(1, ring.TryDequeueMany(headers, apart));
+        ring.Release(headers.AsSpan(0, 1));
+    }
+
     /// <summary>
     /// A CHUNK IS REUSED ONLY WHEN EVERY SPAN IN IT IS DRAINED, AND THEN FIRST. Three spans in one chunk,
     /// one drained: a new batch must NOT be packed into that chunk. All drained: the next batch gets it

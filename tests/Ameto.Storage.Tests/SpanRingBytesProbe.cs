@@ -40,9 +40,11 @@ public sealed class SpanRingBytesProbe : IDisposable
         Fill(capacity: 1 << 10, blobBytes: 375, label: null);                 // warm
         Fill(capacity: 1 << 16, blobBytes: 375,    label: "ordinary span, 375 B attributes");
         Fill(capacity: 1 << 13, blobBytes: 10_000, label: "heavy span, 10 KB attributes");
+        Fill(capacity: 1 << 16, blobBytes: 10_000, label: "heavy span, 10 KB attributes, the 512 MB stand's ring budget",
+             budget: new Ameto.Core.TracesOptions().RingMaxBytesFor(Ameto.Core.MemoryBudgets.Derive(384L << 20, 512L << 20)));
     }
 
-    private void Fill(int capacity, int blobBytes, string? label)
+    private void Fill(int capacity, int blobBytes, string? label, long budget = 0)
     {
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         long liveBefore = GC.GetTotalMemory(forceFullCollection: true);
@@ -63,7 +65,7 @@ public sealed class SpanRingBytesProbe : IDisposable
                 AttributesBytes   = Blob(blobBytes, i),
             };
 
-        var ring     = SpanRingBytesFixture.Ring(capacity);
+        var ring     = budget > 0 ? new SpanRingBuffer(capacity, budget) : SpanRingBytesFixture.Ring(capacity);
         var endpoint = new SpanIngestionEndpoint(ring, NullLogger<SpanIngestionEndpoint>.Instance);
 
         long allocBefore = GC.GetAllocatedBytesForCurrentThread();
@@ -84,6 +86,17 @@ public sealed class SpanRingBytesProbe : IDisposable
             _out.WriteLine($"  native      {native / 1048576.0,12:N1} MB   (slots {ring.SlotBytes / 1048576.0:N1} MB + arena reached)");
             _out.WriteLine($"  enqueue     {(accepted == 0 ? 0 : allocated / accepted),12:N0} B/span allocated (item door: the gRPC receiver's)");
         }
+
+        // THE RESTING LEVEL (review F3): drain the burst, as the drainer would, and let the ring go
+        // idle — what the drainer's idle trim leaves behind is what the process keeps.
+        var headers = new SpanHeader[512];
+        var apart   = new byte[]?[512];
+        int n;
+        while ((n = ring.TryDequeueMany(headers, apart)) > 0) ring.Release(headers.AsSpan(0, n));
+        long given   = ring.TrimIdleArena();
+        long resting = SpanRingBytesFixture.NativeBytes(ring);
+        if (label is not null)
+            _out.WriteLine($"  after idle  {resting / 1048576.0,12:N1} MB   (the trim gave back {given / 1048576.0:N1} MB; slots {ring.SlotBytes / 1048576.0:N1} MB stay)");
 
         GC.KeepAlive(endpoint);
         ring.Dispose();

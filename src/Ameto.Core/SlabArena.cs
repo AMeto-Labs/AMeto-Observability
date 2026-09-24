@@ -34,7 +34,8 @@ namespace Ameto.Core;
 /// above the high-water mark would need a background sweep — a timer wake on an idle server,
 /// which is the thing this work package is removing — to reclaim memory that a LIFO free list
 /// will ask for again on the next burst of the same size. The high-water mark IS the residency,
-/// and it is the true peak, not the ceiling.</para>
+/// and it is the true peak, not the ceiling. (The SPAN ring does trim — <see cref="TryDecommitTail"/> — from
+/// the drainer's existing idle wake, not a timer of its own; the log ring still does not.)</para>
 ///
 /// <para><b>Why it lives in Ameto.Core, and why it is still <c>internal</c>.</b> It was written
 /// for the log ring and lived beside it in <c>Ameto.Ingestion</c>; the span ring needs the same
@@ -59,7 +60,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     private readonly int   _hugePageOptOut; // NoHugePageOptOut, 0 when madvise succeeded, else its errno
 
-    private nuint _committed;               // bytes committed from _base; only grows
+    private nuint _committed;               // bytes committed from _base; grows, and falls only through TryDecommitTail
     private bool  _disposed;
 
     /// <summary>
@@ -278,6 +279,40 @@ internal sealed unsafe class SlabArena : IDisposable
         }
     }
 
+    /// <summary>
+    /// Gives back the pages of <c>[fromOffset, end)</c> — the span ring's idle trim, which the log
+    /// ring does not call (see the class remarks for why the log arena keeps its high-water mark).
+    /// <b>The caller guarantees nothing in the range is in use and nothing will be written to it
+    /// before <see cref="TryEnsureCommitted"/> has been asked for it again.</b>
+    ///
+    /// <para>Reserved (Windows): the range is decommitted and the committed mark lowered to
+    /// <paramref name="fromOffset"/>, so the next write that far is committed afresh. Plain
+    /// allocation on Linux: <c>madvise(MADV_DONTNEED)</c> over its whole pages — they stop being
+    /// resident and read as zeros when touched again, so no mark moves. Anywhere else: nothing.
+    /// Returns the bytes given back (0 when nothing was, or could be).</para>
+    /// </summary>
+    internal long TryDecommitTail(nuint fromOffset)
+    {
+        if (fromOffset >= _bytes) return 0;
+        lock (_growGate)
+        {
+            if (_reserved)
+            {
+                if (fromOffset >= _committed) return 0;
+                nuint len = _committed - fromOffset;
+                if (!VirtualFree((nint)(_base + fromOffset), len, MEM_DECOMMIT)) return 0;
+                Volatile.Write(ref _committed, fromOffset);
+                return (long)len;
+            }
+
+            if (!OperatingSystem.IsLinux() || _simulateCommitFailure) return 0;
+            var (start, length) = PageAlignInward((nuint)(_base + fromOffset), _bytes - fromOffset, (nuint)Environment.SystemPageSize);
+            if (length == 0) return 0;
+            try { return madvise((nint)start, length, MADV_DONTNEED) == 0 ? (long)length : 0; }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { return 0; }
+        }
+    }
+
     // ── Test hook ──────────────────────────────────────────────────────────────
 
     private bool    _simulateCommitFailure;   // read and written under _growGate only
@@ -322,6 +357,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     private const uint MEM_COMMIT     = 0x1000;
     private const uint MEM_RESERVE    = 0x2000;
+    private const uint MEM_DECOMMIT   = 0x4000;
     private const uint MEM_RELEASE    = 0x8000;
     private const uint PAGE_READWRITE = 0x04;
 
@@ -333,6 +369,7 @@ internal sealed unsafe class SlabArena : IDisposable
 
     // ── Linux ──────────────────────────────────────────────────────────────────
 
+    private const int MADV_DONTNEED   = 4;
     private const int MADV_NOHUGEPAGE = 15;
 
     [DllImport("libc", SetLastError = true)]
