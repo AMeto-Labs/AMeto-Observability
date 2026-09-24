@@ -38,9 +38,11 @@ concurrency:
 jobs:
   backend:
     runs-on: windows-latest
-    # The suite is ~11 minutes; the default is six hours. A test that hangs should cost a coffee,
-    # not a runner-day.
-    timeout-minutes: 30
+    # The suite is ~11 minutes when its projects run one after another and ~20 when Storage and
+    # Integration overlap on the two cores; the default is six hours. A test that hangs should cost
+    # a coffee, not a runner-day. 40, not 30: a hang late in a 20-25 minute run needs its 5-minute
+    # blame timeout (below) to fire and report before the job limit cancels everything silently.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -114,6 +116,22 @@ jobs:
             exit 1
           }
           Write-Host "no skipped tests across $($summaries.Count) test projects"
+
+      # THE HANG'S EVIDENCE LEAVES WITH THE RUNNER unless it is uploaded. A hang in a class fixture's
+      # teardown (a WebApplicationFactory host stopping after its last test) happens after every test
+      # has finished, so "the test running when the crash occurred" has nothing to name, and the dump
+      # and the blame Sequence file are the only record of which thread waited on what.
+      - name: Upload hang and crash evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blame-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            **/TestResults/**/*.dmp
+            **/TestResults/**/Sequence_*.xml
+            test-output.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   # THE LINUX INGEST ARENA, ON LINUX.
   #
