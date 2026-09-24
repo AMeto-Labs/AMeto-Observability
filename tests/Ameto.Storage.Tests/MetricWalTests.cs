@@ -122,6 +122,9 @@ public sealed class MetricWalTests : IAsyncLifetime
     private string WalPath  => Path.Combine(_dir, "metrics.wal");
     private string PoolPath => WalPath + ".pool";
 
+    /// <summary>The v2 file header (v1's was 32 bytes): where the first entry starts, and what a file's size adds to its capacity.</summary>
+    private const int Hdr = 64;
+
     private static LabelSet Labels(params (string K, string V)[] pairs) =>
         new(pairs.Select(p => new KeyValuePair<string, string>(p.K, p.V)));
 
@@ -385,7 +388,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);
-            fs.Write(BitConverter.GetBytes(32L + offsetBeforeCommit));
+            fs.Write(BitConverter.GetBytes(Hdr + offsetBeforeCommit));
         }
 
         var reopened = OpenWal();
@@ -826,7 +829,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);                    // WalFileHeader.WriteOffset
-            fs.Write(BitConverter.GetBytes(32 + real + overshoot));
+            fs.Write(BitConverter.GetBytes(Hdr + real + overshoot));
         }
 
         var reopened = OpenWal();
@@ -2098,11 +2101,11 @@ public sealed class MetricWalTests : IAsyncLifetime
         for (int i = 0; i < 300; i++)                       // ~15.6 KB of entries: grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
+        Assert.Equal(Hdr + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
-            fs.Seek(32, SeekOrigin.Begin);                  // first entry's Generation field
+            fs.Seek(Hdr, SeekOrigin.Begin);                  // first entry's Generation field
             fs.Write(BitConverter.GetBytes(155_000_000_000UL));
         }
 
@@ -2115,7 +2118,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Empty(reopened.ReadAll(out _));
         Assert.Equal(0, reopened.WrittenBytes);
         // The grown corpse gave its space back instead of surviving its own cause.
-        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(Hdr + 4 * 1024, new FileInfo(WalPath).Length);
 
         // And the repair is real, not cosmetic: a point appended now is REACHABLE — before the
         // fix it would have landed beyond gigabytes of claimed garbage no scan could cross.
@@ -2146,7 +2149,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);                   // header WriteOffset
-            fs.Write(BitConverter.GetBytes((long)(32 + 4096)));
+            fs.Write(BitConverter.GetBytes((long)(Hdr + 4096)));
         }
 
         var logger   = new RecordingLogger();
@@ -2170,13 +2173,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var wal = OpenWal(4 * 1024);
         for (int i = 0; i < 110; i++)                       // ~5.7 KB: grows 4 → 8 KiB, under its 3/4 mark
             Append(wal, Scalar("cpu", 1_000 + i, i));
-        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(Hdr + 8 * 1024, new FileInfo(WalPath).Length);
 
         ulong gen = wal.BeginFlush();
         Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
 
         Assert.Equal(0, wal.WrittenBytes);
-        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(Hdr + 4 * 1024, new FileInfo(WalPath).Length);
 
         // Still a working log at the smaller size — the shrink remapped, it did not disable.
         Append(wal, Scalar("cpu", 9_000, 7.0));
@@ -2225,7 +2228,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);
-            fs.Write(BitConverter.GetBytes((long)32));      // header: no data at all
+            fs.Write(BitConverter.GetBytes((long)Hdr));      // header: no data at all
         }
 
         OpenWal();
@@ -2319,17 +2322,17 @@ public sealed class MetricWalTests : IAsyncLifetime
         var wal = OpenWal(4 * 1024);
         for (int i = 0; i < 110; i++)                       // ~5.7 KB: grows 4 → 8 KiB, under its 3/4 mark
             Append(wal, Scalar("cpu", 1_000 + i, i));
-        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(Hdr + 8 * 1024, new FileInfo(WalPath).Length);
 
         ulong gen = wal.BeginFlush();
         Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
         Assert.Equal(0, wal.WrittenBytes);
-        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);      // shrunk back to the floor
+        Assert.Equal(Hdr + 4 * 1024, new FileInfo(WalPath).Length);      // shrunk back to the floor
 
         for (int i = 0; i < 110; i++)                       // must re-Grow to 8 KiB, not overrun 4
             Append(wal, Scalar("cpu", 2_000 + i, i));
         Assert.Equal(110 * 52, wal.WrittenBytes);
-        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+        Assert.Equal(Hdr + 8 * 1024, new FileInfo(WalPath).Length);
         wal.Dispose();
 
         var reopened = OpenWal(4 * 1024);
@@ -2417,7 +2420,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         for (int i = 0; i < 300; i++)                       // grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
+        Assert.Equal(Hdr + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
@@ -2428,7 +2431,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         var reopened = OpenWal(4 * 1024);
 
         Assert.Equal(0, reopened.WrittenBytes);             // fresh header, as before
-        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);   // and no longer a corpse
+        Assert.Equal(Hdr + 4 * 1024, new FileInfo(WalPath).Length);   // and no longer a corpse
     }
 
     /// <summary>
@@ -2449,7 +2452,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
-            fs.Seek(32 + 8, SeekOrigin.Begin);              // entry 0's SeriesIndex field
+            fs.Seek(Hdr + 8, SeekOrigin.Begin);              // entry 0's SeriesIndex field
             fs.Write(BitConverter.GetBytes(uint.MaxValue - 3));
         }
 
@@ -2488,7 +2491,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
-            fs.Seek(32, SeekOrigin.Begin);                  // entry 0's Generation field
+            fs.Seek(Hdr, SeekOrigin.Begin);                  // entry 0's Generation field
             fs.Write(BitConverter.GetBytes(155_000_000_000UL));
         }
 
@@ -2520,7 +2523,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         // …because the commit-time shrink is also a resize, so the seam must only arm at OPEN.
         // Grow the file back by hand to guarantee the reopen attempts a shrink.
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
-            fs.SetLength(32 + 16 * 1024);
+            fs.SetLength(Hdr + 16 * 1024);
 
         MetricWriteAheadLog? opened = null;
         var thrown = Record.Exception(() =>
@@ -2737,7 +2740,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
-            fs.Seek(32, SeekOrigin.Begin);               // first entry's Generation field
+            fs.Seek(Hdr, SeekOrigin.Begin);               // first entry's Generation field
             fs.Write(BitConverter.GetBytes(155_000_000_000UL));
         }
 
@@ -2753,6 +2756,6 @@ public sealed class MetricWalTests : IAsyncLifetime
         Span<byte> off = stackalloc byte[8];
         check.Seek(8, SeekOrigin.Begin);                 // WalFileHeader.WriteOffset
         check.ReadExactly(off);
-        Assert.Equal(32L, BitConverter.ToInt64(off));    // the log is empty again
+        Assert.Equal((long)Hdr, BitConverter.ToInt64(off));    // the log is empty again
     }
 }

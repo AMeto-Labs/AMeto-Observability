@@ -52,13 +52,17 @@ internal enum MetricWalCommit
 ///
 /// <code>
 ///   metrics.wal (v2)
-///     [File Header — 32 bytes]
+///     [File Header — 64 bytes; v1's was the first 32 of them]
 ///       0   Magic               uint32  "RDMW"
 ///       4   Version             uint16  2   (1 is still READ: see Open)
 ///       6   _pad                uint16
-///       8   WriteOffset         int64
+///       8   WriteOffset         int64   absolute: includes this header
 ///      16   Generation          uint64  stamped on new appends
 ///      24   CommittedGeneration uint64  everything at or below this is already in files
+///      32   MoveFrom            int64   the relocation record: see RelocateLocked
+///      40   MoveLength          int64   0 = no relocation in flight
+///      48   MoveDone            int64
+///      56   _reserved           8 bytes
 ///     [Entry Header — 48 bytes, Pack = 1, the fields of MetricWalEntryHeader]
 ///     [Crc          — uint32, CRC32C over the 48 header bytes + the bucket counts]
 ///     [BucketCounts — BucketCount × int64]
@@ -69,7 +73,8 @@ internal enum MetricWalCommit
 ///         crc = CRC32C over the first 8 bytes of the record + the body
 /// </code>
 ///
-/// <para><b>v2 is v1 plus a checksum per entry and per pool record, and nothing else.</b> v1
+/// <para><b>v2 is v1 plus a checksum per entry and per pool record, and a header long enough
+/// to record a relocation in flight (see <see cref="RelocateLocked"/>).</b> v1
 /// protected an entry only by judgement — the generation margin, the series-index cap, the
 /// header's claimed end checked against the walk — so a torn entry whose fields happened to
 /// decode as plausible (a generation inside the margin, a small series index) replayed as a
@@ -93,10 +98,13 @@ internal enum MetricWalCommit
 /// batch (<see cref="WriteBatchLocked"/>), so a process that dies inside an append leaves the
 /// batch unclaimed, and every claimed entry verifies. After a power loss the checksum turns the
 /// loss into a clean cut at the first entry that does not verify instead of a replay of
-/// garbage. What it cannot do is make a commit's relocation durable: the moved survivors and
-/// the header that names them sit on different pages, so a power loss can keep the header and
-/// lose the move — the points that arrived during that flush are then lost, not
-/// misreplayed.</para>
+/// garbage. A commit's move of the surviving tail to the front is recorded in the v2 header
+/// before its first byte moves and finished at the next open if the process dies inside it
+/// (<see cref="RelocateLocked"/>) — without that, the checksum itself cut the log at the entry
+/// straddling the copy frontier and stranded every survivor not yet copied. What nothing here
+/// makes durable is that move across a POWER LOSS: the moved survivors and the header that
+/// names them sit on different pages, so the disk can keep the header and lose the move — the
+/// points that arrived during that flush are then lost, not misreplayed.</para>
 ///
 /// <para><b>Flush protocol.</b> A flush is two-phase, because points keep arriving while the
 /// files are being written and their log records must survive:</para>
@@ -183,8 +191,13 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private const uint   MagicNumber     = 0x52_44_4D_57; // "RDMW"
     private const ushort WalVersion      = 2;
     private const ushort WalVersionV1    = 1;
-    private const int    FileHeaderSize  = 32;
     private const ulong  FirstGeneration = 1;
+
+    /// <summary>A v2 file header: v1's 32 bytes, then the relocation record and room. See <see cref="WalFileHeader"/>.</summary>
+    private const int    FileHeaderSize   = 64;
+
+    /// <summary>A v1 file header. Its data starts right after it, so a v1 log's offsets are 32 lower.</summary>
+    private const int    FileHeaderSizeV1 = 32;
 
     /// <summary>The 48 bytes of <see cref="MetricWalEntryHeader"/> — every byte the entry checksum covers besides the buckets. All of a v1 entry header.</summary>
     private const int    ChecksummedHeaderBytes = 48;
@@ -226,6 +239,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>Bucket counts per histogram point are capped so the 16-bit length field holds.</summary>
     private const int MaxBucketCounts = ushort.MaxValue;
 
+    /// <summary>
+    /// The file header. The first 32 bytes are v1's, byte for byte; the rest exists in v2 only,
+    /// and a log that is v1 on disk never reads or writes past its 32 (see <c>_headerSize</c>).
+    ///
+    /// <para><b>The relocation record</b> (<see cref="MoveFrom"/>, <see cref="MoveLength"/>,
+    /// <see cref="MoveDone"/>) is what makes a commit's move of the surviving tail safe against
+    /// the process dying in the middle of it. See <see cref="RelocateLocked"/>.</para>
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
     {
@@ -235,6 +256,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         public long   WriteOffset;
         public ulong  Generation;
         public ulong  CommittedGeneration;
+        // ── v2 only ──
+        public long   MoveFrom;          // logical offset the surviving tail is moved from
+        public long   MoveLength;        // its length; 0 = no relocation in flight
+        public long   MoveDone;          // bytes of it already moved, always a chunk boundary
+        private long  _reserved;
     }
 
     /// <summary>
@@ -303,6 +329,13 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private int  _entryHeaderSize = EntryHeaderSize;
     private bool _checksummed     = true;
+
+    /// <summary>
+    /// Where the data starts: <see cref="FileHeaderSize"/>, or <see cref="FileHeaderSizeV1"/> for
+    /// a log that is v1 on disk. Every offset into the mapping and every file size goes through
+    /// it. Set by <see cref="OpenOrCreate"/> before the mapping is sized, and never again.
+    /// </summary>
+    private int  _headerSize      = FileHeaderSize;
 
     /// <summary>Set by <see cref="OpenOrCreate"/> when the file on disk is a v1 log; <see cref="Open"/> upgrades it.</summary>
     private bool _legacyV1;
@@ -552,7 +585,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             fileHeader.Clear();
             fs.Write(fileHeader);                        // placeholder; the real one goes in last
 
-            byte* data = _ptr + FileHeaderSize;
+            byte* data = _ptr + _headerSize;                 // the v1 map: data at 32
             Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
             long pos = 0, written = 0, total;
             while ((total = EntryAt(data, pos, _writeOffset, verify: false, out _)) > 0)
@@ -589,7 +622,6 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     {
         _floorCapacity = Math.Max(initialCapacity, 1);
         bool exists   = File.Exists(_filePath);
-        long fileSize = FileHeaderSize + initialCapacity;
 
         // ONE handle, held until Dispose, and every mapping is created over it. Reopening by
         // path on each resize is a race with anything that reads the file — and "anything"
@@ -599,42 +631,53 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // what was a routine resize. Measured, not imagined: a retrying reader killed it on its
         // first attempt. Resizes now run against this handle, which nothing can contend.
         _file = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        if (_file.Length < fileSize) _file.SetLength(fileSize);
-        else                         fileSize = _file.Length;   // reopen an already-grown log
 
-        _capacity = fileSize - FileHeaderSize;
-        Map(fileSize);
-
-        ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-        bool known = exists && hdr.Magic == MagicNumber && (hdr.Version == WalVersion || hdr.Version == WalVersionV1);
-        if (known && hdr.Version == WalVersionV1)
+        // The version decides the header's size, and the header's size decides where the data
+        // starts — so it is read off the handle before the mapping is sized.
+        ushort onDisk = exists ? VersionOnDisk(_file) : (ushort)0;
+        bool   known  = onDisk is WalVersion or WalVersionV1;
+        if (onDisk == WalVersionV1)
         {
             // Left in the v1 layout, and read with it — BEFORE the walk below, which has to step
             // with the file's own stride. Open upgrades it once it is open (see there).
             _legacyV1        = true;
+            _headerSize      = FileHeaderSizeV1;
             _entryHeaderSize = EntryHeaderSizeV1;
             _checksummed     = false;
         }
 
+        long fileSize = _headerSize + initialCapacity;
+        if (_file.Length < fileSize) _file.SetLength(fileSize);
+        else                         fileSize = _file.Length;   // reopen an already-grown log
+
+        _capacity = fileSize - _headerSize;
+        Map(fileSize);
+
+        ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
         if (!known)
         {
             // New, foreign or future-versioned file — re-initialise in place, as v2. Anything
             // already there cannot be replayed under a layout this build does not know.
             hdr.Magic               = MagicNumber;
             hdr.Version             = WalVersion;
-            hdr.WriteOffset         = FileHeaderSize;
+            hdr.WriteOffset         = _headerSize;
             hdr.Generation          = FirstGeneration;
             hdr.CommittedGeneration = 0;
+            ClearRelocation(ref hdr);
             _writeOffset            = 0;
             _generation             = FirstGeneration;
             _committedGeneration    = 0;
         }
         else
         {
-            _writeOffset         = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
+            _writeOffset         = Math.Max(0, hdr.WriteOffset - _headerSize);
             _generation          = hdr.Generation;
             _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
+
+            // A commit's move of the surviving tail that the process did not live to finish is
+            // finished here, before anything walks the data. See RelocateLocked.
+            if (!_legacyV1) FinishRelocationLocked(ref hdr);
 
             // The counter must LEAD the watermark. BeginFlush only ever hands out _generation
             // and CommitFlush only ever names a generation it was handed, so a header where the
@@ -758,7 +801,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private void ReconcileDataEndLocked(ref WalFileHeader hdr)
     {
-        byte* data = _ptr + FileHeaderSize;
+        byte* data = _ptr + _headerSize;
 
         long     pos  = 0;
         ulong    seed = 0;
@@ -844,7 +887,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 orphaned, reason, pos, _writeOffset);
 
         _writeOffset    = pos;
-        hdr.WriteOffset = FileHeaderSize + pos;
+        hdr.WriteOffset = _headerSize + pos;
 
         if (pos + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
@@ -936,7 +979,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private void ShrinkLocked(long targetCapacity, string when)
     {
         long oldCapacity = _capacity;
-        long newFileSize = FileHeaderSize + targetCapacity;
+        long newFileSize = _headerSize + targetCapacity;
 
         Unmap();
         try
@@ -957,10 +1000,10 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // Append/BeginFlush already refuse that state honestly.
             try
             {
-                BeforeResize?.Invoke(oldCapacity + FileHeaderSize);
+                BeforeResize?.Invoke(oldCapacity + _headerSize);
                 long actual = _file!.Length;
                 Map(actual);
-                _capacity = actual - FileHeaderSize;
+                _capacity = actual - _headerSize;
                 _logger?.LogWarning(ex,
                     "Metric WAL shrink at {When} failed; continuing at {MiB:F0} MiB.",
                     when, _capacity / 1048576.0);
@@ -1239,7 +1282,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // batch is down. See the remarks above for why the partial state must stay unclaimed.
             long offset     = _writeOffset;
             int  headerSize = _entryHeaderSize;
-            byte* data      = _ptr + FileHeaderSize;
+            byte* data      = _ptr + _headerSize;
 
             // Did the registry turn over between the caller's lock-free lookups and this lock?
             bool staleResolution = preResolved.IsEmpty || _seriesEpoch != resolvedAtEpoch;
@@ -1294,7 +1337,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             OnBatchWrittenForTest?.Invoke(offset);
 
             _writeOffset = offset;
-            Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+            Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + _writeOffset;
         }
     }
 
@@ -1597,7 +1640,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private void Compact(ulong committed)
     {
-        byte* data = _ptr + FileHeaderSize;
+        byte* data = _ptr + _headerSize;
 
         long firstSurvivor = _writeOffset;
         long pos = 0, total;
@@ -1619,10 +1662,23 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         }
 
         long surviving = _writeOffset - firstSurvivor;
-        if (surviving > 0 && firstSurvivor > 0)
-            Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
+        bool move      = surviving > 0 && firstSurvivor > 0;
 
-        _writeOffset = Math.Max(0, surviving);
+        if (move && !_legacyV1)
+        {
+            // v2: the move is recorded before its first byte, finished at the next open if the
+            // process dies inside it, and the record is cleared only once the new end is stored.
+            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+            RelocateLocked(ref hdr, data, firstSurvivor, surviving, done: 0);
+            _writeOffset    = surviving;
+            hdr.WriteOffset = _headerSize + _writeOffset;
+            ClearRelocation(ref hdr);
+        }
+        else
+        {
+            if (move) Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
+            _writeOffset = Math.Max(0, surviving);
+        }
 
         // The move does not erase its source. A crash before the offset store below would
         // therefore leave the old, larger offset covering BOTH the relocated survivors and
@@ -1631,11 +1687,15 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // the data now ends — ReadAll already treats 0 as end-of-data. (No room for the
         // marker means the log is at capacity, where the next append grows it anyway.) The v2
         // checksum does not make the marker redundant: the originals are the very bytes that
-        // were moved, and they verify exactly as well as their copies do.
+        // were moved, and they verify exactly as well as their copies do. In v2 the relocation
+        // record covers the process dying here; the marker stays for the header page that a
+        // power loss may keep older than the data pages. It is planted AFTER the record is
+        // cleared, never before: when the survivors were exactly as long as the prefix, the
+        // marker's slot is the first source entry, which a finish-at-open would still read.
         if (_writeOffset + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + _writeOffset).Generation = 0;
 
-        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + _writeOffset;
 
         // The pool is only reclaimable once nothing references it. Survivors still carry
         // their series indices, so it is truncated on the flushes that empty the log — which
@@ -1666,6 +1726,118 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         }
     }
 
+    /// <summary>
+    /// Test seam fired by <see cref="RelocateLocked"/> with the header's <see cref="WalFileHeader.MoveDone"/>
+    /// each time it is stored — 0 once the record is armed and before the first byte moves, then
+    /// after every chunk. What the file holds at that instant is what a process killed there
+    /// leaves. Null in production.
+    /// </summary>
+    internal Action<long>? OnRelocationStepForTest;
+
+    /// <summary>
+    /// Moves the surviving tail <c>[from, from + length)</c> to the front, FROM <paramref name="done"/>
+    /// on, recording its progress in the header so that a process that dies anywhere inside can be
+    /// finished at the next open (<see cref="FinishRelocationLocked"/>). v2 only; caller holds the
+    /// locks (or is the open).
+    ///
+    /// <para><b>Why v1's single <c>Buffer.MemoryCopy</c> was not enough once entries carry
+    /// checksums.</b> The watermark is stored before the move, so a process killed in the middle
+    /// of the copy left the new watermark over the old claim, with the front half overwritten:
+    /// the copies verify, the entry straddling the copy frontier does not, and the open-time walk
+    /// cut the log there. The survivors not yet copied still sat intact further on — acknowledged
+    /// points in no <c>.mts</c> — and nothing would ever read them again. v1 walked on past the
+    /// frontier off garbage lengths and replayed them, with duplicates; v2 made the loss certain.</para>
+    ///
+    /// <para><b>Chunks no longer than <paramref name="from"/>,</b> so that no chunk's destination
+    /// overlaps its own source: a chunk at <c>d</c> writes <c>[d, d + c)</c> and reads
+    /// <c>[from + d, from + d + c)</c>, and <c>c ≤ from</c>. The earlier chunks wrote only below
+    /// <c>d</c>, so a chunk's source is intact until that chunk is done — which is what makes
+    /// redoing the chunk <see cref="WalFileHeader.MoveDone"/> names exact, however far into it the
+    /// process got. When the survivors fit in the gap (the usual case: a flush's tail is smaller
+    /// than its snapshot) this is ONE chunk, the old single copy; a tail longer than the prefix it
+    /// replaces takes <c>length / from</c> of them, one header store each.</para>
+    ///
+    /// <para><b>Order.</b> <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// first, then <see cref="WalFileHeader.MoveLength"/>, which arms the record; then each chunk,
+    /// then its <see cref="WalFileHeader.MoveDone"/>. The caller stores the new end and only then
+    /// clears the record. Program order is what a killed process leaves behind; across a power loss
+    /// the header page and the data pages still reach the disk in any order, the residual the class
+    /// remarks name.</para>
+    /// </summary>
+    private void RelocateLocked(ref WalFileHeader hdr, byte* data, long from, long length, long done)
+    {
+        if (done == 0)
+        {
+            hdr.MoveFrom   = from;
+            hdr.MoveDone   = 0;
+            hdr.MoveLength = length;                     // armed
+            OnRelocationStepForTest?.Invoke(0);
+        }
+
+        while (done < length)
+        {
+            long chunk = Math.Min(from, length - done);
+            Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
+            done         += chunk;
+            hdr.MoveDone  = done;
+            OnRelocationStepForTest?.Invoke(done);
+        }
+    }
+
+    private static void ClearRelocation(ref WalFileHeader hdr)
+    {
+        hdr.MoveLength = 0;                              // disarmed first
+        hdr.MoveFrom   = 0;
+        hdr.MoveDone   = 0;
+    }
+
+    /// <summary>
+    /// Finishes a relocation the previous process was killed inside (<see cref="RelocateLocked"/>):
+    /// redoes the chunk the header's <see cref="WalFileHeader.MoveDone"/> names and every one after
+    /// it, stores the end the commit would have stored, clears the record and plants the marker.
+    /// Runs at open, before any walk. A record whose numbers cannot describe a move inside this file
+    /// is not acted on — moving bytes by it could only destroy data — and is cleared with an Error;
+    /// the walk that follows then decides where the data ends, as it did before the record existed.
+    /// </summary>
+    private void FinishRelocationLocked(ref WalFileHeader hdr)
+    {
+        long from = hdr.MoveFrom, length = hdr.MoveLength, done = hdr.MoveDone;
+        if (length == 0) return;                         // nothing in flight: the normal case
+
+        if (from <= 0 || length <= 0 || done < 0 || done > length || from > _capacity - length)
+        {
+            _logger?.LogError(
+                "Metric WAL header records a relocation no commit could have started (from {From}, length {Length}, " +
+                "done {Done}, capacity {Capacity}); ignoring it — the walk decides where the data ends.",
+                from, length, done, _capacity);
+            ClearRelocation(ref hdr);
+            return;
+        }
+
+        _logger?.LogWarning(
+            "Metric WAL: finishing the relocation of {Length} byte(s) of surviving points that a stop interrupted " +
+            "after {Done} byte(s).", length, done);
+
+        byte* data = _ptr + _headerSize;
+        RelocateLocked(ref hdr, data, from, length, done);
+        _writeOffset    = length;
+        hdr.WriteOffset = _headerSize + length;
+        ClearRelocation(ref hdr);
+        if (length + _entryHeaderSize <= _capacity)
+            Unsafe.AsRef<MetricWalEntryHeader>(data + length).Generation = 0;
+    }
+
+    /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a metric WAL at all.</summary>
+    private static ushort VersionOnDisk(FileStream file)
+    {
+        Span<byte> head = stackalloc byte[6];
+        file.Position = 0;
+        int read = file.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+        file.Position = 0;
+        if (read < head.Length || BinaryPrimitives.ReadUInt32LittleEndian(head) != MagicNumber) return 0;
+        return BinaryPrimitives.ReadUInt16LittleEndian(head[4..]);
+    }
+
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1691,7 +1863,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             var referenced = new HashSet<uint>();
             for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
-                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + _headerSize + pos);
                 if (eh.Generation > _committedGeneration) referenced.Add(eh.SeriesIndex);
             }
 
@@ -1699,7 +1871,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
             for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
-                byte* src = _ptr + FileHeaderSize + pos;
+                byte* src = _ptr + _headerSize + pos;
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(src);
 
                 if (eh.Generation > _committedGeneration)
@@ -1747,7 +1919,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// replay is the step whose output becomes points.</para>
     /// </summary>
     private long ReplayStrideLocked(long pos, long end) =>
-        EntryAt(_ptr + FileHeaderSize, pos, end, verify: true, out _);
+        EntryAt(_ptr + _headerSize, pos, end, verify: true, out _);
 
     private readonly record struct PoolEntry(
         string Name, MetricKind Kind, string Unit, LabelSet Labels, double[]? Bounds);
@@ -1988,7 +2160,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
         long target = capacity;
         while (target < needed) target = NextCapacity(target);
-        long newFileSize = FileHeaderSize + target;
+        long newFileSize = _headerSize + target;
 
         MemoryMappedFile?         mmf  = null;
         MemoryMappedViewAccessor? view = null;

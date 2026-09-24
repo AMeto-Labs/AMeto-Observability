@@ -46,7 +46,8 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     private string PoolPath => WalPath + ".pool";
     private string TmpPath  => WalPath + MetricWriteAheadLog.UpgradeSuffix;
 
-    private const int  FileHeader = 32;
+    private const int  FileHeader   = 64;    // v2: v1's 32 bytes + the relocation record
+    private const int  FileHeaderV1 = 32;
     private const int  V1Entry    = 48;          // the header, no checksum
     private const int  V2Entry    = 52;          // the same 48 bytes + the CRC
     private const long Capacity   = 64 * 1024;
@@ -179,13 +180,14 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     private void WriteLog(ushort version, ulong generation, ulong committed, byte[][] entries, byte[][] poolRecords)
     {
         long written = entries.Sum(static e => (long)e.Length);
-        var file = new byte[FileHeader + Capacity];
+        int  head = version == 1 ? FileHeaderV1 : FileHeader;
+        var file = new byte[head + Capacity];
         BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(0), 0x52_44_4D_57);          // "RDMW"
         BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(4), version);
-        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), FileHeader + written);
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), head + written);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), generation);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(24), committed);
-        long at = FileHeader;
+        long at = head;
         foreach (var e in entries) { e.CopyTo(file, at); at += e.Length; }
         File.WriteAllBytes(WalPath, file);
         File.WriteAllBytes(PoolPath, poolRecords.SelectMany(static r => r).ToArray());
@@ -442,6 +444,68 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         Assert.Equal(expected, replayed.Select(static r => r.Point.Value));
     }
 
+    // ── A commit's relocation, killed half-way ───────────────────────────────
+
+    /// <summary>
+    /// A PROCESS KILLED INSIDE A COMMIT'S MOVE OF THE SURVIVORS LOSES NONE OF THEM. The commit
+    /// stores the watermark, then moves the surviving tail to the front. The file is copied at the
+    /// relocation's own seam — once its record is armed, or after a whole chunk — and the kill is
+    /// completed by hand the way a forward memmove leaves it: <paramref name="intoNextChunk"/>
+    /// bytes of the next chunk copied, the rest not. Opening that file must replay every survivor
+    /// exactly once and no committed point. Without the record finished at open, the moved copies
+    /// verify, the entry straddling the copy frontier fails its checksum, the walk cuts the log
+    /// there, and every survivor past it is gone — acknowledged points in no <c>.mts</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(6, 4, 0, 78)]      // one chunk (the tail fits in the gap), killed 1.5 entries into it
+    [InlineData(6, 4, 0, 0)]       // killed right after the record was armed: nothing moved yet
+    [InlineData(2, 5, 1, 30)]      // a tail longer than the prefix: three chunks, killed inside the second
+    [InlineData(2, 5, 2, 51)]      // …inside the last, one byte short of it
+    public void A_process_killed_inside_a_commits_relocation_loses_no_survivor(
+        int committedEntries, int survivors, int chunksDone, int intoNextChunk)
+    {
+        long prefix = committedEntries * (long)V2Entry, tail = survivors * (long)V2Entry;
+        long doneAtKill = Math.Min(prefix * chunksDone, tail);
+
+        byte[]? atStep = null, poolAtStep = null;
+        using (var wal = Open())
+        {
+            for (int i = 0; i < committedEntries; i++) wal.Append([Gauge("cpu", i, 100 + i)]);
+            ulong flushing = wal.BeginFlush();
+            for (int j = 0; j < survivors; j++) wal.Append([Gauge("cpu", 50 + j, 200 + j)]);
+
+            wal.OnRelocationStepForTest = done =>
+            {
+                if (done != doneAtKill || atStep is not null) return;
+                atStep     = ReadShared(WalPath);
+                poolAtStep = ReadShared(PoolPath);
+            };
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));
+            wal.OnRelocationStepForTest = null;
+            Assert.Equal(tail, wal.WrittenBytes);                               // the live log finished it
+        }
+        Assert.NotNull(atStep);
+
+        long chunk = Math.Min(prefix, tail - doneAtKill);
+        Array.Copy(atStep!, FileHeader + prefix + doneAtKill, atStep!, FileHeader + doneAtKill, Math.Min(intoNextChunk, chunk));
+
+        string killed = Path.Combine(_dir, "killed");
+        Directory.CreateDirectory(killed);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal"), atStep!);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal.pool"), poolAtStep!);
+
+        double[] expected = Enumerable.Range(0, survivors).Select(static j => 200.0 + j).ToArray();
+        var reopened = Open(path: Path.Combine(killed, "metrics.wal"));
+        Assert.Equal(expected, reopened.ReadAll(out int unresolved).Select(static r => r.Point.Value));
+        Assert.Equal(0, unresolved);
+        Assert.Equal(tail, reopened.WrittenBytes);                                // finished, not just read past
+        reopened.Dispose();
+
+        // And the finish is durable in the file: the next open has nothing left to finish.
+        var again = Open(path: Path.Combine(killed, "metrics.wal"));
+        Assert.Equal(expected, again.ReadAll(out _).Select(static r => r.Point.Value));
+    }
+
     // ── The pool ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -601,7 +665,7 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
 
         // Appended as v1: a 48-byte entry, and a pool record a v1 reader can walk.
         byte[] wal1 = File.ReadAllBytes(WalPath);
-        Assert.Equal(FileHeader + 5 * V1Entry + 4 * 8 + V1Entry, BinaryPrimitives.ReadInt64LittleEndian(wal1.AsSpan(8)));
+        Assert.Equal(FileHeaderV1 + 5 * V1Entry + 4 * 8 + V1Entry, BinaryPrimitives.ReadInt64LittleEndian(wal1.AsSpan(8)));
         byte[] pool = File.ReadAllBytes(PoolPath);
         int v1Records = 8 + CpuBody.Length + 8 + LatencyBody.Length;
         Assert.Equal(0x00, pool[v1Records + 7]);
