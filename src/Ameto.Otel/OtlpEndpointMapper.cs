@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using System.Buffers;
@@ -42,6 +43,18 @@ public static class OtlpEndpointMapper
         AllowTrailingCommas  = true,
     };
 
+    /// <summary>
+    /// What the OTLP receivers — HTTP and gRPC — share across requests: the gate that bounds how
+    /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>). TryAdd, so a
+    /// host that already registered one — a test with a smaller gate — keeps it.
+    /// </summary>
+    public static IServiceCollection AddOtlpReceivers(this IServiceCollection services)
+    {
+        services.TryAddSingleton(static sp => OtlpInflateGate.For(
+            sp.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes));
+        return services;
+    }
+
     /// <param name="basePath">
     /// The deployment prefix, leading slash and no trailing one ("/ameto"), or empty at the root.
     /// Passed on to <see cref="AmetoIngestEndpoints"/>: with a prefix configured an exporter is
@@ -59,12 +72,17 @@ public static class OtlpEndpointMapper
         // same logger — on the busiest route in the server.
         ILogger tracesLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Traces");
 
+        // The one gate both receivers inflate under (see OtlpInflateGate), resolved once here —
+        // and REQUIRED, so a host that maps the receivers without AddOtlpReceivers fails at
+        // startup rather than on its first compressed batch.
+        OtlpInflateGate inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
+
         // ── Traces ────────────────────────────────────────────────────────────
         var traces = async (HttpContext ctx, ISpanSink sink) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
-            var (body, bodyLen) = await ReadBodyAsync(ctx);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
             if (body is null) return;
 
             int ingested, refused;
@@ -88,7 +106,7 @@ public static class OtlpEndpointMapper
                 ctx.Response.StatusCode = 400;
                 return;
             }
-            finally { IngestBufferPool.Return(body); }
+            finally { IngestBufferPool.Return(body); slot?.Exit(); }
 
             LogTracesDecoded(tracesLogger, ingested + refused);
             await WriteJsonOk(ctx, ingested, refused);
@@ -100,7 +118,7 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
 
-            var (body, bodyLen) = await ReadBodyAsync(ctx);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
             if (body is null) return;
 
             List<Ameto.Metrics.MetricIngestItem> points;
@@ -123,7 +141,7 @@ public static class OtlpEndpointMapper
                 }
             }
             catch { ctx.Response.StatusCode = 400; return; }
-            finally { IngestBufferPool.Return(body); }
+            finally { IngestBufferPool.Return(body); slot?.Exit(); }
 
             int refused = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count - refused, refused);
@@ -135,7 +153,7 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
-            var (body, bodyLen) = await ReadBodyAsync(ctx);
+            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate);
             if (body is null) return;
 
             int ingested = 0, dropped = 0;
@@ -152,7 +170,7 @@ public static class OtlpEndpointMapper
                     : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
             }
             catch { ctx.Response.StatusCode = 400; return; }
-            finally { IngestBufferPool.Return(body); }
+            finally { IngestBufferPool.Return(body); slot?.Exit(); }
 
             await WriteJsonOk(ctx, ingested, dropped);
         };
@@ -268,14 +286,18 @@ public static class OtlpEndpointMapper
     /// without ever renting past the ceiling — and the inflate is <see cref="OtlpGzip"/>, which
     /// it shares too, under the SAME ceiling applied to the inflated size.
     ///
-    /// <para>Returns (null, 0) with the refusal already written, and nothing left rented: 415 for
-    /// a coding other than gzip or identity (before a byte of the body is read), 413 for a body
-    /// over the limit on the wire or once inflated, 400 for gzip that does not inflate. On success
-    /// the caller MUST return the buffer via <see cref="IngestBufferPool.Return"/> — use a
-    /// finally block. It is the inflated buffer when the body was compressed; the compressed one
-    /// has already gone back.</para>
+    /// <para>Returns <c>default</c> — no buffer — with the refusal already written, and nothing
+    /// left rented or held: 415 for a coding other than gzip or identity (before a byte of the
+    /// body is read), 413 for a body over the limit on the wire or once inflated, 400 for gzip
+    /// that does not inflate, 503 with <c>Retry-After</c> when every inflate slot stayed taken.
+    /// On success the caller MUST return the buffer via <see cref="IngestBufferPool.Return"/>
+    /// and then, when <c>Slot</c> is not null, <see cref="OtlpInflateGate.Exit"/> it — in a
+    /// finally. The buffer is the inflated one when the body was compressed (the compressed one
+    /// has already gone back), and <c>Slot</c> is the gate slot it holds: see
+    /// <see cref="OtlpInflateGate"/> for why the slot lives as long as the buffer.</para>
     /// </summary>
-    private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
+    private static async ValueTask<(byte[]? Buffer, int Length, OtlpInflateGate? Slot)> ReadBodyAsync(
+        HttpContext ctx, OtlpInflateGate gate)
     {
         // Decided before the body is read: bytes in a coding this receiver cannot undo could
         // only be refused after a buffer had been spent on them.
@@ -284,32 +306,46 @@ public static class OtlpEndpointMapper
         {
             WriteUnsupportedEncoding(ctx);
             await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
-            return (null, 0);
+            return default;
         }
 
         int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
-        var body = await OtlpBodyReader.ReadAsync(ctx, maxBytes);
+        var (buffer, length) = await OtlpBodyReader.ReadAsync(ctx, maxBytes);
 
         // The one thing the two receivers do differently with a refusal: this one has an HTTP
         // status to say it in. The gRPC receiver says it in trailers, as RESOURCE_EXHAUSTED.
-        if (body.Buffer is null)
+        if (buffer is null)
         {
             ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-            return body;
+            return default;
         }
 
         // gzip over NOTHING is an empty message, exactly as an uncompressed empty body is: there
         // is no member to inflate, and GZipStream would read the same zero bytes after allocating
         // itself to find that out. What an empty message answers is the parser's business.
-        if (coding == ContentCoding.Identity || body.Length == 0) return body;
+        // Neither road inflates, so neither takes a slot.
+        if (coding == ContentCoding.Identity || length == 0) return (buffer, length, null);
 
-        return InflateBody(ctx, body.Buffer, body.Length, maxBytes);
+        // A slot before the inflate buffer exists — and the compressed buffer back on every way
+        // out that does not reach InflateBody, which returns it itself.
+        bool entered;
+        try { entered = await gate.TryEnterAsync(ctx.RequestAborted); }
+        catch { IngestBufferPool.Return(buffer); throw; }
+        if (!entered)
+        {
+            IngestBufferPool.Return(buffer);
+            WriteRetryLater(ctx, GateFullMessage);
+            return default;
+        }
+
+        return InflateBody(ctx, buffer, length, maxBytes, gate);
     }
 
     /// <summary>
     /// The gzip road: inflates into a second pooled buffer under the same
     /// <c>MaxOtlpBatchBytes</c> ceiling the wire read used, then gives the compressed one back —
-    /// on every outcome, since nothing downstream reads compressed bytes.
+    /// on every outcome, since nothing downstream reads compressed bytes. Entered holding a slot
+    /// of <paramref name="gate"/>: the slot leaves with the inflated buffer, or goes back here.
     ///
     /// <para>What the ceiling means here is what #57 established for gRPC and what this issue
     /// (#82) had to keep: it bounds the INFLATED size and is decided on bytes already written,
@@ -317,11 +353,12 @@ public static class OtlpEndpointMapper
     /// of output — never the gigabytes it describes. No rent passes the limit; held at once,
     /// the request is the compressed body plus one limit of inflate buffer when the trailer is
     /// honest, one and a half when it understates and the buffer doubles into the limit
-    /// (about 20 MiB at the 8 MiB default). Both buffers are
-    /// from <see cref="IngestBufferPool"/>, so at the steady state an accepted compressed batch
-    /// allocates nothing but the inflater itself.</para>
+    /// (about 20 MiB at the 8 MiB default) — and the gate bounds how many requests do that at
+    /// once. Both buffers are from <see cref="IngestBufferPool"/>, so at the steady state an
+    /// accepted compressed batch allocates nothing but the inflater itself.</para>
     /// </summary>
-    private static (byte[]? Buffer, int Length) InflateBody(HttpContext ctx, byte[] compressed, int compressedLength, int maxBytes)
+    private static (byte[]? Buffer, int Length, OtlpInflateGate? Slot) InflateBody(
+        HttpContext ctx, byte[] compressed, int compressedLength, int maxBytes, OtlpInflateGate gate)
     {
         InflateResult result;
         byte[]? inflated;
@@ -330,12 +367,18 @@ public static class OtlpEndpointMapper
         {
             result = OtlpGzip.Inflate(compressed.AsMemory(0, compressedLength), maxBytes, out inflated, out inflatedLength);
         }
+        catch
+        {
+            gate.Exit();
+            throw;
+        }
         finally
         {
             IngestBufferPool.Return(compressed);
         }
 
-        if (result == InflateResult.Ok) return (inflated, inflatedLength);
+        if (result == InflateResult.Ok) return (inflated, inflatedLength, gate);   // the slot goes with the buffer
+        gate.Exit();
 
         if (result == InflateResult.TooLarge)
         {
@@ -352,7 +395,38 @@ public static class OtlpEndpointMapper
             // parsed, so unlike a malformed message there is no ingested prefix to warn about.
             ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
         }
-        return (null, 0);
+        return default;
+    }
+
+    // ── 503: retry later ──────────────────────────────────────────────────────
+
+    /// <summary>What a 503 says when every inflate slot stayed taken.</summary>
+    internal static ReadOnlySpan<byte> GateFullMessage => "the server is inflating as many gzip batches as it can hold; retry"u8;
+
+    /// <summary>
+    /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and
+    /// one parse, milliseconds for an ordinary batch, so the gate is rarely full for longer — and
+    /// an exporter backs off on its own schedule past this anyway.
+    /// </summary>
+    internal const string RetryAfterSeconds = "1";
+
+    /// <summary>
+    /// The retryable refusal: 503, <c>Retry-After</c>, and the OTLP failure shape carrying
+    /// <paramref name="message"/>. 503 is one of the statuses the OTLP/HTTP specification tells
+    /// an exporter to retry — with backoff, honouring <c>Retry-After</c> — so the batch is
+    /// delayed, not lost. Written without an await; the body goes out as the request completes.
+    /// </summary>
+    private static void WriteRetryLater(HttpContext ctx, ReadOnlySpan<byte> message)
+    {
+        var response = ctx.Response;
+        bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+        response.StatusCode         = StatusCodes.Status503ServiceUnavailable;
+        response.Headers.RetryAfter = RetryAfterSeconds;
+        response.ContentType        = isProto ? ProtobufContentType : JsonContentType;
+
+        var writer = response.BodyWriter;
+        writer.Advance(FormatStatus(writer.GetSpan(StatusBodyMaxBytes), message, isProto));
     }
 
     // ── Content-Encoding ──────────────────────────────────────────────────────
@@ -440,8 +514,14 @@ public static class OtlpEndpointMapper
     /// <summary>The message, at its longest: both literals and a full echo. Under 128, so its protobuf length is one byte.</summary>
     private const int UnsupportedMessageMaxBytes = 18 + EchoMaxChars + 41;
 
-    /// <summary>The body, at its longest: the JSON framing is the larger of the two.</summary>
-    internal const int UnsupportedEncodingMaxBytes = 12 + UnsupportedMessageMaxBytes + 2;
+    /// <summary>Longest message any refusal here carries — under 128, so its protobuf length is one byte.</summary>
+    internal const int StatusMessageMaxBytes = 127;
+
+    /// <summary>A refusal body at its longest: the JSON framing (<c>{"message":"</c> and <c>"}</c>) is the larger of the two.</summary>
+    internal const int StatusBodyMaxBytes = 12 + StatusMessageMaxBytes + 2;
+
+    /// <summary>The 415 body at its longest.</summary>
+    internal const int UnsupportedEncodingMaxBytes = StatusBodyMaxBytes;
 
     /// <summary>
     /// Formats the 415 body into <paramref name="dest"/>; returns the byte count written.
@@ -463,20 +543,32 @@ public static class OtlpEndpointMapper
         tail.CopyTo(message[n..]);
         n += tail.Length;
 
+        return FormatStatus(dest, message[..n], protobuf);
+    }
+
+    /// <summary>
+    /// A refusal body in the OTLP failure shape: a <c>google.rpc.Status</c> with only its
+    /// <c>message</c>, encoded like the request — protobuf for protobuf, JSON otherwise. The
+    /// message must be printable ASCII without quote or backslash (every caller's is: literals,
+    /// or the sanitised echo) and at most <see cref="StatusMessageMaxBytes"/>, so its protobuf
+    /// length is one byte and its JSON needs no escaping.
+    /// </summary>
+    internal static int FormatStatus(Span<byte> dest, ReadOnlySpan<byte> message, bool protobuf)
+    {
         int o = 0;
         if (protobuf)
         {
             dest[o++] = 0x12;                                                  // Status.message = 2, length-delimited
-            dest[o++] = (byte)n;                                               // n < 128: a one-byte varint
-            message[..n].CopyTo(dest[o..]);
-            return o + n;
+            dest[o++] = (byte)message.Length;                                  // < 128: a one-byte varint
+            message.CopyTo(dest[o..]);
+            return o + message.Length;
         }
 
         ReadOnlySpan<byte> open = "{\"message\":\""u8;
         open.CopyTo(dest);
         o = open.Length;
-        message[..n].CopyTo(dest[o..]);
-        o += n;
+        message.CopyTo(dest[o..]);
+        o += message.Length;
         "\"}"u8.CopyTo(dest[o..]);
         return o + 2;
     }

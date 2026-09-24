@@ -37,12 +37,20 @@ public static class OtlpGrpcEndpointMapper
     private const int StatusInvalidArgument   = 3;
     private const int StatusResourceExhausted = 8;
     private const int StatusUnimplemented     = 12;
+    private const int StatusUnavailable       = 14;
     private const int StatusUnauthenticated   = 16;
+
+    /// <summary>What UNAVAILABLE says when every inflate slot stayed taken — retried by every OTLP exporter.</summary>
+    internal const string GateFullMessage = "the server is inflating as many gzip batches as it can hold; retry";
 
     public static void MapOtlpGrpcEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
     {
+        // The SAME gate the HTTP receivers inflate under — one bound on inflated buffers for the
+        // process, whichever port a compressed batch arrived on.
+        OtlpInflateGate inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
+
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, static (c, msg) =>
+            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, static (c, msg) =>
             {
                 var (_, dropped) = OtlpLogProtoParser.Parse(
                     msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
@@ -51,12 +59,12 @@ public static class OtlpGrpcEndpointMapper
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, static (c, msg) =>
                     IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, static (c, msg) =>
                 {
                     var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
                     int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
@@ -87,11 +95,13 @@ public static class OtlpGrpcEndpointMapper
 
     /// <summary>
     /// The shape every Export call shares: check the content type, check the key, unframe, hand
-    /// the protobuf to that signal's own decoder, and answer in trailers.
+    /// the protobuf to that signal's own decoder, and answer in trailers. Internal so the
+    /// gate's answer can be tested over a plain context — see <c>OtlpInflateGateTests</c>.
     /// </summary>
-    private static async Task HandleAsync(
+    internal static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
+        OtlpInflateGate inflateGate,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
@@ -135,10 +145,26 @@ public static class OtlpGrpcEndpointMapper
         }
 
         byte[]? inflated = null;
+        bool holdsSlot   = false;
         try
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
             string? encoding = ctx.Request.Headers["grpc-encoding"];
+
+            // A message that will be inflated waits for a slot of the gate the HTTP receivers
+            // share (OtlpInflateGate); an identity frame never does. Full past the wait is
+            // UNAVAILABLE, the code an exporter retries with backoff — the batch is delayed, not
+            // refused. The slot is given back with the inflated buffer, in the finally below.
+            if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
+            {
+                if (!await inflateGate.TryEnterAsync(ctx.RequestAborted))
+                {
+                    await FinishAsync(ctx, StatusUnavailable, GateFullMessage);
+                    return;
+                }
+                holdsSlot = true;
+            }
+
             var unframed = OtlpGrpcFraming.TryUnframe(body.AsMemory(0, bodyLen), encoding, maxBytes,
                                                       out var message, out inflated, out int inflatedLen);
             if (unframed != UnframeResult.Ok)
@@ -203,6 +229,7 @@ public static class OtlpGrpcEndpointMapper
         {
             IngestBufferPool.Return(body);
             if (inflated is not null) IngestBufferPool.Return(inflated);
+            if (holdsSlot) inflateGate.Exit();
         }
     }
 

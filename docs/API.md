@@ -195,6 +195,8 @@ printf '%s' '{"resourceLogs":[…]}' | gzip \
 
 Switch the exporter to gzip or to no compression; retrying the same request will always be refused.
 
+**Response `503 Service Unavailable`:** a gzip body arrived while the server was already holding as many inflated batches as it allows — at most `min(CPU cores, IngestBufferBytes / Ingestion.MaxOtlpBatchBytes)` at once across the HTTP and gRPC receivers, where `IngestBufferBytes` is the memory model's share for request bodies (**2 on a 512 MB container** at the 8 MB default; up to 16 on a large host). It waits up to a second for a slot first. Nothing was read past the compressed body, and nothing was ingested. The response carries `Retry-After: 1` and an OTLP `Status` message; OTLP exporters retry a 503 with backoff, so the batch is delayed, not lost. Uncompressed bodies are never held here — inflating is the only step where a small request can make the server hold a lot of memory.
+
 **Response `400 Bad Request`:** the payload could not be decoded — a gzip body that does not inflate (not gzip at all, or corrupt: refused before any parser sees it, so nothing of it is ingested) or that was cut off before its trailer (refused the same way, unless the cut happens to leave four bytes that read as a plausible size — possible when the stream was stored rather than compressed, and its last bytes are zeros or the low half of a `1.0` double; the parser then sees a message cut short and answers as below), malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
 
 ### OTLP over gRPC
@@ -226,6 +228,7 @@ before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 | `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
 | `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes` |
 | `12` UNIMPLEMENTED | unsupported compression |
+| `14` UNAVAILABLE | a gzip message arrived while every inflate slot shared with the HTTP receivers stayed taken for a second (see the `503` above); retried by exporters |
 | `16` UNAUTHENTICATED | missing or insufficient API key |
 
 ---

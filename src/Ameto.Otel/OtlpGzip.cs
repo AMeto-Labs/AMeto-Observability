@@ -212,3 +212,79 @@ internal static class OtlpGzip
                ? new MemoryStream(seg.Array, seg.Offset, seg.Count, writable: false)
                : new MemoryStream(payload.ToArray(), writable: false);
 }
+
+/// <summary>
+/// How many gzip bodies may be inflated — and held inflated — at once, across BOTH OTLP receivers.
+///
+/// <para>Each inflate is bounded; nothing bounded how many ran together. A bomb needs ~8 KB of
+/// deflate to fill the 8 MiB default and holds 8–12 MiB until it is refused, so ~30 concurrent
+/// requests with any ingest key — some 360 KB uploaded — reached the 512 MB stand's 384 MB heap
+/// limit. Nothing on the way stopped them: the ingest routes skip the rate limiter, the pool caps
+/// only what it PARKS and allocates past that when empty, and Kestrel's connection and stream
+/// limits are the defaults. An uncompressed body costs its sender every byte it makes the
+/// server hold; only inflation multiplies, so only inflation is gated — identity bodies never
+/// see this.</para>
+///
+/// <para><b>What a slot covers is the inflated BUFFER, not the inflate call.</b> The buffer is
+/// what occupies the memory, and it lives until the parser behind it is done; releasing at the
+/// end of the inflate would leave N highly compressible — valid — batches parsing at once with a
+/// limit-sized buffer each. So a receiver takes a slot before it inflates and gives it back with
+/// the inflated buffer.</para>
+///
+/// <para><b>How many:</b> <c>min(ProcessorCount, MemoryBudgets.IngestBufferBytes /
+/// MaxOtlpBatchBytes)</c>, at least one. The budget term is the memory model's share for request
+/// bodies, spent a limit-sized buffer at a time — 2 on the stand (0.05 x 384 MiB ≈ 20.1 MB over
+/// 8 MiB), 16 where the 128 MiB cap applies; the core term because inflating and parsing are CPU
+/// work, and more of them than cores only queue while holding their buffers.</para>
+///
+/// <para><b>Full</b> is a brief wait (<see cref="DefaultPatience"/>), then a refusal the receiver
+/// answers as HTTP 503 with <c>Retry-After</c> or gRPC <c>UNAVAILABLE</c> — the two answers OTLP
+/// exporters retry. The wait is asynchronous: a queued request holds its compressed body and its
+/// connection, not a thread. Uncontended, entering is <see cref="SemaphoreSlim"/>'s fast path — a
+/// cached completed task, no allocation.</para>
+/// </summary>
+internal sealed class OtlpInflateGate
+{
+    /// <summary>How long a compressed batch waits for a slot before it is told to retry.</summary>
+    internal static readonly TimeSpan DefaultPatience = TimeSpan.FromSeconds(1);
+
+    private readonly SemaphoreSlim _slots;
+    private readonly TimeSpan      _patience;
+
+    public OtlpInflateGate(int capacity, TimeSpan patience)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        Capacity  = capacity;
+        _patience = patience;
+        _slots    = new SemaphoreSlim(capacity, capacity);
+    }
+
+    /// <summary>Slots in all.</summary>
+    public int Capacity { get; }
+
+    /// <summary>Slots free right now.</summary>
+    public int Available => _slots.CurrentCount;
+
+    /// <summary>The sizing rule, separated so it can be checked against the figures it is argued from.</summary>
+    public static int CapacityFor(long ingestBufferBytes, int maxOtlpBatchBytes, int processorCount)
+        => (int)Math.Clamp(Math.Min(processorCount, ingestBufferBytes / Math.Max(1L, maxOtlpBatchBytes)), 1L, int.MaxValue);
+
+    /// <summary>
+    /// The gate for this process. <see cref="IngestBufferPool.MaxPooledTotalBytes"/> IS
+    /// <c>MemoryBudgets.Current().IngestBufferBytes</c>, read once at startup — the same figure,
+    /// without a second pass over the GC's configuration.
+    /// </summary>
+    public static OtlpInflateGate For(int maxOtlpBatchBytes)
+        => new(CapacityFor(IngestBufferPool.MaxPooledTotalBytes, maxOtlpBatchBytes, Environment.ProcessorCount),
+               DefaultPatience);
+
+    /// <summary>
+    /// Takes a slot, waiting at most the gate's patience. False: none came free — the caller
+    /// answers "retry" and must NOT call <see cref="Exit"/>. Throws only if
+    /// <paramref name="ct"/> (the request's abort) fires.
+    /// </summary>
+    public Task<bool> TryEnterAsync(CancellationToken ct) => _slots.WaitAsync(_patience, ct);
+
+    /// <summary>Gives back a slot <see cref="TryEnterAsync"/> granted — once, when the inflated buffer goes back.</summary>
+    public void Exit() => _slots.Release();
+}

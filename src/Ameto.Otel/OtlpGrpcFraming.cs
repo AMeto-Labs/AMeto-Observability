@@ -97,6 +97,16 @@ internal static class OtlpGrpcFraming
         return UnframeResult.Ok;
     }
 
+    /// <summary>
+    /// Whether <see cref="TryUnframe"/> would INFLATE this body: its compression flag is set and
+    /// it names gzip. What decides whether the receiver waits for an <see cref="OtlpInflateGate"/>
+    /// slot — an identity frame never does, and one in a coding this server refuses must get its
+    /// UNIMPLEMENTED at once, not UNAVAILABLE after a wait for a slot it would never use.
+    /// </summary>
+    public static bool WillInflate(ReadOnlySpan<byte> body, string? encoding)
+        => body.Length >= HeaderBytes && body[0] != 0
+        && string.Equals(encoding, "gzip", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Wraps a response message in an uncompressed frame.</summary>
     public static byte[] Frame(ReadOnlySpan<byte> message)
     {
