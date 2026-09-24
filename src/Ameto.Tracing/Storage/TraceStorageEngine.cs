@@ -508,13 +508,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private const int SpansPerPassAtCap = 120_000;
 
     /// <summary>
-    /// A segment's read-back weight: measured when this process wrote it, else priced from its span
-    /// count at the merge cap's own per-span figure — <c>SpanCount × 73 MB / 120 000</c>, which
-    /// makes the byte planner, on a host whose budget is the cap, admit and pair EXACTLY the
-    /// segments the 60 000 / 120 000-span planner did (<c>CompactionThresholdTests</c>).
+    /// A segment's read-back weight: MEASURED when this process wrote it or a pass has read it,
+    /// else the larger of two floors — its span count priced at the merge cap's own per-span
+    /// figure (<c>SpanCount × 73 MB / 120 000</c>, which makes the byte planner, on a host whose
+    /// budget is the cap, admit and pair EXACTLY the segments the 60 000 / 120 000-span planner
+    /// did — <c>CompactionThresholdTests</c>), and its file's length on disk, which no read-back
+    /// can be lighter than. The file floor catches heavy spans that compress poorly; heavy spans
+    /// that compress WELL still slip under both, and the loader weighs them (see
+    /// <c>CompactOnePass</c>) — once.
     /// </summary>
     internal static long EstimatedSegmentBytes(SpanSegmentInfo s) =>
-        s.WeightBytes > 0 ? s.WeightBytes : (long)s.SpanCount * MemoryBudgets.TraceMergeCapBytes / SpansPerPassAtCap;
+        s.WeightBytes > 0
+            ? s.WeightBytes
+            : Math.Max((long)s.SpanCount * MemoryBudgets.TraceMergeCapBytes / SpansPerPassAtCap, s.FileBytes);
 
     /// <summary>
     /// The byte half of the flush trigger — <see cref="TracesOptions.HotTierMaxBytes"/>, by default
@@ -1858,6 +1864,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private static readonly TimeSpan LoadRetryBudget = TimeSpan.FromSeconds(2);
     private long _loadRetryUsedTicks;
 
+    /// <summary>
+    /// The segment with its file's length on disk — the floor <see cref="EstimatedSegmentBytes"/>
+    /// prices an unweighed segment by. A stat that fails (the file just went) leaves it 0, which is
+    /// the count estimate alone, as before.
+    /// </summary>
+    private static SpanSegmentInfo WithFileLength(SpanSegmentInfo info)
+    {
+        try { return info.WithFileBytes(new FileInfo(info.FilePath).Length); }
+        catch (IOException)                 { return info; }
+        catch (UnauthorizedAccessException) { return info; }
+    }
+
     private SpanSegmentInfo? RetryReadSegmentInfo(string file)
     {
         for (int attempt = 1; attempt <= 3; attempt++)
@@ -1868,7 +1886,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             Thread.Sleep(waited);
             try
             {
-                var info = SpanReader.ReadSegmentInfo(file);
+                var info = WithFileLength(SpanReader.ReadSegmentInfo(file));
                 _logger.LogWarning(
                     "Cold segment {File} was busy at startup and read on attempt {Attempt}", file, attempt + 1);
                 return info;
@@ -2670,7 +2688,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             try
             {
-                var info = SpanReader.ReadSegmentInfo(file);
+                var info = WithFileLength(SpanReader.ReadSegmentInfo(file));
                 loaded.Add(info);
 
                 // A header time range that cannot be true. The segment is kept and queried on the
@@ -3395,6 +3413,41 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         return tier;
     }
 
+    /// <summary>
+    /// Records, in the cold snapshot, the weight a pass measured for each segment it read and did
+    /// not merge — matched by path, since the snapshot entry may have been renamed (a segment id
+    /// learned) since the plan. True when anything was recorded: the planner then sees a different
+    /// set of candidates, so the run should plan again.
+    /// </summary>
+    private bool WriteBackWeights(List<(SpanSegmentInfo Seg, long Weight)>? weighed)
+    {
+        if (weighed is null) return false;
+        bool changed = false;
+        _lock.EnterWriteLock();
+        try
+        {
+            var current = _coldSegments;
+            var next    = new SpanSegmentInfo[current.Length];
+            for (int i = 0; i < current.Length; i++)
+            {
+                next[i]  = WeighedAs(current[i], weighed);
+                changed |= !ReferenceEquals(next[i], current[i]);
+            }
+            if (changed) _coldSegments = next;   // weights only: the MaxStartNano order is untouched
+        }
+        finally { _lock.ExitWriteLock(); }
+        return changed;
+    }
+
+    /// <summary>The snapshot entry with the weight a pass measured for its file, if it measured one and the entry has none.</summary>
+    private static SpanSegmentInfo WeighedAs(SpanSegmentInfo s, List<(SpanSegmentInfo Seg, long Weight)>? weighed)
+    {
+        if (weighed is null || s.WeightBytes > 0) return s;
+        foreach (var (seg, weight) in weighed)
+            if (string.Equals(seg.FilePath, s.FilePath, StringComparison.Ordinal)) return s.WithWeight(weight);
+        return s;
+    }
+
     private bool CompactOnePass()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
@@ -3409,28 +3462,52 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var  allSpans    = new List<SpanRecord>();
         var  processed   = new List<SpanSegmentInfo>(small.Count);
         long loadedBytes = 0;
+
+        // What this pass LEARNED: the measured weight of every unweighed segment it read, whether
+        // or not it ends up merging it. See the write-back below for why that is the whole fix.
+        List<(SpanSegmentInfo Seg, long Weight)>? weighed = null;
+
         foreach (var seg in small)
         {
             // THE LOADER'S OWN GUARD, IN BYTES, AS WELL AS THE PLAN. The plan is exact for a
-            // segment this process wrote and weighed; one found on disk at startup is priced from
-            // its span count, and a segment of spans carrying SQL statements weighs ten times that
-            // estimate. So the pass stops taking segments once what it has ACTUALLY read reaches
-            // the budget — overshooting by at most the last segment, which the tier's own byte
-            // budget bounds for anything a flush wrote.
+            // segment this process wrote or weighed; one found on disk at startup is priced from
+            // its span count and its file, and a segment of spans carrying SQL statements that
+            // compress well weighs ten times both. So the pass stops once what it has ACTUALLY
+            // read reaches the budget.
             if (loadedBytes >= _mergeBudgetBytes) break;
             try
             {
                 int before = allSpans.Count;
                 allSpans.AddRange(SpanReader.ReadAll(seg.FilePath));
-                loadedBytes += ReadBackBytesOf(CollectionsMarshal.AsSpan(allSpans)[before..]);
+                long measured = ReadBackBytesOf(CollectionsMarshal.AsSpan(allSpans)[before..]);
+                if (seg.WeightBytes <= 0) (weighed ??= []).Add((seg, measured));
+
+                // A SEGMENT THAT WOULD TAKE THE KEPT SPANS PAST THE BUDGET IS PUT BACK, not merged:
+                // what a pass WRITES never weighs more than a pass may hold, so an underpriced
+                // segment cannot grow a merged one past the budget either. The first segment is
+                // always kept — alone it merges with nothing, or migrates if it is legacy.
+                if (processed.Count > 0 && loadedBytes + measured > _mergeBudgetBytes)
+                {
+                    allSpans.RemoveRange(before, allSpans.Count - before);
+                    break;
+                }
+                loadedBytes += measured;
                 processed.Add(seg);
             }
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
 
         // A single v3 file needs no rewrite; a single v2 file still migrates.
-        if (allSpans.Count == 0) return false;
-        if (processed.Count < 2 && processed.All(s => s.FormatVersion >= 3)) return false;
+        if (allSpans.Count == 0 || (processed.Count < 2 && processed.All(s => s.FormatVersion >= 3)))
+        {
+            // F1: THE PASS THAT MERGED NOTHING MUST STILL LEAVE WHAT IT MEASURED BEHIND. Before, it
+            // returned false with the weights thrown away: the oldest candidate, underpriced, seeded
+            // the same batch on every run, was read in full, stopped the loader, and merged nothing
+            // — and every segment behind it waited for retention. Written back, the heavy segment
+            // is priced as what it is, drops out of the candidates, and the run plans again at once.
+            // Each such pass weighs at least one unweighed segment, so the run cannot spin on it.
+            return WriteBackWeights(weighed);
+        }
 
         try
         {
@@ -3511,7 +3588,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             {
                 var next = new List<SpanSegmentInfo>(_coldSegments.Length);
                 foreach (var s in _coldSegments)
-                    if (!processed.Contains(s)) next.Add(s);
+                    if (!processed.Contains(s)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
                 next.Add(merged);
                 _coldSegments = SortedByMaxStartDesc(next);
             }
@@ -4738,8 +4815,24 @@ public sealed class SpanSegmentInfo
     /// </summary>
     public long WeightBytes { get; init; }
 
+    /// <summary>
+    /// The segment file's length on disk, read when it was found at startup (0 when unknown) — a
+    /// FLOOR on what its spans weigh read back, and what keeps an unweighed segment of heavy,
+    /// poorly-compressing spans out of the compaction candidates before anything has read it:
+    /// decompression never shrinks a block, and a record read back carries more than its row.
+    /// </summary>
+    public long FileBytes { get; init; }
+
     /// <summary>The same segment, named. Used where the id is learned after the file was read.</summary>
-    public SpanSegmentInfo WithSegmentId(ulong id) => new()
+    public SpanSegmentInfo WithSegmentId(ulong id) => With(id, WeightBytes, FileBytes);
+
+    /// <summary>The same segment, weighed. Used where the writer — or a pass that read it — has just measured it.</summary>
+    public SpanSegmentInfo WithWeight(long weightBytes) => With(SegmentId, weightBytes, FileBytes);
+
+    /// <summary>The same segment, with the length its file has on disk.</summary>
+    public SpanSegmentInfo WithFileBytes(long fileBytes) => With(SegmentId, WeightBytes, fileBytes);
+
+    private SpanSegmentInfo With(ulong id, long weightBytes, long fileBytes) => new()
     {
         FilePath           = FilePath,
         MinStartNano       = MinStartNano,
@@ -4750,22 +4843,8 @@ public sealed class SpanSegmentInfo
         HeaderRangeSuspect = HeaderRangeSuspect,
         LastWriteNano      = LastWriteNano,
         SegmentId          = id,
-        WeightBytes        = WeightBytes,
-    };
-
-    /// <summary>The same segment, weighed. Used where the writer has just told us what it wrote.</summary>
-    public SpanSegmentInfo WithWeight(long weightBytes) => new()
-    {
-        FilePath           = FilePath,
-        MinStartNano       = MinStartNano,
-        MaxStartNano       = MaxStartNano,
-        SpanCount          = SpanCount,
-        Services           = Services,
-        FormatVersion      = FormatVersion,
-        HeaderRangeSuspect = HeaderRangeSuspect,
-        LastWriteNano      = LastWriteNano,
-        SegmentId          = SegmentId,
         WeightBytes        = weightBytes,
+        FileBytes          = fileBytes,
     };
 }
 

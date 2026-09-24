@@ -217,14 +217,21 @@ public sealed class TraceMemoryBudgetTests : IDisposable
 
     /// <summary>
     /// THE LOADER'S BYTE GUARD, for the case the plan cannot see: segments found on disk at startup
-    /// carry no weight, so they are priced from their span count — and 200 spans of 10 KB each are
-    /// 2 MB, not the 120 KB their count says. Three of them under a 3 MB pass: the plan admits all
-    /// three, and the pass must stop after the second, whose read already spent the budget.
+    /// carry no weight, so they are priced from their span count and their file — and 200 spans of
+    /// 10 KB that compress to nothing are 2 MB read back, not the 120 KB their count says. Three of
+    /// them: the plan admits all three.
+    ///
+    /// <para>Under a 5 MB pass two fit (4.1 MB) and merge; the third, read, would take the pass to
+    /// 6.2 MB and is PUT BACK, weighed. Under a 3 MB pass not even two fit: nothing merges, all
+    /// three are weighed, and the planner never proposes them again. What a pass writes never weighs
+    /// more than a pass may hold — it used to overshoot by the last segment it read.</para>
     /// </summary>
-    [Fact]
-    public void A_pass_stops_loading_at_its_byte_budget_when_the_plan_underestimates_it()
+    [Theory]
+    [InlineData(5, 2)]
+    [InlineData(3, 3)]
+    public void A_pass_keeps_to_its_byte_budget_when_the_plan_underestimates_it(int budgetMb, int segmentsAfter)
     {
-        string dir  = Dir("loader");
+        string dir  = Dir("loader" + budgetMb);
         byte[] blob = Blob(10_000);
 
         using (var writer = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance))
@@ -236,26 +243,97 @@ public sealed class TraceMemoryBudgetTests : IDisposable
             }
         }
 
-        // A restart: the segments come back from disk with no weight, so the plan is the count's.
+        // A restart: the segments come back from disk with no weight, so the plan is the estimate's.
+        long budget = budgetMb * MB;
         using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance,
-                                             options: new TracesOptions { MergeBudgetBytes = 3 * MB });
+                                             options: new TracesOptions { MergeBudgetBytes = budget });
         e.LoadColdSegments();
         Assert.Equal(3, e.ColdSegmentCountForTest);
         Assert.All(e.ColdSegmentsForTest, static s => Assert.Equal(0, s.WeightBytes));
-        Assert.Equal(3, TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest, 3 * MB).Count);
+        Assert.Equal(3, TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest, budget).Count);
 
         e.CompactSmallSegments();
 
         var after = e.ColdSegmentsForTest;
-        _out.WriteLine($"3 segments of 200 x 10 KB under a 3 MB pass -> {after.Length} "
-                     + $"({string.Join(", ", after.Select(static s => s.SpanCount))} spans)");
-        // Two merged (the second read took the pass past its budget), the third left for later.
-        Assert.Equal(2, after.Length);
-        Assert.Contains(after, static s => s.SpanCount == 400);
-        Assert.Contains(after, static s => s.SpanCount == 200);
-        // And the merged segment now carries the weight its pass measured.
-        Assert.True(after.Single(static s => s.SpanCount == 400).WeightBytes
-                    >= 400 * TraceStorageEngine.ReadBackSpanBytes(blob.Length));
+        _out.WriteLine($"3 segments of 200 x 10 KB under a {budgetMb} MB pass -> {after.Length} "
+                     + $"({string.Join(", ", after.Select(static s => $"{s.SpanCount}:{s.WeightBytes:N0} B"))})");
+        Assert.Equal(segmentsAfter, after.Length);
+        // Nothing a pass wrote weighs more than a pass may hold…
+        Assert.All(after.Where(static s => s.SpanCount > 200), s => Assert.True(s.WeightBytes <= budget,
+            $"a merged segment of {s.SpanCount} spans weighs {s.WeightBytes:N0} B, past the {budget:N0} B budget"));
+        // …and the planner proposes nothing more: what it read is weighed, and what it did not read
+        // (a segment with no peer left) it has no reason to read.
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(after, budget));
+    }
+
+    /// <summary>
+    /// F1 — THE COMPACTION LIVELOCK AFTER A RESTART. The oldest segment on disk is priced from its
+    /// span count (a thousand spans: 0.6 MB, under the 1 MB threshold of a 2 MB pass) but weighs
+    /// 3.2 MB read back — its attributes compress to almost nothing, so its file says nothing either.
+    /// It is the oldest candidate, so it seeds the first batch; the loader reads it, is past its
+    /// budget, and stops with one segment — and a pass that merged nothing used to return false with
+    /// the measured weight thrown away. Every later run re-planned the same seed, re-read it in full,
+    /// and merged nothing; the two ordinary segments behind it waited for retention.
+    ///
+    /// <para>The queue must advance: the heavy seed is weighed once, drops out of the candidates,
+    /// and its peers merge — in the same run, and on no later run is it re-read.</para>
+    /// </summary>
+    [Fact]
+    public void After_a_restart_one_oversized_seed_does_not_stall_the_queue_behind_it()
+    {
+        string dir = Dir("livelock");
+        using (var writer = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance))
+        {
+            byte[] heavy = Blob(3_000);                                   // 'x' repeated: LZ4 crushes it
+            for (int t = 0; t < 1_000; t++) writer.WriteSpan(Span(t, heavy));
+            writer.FlushHotTier();                                        // the oldest: the seed
+            for (int s = 1; s < 3; s++)
+            {
+                for (int t = 0; t < 1_000; t++) writer.WriteSpan(Span(s * 10_000 + t, []));
+                writer.FlushHotTier();                                    // two ordinary peers, same tier
+            }
+        }
+
+        // The restart: every segment comes back unweighed.
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance,
+                                             options: new TracesOptions { MergeBudgetBytes = 2 * MB });
+        e.LoadColdSegments();
+        Assert.All(e.ColdSegmentsForTest, static s => Assert.Equal(0, s.WeightBytes));
+        var plan = TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest, 2 * MB);
+        Assert.Equal(3, plan.Count);                                      // the heavy one seeds it
+        long seedFile = new FileInfo(plan[0].FilePath).Length;
+        _out.WriteLine($"seed: {plan[0].SpanCount} spans, file {seedFile:N0} B, priced "
+                     + $"{TraceStorageEngine.EstimatedSegmentBytes(plan[0]):N0} B, weighs "
+                     + $"{1_000 * TraceStorageEngine.ReadBackSpanBytes(Blob(3_000).Length):N0} B read back");
+
+        for (int run = 0; run < 3; run++) e.CompactSmallSegments();      // the hourly worker, three times
+
+        var after = e.ColdSegmentsForTest;
+        _out.WriteLine($"after three runs: {after.Length} segments ({string.Join(", ", after.Select(static s => $"{s.SpanCount}:{s.WeightBytes:N0} B"))})");
+        Assert.Equal(2, after.Length);                                    // the peers merged
+        Assert.Contains(after, static s => s.SpanCount == 2_000);
+        var seed = Assert.Single(after, static s => s.SpanCount == 1_000);
+        Assert.True(seed.WeightBytes >= 2 * MB, "the seed's measured weight was not kept, so it will be re-read every run");
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(after, 2 * MB));
+    }
+
+    /// <summary>
+    /// AN UNWEIGHED SEGMENT IS NEVER PRICED BELOW ITS OWN FILE. Five thousand spans are 3 MB by the
+    /// count; a 40 MB file of them cannot weigh less than 40 MB read back, so it is not a candidate —
+    /// it is kept out of the plan before anything has had to read it to find that out. The file floor
+    /// only ever raises an estimate: two segments of ordinary spans, whose files are far lighter than
+    /// their count, still pair.
+    /// </summary>
+    [Fact]
+    public void An_unweighed_segment_is_priced_at_no_less_than_its_file()
+    {
+        const long Forty = 40L * 1000 * 1000;
+        var heavy    = new[] { Seg(5_000, 0, 1, fileBytes: Forty), Seg(5_000, 2, 3, fileBytes: Forty) };
+        var ordinary = new[] { Seg(5_000, 0, 1, fileBytes: 200_000), Seg(5_000, 2, 3, fileBytes: 200_000) };
+
+        Assert.Equal(Forty, TraceStorageEngine.EstimatedSegmentBytes(heavy[0]));
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(heavy, MemoryBudgets.TraceMergeCapBytes));
+        Assert.Equal(2, TraceStorageEngine.SelectCompactionBatch(ordinary, MemoryBudgets.TraceMergeCapBytes).Count);
     }
 
     /// <summary>
@@ -321,7 +399,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
         return buf.WrittenMemory.ToArray();
     }
 
-    private static SpanSegmentInfo Seg(int spanCount, long minNano, long maxNano, long weight = 0) => new()
+    private static SpanSegmentInfo Seg(int spanCount, long minNano, long maxNano, long weight = 0, long fileBytes = 0) => new()
     {
         FilePath      = $"spans-{minNano}-{maxNano}-{spanCount}-{weight}.trc",
         MinStartNano  = minNano,
@@ -330,5 +408,6 @@ public sealed class TraceMemoryBudgetTests : IDisposable
         Services      = ["billing"],
         FormatVersion = 4,
         WeightBytes   = weight,
+        FileBytes     = fileBytes,
     };
 }
