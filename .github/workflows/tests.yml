@@ -223,7 +223,11 @@ jobs:
       # process is read by an invariant one. AMETO_REQUIRE_INVARIANT_GLOBALIZATION=1 turns "this
       # process is not invariant" into a failure instead of an early return; the grep is the same
       # "did not run and pass" guard as above. PREDEFINED_CULTURES_ONLY=false lets the facts pin
-      # ru-KZ / sv-SE, which invariant mode otherwise refuses to construct.
+      # ru-KZ / sv-SE, which invariant mode otherwise refuses to construct — BUT UNDER INVARIANT
+      # GLOBALIZATION EVERY CULTURE FORMATS LIKE THE INVARIANT ONE, so the ru-KZ / sv-SE rows here
+      # assert nothing culture-specific: a decimal comma or a U+2212 minus never appears. They are
+      # listed for what they still check (the fold, the segment round trip); the culture half of
+      # them runs for real in the Windows (ICU) backend job above.
       - name: Test the span bloom under invariant globalization (Debug)
         shell: bash
         env:
