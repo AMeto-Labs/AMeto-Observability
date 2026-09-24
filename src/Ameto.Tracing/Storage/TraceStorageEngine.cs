@@ -15,7 +15,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
+public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     // _hotSpans is SWAPPED at flush start (the snapshot goes to the writer, a fresh list
@@ -974,6 +974,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         string[] services = System.Buffers.ArrayPool<string>.Shared.Rent(Math.Min(scratch, 4_096));
         var      blobs    = System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Rent(Math.Min(scratch, 4_096));
         bool[]   pooled   = System.Buffers.ArrayPool<bool>.Shared.Rent(Math.Min(2 * scratch, 8_192));
+        Exception? flushStartFault = null;
         try
         {
             while (taken < count)
@@ -1034,8 +1035,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     // max(spanCount ≥ N, hotBytes ≥ budget): whichever the tier reaches first. The
                     // count bounds what a span costs beyond its bytes; the bytes bound what a
                     // span carrying a SQL statement or a stack would otherwise make of 50 000.
+                    //
+                    // BEST-EFFORT, AS FAR AS THIS BATCH IS CONCERNED. This hold's spans are already
+                    // in the log and in the tier; a flush that cannot START changes nothing about
+                    // them (TryStartFlushLocked leaves the tier and the log as they were), and the
+                    // next hold or due check retries it. Letting the throw out of here ended the
+                    // batch after this hold, and the drainer then released the rest of what it had
+                    // drained — 384 of every 512 spans, already acknowledged to the exporter, gone.
                     if (_hotSpans.Count >= HotFlushThreshold || _hotBytes >= _hotTierBudgetBytes)
-                        TryStartFlushLocked();
+                    {
+                        try     { TryStartFlushLocked(); }
+                        catch (Exception ex) { flushStartFault = ex; }   // logged off the lock, below
+                    }
                     _insideWriteHoldForTest?.Invoke(taken);
                 }
                 finally
@@ -1043,6 +1054,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     _lock.ExitWriteLock();
                 }
                 LetQueuedWaitersIn();
+                if (flushStartFault is not null)
+                {
+                    NoteFlushStartFailure(flushStartFault);
+                    flushStartFault = null;
+                }
                 _afterWriteHoldForTest?.Invoke(taken);
             }
         }
@@ -1059,6 +1075,40 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         return taken;
     }
+
+    // ── A FLUSH THAT CANNOT START IS SAID, AT MOST ONCE A MINUTE ─────────────────
+    //
+    // The write path swallows it (see WriteBatch) because the batch must go on; the operator must
+    // still hear it, and under load every hold past the threshold retries — ten thousand warnings a
+    // second would bury the one line that matters. The ingest endpoint's pool warning is the model.
+
+    /// <summary>The shortest gap between two "could not start a flush" warnings.</summary>
+    internal static readonly TimeSpan FlushStartWarningInterval = TimeSpan.FromMinutes(1);
+
+    private long _nextFlushStartWarningAt = long.MinValue;   // Environment.TickCount64, ms
+    private long _flushStartFailuresSinceWarning;
+    private long _flushStartFailures;
+
+    /// <summary>Test hook: flush starts the write path caught and carried on past, since the engine was built.</summary>
+    internal long FlushStartFailuresForTest => Interlocked.Read(ref _flushStartFailures);
+
+    private void NoteFlushStartFailure(Exception ex)
+    {
+        Interlocked.Increment(ref _flushStartFailures);
+        Interlocked.Increment(ref _flushStartFailuresSinceWarning);
+        long now  = Environment.TickCount64;
+        long next = Volatile.Read(ref _nextFlushStartWarningAt);
+        if (now < next) return;
+        long step = (long)FlushStartWarningInterval.TotalMilliseconds;
+        if (Interlocked.CompareExchange(ref _nextFlushStartWarningAt, now + step, next) != next) return;
+
+        LogFlushStartFailed(_logger, ex, Interlocked.Exchange(ref _flushStartFailuresSinceWarning, 0));
+    }
+
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Could not start a hot-tier flush ({Failures} failed start(s) since the last warning) — the spans "
+                + "stay in the hot tier and in spans.wal, the batch carries on, and the next write hold or due check retries")]
+    private static partial void LogFlushStartFailed(ILogger logger, Exception ex, long failures);
 
     /// <summary>
     /// One span into a held log scope, from an ingest ITEM: the log takes UTF-8 and the item
@@ -2348,13 +2398,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (!_flushInProgress)
                 {
                     if (_hotSpans.Count == 0) return;
-                    snapshot = TakeSnapshotLocked();
                     // Publish the INLINE flush as the in-flight one as well. Without a task
                     // to wait on, a second caller (the drainer's dispose overlapping the
                     // engine's) saw _flushInProgress with _flushTask still null and spun the
                     // write lock flat out for the whole multi-second build.
-                    inlineDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    _flushTask = inlineDone.Task;
+                    // BUILT BEFORE THE SNAPSHOT IS TAKEN: allocated after it, a throw here left
+                    // _flushInProgress set with no task to wait on and nothing to complete it —
+                    // this very loop then spun on it for ever. See TakeSnapshotLocked.
+                    var done   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    snapshot   = TakeSnapshotLocked();
+                    inlineDone = done;
+                    _flushTask = done.Task;
                 }
             }
             finally { _lock.ExitWriteLock(); }
@@ -2393,16 +2447,37 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// Detaches the hot tier for a flush: the snapshot goes to the writer, a fresh list
     /// takes its place, and the WAL opens its two-generation window. Caller holds the
     /// write lock and MUST hand the snapshot to <see cref="CompleteFlush"/>.
+    ///
+    /// <para><b>NOTHING AFTER THE LOG OPENS ITS WINDOW MAY THROW</b> — every allocation the detach
+    /// needs is made before <see cref="SpanWriteAheadLog.BeginFlush"/>, and after it there are only
+    /// stores (<see cref="DetachTierLocked"/>). The name pool used to be built AFTER the window
+    /// opened and the tier was detached, and an <see cref="OutOfMemoryException"/> there (the 512 MB
+    /// stand runs a 384 MB heap hard limit, and has run out) left the snapshot referenced by
+    /// nothing — up to 50 000 spans invisible to every query until a restart — and the window open
+    /// for good: every later flush met "already open", so the tier and the log grew without bound.
+    /// Allocated first, a failure leaves the tier and the log exactly where they were.</para>
     /// </summary>
     private List<SpanRecord> TakeSnapshotLocked()
     {
-        // The log opens its window FIRST: if BeginFlush throws, the tier must still be
-        // where it was — detaching first would strand the snapshot with no flush to carry
-        // it and no caller holding a reference.
-        _wal.BeginFlush();
+        var nextTier  = new List<SpanRecord>();
+        var nextNames = _pools.CreateNamePool();
 
+        // The log opens its window only now, and first of the two: if BeginFlush throws, the tier
+        // must still be where it was — detaching first would strand the snapshot with no flush to
+        // carry it and no caller holding a reference.
+        _wal.BeginFlush();
+        return DetachTierLocked(nextTier, nextNames);
+    }
+
+    /// <summary>
+    /// The detach itself, once the log's window is open: stores and a <c>Clear</c>, nothing that
+    /// allocates or throws. <paramref name="nextTier"/> and <paramref name="nextNames"/> were built
+    /// by the caller before the window opened. Under _lock(write).
+    /// </summary>
+    private List<SpanRecord> DetachTierLocked(List<SpanRecord> nextTier, Ameto.Core.StringInternPool nextNames)
+    {
         var snapshot = _hotSpans;
-        _hotSpans = new List<SpanRecord>();
+        _hotSpans = nextTier;
         _traceIdx.Clear();
         _hotSince = null;
         _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
@@ -2410,12 +2485,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // SHED ON FLUSH: the next tier interns into an empty name pool, so the pool never holds
         // more than one tier's distinct names. Safe at any moment — the tier stores the shared
         // instances, never pool indices, so nothing that was handed out can change meaning.
-        _pools.ShedNames();
+        _pools.InstallNames(nextNames);
         _flushInProgress = true;
         _flushingSpans   = snapshot;
         _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey
         return snapshot;
     }
+
+    /// <summary>
+    /// Test seam: the background flush task is about to be started, with the log's window already
+    /// open and the tier not yet detached. Throwing from it is <c>Task.Start</c> failing — the
+    /// thread pool's queue could not take the work item. Null in production.
+    /// </summary>
+    internal Action? _beforeFlushTaskStartForTest;
 
     /// <summary>
     /// Starts a background flush unless one is already running — or the engine is shutting
@@ -2424,6 +2506,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// could start a flush that publishes its segment and then faults trying to commit the WAL,
     /// leaving a segment on disk whose spans the log still replays — permanent duplicates.
     /// Spans refused here stay in the hot tier AND in the WAL, so the next start replays them.
+    ///
+    /// <para><b>A START THAT THROWS CHANGES NOTHING, AND GIVES ITS SLOT BACK.</b> The slot used to
+    /// be released only from inside the task, so a throw before the task existed leaked one per
+    /// attempt — and every due check and every hold over the threshold is an attempt — until the
+    /// teardown spent its whole budget waiting for phases that would never end and left the engine
+    /// frozen. Now everything that can fail runs while nothing has been touched: the next tier, its
+    /// name pool and the task are built first; <c>BeginFlush</c> changes nothing when it throws; a
+    /// task that cannot be started closes the window it opened (<c>AbandonFlush</c>, which leaves the
+    /// log as a failed flush does: every entry still replays); and only a STARTED task is followed
+    /// by the detach, which is stores alone. The task may begin while the detach is still running
+    /// — it reads the snapshot list, which nothing appends to while this caller holds the write
+    /// lock, and it touches the engine's fields only under that lock.</para>
     /// </summary>
     private void TryStartFlushLocked()
     {
@@ -2432,12 +2526,38 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // instant in which the spans are in neither tier and nothing counts the task that holds
         // them — the one state the teardown must never mistake for quiet.
         if (!TryBeginHeavyPhase()) return;
-        var snapshot = TakeSnapshotLocked();
-        _flushTask = Task.Run(() =>
+        bool started = false;
+        try
         {
-            try     { CompleteFlush(snapshot); }
-            finally { EndHeavyPhase(); }
-        });
+            var snapshot  = _hotSpans;
+            var nextTier  = new List<SpanRecord>();
+            var nextNames = _pools.CreateNamePool();
+            var flush     = new Task(() =>
+            {
+                try     { CompleteFlush(snapshot); }
+                finally { EndHeavyPhase(); }
+            }, TaskCreationOptions.DenyChildAttach);            // what Task.Run passes
+
+            _wal.BeginFlush();
+            try
+            {
+                _beforeFlushTaskStartForTest?.Invoke();
+                flush.Start(TaskScheduler.Default);
+            }
+            catch
+            {
+                _wal.AbandonFlush();                            // flag-only, no I/O — fine under the lock
+                throw;
+            }
+            started = true;                                     // the slot is the task's to release now
+
+            DetachTierLocked(nextTier, nextNames);
+            _flushTask = flush;
+        }
+        finally
+        {
+            if (!started) EndHeavyPhase();
+        }
     }
 
     /// <summary>

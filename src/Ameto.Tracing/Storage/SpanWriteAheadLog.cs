@@ -608,6 +608,13 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     // generation; Abandon leaves everything replayable for the retry.
 
     /// <summary>
+    /// Test seam: <see cref="BeginFlush"/> is about to open its window. Throwing from it is
+    /// BeginFlush failing before it changed anything — which is also what its "already open"
+    /// refusal is. Null in production.
+    /// </summary>
+    internal Action? _beforeBeginFlushForTest;
+
+    /// <summary>
     /// Opens a flush: appends from here on carry the NEXT generation; the entries being
     /// flushed keep the current one, and recovery accepts both until <see cref="CommitFlush"/>.
     /// The generation is bumped once per commit CYCLE — a Begin after an Abandon reuses the
@@ -615,6 +622,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// </summary>
     public void BeginFlush()
     {
+        _beforeBeginFlushForTest?.Invoke();
         lock (_writeLock)
         {
             if (_flushOpen)
