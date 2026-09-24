@@ -236,6 +236,49 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
         Assert.Equal(2, _log.Lines.Count(l => l.Message.Contains("was not evaluated")));
     }
 
+    /// <summary>
+    /// LOADING AND CLOSED ARE TWO THINGS TO SAY. A store reported Loading and then closing within
+    /// the same minute is reported Closed at once — sharing one slot, the Closed line waited out the
+    /// Loading line's minute, and the operator read "still loading" about a store that had shut.
+    /// </summary>
+    [Fact]
+    public async Task A_store_that_closes_within_a_minute_of_loading_is_reported_closed_at_once()
+    {
+        TraceRule(AlertComparator.GreaterThan, 1);
+
+        _traces.Availability = QueryAvailability.Loading;
+        await _evaluator.EvaluateOnceAsync();
+        _traces.Availability = QueryAvailability.Closed;
+        await _evaluator.EvaluateOnceAsync();
+
+        Assert.Single(_log.Lines, l => l.Message.Contains("Trace store is Loading"));
+        Assert.Single(_log.Lines, l => l.Message.Contains("Trace store is Closed"));
+    }
+
+    /// <summary>
+    /// THE RULES A LINE DOES NOT NAME ARE COUNTED. Three rules skipped on each of two ticks: the
+    /// first line names one and counts one; a minute later the next counts the five skipped in
+    /// between plus its own — six — so a line a minute still accounts for every rule left alone.
+    /// </summary>
+    [Fact]
+    public async Task Each_line_counts_the_evaluations_skipped_since_the_last()
+    {
+        TraceRule(AlertComparator.GreaterThan, 1, "a");
+        TraceRule(AlertComparator.GreaterThan, 2, "b");
+        TraceRule(AlertComparator.LessThan,    3, "c");
+        _traces.Availability = QueryAvailability.Closed;
+
+        await _evaluator.EvaluateOnceAsync();
+        await _evaluator.EvaluateOnceAsync();
+        _clock.Advance(TimeSpan.FromMinutes(1));
+        await _evaluator.EvaluateOnceAsync();
+
+        var lines = _log.Lines.Where(l => l.Message.Contains("was not evaluated")).Select(l => l.Message).ToList();
+        Assert.Equal(2, lines.Count);
+        Assert.Contains("— 1 rule evaluation(s) skipped", lines[0]);
+        Assert.Contains("— 6 rule evaluation(s) skipped", lines[1]);
+    }
+
     /// <summary>The editor's preview says "cannot say" rather than 0 — "would not fire" about nothing.</summary>
     [Fact]
     public async Task The_preview_of_a_rule_over_a_closed_store_is_unavailable_not_zero()

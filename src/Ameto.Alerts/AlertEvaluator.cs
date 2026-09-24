@@ -498,28 +498,45 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     /// <summary>
     /// Says that rules are being left as they were because their store cannot answer — once a
-    /// minute per SOURCE, not per rule: a closed store skips every rule that reads it, on every
-    /// tick, and a line per rule per tick would bury the log for as long as the store stays down.
+    /// minute per SOURCE AND STATE, not per rule: a closed store skips every rule that reads it, on
+    /// every tick, and a line per rule per tick would bury the log for as long as the store stays
+    /// down. Loading and Closed have a slot each, so a store that finishes loading and then closes
+    /// within the minute is still reported closed at once; and each line says how many evaluations
+    /// were skipped since the last line of its slot, so the rules it does not name are counted.
     /// </summary>
     private void WarnUnavailable(AlertRule rule, QueryAvailability why)
     {
-        ref long slot = ref _unavailableWarnedAt[(int)rule.Source % _unavailableWarnedAt.Length];
+        int i = ((int)rule.Source % SourceCount) * 2 + (why == QueryAvailability.Closed ? 1 : 0);
+        Interlocked.Increment(ref _unavailableSkipped[i]);
+
+        ref long slot = ref _unavailableWarnedAt[i];
         long now  = _time.GetTimestamp();
         long last = Volatile.Read(ref slot);
         if (last != 0 && _time.GetElapsedTime(last, now) < UnavailableWarnInterval) return;
         if (Interlocked.CompareExchange(ref slot, now, last) != last) return;   // another tick said it
 
+        int skipped = Interlocked.Exchange(ref _unavailableSkipped[i], 0);
         _logger.LogWarning(
             "Alert rule {Rule} was not evaluated: the {Source} store is {Availability}, so its answer "
-          + "would be {Answer}, not a value. The rule keeps its state and nothing is sent. Said at "
-          + "most once a minute per source",
-            rule.Id, rule.Source, why, why == QueryAvailability.Loading ? "partial" : "empty");
+          + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
+          + "since the last such line. Rules keep their state and nothing is sent. Said at most once "
+          + "a minute per source and state",
+            rule.Id, rule.Source, why, why == QueryAvailability.Loading ? "partial" : "empty", skipped);
     }
 
     private static readonly TimeSpan UnavailableWarnInterval = TimeSpan.FromMinutes(1);
 
-    /// <summary>Last <see cref="_time"/> timestamp a warning was logged, per <see cref="AlertSource"/>; 0 = never.</summary>
-    private readonly long[] _unavailableWarnedAt = new long[3];
+    /// <summary>The <see cref="AlertSource"/> values: Log, Metric, Trace.</summary>
+    private const int SourceCount = 3;
+
+    /// <summary>
+    /// Last <see cref="_time"/> timestamp a warning was logged, per (<see cref="AlertSource"/>,
+    /// Loading or Closed) — index <c>source * 2 + (closed ? 1 : 0)</c>; 0 = never.
+    /// </summary>
+    private readonly long[] _unavailableWarnedAt = new long[SourceCount * 2];
+
+    /// <summary>Evaluations skipped per slot of <see cref="_unavailableWarnedAt"/> since its last line.</summary>
+    private readonly int[] _unavailableSkipped = new int[SourceCount * 2];
 
     /// <summary>
     /// Safety bound for the scanning fallback. It replaces a hard 10 000 that was NOT a
