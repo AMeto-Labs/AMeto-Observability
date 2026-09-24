@@ -24,6 +24,11 @@ namespace Ameto.Perf;
 /// <para>Through the protobuf parser and a private interner of the production size — the same class
 /// and bounds as <see cref="MetricLabelInterner.Shared"/>, which a probe must not fill for the rest
 /// of the assembly.</para>
+///
+/// <para><b>Sized for the CI run</b> (Debug, two cores, which runs every probe — its skip guard
+/// expects no skips): what the facts ASSERT is bytes per point and string instances, which are
+/// deterministic and need a few runs, not many; the nanoseconds are printed for reading in Release.
+/// Best of three short runs, ~100 000 engine ingests in all.</para>
 /// </summary>
 public sealed class MetricLabelPoolChurnProbe
 {
@@ -50,14 +55,16 @@ public sealed class MetricLabelPoolChurnProbe
                 OtlpMetricProtoParser.Parse(PodBatch(s, 0, r), interner);
         int atRest = interner.Strings.ClaimedCount;
 
-        // Rollouts, round-robin over the deployments, until the pool stops pooling.
+        // Rollouts, round-robin over the deployments, until the pool stops pooling. Each replaced pod
+        // exports ONE point: what fills the pool is its resource identity, the same whatever the
+        // export carries, and building thousands of full exports only cost the CI run time.
         int rollouts = 0, lastGeneration = 0;
         while (interner.Strings.ClaimedCount < cap)
         {
             int s = rollouts % Services;
             lastGeneration = 1 + rollouts / Services;
             for (int r = 0; r < Replicas; r++)
-                OtlpMetricProtoParser.Parse(PodBatch(s, lastGeneration, r), interner);
+                OtlpMetricProtoParser.Parse(PodBatch(s, lastGeneration, r, fillOnly: true), interner);
             rollouts++;
         }
         double perPod = (double)(interner.Strings.ClaimedCount - atRest) / (rollouts * Replicas);
@@ -102,7 +109,7 @@ public sealed class MetricLabelPoolChurnProbe
     /// point's lookup meets a value-equal key with different references and compares strings where
     /// it compared pointers, until the series goes stale and is re-filed. Measured on the ingest
     /// alone: the same export's items, parsed before the reset (the instances the keys hold) and
-    /// after it (value-equal, new instances), into one real engine, interleaved, best of five.
+    /// after it (value-equal, new instances), into one real engine, interleaved, best of three.
     /// </summary>
     [Fact]
     public async Task Probe_ingest_of_live_series_before_and_after_a_reset()
@@ -126,9 +133,9 @@ public sealed class MetricLabelPoolChurnProbe
 
             // Churn fills the pool; an hour on, a miss resets it; the live pods export again.
             for (int g = 1; interner.Strings.ClaimedCount < interner.Strings.MaxPoolSize; g++)
-                OtlpMetricProtoParser.Parse(PodBatch(g % Services, g, 1), interner);
+                OtlpMetricProtoParser.Parse(PodBatch(g % Services, g, 1, fillOnly: true), interner);
             clock.Advance(MetricLabelInterner.ResetInterval);
-            OtlpMetricProtoParser.Parse(PodBatch(0, 1_000_000, 2), interner);
+            OtlpMetricProtoParser.Parse(PodBatch(0, 1_000_000, 2, fillOnly: true), interner);
             Assert.Equal(1, interner.Resets);
             var reinterned = new List<MetricIngestItem>();
             for (int s = 0; s < 10; s++) reinterned.AddRange(OtlpMetricProtoParser.Parse(PodBatch(s, 0, 0), interner));
@@ -147,13 +154,13 @@ public sealed class MetricLabelPoolChurnProbe
 
             var best = new (double Ns, double Bytes)[3];
             Array.Fill(best, (double.MaxValue, double.MaxValue));
-            for (int run = 0; run < 7; run++)
+            for (int run = 0; run < 3; run++)
             {
                 var r = new[] { IngestCost(engine, live), IngestCost(engine, reinterned), IngestCost(engine, copies) };
                 for (int v = 0; v < 3; v++) best[v] = (Math.Min(best[v].Ns, r[v].Ns), Math.Min(best[v].Bytes, r[v].Bytes));
             }
 
-            _out.WriteLine($"INGEST OF LIVE SERIES ({live.Count} points per export, 10 pods), engine only, best of 7, interleaved");
+            _out.WriteLine($"INGEST OF LIVE SERIES ({live.Count} points per export, 10 pods), engine only, best of 3, interleaved");
             _out.WriteLine($"  the stored keys' own instances            : {best[0].Ns,6:N0} ns | {best[0].Bytes,4:N0} B per point");
             _out.WriteLine($"  re-interned after a reset, over the bridge: {best[1].Ns,6:N0} ns | {best[1].Bytes,4:N0} B per point");
             _out.WriteLine($"  new instances (a reset with no bridge)    : {best[2].Ns,6:N0} ns | {best[2].Bytes,4:N0} B per point");
@@ -173,8 +180,8 @@ public sealed class MetricLabelPoolChurnProbe
 
     private static (double Ns, double Bytes) IngestCost(Ameto.Metrics.Storage.MetricStorageEngine engine, List<MetricIngestItem> items)
     {
-        const int iters = 100;
-        for (int i = 0; i < 5; i++) engine.Ingest(CollectionsMarshal.AsSpan(items));      // warm
+        const int iters = 20;
+        for (int i = 0; i < 2; i++) engine.Ingest(CollectionsMarshal.AsSpan(items));      // warm
         long b0 = GC.GetAllocatedBytesForCurrentThread();
         long t0 = Stopwatch.GetTimestamp();
         for (int i = 0; i < iters; i++) engine.Ingest(CollectionsMarshal.AsSpan(items));
@@ -185,14 +192,14 @@ public sealed class MetricLabelPoolChurnProbe
 
     // ── Measurement ───────────────────────────────────────────────────────────
 
-    /// <summary>Per point, best of five runs of 200 exports; per-thread bytes (the parse runs on this thread).</summary>
+    /// <summary>Per point, best of three runs of 40 exports; per-thread bytes (the parse runs on this thread).</summary>
     private static (double Ns, double Bytes) Best(Action export)
     {
-        for (int i = 0; i < 20; i++) export();                        // warm JIT and the caches
+        for (int i = 0; i < 5; i++) export();                         // warm JIT and the caches
         double ns = double.MaxValue, bytes = double.MaxValue;
-        for (int run = 0; run < 5; run++)
+        for (int run = 0; run < 3; run++)
         {
-            const int iters = 200;
+            const int iters = 40;
             long b0 = GC.GetAllocatedBytesForCurrentThread();
             long t0 = Stopwatch.GetTimestamp();
             for (int i = 0; i < iters; i++) export();
@@ -206,7 +213,7 @@ public sealed class MetricLabelPoolChurnProbe
 
     // ── The workload ──────────────────────────────────────────────────────────
 
-    internal static byte[] PodBatch(int service, int generation, int replica)
+    internal static byte[] PodBatch(int service, int generation, int replica, bool fillOnly = false)
     {
         string svc     = "svc-" + service.ToString("D2", CultureInfo.InvariantCulture);
         string rs      = svc + "-" + Hex(service * 7919 + generation * 104_729, 10);
@@ -233,7 +240,7 @@ public sealed class MetricLabelPoolChurnProbe
 
         byte[] scope = OtlpProtoPayloads.Msg(sm =>
         {
-            for (int m = 0; m < Instruments; m++)
+            for (int m = 0; m < (fillOnly ? 1 : Instruments); m++)
             {
                 int mi = m;
                 OtlpProtoPayloads.Nested(sm, 2, OtlpProtoPayloads.Msg(metric =>
@@ -242,7 +249,7 @@ public sealed class MetricLabelPoolChurnProbe
                     metric.WriteString("http.server.metric." + mi.ToString(CultureInfo.InvariantCulture));
                     OtlpProtoPayloads.Nested(metric, 7, OtlpProtoPayloads.Msg(sum =>   // sum
                     {
-                        for (int p = 0; p < SeriesEach; p++)
+                        for (int p = 0; p < (fillOnly ? 1 : SeriesEach); p++)
                         {
                             int pi = p;
                             OtlpProtoPayloads.Nested(sum, 1, OtlpProtoPayloads.Msg(dp =>
