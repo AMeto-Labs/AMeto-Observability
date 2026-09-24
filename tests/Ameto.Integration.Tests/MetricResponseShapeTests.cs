@@ -24,7 +24,7 @@ namespace Ameto.Integration.Tests;
 /// sent — kept, not fixed, by the switch).</para>
 ///
 /// <para><b>Changed on purpose since, and only for those series (#92):</b> a repeated label key is
-/// written once, with the last value of its run — <c>raw-dup-key</c>, <c>query-dup-key</c> and
+/// written once, with its ordinal-greatest value (the last of its sorted run) — <c>raw-dup-key</c>, <c>query-dup-key</c> and
 /// <c>exemplars-dup-key</c> were 500 and are 200 — and a NaN or an infinity is written as
 /// <c>null</c> — <c>raw-nan</c>, <c>raw-infinity</c>, <c>query-nan</c>, <c>expr-sub-default-name</c>
 /// and <c>expr-unknown-op</c> (whose arithmetic overflows) were 500 and are 200, as are the new
@@ -228,7 +228,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
 
     /// <summary>
     /// The DTO's label dictionary as the old endpoints built it (<c>Pairs.ToDictionary</c>), except
-    /// that a repeated key keeps the last value of its run where ToDictionary threw (#92) — for a
+    /// that a repeated key keeps its ordinal-greatest value (the last of its sorted run) where ToDictionary threw (#92) — for a
     /// valid set, the same dictionary in the same order.
     /// </summary>
     private static Dictionary<string, string> LastValueWins(LabelSet labels)
@@ -242,7 +242,7 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
     /// A repeated label key far past the first flush (WP7 review, F4; #92). It used to fail the
     /// request: a clean 500 from the list answers, which checked every series before the first
     /// byte, and a DROPPED CONNECTION from the streamed raw answer once its first ~14.7 KB had gone —
-    /// the browser saw status 0. The key is now written once, last value of its run, so both
+    /// the browser saw status 0. The key is now written once, its ordinal-greatest value, so both
     /// complete, and every series around it is written exactly as before.
     /// </summary>
     [Theory]

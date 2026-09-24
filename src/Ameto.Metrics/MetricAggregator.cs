@@ -635,8 +635,9 @@ public sealed class MetricAggregator : IMetricAggregator
     {
         // The pairs are in canonical order and a subset of them keeps it, so the reduced set is
         // built straight from the kept strings — no pair list, no sort. A key repeated in a set
-        // stored before ingest collapsed repeats (#92) keeps the LAST value of its run, the one the
-        // answer writes and a filter matches, so such a series groups with the series it reads as.
+        // stored before ingest collapsed repeats (#92) keeps the last of its run — the ordinal-greatest
+        // value, the one the answer writes and a filter matches — so such a series groups with the
+        // series it reads as.
         var kv = labels.Interleaved;
         int n  = 0;
         for (int i = 0; i < kv.Length; i += 2)

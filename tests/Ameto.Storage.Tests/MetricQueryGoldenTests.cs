@@ -251,7 +251,8 @@ public sealed class MetricQueryGoldenTests : IDisposable
     // The latent bug this class used to pin — kept by the rewrite, not fixed by it — is fixed now:
     // a set with a key twice (stored before ingest collapsed repeats) failed ANY filtered read with
     // the ArgumentException ToDictionary threw. It is matched instead, on the value the answer
-    // writes for the key: the last of its run, "v2".
+    // writes for the key: the last of its run, which is its ORDINAL-GREATEST value ("v2") — not
+    // necessarily the one sent last, whose order was never stored.
 
     private static LabelSet Duplicated() =>
         new([new("k", "v1"), new("k", "v2"), new("z", "1")]);
@@ -287,6 +288,26 @@ public sealed class MetricQueryGoldenTests : IDisposable
             await foreach (var _ in MetricReader.ReadAsync(file, "golden.dup", long.MinValue, long.MaxValue, m, CancellationToken.None)) n++;
             Assert.Equal(matches ? 1 : 0, n);
         }
+    }
+
+    /// <summary>
+    /// API.md's example, pinned: a series stored with a point <c>service.name=api</c> under a resource
+    /// <c>service.name=gateway</c> answers to <c>gateway</c> — the greater — though today's ingest
+    /// would keep <c>api</c> (a point attribute wins).
+    /// </summary>
+    [Fact]
+    public async Task A_stored_series_answers_to_its_ordinal_greatest_value_not_the_one_ingest_keeps_today()
+    {
+        await using var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance,
+                                                         new Ameto.Core.MetricsOptions { HotTierBytes = 1L << 30 });
+        engine.Ingest([new MetricIngestItem { Name = "golden.svc", Kind = MetricKind.Gauge,
+                                              Labels = new([new("service.name", "api"), new("service.name", "gateway")]),
+                                              TimestampUnixNano = T0, ScalarValue = 1 }]);
+
+        int gateway = 0, api = 0;
+        await foreach (var _ in engine.QueryAsync("golden.svc", labelMatchers: new Dictionary<string, string> { ["service.name"] = "gateway" })) gateway++;
+        await foreach (var _ in engine.QueryAsync("golden.svc", labelMatchers: new Dictionary<string, string> { ["service.name"] = "api" })) api++;
+        Assert.Equal((1, 0), (gateway, api));
     }
 
     [Fact]

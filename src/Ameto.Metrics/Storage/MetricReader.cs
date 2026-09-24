@@ -729,9 +729,14 @@ internal static class MetricReader
     /// five. The pairs are already sorted by key (ordinal), so a walk that stops at the first key
     /// past the one sought answers the same lookup with no allocation at all.</para>
     ///
-    /// <para><b>A repeated key is matched on the LAST value of its run</b> (#92) — the value the
-    /// answer writes for it (<c>MetricSeriesJson.WriteLabels</c>), so a filter selects exactly the
-    /// series whose written labels satisfy it. Ingest no longer builds such a set; one stored before
+    /// <para><b>A repeated key is matched on the ORDINAL-GREATEST of its values</b> (#92) — the last
+    /// of its run, since a set is sorted by key and then by value — which is the value the answer
+    /// writes for it (<c>MetricSeriesJson.WriteLabels</c>), so a filter selects exactly the series
+    /// whose written labels satisfy it. It is NOT the value ingest keeps today (the last one sent, a
+    /// point attribute over the resource): the order the values arrived in was never stored. A series
+    /// stored with a point <c>service.name=api</c> under a resource <c>service.name=gateway</c> is
+    /// answered and filtered as <c>gateway</c>, while the same series ingested now is <c>api</c>.
+    /// Ingest no longer builds such a set; one stored before
     /// that fix (the WAL, an <c>.mts</c>) is matched, never refused. It used to throw
     /// <see cref="ArgumentException"/> before any matcher was looked at, as the <c>ToDictionary</c>
     /// this scan replaced did: any filter on /query, /heatmap or /exemplars that touched such a
@@ -756,8 +761,8 @@ internal static class MetricReader
     }
 
     /// <summary>
-    /// The value under <paramref name="key"/> in canonically sorted pairs — the last of its run when
-    /// the key repeats (see <see cref="MatchesLabels"/>) — tested against the matcher.
+    /// The value under <paramref name="key"/> in canonically sorted pairs — the last of its run, the
+    /// ordinal-greatest, when the key repeats (see <see cref="MatchesLabels"/>) — tested against the matcher.
     /// </summary>
     private static bool Matches(ReadOnlySpan<string> kv, string key, string matcher)
     {

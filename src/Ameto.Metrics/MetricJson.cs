@@ -109,14 +109,16 @@ internal sealed class NonFiniteAsNullArrayConverter : JsonConverter<double[]>
 /// same answer the exemplar and heatmap DTOs give through <see cref="NonFiniteAsNullConverter"/>.
 /// A finite value's bytes are what they were.</para>
 ///
-/// <para><b>A repeated label key is written once — the last of its run — and never fails the
-/// answer</b> (#92). It used to throw, as the <c>ToDictionary</c> that built the DTO did: one such
-/// series failed a whole panel with a 500, or — past the first flush of the streamed raw answer —
-/// dropped the connection. Ingest no longer produces such a set (the OTLP label builder lets the
-/// last value of a repeated key win), so what is left is a set stored before that fix, or one a
-/// caller built by hand; neither may take the answer down with it. The pairs are sorted by key,
-/// then value, so the value written is the one a browser's <c>JSON.parse</c> would have kept had
-/// the key gone out twice. A null key (no reader produces one) is skipped for the same reason.</para>
+/// <para><b>A repeated label key is written once — the last of its run, which is its ordinal-greatest
+/// value — and never fails the answer</b> (#92). It used to throw, as the <c>ToDictionary</c> that
+/// built the DTO did: one such series failed a whole panel with a 500, or — past the first flush of
+/// the streamed raw answer — dropped the connection. Ingest no longer produces such a set (the OTLP
+/// label builder lets the last value SENT win), so what is left is a set stored before that fix, or
+/// one a caller built by hand; neither may take the answer down with it. The pairs are sorted by
+/// key, then value, so the value written is the one a browser's <c>JSON.parse</c> would have kept
+/// had the key gone out twice — the greatest, not the last sent, whose order was never stored (a
+/// point <c>service.name=api</c> under a resource <c>service.name=gateway</c> is answered as
+/// <c>gateway</c>). A null key (no reader produces one) is skipped for the same reason.</para>
 ///
 /// <para><b>When bytes leave.</b> Output collects in the response pipe and is flushed to the network
 /// once more than <see cref="FlushThresholdBytes"/> have accumulated — the serializer's own habit —
@@ -199,7 +201,8 @@ internal static class MetricSeriesJson
 
     /// <summary>
     /// The label pairs as object members, each key ONCE: the pairs are sorted by key, then value, so
-    /// a repeated key is a run of adjacent pairs and only the last of the run is written. A null key
+    /// a repeated key is a run of adjacent pairs and only the last of the run — the ordinal-greatest
+    /// value — is written. A null key
     /// is skipped. Neither can come from ingest (see the class remarks); this is the defence that
     /// keeps a set stored before that fix from failing the answer. Valid sets are written pair for
     /// pair, as before.
