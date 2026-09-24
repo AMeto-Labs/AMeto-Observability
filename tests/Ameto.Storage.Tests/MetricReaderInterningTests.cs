@@ -103,6 +103,12 @@ public sealed class MetricReaderInterningTests : IDisposable
         var got = Assert.Single(MetricReader.ReadAllSync(file));
         Assert.Equal(20, got.Labels.Count);
         Assert.Equal(before, MetricLabelInterner.Shared.Strings.ClaimedCount);
+
+        // A count check alone passes against an inserting read once Shared is full (Claim refuses
+        // and ClaimedCount is capped), so also ask for the text itself: a lookup-only read left
+        // none of it in the pool, whatever the pool's fill.
+        Assert.False(MetricLabelInterner.Shared.Strings.TryGet(got.Labels.KeyAt(0), out _, out _));
+        Assert.False(MetricLabelInterner.Shared.Strings.TryGet(got.Labels.ValueAt(0), out _, out _));
     }
 
     [Fact]
