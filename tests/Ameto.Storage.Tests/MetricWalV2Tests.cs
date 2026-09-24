@@ -509,35 +509,42 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     // ── The pool ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// A POOL RECORD THAT FAILS ITS CHECKSUM IS NOT DECODED INTO A SERIES. One flipped bit inside
-    /// "beta" would have decoded as a series named "bdta" with the real point under it — the pool's
-    /// version of the garbage replay. Its points come back as UNRESOLVED instead, the pool is cut
-    /// back to the last record that verifies (so the next record appends on a clean boundary), and
-    /// the index is not handed out again: the log's own entry still pins it.
+    /// A POOL RECORD THAT FAILS ITS CHECKSUM IS SKIPPED, NOT DECODED — AND ONLY IT. One flipped bit
+    /// inside "beta" would have decoded as a series named "bdta" with the real point under it — the
+    /// pool's version of the garbage replay. Its points come back as UNRESOLVED instead; the
+    /// records around it, before AND after, resolve as usual, because its framing held and the
+    /// walk steps over it; the file is not cut (a Warning names the skip); and the index is not
+    /// handed out again — the log's own entry still pins it, so "delta", registered after the
+    /// restart, does not replay under beta's index. Ending the walk at the bad record, as the
+    /// first cut of v2 did, left gamma unresolved too and cut it off the file at the next open.
     /// </summary>
     [Fact]
-    public void A_pool_record_that_fails_its_checksum_is_not_decoded_into_a_series()
+    public void A_pool_record_that_fails_its_checksum_is_skipped_and_the_records_after_it_resolve()
     {
         using (var wal = Open())
         {
             wal.Append([Gauge("alpha", 0, 1.0)]);
-            wal.Append([Gauge("beta", 1, 2.0)]);
+            wal.Append([Gauge("beta",  1, 2.0)]);
+            wal.Append([Gauge("gamma", 2, 3.0)]);
         }
         byte[] pool = File.ReadAllBytes(PoolPath);
+        long poolLength = pool.Length;
         int alphaEnd = 12 + (int)(BinaryPrimitives.ReadUInt32LittleEndian(pool.AsSpan(4)) & 0x00FF_FFFF);
         Assert.Equal((byte)'e', pool[alphaEnd + 12 + 1 + 2 + 1]);                // kind, u16 length, 'b', then 'e'
         Xor(PoolPath, alphaEnd + 12 + 1 + 2 + 1, 0x01);                          // "beta" → "bdta"
 
-        using (var wal = Open())
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
         {
-            Assert.Equal(alphaEnd, new FileInfo(PoolPath).Length);               // cut to the last verified record
-            wal.Append([Gauge("charlie", 2, 3.0)]);                              // must not take beta's index
+            Assert.Equal(poolLength, new FileInfo(PoolPath).Length);             // nothing cut
+            wal.Append([Gauge("delta", 3, 4.0)]);                                // must not take beta's index
         }
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Warning && e.Text.Contains("fail their checksum"));
 
         var replayed = Open().ReadAll(out int unresolved);
         Assert.Equal(1, unresolved);                                             // beta, honestly lost
-        Assert.Equal(["alpha", "charlie"], replayed.Select(static r => r.Name));
-        Assert.Equal([1.0, 3.0], replayed.Select(static r => r.Point.Value));
+        Assert.Equal(["alpha", "gamma", "delta"], replayed.Select(static r => r.Name));
+        Assert.Equal([1.0, 3.0, 4.0], replayed.Select(static r => r.Point.Value));
     }
 
     // ── v1 still replays, and is upgraded ────────────────────────────────────

@@ -765,17 +765,29 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // opening the log interns nothing (see LoadPool for why that matters).
         if (_writeOffset > 0)
         {
-            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne);
+            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne, out int badRecords);
 
             _nextSeriesIndex = (uint)Math.Min(uint.MaxValue,
                                               Math.Max(poolMaxPlusOne, _survivorSeriesSeed));
 
+            if (badRecords > 0)
+                _logger?.LogWarning(
+                    "Metric WAL pool: {Count} series record(s) fail their checksum and are skipped; points that " +
+                    "reference them replay as unresolved, the records after them are read as usual.", badRecords);
+
             // A torn pool tail is not just a lost record: the next WritePoolRecord appends
             // AFTER the garbage, so every record from then on is read at the wrong offset and
             // the whole pool decodes into nonsense. Cutting the file back to the last clean
-            // boundary costs one already-unreadable record and keeps the file parseable.
-            if (cleanPoolEnd < _poolStream.Length)
+            // boundary costs one already-unreadable record and keeps the file parseable. Only
+            // where the FRAMING broke — a record that merely fails its checksum is stepped over
+            // above and cut by nothing.
+            long poolLength = _poolStream.Length;
+            if (cleanPoolEnd < poolLength)
             {
+                _logger?.LogWarning(
+                    "Metric WAL pool: cutting {Bytes} byte(s) of torn records at offset {Offset} — their framing is " +
+                    "unreadable, and a record appended after them would be read at the wrong offset.",
+                    poolLength - cleanPoolEnd, cleanPoolEnd);
                 try
                 {
                     _poolStream.SetLength(cleanPoolEnd);
@@ -1950,7 +1962,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private Dictionary<uint, PoolEntry> LoadPool(HashSet<uint> referenced)
     {
-        var bodies = ReadPoolRecords(referenced, out _, out _);
+        var bodies = ReadPoolRecords(referenced, out _, out _, out _);
         var map    = new Dictionary<uint, PoolEntry>(bodies.Count);
         var interner = Interner;
         foreach (var (index, body) in bodies)
@@ -2001,18 +2013,24 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// width of the garbage, which breaks pool parsing for every series registered afterwards,
     /// not just the one that was lost.
     ///
-    /// <para><b>A v2 record that does not verify ends the walk like a torn one</b>, and is read
-    /// whole to find out — kept or not, because its checksum covers the body. So a record whose
-    /// length landed and whose body did not is never decoded into a series with a garbage name and
-    /// labels that the points referencing it would then replay under; they come back as
-    /// unresolved instead, which is honest. A v1 record (see <see cref="PoolRecordTagV2"/>) has
-    /// only the length check it always had, and its body is still stepped over unread.</para>
+    /// <para><b>A v2 record that does not verify is skipped, not decoded</b> — and read whole to
+    /// find out, kept or not, because its checksum covers the body. So a record whose length
+    /// landed and whose body did not never becomes a series with a garbage name and labels that
+    /// the points referencing it would then replay under; they come back as unresolved instead,
+    /// which is honest. When its framing is intact (the length tagged, sane, inside the file) the
+    /// walk steps over it and goes on: every record after it is exactly where it should be, and
+    /// ending the walk there — as this did at first — made every series registered later
+    /// unresolved and let the open cut them off the file. <paramref name="skipped"/> counts them.
+    /// Only broken framing ends the walk. A v1 record (see <see cref="PoolRecordTagV2"/>) has only
+    /// the length check it always had, and its body is still stepped over unread.</para>
     /// </summary>
-    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling)
+    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling,
+                                                     out int skipped)
     {
         var bodies = new Dictionary<uint, byte[]>();
         cleanEnd     = 0;
         indexCeiling = 0;
+        skipped      = 0;
         if (!File.Exists(_poolPath)) return bodies;
 
         byte[]? scratch = null;
@@ -2058,7 +2076,20 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
                     if (v2 && BinaryPrimitives.ReadUInt32LittleEndian(head[PoolHeadV1..])
                               != Crc32c.Append(Crc32c.Append(0, head[..PoolHeadV1]), body.AsSpan(0, (int)len)))
-                        break;                                               // torn: the checksum says so
+                    {
+                        // Its framing held — the length is tagged, sane and inside the file — so
+                        // the records after it are where they should be: step over this one, not
+                        // off the end of the walk. Nothing of it is used, not even to let an
+                        // EARLIER record for the same index stand in for it (later records win,
+                        // and this was the later one). Its index still counts toward the ceiling
+                        // below when it could be one, so a new series cannot take it while an
+                        // entry that references it is in the log.
+                        skipped++;
+                        bodies.Remove(index);
+                        if (index < SeriesIndexSanityCap && index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                        cleanEnd = fs.Position;
+                        continue;
+                    }
 
                     if (kept) bodies[index] = body;                          // later records win
                 }
