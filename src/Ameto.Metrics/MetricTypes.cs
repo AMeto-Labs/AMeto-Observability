@@ -340,6 +340,64 @@ public sealed class MetricLabelInterner
         return _strings.Intern(s, out value);
     }
 
+    /// <summary>
+    /// LOOKUP ONLY: the pooled instance of these UTF-8 bytes and its id when the pool already
+    /// holds the text; otherwise a fresh string (decoded exactly as <c>Encoding.UTF8.GetString</c>
+    /// does) and -1 — and NOTHING is added. For text read back from disk (<c>MetricReader</c>):
+    /// the pool never evicts, so a cold read that interned every value it met would fill it at
+    /// startup with the dead values of the whole retention window, and every series started
+    /// after that would be ingested at the uninterned cost. A value still being sent is in the
+    /// pool already — the parsers put it there — and comes back shared. Empty input answers
+    /// <see cref="EmptyStringId"/>, as <see cref="Intern(ReadOnlySpan{byte}, out string)"/> does.
+    /// </summary>
+    public int Lookup(ReadOnlySpan<byte> utf8, out string value)
+    {
+        if (utf8.IsEmpty) { value = string.Empty; return EmptyStringId; }
+        if (utf8.Length > MaxInternedUtf8Bytes) { value = Encoding.UTF8.GetString(utf8); return -1; }
+
+        // A UTF-8 byte decodes to at most one char (an invalid sequence to one U+FFFD), so the
+        // bound above bounds the chars too: one decode, on the stack, serves the lookup and the miss.
+        Span<char> chars = stackalloc char[MaxInternedUtf8Bytes];
+        int n = Encoding.UTF8.GetChars(utf8, chars);
+        if (_strings.TryGet(chars[..n], out string? pooled, out int id)) { value = pooled; return id; }
+        value = new string(chars[..n]);
+        return -1;
+    }
+
+    /// <summary>
+    /// LOOKUP ONLY counterpart of <see cref="GetLabelSet"/>: sorts <paramref name="kv"/> and
+    /// <paramref name="ids"/> into canonical order in place, answers the set the table holds for
+    /// exactly these instances when there is one, and otherwise builds a fresh set WITHOUT
+    /// publishing it — the same probe of the same two slots, and no write. See <see cref="Lookup"/>
+    /// for why a cold read must not fill the table either.
+    /// </summary>
+    public LabelSet LookupLabelSet(Span<string> kv, Span<int> ids)
+    {
+        if (kv.IsEmpty) return LabelSet.Empty;
+        if (ids.Length != kv.Length || (kv.Length & 1) != 0)
+            throw new ArgumentException("one id per string, and whole pairs", nameof(ids));
+        LabelSet.SortInterleaved(kv, ids);
+
+        uint h = 2166136261;
+        for (int i = 0; i < ids.Length; i++)
+        {
+            int id = ids[i];
+            if (id < 0) return LabelSet.FromSorted(kv);   // not all pooled: no identity to key on
+            h = (h ^ (uint)id) * 16777619;
+        }
+        h ^= h >> 15; h *= 0x2C1B3C6D; h ^= h >> 12;
+
+        var sets = _sets;
+        int a = (int)(h & (uint)_mask);
+        int b = (int)((h >> 16 | h << 16) & (uint)_mask);
+
+        var hit = Volatile.Read(ref sets[a]);
+        if (hit is not null && hit.SameReferences(kv)) return hit;
+        hit = Volatile.Read(ref sets[b]);
+        if (hit is not null && hit.SameReferences(kv)) return hit;
+        return LabelSet.FromSorted(kv);
+    }
+
     /// <summary>The canonical instance of <paramref name="s"/> (or <paramref name="s"/> itself when
     /// it is not pooled). For names and units, which a <c>SeriesKey</c> holds for the series'
     /// life.</summary>

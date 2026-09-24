@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using K4os.Compression.LZ4;
 using MessagePack;
 using Microsoft.Extensions.Logging;
@@ -1436,12 +1437,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             prefix is null || name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
-    public async IAsyncEnumerable<MetricSeries> QueryAsync(
+    public IAsyncEnumerable<MetricSeries> QueryAsync(
         string             metricName,
         DateTimeOffset?    from         = null,
         DateTimeOffset?    to           = null,
         TimeSpan?          step         = null,
         IReadOnlyDictionary<string, string>? labelMatchers = null,
+        CancellationToken  ct           = default) =>
+        QueryAsync(metricName, from, to, step, labelMatchers, MetricPointFields.All, ct);
+
+    /// <summary>
+    /// The query, for a caller that reads only <paramref name="fields"/>. With
+    /// <see cref="MetricPointFields.NoBuckets"/> the COLD read builds no bucket arrays (the hot
+    /// tier's points carry references to arrays that exist anyway, and are left as they are) —
+    /// every other field, series and point is the same answer.
+    /// </summary>
+    public async IAsyncEnumerable<MetricSeries> QueryAsync(
+        string             metricName,
+        DateTimeOffset?    from,
+        DateTimeOffset?    to,
+        TimeSpan?          step,
+        IReadOnlyDictionary<string, string>? labelMatchers,
+        MetricPointFields  fields,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
@@ -1477,10 +1494,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try
             {
-                coldCandidates = _coldSegments
-                    .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
-                             && s.MaxNano >= fromNano && s.MinNano <= toNano)
-                    .ToList();
+                // A loop, not Where().ToList(): the same segments in the same order (the order the
+                // fragments come back in, which the aggregator's merge tie-break depends on),
+                // without a closure and an iterator per query.
+                for (int i = 0; i < _coldSegments.Count; i++)
+                {
+                    var s = _coldSegments[i];
+                    if (s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
+                        && s.MaxNano >= fromNano && s.MinNano <= toNano)
+                        coldCandidates.Add(s);
+                }
             }
             finally { _coldLock.ExitReadLock(); }
         }
@@ -1488,9 +1511,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         foreach (var seg in coldCandidates)
         {
             ct.ThrowIfCancellationRequested();
-            await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers, ct))
+            await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers,
+                                                                buckets: fields != MetricPointFields.NoBuckets, ct))
             {
-                var points = step.HasValue ? Downsample(series.Points, step.Value, series.Kind) : series.Points;
+                // The reader's series is already this query's answer — its points are the ones in
+                // range, in a list nothing else holds — so without a step it is handed on as is.
+                if (!step.HasValue) { yield return series; continue; }
                 yield return new MetricSeries
                 {
                     Name         = series.Name,
@@ -1498,7 +1524,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     Unit         = series.Unit,
                     Labels       = series.Labels,
                     BucketBounds = series.BucketBounds,
-                    Points       = points,
+                    Points       = Downsample(series.Points, step.Value, series.Kind),
                 };
             }
         }
@@ -2375,81 +2401,156 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private const int SeriesChunk = 512;
 
     /// <summary>
+    /// Test seam: invoked by <see cref="RewriteMetricInChunks"/> with a chunk's first key index the
+    /// moment that chunk's output is written — where retention deleting a source, or a later chunk
+    /// failing, would leave an output nothing publishes. Null in production.
+    /// </summary>
+    internal Action<int>? OnRewriteChunkWrittenForTest;
+
+    /// <summary>
     /// Rewrites ONE metric's source files, transforming each series' points, with the
     /// retained <em>point</em> volume bounded by <see cref="SeriesChunk"/> series. That
     /// is the bound that matters — points are what scale with time and dominate the
-    /// heap. It is NOT fully independent of cardinality: <c>keys</c>/<c>seen</c>/
-    /// <c>bounds</c> below hold one entry per series for the whole rewrite (a key is a
-    /// name + kind + unit + <see cref="LabelSet"/>, tens of bytes, so 40k series cost
-    /// single-digit MB against the hundreds of MB of points this avoids).
+    /// heap. It is NOT fully independent of cardinality: the key list, its index and the
+    /// bounds hold one entry per series for the whole rewrite, and each source's series
+    /// positions one long and one int per series (a key is a name + kind + unit +
+    /// <see cref="LabelSet"/>, tens of bytes, so 40k series cost single-digit MB against the
+    /// hundreds of MB of points this avoids).
     ///
-    /// <para>A metric with more series than the chunk is processed in several passes:
-    /// pass 0 collects the key set (its points are decoded one series at a time by
-    /// <see cref="MetricReader"/> and dropped immediately), then each chunk re-reads the
-    /// sources and keeps only its own series. Chunk boundaries are deliberately NOT
-    /// aligned to source files even though <see cref="SeriesChunk"/> equals the writer's
-    /// per-file cap: file membership is insertion order at write time, so the same series
-    /// lands in different file slots across time windows, and the sources being merged
-    /// here are of mixed vintage (pre-cap files carry unbounded series counts). Pairing
-    /// by file index would silently split a series across two outputs. Re-reading costs
-    /// LZ4 decompression on a background path — cheaper than retaining hundreds of MB and
-    /// paying for it in blocking gen2 collections. The reader rents its compressed and
-    /// decompressed buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the extra
-    /// passes do not churn the LOH (this process runs workstation GC, which never
-    /// compacts it). Metrics that fit in one chunk read each file exactly once.</para>
+    /// <para>Chunks are key-ordered: the keys are numbered in the order they are first met
+    /// across the sources, and chunk <c>n</c> is keys <c>[n x 512, (n + 1) x 512)</c>. Chunk
+    /// boundaries are deliberately NOT aligned to source files even though
+    /// <see cref="SeriesChunk"/> equals the writer's per-file cap: file membership is insertion
+    /// order at write time, so the same series lands in different file slots across time
+    /// windows, and the sources being merged here are of mixed vintage (pre-cap files carry
+    /// unbounded series counts). Pairing by file index would silently split a series across two
+    /// outputs.</para>
+    ///
+    /// <para><b>Each source is DECODED once for its identities, not once per chunk.</b> The first
+    /// pass reads every source in full order — numbering the keys, gathering bucket bounds,
+    /// recording where each series sits (<see cref="MetricReader.ReadForRewrite"/>), and
+    /// decoding the points of the first chunk's series only, which it keeps: so a metric that fits
+    /// in one chunk is read exactly once. Every later chunk goes back only to the sources that
+    /// hold one of its series, and reads only those series, at their recorded positions, without
+    /// their labels (<see cref="MetricReader.ReadAt"/>). It used to re-open, re-inflate and fully
+    /// decode every source for every chunk — every label string of every series re-materialised,
+    /// only to throw away the series the chunk did not want — after a first pass that had decoded
+    /// every point just to learn the keys. The reader rents its compressed and decompressed
+    /// buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the passes do not churn the LOH
+    /// (this process runs workstation GC, which never compacts it).</para>
+    ///
+    /// <para>What is written is what the per-chunk re-read wrote, byte for byte: the same chunks,
+    /// the same series order within one (first seen), the same points in the same order (sources
+    /// in order, series in file order), the same bounds (the last non-null seen), the same key text.
+    /// <c>MetricDownsampleGoldenTests</c> pins the output files.</para>
     /// </summary>
     internal List<MetricSegmentInfo> RewriteMetricInChunks(
         List<MetricSegmentInfo> segs,
         MetricGranularity       target,
         Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform)
     {
-        // ── Pass 0: key set + bucket bounds (no points retained) ───────────────
-        var keys   = new List<SeriesKey>();
-        var seen   = new HashSet<SeriesKey>();
-        var bounds = new Dictionary<SeriesKey, double[]?>();
+        // ── Pass 0: key set + bucket bounds + positions, and the first chunk's points ────────
+        var keys    = new List<SeriesKey>();
+        var index   = new Dictionary<SeriesKey, int>();
+        var bounds  = new List<double[]?>();
+        var first   = new List<List<MetricDataPoint>?>();
+        var located = new List<(string Path, List<long> Positions, List<int> Keys)>(segs.Count);
+
+        Func<SeriesKey, int> keyOf = key =>
+        {
+            if (index.TryGetValue(key, out int k)) return k;
+            k = keys.Count;
+            index[key] = k;
+            keys.Add(key);
+            bounds.Add(null);
+            return k;
+        };
+
         foreach (var seg in segs)
-            foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+        {
+            var positions = new List<long>();
+            var keyOrder  = new List<int>();
+            foreach (var (position, k, s) in MetricReader.ReadForRewrite(seg.FilePath, keyOf, SeriesChunk))
             {
-                var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
-                if (seen.Add(key)) keys.Add(key);
-                if (s.BucketBounds is not null) bounds[key] = s.BucketBounds;
+                positions.Add(position);
+                keyOrder.Add(k);
+                if (s.BucketBounds is not null) bounds[k] = s.BucketBounds;
+                if (k < SeriesChunk)
+                {
+                    while (first.Count <= k) first.Add(null);
+                    (first[k] ??= []).AddRange(s.Points);
+                }
             }
+            located.Add((seg.FilePath, positions, keyOrder));
+        }
         if (keys.Count == 0) return [];
 
+        // ALL OR NOTHING ON DISK, like MetricWriter.Write itself. Chunk 0 is written before a later
+        // chunk's series are decoded — pass 0 walks past their points, and ReadAt meets them — so a
+        // later chunk can fail AFTER an output exists: a source corrupt past the first chunk, or one
+        // retention deleted mid-rewrite. The caller then keeps the sources and publishes nothing,
+        // and an output left behind would be loaded at the next start beside the sources it
+        // duplicates, one more per failed rewrite. So a failure takes back every output first.
         var written = new List<MetricSegmentInfo>();
-        for (int off = 0; off < keys.Count; off += SeriesChunk)
+        try
         {
-            int take  = Math.Min(SeriesChunk, keys.Count - off);
-            // Single-chunk metric: no filtering needed, one pass over the files.
-            var wanted = keys.Count <= SeriesChunk
-                ? null
-                : new HashSet<SeriesKey>(keys.GetRange(off, take));
+            WriteChunk(0, first);
+            OnRewriteChunkWrittenForTest?.Invoke(0);
 
-            var acc = new Dictionary<SeriesKey, List<MetricDataPoint>>(take);
-            foreach (var seg in segs)
-                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+            // ── Every later chunk: only its series, at their positions ───────────────────────
+            for (int off = SeriesChunk; off < keys.Count; off += SeriesChunk)
+            {
+                int take = Math.Min(SeriesChunk, keys.Count - off);
+                var acc  = new List<MetricDataPoint>?[Math.Min(SeriesChunk, keys.Count - off)];
+                foreach (var (path, positions, keyOrder) in located)
                 {
-                    var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
-                    if (wanted is not null && !wanted.Contains(key)) continue;
-                    if (!acc.TryGetValue(key, out var pts))
+                    var at    = new List<long>();
+                    var atKey = new List<int>();
+                    for (int j = 0; j < positions.Count; j++)
                     {
-                        pts = new List<MetricDataPoint>();
-                        acc[key] = pts;
+                        int k = keyOrder[j];
+                        if (k < off || k >= off + take) continue;
+                        at.Add(positions[j]);
+                        atKey.Add(k);
                     }
-                    pts.AddRange(s.Points);
+                    if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
+
+                    int n = 0;
+                    foreach (var (_, _, s) in MetricReader.ReadAt(path, at))
+                        (acc[atKey[n++] - off] ??= []).AddRange(s.Points);
                 }
-
-            var batch = new List<(SeriesKey, HotSeries)>(acc.Count);
-            foreach (var (key, pts) in acc)
-                batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds.GetValueOrDefault(key))));
-
-            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+                WriteChunk(off, acc);
+                OnRewriteChunkWrittenForTest?.Invoke(off);
+            }
+        }
+        catch
+        {
+            // Best effort — the original failure is what the caller must see. An output that cannot be
+            // deleted (a scanner holding it on Windows) is loaded beside its sources at the next start,
+            // so it is named here: the operator can remove it before then.
+            foreach (var info in written)
+                try { File.Delete(info.FilePath); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete the partial rewrite output {File}; it duplicates its sources until removed", info.FilePath); }
+            throw;
         }
         return written;
+
+        // One chunk's series, in key order, to its output file(s).
+        void WriteChunk(int off, IReadOnlyList<List<MetricDataPoint>?> points)
+        {
+            var batch = new List<(SeriesKey, HotSeries)>(points.Count);
+            for (int i = 0; i < points.Count; i++)
+            {
+                if (points[i] is not { } pts) continue;
+                var key = keys[off + i];
+                batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds[off + i])));
+            }
+            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+        }
     }
 
     /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
-    private static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
+    internal static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
     {
         pts.Sort(static (a, b) => a.TimestampUnixNano.CompareTo(b.TimestampUnixNano));
         var result = new List<MetricDataPoint>(pts.Count);
@@ -2479,8 +2580,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // hundreds of MB while it is rewritten.
                 var newInfos = RewriteMetricInChunks(
                     group.ToList(), targetGranularity,
-                    (pts, kind) => Downsample(
-                        pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList());
+                    (pts, kind) => RollupPoints(pts, bucketSize, kind));
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -2504,34 +2604,60 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    /// <summary>
+    /// The rollup's transform of one series' gathered points: ordered by timestamp, then
+    /// <see cref="Downsample"/>d into <paramref name="bucketSize"/> buckets. What reaches the
+    /// <c>.mts</c> files a rollup writes — <c>MetricDownsampleGoldenTests</c> pins it.
+    ///
+    /// <para>The order is a STABLE sort by timestamp, as <c>OrderBy</c> was: equal timestamps keep
+    /// the order the sources were read in, which decides the last bit of a gauge's average and
+    /// which of two equal counter points a bucket keeps. The gathered list is already in order
+    /// whenever the series lives in one source file (the common case — the writer emits sorted
+    /// points), and then nothing is copied at all; otherwise a copy is sorted and the caller's list
+    /// is left as it was, as the LINQ chain left it.</para>
+    /// </summary>
+    internal static List<MetricDataPoint> RollupPoints(List<MetricDataPoint> pts, TimeSpan bucketSize, MetricKind kind) =>
+        Downsample(IsSortedByTimestamp(CollectionsMarshal.AsSpan(pts)) ? pts : StableSortedByTimestamp(pts), bucketSize, kind);
 
-    private static bool MatchesLabels(
-        LabelSet labels,
-        IReadOnlyDictionary<string, string>? matchers)
+    private static bool IsSortedByTimestamp(ReadOnlySpan<MetricDataPoint> pts)
     {
-        if (matchers is null || matchers.Count == 0) return true;
-        var pairs = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
-        foreach (var (k, v) in matchers)
-        {
-            if (!pairs.TryGetValue(k, out var actual)) return false;
-            if (!LabelValueMatches(actual, v)) return false;
-        }
+        for (int i = 1; i < pts.Length; i++)
+            if (pts[i].TimestampUnixNano < pts[i - 1].TimestampUnixNano) return false;
         return true;
     }
 
     /// <summary>
-    /// Exact match, or OR-match when the matcher value is '|'-delimited
-    /// (e.g. <c>service.name=A|B|C</c>) — lets the multi-service filter merge
-    /// several series server-side so quantiles aggregate over the union.
+    /// A copy of <paramref name="pts"/> ordered by timestamp, ties in input order — the order
+    /// <c>OrderBy</c> gives. (timestamp, input index) pairs are unique, so an unstable sort of
+    /// them IS the stable order; the pair array is rented.
     /// </summary>
-    private static bool LabelValueMatches(string actual, string matcher)
+    private static List<MetricDataPoint> StableSortedByTimestamp(List<MetricDataPoint> pts)
     {
-        if (matcher.IndexOf('|') < 0) return actual == matcher;
-        foreach (var opt in matcher.Split('|'))
-            if (actual == opt) return true;
-        return false;
+        var src  = CollectionsMarshal.AsSpan(pts);
+        var keys = ArrayPool<(long Ts, int Index)>.Shared.Rent(src.Length);
+        try
+        {
+            for (int i = 0; i < src.Length; i++) keys[i] = (src[i].TimestampUnixNano, i);
+            Array.Sort(keys, 0, src.Length);
+            var sorted = new List<MetricDataPoint>(src.Length);
+            for (int i = 0; i < src.Length; i++) sorted.Add(src[keys[i].Index]);
+            return sorted;
+        }
+        finally { ArrayPool<(long, int)>.Shared.Return(keys); }
     }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The hot tier's and the exemplar ring's filter: no matchers (null OR empty) match
+    /// everything WITHOUT looking at the labels — which is why an empty filter never reached the
+    /// repeated-key throw here and still does not — and anything else is
+    /// <see cref="MetricReader.MatchesLabels"/>, the scan the cold reader uses.
+    /// </summary>
+    private static bool MatchesLabels(
+        LabelSet labels,
+        IReadOnlyDictionary<string, string>? matchers) =>
+        matchers is null || matchers.Count == 0 || MetricReader.MatchesLabels(labels, matchers);
 
     /// <summary>
     /// Type-aware downsample into fixed time buckets:
@@ -2541,41 +2667,154 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     ///   later rate/quantile computation. Averaging would corrupt them.</item>
     ///   <item>Gauge: average within the bucket.</item>
     /// </list>
+    ///
+    /// <para><b>One forward pass, and the answer the LINQ chain gave, to the bit.</b> It was
+    /// <c>GroupBy</c> + <c>Select</c> + an inner <c>OrderBy</c> + <c>Last</c> / <c>Average</c> /
+    /// <c>Sum</c> + <c>OrderBy</c> + <c>ToList</c> — five iterators, a grouping per bucket and a
+    /// list per series, on every stepped query and every rollup. What each link decided, and what
+    /// stands in for it here (<c>MetricDownsampleGoldenTests</c> pins every line):</para>
+    /// <list type="bullet">
+    /// <item>the key is <c>ts / b * b</c>, truncating toward zero, and a step under a millisecond
+    /// divides by zero on the first point (never on empty input) — the same expression;</item>
+    /// <item>counter / histogram keep the greatest timestamp, the LATER of equal greatest ones
+    /// (<c>OrderBy</c> is stable, then <c>Last</c>) — a <c>&gt;=</c> in input order;</item>
+    /// <item><c>Average</c> seeds its sum with the first value and adds the rest in input order,
+    /// <c>Sum</c> seeds with +0.0 (a lone -0.0 averages to -0.0 and sums to +0.0), and the long sum
+    /// is <c>checked</c> — the same seeds, the same order, the same <c>checked</c>;</item>
+    /// <item>buckets come out in key order — which a sorted input (every caller's: the hot tier,
+    /// the files, the rollup's sort) already is, so the pass emits them as it closes them. Input
+    /// whose keys go backwards takes <see cref="DownsampleUnsorted"/>, which groups by a stable
+    /// sort on the key so each bucket still sees its points in input order.</item>
+    /// </list>
     /// </summary>
-    private static IReadOnlyList<MetricDataPoint> Downsample(
+    internal static List<MetricDataPoint> Downsample(
         IReadOnlyList<MetricDataPoint> points,
         TimeSpan step,
         MetricKind kind)
     {
         long bucketNanos = (long)step.TotalMilliseconds * 1_000_000L;
-        bool takeLast = kind is MetricKind.Counter or MetricKind.Histogram;
+        bool takeLast    = kind is MetricKind.Counter or MetricKind.Histogram;
+        if (points.Count == 0) return [];
 
-        return points
-            .GroupBy(p => p.TimestampUnixNano / bucketNanos * bucketNanos)
-            .Select(g =>
+        MetricDataPoint[]? rented = null;
+        ReadOnlySpan<MetricDataPoint> all;
+        if (points is List<MetricDataPoint> list) all = CollectionsMarshal.AsSpan(list);
+        else if (points is MetricDataPoint[] array) all = array;
+        else
+        {
+            rented = ArrayPool<MetricDataPoint>.Shared.Rent(points.Count);
+            for (int i = 0; i < points.Count; i++) rented[i] = points[i];
+            all = rented.AsSpan(0, points.Count);
+        }
+
+        try
+        {
+            // Sized to the buckets the span can hold, when the ends say so; never above the point
+            // count, which is the most buckets there can be. The span is taken UNSIGNED: two keys
+            // more than long.MaxValue apart (an OTLP timestamp with its top bit set is a long at or
+            // below -7.5e18, and ingest refuses only future ones) wrap a signed difference negative,
+            // and a negative capacity threw where GroupBy had answered. last >= first, so the
+            // unsigned difference is the true one.
+            long firstKey = all[0].TimestampUnixNano / bucketNanos * bucketNanos;
+            long lastKey  = all[^1].TimestampUnixNano / bucketNanos * bucketNanos;
+            int  capacity = all.Length;
+            if (bucketNanos > 0 && lastKey >= firstKey)
             {
-                if (takeLast)
-                {
-                    var last = g.OrderBy(p => p.TimestampUnixNano).Last();
-                    return new MetricDataPoint
-                    {
-                        TimestampUnixNano = g.Key,
-                        Value             = last.Value,
-                        Count             = last.Count,
-                        Sum               = last.Sum,
-                        BucketCounts      = last.BucketCounts,
-                    };
-                }
-                return new MetricDataPoint
-                {
-                    TimestampUnixNano = g.Key,
-                    Value             = g.Average(p => p.Value),
-                    Count             = g.Sum(p => p.Count),
-                    Sum               = g.Sum(p => p.Sum),
-                };
-            })
-            .OrderBy(p => p.TimestampUnixNano)
-            .ToList();
+                ulong buckets = unchecked((ulong)(lastKey - firstKey)) / (ulong)bucketNanos;
+                if (buckets < (ulong)all.Length) capacity = (int)buckets + 1;
+            }
+
+            var result = new List<MetricDataPoint>(Math.Min(capacity, all.Length));
+            int start = 0;
+            long key  = firstKey;
+            for (int i = 1; i <= all.Length; i++)
+            {
+                long next = i < all.Length ? all[i].TimestampUnixNano / bucketNanos * bucketNanos : 0;
+                if (i < all.Length && next == key) continue;
+                if (i < all.Length && next < key) return DownsampleUnsorted(all, bucketNanos, takeLast);
+
+                result.Add(Reduce(all[start..i], key, takeLast));
+                start = i;
+                key   = next;
+            }
+            return result;
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<MetricDataPoint>.Shared.Return(rented, clearArray: true);
+        }
+    }
+
+    /// <summary>One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.</summary>
+    private static MetricDataPoint Reduce(ReadOnlySpan<MetricDataPoint> bucket, long key, bool takeLast)
+    {
+        if (takeLast)
+        {
+            int best = 0;
+            for (int i = 1; i < bucket.Length; i++)
+                if (bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano) best = i;
+            ref readonly var last = ref bucket[best];
+            return new MetricDataPoint
+            {
+                TimestampUnixNano = key,
+                Value             = last.Value,
+                Count             = last.Count,
+                Sum               = last.Sum,
+                BucketCounts      = last.BucketCounts,
+            };
+        }
+
+        double value = bucket[0].Value;           // Average's seed: the first element
+        long   count = 0;                         // Sum's seed: zero
+        double sum   = 0.0;
+        for (int i = 0; i < bucket.Length; i++)
+        {
+            if (i > 0) value += bucket[i].Value;
+            count = checked(count + bucket[i].Count);
+            sum  += bucket[i].Sum;
+        }
+        return new MetricDataPoint
+        {
+            TimestampUnixNano = key,
+            Value             = value / bucket.Length,
+            Count             = count,
+            Sum               = sum,
+        };
+    }
+
+    /// <summary>
+    /// The general case of <see cref="Downsample"/>, for input whose bucket keys go backwards —
+    /// which no caller in this engine produces, and which must still answer what <c>GroupBy</c>
+    /// answered: buckets in key order, each reducing its points in INPUT order. A stable sort on
+    /// (key, input index) gives exactly that grouping. The pair array is rented.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static List<MetricDataPoint> DownsampleUnsorted(ReadOnlySpan<MetricDataPoint> all, long bucketNanos, bool takeLast)
+    {
+        var order  = ArrayPool<(long Key, int Index)>.Shared.Rent(all.Length);
+        var bucket = ArrayPool<MetricDataPoint>.Shared.Rent(all.Length);
+        try
+        {
+            for (int i = 0; i < all.Length; i++) order[i] = (all[i].TimestampUnixNano / bucketNanos * bucketNanos, i);
+            Array.Sort(order, 0, all.Length);
+
+            var result = new List<MetricDataPoint>(all.Length);
+            int start  = 0;
+            for (int i = 1; i <= all.Length; i++)
+            {
+                if (i < all.Length && order[i].Key == order[start].Key) continue;
+                int n = i - start;
+                for (int j = 0; j < n; j++) bucket[j] = all[order[start + j].Index];
+                result.Add(Reduce(bucket.AsSpan(0, n), order[start].Key, takeLast));
+                start = i;
+            }
+            return result;
+        }
+        finally
+        {
+            ArrayPool<(long, int)>.Shared.Return(order);
+            ArrayPool<MetricDataPoint>.Shared.Return(bucket, clearArray: true);
+        }
     }
 
     private void LoadColdSegments()
