@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using System.Globalization;
+using System.Text.Json.Serialization;
 using Ameto.Core;
 
 namespace Ameto.Metrics;
@@ -258,6 +259,8 @@ public sealed class MetricSeriesDto
 public sealed class ExemplarDto
 {
     public long                       Ts      { get; init; }
+    /// <summary><c>null</c> on the wire when NaN or ±Infinity (#92) — see <see cref="NonFiniteAsNullConverter"/>.</summary>
+    [JsonConverter(typeof(NonFiniteAsNullConverter))]
     public double                     Value   { get; init; }
     public string                     TraceId { get; init; } = string.Empty;
     public string                     SpanId  { get; init; } = string.Empty;
@@ -276,6 +279,8 @@ public sealed class MetricPointDto
 /// <summary>Histogram heatmap payload.</summary>
 public sealed class HeatmapDto
 {
+    /// <summary>A non-finite bound (an exporter's <c>+Inf</c>) is <c>null</c> on the wire (#92).</summary>
+    [JsonConverter(typeof(NonFiniteAsNullArrayConverter))]
     public double[]            Bounds  { get; init; } = [];
     public string              Unit    { get; init; } = string.Empty;
     public HeatmapColumnDto[]  Columns { get; init; } = [];
@@ -284,5 +289,7 @@ public sealed class HeatmapDto
 public sealed class HeatmapColumnDto
 {
     public long     Ts     { get; init; }
+    /// <summary>Deltas of integer counts, so finite; written like <see cref="HeatmapDto.Bounds"/> all the same.</summary>
+    [JsonConverter(typeof(NonFiniteAsNullArrayConverter))]
     public double[] Counts { get; init; } = [];
 }

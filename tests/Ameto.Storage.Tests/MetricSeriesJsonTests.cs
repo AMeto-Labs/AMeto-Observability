@@ -161,18 +161,37 @@ public sealed class MetricSeriesJsonTests
             Written([valid, dup, valid]));
     }
 
+    /// <summary>
+    /// NaN and ±Infinity — which the DTO path threw on, failing the whole answer — are written as
+    /// <c>null</c>, per field and per point (#92); the finite fields of the same point, and the
+    /// points around it, are written exactly as before.
+    /// </summary>
     [Fact]
-    public void It_fails_where_the_DTO_path_failed()
+    public void A_non_finite_value_or_sum_is_written_as_null()
     {
         foreach (double bad in new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity })
         {
-            var valued = new MetricSeries { Name = "m", Points = [new MetricDataPoint { Value = bad }] };
-            var summed = new MetricSeries { Name = "m", Points = [new MetricDataPoint { Sum = bad }] };
-            Assert.Throws<ArgumentException>(() => Oracle([valued]));
-            Assert.Throws<ArgumentException>(() => Written([valued]));
+            var valued = new MetricSeries { Name = "m", Points = [new MetricDataPoint { TimestampUnixNano = 7, Value = bad, Count = 3, Sum = 0.5 }] };
+            var summed = new MetricSeries { Name = "m", Points = [new MetricDataPoint { TimestampUnixNano = 7, Value = 0.5, Count = 3, Sum = bad }] };
+            Assert.Throws<ArgumentException>(() => Oracle([valued]));   // what the endpoints used to do with it
             Assert.Throws<ArgumentException>(() => Oracle([summed]));
-            Assert.Throws<ArgumentException>(() => Written([summed]));
+
+            Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":7,"value":null,"count":3,"sum":0.5}]}]""",
+                         Written([valued]));
+            Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":7,"value":0.5,"count":3,"sum":null}]}]""",
+                         Written([summed]));
         }
+
+        var mixed = new MetricSeries
+        {
+            Name   = "m",
+            Points = [new MetricDataPoint { TimestampUnixNano = 1, Value = 1e300 },
+                      new MetricDataPoint { TimestampUnixNano = 2, Value = double.NaN, Sum = double.NegativeInfinity },
+                      new MetricDataPoint { TimestampUnixNano = 3, Value = -0.0, Sum = 5e-324 }],
+        };
+        Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":1,"value":1E+300,"count":0,"sum":0},"""
+                   + """{"ts":2,"value":null,"count":0,"sum":null},{"ts":3,"value":-0,"count":0,"sum":5E-324}]}]""",
+                     Written([mixed]));
     }
 
     /// <summary>

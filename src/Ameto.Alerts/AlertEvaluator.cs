@@ -197,9 +197,16 @@ public sealed class AlertEvaluator : IAsyncDisposable
         return false;
     }
 
-    /// <summary>Evaluate a rule's value right now without affecting state (for the editor preview).</summary>
+    /// <summary>
+    /// Evaluate a rule's value right now without affecting state (for the editor preview). A metric
+    /// window with no finite point answers 0, as it did before such a window became "no value" to
+    /// the evaluator: the preview is serialized as a JSON number, and NaN has none.
+    /// </summary>
     public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
-        => await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+    {
+        double value = await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+        return double.IsNaN(value) ? 0 : value;
+    }
 
     /// <summary>
     /// Dispatches a one-off TEST notification through the rule's channels — bypasses the
@@ -270,6 +277,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 // here with the flag up. Checking only at the top of the cycle left the case that
                 // matters: a tick that began while the host was running and read its 0 after.
                 if (IsStopping) return;
+
+                // No value to compare — a metric window whose every point is NaN or infinite (see
+                // MetricValueAsync, which has said so in the log). The rule keeps its state: a
+                // comparison against NaN is false, and "not breached" would resolve it.
+                if (double.IsNaN(value)) continue;
                 Transition(rule, value, now);
             }
             catch (OperationCanceledException) when (IsStopping)
@@ -604,16 +616,54 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // Reduce over the whole window (not just the last point — a quiet final
         // interval would read 0 and miss the spike). For ">" thresholds take the
         // peak; for "<" thresholds take the trough.
+        //
+        // A NaN or ±Infinity point is SKIPPED (#92): it is no measurement — an exporter's division
+        // by zero, an empty histogram's mean — and the panel shows it as a gap (the JSON writes it
+        // as null). Folded in, it did damage both ways: Math.Max(acc, NaN) is NaN, which reset the
+        // reduction and dropped the peak before it, and a NaN last in the window came out as 0 —
+        // resolving a firing ">" rule, or firing a "<" rule, with nothing in the log.
         bool wantMax = rule.Comparator is AlertComparator.GreaterThan or AlertComparator.GreaterOrEqual;
         double acc = double.NaN;
+        int skipped = 0;
         foreach (var s in series)
             foreach (var p in s.Points)
             {
+                if (!double.IsFinite(p.Value)) { skipped++; continue; }
                 if (double.IsNaN(acc)) acc = p.Value;
                 else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
             }
-        return double.IsNaN(acc) ? 0 : acc;
+
+        if (skipped > 0) WarnNonFinite(rule, skipped, undetermined: double.IsNaN(acc));
+
+        // Points, and not one of them finite: there is no value to compare, and 0 — the answer for
+        // an empty window — would decide the rule on data that says nothing. NaN tells the caller
+        // to leave the rule's state as it is (see EvaluateAllAsync).
+        if (double.IsNaN(acc)) return skipped > 0 ? double.NaN : 0;
+        return acc;
     }
+
+    /// <summary>
+    /// Says ONCE per rule — per kind: some points skipped, or no value at all — that a metric rule
+    /// met non-finite values. Once, because an exporter that sends NaN sends it every interval, and a
+    /// line every 15 s for the life of the rule would bury the log; the operator needs to learn it
+    /// happens, and which rule it touches.
+    /// </summary>
+    private void WarnNonFinite(AlertRule rule, int skipped, bool undetermined)
+    {
+        if (!_nonFiniteWarned.TryAdd((rule.Id, undetermined), 0)) return;
+        if (undetermined)
+            _logger.LogWarning(
+                "Alert rule {Rule}: every point of metric {Metric} in the window is NaN or infinite ({Skipped} point(s)), "
+              + "so the rule was not evaluated and keeps its state. Said once per rule",
+                rule.Id, rule.Metric, skipped);
+        else
+            _logger.LogWarning(
+                "Alert rule {Rule}: skipped {Skipped} NaN or infinite point(s) of metric {Metric}; the rule is evaluated "
+              + "on the finite ones. Said once per rule",
+                rule.Id, skipped, rule.Metric);
+    }
+
+    private readonly ConcurrentDictionary<(string RuleId, bool Undetermined), byte> _nonFiniteWarned = new();
 
     private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
