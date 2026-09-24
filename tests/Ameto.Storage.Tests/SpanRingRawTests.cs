@@ -222,8 +222,12 @@ public sealed class SpanRingRawTests : IDisposable
         long given = ring.TrimIdleArena();
         _out.WriteLine($"burst reached {before:N0} B; trim gave back {given:N0} B; high water now {ring.ArenaHighWaterBytes:N0} B");
         Assert.Equal(64L * SpanRingBuffer.ChunkBytes, before);
-        Assert.True(given >= (64 - SpanRingBuffer.LowWaterChunks) * (long)SpanRingBuffer.ChunkBytes);
-        Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        if (TrimGivesBack)
+        {
+            Assert.True(given >= (64 - SpanRingBuffer.LowWaterChunks) * (long)SpanRingBuffer.ChunkBytes - Environment.SystemPageSize);
+            Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        }
+        else Assert.Equal(0, given);
 
         // Across the given-back range again: committed afresh, byte for byte.
         EnqueueChunkSpans(ring, 1_000, 64);
@@ -238,10 +242,22 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
-    /// THE TRIM NEVER GIVES BACK A CHUNK SOMETHING STILL USES. Sixty-four chunks drained, but the span
-    /// in chunk 40 not yet released (the drainer is still copying it): the trim may give back only
-    /// what lies ABOVE it, and that span's bytes must read back whole. Released, the next trim takes
-    /// the rest down to the low-water mark.
+    /// Whether this platform's trim gives memory back at all: VirtualFree on Windows, madvise on the
+    /// plain Linux allocation. Anywhere else the arena keeps its pages and the trim answers 0.
+    /// </summary>
+    private static bool TrimGivesBack => OperatingSystem.IsWindows() || OperatingSystem.IsLinux();
+
+    /// <summary>
+    /// THE TRIM NEVER GIVES BACK A CHUNK SOMETHING STILL USES. Sixty-four chunks drained, but the
+    /// spans in chunks 10, 39 and 40 not yet released (the drainer is still copying them): the trim
+    /// may give back only what lies ABOVE chunk 40, and those spans' bytes must read back whole —
+    /// chunk 40 sits right against the cut, so a page rounded the wrong way at the boundary shows
+    /// here. Released, the next trim takes the rest down to the low-water mark.
+    ///
+    /// <para>PLATFORM-AWARE, because the bytes given back are counted differently: exactly the 23
+    /// chunks on Windows (the committed range is decommitted), from the cut to the END of the arena
+    /// on Linux (madvise covers never-touched pages too), and nothing elsewhere. The high-water mark
+    /// and the live bytes are the same claim everywhere.</para>
     /// </summary>
     [Fact]
     public void The_trim_never_gives_back_a_chunk_a_span_still_uses()
@@ -254,20 +270,37 @@ public sealed class SpanRingRawTests : IDisposable
         ring.EndBatch();
         int n = ring.TryDequeueMany(headers, apart);
         Assert.Equal(64, n);
-        int held = Array.FindIndex(headers, 0, n, static h => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes == 40);
-        ring.Release(headers.AsSpan(0, held));
-        ring.Release(headers.AsSpan(held + 1, n - held - 1));             // everything but chunk 40
+
+        int[] heldChunks = [10, 39, 40];
+        var   held = new List<int>();
+        for (int i = 0; i < n; i++)
+        {
+            if (Array.IndexOf(heldChunks, headers[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes) >= 0) held.Add(i);
+            else ring.Release(headers.AsSpan(i, 1));                      // everything else
+        }
+        Assert.Equal(3, held.Count);
 
         long given = ring.TrimIdleArena();
-        Assert.Equal((64 - 41) * (long)SpanRingBuffer.ChunkBytes, given);
-        Assert.Equal(41L * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        _out.WriteLine($"trim with chunks 10, 39, 40 in use gave back {given:N0} B");
+        if (OperatingSystem.IsWindows())    Assert.Equal((64 - 41) * (long)SpanRingBuffer.ChunkBytes, given);
+        else if (OperatingSystem.IsLinux()) Assert.True(given >= (64 - 41) * (long)SpanRingBuffer.ChunkBytes - Environment.SystemPageSize);
+        else                                Assert.Equal(0, given);
+        if (TrimGivesBack) Assert.Equal(41L * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
 
-        var batch = ring.Drained(headers.AsSpan(held, 1), apart.AsSpan(held, 1), new ServiceIndexCache());
-        Assert.True(Stamp(held).AsSpan().SequenceEqual(batch.Attributes(0)), "a chunk still in use was given back");
-        ring.Release(headers.AsSpan(held, 1));
+        foreach (int i in held)
+        {
+            var batch = ring.Drained(headers.AsSpan(i, 1), apart.AsSpan(i, 1), new ServiceIndexCache());
+            Assert.True(Stamp(i).AsSpan().SequenceEqual(batch.Attributes(0)),
+                $"the span in chunk {headers[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes}, still in use, did not read back whole");
+            ring.Release(headers.AsSpan(i, 1));
+        }
 
-        Assert.True(ring.TrimIdleArena() > 0);
-        Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        long rest = ring.TrimIdleArena();
+        if (TrimGivesBack)
+        {
+            Assert.True(rest > 0);
+            Assert.Equal((long)SpanRingBuffer.LowWaterChunks * SpanRingBuffer.ChunkBytes, ring.ArenaHighWaterBytes);
+        }
     }
 
     /// <summary>

@@ -298,10 +298,17 @@ internal sealed unsafe class SlabArena : IDisposable
         {
             if (_reserved)
             {
-                if (fromOffset >= _committed) return 0;
-                nuint len = _committed - fromOffset;
-                if (!VirtualFree((nint)(_base + fromOffset), len, MEM_DECOMMIT)) return 0;
-                Volatile.Write(ref _committed, fromOffset);
+                // ROUNDED UP TO A PAGE, never down. VirtualFree(MEM_DECOMMIT) takes every page that
+                // holds ANY byte of the range, so an unaligned start would decommit the bytes just
+                // below it too — live data, since the caller only vouches for what lies above. (The
+                // span ring passes chunk boundaries, which are aligned; this does not rely on it.)
+                // The Linux branch below rounds inward for the same reason (PageAlignInward).
+                nuint page = (nuint)Environment.SystemPageSize;
+                nuint from = (fromOffset + page - 1) / page * page;
+                if (from >= _committed) return 0;
+                nuint len = _committed - from;
+                if (!VirtualFree((nint)(_base + from), len, MEM_DECOMMIT)) return 0;
+                Volatile.Write(ref _committed, from);
                 return (long)len;
             }
 

@@ -112,7 +112,8 @@ jobs:
   # — runs in the backend job above on Windows, takes its off-Linux branch and passes, so the madvise
   # call, its errno and the smaps check behind it were exercised by no CI run at all.
   #
-  # This job runs that test's class and nothing else. The whole suite already runs above; this job
+  # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
+  # madvise(MADV_DONTNEED) on Linux — see the second step). The whole suite already runs above; this job
   # exists for the code that only does anything on Linux.
   #
   # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
@@ -124,7 +125,8 @@ jobs:
   # renamed test method by running only its neighbours.
   backend-linux:
     runs-on: ubuntu-latest
-    # Restore, a Debug build of Ameto.Perf and its references, and a few seconds of tests.
+    # Restore, Debug builds of Ameto.Perf and Ameto.Storage.Tests and their references, and a few
+    # seconds of tests.
     timeout-minutes: 15
     env:
       AMETO_REQUIRE_THP: '1'
@@ -142,10 +144,36 @@ jobs:
             --filter "FullyQualifiedName~SlabArenaCommitTests" \
             --logger "console;verbosity=normal" 2>&1 | tee test-output.txt
 
-          if ! grep -q "Passed Ameto.Perf.SlabArenaCommitTests.On_Linux_the_arena_is_opted_out_of_transparent_huge_pages" test-output.txt; then
-            echo "::error::On_Linux_the_arena_is_opted_out_of_transparent_huge_pages did not run and pass; the filter no longer reaches it."
-            exit 1
-          fi
+          for t in On_Linux_the_arena_is_opted_out_of_transparent_huge_pages \
+                   A_decommitted_tail_leaves_every_byte_below_it_intact_and_is_usable_again; do
+            if ! grep -q "Passed Ameto.Perf.SlabArenaCommitTests.$t" test-output.txt; then
+              echo "::error::$t did not run and pass; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE SPAN RING'S IDLE TRIM, ON LINUX. On Linux the trim gives the arena back with
+      # madvise(MADV_DONTNEED) on a plain allocation — the path the Linux stand runs — while the
+      # backend job above takes Windows' VirtualFree path. A page rounded the wrong way here would
+      # silently zero live span payloads, so the ring's arena facts run on the platform they are
+      # about. Same guard as above: each named fact must appear as Passed, or the job fails.
+      - name: Test the span ring's arena trim (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~SpanRingRawTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee ring-output.txt
+
+          for t in A_burst_is_given_back_once_the_ring_is_idle_and_the_ring_still_works \
+                   The_trim_never_gives_back_a_chunk_a_span_still_uses \
+                   A_producer_that_meets_a_trim_waits_for_it_instead_of_refusing \
+                   A_payload_goes_through_the_ring_and_comes_back_byte_for_byte; do
+            if ! grep -q "Passed Ameto.Storage.Tests.SpanRingRawTests.$t" ring-output.txt; then
+              echo "::error::SpanRingRawTests.$t did not run and pass; the filter no longer reaches it."
+              exit 1
+            fi
+          done
 
   client:
     runs-on: ubuntu-latest
