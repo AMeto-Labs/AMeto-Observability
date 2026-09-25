@@ -881,8 +881,16 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         // index space by any route, and reuse at the ceiling beats reuse from zero.
         //
         // THE INDICES ONLY. Seeding needs the largest index of every record, dead or alive, and
-        // nothing about their text: the walk reads each record's head and steps over its body, so
-        // opening the log interns nothing (see LoadPool for why that matters).
+        // nothing about their text: the walk steps over a v1 record's body and reads a v2 record's
+        // whole only to verify it — never decoding either — so opening the log interns nothing
+        // (see LoadPool for why that matters).
+        //
+        // The pool is therefore read twice on the engine's start: here, for the ceiling, the
+        // clean end and the checksums, and again by ReadAll, for the referenced bodies. Kept so on
+        // purpose: sharing one read means carrying the bodies from the open to the first ReadAll
+        // and knowing when an append has made them stale — state for a second sequential read of a
+        // file that is bounded by the series registered since the log was last empty, and that
+        // the first read has just put in the page cache.
         if (_writeOffset > 0)
         {
             ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne, out int badRecords);
@@ -1344,7 +1352,8 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// taken here, against the generation read now and the index resolved before, and
     /// <see cref="WriteBatchLocked"/> stores it only where both still hold — otherwise it hashes
     /// that entry from the map, under the lock. Measured on the log alone
-    /// (<c>MetricWalAppendContentionProbe</c>, medians of ten runs): hashing every entry from the
+    /// (<c>MetricWalAppendContentionProbe</c>; each run reports the best of five per thread count,
+    /// and these are the medians of ten such runs): hashing every entry from the
     /// map under the lock cost ~20 ns a point per thread at one and two threads (141 and 151 ns
     /// against 121 and 134 without a checksum); hashing here, nothing the runs could separate
     /// from none (117 and 127). Nothing about the entry's POSITION is in the checksum, so neither
