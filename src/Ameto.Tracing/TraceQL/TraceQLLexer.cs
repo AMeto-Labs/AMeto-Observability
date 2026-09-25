@@ -8,7 +8,7 @@ public enum TokenKind
     Attr,     // .key.sub-key  (leading dot consumed, dots in key kept)
     Ident,    // service / duration / status / name / kind / error / ok / unset / ...
     String,   // "..." or `...`
-    Number,   // 123 or 1.5
+    Number,   // 123, 1.5, -3, -1e3
     Duration, // 1s / 500ms / 1.5m  — Raw holds nanoseconds as long
     Eof,
 }
@@ -86,6 +86,18 @@ public static class TraceQLLexer
                 case '.':
                     tokens.Add(ReadAttr(input, ref pos));
                     break;
+                case '-':
+                    // A NEGATIVE LITERAL, or nothing this grammar has. There is no binary minus, so
+                    // a '-' directly before a digit can only be a sign. It used to fall into "skip
+                    // unknown" below, which turned `{ .x = -3 }` into `{ .x = 3 }` — a query that
+                    // answered, just not the question asked. Any other '-' is refused for the same
+                    // reason: `.x = - 3` silently read as 3 is the same wrong answer.
+                    if (pos + 1 < input.Length && char.IsAsciiDigit(input[pos + 1]))
+                        tokens.Add(ReadNumberOrDuration(input, ref pos));
+                    else
+                        throw new TraceQLException(
+                            $"'-' at position {pos} is not followed by a number; a negative literal is written '-3', '-0.5' or '-1e3'");
+                    break;
                 default:
                     if (char.IsDigit(c))
                         tokens.Add(ReadNumberOrDuration(input, ref pos));
@@ -131,49 +143,73 @@ public static class TraceQLLexer
 
     // ── Number or duration ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// <c>-?digits[.digits][e[+-]digits][suffix]</c>. The sign and the exponent are part of the
+    /// literal — <c>-3</c>, <c>-0.5</c>, <c>-1e3</c> — and a duration keeps its sign so the parser
+    /// can refuse <c>-1ms</c> by name rather than read it as something else.
+    ///
+    /// <para>TEXT THAT DOES NOT PARSE IS AN ERROR, not the number 0 it used to become:
+    /// <c>{ .version = 1.2.3 }</c> read as <c>.version = 0</c>.</para>
+    /// </summary>
     private static Token ReadNumberOrDuration(ReadOnlySpan<char> src, ref int pos)
     {
         int start = pos;
+        if (src[pos] == '-') pos++;
         while (pos < src.Length && (char.IsDigit(src[pos]) || src[pos] == '.'))
             pos++;
 
-        var numText = src[start..pos];
-        if (!double.TryParse(numText, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out var num))
-            return new Token(TokenKind.Number, numText.ToString(), 0);
+        // An exponent only when a digit follows it (after an optional sign): `1e3`, `2.5E-4`. A
+        // bare `e` is left for the identifier reader, as before.
+        if (pos < src.Length && src[pos] is 'e' or 'E')
+        {
+            int e = pos + 1;
+            if (e < src.Length && src[e] is '+' or '-') e++;
+            if (e < src.Length && char.IsAsciiDigit(src[e]))
+            {
+                pos = e;
+                while (pos < src.Length && char.IsAsciiDigit(src[pos])) pos++;
+            }
+        }
 
-        // Check for duration suffix
-        long nanos = TryParseDurationSuffix(src, ref pos, num);
-        if (nanos >= 0)
+        var numText = src[start..pos];
+        if (!double.TryParse(numText, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var num)
+            || !double.IsFinite(num))
+            throw new TraceQLException($"'{numText}' at position {start} is not a number");
+
+        // Check for duration suffix. A bool, not "nanos >= 0": a negative duration is still a
+        // duration, and the parser refuses it by name.
+        if (TryParseDurationSuffix(src, ref pos, num, out long nanos))
             return new Token(TokenKind.Duration, src[start..pos].ToString(), nanos);
 
         return new Token(TokenKind.Number, numText.ToString(), num);
     }
 
-    private static long TryParseDurationSuffix(ReadOnlySpan<char> src, ref int pos, double num)
+    private static bool TryParseDurationSuffix(ReadOnlySpan<char> src, ref int pos, double num, out long nanos)
     {
-        if (pos >= src.Length) return -1;
+        nanos = 0;
+        if (pos >= src.Length) return false;
 
         // ms
         if (pos + 1 < src.Length && src[pos] == 'm' && src[pos + 1] == 's')
-        { pos += 2; return (long)(num * 1_000_000); }
+        { pos += 2; nanos = (long)(num * 1_000_000); return true; }
         // us
         if (pos + 1 < src.Length && src[pos] == 'u' && src[pos + 1] == 's')
-        { pos += 2; return (long)(num * 1_000); }
+        { pos += 2; nanos = (long)(num * 1_000); return true; }
         // ns
         if (pos + 1 < src.Length && src[pos] == 'n' && src[pos + 1] == 's')
-        { pos += 2; return (long)num; }
+        { pos += 2; nanos = (long)num; return true; }
         // s  (but not followed by a letter — avoids matching "service")
         if (src[pos] == 's' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; return (long)(num * 1_000_000_000L); }
+        { pos += 1; nanos = (long)(num * 1_000_000_000L); return true; }
         // m  (minutes)
         if (src[pos] == 'm' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; return (long)(num * 60_000_000_000L); }
+        { pos += 1; nanos = (long)(num * 60_000_000_000L); return true; }
         // h
         if (src[pos] == 'h' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; return (long)(num * 3_600_000_000_000L); }
+        { pos += 1; nanos = (long)(num * 3_600_000_000_000L); return true; }
 
-        return -1;
+        return false;
     }
 
     // ── Identifier ─────────────────────────────────────────────────────────────

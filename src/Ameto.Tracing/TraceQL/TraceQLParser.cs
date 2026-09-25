@@ -211,6 +211,13 @@ public static class TraceQLParser
         private TraceQLValue ParseScalar()
         {
             var t = Consume();
+
+            // A NEGATIVE DURATION IS REFUSED, not compared: no span lasts -1ms, so `duration > -1ms`
+            // would select everything and `duration < -1ms` nothing, each without a word. The lexer
+            // keeps the sign on a duration literal precisely so this can say which one it was.
+            if (t.Kind == TokenKind.Duration && t.Number < 0)
+                throw new TraceQLException($"A duration cannot be negative ('{t.Text}')");
+
             return t.Kind switch
             {
                 TokenKind.String   => TraceQLValue.FromString(t.Text),
@@ -288,6 +295,9 @@ public static class TraceQLParser
                 case "duration":
                     if (!val.IsNumber)
                         throw new TraceQLException("duration requires a number or duration literal");
+                    // The bare-number spelling (nanoseconds) gets the same refusal as `-1ms` above.
+                    if (val.Number < 0)
+                        throw new TraceQLException($"A duration cannot be negative ({val.Number.ToString(System.Globalization.CultureInfo.InvariantCulture)})");
                     return new DurationPredicate(op, (long)val.Number);
 
                 case "status":
