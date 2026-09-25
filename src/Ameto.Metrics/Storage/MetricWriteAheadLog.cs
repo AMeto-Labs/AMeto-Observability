@@ -2088,10 +2088,13 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     ///
     /// <para><b>A record in a header that did not verify</b> (<paramref name="trusted"/> false) has
     /// to prove it describes the move a commit made, not merely one that would fit: the claim must
-    /// be where that commit left it — the old end, <c>from + length</c>, until it stored the new
-    /// one, and <c>length</c> after — and <c>done</c> a chunk boundary (a multiple of
-    /// <c>from</c>, or all of it). Rot that passes both, in two fields no store ties together, is
-    /// not a case worth moving bytes for.</para>
+    /// be where that commit left it, with the progress that goes with it: the old end,
+    /// <c>from + length</c>, with <c>done</c> a chunk boundary (a multiple of <c>from</c>, or all of
+    /// it) — the move in flight; or the new end, <c>length</c>, with <c>done == length</c> — the
+    /// move finished and its end stored, only the clear missing. A new end with less done is no
+    /// state a commit leaves, and redoing from there would read source bytes the later chunks have
+    /// already overwritten. Rot that passes, in two fields no store ties together, is not a case
+    /// worth moving bytes for.</para>
     /// </summary>
     private void FinishRelocationLocked(ref WalFileHeader hdr, bool trusted)
     {
@@ -2100,8 +2103,8 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
         bool fits    = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
         bool matches = fits
-                    && (_writeOffset == from + length || _writeOffset == length)
-                    && (done % from == 0 || done == length);
+                    && ((_writeOffset == from + length && (done % from == 0 || done == length))
+                     || (_writeOffset == length && done == length));
         if (!fits || (!trusted && !matches))
         {
             _logger?.LogError(

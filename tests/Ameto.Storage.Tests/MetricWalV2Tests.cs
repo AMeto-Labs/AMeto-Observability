@@ -749,6 +749,31 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A RECORD THAT SAYS THE NEW END IS STORED BUT THE MOVE IS NOT DONE IS NO STATE A COMMIT LEAVES.
+    /// The three-chunk move killed after its new end was stored (the record still armed, all of it
+    /// done), then the header's generation rotted and MoveDone rotted to a lower chunk boundary. The
+    /// claim equals the move's length and <c>done</c> is a multiple of <c>from</c>, so a check that
+    /// took them separately trusted it — and redoing from there read source bytes the later chunks
+    /// had already overwritten, corrupting survivors that were whole. The record is refused; the
+    /// five survivors, already in place, replay.
+    /// </summary>
+    [Fact]
+    public void A_record_claiming_the_new_end_with_the_move_unfinished_is_not_redone()
+    {
+        string killed  = KilledRelocation(committedEntries: 2, survivors: 5, "end-stored", done: 5 * V2Entry, intoNextChunk: 0);
+        string walPath = Path.Combine(killed, "metrics.wal");
+        byte[] file = File.ReadAllBytes(walPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);          // Generation: rot
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(48), 2 * V2Entry);                      // MoveDone: rot, a boundary
+        File.WriteAllBytes(walPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger, walPath))
+            Assert.Equal([200.0, 201.0, 202.0, 203.0, 204.0], wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("cannot vouch for"));
+    }
+
+    /// <summary>
     /// THE DOUBLE STOP. The first kill leaves a header that verifies only by its pending checksum;
     /// the open that finishes the move is killed in turn, inside its first covered store, after it
     /// wrote that store's pending checksum and before the field. Unless the open sealed the header
