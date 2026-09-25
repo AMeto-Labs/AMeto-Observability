@@ -319,9 +319,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     private DateTimeOffset HeldPastUnobservedTicks(DateTimeOffset since, DateTimeOffset lastEvaluated, DateTimeOffset now)
     {
-        DateTimeOffset previousTick = _previousCycleAt ?? now;                        // none yet in this process: this one
-        DateTimeOffset seenUntil    = lastEvaluated == default ? since : lastEvaluated; // restored: nothing after `since` is known
-        return previousTick > seenUntil ? since + (previousTick - seenUntil) : since;
+        // Restored from disk: nothing after `since` is known to have been seen, so the clock restarts
+        // at THIS tick — not at the previous cycle, which in this process may itself have skipped the
+        // rule (a store still loading, a failed read) and would credit an interval nobody saw.
+        if (lastEvaluated == default) return now;
+        DateTimeOffset previousTick = _previousCycleAt ?? now;
+        return previousTick > lastEvaluated ? since + (previousTick - lastEvaluated) : since;
     }
 
     private void Transition(AlertRule rule, double value, DateTimeOffset now)

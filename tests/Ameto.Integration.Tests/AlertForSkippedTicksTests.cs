@@ -134,6 +134,32 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
         Assert.Equal(AlertState.Firing, StateOf(after).State);    // 60 s seen
     }
 
+    /// <summary>
+    /// The restart again, with the first tick after it SKIPPING the rule — a store still loading, a
+    /// read that failed. The clock restarts at the first tick that sees the breach, not at the cycle
+    /// before it: counting from the skipped tick credited 15 s nobody saw.
+    /// </summary>
+    [Fact]
+    public async Task After_a_restart_the_clock_starts_at_the_first_tick_that_sees_the_breach()
+    {
+        await using (var before = NewEvaluator())
+            await before.EvaluateOnceAsync(At(0));
+
+        await using var after = NewEvaluator();
+        _traces.Failing = true;
+        await after.EvaluateOnceAsync(At(40));   // the first tick after the restart: skipped
+        _traces.Failing = false;
+        await after.EvaluateOnceAsync(At(41));
+
+        Assert.Equal(AlertState.Pending, StateOf(after).State);
+        Assert.Equal(At(41), StateOf(after).PendingSince);
+
+        for (int t = 42; t <= 44; t++) await after.EvaluateOnceAsync(At(t));
+        Assert.Equal(AlertState.Pending, StateOf(after).State);   // 45 s seen: was Firing, on 60 s counted from tick 40
+        await after.EvaluateOnceAsync(At(45));
+        Assert.Equal(AlertState.Firing, StateOf(after).State);    // 60 s seen
+    }
+
     /// <summary>A trace store answering 20 spans, or failing the read while <see cref="Failing"/> is set.</summary>
     private sealed class FlakyTraces : ITraceStatsProvider
     {
