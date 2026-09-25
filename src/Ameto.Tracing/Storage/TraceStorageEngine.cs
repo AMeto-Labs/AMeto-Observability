@@ -2626,7 +2626,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // The writer hands over the trace-to-offsets map it built anyway. Taken from there rather
         // than read back out of the finished file, because an index derived from a second,
         // independent pass is an index that can disagree with the segment it describes.
-        TraceIndexPairs traceIndex = default;   // owned once handed over: released after its run is written
+        TraceIndexPairs? traceIndex = null;   // owned once handed over: released after its run is written
         bool registered = false;
 
         try
@@ -2640,7 +2640,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // free to close.
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
-                                    onTraceIndex: pairs => traceIndex = pairs,
+                                    // No index, no refs: a v4 flush then builds and sorts none at all.
+                                    onTraceIndex: _indexEnabled ? pairs => traceIndex = pairs : null,
                                     version:      _segmentVersion,
                                     scratch:      _writeScratch);
             // Weighed while the spans are still at hand, so the compaction planner prices this
@@ -2702,7 +2703,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                   + "queryable, and is queued for adoption by the background worker", named.FilePath);
             }
         }
-        traceIndex.Release();   // the writer's refs: the run (if any) holds its own copies now
+        traceIndex?.Release();   // the writer's refs: the run (if any) holds its own copies now
 
         try
         {
@@ -3465,13 +3466,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// run. The backfill's map, read out of a v3 file, takes the overload above. An empty
     /// <paramref name="traceIndex"/> (the writer handed nothing over) is the null of that one.
     /// </summary>
-    private TraceIndexRun? WriteIndexRun(SpanSegmentInfo segment, ulong segmentId, in TraceIndexPairs traceIndex)
+    private TraceIndexRun? WriteIndexRun(SpanSegmentInfo segment, ulong segmentId, TraceIndexPairs? traceIndex)
     {
-        if (traceIndex.Count == 0 || !_indexEnabled || SuppressIndexRunsForTest) return null;
+        if (traceIndex is null || !_indexEnabled || SuppressIndexRunsForTest) return null;
         try
         {
             var w = new TraceIndexWriter();
-            w.AddSegment(in traceIndex, segmentId);
+            w.AddSegment(traceIndex, segmentId);
             return WriteRun(w, segment, segmentId);
         }
         catch (Exception ex)
@@ -3914,9 +3915,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // recoverable:false — the sources are still on disk until the swap below, so a
             // merge temp resurrected after a crash would publish a SECOND copy of every
             // span it merged. Only a hot-tier flush's temp is worth recovering.
-            TraceIndexPairs mergedTraceIndex = default;   // released after its run is written
+            TraceIndexPairs? mergedTraceIndex = null;   // released after its run is written
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
-                                          onTraceIndex: pairs => mergedTraceIndex = pairs,
+                                          onTraceIndex: _indexEnabled ? pairs => mergedTraceIndex = pairs : null,
                                           version: _segmentVersion, scratch: _writeScratch)
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
@@ -4004,7 +4005,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     merged.FilePath);
             }
 
-            mergedTraceIndex.Release();   // the writer's refs: the merged run (if any) holds its own copies now
+            mergedTraceIndex?.Release();   // the writer's refs: the merged run (if any) holds its own copies now
             _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
             _lock.EnterWriteLock();
             try

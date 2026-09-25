@@ -95,15 +95,18 @@ internal readonly struct TraceSpanRef(TraceId traceId, uint offset)
 /// <c>List&lt;uint&gt;</c> — and its growth — per trace.
 ///
 /// <para>OWNS A RENTED ARRAY, handed from <c>SpanWriter.Write</c> to its <c>onTraceIndex</c> callee,
-/// which calls <see cref="Release"/> when it is done with it — once, on one copy. A copy never
-/// released costs nothing but the pool's chance to reuse the array.</para>
+/// which calls <see cref="Release"/> when it is done with it. A class, not a struct, so that is
+/// one owner whatever holds a reference: <see cref="Release"/> takes the array out first, and a
+/// second call — from any reference — finds nothing to give back rather than pooling the same
+/// array twice (two renters would then share it). One small object per flush. Never released
+/// costs nothing but the pool's chance to reuse the array.</para>
 /// </summary>
-internal readonly struct TraceIndexPairs
+internal sealed class TraceIndexPairs
 {
-    private readonly TraceSpanRef[]?   _refs;
+    private TraceSpanRef[]?            _refs;
     private readonly SpanWriteScratch? _owner;
 
-    /// <summary>How many spans: the length of <see cref="Refs"/>.</summary>
+    /// <summary>How many spans: the length of <see cref="Refs"/> until <see cref="Release"/>.</summary>
     public int Count { get; }
 
     /// <summary>How many distinct traces: the runs in <see cref="Refs"/>.</summary>
@@ -117,15 +120,20 @@ internal readonly struct TraceIndexPairs
         Traces = traces;
     }
 
-    /// <summary>The sorted refs: trace by trace, offsets ascending within each.</summary>
-    public ReadOnlySpan<TraceSpanRef> Refs => _refs is null ? default : new(_refs, 0, Count);
+    /// <summary>The sorted refs: trace by trace, offsets ascending within each. Empty once released.</summary>
+    public ReadOnlySpan<TraceSpanRef> Refs =>
+        Volatile.Read(ref _refs) is { } refs ? new(refs, 0, Count) : default;
 
-    /// <summary>Gives the array back — to the engine's scratch when it came from there, else to the shared pool.</summary>
+    /// <summary>
+    /// Gives the array back — to the engine's scratch when it came from there, else to the shared
+    /// pool. Idempotent: only the first call has an array to give.
+    /// </summary>
     public void Release()
     {
-        if (_refs is null) return;
-        if (_owner is not null) _owner.Return(_refs);
-        else                    ArrayPool<TraceSpanRef>.Shared.Return(_refs);
+        var refs = Interlocked.Exchange(ref _refs, null);
+        if (refs is null) return;
+        if (_owner is not null) _owner.Return(refs);
+        else                    ArrayPool<TraceSpanRef>.Shared.Return(refs);
     }
 }
 

@@ -47,7 +47,7 @@ public sealed class TraceIndexPairsTests : IDisposable
     [Fact]
     public void The_v3_index_block_keeps_first_seen_order_and_the_run_answers_what_it_holds()
     {
-        TraceIndexPairs pairs = default;
+        TraceIndexPairs? pairs = null;
         var info = SpanWriter.Write(_dir, Corpus(), onTraceIndex: p => pairs = p, version: 3);
         try
         {
@@ -59,7 +59,7 @@ public sealed class TraceIndexPairsTests : IDisposable
 
             var v3 = SpanReader.ReadTraceIndexForTest(info.FilePath)!;
             Assert.Equal(firstSeen, v3.Keys.ToList());                      // the block's order
-            Assert.Equal(700, pairs.Traces);
+            Assert.Equal(700, pairs!.Traces);
             Assert.Equal(9_000, pairs.Count);
 
             // The refs: sorted by id, then offset; each run is the v3 index's list for that trace.
@@ -71,7 +71,7 @@ public sealed class TraceIndexPairsTests : IDisposable
 
             // The .tix built from them answers every trace with exactly those offsets.
             var w = new TraceIndexWriter();
-            w.AddSegment(in pairs, segmentId: 42);
+            w.AddSegment(pairs, segmentId: 42);
             var run = w.Write(Path.Combine(_dir, "pairs.tix"), level: 1, coveredSegments: [42UL]);
             Assert.Equal(700, run.EntryCount);
             using var reader = TraceIndexReader.Open(run.FilePath)!;
@@ -83,7 +83,7 @@ public sealed class TraceIndexPairsTests : IDisposable
                 Assert.Contains(hits, h => h.SegmentId == 42 && h.Offsets.SequenceEqual(offsets));
             }
         }
-        finally { pairs.Release(); }
+        finally { pairs?.Release(); }
     }
 
     [Fact]
@@ -92,13 +92,36 @@ public sealed class TraceIndexPairsTests : IDisposable
         var v4 = SpanWriter.Write(_dir, Corpus(), version: 4);                        // nothing to hand over
         Assert.Equal(9_000, SpanReader.ReadAll(v4.FilePath).Count);
 
-        TraceIndexPairs pairs = default;
+        TraceIndexPairs? pairs = null;
         SpanWriter.Write(_dir, Corpus(), onTraceIndex: p => pairs = p, version: 4);
         try
         {
-            Assert.Equal(700, pairs.Traces);
+            Assert.Equal(700, pairs!.Traces);
             Assert.Equal(9_000, pairs.Count);
         }
-        finally { pairs.Release(); }
+        finally { pairs?.Release(); }
+    }
+
+    /// <summary>
+    /// A SECOND RELEASE GIVES NOTHING BACK (review of this branch). The refs' array is rented; as a
+    /// struct, every copy carried it, and a second <c>Release</c> — from any copy — pooled it again
+    /// while somebody else might already hold it. Reverted (the struct): the array is back in the
+    /// scratch slot while the second renter still has it.
+    /// </summary>
+    [Fact]
+    public void Releasing_the_refs_twice_pools_their_array_once()
+    {
+        var scratch = new SpanWriteScratch();
+        var array   = scratch.RentPairs(10);
+        var pairs   = new TraceIndexPairs(array, 10, 1, scratch);
+
+        pairs.Release();
+        Assert.Same(array, scratch.HeldForTest.Pairs);                 // given back once
+        Assert.True(pairs.Refs.IsEmpty);
+
+        var taken = scratch.RentPairs(10);                              // somebody else has it now
+        Assert.Same(array, taken);
+        pairs.Release();                                                // must not hand it out again
+        Assert.Null(scratch.HeldForTest.Pairs);
     }
 }

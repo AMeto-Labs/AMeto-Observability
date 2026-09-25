@@ -68,6 +68,25 @@ public sealed class SpanWriteScratchTests : IDisposable
         Assert.Equal(2, e.ColdSegmentCountForTest);
     }
 
+    /// <summary>
+    /// With the trace-id index off, a v4 flush builds no trace refs at all (review of this branch):
+    /// there is no run to write and no v3 block to fill, so nothing is rented or sorted. Reverted (the
+    /// engine hands the writer its callback regardless): the refs are built, sorted and pooled.
+    /// </summary>
+    [Fact]
+    public void With_the_index_off_a_v4_flush_builds_no_trace_refs()
+    {
+        using var e = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance,
+                                             writeSegmentFormatV4: true, indexEnabled: false);
+        Fill(e, 0, 5_000);
+        e.FlushHotTier();
+
+        var held = e.WriteScratchForTest.HeldForTest;
+        Assert.NotNull(held.Order);                                    // the flush did use the scratch
+        Assert.Null(held.Pairs);                                       // …but built no refs
+        Assert.Equal(1, e.ColdSegmentCountForTest);
+    }
+
     [Fact]
     public void An_array_past_a_flush_size_is_not_kept()
     {

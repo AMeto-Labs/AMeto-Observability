@@ -160,8 +160,14 @@ internal sealed class TraceIndexWriter
     /// entry per trace, its offsets copied out of the run. The refs are sorted by id and then by
     /// offset (<see cref="TraceIndexPairs"/>), so each offset list is ascending as it is copied and
     /// the entries arrive in key order.
+    ///
+    /// <para>THE <c>.tix</c> BYTES ARE THOSE OF THE DICTIONARY PATH, with one exception that changes
+    /// no answer: two traces of one segment sharing a key (the id's high half — a producer varying
+    /// only the low half, or a collision). Entries are sorted by (key, segment), which ties for
+    /// those two, and the unstable sort resolves the tie from the order entries were added —
+    /// first-seen before, id order now. A lookup returns every entry under the key either way.</para>
     /// </summary>
-    public void AddSegment(in TraceIndexPairs pairs, ulong segmentId)
+    public void AddSegment(TraceIndexPairs pairs, ulong segmentId)
     {
         var refs = pairs.Refs;
         _entries.EnsureCapacity(_entries.Count + pairs.Traces);
