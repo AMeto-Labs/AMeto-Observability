@@ -2523,9 +2523,19 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                         // and this was the later one). Its index still counts toward the ceiling
                         // below when it could be one, so a new series cannot take it while an
                         // entry that references it is in the log.
+                        //
+                        // Both of those trust the record's INDEX, which is inside what failed its
+                        // checksum and may itself be what rotted. Neither can do worse than cost one
+                        // good series: a wrong index removes an earlier record of some OTHER series,
+                        // whose points then come back unresolved — never under the wrong name — and
+                        // raises the ceiling a little. An index no registration could have issued is
+                        // not trusted for either.
                         skipped++;
-                        bodies.Remove(index);
-                        if (index < SeriesIndexSanityCap && index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                        if (index < SeriesIndexSanityCap)
+                        {
+                            bodies.Remove(index);
+                            if (index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                        }
                         cleanEnd = fs.Position;
                         continue;
                     }
