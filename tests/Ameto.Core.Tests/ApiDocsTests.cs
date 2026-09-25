@@ -82,7 +82,7 @@ public sealed class ApiDocsTests
         foreach (string field in new[]
                  {
                      "indexCacheBudgetBytes", "indexCacheIdleEvicted", "indexCacheNativeBytes",
-                     "indexCacheNativeEvicted",
+                     "indexCacheNativeEvicted", "indexCacheStaleReplaced",
                      "indexBuildPooledBytes",
                      "ingestBufferPooledBytes", "ingestArenaResidentBytes", "logsQuarantinedBytes",
                  })

@@ -348,15 +348,17 @@ Server health snapshot.
   "logsStorageBytes": 134217728,
   "logsQuarantinedBytes": 0,
 
-  "indexCacheEntries": 12,
-  "indexCacheBytes": 41943040,
+  "indexCacheEntries": 240,
+  "indexCacheBytes": 1468006,
   "indexCacheBudgetBytes": 60129542,
   "indexCacheHits": 1843,
   "indexCacheMisses": 57,
   "indexCacheIdleEvicted": 3,
-  "indexCacheNativeBytes": 6291456,
+  "indexCacheNativeBytes": 0,
   "indexCacheNativeBudgetBytes": 26843545,
   "indexCacheShedEvicted": 0,
+  "indexCacheNativeEvicted": 0,
+  "indexCacheStaleReplaced": 0,
 
   "ingestBufferPooledBytes": 4194304,
   "ingestBufferBudgetBytes": 134217728,
@@ -390,7 +392,7 @@ The response carries more fields than are shown here (disk, GC, per-signal stora
 
 The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the index cache — per index group, a memo of what searches worked out, kilobytes each (the budget is what the cache was BUILT with, not a fresh derivation); `indexCacheHits` / `indexCacheMisses` count group uses answered without reading any of the group's index sections and those that had to read one; `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — the deepest slab ever used times the slab size, never given back, so it is a resting level rather than a peak. On Windows that figure is the arena's commit charge (what a job object's memory limit counts). On Linux it is an upper bound on the arena's resident memory, not a measurement of it: pages become resident only when written, and a small event writes only the first page of its slab. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
 
-`indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — segment bloom filter bits — with its own ceiling. Since #80 a search caches the bloom's verdicts rather than its bits, so on a server this reads 0; the ceiling is a backstop. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-read index sections on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves.
+`indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — segment bloom filter bits — with its own ceiling. Since #80 a search caches the bloom's verdicts rather than its bits, so on a server this reads 0; the ceiling is a backstop. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-read index sections on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves. `indexCacheStaleReplaced` counts cached index entries thrown away because the segment file behind their path had been replaced by a different one (a replica re-imported under the same name); it should stay at or near 0, and a number that climbs means segment files are being replaced under their own names.
 
 The `metrics*` and `traces*` budget fields are the **effective** figures the engines enforce — after an explicit `Ameto:Metrics` / `Ameto:Traces` value, the derivation from the memory limits and the floors — so they are what to read after tuning those knobs; each signal also prints them once at startup (`Metric budgets:`, `Trace budgets:`). They are `null` when the signal is disabled. `metricsExemplarMetricsRefused` counts exemplars dropped because `metricsMaxExemplarMetrics` names already own a ring (a correlation hint, never data). The span ring's refusals are counted by cause, because they are different problems: `tracesRingRefusedForBytes` is a burst heavier than `tracesRingMaxBytes`, `tracesRingRefusedNoSlot` a drainer that fell behind, and `tracesRingRefusedNoArena` a payload mix the ring's 64 KiB chunks pack badly (see `RingMaxBytes` in CONFIGURATION.md). `tracesInternPoolSaturations`, `tracesUnpooledSpanNames` and `tracesUnpooledServiceNames` say a span-name or service intern pool filled up: nothing is dropped, but each span past that point keeps its own string.
 
