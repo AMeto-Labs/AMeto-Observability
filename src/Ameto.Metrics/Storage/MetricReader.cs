@@ -58,7 +58,7 @@ internal static class MetricReader
         Span<byte> nameHead = stackalloc byte[6];
         if (nameIdxOffset < 0) throw new IOException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
         if (ReadAt(handle, nameHead, nameIdxOffset) < 6) throw new EndOfStreamException();
-        int     nameLen = BinaryPrimitives.ReadUInt16LittleEndian(nameHead[4..]);
+        ushort  nameLen = BinaryPrimitives.ReadUInt16LittleEndian(nameHead[4..]);   // 16 bits: the type is the bound
         byte[]? rented  = nameLen > 256 ? ArrayPool<byte>.Shared.Rent(nameLen) : null;
         try
         {
