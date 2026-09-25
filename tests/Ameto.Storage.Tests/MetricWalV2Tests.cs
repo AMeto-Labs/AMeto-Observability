@@ -688,6 +688,25 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE BOUND IS EIGHT CHUNKS, NOT NINE. A one-entry prefix (52 B) before seven one-bucket
+    /// histograms (60 B each, 420 B): 420 / 8 floors to 52, so `prefix &lt; tail / 8` let the move run
+    /// — nine chunks. Compared multiplied (52 × 8 = 416 &lt; 420), the prefix is left in place.
+    /// </summary>
+    [Fact]
+    public void A_tail_just_over_eight_prefixes_is_not_moved()
+    {
+        long steps = 0;
+        using var wal = Open();
+        wal.Append([Gauge("cpu", 0, 100.0)]);
+        ulong first = wal.BeginFlush();
+        for (int j = 0; j < 7; j++) wal.Append([Histo("latency", 1 + j, [1])]);
+        wal.OnRelocationStepForTest = (_, _) => steps++;
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(first));
+        Assert.Equal(0, steps);
+        Assert.Equal(V2Entry + 7L * (V2Entry + 8), wal.WrittenBytes);
+    }
+
+    /// <summary>
     /// Builds, in a directory of its own, the file a process killed inside a commit's relocation
     /// leaves: <paramref name="committedEntries"/> points (100…) flushed, <paramref name="survivors"/>
     /// (200…) appended during the flush, and the file copied at <paramref name="point"/> — a

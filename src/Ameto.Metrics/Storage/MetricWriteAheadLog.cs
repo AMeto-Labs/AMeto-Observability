@@ -1937,8 +1937,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         // place, the prefix is dead weight the replay already skips (it is at or below the watermark),
         // and the next commit reclaims it with everything else — its own prefix is then at least this
         // whole tail, so the move it makes is a few chunks at most. v1 moves in one copy, with nothing
-        // to seal, and is left as it was.
-        if (move && !_legacyV1 && firstSurvivor < surviving / MinPrefixToMoveTail) return;
+        // to seal, and is left as it was. Compared multiplied, not divided: `surviving / 8` floors,
+        // and a tail of 8 prefixes and a little more then passed as nine chunks.
+        if (move && !_legacyV1 && firstSurvivor * MinPrefixToMoveTail < surviving) return;
 
         if (move && !_legacyV1)
         {
@@ -2017,7 +2018,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         Cleared,
     }
 
-    /// <summary>A commit moves its surviving tail only when the dead prefix is at least this fraction (1/n) of it; see <see cref="Compact"/>.</summary>
+    /// <summary>A commit moves its surviving tail only when the dead prefix is at least 1/n of it — at most n chunks; see <see cref="Compact"/>.</summary>
     private const long MinPrefixToMoveTail = 8;
 
     /// <summary>
@@ -2310,15 +2311,21 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// check exists so that a development build's leftovers are re-initialised with an Error instead
     /// of being walked 32 bytes out of step (which the entry checksums would stop, silently, at the
     /// first entry). Asked only of a header that does not verify: a v2 entry that verifies at byte
-    /// 32 is the evidence.
+    /// 32 is the evidence — and one that verifies at byte 64, where a real v2 log's first entry is,
+    /// is evidence against: that is a v2 log whose header rotted, and it is rebuilt, not thrown away.
     /// </summary>
     private bool IsPreReleaseV2(long fileSize)
     {
-        byte* entry = _ptr + FileHeaderSizeV1;
-        if (FileHeaderSizeV1 + EntryHeaderSize > fileSize) return false;
-        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(entry);
-        if (eh.Generation == 0 || FileHeaderSizeV1 + EntryHeaderSize + eh.BucketCount * (long)sizeof(long) > fileSize) return false;
-        return Unsafe.ReadUnaligned<uint>(entry + ChecksummedHeaderBytes) == EntryChecksum(entry, eh.BucketCount);
+        return EntryVerifiesAt(FileHeaderSizeV1) && !EntryVerifiesAt(FileHeaderSize);
+
+        bool EntryVerifiesAt(long offset)
+        {
+            if (offset + EntryHeaderSize > fileSize) return false;
+            byte* entry = _ptr + offset;
+            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(entry);
+            if (eh.Generation == 0 || offset + EntryHeaderSize + eh.BucketCount * (long)sizeof(long) > fileSize) return false;
+            return Unsafe.ReadUnaligned<uint>(entry + ChecksummedHeaderBytes) == EntryChecksum(entry, eh.BucketCount);
+        }
     }
 
     /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a metric WAL at all.</summary>
