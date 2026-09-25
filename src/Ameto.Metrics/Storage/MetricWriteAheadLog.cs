@@ -542,6 +542,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// </summary>
     [ThreadStatic] internal static Action<RelocationStep, long>? t_relocationStepForNextOpenForTest;
 
+    /// <summary>Test seam: <see cref="OnPendingStoredForTest"/> for the logs this THREAD opens next. Null in production.</summary>
+    [ThreadStatic] internal static Action<string, ulong>? t_pendingStoredForNextOpenForTest;
+
     private static MetricWriteAheadLog OpenInstance(string filePath, long initialCapacity, ILogger? logger,
                                                     Action<long>? beforeResize, MetricLabelInterner? interner)
     {
@@ -551,6 +554,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // cannot reach — and its double-failure path is exactly what needs the coverage.
             BeforeResize = beforeResize,
             OnRelocationStepForTest = t_relocationStepForNextOpenForTest,
+            OnPendingStoredForTest  = t_pendingStoredForNextOpenForTest,
         };
         try { wal.OpenOrCreate(initialCapacity); }
         catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
@@ -831,6 +835,12 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
             // Decided before anything below re-seals the header. A v1 header has no checksum.
             bool counted = _legacyV1 || HeaderVerifies(in hdr);
+
+            // A header that verifies only by its PENDING checksum — the previous process stopped
+            // between a field and its seal — is sealed before anything else is stored: the next
+            // covered store overwrites PendingCrc first, and a second stop before that store's
+            // field would leave a header matching neither slot, a false "does not verify".
+            if (counted) SealHeaderLocked();
 
             // Nothing below may make a header that did NOT verify verify again before its counters
             // are rebuilt: a process killed during this open would otherwise leave the old counters
@@ -2149,6 +2159,13 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     internal Action<string, ulong>? OnCoveredStoreForTest;
 
     /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after <see cref="WalFileHeader.PendingCrc"/> is
+    /// stored and BEFORE the field — the other state a process killed inside the store leaves.
+    /// Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnPendingStoredForTest;
+
+    /// <summary>
     /// THE ONE WAY A COVERED HEADER FIELD CHANGES once the header exists: the checksum of the header
     /// AS IT WILL BE goes into <see cref="WalFileHeader.PendingCrc"/>, then the field, then the same
     /// value into <see cref="WalFileHeader.Crc"/>. A process killed anywhere in that sequence leaves
@@ -2173,6 +2190,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         WalFileHeader next = h;
         Set(ref next, field, value);
         h.PendingCrc = HeaderChecksum(in next);
+        OnPendingStoredForTest?.Invoke(field.ToString(), value);
         Set(ref h, field, value);
         OnCoveredStoreForTest?.Invoke(field.ToString(), value);
         h.Crc = h.PendingCrc;

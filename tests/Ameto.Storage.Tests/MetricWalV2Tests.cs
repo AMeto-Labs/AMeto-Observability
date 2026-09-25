@@ -749,6 +749,45 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE DOUBLE STOP. The first kill leaves a header that verifies only by its pending checksum;
+    /// the open that finishes the move is killed in turn, inside its first covered store, after it
+    /// wrote that store's pending checksum and before the field. Unless the open sealed the header
+    /// before storing anything, that file matches neither slot and the next open reports rot that
+    /// is not there. It must verify, finish, and replay every survivor once.
+    /// </summary>
+    [Theory]
+    [InlineData(6, 4, "armed-unsealed", 0)]
+    [InlineData(2, 5, "chunk-unsealed", 104)]
+    [InlineData(6, 4, "end-stored",     208)]
+    public void A_second_stop_inside_the_open_that_finishes_a_first_leaves_a_header_that_verifies(
+        int committedEntries, int survivors, string point, long done)
+    {
+        string killed  = KilledRelocation(committedEntries, survivors, point, done, intoNextChunk: 0);
+        string walPath = Path.Combine(killed, "metrics.wal");
+
+        byte[]? secondStop = null, secondStopPool = null;
+        MetricWriteAheadLog.t_pendingStoredForNextOpenForTest = (_, _) =>
+        {
+            if (secondStop is not null) return;
+            secondStop     = ReadShared(walPath);
+            secondStopPool = ReadShared(walPath + ".pool");
+        };
+        try { Open(path: walPath).Dispose(); }
+        finally { MetricWriteAheadLog.t_pendingStoredForNextOpenForTest = null; }
+        Assert.NotNull(secondStop);
+
+        string twice = Path.Combine(_dir, "twice");
+        Directory.CreateDirectory(twice);
+        File.WriteAllBytes(Path.Combine(twice, "metrics.wal"), secondStop!);
+        File.WriteAllBytes(Path.Combine(twice, "metrics.wal.pool"), secondStopPool!);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger, Path.Combine(twice, "metrics.wal")))
+            Assert.Equal(Enumerable.Range(0, survivors).Select(static j => 200.0 + j), wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Error);
+    }
+
+    /// <summary>
     /// AN OPEN KILLED WHILE IT FINISHES A RELOCATION UNDER A HEADER THAT DOES NOT VERIFY LEAVES IT
     /// NOT VERIFYING. The open redoes the move chunk by chunk, storing its progress; if those stores
     /// sealed the header, the rotted generation would be sealed with them, and the open after a
