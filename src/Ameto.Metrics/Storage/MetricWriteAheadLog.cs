@@ -539,7 +539,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// way to reach a relocation the open itself finishes. Thread-static so that no other test's open
     /// sees it. Null in production.
     /// </summary>
-    [ThreadStatic] internal static Action<long>? t_relocationStepForNextOpenForTest;
+    [ThreadStatic] internal static Action<RelocationStep, long>? t_relocationStepForNextOpenForTest;
 
     private static MetricWriteAheadLog OpenInstance(string filePath, long initialCapacity, ILogger? logger,
                                                     Action<long>? beforeResize, MetricLabelInterner? interner)
@@ -1839,7 +1839,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             RelocateLocked(ref hdr, data, firstSurvivor, surviving, done: 0);
             _writeOffset    = surviving;
             hdr.WriteOffset = _headerSize + _writeOffset;
+            OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, surviving);
             ClearRelocationLocked();
+            OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, surviving);
         }
         else
         {
@@ -1893,13 +1895,26 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         }
     }
 
+    /// <summary>The points of a relocation <see cref="OnRelocationStepForTest"/> fires at, in order.</summary>
+    internal enum RelocationStep : byte
+    {
+        /// <summary>The record is armed and sealed; no byte has moved.</summary>
+        Armed,
+        /// <summary>A chunk is moved and its <see cref="WalFileHeader.MoveDone"/> sealed.</summary>
+        Chunk,
+        /// <summary>The new end is stored; the record is still armed.</summary>
+        EndStored,
+        /// <summary>The record is cleared and sealed; the end marker is not planted yet.</summary>
+        Cleared,
+    }
+
     /// <summary>
-    /// Test seam fired by <see cref="RelocateLocked"/> with the header's <see cref="WalFileHeader.MoveDone"/>
-    /// each time it is stored — 0 once the record is armed and before the first byte moves, then
-    /// after every chunk. What the file holds at that instant is what a process killed there
-    /// leaves. Null in production.
+    /// Test seam fired at every <see cref="RelocationStep"/> of a relocation — a commit's, or the one
+    /// the open finishes — with the bytes moved so far. What the file holds at that instant is what
+    /// a process killed there leaves. The states BETWEEN a covered store and its checksum are
+    /// <see cref="OnCoveredStoreForTest"/>'s. Null in production.
     /// </summary>
-    internal Action<long>? OnRelocationStepForTest;
+    internal Action<RelocationStep, long>? OnRelocationStepForTest;
 
     /// <summary>
     /// Moves the surviving tail <c>[from, from + length)</c> to the front, FROM <paramref name="done"/>
@@ -1940,7 +1955,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             hdr.MoveFrom = from;
             hdr.MoveDone = 0;
             StoreCovered(HeaderField.MoveLength, (ulong)length);   // armed
-            OnRelocationStepForTest?.Invoke(0);
+            OnRelocationStepForTest?.Invoke(RelocationStep.Armed, 0);
         }
 
         while (done < length)
@@ -1949,7 +1964,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
             done         += chunk;
             StoreCovered(HeaderField.MoveDone, (ulong)done);
-            OnRelocationStepForTest?.Invoke(done);
+            OnRelocationStepForTest?.Invoke(RelocationStep.Chunk, done);
         }
     }
 
@@ -2004,7 +2019,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         RelocateLocked(ref hdr, data, from, length, done);
         _writeOffset    = length;
         hdr.WriteOffset = _headerSize + length;
+        OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, length);
         ClearRelocationLocked();
+        OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, length);
         if (length + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + length).Generation = 0;
     }

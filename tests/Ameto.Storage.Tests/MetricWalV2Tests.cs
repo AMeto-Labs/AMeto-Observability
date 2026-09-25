@@ -499,70 +499,124 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     // ── A commit's relocation, killed half-way ───────────────────────────────
 
     /// <summary>
-    /// A PROCESS KILLED INSIDE A COMMIT'S MOVE OF THE SURVIVORS LOSES NONE OF THEM. The commit
-    /// stores the watermark, then moves the surviving tail to the front. The file is copied at the
-    /// relocation's own seam — once its record is armed, or after a whole chunk — and the kill is
-    /// completed by hand the way a forward memmove leaves it: <paramref name="intoNextChunk"/>
-    /// bytes of the next chunk copied, the rest not. Opening that file must replay every survivor
-    /// exactly once and no committed point. Without the record finished at open, the moved copies
-    /// verify, the entry straddling the copy frontier fails its checksum, the walk cuts the log
-    /// there, and every survivor past it is gone — acknowledged points in no <c>.mts</c>.
+    /// A PROCESS KILLED ANYWHERE INSIDE A COMMIT'S MOVE OF THE SURVIVORS LOSES NONE OF THEM. The
+    /// commit stores the watermark, then moves the surviving tail to the front. The file is copied
+    /// at every point of that move a process can die at: once the record is armed — sealed, or
+    /// between the arming store and its checksum; after each chunk — sealed, or between its
+    /// <c>MoveDone</c> and the checksum, including the last chunk (all moved, nothing stored
+    /// after); after the new end is stored with the record still armed; between disarming and its
+    /// checksum; and after disarming, before the end marker. Where a chunk can be in flight the
+    /// kill is completed by hand the way a forward memmove leaves it — <c>intoNextChunk</c> bytes
+    /// of the next chunk copied. Some rows also rot the header's generation, so the header fails
+    /// its checksum WITH a record armed. Opening each file must replay every survivor exactly once
+    /// and no committed point, leave the log finished (the tail's length), and leave nothing for
+    /// the next open to finish or rebuild. Without the finish at open, the moved copies verify, the
+    /// entry straddling the frontier fails its checksum, and every survivor past it is lost.
     /// </summary>
     [Theory]
-    [InlineData(6, 4, 0, 78)]      // one chunk (the tail fits in the gap), killed 1.5 entries into it
-    [InlineData(6, 4, 0, 0)]       // killed right after the record was armed: nothing moved yet
-    [InlineData(2, 5, 1, 30)]      // a tail longer than the prefix: three chunks, killed inside the second
-    [InlineData(2, 5, 2, 51)]      // …inside the last, one byte short of it
-    public void A_process_killed_inside_a_commits_relocation_loses_no_survivor(
-        int committedEntries, int survivors, int chunksDone, int intoNextChunk)
+    [InlineData(6, 4, "armed",          0,   0,  false)]   // one chunk (the tail fits in the gap)
+    [InlineData(6, 4, "armed",          0,   78, false)]   // …1.5 entries into it
+    [InlineData(6, 4, "armed",          0,   78, true)]    // …and the header rotted
+    [InlineData(6, 4, "armed-unsealed", 0,   0,  false)]   // between arming and its checksum
+    [InlineData(6, 4, "armed-unsealed", 0,   0,  true)]
+    [InlineData(6, 4, "chunk",          208, 0,  false)]   // all moved: done == tail
+    [InlineData(6, 4, "chunk-unsealed", 208, 0,  false)]
+    [InlineData(6, 4, "end-stored",     208, 0,  false)]   // the new end stored, the record armed
+    [InlineData(6, 4, "end-stored",     208, 0,  true)]
+    [InlineData(6, 4, "clear-unsealed", 208, 0,  false)]   // between disarming and its checksum
+    [InlineData(6, 4, "clear-unsealed", 208, 0,  true)]
+    [InlineData(6, 4, "cleared",        208, 0,  false)]   // disarmed, the end marker not planted
+    [InlineData(2, 5, "chunk",          104, 30, false)]   // a tail longer than the prefix: three chunks
+    [InlineData(2, 5, "chunk",          104, 30, true)]
+    [InlineData(2, 5, "chunk-unsealed", 104, 0,  false)]
+    [InlineData(2, 5, "chunk-unsealed", 104, 0,  true)]
+    [InlineData(2, 5, "chunk",          208, 51, false)]   // inside the last, one byte short of it
+    [InlineData(2, 5, "chunk",          260, 0,  false)]   // done == tail
+    [InlineData(2, 5, "end-stored",     260, 0,  false)]
+    [InlineData(2, 5, "cleared",        260, 0,  false)]
+    public void A_process_killed_anywhere_inside_a_commits_relocation_loses_no_survivor(
+        int committedEntries, int survivors, string point, long done, int intoNextChunk, bool rotHeader)
     {
-        long prefix = committedEntries * (long)V2Entry, tail = survivors * (long)V2Entry;
-        string killed = KilledRelocation(committedEntries, survivors, Math.Min(prefix * chunksDone, tail), intoNextChunk);
+        long tail = survivors * (long)V2Entry;
+        string killed  = KilledRelocation(committedEntries, survivors, point, done, intoNextChunk);
+        string walPath = Path.Combine(killed, "metrics.wal");
+        if (rotHeader)
+        {
+            byte[] file = File.ReadAllBytes(walPath);
+            BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);      // Generation
+            File.WriteAllBytes(walPath, file);
+        }
 
         double[] expected = Enumerable.Range(0, survivors).Select(static j => 200.0 + j).ToArray();
-        var reopened = Open(path: Path.Combine(killed, "metrics.wal"));
+        var logger   = new CapturingLogger();
+        var reopened = Open(logger, walPath);
         Assert.Equal(expected, reopened.ReadAll(out int unresolved).Select(static r => r.Point.Value));
         Assert.Equal(0, unresolved);
         Assert.Equal(tail, reopened.WrittenBytes);                                // finished, not just read past
         reopened.Dispose();
+        Assert.Equal(rotHeader, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify")));
+        Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("cannot vouch for"));
 
-        // And the finish is durable in the file: the next open has nothing left to finish.
-        var again = Open(path: Path.Combine(killed, "metrics.wal"));
+        // And the finish is durable in the file: the next open has nothing to finish or rebuild.
+        var quiet = new CapturingLogger();
+        var again = Open(quiet, walPath);
         Assert.Equal(expected, again.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.DoesNotContain(quiet.Entries, static e => e.Level >= LogLevel.Warning);
     }
 
     /// <summary>
     /// Builds, in a directory of its own, the file a process killed inside a commit's relocation
     /// leaves: <paramref name="committedEntries"/> points (100…) flushed, <paramref name="survivors"/>
-    /// (200…) appended during the flush, the file copied at the relocation seam once
-    /// <paramref name="doneAtKill"/> bytes are moved, and <paramref name="intoNextChunk"/> bytes of the
-    /// next chunk then copied by hand the way a forward memmove leaves them. Returns the directory.
+    /// (200…) appended during the flush, and the file copied at <paramref name="point"/> — a
+    /// <see cref="MetricWriteAheadLog.RelocationStep"/> ("armed", "chunk", "end-stored", "cleared"),
+    /// or the state between a covered store and its checksum ("armed-unsealed", "chunk-unsealed",
+    /// "clear-unsealed") — with <paramref name="done"/> bytes moved; then <paramref name="intoNextChunk"/>
+    /// bytes of the next chunk copied by hand the way a forward memmove leaves them. Returns the
+    /// directory.
     /// </summary>
-    private string KilledRelocation(int committedEntries, int survivors, long doneAtKill, int intoNextChunk,
+    private string KilledRelocation(int committedEntries, int survivors, string point, long done, int intoNextChunk,
                                     string name = "killed")
     {
         long prefix = committedEntries * (long)V2Entry, tail = survivors * (long)V2Entry;
+        string source = Path.Combine(_dir, name + "-source.wal");
         byte[]? atStep = null, poolAtStep = null;
-        using (var wal = Open(path: Path.Combine(_dir, name + "-source.wal")))
+        void Take()
+        {
+            if (atStep is not null) return;
+            atStep     = ReadShared(source);
+            poolAtStep = ReadShared(source + ".pool");
+        }
+
+        using (var wal = Open(path: source))
         {
             for (int i = 0; i < committedEntries; i++) wal.Append([Gauge("cpu", i, 100 + i)]);
             ulong flushing = wal.BeginFlush();
             for (int j = 0; j < survivors; j++) wal.Append([Gauge("cpu", 50 + j, 200 + j)]);
 
-            wal.OnRelocationStepForTest = done =>
+            wal.OnRelocationStepForTest = (step, moved) =>
             {
-                if (done != doneAtKill || atStep is not null) return;
-                atStep     = ReadShared(Path.Combine(_dir, name + "-source.wal"));
-                poolAtStep = ReadShared(Path.Combine(_dir, name + "-source.wal.pool"));
+                if (moved != done) return;
+                if ((point, step) is ("armed", MetricWriteAheadLog.RelocationStep.Armed)
+                                  or ("chunk", MetricWriteAheadLog.RelocationStep.Chunk)
+                                  or ("end-stored", MetricWriteAheadLog.RelocationStep.EndStored)
+                                  or ("cleared", MetricWriteAheadLog.RelocationStep.Cleared)) Take();
+            };
+            wal.OnCoveredStoreForTest = (field, value) =>
+            {
+                if ((point, field) is ("armed-unsealed", "MoveLength") && value != 0) Take();
+                if ((point, field) is ("chunk-unsealed", "MoveDone") && (long)value == done) Take();
+                if ((point, field) is ("clear-unsealed", "MoveLength") && value == 0) Take();
             };
             Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));
             wal.OnRelocationStepForTest = null;
+            wal.OnCoveredStoreForTest   = null;
             Assert.Equal(tail, wal.WrittenBytes);                               // the live log finished it
         }
-        Assert.NotNull(atStep);
+        Assert.True(atStep is not null, $"the kill point {point} at {done} was never reached");
 
-        long chunk = Math.Min(prefix, tail - doneAtKill);
-        Array.Copy(atStep!, FileHeader + prefix + doneAtKill, atStep!, FileHeader + doneAtKill, Math.Min(intoNextChunk, chunk));
+        long chunk = Math.Min(prefix, tail - done);
+        if (intoNextChunk > 0)
+            Array.Copy(atStep!, FileHeader + prefix + done, atStep!, FileHeader + done, Math.Min(intoNextChunk, chunk));
 
         string killed = Path.Combine(_dir, name);
         Directory.CreateDirectory(killed);
@@ -585,7 +639,7 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     [InlineData(true,  new[] { 200.0, 201.0 })]
     public void A_relocation_record_in_a_header_that_does_not_verify_must_match_the_move_it_names(bool rotDone, double[] expected)
     {
-        string killed = KilledRelocation(committedEntries: 2, survivors: 5, doneAtKill: 2 * V2Entry, intoNextChunk: 30);
+        string killed = KilledRelocation(committedEntries: 2, survivors: 5, "chunk", done: 2 * V2Entry, intoNextChunk: 30);
         string walPath = Path.Combine(killed, "metrics.wal");
         byte[] file = File.ReadAllBytes(walPath);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);          // Generation: rot
@@ -610,14 +664,14 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     [Fact]
     public void An_open_killed_while_it_finishes_a_relocation_under_a_rotted_header_still_rebuilds()
     {
-        string killed = KilledRelocation(committedEntries: 2, survivors: 5, doneAtKill: 2 * V2Entry, intoNextChunk: 30);
+        string killed = KilledRelocation(committedEntries: 2, survivors: 5, "chunk", done: 2 * V2Entry, intoNextChunk: 30);
         string walPath = Path.Combine(killed, "metrics.wal");
         byte[] file = File.ReadAllBytes(walPath);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);
         File.WriteAllBytes(walPath, file);
 
         byte[]? midOpen = null, midOpenPool = null;
-        MetricWriteAheadLog.t_relocationStepForNextOpenForTest = done =>
+        MetricWriteAheadLog.t_relocationStepForNextOpenForTest = (_, _) =>
         {
             if (midOpen is not null) return;
             midOpen     = ReadShared(walPath);
