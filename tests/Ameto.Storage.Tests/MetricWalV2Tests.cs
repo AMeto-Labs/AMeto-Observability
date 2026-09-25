@@ -566,14 +566,14 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     /// or above every entry's generation hid them all — replay skips what the watermark covers, and
     /// the crossed-header repair then raised the counter above it — acknowledged points dropped by
     /// eight bytes of header, silently; now the watermark is rebuilt below the oldest entry and all
-    /// of them replay, with an Error. A watermark BELOW the newest entry is what a commit killed
-    /// between its watermark store and the seal leaves, and it is kept: the committed prefix still
-    /// in the file stays dead and the survivors replay once. The next open finds a header that
-    /// verifies.
+    /// of them replay, with an Error. A rotted watermark BELOW the newest entry hides at most a
+    /// prefix and is kept: a committed prefix still in the file stays dead and the survivors replay
+    /// once. The next open finds a header that verifies. (A STOP between a watermark store and its
+    /// checksum is not this: the header verifies by its pending checksum — the next fact.)
     /// </summary>
     [Theory]
-    [InlineData(1_000UL, new[] { 1.0, 2.0, 3.0 })]   // rotted: above every entry — rebuilt, all replay
-    [InlineData(1UL,     new[] { 4.0, 5.0 })]        // a commit killed before its seal — kept, survivors only
+    [InlineData(1_000UL, new[] { 1.0, 2.0, 3.0 })]   // rotted above every entry — rebuilt, all replay
+    [InlineData(1UL,     new[] { 4.0, 5.0 })]        // rotted below the newest — kept, survivors only
     public void A_header_that_does_not_verify_has_its_counters_rebuilt_from_the_entries(ulong watermark, double[] expected)
     {
         using (var wal = Open())
@@ -598,6 +598,48 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         using (var wal = Open(quiet))
             Assert.Equal(expected, wal.ReadAll(out _).Select(static r => r.Point.Value));
         Assert.DoesNotContain(quiet.Entries, static e => e.Level >= LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A COMMIT KILLED BETWEEN ITS WATERMARK STORE AND THE HEADER'S CHECKSUM REPLAYS NOTHING IT
+    /// FLUSHED. The usual periodic flush: nothing arrived while it wrote its files, so the commit
+    /// stores the watermark over every entry in the log and then compacts it to nothing. The file
+    /// is copied at the seam between the watermark store and the checksum that covers it. The
+    /// header must verify — by the checksum written for its new state before the field — so the
+    /// watermark stands and nothing replays. When the store came first and the seal after it, that
+    /// header failed, the rebuild dropped a watermark covering every entry, and the whole flushed
+    /// generation replayed beside the .mts files it had already been written to.
+    /// </summary>
+    [Fact]
+    public void A_commit_killed_between_its_watermark_store_and_the_checksum_replays_nothing_it_flushed()
+    {
+        byte[]? atStore = null, poolAtStore = null;
+        using (var wal = Open())
+        {
+            wal.Append([Gauge("cpu", 0, 1.0), Gauge("cpu", 1, 2.0), Gauge("cpu", 2, 3.0)]);
+            ulong flushing = wal.BeginFlush();
+            wal.OnCoveredStoreForTest = (field, _) =>
+            {
+                if (field != "Committed") return;
+                atStore     = ReadShared(WalPath);
+                poolAtStore = ReadShared(PoolPath);
+            };
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));
+            wal.OnCoveredStoreForTest = null;
+        }
+        Assert.NotNull(atStore);
+        Assert.Equal(1UL, BinaryPrimitives.ReadUInt64LittleEndian(atStore.AsSpan(24)));       // the watermark landed
+        Assert.Equal(3L * V2Entry, BinaryPrimitives.ReadInt64LittleEndian(atStore.AsSpan(8)) - FileHeader);
+
+        string killed = Path.Combine(_dir, "killed");
+        Directory.CreateDirectory(killed);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal"), atStore!);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal.pool"), poolAtStore!);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger, Path.Combine(killed, "metrics.wal")))
+            Assert.Empty(wal.ReadAll(out _));
+        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Error);
     }
 
     // ── The pool ─────────────────────────────────────────────────────────────
