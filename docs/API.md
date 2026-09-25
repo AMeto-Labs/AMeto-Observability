@@ -302,7 +302,7 @@ What each page stores: **logs** — the filter expression as typed; **traces** �
 through the TraceQL box); **metrics** — the committed builder tuple as
 `metric=…&agg=…[&q=…][&gb=…][&filters=…]`, the same encoding the page's own URL uses.
 
-> **Changed in this release — TraceQL numeric literals.** A minus sign is now part of the number: `{ .x = -3 }` asks for −3 (it used to drop the sign and ask for 3), and exponents parse (`-1e3`, `2.5E-1`). A literal that cannot mean a number — `1.2.3`, a stray `-` as in `.x = - 3`, `1e999` — and a negative span duration (`duration > -1ms`, `duration > -5`) are now a **query error** (`400`, or a `query-error` frame on the streams) instead of a silently wrong answer (`1.2.3` used to become 0). A saved or pinned trace query written that way fails on replay until it is corrected. Comparing an *attribute* with a negative duration (`.clock.skew < -5ms`) is an ordinary number comparison.
+> **Changed in this release — TraceQL numeric literals.** A **traces** entry is replayed as the text it holds, so one that holds a negative number now answers the question it spells, and one that holds `1.2.3`, a stray `-` or a negative `duration` now replays to a query error until it is edited — see [Traces](#traces).
 
 All require JWT Bearer.
 
@@ -511,6 +511,12 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 | `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace. |
 | `GET /api/traces/{traceId}/logs` | Logs correlated to the trace (via `@tr`). |
 | `GET /api/spans/{spanId}/logs` | Logs correlated to a single span (via `@sp`). |
+
+> **Changed in this release — TraceQL numeric literals.** The lexer had no sign, and read text that was not a number as `0`; each of those answered a different question from the one written, without a word. A literal now either means the number it spells or the query is refused.
+>
+> - **Now parses.** A `-` directly before a digit is part of the number: `{ .x = -3 }` asks for −3 and `{ .code < -1 }` for "below −1" — they used to drop the sign and ask `.x = 3` / `.code < 1`. **Such a query returns different rows after upgrading, with no error.** An exponent is part of the literal: `1e3`, `2.5E-1`, `-1e3` (it used to lex as a number followed by a name). An *attribute* compared with a negative duration (`{ .clock.skew < -5ms }`) is an ordinary number comparison against its nanoseconds.
+> - **Now a query error.** Text that does not spell a finite number — `1.2.3` (it used to become `0`), `1e999`; a `-` not directly followed by a digit, outside quotes and attribute names — `.x = - 3` (it used to read as `3`); and a negative value against the `duration` intrinsic — `duration > -1ms`, `duration > -5` (no span lasts less than zero, so it used to select every span or none). The REST query (`/api/traces/query`) answers `400` with `TraceQL parse error: …` naming the literal; `/api/traces/query/stream?ql=` ends with a `query-error` frame on a `200`, as for any parse error.
+> - **Where old text lives.** The traces page replays query text exactly as written: a bookmarked or shared `/traces?ql=…` link, and a per-user trace entry in [Search history](#search-history) (recent or pinned), that holds a refused form now opens on the query error until the text is corrected. Text the page writes itself does not hit the refusals: the filter bar and the attribute menu (`tqlPredicate` in `client/src/app/pages/traces/traces.ts`) already emit a value unquoted only when it matches `-?\d+(\.\d+)?` — the sign glued to its digits, no exponent — or is `true`/`false`, and quote anything else. An entry recorded from a negative value (`.x = -3`) used to replay as `3`; it now replays as what was clicked. The one exception is a negative **Min/Max ms** typed into the filter bar (the field only hints `min="1"`): it is recorded as `duration >= -5ms`, which is now refused like any negative duration.
 
 ---
 
