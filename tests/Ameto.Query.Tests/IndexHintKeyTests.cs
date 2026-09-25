@@ -310,6 +310,12 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void QuotedDoubleLiteral()  => AssertIndexPath("Ratio = '2.5'", 9001);
     [Fact] public void DoubleLiteral()        => AssertIndexPath("Ratio = 2.5", 9001);
 
+    // A quoted numeral spelled otherwise than the stored number: the scan coerces both sides to
+    // a double, but the bloom holds only the stored spelling, "12345" — which is the SECOND plain
+    // form of these literals, not the first. A gate that probed one form dropped the segment.
+    [Fact] public void QuotedIntegerSpelledAsDecimal() => AssertIndexPath("Score = '12345.0'", 9001);
+    [Fact] public void QuotedIntegerWithLeadingZero()  => AssertIndexPath("Score = '012345'", 9001);
+
     [Fact]
     public void WrongNumericValue_StillSkipsTheSegment()
     {
@@ -430,14 +436,12 @@ public sealed class IndexHintKeyTests : IDisposable
         if (!hasIndexHint && invertedHints.Count == 0 && trigramHints.Count == 0)
             return true;
 
-        if (hasIndexHint)
-        {
-            using var bloom = SegmentBloomFilter.Deserialise(_bloomBytes);
-            if (!QueryExecutor.PassesBloomGate(filter, bloom)) return false;
-        }
+        // The view production opens per group — here over this fixture's sections, with a memo
+        // of its own — so the gate and the narrowing below are the very calls the executor makes.
+        using var index = SegmentIndexView.OverSections(null, "fixture.seg", 0, _invertedBytes, _trigramBytes, _bloomBytes);
+        if (hasIndexHint && !QueryExecutor.PassesBloomGate(filter, index)) return false;
 
-        var idx = SegmentIndexReader.Load(_invertedBytes, _trigramBytes, _bloomBytes);
-        return QueryExecutor.TryNarrowWithIndex(filter, idx, out candidates);
+        return QueryExecutor.TryNarrowWithIndex(filter, index, out candidates);
     }
 
     // ── Fixture helpers ───────────────────────────────────────────────────────

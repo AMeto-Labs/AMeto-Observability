@@ -21,6 +21,8 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Ameto.Indexing.Tests" />
     <InternalsVisibleTo Include="Ameto.Perf" />
+    <!-- IndexHintKeyTests runs the executor's prefilter through the view production opens (SegmentIndexView.OverSections). -->
+    <InternalsVisibleTo Include="Ameto.Query.Tests" />
   </ItemGroup>
 
 </Project>

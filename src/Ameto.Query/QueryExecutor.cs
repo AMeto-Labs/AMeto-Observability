@@ -702,23 +702,16 @@ public sealed class QueryExecutor : IQueryExecutor
     }
 
     /// <summary>
-    /// Phase 1 of the prefilter: the cheap bloom-only gate on the equality hint. False drops
-    /// the segment without ever loading the multi-megabyte index sections.
+    /// Phase 1 of the prefilter: the bloom gate on the equality hint, through the group's view —
+    /// every value form the scan would accept is probed, each verdict answered from the group's
+    /// memo when an earlier query already asked and from its bloom section when not. False drops
+    /// the group before any inverted or trigram lookup.
     ///
     /// <para>Factored out of the parallel body together with <see cref="TryNarrowWithIndex"/>
     /// so the tests that assert "the index never costs a query its rows" can run the decision
     /// this method makes instead of a copy of it. A copy passed while the original was
-    /// reverted, which is the one thing those tests exist to catch.</para>
-    /// </summary>
-    internal static bool PassesBloomGate(CompiledFilter filter, SegmentBloomFilter bloom)
-    {
-        if (!filter.TryGetIndexHint(out _, out object? hintVal)) return true;
-        return SegmentIndexReader.MightContainValue(bloom, hintVal);
-    }
-
-    /// <summary>
-    /// The same gate through a group's view: the same value forms probed, each verdict answered
-    /// from the group's memo when an earlier query already asked, from its bloom section when not.
+    /// reverted, which is the one thing those tests exist to catch — and so is a test that runs a
+    /// DIFFERENT overload than production does, which is why there is only this one.</para>
     /// </summary>
     internal static bool PassesBloomGate(CompiledFilter filter, SegmentIndexView index)
     {
