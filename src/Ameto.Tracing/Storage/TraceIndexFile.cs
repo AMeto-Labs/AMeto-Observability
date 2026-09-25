@@ -155,6 +155,30 @@ internal sealed class TraceIndexWriter
         _entries.Add((key, segmentId, offsets));
     }
 
+    /// <summary>
+    /// Records every trace of one segment, straight from the writer's sorted refs (TS#7(c)) — one
+    /// entry per trace, its offsets copied out of the run. The refs are sorted by id and then by
+    /// offset (<see cref="TraceIndexPairs"/>), so each offset list is ascending as it is copied and
+    /// the entries arrive in key order.
+    /// </summary>
+    public void AddSegment(in TraceIndexPairs pairs, ulong segmentId)
+    {
+        var refs = pairs.Refs;
+        _entries.EnsureCapacity(_entries.Count + pairs.Traces);
+        int i = 0;
+        while (i < refs.Length)
+        {
+            var id  = refs[i].TraceId;
+            int end = i + 1;
+            while (end < refs.Length && refs[end].TraceId.Equals(id)) end++;
+
+            var offsets = new uint[end - i];
+            for (int k = i; k < end; k++) offsets[k - i] = refs[k].Offset;
+            _entries.Add((TraceIndexFile.KeyOf(id), segmentId, offsets));
+            i = end;
+        }
+    }
+
     private static bool IsAscending(uint[] o)
     {
         for (int i = 1; i < o.Length; i++)

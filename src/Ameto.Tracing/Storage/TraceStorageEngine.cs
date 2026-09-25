@@ -2626,7 +2626,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // The writer hands over the trace-to-offsets map it built anyway. Taken from there rather
         // than read back out of the finished file, because an index derived from a second,
         // independent pass is an index that can disagree with the segment it describes.
-        Dictionary<TraceId, List<uint>>? traceIndex = null;
+        TraceIndexPairs traceIndex = default;   // owned once handed over: released after its run is written
         bool registered = false;
 
         try
@@ -2640,7 +2640,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // free to close.
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
-                                    onTraceIndex: map  => traceIndex = map,
+                                    onTraceIndex: pairs => traceIndex = pairs,
                                     version:      _segmentVersion,
                                     scratch:      _writeScratch);
             // Weighed while the spans are still at hand, so the compaction planner prices this
@@ -2702,6 +2702,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                   + "queryable, and is queued for adoption by the background worker", named.FilePath);
             }
         }
+        traceIndex.Release();   // the writer's refs: the run (if any) holds its own copies now
 
         try
         {
@@ -3412,18 +3413,47 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             var w = new TraceIndexWriter();
             foreach (var (traceId, offsets) in traceIndex)
                 w.Add(traceId, segmentId, [.. offsets]);
-            var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
-            _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
-            return written;
+            return WriteRun(w, segment, segmentId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex,
-                "Could not write the trace-id index for {File} — the segment stays outside the "
-              + "index's coverage and is read by scanning, as before", segment.FilePath);
+            NoteIndexRunFailed(ex, segment);
             return null;
         }
     }
+
+    /// <summary>
+    /// The same, from the segment writer's own sorted refs (TS#7(c)) — the flush's and the merge's
+    /// run. The backfill's map, read out of a v3 file, takes the overload above. An empty
+    /// <paramref name="traceIndex"/> (the writer handed nothing over) is the null of that one.
+    /// </summary>
+    private TraceIndexRun? WriteIndexRun(SpanSegmentInfo segment, ulong segmentId, in TraceIndexPairs traceIndex)
+    {
+        if (traceIndex.Count == 0 || !_indexEnabled || SuppressIndexRunsForTest) return null;
+        try
+        {
+            var w = new TraceIndexWriter();
+            w.AddSegment(in traceIndex, segmentId);
+            return WriteRun(w, segment, segmentId);
+        }
+        catch (Exception ex)
+        {
+            NoteIndexRunFailed(ex, segment);
+            return null;
+        }
+    }
+
+    private TraceIndexRun WriteRun(TraceIndexWriter w, SpanSegmentInfo segment, ulong segmentId)
+    {
+        var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
+        _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
+        return written;
+    }
+
+    private void NoteIndexRunFailed(Exception ex, SpanSegmentInfo segment) =>
+        _logger.LogWarning(ex,
+            "Could not write the trace-id index for {File} — the segment stays outside the "
+          + "index's coverage and is read by scanning, as before", segment.FilePath);
 
     /// <summary>
     /// Reconciles the catalog against what is actually on disk, and hands back the discovered
@@ -3825,9 +3855,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // recoverable:false — the sources are still on disk until the swap below, so a
             // merge temp resurrected after a crash would publish a SECOND copy of every
             // span it merged. Only a hot-tier flush's temp is worth recovering.
-            Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
+            TraceIndexPairs mergedTraceIndex = default;   // released after its run is written
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
-                                          onTraceIndex: map => mergedTraceIndex = map,
+                                          onTraceIndex: pairs => mergedTraceIndex = pairs,
                                           version: _segmentVersion, scratch: _writeScratch)
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
@@ -3915,6 +3945,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     merged.FilePath);
             }
 
+            mergedTraceIndex.Release();   // the writer's refs: the merged run (if any) holds its own copies now
             _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
             _lock.EnterWriteLock();
             try

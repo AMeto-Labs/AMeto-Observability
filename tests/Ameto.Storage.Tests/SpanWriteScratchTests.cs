@@ -55,6 +55,7 @@ public sealed class SpanWriteScratchTests : IDisposable
         Assert.NotNull(first.Order);
         Assert.NotNull(first.Keys);
         Assert.NotNull(first.Body);
+        Assert.NotNull(first.Pairs);                                   // the trace-index refs, released after the run (TS#7(c))
 
         Fill(e, 5_000, 5_000);
         OnFreshThread(e.FlushHotTier);                                 // another thread, empty pool slots
@@ -63,6 +64,7 @@ public sealed class SpanWriteScratchTests : IDisposable
         Assert.Same(first.Order, second.Order);
         Assert.Same(first.Keys,  second.Keys);
         Assert.Same(first.Body,  second.Body);
+        Assert.Same(first.Pairs, second.Pairs);
         Assert.Equal(2, e.ColdSegmentCountForTest);
     }
 
