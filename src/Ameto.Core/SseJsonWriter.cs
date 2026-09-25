@@ -111,6 +111,12 @@ public sealed class SseJsonWriter : IDisposable
     private readonly Utf8JsonWriter          _json;
     private readonly Stream                  _body;
 
+    /// <summary>
+    /// The writer of the <c>done</c> and <c>query-error</c> payloads: <see cref="_json"/> itself, or
+    /// one over the host's encoder when the caller gave its options — see the constructor.
+    /// </summary>
+    private readonly Utf8JsonWriter          _terminalJson;
+
     /// <summary>The clock both hold rules read. <see cref="TimeProvider.System"/> outside tests.</summary>
     private readonly TimeProvider _time;
 
@@ -147,19 +153,36 @@ public sealed class SseJsonWriter : IDisposable
     /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
     public SseJsonWriter(Stream body) : this(body, TimeProvider.System) { }
 
+    /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
+    /// <param name="terminalFrames">
+    /// How the <c>done</c> and <c>query-error</c> payloads are encoded: the host's writer settings,
+    /// so an error message carrying the user's own text (a TraceQL literal, a service name) goes
+    /// out as the REST answers of the same host write it — under ASP.NET Core's relaxed encoder
+    /// Cyrillic, <c>&lt;</c> and <c>'</c> as UTF-8, not <c>\uXXXX</c> (#94). <c>Indented</c> is
+    /// IGNORED: a payload is one <c>data:</c> line, and an indented one would carry the raw line
+    /// break that ends it. Every other frame keeps this writer's own default encoding; a stream
+    /// whose rows must match a REST twin encodes them itself (the trace streams do).
+    /// </param>
+    public SseJsonWriter(Stream body, JsonWriterOptions terminalFrames)
+        : this(body, TimeProvider.System, terminalFrames) { }
+
     /// <param name="body">The response body to frame into.</param>
     /// <param name="time">
     /// The clock the hold rules read. A test passes one that moves only when it says so: against the
     /// wall clock, "this row is still buffered" held only as long as nothing stalled the test for
     /// 100 ms between two calls, which a loaded two-core CI runner does not promise.
     /// </param>
-    internal SseJsonWriter(Stream body, TimeProvider time)
+    /// <param name="terminalFrames">See the public overload; null keeps the default encoding for them too.</param>
+    internal SseJsonWriter(Stream body, TimeProvider time, JsonWriterOptions? terminalFrames = null)
     {
         _body               = body;
         _time               = time;
         _maxFrameHoldStamps = MaxFrameHold.Ticks * time.TimestampFrequency / TimeSpan.TicksPerSecond;
         _lastSendStamp      = time.GetTimestamp();
         _json               = new Utf8JsonWriter(_buffer);
+        _terminalJson       = terminalFrames is { } o
+            ? new Utf8JsonWriter(_buffer, o with { Indented = false })
+            : _json;
     }
 
     /// <summary>
@@ -419,13 +442,13 @@ public sealed class SseJsonWriter : IDisposable
         try
         {
             _buffer.Write(DonePrefix);
-            _json.Reset(_buffer);
-            _json.WriteStartObject();
-            _json.WriteBoolean("complete", complete);
-            _json.WriteString("reason", reason);
-            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-            _json.WriteEndObject();
-            _json.Flush();
+            _terminalJson.Reset(_buffer);
+            _terminalJson.WriteStartObject();
+            _terminalJson.WriteBoolean("complete", complete);
+            _terminalJson.WriteString("reason", reason);
+            if (truncatedBy is not null) _terminalJson.WriteString("truncatedBy", truncatedBy);
+            _terminalJson.WriteEndObject();
+            _terminalJson.Flush();
             _buffer.Write(FrameSuffix);
         }
         catch
@@ -455,12 +478,12 @@ public sealed class SseJsonWriter : IDisposable
         try
         {
             _buffer.Write(ErrorPrefix);
-            _json.Reset(_buffer);
-            _json.WriteStartObject();
-            _json.WriteString("error", message);
-            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-            _json.WriteEndObject();
-            _json.Flush();
+            _terminalJson.Reset(_buffer);
+            _terminalJson.WriteStartObject();
+            _terminalJson.WriteString("error", message);
+            if (truncatedBy is not null) _terminalJson.WriteString("truncatedBy", truncatedBy);
+            _terminalJson.WriteEndObject();
+            _terminalJson.Flush();
             _buffer.Write(FrameSuffix);
         }
         catch
@@ -485,5 +508,9 @@ public sealed class SseJsonWriter : IDisposable
     /// outlives the call that started it, so once the handler's last call has returned the body
     /// is never touched again.
     /// </summary>
-    public void Dispose() => _json.Dispose();
+    public void Dispose()
+    {
+        _json.Dispose();
+        if (!ReferenceEquals(_terminalJson, _json)) _terminalJson.Dispose();
+    }
 }
