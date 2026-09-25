@@ -1831,6 +1831,17 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         long surviving = _writeOffset - firstSurvivor;
         bool move      = surviving > 0 && firstSurvivor > 0;
 
+        // A PREFIX FAR SHORTER THAN THE TAIL BEHIND IT IS LEFT WHERE IT IS. The move goes in chunks
+        // no longer than the prefix, each with a header store and two checksums, under both of this
+        // log's locks: a one-entry prefix before an 8 MiB tail was 160 000 of them — 11-26 ms of
+        // stalled ingest, and a tail of hundreds of MiB would be most of a second
+        // (MetricWalAppendContentionProbe.Probe_commit_of_a_long_tail_behind_a_short_prefix). Left in
+        // place, the prefix is dead weight the replay already skips (it is at or below the watermark),
+        // and the next commit reclaims it with everything else — its own prefix is then at least this
+        // whole tail, so the move it makes is a few chunks at most. v1 moves in one copy, with nothing
+        // to seal, and is left as it was.
+        if (move && !_legacyV1 && firstSurvivor < surviving / MinPrefixToMoveTail) return;
+
         if (move && !_legacyV1)
         {
             // v2: the move is recorded before its first byte, finished at the next open if the
@@ -1907,6 +1918,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         /// <summary>The record is cleared and sealed; the end marker is not planted yet.</summary>
         Cleared,
     }
+
+    /// <summary>A commit moves its surviving tail only when the dead prefix is at least this fraction (1/n) of it; see <see cref="Compact"/>.</summary>
+    private const long MinPrefixToMoveTail = 8;
 
     /// <summary>
     /// Test seam fired at every <see cref="RelocationStep"/> of a relocation — a commit's, or the one

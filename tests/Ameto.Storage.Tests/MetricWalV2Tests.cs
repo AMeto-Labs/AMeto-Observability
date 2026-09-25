@@ -565,6 +565,37 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A DEAD PREFIX FAR SHORTER THAN THE TAIL BEHIND IT IS LEFT IN PLACE, NOT MOVED IN THOUSANDS OF
+    /// SEALED CHUNKS. One committed entry before twenty survivors: moving them would take twenty
+    /// one-entry chunks, each a header store and two checksums under both locks — at 8 MiB of tail,
+    /// 160 000 of them. The commit leaves the log as it is (no relocation step fires, the length
+    /// is unchanged), replay skips the dead entry, and the next commit reclaims everything.
+    /// </summary>
+    [Fact]
+    public void A_dead_prefix_far_shorter_than_its_tail_is_left_in_place_until_the_next_commit()
+    {
+        long steps = 0;
+        using (var wal = Open())
+        {
+            wal.Append([Gauge("cpu", 0, 100.0)]);
+            ulong first = wal.BeginFlush();
+            for (int j = 0; j < 20; j++) wal.Append([Gauge("cpu", 1 + j, 200.0 + j)]);
+
+            wal.OnRelocationStepForTest = (_, _) => steps++;
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(first));
+            Assert.Equal(21L * V2Entry, wal.WrittenBytes);                       // nothing moved
+            Assert.Equal(0, steps);
+        }
+
+        using (var wal = Open())
+        {
+            Assert.Equal(Enumerable.Range(0, 20).Select(static j => 200.0 + j), wal.ReadAll(out _).Select(static r => r.Point.Value));
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(wal.BeginFlush()));
+            Assert.Equal(0, wal.WrittenBytes);                                    // reclaimed with the rest
+        }
+    }
+
+    /// <summary>
     /// Builds, in a directory of its own, the file a process killed inside a commit's relocation
     /// leaves: <paramref name="committedEntries"/> points (100…) flushed, <paramref name="survivors"/>
     /// (200…) appended during the flush, and the file copied at <paramref name="point"/> — a

@@ -65,6 +65,47 @@ public sealed class MetricWalAppendContentionProbe
         GC.KeepAlive(sink);
     }
 
+    /// <summary>
+    /// WHAT A COMMIT HOLDS THE LOG FOR WHEN ITS TAIL IS FAR LONGER THAN THE PREFIX IT REPLACES — a
+    /// flush of a near-empty tier during a burst. The relocation moves the tail in chunks no longer
+    /// than the prefix, each with a header store and its checksums, under both of the log's locks;
+    /// a one-entry prefix before 160 000 survivors is 160 000 of them. Printed, not asserted: the
+    /// commit's wall time for 1- and 16-entry prefixes, and whether it moved anything.
+    /// </summary>
+    [Fact]
+    public void Probe_commit_of_a_long_tail_behind_a_short_prefix()
+    {
+        foreach (int prefixEntries in new[] { 1, 16, 1 })          // the first 1 warms the JIT
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "ameto-mwaltail-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                using var wal = MetricWriteAheadLog.Open(Path.Combine(dir, "metrics.wal"), 64L * 1024 * 1024);
+                var one = new MetricIngestItem[BatchPoints];
+                for (int i = 0; i < one.Length; i++)
+                    one[i] = new MetricIngestItem
+                    {
+                        Name = "burst", Kind = MetricKind.Gauge, Labels = new LabelSet([new("s", (i & 7).ToString())]),
+                        TimestampUnixNano = 1_785_300_000_000_000_000L + i, ScalarValue = i,
+                    };
+
+                wal.Append(one.AsSpan(0, prefixEntries));
+                ulong flushing = wal.BeginFlush();
+                for (int b = 0; b < 320; b++) wal.Append(one);          // 160 000 survivors, ~8.3 MB
+                long before = wal.WrittenBytes;
+
+                var sw = Stopwatch.StartNew();
+                wal.CommitFlush(flushing);
+                sw.Stop();
+
+                _out.WriteLine($"prefix {prefixEntries,2} entr(ies), tail {before / 1048576.0:F1} MiB: commit {sw.Elapsed.TotalMilliseconds,7:F2} ms, "
+                             + $"log after {wal.WrittenBytes / 1048576.0:F2} MiB");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        }
+    }
+
     private static (double NsPerPointPerThread, double PointsPerSecond) RunSweepPoint(int threads)
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-mwalcontention-" + Guid.NewGuid().ToString("N"));
