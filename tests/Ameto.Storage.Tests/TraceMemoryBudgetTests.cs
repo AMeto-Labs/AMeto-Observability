@@ -432,6 +432,71 @@ public sealed class TraceMemoryBudgetTests : IDisposable
     }
 
     /// <summary>
+    /// A SEGMENT WHOSE READ THROWS ON ITS CONTENT DOES NOT HOLD UP THE BATCH BEHIND IT EITHER
+    /// (review of this branch). Such a read was logged and nothing else — neither weighed nor put out
+    /// of planning. With exactly one readable peer of its tier in its window, every pass planned the
+    /// same oldest batch: the damaged one threw, the peer alone merged with nothing, the run ended
+    /// with "no change", and the real batch behind them waited for retention.
+    ///
+    /// <para>The damage is a block length no file can hold (InvalidDataException out of the reader's
+    /// bound, a content fault). A fault of the machine — an IOException — is left to retry.
+    /// Reverted (no quarantine on a content fault): after three runs the real pair is unmerged —
+    /// four segments instead of three.</para>
+    /// </summary>
+    [Fact]
+    public void A_segment_that_will_not_decode_does_not_hold_up_the_batch_behind_it()
+    {
+        string dir = Dir("undecodable-ahead");
+        string? damaged = null;
+        for (int s = 0; s < 2; s++)
+        {
+            var spans = new List<SpanRecord>();
+            for (int t = 0; t < 3; t++)                                    // 3 spans: tier 0
+                spans.Add(new SpanRecord
+                {
+                    TraceId = new TraceId(0xE6, (ulong)(s * 10 + t + 1)), SpanId = new SpanId((ulong)(s * 10 + t + 1)),
+                    StartTimeUnixNano = _baseNano + (s * 10 + t) * Ms, DurationNanos = Ms,
+                    Name = "op", ServiceName = "billing", Kind = SpanKind.Server,
+                });
+            var info = SpanWriter.Write(dir, spans);
+            if (s != 0) continue;
+            // The first block's uncompressed length (just past the 27-byte header) made impossible.
+            using var fs = new FileStream(info.FilePath, FileMode.Open, FileAccess.ReadWrite);
+            fs.Seek(27, SeekOrigin.Begin);
+            fs.Write(BitConverter.GetBytes(0x7FFF_FFFFu));
+            damaged = info.FilePath;
+        }
+        for (int s = 0; s < 2; s++)
+        {
+            var spans = new List<SpanRecord>();
+            for (int t = 0; t < 20; t++)                                   // 20 spans: tier 2, an hour later
+                spans.Add(new SpanRecord
+                {
+                    TraceId = new TraceId(0xE7, (ulong)(s * 100 + t + 1)), SpanId = new SpanId((ulong)(s * 100 + t + 1)),
+                    StartTimeUnixNano = _baseNano + 3_600_000 * Ms + (s * 100 + t) * Ms, DurationNanos = Ms,
+                    Name = "op", ServiceName = "billing", Kind = SpanKind.Server,
+                });
+            SpanWriter.Write(dir, spans);
+        }
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        e.LoadColdSegments();
+        Assert.Equal(4, e.ColdSegmentCountForTest);
+        Assert.Throws<InvalidDataException>(() => SpanReader.ReadAll(damaged!));
+        Assert.Contains(damaged, TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest).Select(static s => s.FilePath));
+
+        for (int run = 0; run < 3; run++) e.CompactSmallSegments();
+
+        var after = e.ColdSegmentsForTest;
+        _out.WriteLine($"after three runs: {after.Length} segments ({string.Join(", ", after.Select(static s => $"{s.SpanCount} spans"))})");
+        Assert.Equal(3, after.Length);                                    // damaged + its peer + the merged pair
+        Assert.Contains(after, static s => s.SpanCount == 40);
+        Assert.True(File.Exists(damaged));                                // left on disk
+        e.CompactSmallSegments();
+        Assert.Equal(0, e.LastCompactionPassesForTest);
+    }
+
+    /// <summary>
     /// AN UNWEIGHED SEGMENT IS NEVER PRICED BELOW ITS OWN FILE. Five thousand spans are 3 MB by the
     /// count; a 40 MB file of them cannot weigh less than 40 MB read back, so it is not a candidate —
     /// it is kept out of the plan before anything has had to read it to find that out. The file floor

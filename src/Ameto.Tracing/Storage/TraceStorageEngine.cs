@@ -3670,19 +3670,28 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
-    /// Segments a compaction pass read back EMPTY, by path: never planned again by this process.
-    /// See the loader in <see cref="CompactOnePass"/>. Like <see cref="_backfillFailed"/>, the
-    /// memory of a failure that would otherwise be met on every pass; a path retention later
-    /// removes stays here, a few dozen bytes per damaged file, for the process's life.
+    /// Segments a compaction pass read back EMPTY, or could not read for their CONTENT, by path:
+    /// never planned again by this process. See the loader in <see cref="CompactOnePass"/>. Like
+    /// <see cref="_backfillFailed"/>, the memory of a failure that would otherwise be met on every
+    /// pass; a path retention later removes stays here, a few dozen bytes per damaged file, for the
+    /// process's life.
     /// </summary>
     private readonly HashSet<string> _compactionQuarantine = new(StringComparer.Ordinal);
 
-    /// <summary>Takes <paramref name="seg"/> out of compaction planning, and says so once.</summary>
-    private void QuarantineFromCompaction(SpanSegmentInfo seg)
+    /// <summary>
+    /// Takes <paramref name="seg"/> out of compaction planning, and says so once.
+    /// <paramref name="fault"/> is the content fault its read threw, or null when it read back empty.
+    /// </summary>
+    private void QuarantineFromCompaction(SpanSegmentInfo seg, Exception? fault = null)
     {
         bool added;
         lock (_compactionQuarantine) added = _compactionQuarantine.Add(seg.FilePath);
-        if (added && seg.SpanCount > 0)
+        if (!added) return;
+        if (fault is not null)
+            _logger.LogWarning(fault,
+                "Compaction: {File} will not decode — left on disk and out of compaction from now on; "
+              + "retention removes it as usual", seg.FilePath);
+        else if (seg.SpanCount > 0)
             _logger.LogWarning(
                 "Compaction: {File} claims {Spans} spans and reads back none — left on disk and out of "
               + "compaction from now on; retention removes it as usual", seg.FilePath, seg.SpanCount);
@@ -3831,6 +3840,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 }
                 loadedBytes += measured;
                 processed.Add(seg);
+            }
+            catch (Exception ex) when (FileBounds.DescribesContent(ex))
+            {
+                // A READ THAT FAILS ON THE FILE'S CONTENT FAILS THE SAME WAY ON EVERY PASS. It was
+                // logged and nothing else: the segment was neither weighed nor put out of planning,
+                // so with one readable peer of its tier in its window it seeded the same oldest
+                // batch every pass of every run — read, one survivor, nothing merged, "no change" —
+                // and everything behind it waited for retention. Quarantined as an empty read is.
+                // A fault of the MACHINE (an IOException: a locked file, a mount blip) is not: it
+                // is logged below and the next run tries again.
+                QuarantineFromCompaction(seg, ex);
+                quarantined = true;
             }
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
