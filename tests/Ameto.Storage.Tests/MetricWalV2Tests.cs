@@ -788,6 +788,40 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         Assert.False(File.Exists(TmpPath));
     }
 
+    /// <summary>
+    /// THE UPGRADE'S COMMIT POINT REPLACES THE LOG, AND FAILS THE WAY ITS RETRY EXPECTS. On Windows
+    /// the default move is MoveFileEx with MOVEFILE_WRITE_THROUGH — a durable rename, which
+    /// File.Move cannot ask for; elsewhere it is File.Move and the directory is fsynced after it.
+    /// Durability itself is not observable from a test; what is pinned is the contract the upgrade
+    /// leans on: the file is replaced, a destination held open fails as IOException or
+    /// UnauthorizedAccessException (the two the retry filters on, where a Win32Exception would
+    /// escape it and fail the start), and the directory sync succeeds.
+    /// </summary>
+    [Fact]
+    public void The_durable_move_replaces_the_log_and_fails_the_way_the_retry_expects()
+    {
+        string from = Path.Combine(_dir, "a.tmp"), to = Path.Combine(_dir, "b.wal");
+        File.WriteAllBytes(from, [1, 2, 3]);
+        File.WriteAllBytes(to,   [9]);
+
+        MetricWriteAheadLog.DurableMove(from, to);
+        Assert.Equal([1, 2, 3], File.ReadAllBytes(to));
+        Assert.False(File.Exists(from));
+        Assert.True(MetricWriteAheadLog.SyncDirectory(_dir));
+
+        var missing = Record.Exception(() => MetricWriteAheadLog.DurableMove(from, to));
+        Assert.True(missing is IOException, $"a missing source threw {missing?.GetType().Name}");
+
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllBytes(from, [4]);
+            using var held = new FileStream(to, FileMode.Open, FileAccess.Read, FileShare.None);
+            var locked = Record.Exception(() => MetricWriteAheadLog.DurableMove(from, to));
+            Assert.True(locked is IOException or UnauthorizedAccessException,
+                $"a held destination threw {locked?.GetType().Name}");
+        }
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         public readonly List<(LogLevel Level, string Text, Exception? Error)> Entries = [];

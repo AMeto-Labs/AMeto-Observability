@@ -187,7 +187,7 @@ internal enum MetricWalCommit
 /// are not written to cold files either, so replaying them would restore state that a normal
 /// flush never persisted.</para>
 /// </summary>
-internal sealed unsafe class MetricWriteAheadLog : IDisposable
+internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 {
     private const uint   MagicNumber     = 0x52_44_4D_57; // "RDMW"
     private const ushort WalVersion      = 2;
@@ -426,7 +426,10 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// and never flushed. So a v1 file is opened with the v1 stride, reconciled exactly as that
     /// release would have (the #59 repairs are version-blind), rewritten entry for entry as v2
     /// into <c>metrics.wal.upgrade.tmp</c> (each entry's 48 header bytes and buckets verbatim, now
-    /// with a checksum), fsynced, and moved over the original. The move is the commit point: a
+    /// with a checksum), fsynced, and moved over the original — durably: a write-through move on
+    /// Windows, a directory fsync after the rename elsewhere (<see cref="DurableMove"/>), because an
+    /// atomic rename the disk has not committed can come undone in a power loss and bring the v1
+    /// log back under the name with its old watermark. The move is the commit point: a
     /// crash before it leaves the v1 file authoritative and the next start upgrades it again; a
     /// crash after it leaves a complete v2 file. A stale copy from an upgrade that died before
     /// its move is deleted beside a v2 log and overwritten beside a v1 one.</para>
@@ -500,11 +503,24 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
               + "it stays v1 (no per-entry checksum) for this run, every point in it replays, and the "
               + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
         }
-        else if (droppedFuture > 0)
-            logger?.LogWarning(
-                "The metric WAL at {Path} was upgraded to v2 without {Count} v1 entries stamped more than a day "
-              + "in the future — torn entries, which the replay would have refused anyway, and which the "
-              + "upgrade's checksum must not vouch for.", filePath, droppedFuture);
+        else
+        {
+            // The rename is atomic, not yet durable: until the directory entry reaches the disk a
+            // power loss can bring the v1 inode back under the name - with the watermark it had at
+            // the upgrade, so every flush since would replay as duplicates, and every point logged
+            // since would be gone. Windows' move is write-through (DurableMove); a POSIX rename is
+            // made durable by fsync on the directory, which is this.
+            if (!SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(filePath))!))
+                logger?.LogWarning(
+                    "The metric WAL at {Path} was upgraded, but its directory could not be synced: until the "
+                  + "file system commits the rename on its own, a power loss can bring the v1 log back.", filePath);
+
+            if (droppedFuture > 0)
+                logger?.LogWarning(
+                    "The metric WAL at {Path} was upgraded to v2 without {Count} v1 entries stamped more than a day "
+                  + "in the future — torn entries, which the replay would have refused anyway, and which the "
+                  + "upgrade's checksum must not vouch for.", filePath, droppedFuture);
+        }
 
         // Whatever is at the path now: the v2 copy, or — the move is atomic — the v1 log as it was,
         // which opens in the v1 layout by itself.
@@ -567,8 +583,68 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     {
         public static readonly UpgradeIo Default = new();
 
-        public Action<string, string> Move { get; init; } = static (from, to) => File.Move(from, to, overwrite: true);
+        public Action<string, string> Move { get; init; } = DurableMove;
         public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
+    }
+
+    /// <summary>
+    /// The upgrade's commit point: <paramref name="from"/> replaces <paramref name="to"/> atomically
+    /// and, on Windows, durably — <c>MoveFileEx</c> with <c>MOVEFILE_WRITE_THROUGH</c> does not return
+    /// until the move is on the disk, which <see cref="File.Move(string, string, bool)"/> cannot ask
+    /// for. Elsewhere it is <see cref="File.Move(string, string, bool)"/> (rename(2), atomic) and the
+    /// caller fsyncs the directory (<see cref="SyncDirectory"/>). Fails the way File.Move does —
+    /// <see cref="UnauthorizedAccessException"/> for access denied, <see cref="IOException"/>
+    /// otherwise — because the retry around it filters on exactly those two.
+    /// </summary>
+    internal static void DurableMove(string from, string to)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            File.Move(from, to, overwrite: true);
+            return;
+        }
+
+        const uint MoveFileReplaceExisting = 0x1, MoveFileWriteThrough = 0x8;
+        if (Native.MoveFileEx(Path.GetFullPath(from), Path.GetFullPath(to), MoveFileReplaceExisting | MoveFileWriteThrough))
+            return;
+
+        int error = Marshal.GetLastPInvokeError();
+        string message = $"Could not move '{from}' over '{to}': {Marshal.GetPInvokeErrorMessage(error)}";
+        if (error == 5) throw new UnauthorizedAccessException(message);        // ERROR_ACCESS_DENIED
+        throw new IOException(message, unchecked((int)0x80070000) | error);     // HRESULT_FROM_WIN32
+    }
+
+    /// <summary>
+    /// fsyncs the directory <paramref name="directory"/>, so a rename inside it survives a power loss.
+    /// True where that happened or where the platform has nothing to do (Windows, whose move was
+    /// write-through); false when a POSIX call failed. macOS gets fsync, not F_FULLFSYNC — the
+    /// residual the rest of this log already accepts there.
+    /// </summary>
+    internal static bool SyncDirectory(string directory)
+    {
+        if (OperatingSystem.IsWindows()) return true;
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return false;
+
+        int fd = Native.Open(directory, 0 /* O_RDONLY */);
+        if (fd < 0) return false;
+        try { return Native.Fsync(fd) == 0; }
+        finally { Native.Close(fd); }
+    }
+
+    private static partial class Native
+    {
+        [LibraryImport("kernel32.dll", EntryPoint = "MoveFileExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static partial bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
+        [LibraryImport("libc", EntryPoint = "open", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int Open(string path, int flags);
+
+        [LibraryImport("libc", EntryPoint = "fsync", SetLastError = true)]
+        internal static partial int Fsync(int fd);
+
+        [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
+        internal static partial int Close(int fd);
     }
 
     /// <summary>
