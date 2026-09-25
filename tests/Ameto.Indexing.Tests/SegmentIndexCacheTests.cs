@@ -192,7 +192,7 @@ public sealed class SegmentIndexCacheTests
         using (var lease = cache.Insert("a.seg", 0, hasTrigram: true, r, r.ApproxRetainedBytes))
         {
             Assert.Same(r, lease.Index);
-            Assert.Equal([0u], lease.Index.LookupIntersect([("P", "v")]));
+            Assert.Equal([0u], lease.Index.LookupIntersect([("P", "v")])!);
         }
         var hit = cache.TryAcquire("a.seg", 0, needTrigram: false);
         Assert.NotNull(hit);
