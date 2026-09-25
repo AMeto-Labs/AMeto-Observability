@@ -1052,6 +1052,17 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             hdr.WriteOffset     = _headerSize + pos;
             if (pos + _entryHeaderSize <= _capacity)
                 Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
+
+            // The counter must cover what the walk just took in. A header that did not verify had
+            // its generation rebuilt from the entries BELOW the rotted claim; the ones found past it
+            // can be newer, and a counter left below them hands the next flush a generation that
+            // does not cover them — they stay above every watermark and replay, beside their own
+            // files, for as long as it takes the counter to catch up.
+            if (lastGen > _generation)
+            {
+                _generation = lastGen;
+                StoreCovered(HeaderField.Generation, _generation);
+            }
             return;
         }
 

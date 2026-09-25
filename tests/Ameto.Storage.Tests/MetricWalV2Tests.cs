@@ -365,6 +365,35 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// TWO ROTS: THE HEADER AND THE CLAIM. The header's generation rots, so its counters are
+    /// rebuilt from the entries below the claim — and the claim has rotted into the very first
+    /// entry, so there are none, and the counter starts over at 1. The walk past the rotted claim
+    /// then takes in all five entries, the last two of generation 2. Left at 1, the counter handed
+    /// the next flush generation 1, whose commit leaves the generation-2 points above the watermark:
+    /// written to a file and replayed again at the next start. The counter is raised to the newest
+    /// generation the walk took in.
+    /// </summary>
+    [Fact]
+    public void A_counter_rebuilt_below_a_rotted_claim_is_raised_to_what_the_walk_past_it_found()
+    {
+        using (var wal = Open())
+        {
+            wal.Append([Gauge("cpu", 0, 1.0), Gauge("cpu", 1, 2.0), Gauge("cpu", 2, 3.0)]);   // generation 1
+            ulong flushing = wal.BeginFlush();
+            wal.Append([Gauge("cpu", 3, 4.0), Gauge("cpu", 4, 5.0)]);                        // generation 2
+            wal.AbandonFlush(flushing);
+        }
+        byte[] file = File.ReadAllBytes(WalPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);   // Generation: rot
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), FileHeader + 10);           // the claim: rot
+        File.WriteAllBytes(WalPath, file);
+
+        using var wal2 = Open();
+        Assert.Equal([1.0, 2.0, 3.0, 4.0, 5.0], wal2.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.Equal(2UL, wal2.BeginFlush());                  // covers every entry in the log
+    }
+
+    /// <summary>
     /// A TORN ENTRY IS A TORN WRITE, WHATEVER ITS FIELDS DECODE TO; AN ENTRY THAT VERIFIES AND IS
     /// STILL IMPOSSIBLE IS CORRUPTION. The first entry's generation is set to the incident's
     /// ≈155e9. Left with its old checksum it is what a random tear looks like — a Warning, and no
