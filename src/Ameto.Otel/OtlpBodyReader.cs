@@ -19,7 +19,7 @@ namespace Ameto.Otel;
 /// <para>What the receivers genuinely differ in is how they say no — an HTTP 413 against a gRPC
 /// status in trailers — and that stays with each of them. How they read does not.</para>
 ///
-/// <para>Growth here follows <c>OtlpGrpcFraming.Inflate</c>, the third reader of the same
+/// <para>Growth here follows <c>OtlpGzip.Inflate</c>, the third reader of the same
 /// ceiling, which already had this right: never grow past the limit, and when the buffer reaches
 /// it, one byte — not one doubling — settles whether the body has more to give.</para>
 /// </summary>
