@@ -296,20 +296,21 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
-    /// INCIDENT #56's HEAD DOES NOT REPLAY. Reconstructed from the stand's forensics (the bytes
-    /// themselves were not kept in the repo): header generation 3 705 over watermark 3 704, the
-    /// first entry torn — its bucket count reading 8, so the stride lands on an all-zero slot at
-    /// the old byte 112 — and series 0 registered in the pool. v1 caught the incident's own
-    /// generation (≈155e9) with the margin; the residual it could not catch is the same tear
-    /// with a PLAUSIBLE generation, here the header's own. Its timestamp is the year-2116 value
-    /// the incident minted immortal files with, or — the case no timestamp guard can see — a
-    /// sane one, and its value is garbage. v2 replays neither, because its checksum slot holds
-    /// what a tear leaves there; the engine built over it comes up with an empty tier.
+    /// THE INCIDENT #56 HEAD, AS A v2 LOG TEARS, DOES NOT REPLAY. Reconstructed from the stand's
+    /// forensics (the bytes themselves were not kept in the repo): header generation 3 705 over
+    /// watermark 3 704, the first entry torn — its bucket count reading 8, so the stride lands on
+    /// an all-zero slot — and series 0 registered in the pool. This is the incident's SHAPE written
+    /// the way a v2 append tears: the fields landed, the checksum slot did not (zeros). v1 caught
+    /// the incident's own generation (≈155e9) with the margin; the residual it could not catch is
+    /// the same tear with a PLAUSIBLE generation, here the header's own. Its timestamp is the
+    /// year-2116 value the incident minted immortal files with, or — the case no timestamp guard
+    /// can see — a sane one, and its value is garbage. v2 replays neither; the engine built over it
+    /// comes up with an empty tier. A v1 log carrying the same head is the next fact.
     /// </summary>
     [Theory]
     [InlineData(true)]                                // the incident's year-2116 MaxNano
     [InlineData(false)]                               // a minute ago: invisible to every guard but the CRC
-    public async Task The_incident_56_head_replays_no_point(bool year2116)
+    public void The_incident_56_head_as_a_v2_log_tears_replays_no_point(bool year2116)
     {
         long stamp = year2116 ? 4_610_746_851_722_254_905L : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L - 60_000_000_000L;
         var torn = new RawEntry(3_705, 0, stamp, BitConverter.Int64BitsToDouble(0x4B3F_A97A_8424_3FA9),
@@ -337,22 +338,33 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
-    /// What the same head did in v1 — and still does in a log that is v1 on disk: a v1 entry
-    /// carries no checksum, so the torn head replays as a point with a garbage value, and an
-    /// upgrade (see <see cref="A_v1_log_opens_replays_and_is_upgraded_in_place"/>) checksums what
-    /// it finds. This is the fact the v2 facts above are the fix for, kept so that fix is measured
-    /// against the old behaviour rather than asserted into existence.
+    /// THE SAME HEAD IN A v1 LOG — the log the incident actually had — AND WHAT THE UPGRADE DOES
+    /// WITH IT. A v1 entry carries no checksum, and the upgrade computes one over the bytes as it
+    /// finds them, so whatever it copies it vouches for. With the incident's year-2116 timestamp the
+    /// entry fails v1's own far-future judgement and is DROPPED by the upgrade (a Warning counts
+    /// it): nothing replays. Before, it was copied, checksummed, and replayed from the v2 log as a
+    /// garbage point. With a SANE timestamp and a garbage value nothing in a v1 entry can tell it
+    /// from a real point — the upgrade carries it over and it replays: that limit is pinned here
+    /// on purpose, and docs/CONFIGURATION.md states it.
     /// </summary>
-    [Fact]
-    public void The_same_head_in_a_v1_log_replays_as_a_garbage_point()
+    [Theory]
+    [InlineData(true,  0)]                            // the incident: dropped
+    [InlineData(false, 1)]                            // indistinguishable from data: carried, and replayed
+    public void The_incident_56_head_in_a_v1_log_is_dropped_by_the_upgrade_when_v1_can_tell(bool year2116, int replays)
     {
         double garbage = BitConverter.Int64BitsToDouble(0x4B3F_A97A_8424_3FA9);
+        long   stamp   = year2116 ? 4_610_746_851_722_254_905L : BaseNano;
         WriteLog(1, generation: 3_705, committed: 3_704,
-                 [EntryBytes(new RawEntry(3_705, 0, BaseNano, garbage, Buckets: new long[8]), v2: false)],
+                 [EntryBytes(new RawEntry(3_705, 0, stamp, garbage, Buckets: new long[8]), v2: false)],
                  [PoolRecord(0, PoolBody("process_memory_usage", MetricKind.Gauge, "By", [], null), v2: false)]);
 
-        var replayed = Open().ReadAll(out _);
-        Assert.Equal(garbage, Assert.Single(replayed).Point.Value);
+        var logger   = new CapturingLogger();
+        var replayed = Open(logger).ReadAll(out _);
+
+        Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+        Assert.Equal(replays, replayed.Count);
+        if (replays == 1) Assert.Equal(garbage, replayed[0].Point.Value);
+        Assert.Equal(year2116, logger.Entries.Any(static e => e.Level == LogLevel.Warning && e.Text.Contains("stamped more than a day")));
     }
 
     // ── Where the checksum lands relative to the claim ───────────────────────

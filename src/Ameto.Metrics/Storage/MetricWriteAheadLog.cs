@@ -477,7 +477,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             return wal;
         }
 
-        try { wal.WriteUpgradedCopy(tmp); }
+        int droppedFuture;
+        try { droppedFuture = wal.WriteUpgradedCopy(tmp); }
         catch (Exception ex)
         {
             DeleteQuietly(tmp);
@@ -498,6 +499,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
               + "it stays v1 (no per-entry checksum) for this run, every point in it replays, and the "
               + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
         }
+        else if (droppedFuture > 0)
+            logger?.LogWarning(
+                "The metric WAL at {Path} was upgraded to v2 without {Count} v1 entries stamped more than a day "
+              + "in the future — torn entries, which the replay would have refused anyway, and which the "
+              + "upgrade's checksum must not vouch for.", filePath, droppedFuture);
 
         // Whatever is at the path now: the v2 copy, or — the move is atomic — the v1 log as it was,
         // which opens in the v1 layout by itself.
@@ -565,15 +571,26 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     }
 
     /// <summary>
-    /// Rewrites this (v1) log as v2 at <paramref name="tmpPath"/> and fsyncs it. Every entry the
-    /// open-time walk accepted — everything below <c>_writeOffset</c>, committed generations
-    /// included, exactly as the v1 file holds them — is copied: its 48 header bytes and its bucket
-    /// counts verbatim, the checksum computed over them. The upgraded log therefore replays exactly
-    /// what the v1 log would have, under the same watermark, and seeds the same series indices. It
-    /// is sized along the same capacity ladder a reopen at this log's floor would fit it to, so
+    /// Rewrites this (v1) log as v2 at <paramref name="tmpPath"/> and fsyncs it; returns how many
+    /// entries it refused to carry over. Every entry the open-time walk accepted — everything below
+    /// <c>_writeOffset</c>, committed generations included, exactly as the v1 file holds them — is
+    /// copied: its 48 header bytes and its bucket counts verbatim, the checksum computed over them.
+    /// It is sized along the same capacity ladder a reopen at this log's floor would fit it to, so
     /// the reopen neither grows nor shrinks it.
+    ///
+    /// <para><b>The checksum computed here vouches for whatever the v1 bytes ARE,</b> torn or not,
+    /// so nothing may be copied that v1's own judgement already refuses. The walk stops at a
+    /// generation past the margin and a series index past the cap (the v1 reconcile at open already
+    /// cut the log there), and an entry stamped past <see cref="MetricStorageEngine.FutureLimitNanos"/>
+    /// — the incident's year-2116 head is exactly that — is DROPPED: not copied, while the walk goes
+    /// on with the stride it declares (the far-future guard is the only one of the three that
+    /// judges a value rather than the framing, so the entries after it are no less trustworthy
+    /// than they were). The engine's replay would have refused such a point anyway; before this,
+    /// the upgrade gave it a valid checksum and it replayed from v2 as well. What no check can see
+    /// is a torn v1 entry whose fields all happen to decode plausible — a sane timestamp, a garbage
+    /// value — and that one IS blessed: a v1 entry carries nothing to tell it from a real one.</para>
     /// </summary>
-    private void WriteUpgradedCopy(string tmpPath)
+    private int WriteUpgradedCopy(string tmpPath)
     {
         lock (_writeLock)
         {
@@ -588,8 +605,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             byte* data = _ptr + _headerSize;                 // the v1 map: data at 32
             Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
             long pos = 0, written = 0, total;
+            long futureLimit = MetricStorageEngine.FutureLimitNanos();
+            int  dropped     = 0;
             while ((total = EntryAt(data, pos, _writeOffset, verify: false, out _)) > 0)
             {
+                if (Unsafe.AsRef<MetricWalEntryHeader>(data + pos).TimestampUnixNano > futureLimit)
+                {
+                    dropped++;
+                    pos += total;
+                    continue;
+                }
+
                 var header  = new ReadOnlySpan<byte>(data + pos, ChecksummedHeaderBytes);
                 var buckets = new ReadOnlySpan<byte>(data + pos + EntryHeaderSizeV1, (int)(total - EntryHeaderSizeV1));
                 BinaryPrimitives.WriteUInt32LittleEndian(crcBytes, Crc32c.Append(Crc32c.Append(0, header), buckets));
@@ -615,6 +641,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             fs.Position = 0;
             fs.Write(fileHeader);
             fs.Flush(flushToDisk: true);
+            return dropped;
         }
     }
 
