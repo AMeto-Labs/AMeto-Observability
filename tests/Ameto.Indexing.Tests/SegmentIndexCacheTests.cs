@@ -199,6 +199,28 @@ public sealed class SegmentIndexCacheTests
         using (hit.Value) Assert.Same(r, hit.Value.Index);
     }
 
+    /// <summary>
+    /// An inserted reader has no fingerprint, so the query path cannot check it and replaces it —
+    /// but that is not the cache noticing a file replaced under its path, which is what
+    /// <see cref="SegmentIndexCache.StaleReplacedCount"/> tells an operator. Only an entry that
+    /// knew its bytes counts.
+    /// </summary>
+    [Fact]
+    public void Replacing_an_inserted_reader_is_not_counted_as_stale()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        using (cache.Insert("a.seg", 0, true, NewReader(), 10)) { }
+
+        var fp = new IndexGroupFingerprint(1, default, 100, default, 1, 1);
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, fp)) { }
+        Assert.Equal(0, cache.StaleReplacedCount);
+
+        var other = fp with { LastWriteTicks = 2 };
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, other)) { }
+        Assert.Equal(1, cache.StaleReplacedCount);                  // a memo that knew its bytes: stale
+        Assert.Equal(1, cache.EntryCount);
+    }
+
     [Fact]
     public void Disabled_cache_misses_and_leases_own_the_reader()
     {

@@ -19,9 +19,11 @@ namespace Ameto.Indexing;
 /// section and no native memory; the sections stay in the segment file, which the asking query
 /// has mapped anyway. Until #80 an entry was the group's index decoded whole — 128 MB for a
 /// prop-dense group against a 256 MB budget, which is why the cache held two groups and hit 2 %
-/// of the time. <see cref="Insert"/> still takes any reader, and <see cref="TryAcquire"/> still
-/// finds it, for callers and tests that build a reader themselves; neither ever hands out a memo,
-/// which to them is a miss, and an inserted reader replaces one.</para>
+/// of the time. <see cref="Insert"/> and <see cref="TryAcquire"/> — internal, for the tests of
+/// the ownership rules below — take and find a whole reader keyed by path alone; neither ever
+/// hands out a memo, which to them is a miss, and an inserted reader replaces one. An inserted
+/// entry carries no fingerprint, so the query path replaces it on sight without calling it
+/// stale.</para>
 ///
 /// <para>Ownership: a <see cref="SegmentIndexReader"/> made by <c>Load</c> holds NATIVE memory
 /// (the bloom bits), so an entry is disposed exactly once — on eviction if unreferenced,
@@ -278,7 +280,9 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                     return new Lease(this, e);
                 }
                 RemoveLocked(e, toDispose = []);                 // other bytes behind this path now
-                Interlocked.Increment(ref _staleReplaced);
+                // Stale only if the entry knew what bytes it learned from: one inserted whole (Insert,
+                // default fingerprint) is replaced because it cannot be checked, not because it is stale.
+                if (e.Fingerprint != default) Interlocked.Increment(ref _staleReplaced);
             }
 
             var  reader = SegmentIndexReader.CreateMemo();
@@ -304,7 +308,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// Acquires the cached reader for the group, or null on a miss — including the case
     /// where the cached entry lacks the trigram index the caller needs.
     /// </summary>
-    public Lease? TryAcquire(string path, int group, bool needTrigram)
+    internal Lease? TryAcquire(string path, int group, bool needTrigram)
     {
         if (!Enabled) return null;
         lock (_lock)
@@ -333,7 +337,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// caller must not touch <paramref name="reader"/> after this call except through
     /// the returned lease.
     /// </summary>
-    public Lease Insert(string path, int group, bool hasTrigram, SegmentIndexReader reader, long sizeBytes)
+    internal Lease Insert(string path, int group, bool hasTrigram, SegmentIndexReader reader, long sizeBytes)
     {
         if (!Enabled)
         {
