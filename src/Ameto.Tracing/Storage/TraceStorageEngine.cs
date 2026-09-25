@@ -3532,13 +3532,21 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         SelectCompactionBatch(segments, MemoryBudgets.TraceMergeCapBytes);
 
     /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
-    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments, long mergeBudgetBytes)
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments, long mergeBudgetBytes) =>
+        SelectCompactionBatch(segments, mergeBudgetBytes, quarantined: null);
+
+    /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
+    /// <param name="quarantined">Paths never to plan — segments a pass read back empty (see
+    /// <see cref="QuarantineFromCompaction"/>). Null when there are none.</param>
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(
+        SpanSegmentInfo[] segments, long mergeBudgetBytes, HashSet<string>? quarantined)
     {
         const long MaxSpanNanos = 24L * 3600 * 1_000_000_000; // 24 h
 
         long thresholdBytes = CompactionThresholdBytesFor(mergeBudgetBytes);
         var candidates = segments
-            .Where(s => EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
+            .Where(s => (EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
+                     && (quarantined is null || !quarantined.Contains(s.FilePath)))
             .OrderBy(s => s.MinStartNano)
             .ToList();
 
@@ -3600,6 +3608,34 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         int tier = 0;
         for (int n = Math.Max(1, spanCount); n >= TierRatio; n /= TierRatio) tier++;
         return tier;
+    }
+
+    /// <summary>
+    /// Segments a compaction pass read back EMPTY, by path: never planned again by this process.
+    /// See the loader in <see cref="CompactOnePass"/>. Like <see cref="_backfillFailed"/>, the
+    /// memory of a failure that would otherwise be met on every pass; a path retention later
+    /// removes stays here, a few dozen bytes per damaged file, for the process's life.
+    /// </summary>
+    private readonly HashSet<string> _compactionQuarantine = new(StringComparer.Ordinal);
+
+    /// <summary>Takes <paramref name="seg"/> out of compaction planning, and says so once.</summary>
+    private void QuarantineFromCompaction(SpanSegmentInfo seg)
+    {
+        bool added;
+        lock (_compactionQuarantine) added = _compactionQuarantine.Add(seg.FilePath);
+        if (added && seg.SpanCount > 0)
+            _logger.LogWarning(
+                "Compaction: {File} claims {Spans} spans and reads back none — left on disk and out of "
+              + "compaction from now on; retention removes it as usual", seg.FilePath, seg.SpanCount);
+    }
+
+    /// <summary>A copy of the quarantine for one plan, or null when it is empty (the usual case: no allocation).</summary>
+    private HashSet<string>? CompactionQuarantineSnapshot()
+    {
+        lock (_compactionQuarantine)
+            return _compactionQuarantine.Count == 0
+                ? null
+                : new HashSet<string>(_compactionQuarantine, StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -3676,12 +3712,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // left the segments un-compacted — so they piled up and every pass failed worse.
         // Legacy-v2 files are selected regardless of size so old data migrates to the
         // v3 format (and shrinks) in the background.
-        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes);
+        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes, CompactionQuarantineSnapshot());
         if (small.Count == 0) return false;
 
         var  allSpans    = new List<SpanRecord>();
         var  processed   = new List<SpanSegmentInfo>(small.Count);
         long loadedBytes = 0;
+        bool quarantined = false;   // this pass took a segment out of planning: the run plans again
 
         // What this pass LEARNED: the measured weight of every unweighed segment it read, whether
         // or not it ends up merging it. See the write-back below for why that is the whole fix.
@@ -3705,6 +3742,21 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // looked unweighed on every pass — each one reported a change, re-planned it and read it
                 // again, to the run's 500-pass valve, on every run.
                 if (seg.WeightBytes <= 0) (weighed ??= []).Add((seg, Math.Max(1, measured)));
+
+                // A SEGMENT THAT READS BACK EMPTY LEAVES THE PLAN (#94). Weighing it (above) stopped
+                // the run re-reading it to the valve, but not the planner choosing it: two such
+                // segments of one tier and 24 h window still made the oldest batch, every pass read
+                // them, merged nothing and ended the run — and every segment behind them waited for
+                // retention. Quarantined from planning for this process instead, and NOT merged:
+                // the file's header claims spans its blocks no longer yield (a damaged footer does
+                // that), and merging it away would delete whatever a repair could still recover.
+                // Retention removes it on its own clock, as it always did.
+                if (allSpans.Count == before)
+                {
+                    QuarantineFromCompaction(seg);
+                    quarantined = true;
+                    continue;
+                }
 
                 // A SEGMENT THAT WOULD TAKE THE KEPT SPANS PAST THE BUDGET IS PUT BACK, not merged:
                 // what a pass WRITES never weighs more than a pass may hold, so an underpriced
@@ -3730,7 +3782,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // — and every segment behind it waited for retention. Written back, the heavy segment
             // is priced as what it is, drops out of the candidates, and the run plans again at once.
             // Each such pass weighs at least one unweighed segment, so the run cannot spin on it.
-            return WriteBackWeights(weighed);
+            // A pass that quarantined a segment re-plans too, and cannot spin either: each one
+            // quarantines a segment that was still a candidate.
+            return WriteBackWeights(weighed) | quarantined;
         }
 
         HashSet<string>? claimed = null;   // the sources this pass has claimed from adoption
