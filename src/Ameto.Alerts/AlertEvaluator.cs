@@ -236,6 +236,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     internal Task EvaluateOnceAsync(CancellationToken ct = default) => EvaluateAllAsync(ct);
 
+    /// <summary>
+    /// Test hook: one evaluation cycle as if it began at <paramref name="at"/> — the tick's time, which
+    /// every rule of the cycle is evaluated at and which <c>For</c> is measured on.
+    /// </summary>
+    internal Task EvaluateOnceAsync(DateTimeOffset at, CancellationToken ct = default) => EvaluateAllAsync(ct, at);
+
     /// <summary>Test hook: true once the eval loop has ended — no further tick can land.</summary>
     internal bool LoopEndedForTest => _loop.IsCompleted;
 
@@ -253,9 +259,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
         catch (ObjectDisposedException) { /* already disposed: the loop is gone */ }
     }
 
-    private async Task EvaluateAllAsync(CancellationToken ct)
+    private async Task EvaluateAllAsync(CancellationToken ct, DateTimeOffset? at = null)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = at ?? DateTimeOffset.UtcNow;
+        _previousCycleAt = _cycleAt;   // see HeldPastUnobservedTicks
+        _cycleAt         = now;
         foreach (var rule in _store.GetAll())
         {
             if (IsStopping) return;
@@ -285,9 +293,41 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     // ── State machine ───────────────────────────────────────────────────────────
 
+    /// <summary>When the cycle before the current one began, and the current one; null until there was one.</summary>
+    private DateTimeOffset? _previousCycleAt, _cycleAt;
+
+    /// <summary>
+    /// A Pending rule's <see cref="MutableState.PendingSince"/>, moved forward past the ticks that did not
+    /// evaluate it (#94). <c>For</c> is how long the condition has been SEEN to hold, and a tick that
+    /// skipped the rule saw nothing: its evaluation threw, its value was not a number, its store was
+    /// loading or closed (the skips #92 and #95 add), or the process was not running. Counted as
+    /// time held, those ticks let a rule that went Pending just before a long outage fire on the
+    /// first tick after it, on one observation.
+    ///
+    /// <para>So each evaluated tick adds the interval since the tick before it, as it always did, and
+    /// a skipped tick adds nothing: the span from this rule's last evaluation to the cycle before
+    /// this one is added to <c>PendingSince</c>. Consecutive ticks move nothing — the last evaluation
+    /// WAS the previous cycle. The comparison is to the previous cycle's time, not to a fixed
+    /// interval, so a slow cycle costs no rule its credit.</para>
+    ///
+    /// <para><b>Across a restart</b>, the same rule, and it restarts the clock: a Pending state restored
+    /// from disk carries its <c>PendingSince</c> but not when it was last evaluated (nothing persists
+    /// that per tick), so nothing after <c>PendingSince</c> is known to have been seen. Before this, a
+    /// rule Pending for a minute before a ten-minute restart fired on the first tick after it; now it
+    /// waits out <c>For</c> again from the first tick that sees the breach — later by at most
+    /// <c>For</c>, never earlier.</para>
+    /// </summary>
+    private DateTimeOffset HeldPastUnobservedTicks(DateTimeOffset since, DateTimeOffset lastEvaluated, DateTimeOffset now)
+    {
+        DateTimeOffset previousTick = _previousCycleAt ?? now;                        // none yet in this process: this one
+        DateTimeOffset seenUntil    = lastEvaluated == default ? since : lastEvaluated; // restored: nothing after `since` is known
+        return previousTick > seenUntil ? since + (previousTick - seenUntil) : since;
+    }
+
     private void Transition(AlertRule rule, double value, DateTimeOffset now)
     {
         var st = _states.GetOrAdd(rule.Id, _ => new MutableState());
+        var lastEvaluated = st.EvaluatedAt;   // before this tick; default: never, in this process
         st.LastValue   = value;
         st.EvaluatedAt = now;
         var prevState  = st.State;
@@ -322,6 +362,10 @@ public sealed class AlertEvaluator : IAsyncDisposable
         {
             st.PendingSince = now;
             st.State = rule.For <= TimeSpan.Zero ? AlertState.Firing : AlertState.Pending;
+        }
+        else if (st.State == AlertState.Pending && st.PendingSince is { } held)
+        {
+            st.PendingSince = HeldPastUnobservedTicks(held, lastEvaluated, now);
         }
 
         if (st.State == AlertState.Pending && st.PendingSince is { } since && now - since >= rule.For)
