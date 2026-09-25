@@ -292,4 +292,88 @@ public sealed class TraceCatalogLifecycleTests : IDisposable
         Assert.Equal(1, e.CatalogCountsForTest.Segments);
         Assert.Equal(200, merged.SpanCount);                             // both sources' spans, once
     }
+
+    /// <summary>
+    /// A PATH QUEUED FOR ADOPTION SURVIVES AN ADOPTION PASS THAT LANDS BEFORE ITS PUBLISH (#94).
+    /// Adoption drops a queued path it cannot find in the snapshot — that is how a path merged or
+    /// retired away leaves the queue. The flush queued a segment whose registration failed BEFORE
+    /// publishing it, so an adoption pass landing in between found no snapshot entry, dropped the
+    /// path, and the segment kept id 0 until the next restart.
+    ///
+    /// <para>At the seams: the registration throws, and adoption runs from the seam between the
+    /// catalog step and the publish. Reverted (queued before the publish): the in-window pass drops
+    /// the path and the worker's next pass has nothing to adopt — the segment stays at id 0.</para>
+    /// </summary>
+    [Fact]
+    public void An_adoption_before_the_flush_publishes_does_not_drop_the_queued_segment()
+    {
+        string dir = Dir("adopt-before-publish");
+        using var e = Engine(dir);
+
+        int landed = 0;
+        e._beforeCatalogRegistrationForTest = () => throw new IOException("injected: the manifest write failed");
+        e._beforeFlushPublishForTest = () => { landed++; e.AdoptUnnamedSegments(); };   // the index worker, landing here
+        for (int k = 0; k < 50; k++) Write(e, 10_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        e._beforeCatalogRegistrationForTest = null;
+        e._beforeFlushPublishForTest = null;
+
+        Assert.Equal(1, landed);
+        Assert.Equal(0UL, Assert.Single(e.ColdSegmentsForTest).SegmentId);   // published unnamed
+        Assert.Equal(0, e.CatalogCountsForTest.Segments);
+
+        e.AdoptUnnamedSegments();                                              // the worker's next pass
+
+        var seg = Assert.Single(e.ColdSegmentsForTest);
+        _out.WriteLine($"after the next pass: id {seg.SegmentId} ← {Path.GetFileName(seg.FilePath)}");
+        Assert.NotEqual(0UL, seg.SegmentId);
+        Assert.Equal(seg.FilePath, Assert.Single(e.CatalogPathsForTest));
+    }
+
+    /// <summary>
+    /// The same window on the compaction path: a merge whose catalog step fails queued the merged
+    /// file in its catch, BEFORE the snapshot swap — and that file holds every source's spans, so an
+    /// id-0 merged segment is scanned by every trace lookup until a restart.
+    ///
+    /// <para>At the seams: the merged segment's registration throws, and adoption runs at
+    /// <c>Catalogued</c> — after the catch, before the swap. Reverted: the merged segment stays at
+    /// id 0 after the worker's next pass.</para>
+    /// </summary>
+    [Fact]
+    public void An_adoption_before_the_merge_swap_does_not_drop_the_queued_merged_segment()
+    {
+        string dir = Dir("adopt-before-swap");
+        using var e = Engine(dir);
+
+        for (int k = 0; k < 100; k++) Write(e, 11_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        for (int k = 0; k < 100; k++) Write(e, 12_000 + (ulong)k, _baseNano + (200 + k) * Ms);
+        e.FlushHotTier();
+        Assert.Equal(2, e.ColdSegmentsForTest.Length);
+        Assert.All(e.ColdSegmentsForTest, s => Assert.NotEqual(0UL, s.SegmentId));
+
+        int landed = 0;
+        e._beforeCatalogRegistrationForTest = () => throw new IOException("injected: the manifest write failed");
+        e._compactionStageForTest = stage =>
+        {
+            if (stage != TraceStorageEngine.CompactionStage.Catalogued) return;
+            landed++;
+            e.AdoptUnnamedSegments();                                          // the index worker, landing here
+        };
+        e.CompactSmallSegments();
+        e._beforeCatalogRegistrationForTest = null;
+        e._compactionStageForTest = null;
+
+        Assert.Equal(1, landed);
+        var unnamed = Assert.Single(e.ColdSegmentsForTest);
+        Assert.Equal(0UL, unnamed.SegmentId);                                  // published unnamed
+        Assert.Equal(200, unnamed.SpanCount);
+
+        e.AdoptUnnamedSegments();                                              // the worker's next pass
+
+        var merged = Assert.Single(e.ColdSegmentsForTest);
+        _out.WriteLine($"after the next pass: id {merged.SegmentId} ← {Path.GetFileName(merged.FilePath)}");
+        Assert.NotEqual(0UL, merged.SegmentId);
+        Assert.Contains(merged.FilePath, e.CatalogPathsForTest);
+    }
 }

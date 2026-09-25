@@ -265,12 +265,20 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>
     /// Test seam: called inside <c>CompleteFlush</c> just before the segment is registered in the
-    /// catalog. Throwing from it is the manifest write that fails there (a File.Move over the live
-    /// manifest meeting an antivirus's sharing violation, on Windows): the segment is published with
-    /// id 0 and queued for adoption — the one way a segment reaches <see cref="AdoptUnnamedSegments"/>
-    /// without a restart, and on every OS.
+    /// catalog, and in a compaction pass just before the merged segment is. Throwing from it is the
+    /// manifest write that fails there (a File.Move over the live manifest meeting an antivirus's
+    /// sharing violation, on Windows): the segment is published with id 0 and queued for adoption —
+    /// the one way a segment reaches <see cref="AdoptUnnamedSegments"/> without a restart, and on
+    /// every OS.
     /// </summary>
     internal Action? _beforeCatalogRegistrationForTest;
+
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> after the catalog step and before the segment is
+    /// published to <c>_coldSegments</c> — where the index worker's adoption can land while a segment
+    /// whose registration failed is on disk and not yet in the snapshot. Null in production.
+    /// </summary>
+    internal Action? _beforeFlushPublishForTest;
 
     /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
     internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
@@ -2662,23 +2670,14 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             {
                 _logger.LogWarning(ex,
                     "Could not record {File} in the trace catalog — the segment is published and "
-                  + "queryable, and will be adopted on the next start", named.FilePath);
-            }
-
-            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. Any throw above — and both
-            // manifest calls end in a File.Move over the live file, which is where an antivirus
-            // gives a sharing violation on Windows — left the segment with SegmentId 0 for the
-            // life of the process: the backfill skips id 0, and nothing else re-adopts a segment
-            // already in the snapshot. The log line said "adopted on the next start" and meant it
-            // literally. Queued here instead, so the background worker picks it up in seconds.
-            if (!registered && info is { } unnamed)
-            {
-                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
+                  + "queryable, and is queued for adoption by the background worker", named.FilePath);
             }
         }
 
         try
         {
+            _beforeFlushPublishForTest?.Invoke();   // test seam: the index worker, landing before the publish
+
             // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is
             //    what stops another flush opening a WAL cycle before this one commits.
             _lock.EnterWriteLock();
@@ -2704,6 +2703,22 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
+
+            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. A throw in the registration
+            // above — both manifest calls end in a File.Move over the live file, which is where an
+            // antivirus gives a sharing violation on Windows — left the segment with SegmentId 0
+            // for the life of the process: the backfill skips id 0, and nothing else re-adopts a
+            // segment already in the snapshot. Queued, so the background worker picks it up in
+            // seconds.
+            //
+            // QUEUED AFTER THE PUBLISH, NOT BEFORE IT (#94). Adoption drops a queued path it cannot
+            // find in the snapshot — that is how a path merged or retired away leaves the queue —
+            // so a pass landing between a queueing before the publish and the publish itself threw
+            // the path away, and the segment kept id 0 until the next restart.
+            if (!registered && info is { } unnamed)
+            {
+                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
+            }
 
             // ── Commit the log OFF the lock: it relocates the tail and issues two
             //    whole-mapping device flushes. Under the exclusive lock that would stall
@@ -3758,8 +3773,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // with them, because an index vouching for a file that is about to be unlinked is the
             // silent-loss shape this whole design exists to prevent.
             TraceIndexRun? run = null;
+            bool mergedUnnamed = false;
             try
             {
+                _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
                 ulong mergedId = _manifest.AllocateSegmentId();
                 run = WriteIndexRun(merged, mergedId, mergedTraceIndex);
 
@@ -3801,8 +3818,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // skips id 0, and ReconcileCatalog runs once per process. The cost here is higher
                 // than on the flush path — this file holds the spans of every source, the sources
                 // are already gone, and every GET /api/traces/{id} would scan the largest file in
-                // the directory until somebody restarted.
-                lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
+                // the directory until somebody restarted. Queued AFTER the swap below (#94):
+                // adoption drops a path it cannot find in the snapshot, so one landing between a
+                // queueing here and the swap threw the merged file away for the process's life.
+                mergedUnnamed = true;
 
                 _logger.LogWarning(ex,
                     "Could not record the merged segment {File} in the trace catalog — it is "
@@ -3821,6 +3840,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _coldSegments = SortedByMaxStartDesc(next);
             }
             finally { _lock.ExitWriteLock(); }
+
+            if (mergedUnnamed) lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
 
             foreach (var seg in processed)   // delete only the segments we actually merged
                 DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
