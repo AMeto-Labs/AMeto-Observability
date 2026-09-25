@@ -586,6 +586,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <summary>One compaction pass's byte budget this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
     internal long MergeBudgetBytes => _mergeBudgetBytes;
 
+    /// <summary>
+    /// The entry cap of one trace-index merge, from the same budget as a compaction pass: the two
+    /// are background chores on one heap. 2 000 000 at the cap; see <see cref="TraceIndexCompactor.MaxEntriesPerMergeFor"/>.
+    /// </summary>
+    internal int IndexMergeMaxEntries => TraceIndexCompactor.MaxEntriesPerMergeFor(_mergeBudgetBytes);
+
     /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
     internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;
 
@@ -3191,7 +3197,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private bool CompactIndexOnceCore(CancellationToken ct)
     {
-        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs);
+        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs, IndexMergeMaxEntries);
         if (batch.Count == 0) return false;
 
         ct.ThrowIfCancellationRequested();
