@@ -164,7 +164,7 @@ public static class TraceQueryEndpointMapper
             string ql      = ctx.Request.Query["ql"].ToString();
 
             await BeginEventStreamAsync(ctx);
-            using var sse = new SseJsonWriter(ctx.Response.Body);
+            using var sse = new SseJsonWriter(ctx.Response.Body, TraceDetailJson.WriterOptions(ctx));   // done / query-error in the host encoding (#94)
             try
             {
                 SpanPredicate predicate;
@@ -211,7 +211,7 @@ public static class TraceQueryEndpointMapper
             int max             = ParseInt(ctx.Request.Query["max"], 2000, 1, 5000);
 
             await BeginEventStreamAsync(ctx);
-            using var sse = new SseJsonWriter(ctx.Response.Body);
+            using var sse = new SseJsonWriter(ctx.Response.Body, TraceDetailJson.WriterOptions(ctx));   // done / query-error in the host encoding (#94)
             try
             {
                 var end = await StreamTracePagesAsync(ctx, sse, max, FilterStreamPageSize, from, to,

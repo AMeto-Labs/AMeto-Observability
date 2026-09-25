@@ -254,6 +254,24 @@ public sealed class TraceStreamEndpointTests : IClassFixture<AmetoWebAppFactory>
         Assert.Contains("parse error", capture.Error ?? "", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// THE query-error FRAME IS IN THE HOST'S ENCODING (#94), as the REST answers of the same host
+    /// are: a parse error naming the user's literal carries it as UTF-8 under the host's relaxed
+    /// encoder, not as <c>п…</c> and <c>'</c> from the SSE writer's default one.
+    /// Reverted (the stream's writer built without the host's options): the frame is escaped.
+    /// </summary>
+    [Fact]
+    public async Task QlStream_ParseError_FrameCarriesTheLiteralInTheHostEncoding()
+    {
+        var response = await _client.GetAsync($"/api/traces/query/stream?{Ql("{ \"привет\" }")}&max=10");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        string body = Encoding.UTF8.GetString(await response.Content.ReadAsByteArrayAsync());
+
+        Assert.Contains(
+            "event: query-error\ndata: {\"error\":\"TraceQL parse error: Unexpected token String('привет')\"}\n\n",
+            body);
+    }
+
     [Fact]
     public async Task FilterStream_SparseFilter_KeepsPagingPastAPageThatCameBackShort()
     {

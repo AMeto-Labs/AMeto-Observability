@@ -115,12 +115,20 @@ internal static class SpanWriter
     /// published and only if it was. The trace-id index needs exactly this map, and building it
     /// here rather than reading it back out of the finished file is not merely cheaper: an index
     /// derived from a second, independent pass is an index that can disagree with the segment it
-    /// describes. Handing over the writer's own is the only version that cannot.
+    /// describes. Handing over the writer's own is the only version that cannot. The map is a
+    /// <see cref="TraceIndexPairs"/> whose array the callee now OWNS and must
+    /// <see cref="TraceIndexPairs.Release"/>.
+    /// </param>
+    /// <param name="scratch">
+    /// The engine's own scratch arrays (#90), or null for the shared pool. See
+    /// <see cref="SpanWriteScratch"/>: a thread-pool flush otherwise missed the pool slot its last
+    /// flush left on another thread, and allocated its biggest arrays on the LOH again.
     /// </param>
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
                                         Action<string>? onNamed = null,
-                                        Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null,
-                                        ushort version = DefaultVersion)
+                                        Action<TraceIndexPairs>? onTraceIndex = null,
+                                        ushort version = DefaultVersion,
+                                        SpanWriteScratch? scratch = null)
     {
         int count = spans.Count;
         if (count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
@@ -154,8 +162,8 @@ internal static class SpanWriter
         // those comparison results. The permutation is therefore the same one, and
         // TraceFlushProbe's corpus — 12 000 spans over 500 start times, 24 ties apiece — is what
         // holds that claim to the byte.
-        int[]  order = ArrayPool<int>.Shared.Rent(count);
-        long[] keys  = ArrayPool<long>.Shared.Rent(count);
+        int[]  order = scratch?.RentOrder(count) ?? ArrayPool<int>.Shared.Rent(count);
+        long[] keys  = scratch?.RentKeys(count)  ?? ArrayPool<long>.Shared.Rent(count);
         try
         {
             for (int i = 0; i < count; i++)
@@ -166,12 +174,16 @@ internal static class SpanWriter
             order.AsSpan(0, count).Sort((a, b) => keys[a].CompareTo(keys[b]));
 
             var batch = new OrderedSpans(spans, order, count);
-            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version);
+            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch);
         }
         finally
         {
-            ArrayPool<long>.Shared.Return(keys);
-            ArrayPool<int>.Shared.Return(order);
+            if (scratch is not null) { scratch.Return(keys); scratch.Return(order); }
+            else
+            {
+                ArrayPool<long>.Shared.Return(keys);
+                ArrayPool<int>.Shared.Return(order);
+            }
         }
     }
 
@@ -181,8 +193,8 @@ internal static class SpanWriter
     /// </summary>
     private static SpanSegmentInfo WriteOrdered(string dataDir, in OrderedSpans spans, bool recoverable,
                                                 Action<string>? onNamed,
-                                                Action<Dictionary<TraceId, List<uint>>>? onTraceIndex,
-                                                ushort version)
+                                                Action<TraceIndexPairs>? onTraceIndex,
+                                                ushort version, SpanWriteScratch? scratch)
     {
         int  count   = spans.Count;
         long minNano = spans[0].StartTimeUnixNano;
@@ -214,8 +226,16 @@ internal static class SpanWriter
         string svcgraphFinal = Path.ChangeExtension(trcPath, ".svcgraph");
         string tracesumFinal = Path.ChangeExtension(trcPath, ".tracesum");
 
-        // Accumulate service→block mapping and stats in a single pass through WriteBlock
-        var traceIndex  = new Dictionary<TraceId, List<uint>>(capacity: count / 4);
+        // Accumulate service→block mapping and stats in a single pass through WriteBlock.
+        //
+        // THE TRACE INDEX IS ONE (trace, offset) PER SPAN, SORTED AFTER THE BLOCKS (TS#7(c)), not a
+        // Dictionary<TraceId, List<uint>> with a List per trace and its growth arrays. Needed by the
+        // v3 index block and by the caller's run; a v4 file with no caller needs neither.
+        bool wantTraceIndex = version < 4 || onTraceIndex is not null;
+        TraceSpanRef[]? traceRefs = wantTraceIndex
+            ? scratch?.RentPairs(count) ?? ArrayPool<TraceSpanRef>.Shared.Rent(count)
+            : null;
+        int traceCount = 0;
         // A LIST WITH A LAST-BLOCK GUARD, NOT A SET. Block indices are handed to WriteBlock in
         // ascending order and are constant within a block, so "have I already recorded this block
         // for this service" is answered by looking at the last element — one comparison against a
@@ -263,11 +283,20 @@ internal static class SpanWriter
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
                     var block      = WriteBlock(in spans, written, batchCount, blockBuf, blockIdx,
-                                                traceIndex, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
+                                                traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
                     bw.Write(block.CompressedBytes);
                     written += batchCount;
+                }
+
+                // One run per trace, offsets ascending inside it. The order is total (an offset is
+                // one span's), so the result does not depend on the sort being stable.
+                if (traceRefs is not null)
+                {
+                    var refs = traceRefs.AsSpan(0, count);
+                    refs.Sort(new ByTraceThenOffset());
+                    traceCount = CountTraces(refs);
                 }
 
                 // ── TraceId index ──────────────────────────────────────────────
@@ -288,23 +317,16 @@ internal static class SpanWriter
                 // SpanReader.ReadTraceOffsets.
                 long traceIdxOffset = fs.Position;
                 {
-                    var idxBuf = new MemoryStream(version >= 4 ? 8 : traceIndex.Count * 32);
+                    var idxBuf = new MemoryStream(version >= 4 ? 8 : traceCount * 32);
                     var idxBw  = new BinaryWriter(idxBuf);
-                    Span<byte> traceIdBuf = stackalloc byte[16];
                     if (version >= 4)
                     {
                         idxBw.Write(0u);                       // zero traces: the block is a stub
                     }
                     else
                     {
-                        idxBw.Write((uint)traceIndex.Count);
-                        foreach (var (traceId, offsets) in traceIndex)
-                        {
-                            traceId.WriteTo(traceIdBuf);
-                            idxBw.Write(traceIdBuf);
-                            idxBw.Write((uint)offsets.Count);
-                            foreach (var o in offsets) idxBw.Write(o);
-                        }
+                        idxBw.Write((uint)traceCount);
+                        WriteV3TraceIndex(idxBw, in spans, traceRefs.AsSpan(0, count));
                     }
                     // Compress from the stream's own backing array — ToArray() duplicated the
                     // whole index (LOH-sized on a busy segment) for nothing.
@@ -352,7 +374,7 @@ internal static class SpanWriter
             //    nothing — an empty stats/edge set produces no file at all.
             WriteStatsSidecar(statsFinal + ".tmp", svcStats);
             ServiceGraphSidecar.WriteOrdered(trcPath, in spans, svcgraphFinal + ".tmp", spanSvc);
-            TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp");
+            TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp", scratch);
 
             // ── Publish: sidecars first, the .trc last — a visible .trc implies its
             //    sidecars are complete.
@@ -372,11 +394,18 @@ internal static class SpanWriter
             TryDelete(statsFinal + ".tmp");
             TryDelete(svcgraphFinal + ".tmp");
             TryDelete(tracesumFinal + ".tmp");
+            if (traceRefs is not null) new TraceIndexPairs(traceRefs, 0, 0, scratch).Release();
             throw;
         }
 
-        // After the publish, so a map only ever describes a segment that exists on disk.
-        onTraceIndex?.Invoke(traceIndex);
+        // After the publish, so a map only ever describes a segment that exists on disk. The
+        // callee owns the array from here; without one, it goes back now.
+        if (traceRefs is not null)
+        {
+            var pairs = new TraceIndexPairs(traceRefs, count, traceCount, scratch);
+            if (onTraceIndex is not null) onTraceIndex(pairs);
+            else                          pairs.Release();
+        }
 
         var services = new string[svcBlockMap.Count];
         svcBlockMap.Keys.CopyTo(services, 0);
@@ -414,6 +443,58 @@ internal static class SpanWriter
         try { if (File.Exists(path)) File.Delete(path); } catch { /* constructor sweep collects it */ }
     }
 
+    // ── The trace index, from the sorted refs ──────────────────────────────────
+
+    /// <summary>How many distinct traces: runs of one id in refs sorted by <see cref="ByTraceThenOffset"/>.</summary>
+    private static int CountTraces(ReadOnlySpan<TraceSpanRef> sorted)
+    {
+        int traces = 0;
+        for (int i = 0; i < sorted.Length; i++)
+            if (i == 0 || !sorted[i].TraceId.Equals(sorted[i - 1].TraceId)) traces++;
+        return traces;
+    }
+
+    /// <summary>
+    /// The v3 trace-index payload after its count: per trace, the id, the span count and the
+    /// offsets — IN FIRST-SEEN ORDER, the order the <c>Dictionary</c> it replaces enumerated in
+    /// (insertion order: nothing was ever removed). The golden v3 <c>.trc</c> bytes pin that order
+    /// (TraceFlushProbe). So the walk is the SPAN order again: at each span that is its trace's
+    /// first — the run for its id, found by binary search in the id-sorted refs, starts at its own
+    /// offset — the whole run is written. Offsets are ascending within a run, as the list appended
+    /// them. No second array: one search per span, of a run that is already in memory.
+    /// </summary>
+    private static void WriteV3TraceIndex(BinaryWriter w, in OrderedSpans spans, ReadOnlySpan<TraceSpanRef> sorted)
+    {
+        Span<byte> idBuf = stackalloc byte[16];
+        for (int i = 0; i < sorted.Length; i++)
+        {
+            var id    = spans[i].TraceId;
+            int start = FirstOf(sorted, id);
+            if (sorted[start].Offset != (uint)i) continue;       // not this trace's first span
+
+            int end = start + 1;
+            while (end < sorted.Length && sorted[end].TraceId.Equals(id)) end++;
+
+            id.WriteTo(idBuf);
+            w.Write(idBuf);
+            w.Write((uint)(end - start));
+            for (int k = start; k < end; k++) w.Write(sorted[k].Offset);
+        }
+    }
+
+    /// <summary>The index of the first ref of <paramref name="id"/> in id-sorted refs that hold it.</summary>
+    private static int FirstOf(ReadOnlySpan<TraceSpanRef> sorted, TraceId id)
+    {
+        int lo = 0, hi = sorted.Length - 1;
+        while (lo < hi)
+        {
+            int mid = (int)(((uint)lo + (uint)hi) >> 1);
+            if (sorted[mid].TraceId.CompareTo(id) < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
     // ── Block serialisation ────────────────────────────────────────────────────
 
     private static (byte[] CompressedBytes, int UncompressedSize) WriteBlock(
@@ -422,7 +503,7 @@ internal static class SpanWriter
         int                                      count,
         ArrayBufferWriter<byte>                  bufWriter,
         uint                                     blockIdx,
-        Dictionary<TraceId, List<uint>>          traceIndex,
+        TraceSpanRef[]?                          traceRefs,
         Dictionary<string, List<uint>>           svcBlockMap,
         Dictionary<SpanId, string>               spanSvc,
         HashSet<ulong>                           bloomHashes,
@@ -451,12 +532,7 @@ internal static class SpanWriter
             uint globalOffset = (uint)(offset + i);
 
             // ── TraceId index ────────────────────────────────────────────────
-            if (!traceIndex.TryGetValue(s.TraceId, out var tOffsets))
-            {
-                tOffsets = new List<uint>(4);
-                traceIndex[s.TraceId] = tOffsets;
-            }
-            tOffsets.Add(globalOffset);
+            if (traceRefs is not null) traceRefs[globalOffset] = new TraceSpanRef(s.TraceId, globalOffset);   // sorted after the blocks
 
             // ── Service block map ────────────────────────────────────────────
             if (!svcBlockMap.TryGetValue(s.ServiceName, out var blocks))

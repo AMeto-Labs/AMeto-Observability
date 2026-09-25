@@ -288,6 +288,13 @@ public static class TraceQLParser
                 case "duration":
                     if (!val.IsNumber)
                         throw new TraceQLException("duration requires a number or duration literal");
+                    // A NEGATIVE DURATION IS REFUSED HERE, not compared: no span lasts -1ms, so
+                    // `duration > -1ms` would select everything and `duration < -1ms` nothing, each
+                    // without a word — and the bare-number spelling (nanoseconds) likewise. Only for
+                    // this intrinsic: an attribute can hold a negative duration (`.clock.skew < -5ms`).
+                    if (val.Number < 0)
+                        throw new TraceQLException(
+                            $"A span's duration cannot be negative ({val.Number.ToString(System.Globalization.CultureInfo.InvariantCulture)} ns)");
                     return new DurationPredicate(op, (long)val.Number);
 
                 case "status":

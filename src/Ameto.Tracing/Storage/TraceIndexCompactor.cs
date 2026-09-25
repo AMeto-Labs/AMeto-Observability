@@ -49,13 +49,43 @@ internal sealed class TraceIndexCompactor
     internal const int MaxRunsPerMerge = 32;
 
     /// <summary>
-    /// Entries one merge may take, because the merge holds all of them at once. At roughly 60-88
-    /// bytes apiece — the writer's tuple in a doubling backing array plus the per-entry offset
-    /// array — two million is about 150 MB, which is as much as a background chore may ask for on
-    /// the 512 MB deployment this branch exists to keep alive. Two runs are always taken even if
-    /// they exceed it: a merge of one is not a merge, and refusing outright would wedge the level.
+    /// Entries one merge may take ON A HOST WHOSE TRACE MERGE BUDGET IS THE CAP
+    /// (<see cref="Ameto.Core.MemoryBudgets.TraceMergeCapBytes"/>, 73 MB), because the merge holds
+    /// all of them at once. At roughly 60-88 bytes apiece — the writer's tuple in a doubling backing
+    /// array plus the per-entry offset array — two million is about 150 MB. Two runs are always
+    /// taken even if they exceed it: a merge of one is not a merge, and refusing outright would
+    /// wedge the level. Every other host scales it — see <see cref="MaxEntriesPerMergeFor"/>.
     /// </summary>
     internal const int MaxEntriesPerMerge = 2_000_000;
+
+    /// <summary>
+    /// The entry cap for a host whose trace merge budget is <paramref name="mergeBudgetBytes"/>:
+    /// <see cref="MaxEntriesPerMerge"/> scaled by that budget's share of the cap, and never above it.
+    ///
+    /// <para>A CONSTANT WAS THE SAME 150 MB EVERYWHERE (#94). The segment compactor's pass is held to
+    /// the budget the host derived (~24 MB on the 512 MB stand, 73 MB on a large host); the index
+    /// merge beside it, a chore of the same kind on the same heap, asked a large host's 150 MB of
+    /// the stand too. Scaled, the large host keeps exactly two million and the stand asks for about
+    /// a third of it.</para>
+    ///
+    /// <para>AND NEVER BELOW THE SHARE OF THE SMALLEST BUDGET A HOST DERIVES (<see cref="MinMergeBudgetBytes"/>,
+    /// 459 649 entries). An explicit <c>Traces:MergeBudgetBytes</c> has no floor of its own, and a
+    /// tiny one scaled the cap down to a handful of entries: every L1 merge then took just its two
+    /// runs, the L1 run count grew with the flush rate, and the index stopped doing the one thing it
+    /// merges for. The budget still shrinks the segment compactor's pass; it no longer starves this.</para>
+    /// </summary>
+    internal static int MaxEntriesPerMergeFor(long mergeBudgetBytes)
+    {
+        long budget = Math.Clamp(mergeBudgetBytes, MinMergeBudgetBytes, Ameto.Core.MemoryBudgets.TraceMergeCapBytes);
+        return (int)(MaxEntriesPerMerge * budget / Ameto.Core.MemoryBudgets.TraceMergeCapBytes);
+    }
+
+    /// <summary>
+    /// The smallest trace merge budget <see cref="Ameto.Core.MemoryBudgets"/> derives for any host,
+    /// 16 MiB — its <c>MinTraceMergeBytes</c>, which is private there (MemoryBudgets is not this
+    /// class's to change); <c>TraceIndexCompactionTests</c> pins that the two agree.
+    /// </summary>
+    internal const long MinMergeBudgetBytes = 16L * 1024 * 1024;
 
     private readonly string  _dir;
     private readonly ILogger _logger;
@@ -73,7 +103,12 @@ internal sealed class TraceIndexCompactor
     /// keeps the run count from growing, and doing it before the bigger levels means the cheap work
     /// happens first and often.</para>
     /// </summary>
-    internal static List<TraceIndexRun> SelectMergeBatch(IReadOnlyList<TraceIndexRun> runs)
+    internal static List<TraceIndexRun> SelectMergeBatch(IReadOnlyList<TraceIndexRun> runs) =>
+        SelectMergeBatch(runs, MaxEntriesPerMerge);
+
+    /// <inheritdoc cref="SelectMergeBatch(IReadOnlyList{TraceIndexRun})"/>
+    /// <param name="maxEntries">The entry cap — <see cref="MaxEntriesPerMergeFor"/> the engine's merge budget.</param>
+    internal static List<TraceIndexRun> SelectMergeBatch(IReadOnlyList<TraceIndexRun> runs, int maxEntries)
     {
         var byLevel = new Dictionary<int, List<TraceIndexRun>>();
         foreach (var r in runs)
@@ -102,7 +137,7 @@ internal sealed class TraceIndexCompactor
             foreach (var r in list)
             {
                 if (batch.Count == MaxRunsPerMerge) break;
-                if (batch.Count >= 2 && entries + r.EntryCount > MaxEntriesPerMerge) break;
+                if (batch.Count >= 2 && entries + r.EntryCount > maxEntries) break;
                 batch.Add(r);
                 entries += r.EntryCount;
             }

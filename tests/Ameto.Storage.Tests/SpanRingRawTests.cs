@@ -613,6 +613,66 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
+    /// A CHUNK FREED INTO THE LOW LIST AFTER THE PRODUCER LOOKED THERE IS FOUND BEFORE A REFUSAL (#94).
+    /// The two free lists are read one after the other: a producer finds the low list empty, a drained
+    /// span then frees a low chunk while another producer takes the last high one, and the producer
+    /// finds the high list empty too — with no trim running, so it refused the span for want of an
+    /// arena that had a free chunk the whole time.
+    ///
+    /// <para>At the seam, on one thread: the arena is filled to its last chunk and drained but not
+    /// released, so both lists are empty; the producer's look-then-decide seam frees one LOW chunk
+    /// (a drained span's release) after the lists were found empty. Reverted (refused on "both
+    /// empty, no trim"): the span is refused and <c>RefusedNoArena</c> moves.</para>
+    /// </summary>
+    [Fact]
+    public void A_low_chunk_freed_between_the_look_and_the_decision_is_taken_not_refused()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[1_024];
+        var apart   = new byte[]?[1_024];
+
+        // Every chunk of the arena, one span each, then one more: refused for want of arena. That
+        // refusal is the fixture's proof that both free lists are now empty.
+        int filled = 0;
+        while (true)
+        {
+            var h = Fields(filled);
+            if (!ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(filled))) break;
+            filled++;
+            Assert.True(filled < 1_000, "the arena never filled");
+        }
+        ring.EndBatch();
+        Assert.Equal(1, ring.RefusedNoArena);
+        int n = ring.TryDequeueMany(headers, apart);                      // drained, still unreleased
+        Assert.Equal(filled, n);
+        int low = Array.FindIndex(headers, 0, n, static h => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes == 5);
+        Assert.True(low >= 0, "no span in low chunk 5");
+
+        int looks = 0;
+        ring._afterListsFoundEmptyForTest = () =>
+        {
+            if (Interlocked.Increment(ref looks) != 1) return;
+            ring.Release(headers.AsSpan(low, 1));                          // chunk 5 back on the LOW list, after the look
+        };
+
+        var span = Fields(5_000);
+        bool taken = ring.TryEnqueueRaw(in span, "op"u8, -1, "svc"u8, Stamp(5_000));
+        ring.EndBatch();
+        ring._afterListsFoundEmptyForTest = null;
+
+        _out.WriteLine($"{filled} chunks filled; looked {looks} time(s); taken: {taken}; refused for want of arena: {ring.RefusedNoArena}");
+        Assert.Equal(1, looks);
+        Assert.True(taken, "the span was refused with a free chunk on the low list");
+        Assert.Equal(1, ring.RefusedNoArena);                             // only the fixture's own refusal
+
+        int m = ring.TryDequeueMany(headers.AsSpan(n), apart.AsSpan(n));
+        Assert.Equal(1, m);
+        Assert.Equal(5, headers[n].PayloadArenaOffset / SpanRingBuffer.ChunkBytes);
+        for (int i = 0; i < n + m; i++)
+            if (i != low) ring.Release(headers.AsSpan(i, 1));
+    }
+
+    /// <summary>
     /// A CHUNK IS REUSED ONLY WHEN EVERY SPAN IN IT IS DRAINED, AND THEN FIRST. Three spans in one chunk,
     /// one drained: a new batch must NOT be packed into that chunk. All drained: the next batch gets it
     /// back (LIFO), so a drainer that keeps up works in one chunk forever — the arena's residency is

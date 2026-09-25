@@ -169,14 +169,44 @@ internal sealed class SpanDrainer : IAsyncDisposable
             MaybeFlush();
         }
 
-        // Drain remaining items before shutdown
+        // Drain remaining items before shutdown.
+        //
+        // A BATCH THAT THROWS IS LOGGED AND THE DRAIN GOES ON, as it does in the loop above. This
+        // pass used to end at the first batch that threw, and every span queued behind it — each
+        // one already acknowledged to its exporter — stayed in the ring and was never written.
+        // DrainOnce releases the batch that threw, so each failure still empties one batch from
+        // the ring and the pass makes progress; a run of failures that long is an engine that
+        // will not take spans at all, and the pass stops there and says how many it left.
+        int consecutiveFailures = 0;
         while (true)
         {
-            int remaining = DrainOnce(out int taken);
+            int remaining, taken;
+            try
+            {
+                remaining = DrainOnce(out taken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain");
+                if (++consecutiveFailures < MaxConsecutiveFinalDrainFailures) continue;
+                _logger.LogError(
+                    "SpanDrainer: the final drain stopped after {Failures} failing batches in a row — "
+                  + "{Lost} span(s) still in the ring were not stored",
+                    consecutiveFailures, _ring.ApproximateCount);
+                return;
+            }
+            consecutiveFailures = 0;
             if (remaining == 0) break;
             if (taken < remaining) { ReportRefused(remaining - taken); return; }
         }
     }
+
+    /// <summary>
+    /// Failing batches in a row after which the final drain gives up: at <see cref="BatchSize"/>
+    /// spans a batch, eight is 4 096 spans the engine refused one after another — past a bad batch,
+    /// into an engine that is not taking anything.
+    /// </summary>
+    private const int MaxConsecutiveFinalDrainFailures = 8;
 
     /// <summary>
     /// Says, once, that the engine stopped taking spans. It is not an error: the spans were
@@ -246,6 +276,16 @@ internal sealed class SpanDrainer : IAsyncDisposable
             _cts.Cancel();
             try { await _drainTask.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                // THE FINAL DRAIN IS THE ONE WRITE THE LOOP DOES NOT GUARD: a batch that throws in the
+                // main loop is logged and the loop goes on, but a throw out of the "drain remaining
+                // items" pass ends the task. Letting it out of here skipped the flush below — the
+                // spans that drain had already put in the tier were then left to the engine's own
+                // teardown, which the host timeout may cut short — and threw out of a disposal the
+                // host runs on two chains at once. Logged, then the tier is flushed all the same.
+                _logger.LogError(ex, "SpanDrainer: the final drain at shutdown failed; flushing what reached the hot tier");
+            }
 
             // Final flush so spans drained from the ring buffer at shutdown reach disk
             // even if the engine's own Dispose flush is cut short by the host timeout.

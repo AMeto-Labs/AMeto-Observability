@@ -265,12 +265,20 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>
     /// Test seam: called inside <c>CompleteFlush</c> just before the segment is registered in the
-    /// catalog. Throwing from it is the manifest write that fails there (a File.Move over the live
-    /// manifest meeting an antivirus's sharing violation, on Windows): the segment is published with
-    /// id 0 and queued for adoption — the one way a segment reaches <see cref="AdoptUnnamedSegments"/>
-    /// without a restart, and on every OS.
+    /// catalog, and in a compaction pass just before the merged segment is. Throwing from it is the
+    /// manifest write that fails there (a File.Move over the live manifest meeting an antivirus's
+    /// sharing violation, on Windows): the segment is published with id 0 and queued for adoption —
+    /// the one way a segment reaches <see cref="AdoptUnnamedSegments"/> without a restart, and on
+    /// every OS.
     /// </summary>
     internal Action? _beforeCatalogRegistrationForTest;
+
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> after the catalog step and before the segment is
+    /// published to <c>_coldSegments</c> — where the index worker's adoption can land while a segment
+    /// whose registration failed is on disk and not yet in the snapshot. Null in production.
+    /// </summary>
+    internal Action? _beforeFlushPublishForTest;
 
     /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
     internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
@@ -551,6 +559,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     private readonly SpanStringPools _pools;
 
+    /// <summary>
+    /// The segment writer's largest scratch arrays, kept here between flushes rather than in the
+    /// slot of whichever thread-pool thread returned them last (#90) — see <see cref="SpanWriteScratch"/>.
+    /// </summary>
+    private readonly SpanWriteScratch _writeScratch = new();
+
+    /// <summary>Test hook: the writer scratch this engine's flushes and merges rent from.</summary>
+    internal SpanWriteScratch WriteScratchForTest => _writeScratch;
+
     /// <summary>Test hook: the intern pools this engine resolves names and services through.</summary>
     internal SpanStringPools PoolsForTest => _pools;
 
@@ -577,6 +594,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>One compaction pass's byte budget this engine was built with — see <see cref="TraceDiagnostics"/>.</summary>
     internal long MergeBudgetBytes => _mergeBudgetBytes;
+
+    /// <summary>
+    /// The entry cap of one trace-index merge, from the same budget as a compaction pass: the two
+    /// are background chores on one heap. 2 000 000 at the cap; see <see cref="TraceIndexCompactor.MaxEntriesPerMergeFor"/>.
+    /// </summary>
+    internal int IndexMergeMaxEntries => TraceIndexCompactor.MaxEntriesPerMergeFor(_mergeBudgetBytes);
 
     /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
     internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;
@@ -1068,6 +1091,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 {
                     _lock.ExitWriteLock();
                 }
+                _betweenWriteHoldsForTest?.Invoke(taken);
                 LetQueuedWaitersIn();
                 if (flushStartFault is not null)
                 {
@@ -1199,6 +1223,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     {
         int writersQueued = _lock.WaitingWriteCount;
         if (writersQueued == 0 && _lock.WaitingReadCount == 0) return;
+        _handoffWaitingForTest?.Invoke();
         long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
         var  spin     = new SpinWait();
         while ((writersQueued > 0 && _lock.WaitingWriteCount >= writersQueued)          // none of them in yet
@@ -1214,6 +1239,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>Test seam: called INSIDE each write hold of <see cref="WriteSpans"/>, after the spans joined the tier.</summary>
     internal Action<int>? _insideWriteHoldForTest;
+
+    /// <summary>
+    /// Test seam: called between two write holds of <see cref="WriteSpans"/> — the lock just released,
+    /// the hand-off (<see cref="LetQueuedWaitersIn"/>) not yet decided — with the spans taken so far.
+    /// A test queues a writer here, behind a holder it controls, so whether the next hold waits for
+    /// it is decided by the hand-off and not by which thread the scheduler runs first.
+    /// </summary>
+    internal Action<int>? _betweenWriteHoldsForTest;
+
+    /// <summary>Test seam: <see cref="LetQueuedWaitersIn"/> found a reader or a writer queued and is about to wait for it.</summary>
+    internal Action? _handoffWaitingForTest;
 
     /// <summary>
     /// Test hook: the live log. Lets a test hold the log and the hot tier side by side — the pair
@@ -2590,7 +2626,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // The writer hands over the trace-to-offsets map it built anyway. Taken from there rather
         // than read back out of the finished file, because an index derived from a second,
         // independent pass is an index that can disagree with the segment it describes.
-        Dictionary<TraceId, List<uint>>? traceIndex = null;
+        TraceIndexPairs? traceIndex = null;   // owned once handed over: released after its run is written
         bool registered = false;
 
         try
@@ -2604,8 +2640,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // free to close.
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
-                                    onTraceIndex: map  => traceIndex = map,
-                                    version:      _segmentVersion);
+                                    // No index, no refs: a v4 flush then builds and sorts none at all.
+                                    onTraceIndex: _indexEnabled ? pairs => traceIndex = pairs : null,
+                                    version:      _segmentVersion,
+                                    scratch:      _writeScratch);
             // Weighed while the spans are still at hand, so the compaction planner prices this
             // segment by what it holds rather than by its span count.
             info = info.WithWeight(ReadBackBytesOf(CollectionsMarshal.AsSpan(snapshot)));
@@ -2662,23 +2700,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             {
                 _logger.LogWarning(ex,
                     "Could not record {File} in the trace catalog — the segment is published and "
-                  + "queryable, and will be adopted on the next start", named.FilePath);
-            }
-
-            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. Any throw above — and both
-            // manifest calls end in a File.Move over the live file, which is where an antivirus
-            // gives a sharing violation on Windows — left the segment with SegmentId 0 for the
-            // life of the process: the backfill skips id 0, and nothing else re-adopts a segment
-            // already in the snapshot. The log line said "adopted on the next start" and meant it
-            // literally. Queued here instead, so the background worker picks it up in seconds.
-            if (!registered && info is { } unnamed)
-            {
-                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
+                  + "queryable, and is queued for adoption by the background worker", named.FilePath);
             }
         }
+        traceIndex?.Release();   // the writer's refs: the run (if any) holds its own copies now
 
         try
         {
+            _beforeFlushPublishForTest?.Invoke();   // test seam: the index worker, landing before the publish
+
             // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is
             //    what stops another flush opening a WAL cycle before this one commits.
             _lock.EnterWriteLock();
@@ -2704,6 +2734,22 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
+
+            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. A throw in the registration
+            // above — both manifest calls end in a File.Move over the live file, which is where an
+            // antivirus gives a sharing violation on Windows — left the segment with SegmentId 0
+            // for the life of the process: the backfill skips id 0, and nothing else re-adopts a
+            // segment already in the snapshot. Queued, so the background worker picks it up in
+            // seconds.
+            //
+            // QUEUED AFTER THE PUBLISH, NOT BEFORE IT (#94). Adoption drops a queued path it cannot
+            // find in the snapshot — that is how a path merged or retired away leaves the queue —
+            // so a pass landing between a queueing before the publish and the publish itself threw
+            // the path away, and the segment kept id 0 until the next restart.
+            if (!registered && info is { } unnamed)
+            {
+                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
+            }
 
             // ── Commit the log OFF the lock: it relocates the tail and issues two
             //    whole-mapping device flushes. Under the exclusive lock that would stall
@@ -2813,6 +2859,44 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private void LoadColdSegmentsCore()
     {
+        // A SCAN THAT FAILS AS A WHOLE — the directory would not list, the enumeration broke off —
+        // is said ONCE, as an Error that names what it costs, and ends here (#94; the metric and
+        // log engines say the same). The files it did not reach stay out of the cold tier until a
+        // restart, so the tier is marked short and every trace read over any window reports an
+        // unreadable region rather than a complete answer. It used to escape to the compaction
+        // worker, which logged "cold-segment load failed" and nothing about the alert rules that go
+        // on reading the missing window as a quiet one. A file that fails on its own is not this:
+        // the scan handles those one by one, each with its own line.
+        try { ScanColdSegments(); }
+        catch (Exception ex)
+        {
+            _coldTierIncomplete = true;
+            LogColdScanFailed(_logger, ex, _dataDir);
+        }
+    }
+
+    /// <summary>
+    /// The cold scan failed as a whole — see <see cref="LoadColdSegmentsCore"/>. The trace side's
+    /// twin of the metric engine's line of the same name.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "The cold trace segment scan of {DataDirectory} failed: the segments on disk are not served until a "
+                + "restart, and trace queries answer from the hot tier and what has been flushed since, reporting the "
+                + "window as unreadable. Trace ALERT RULES keep being evaluated on that partial data: a missing window "
+                + "reads as a quiet one, so a \"<\" rule can fire and a \">\" rule can resolve on spans that exist but "
+                + "were not loaded. Restart once the cause is fixed")]
+    private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
+
+    /// <summary>
+    /// Test seam: thrown from the start of the cold scan — the scan failing as a whole, which
+    /// nothing else produces on demand. Null in production.
+    /// </summary>
+    internal Exception? _failColdScanForTest;
+
+    private void ScanColdSegments()
+    {
+        if (_failColdScanForTest is { } fault) throw fault;
+
         var sw     = System.Diagnostics.Stopwatch.StartNew();
         var loaded = new List<SpanSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.trc").OrderBy(f => f))
@@ -3176,7 +3260,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private bool CompactIndexOnceCore(CancellationToken ct)
     {
-        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs);
+        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs, IndexMergeMaxEntries);
         if (batch.Count == 0) return false;
 
         ct.ThrowIfCancellationRequested();
@@ -3368,18 +3452,47 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             var w = new TraceIndexWriter();
             foreach (var (traceId, offsets) in traceIndex)
                 w.Add(traceId, segmentId, [.. offsets]);
-            var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
-            _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
-            return written;
+            return WriteRun(w, segment, segmentId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex,
-                "Could not write the trace-id index for {File} — the segment stays outside the "
-              + "index's coverage and is read by scanning, as before", segment.FilePath);
+            NoteIndexRunFailed(ex, segment);
             return null;
         }
     }
+
+    /// <summary>
+    /// The same, from the segment writer's own sorted refs (TS#7(c)) — the flush's and the merge's
+    /// run. The backfill's map, read out of a v3 file, takes the overload above. An empty
+    /// <paramref name="traceIndex"/> (the writer handed nothing over) is the null of that one.
+    /// </summary>
+    private TraceIndexRun? WriteIndexRun(SpanSegmentInfo segment, ulong segmentId, TraceIndexPairs? traceIndex)
+    {
+        if (traceIndex is null || !_indexEnabled || SuppressIndexRunsForTest) return null;
+        try
+        {
+            var w = new TraceIndexWriter();
+            w.AddSegment(traceIndex, segmentId);
+            return WriteRun(w, segment, segmentId);
+        }
+        catch (Exception ex)
+        {
+            NoteIndexRunFailed(ex, segment);
+            return null;
+        }
+    }
+
+    private TraceIndexRun WriteRun(TraceIndexWriter w, SpanSegmentInfo segment, ulong segmentId)
+    {
+        var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
+        _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
+        return written;
+    }
+
+    private void NoteIndexRunFailed(Exception ex, SpanSegmentInfo segment) =>
+        _logger.LogWarning(ex,
+            "Could not write the trace-id index for {File} — the segment stays outside the "
+          + "index's coverage and is read by scanning, as before", segment.FilePath);
 
     /// <summary>
     /// Reconciles the catalog against what is actually on disk, and hands back the discovered
@@ -3517,13 +3630,21 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         SelectCompactionBatch(segments, MemoryBudgets.TraceMergeCapBytes);
 
     /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
-    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments, long mergeBudgetBytes)
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments, long mergeBudgetBytes) =>
+        SelectCompactionBatch(segments, mergeBudgetBytes, quarantined: null);
+
+    /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
+    /// <param name="quarantined">Paths never to plan — segments a pass read back empty (see
+    /// <see cref="QuarantineFromCompaction"/>). Null when there are none.</param>
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(
+        SpanSegmentInfo[] segments, long mergeBudgetBytes, HashSet<string>? quarantined)
     {
         const long MaxSpanNanos = 24L * 3600 * 1_000_000_000; // 24 h
 
         long thresholdBytes = CompactionThresholdBytesFor(mergeBudgetBytes);
         var candidates = segments
-            .Where(s => EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
+            .Where(s => (EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
+                     && (quarantined is null || !quarantined.Contains(s.FilePath)))
             .OrderBy(s => s.MinStartNano)
             .ToList();
 
@@ -3585,6 +3706,46 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         int tier = 0;
         for (int n = Math.Max(1, spanCount); n >= TierRatio; n /= TierRatio) tier++;
         return tier;
+    }
+
+    /// <summary>
+    /// Segments a compaction pass read back EMPTY, or could not read for their CONTENT, by path:
+    /// never planned again by this process. See the loader in <see cref="CompactOnePass"/>. Like
+    /// <see cref="_backfillFailed"/>, the memory of a failure that would otherwise be met on every
+    /// pass; a path retention later removes stays here, a few dozen bytes per damaged file, for the
+    /// process's life.
+    /// </summary>
+    private readonly HashSet<string> _compactionQuarantine = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Takes <paramref name="seg"/> out of compaction planning, and says so once.
+    /// <paramref name="fault"/> is the content fault its read threw, or null when it read back empty.
+    /// </summary>
+    private void QuarantineFromCompaction(SpanSegmentInfo seg, Exception? fault = null)
+    {
+        bool added;
+        lock (_compactionQuarantine) added = _compactionQuarantine.Add(seg.FilePath);
+        if (!added) return;
+        if (fault is not null)
+            _logger.LogWarning(fault,
+                "Compaction: {File} will not decode — left on disk and out of compaction from now on; "
+              + "retention removes it as usual", seg.FilePath);
+        else if (seg.SpanCount > 0)
+            _logger.LogWarning(
+                "Compaction: {File} claims {Spans} spans and reads back none — left on disk and out of "
+              + "compaction from now on; retention removes it as usual", seg.FilePath, seg.SpanCount);
+    }
+
+    /// <summary>A copy of the quarantine for one plan, or null when it is empty (the usual case: no allocation).</summary>
+    private HashSet<string>? CompactionQuarantineSnapshot()
+    {
+        lock (_compactionQuarantine)
+        {
+            if (_compactionQuarantine.Count == 0) return null;
+            var copy = new HashSet<string>(StringComparer.Ordinal);
+            copy.UnionWith(_compactionQuarantine);
+            return copy;
+        }
     }
 
     /// <summary>
@@ -3661,12 +3822,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // left the segments un-compacted — so they piled up and every pass failed worse.
         // Legacy-v2 files are selected regardless of size so old data migrates to the
         // v3 format (and shrinks) in the background.
-        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes);
+        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes, CompactionQuarantineSnapshot());
         if (small.Count == 0) return false;
 
         var  allSpans    = new List<SpanRecord>();
         var  processed   = new List<SpanSegmentInfo>(small.Count);
         long loadedBytes = 0;
+        bool quarantined = false;   // this pass took a segment out of planning: the run plans again
 
         // What this pass LEARNED: the measured weight of every unweighed segment it read, whether
         // or not it ends up merging it. See the write-back below for why that is the whole fix.
@@ -3691,6 +3853,21 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // again, to the run's 500-pass valve, on every run.
                 if (seg.WeightBytes <= 0) (weighed ??= []).Add((seg, Math.Max(1, measured)));
 
+                // A SEGMENT THAT READS BACK EMPTY LEAVES THE PLAN (#94). Weighing it (above) stopped
+                // the run re-reading it to the valve, but not the planner choosing it: two such
+                // segments of one tier and 24 h window still made the oldest batch, every pass read
+                // them, merged nothing and ended the run — and every segment behind them waited for
+                // retention. Quarantined from planning for this process instead, and NOT merged:
+                // the file's header claims spans its blocks no longer yield (a damaged footer does
+                // that), and merging it away would delete whatever a repair could still recover.
+                // Retention removes it on its own clock, as it always did.
+                if (allSpans.Count == before)
+                {
+                    QuarantineFromCompaction(seg);
+                    quarantined = true;
+                    continue;
+                }
+
                 // A SEGMENT THAT WOULD TAKE THE KEPT SPANS PAST THE BUDGET IS PUT BACK, not merged:
                 // what a pass WRITES never weighs more than a pass may hold, so an underpriced
                 // segment cannot grow a merged one past the budget either. The first segment is
@@ -3702,6 +3879,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 }
                 loadedBytes += measured;
                 processed.Add(seg);
+            }
+            catch (Exception ex) when (FileBounds.DescribesContent(ex))
+            {
+                // A READ THAT FAILS ON THE FILE'S CONTENT FAILS THE SAME WAY ON EVERY PASS. It was
+                // logged and nothing else: the segment was neither weighed nor put out of planning,
+                // so with one readable peer of its tier in its window it seeded the same oldest
+                // batch every pass of every run — read, one survivor, nothing merged, "no change" —
+                // and everything behind it waited for retention. Quarantined as an empty read is.
+                // A fault of the MACHINE (an IOException: a locked file, a mount blip) is not: it
+                // is logged below and the next run tries again.
+                QuarantineFromCompaction(seg, ex);
+                quarantined = true;
             }
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
@@ -3715,7 +3904,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // — and every segment behind it waited for retention. Written back, the heavy segment
             // is priced as what it is, drops out of the candidates, and the run plans again at once.
             // Each such pass weighs at least one unweighed segment, so the run cannot spin on it.
-            return WriteBackWeights(weighed);
+            // A pass that quarantined a segment re-plans too, and cannot spin either: each one
+            // quarantines a segment that was still a candidate.
+            return WriteBackWeights(weighed) | quarantined;
         }
 
         HashSet<string>? claimed = null;   // the sources this pass has claimed from adoption
@@ -3724,10 +3915,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // recoverable:false — the sources are still on disk until the swap below, so a
             // merge temp resurrected after a crash would publish a SECOND copy of every
             // span it merged. Only a hot-tier flush's temp is worth recovering.
-            Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
+            TraceIndexPairs? mergedTraceIndex = null;   // released after its run is written
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
-                                          onTraceIndex: map => mergedTraceIndex = map,
-                                          version: _segmentVersion)
+                                          onTraceIndex: _indexEnabled ? pairs => mergedTraceIndex = pairs : null,
+                                          version: _segmentVersion, scratch: _writeScratch)
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
@@ -3758,8 +3949,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // with them, because an index vouching for a file that is about to be unlinked is the
             // silent-loss shape this whole design exists to prevent.
             TraceIndexRun? run = null;
+            bool mergedUnnamed = false;
             try
             {
+                _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
                 ulong mergedId = _manifest.AllocateSegmentId();
                 run = WriteIndexRun(merged, mergedId, mergedTraceIndex);
 
@@ -3801,8 +3994,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // skips id 0, and ReconcileCatalog runs once per process. The cost here is higher
                 // than on the flush path — this file holds the spans of every source, the sources
                 // are already gone, and every GET /api/traces/{id} would scan the largest file in
-                // the directory until somebody restarted.
-                lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
+                // the directory until somebody restarted. Queued AFTER the swap below (#94):
+                // adoption drops a path it cannot find in the snapshot, so one landing between a
+                // queueing here and the swap threw the merged file away for the process's life.
+                mergedUnnamed = true;
 
                 _logger.LogWarning(ex,
                     "Could not record the merged segment {File} in the trace catalog — it is "
@@ -3810,6 +4005,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     merged.FilePath);
             }
 
+            mergedTraceIndex?.Release();   // the writer's refs: the merged run (if any) holds its own copies now
             _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
             _lock.EnterWriteLock();
             try
@@ -3821,6 +4017,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _coldSegments = SortedByMaxStartDesc(next);
             }
             finally { _lock.ExitWriteLock(); }
+
+            if (mergedUnnamed) lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
 
             foreach (var seg in processed)   // delete only the segments we actually merged
                 DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
@@ -4740,21 +4938,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
-    /// The histogram bounds, read ONCE. <c>HistogramBuckets.Bounds</c> is a <c>ReadOnlySpan&lt;long&gt;</c> property
-    /// over <c>new long[] { ... }</c>, and measured it allocates on every access: 72 B per
-    /// <c>HistogramBuckets.IndexOf</c>, 720 KB for the stats pass over 10 000 spans. The values still come
-    /// from that one list; only the access is cached.
+    /// The histogram bucket of a duration. Was a private copy of the bounds while
+    /// <c>HistogramBuckets.Bounds</c> allocated per access in unoptimized builds (72 B, 720 KB for
+    /// the stats pass over 10 000 spans); it is a span over a static array now, so the canonical
+    /// lookup is free and there is one list of bounds again.
     /// </summary>
-    private static readonly long[] BucketBounds = HistogramBuckets.Bounds.ToArray();
-
-    /// <summary><c>HistogramBuckets.IndexOf</c> without the allocation — see <see cref="BucketBounds"/>.</summary>
-    private static int BucketIndex(long durationNanos)
-    {
-        var bounds = BucketBounds;
-        for (int i = 0; i < bounds.Length; i++)
-            if (durationNanos < bounds[i]) return i;
-        return bounds.Length;
-    }
+    private static int BucketIndex(long durationNanos) => HistogramBuckets.IndexOf(durationNanos);
 
     /// <summary>
     /// The teardown. One caller runs it; the other five — the container holds this instance
