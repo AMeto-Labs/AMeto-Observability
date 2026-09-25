@@ -737,59 +737,77 @@ public sealed class SpanWalTests : IDisposable
     /// compaction and retention passes that swap the cold set; the hand-off used to look only at
     /// <c>WaitingReadCount</c>, so one of them queued behind a busy drainer was woken at every exit
     /// and beaten back in at every re-entry, for as long as ingest stayed busy — a flush publish,
-    /// and with it the WAL commit and the hot tier's release, deferred by load. Here a writer queues
-    /// on the engine lock from inside the first hold, blocked on the lock itself; by the second hold
-    /// it must have been in and out. The hand-off budget is a hang guard, so nothing is decided by
-    /// time. Without the writer half of the hand-off, the second hold begins with it still queued.
+    /// and with it the WAL commit and the hot tier's release, deferred by load.
+    ///
+    /// <para>DECIDED AT SEAMS, NOT BY THE SCHEDULER (#90). The first version queued the writer from
+    /// inside the first hold and let the lock's release wake it; whether the drainer then re-entered
+    /// first was up to which thread ran first, so without the fix it was red 5/5 unpinned but 1/10
+    /// on two pinned cores — a revert that CI's two-core runner would almost always miss — and only
+    /// after a JIT warm-up. Now, in the gap between the holds (a seam on the drainer's thread, the
+    /// hand-off not yet decided), a HOLDER takes the free lock and the writer queues behind it; the
+    /// holder lets go only once the drainer has decided — it waits in the hand-off (the hand-off
+    /// seam), or it went for its next hold with the writer still queued (a second waiting writer).
+    /// The hand-off budget is a hang guard. Reverted (the hand-off looks at readers only): the
+    /// drainer queues for its next hold behind the holder, beside the writer, every run.</para>
     /// </summary>
     [Fact]
     public void A_writer_queued_behind_a_hold_gets_in_before_the_next_one()
     {
+        var hang    = TimeSpan.FromSeconds(30);
         int perHold = TraceStorageEngine.MaxSpansPerWriteHold;
         using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
         engine._readerHandoffTicks = System.Diagnostics.Stopwatch.Frequency * 30;   // a hang guard, not a timer
+        var rw = engine.LockForTest;
 
         var items = new SpanIngestItem[3 * perHold];
         for (int i = 0; i < items.Length; i++) items[i] = Item(i, BaseNano + i * 1_000L);
 
-        // WARM THE PATH BETWEEN TWO HOLDS FIRST. On a cold engine the first gap between holds is
-        // where the hand-off is JIT-compiled, and a compile is hundreds of microseconds — ample time
-        // for a woken writer to take the lock, so the barging this fact is about never happens and
-        // the fact passes with no hand-off at all. Measured: 16 of 16 runs green without the fix,
-        // cold; warm, the drainer re-enters ahead of the queued writer.
-        var warm = new SpanIngestItem[2 * perHold];
-        for (int i = 0; i < warm.Length; i++) warm[i] = Item(10_000 + i, BaseNano - 1_000_000_000L + i * 1_000L);
-        Assert.Equal(warm.Length, engine.WriteSpans(warm));
-
+        using var holderIn    = new ManualResetEventSlim();
         using var writerWasIn = new ManualResetEventSlim();
-        Thread? writer        = null;
-        bool queued           = false;
-        bool inBySecondHold   = false;
+        Thread? holder = null, writer = null;
+        int  handoffWaits    = 0;
+        bool queued          = false;
+        bool reenteredPastIt = false;
+        bool inBySecondHold  = false;
+
+        engine._handoffWaitingForTest = () => Interlocked.Increment(ref handoffWaits);
+        engine._betweenWriteHoldsForTest = taken =>
+        {
+            if (taken != perHold) return;                                  // the gap after the first hold only
+
+            holder = new Thread(() =>
+            {
+                rw.EnterWriteLock();                                       // the lock is free: the gap
+                holderIn.Set();
+                SpinWait.SpinUntil(() => Volatile.Read(ref handoffWaits) > 0 || rw.WaitingWriteCount >= 2, hang);
+                reenteredPastIt = rw.WaitingWriteCount >= 2;               // the drainer queued beside the writer
+                rw.ExitWriteLock();
+            }) { IsBackground = true };
+            holder.Start();
+            Assert.True(holderIn.Wait(hang), "setup: the holder never took the lock");
+
+            writer = new Thread(() =>
+            {
+                rw.EnterWriteLock();
+                writerWasIn.Set();
+                rw.ExitWriteLock();
+            }) { IsBackground = true };
+            writer.Start();
+            // In the lock's own wait, behind the holder — not merely started.
+            queued = SpinWait.SpinUntil(() => rw.WaitingWriteCount > 0, hang);
+        };
         engine._insideWriteHoldForTest = taken =>
         {
-            if (taken == perHold)
-            {
-                var rw = engine.LockForTest;
-                writer = new Thread(() =>
-                {
-                    rw.EnterWriteLock();
-                    writerWasIn.Set();
-                    rw.ExitWriteLock();
-                }) { IsBackground = true };
-                writer.Start();
-                // Blocked behind THIS hold, in the lock's own wait — not merely started.
-                queued = SpinWait.SpinUntil(() => rw.WaitingWriteCount > 0, TimeSpan.FromSeconds(30));
-            }
-            else if (taken == 2 * perHold)
-            {
-                inBySecondHold = writerWasIn.IsSet;
-            }
+            if (taken == 2 * perHold) inBySecondHold = writerWasIn.IsSet;
         };
 
         Assert.Equal(items.Length, engine.WriteSpans(items));
-        Assert.True(writer!.Join(TimeSpan.FromSeconds(30)));
+        Assert.True(holder!.Join(hang));
+        Assert.True(writer!.Join(hang));
 
         Assert.True(queued, "setup: the writer never queued on the engine lock");
+        Assert.False(reenteredPastIt, "the drainer went for its next hold with a writer still queued behind the last one");
+        Assert.Equal(1, Volatile.Read(ref handoffWaits));
         Assert.True(inBySecondHold, "the next hold began with a writer still queued behind the last one");
     }
 

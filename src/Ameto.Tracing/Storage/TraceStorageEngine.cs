@@ -1082,6 +1082,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 {
                     _lock.ExitWriteLock();
                 }
+                _betweenWriteHoldsForTest?.Invoke(taken);
                 LetQueuedWaitersIn();
                 if (flushStartFault is not null)
                 {
@@ -1213,6 +1214,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     {
         int writersQueued = _lock.WaitingWriteCount;
         if (writersQueued == 0 && _lock.WaitingReadCount == 0) return;
+        _handoffWaitingForTest?.Invoke();
         long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
         var  spin     = new SpinWait();
         while ((writersQueued > 0 && _lock.WaitingWriteCount >= writersQueued)          // none of them in yet
@@ -1228,6 +1230,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>Test seam: called INSIDE each write hold of <see cref="WriteSpans"/>, after the spans joined the tier.</summary>
     internal Action<int>? _insideWriteHoldForTest;
+
+    /// <summary>
+    /// Test seam: called between two write holds of <see cref="WriteSpans"/> — the lock just released,
+    /// the hand-off (<see cref="LetQueuedWaitersIn"/>) not yet decided — with the spans taken so far.
+    /// A test queues a writer here, behind a holder it controls, so whether the next hold waits for
+    /// it is decided by the hand-off and not by which thread the scheduler runs first.
+    /// </summary>
+    internal Action<int>? _betweenWriteHoldsForTest;
+
+    /// <summary>Test seam: <see cref="LetQueuedWaitersIn"/> found a reader or a writer queued and is about to wait for it.</summary>
+    internal Action? _handoffWaitingForTest;
 
     /// <summary>
     /// Test hook: the live log. Lets a test hold the log and the hot tier side by side — the pair
