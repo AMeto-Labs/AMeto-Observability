@@ -2858,6 +2858,44 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private void LoadColdSegmentsCore()
     {
+        // A SCAN THAT FAILS AS A WHOLE — the directory would not list, the enumeration broke off —
+        // is said ONCE, as an Error that names what it costs, and ends here (#94; the metric and
+        // log engines say the same). The files it did not reach stay out of the cold tier until a
+        // restart, so the tier is marked short and every trace read over any window reports an
+        // unreadable region rather than a complete answer. It used to escape to the compaction
+        // worker, which logged "cold-segment load failed" and nothing about the alert rules that go
+        // on reading the missing window as a quiet one. A file that fails on its own is not this:
+        // the scan handles those one by one, each with its own line.
+        try { ScanColdSegments(); }
+        catch (Exception ex)
+        {
+            _coldTierIncomplete = true;
+            LogColdScanFailed(_logger, ex, _dataDir);
+        }
+    }
+
+    /// <summary>
+    /// The cold scan failed as a whole — see <see cref="LoadColdSegmentsCore"/>. The trace side's
+    /// twin of the metric engine's line of the same name.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "The cold trace segment scan of {DataDirectory} failed: the segments on disk are not served until a "
+                + "restart, and trace queries answer from the hot tier and what has been flushed since, reporting the "
+                + "window as unreadable. Trace ALERT RULES keep being evaluated on that partial data: a missing window "
+                + "reads as a quiet one, so a \"<\" rule can fire and a \">\" rule can resolve on spans that exist but "
+                + "were not loaded. Restart once the cause is fixed")]
+    private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
+
+    /// <summary>
+    /// Test seam: thrown from the start of the cold scan — the scan failing as a whole, which
+    /// nothing else produces on demand. Null in production.
+    /// </summary>
+    internal Exception? _failColdScanForTest;
+
+    private void ScanColdSegments()
+    {
+        if (_failColdScanForTest is { } fault) throw fault;
+
         var sw     = System.Diagnostics.Stopwatch.StartNew();
         var loaded = new List<SpanSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.trc").OrderBy(f => f))
