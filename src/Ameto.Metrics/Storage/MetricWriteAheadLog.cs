@@ -1,10 +1,12 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using Ameto.Core;
 using Microsoft.Extensions.Logging;
 
 namespace Ameto.Metrics.Storage;
@@ -49,19 +51,63 @@ internal enum MetricWalCommit
 /// would carry its full label set, which is the bulk of a metric's bytes.</para>
 ///
 /// <code>
-///   metrics.wal
-///     [File Header — 32 bytes]
+///   metrics.wal (v2)
+///     [File Header — 64 bytes; v1's was the first 32 of them]
 ///       0   Magic               uint32  "RDMW"
-///       4   Version             uint16  1
+///       4   Version             uint16  2   (1 is still READ: see Open). v2 IS this 64-byte header;
+///                                           see IsPreReleaseV2 for the 32-byte one no release wrote
 ///       6   _pad                uint16
-///       8   WriteOffset         int64
+///       8   WriteOffset         int64   absolute: includes this header
 ///      16   Generation          uint64  stamped on new appends
 ///      24   CommittedGeneration uint64  everything at or below this is already in files
-///     [Entry — 48 bytes, Pack = 1][BucketCounts: BucketCount × int64]
+///      32   MoveFrom            int64   the relocation record: see RelocateLocked
+///      40   MoveLength          int64   0 = no relocation in flight
+///      48   MoveDone            int64
+///      56   Crc                 uint32  CRC32C over bytes [0, 8) and [16, 56): all but the claim
+///      60   PendingCrc          uint32  the same, of the state a store in progress is writing
+///     [Entry Header — 48 bytes, Pack = 1, the fields of MetricWalEntryHeader]
+///     [Crc          — uint32, CRC32C over the 48 header bytes + the bucket counts]
+///     [BucketCounts — BucketCount × int64]
 ///
-///   metrics.wal.pool
-///     [index uint32][byteLen uint32][kind, name, unit, labels, bounds]  (repeated)
+///   metrics.wal.pool (records of both shapes may sit in one file)
+///     v1: [index uint32][byteLen uint32][kind, name, unit, labels, bounds]
+///     v2: [index uint32][byteLen uint32, top byte 0xC5][crc uint32][same body]
+///         crc = CRC32C over the first 8 bytes of the record + the body
 /// </code>
+///
+/// <para><b>v2 is v1 plus a checksum per entry and per pool record, and a header long enough
+/// to record a relocation in flight (see <see cref="RelocateLocked"/>).</b> v1
+/// protected an entry only by judgement — the generation margin, the series-index cap, the
+/// header's claimed end checked against the walk — so a torn entry whose fields happened to
+/// decode as plausible (a generation inside the margin, a small series index) replayed as a
+/// point, and a flush then wrote it into a permanent <c>.mts</c>, the way the #56 incident's
+/// year-2116 garbage point did on every restart. The CRC is stored after the 48 header bytes and
+/// written LAST, and every walk that decides what the data is — the open-time reconciliation,
+/// both passes of <see cref="ReadAll"/> — stops at the first entry that does not verify. The
+/// judgement checks stay, BEHIND it (see <see cref="EntryAt"/>): a checksum failure is reported as
+/// the torn write an unclean stop leaves, whatever its fields decode to, and an impossible
+/// generation or series index is classified as corruption (an Error and a quarantine copy) only
+/// in an entry that verifies. They are all a log that could not be upgraded has (see
+/// <see cref="Open"/>).</para>
+///
+/// <para><b>Durability, stated because it is a choice.</b> Nothing msyncs this log: not an
+/// append, not a timer — THERE IS NO PERIODIC FSYNC BETWEEN FLUSHES — and not a commit either.
+/// A flushed point's durable copy is its <c>.mts</c>, which the writer forces to disk before the
+/// commit; the log's own pages reach the disk when the OS writes them back, and at
+/// <see cref="Dispose"/>. So the death of the PROCESS loses nothing (the page cache is the
+/// file's), and the death of the MACHINE loses whatever had not been written back, in whatever
+/// page order the OS chose. Program order is what the checksum rides on: an entry's CRC is
+/// stored after its last field and bucket, and the header's write offset only after the whole
+/// batch (<see cref="WriteBatchLocked"/>), so a process that dies inside an append leaves the
+/// batch unclaimed, and every claimed entry verifies. After a power loss the checksum turns the
+/// loss into a clean cut at the first entry that does not verify instead of a replay of
+/// garbage. A commit's move of the surviving tail to the front is recorded in the v2 header
+/// before its first byte moves and finished at the next open if the process dies inside it
+/// (<see cref="RelocateLocked"/>) — without that, the checksum itself cut the log at the entry
+/// straddling the copy frontier and stranded every survivor not yet copied. What nothing here
+/// makes durable is that move across a POWER LOSS: the moved survivors and the header that
+/// names them sit on different pages, so the disk can keep the header and lose the move — the
+/// points that arrived during that flush are then lost, not misreplayed.</para>
 ///
 /// <para><b>Flush protocol.</b> A flush is two-phase, because points keep arriving while the
 /// files are being written and their log records must survive:</para>
@@ -143,20 +189,39 @@ internal enum MetricWalCommit
 /// are not written to cold files either, so replaying them would restore state that a normal
 /// flush never persisted.</para>
 /// </summary>
-internal sealed unsafe class MetricWriteAheadLog : IDisposable
+internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 {
     private const uint   MagicNumber     = 0x52_44_4D_57; // "RDMW"
-    private const ushort WalVersion      = 1;
-    private const int    FileHeaderSize  = 32;
-    private const int    EntryHeaderSize = 48;
+    private const ushort WalVersion      = 2;
+    private const ushort WalVersionV1    = 1;
     private const ulong  FirstGeneration = 1;
+
+    /// <summary>A v2 file header: v1's 32 bytes, then the relocation record and room. See <see cref="WalFileHeader"/>.</summary>
+    private const int    FileHeaderSize   = 64;
+
+    /// <summary>A v1 file header. Its data starts right after it, so a v1 log's offsets are 32 lower.</summary>
+    private const int    FileHeaderSizeV1 = 32;
+
+    /// <summary>The 48 bytes of <see cref="MetricWalEntryHeader"/> — every byte the entry checksum covers besides the buckets. All of a v1 entry header.</summary>
+    private const int    ChecksummedHeaderBytes = 48;
+
+    /// <summary>A v2 entry header: the checksummed 48 bytes, then the CRC32C over them and the bucket counts.</summary>
+    private const int    EntryHeaderSize   = ChecksummedHeaderBytes + sizeof(uint);
+
+    /// <summary>A v1 entry header: no checksum. Read, and appended only by a log whose upgrade could not commit.</summary>
+    private const int    EntryHeaderSizeV1 = ChecksummedHeaderBytes;
+
+    /// <summary>Where a v1 log is rewritten as v2 before it replaces the original. See <see cref="Open"/>.</summary>
+    internal const string UpgradeSuffix = ".upgrade.tmp";
 
     /// <summary>
     /// How far above the recovered header counter an entry's generation may run and still
     /// count as real data (the header page can lag the data pages across a power loss —
     /// nothing msyncs this log). Torn entries decode to effectively random u64 values, so
-    /// the margin rejects them while a legitimately lagging header stays replayable; the
-    /// airtight fix is a per-entry CRC in a v2 entry layout.
+    /// the margin rejects them while a legitimately lagging header stays replayable. The
+    /// per-entry CRC (v2) is what catches the torn entry whose generation lands INSIDE the
+    /// margin; this stays as the check that tells corruption from a torn write, and as all a
+    /// v1 log has.
     /// </summary>
     private const ulong  GenerationSanityMargin = 1_000_000;
 
@@ -177,6 +242,19 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>Bucket counts per histogram point are capped so the 16-bit length field holds.</summary>
     private const int MaxBucketCounts = ushort.MaxValue;
 
+    /// <summary>
+    /// The file header. The first 32 bytes are v1's, byte for byte; the rest exists in v2 only,
+    /// and a log that is v1 on disk never reads or writes past its 32 (see <c>_headerSize</c>).
+    ///
+    /// <para><b>The relocation record</b> (<see cref="MoveFrom"/>, <see cref="MoveLength"/>,
+    /// <see cref="MoveDone"/>) is what makes a commit's move of the surviving tail safe against
+    /// the process dying in the middle of it. See <see cref="RelocateLocked"/>.</para>
+    ///
+    /// <para><b><see cref="Crc"/></b> covers everything but <see cref="WriteOffset"/>: the counters
+    /// and the record, which change a few times per flush, and not the claim, which every batch
+    /// moves and which the open-time walk checks against the data anyway (#59). See
+    /// <see cref="SealHeaderLocked"/>.</para>
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
     {
@@ -186,14 +264,26 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         public long   WriteOffset;
         public ulong  Generation;
         public ulong  CommittedGeneration;
+        // ── v2 only ──
+        public long   MoveFrom;          // logical offset the surviving tail is moved from
+        public long   MoveLength;        // its length; 0 = no relocation in flight
+        public long   MoveDone;          // bytes of it already moved, always a chunk boundary
+        public uint   Crc;               // CRC32C over bytes [0, 8) and [16, 56): see SealHeaderLocked
+        public uint   PendingCrc;        // the same, of the header as the store in progress leaves it
     }
 
     /// <summary>
-    /// Pack = 1 pins the fields at 46 bytes inside the 48-byte stride. Without it the 8-byte
-    /// members would align and push the tail past the stride into the payload area.
-    /// A 64-bit generation removes any need to reason about wrap-around.
+    /// Pack = 1 pins the fields at exactly 48 bytes. Without it the 8-byte members would align
+    /// and push the tail past the stride into the payload area. A 64-bit generation removes any
+    /// need to reason about wrap-around. In v2 the entry's CRC follows these 48 bytes; it is not
+    /// a field here, so a v1 entry and a v2 entry share this struct byte for byte.
+    ///
+    /// <para><see cref="Reserved"/> is the two bytes v1 left as padding and never wrote. A v2
+    /// append writes it as zero, because the checksum covers it and may be computed from the
+    /// point in hand rather than from the map (see <see cref="PrecomputeChecksums"/>); an
+    /// upgraded v1 entry keeps whatever its padding held, checksummed as it is.</para>
     /// </summary>
-    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = EntryHeaderSize)]
+    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = ChecksummedHeaderBytes)]
     private struct MetricWalEntryHeader
     {
         public ulong  Generation;        // 0 = unwritten; see the class remarks
@@ -203,6 +293,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         public long   Count;
         public double Sum;
         public ushort BucketCount;       // number of int64 bucket counts that follow
+        public ushort Reserved;          // 0 in v2; unwritten padding in v1
     }
 
     /// <summary>A point recovered from the log, with the series it belongs to.</summary>
@@ -236,6 +327,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private ulong                     _generation;
     private ulong                     _committedGeneration;
     private bool                      _disposed;
+
+    /// <summary>
+    /// The entry stride this log reads and appends, and whether its entries and pool records
+    /// carry checksums: v2 (<see cref="EntryHeaderSize"/>, checksummed) unless the file on disk
+    /// is a v1 log (<see cref="EntryHeaderSizeV1"/>, no checksum) — which <see cref="Open"/>
+    /// upgrades, and which stays v1 for the life of the process only when that upgrade cannot
+    /// commit. Set by <see cref="OpenOrCreate"/> before the first walk and never again, so the
+    /// lock-free size pass of an append may read it.
+    /// </summary>
+    private int  _entryHeaderSize = EntryHeaderSize;
+    private bool _checksummed     = true;
+
+    /// <summary>
+    /// Where the data starts: <see cref="FileHeaderSize"/>, or <see cref="FileHeaderSizeV1"/> for
+    /// a log that is v1 on disk. Every offset into the mapping and every file size goes through
+    /// it. Set by <see cref="OpenOrCreate"/> before the mapping is sized, and never again.
+    /// </summary>
+    private int  _headerSize      = FileHeaderSize;
+
+    /// <summary>Set by <see cref="OpenOrCreate"/> when the file on disk is a v1 log; <see cref="Open"/> upgrades it.</summary>
+    private bool _legacyV1;
 
     /// <summary>
     /// The generation handed out by <see cref="BeginFlush"/> that has not yet been committed or
@@ -312,23 +424,350 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         Interner  = interner ?? MetricLabelInterner.Shared;
     }
 
+    /// <summary>
+    /// Opens the log, creating it if absent, and reconciles what a crash left (see
+    /// <see cref="OpenOrCreate"/>).
+    ///
+    /// <para><b>A v1 LOG IS UPGRADED, NOT DISCARDED.</b> The release before this one wrote v1, and
+    /// an unknown version is re-initialised as a foreign file — which, for the v1 log the first
+    /// start of this release finds, would silently drop every point the previous process logged
+    /// and never flushed. So a v1 file is opened with the v1 stride, reconciled exactly as that
+    /// release would have (the #59 repairs are version-blind), rewritten entry for entry as v2
+    /// into <c>metrics.wal.upgrade.tmp</c> (each entry's 48 header bytes and buckets verbatim, now
+    /// with a checksum), fsynced, and moved over the original — durably: a write-through move on
+    /// Windows, a directory fsync after the rename elsewhere (<see cref="DurableMove"/>), because an
+    /// atomic rename the disk has not committed can come undone in a power loss and bring the v1
+    /// log back under the name with its old watermark. The move is the commit point: a
+    /// crash before it leaves the v1 file authoritative and the next start upgrades it again; a
+    /// crash after it leaves a complete v2 file. A stale copy from an upgrade that died before
+    /// its move is deleted beside a v2 log and overwritten beside a v1 one.</para>
+    ///
+    /// <para><b>The pool is not rewritten.</b> Its records say their own version (see
+    /// <see cref="WritePoolRecord"/>), so v1 records stay readable beside the v2 ones appended
+    /// after them, and nothing forces a second file through a second atomic swap that could land
+    /// without the first. Rewriting them would buy nothing either: a checksum computed now, over
+    /// bytes read back from the disk, vouches for whatever those bytes are, torn or not. The same
+    /// is true of the upgraded entries — the upgrade cannot detect damage that happened before it
+    /// — and they are rewritten only because the stride changed. The v1 records go the first time
+    /// a commit empties the log.</para>
+    ///
+    /// <para><b>AN UPGRADE THAT CANNOT COMPLETE DOES NOT STOP THE SERVER.</b> This runs in the
+    /// metric engine's constructor, where a throw fails the host — once, on every existing
+    /// install, at the first start of the release. The move is retried briefly (an antivirus
+    /// scanner holding the fresh copy open is the sharing violation seen on Windows); if the copy
+    /// cannot be written (a full disk) or the move still fails, the log is opened AS v1, in place:
+    /// every point it holds replays, new points are appended in the v1 layout, the pool gets v1
+    /// records, the error is logged, and the upgrade is tried again at the next start. That is
+    /// exactly the log the previous release ran with, for one more process lifetime — and so
+    /// exactly the file a rollback to it can still read.</para>
+    ///
+    /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
+    /// foreign file and re-initialises it, which empties it and, with it, the pool. That costs
+    /// nothing only when the log held nothing unflushed — after a clean stop whose final flush
+    /// ran and no point arrived behind it; docs/CONFIGURATION.md ("Upgrading and rolling back")
+    /// tells operators how to get there.</para>
+    /// </summary>
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
                                            ILogger? logger = null, Action<long>? beforeResize = null,
-                                           MetricLabelInterner? interner = null)
+                                           MetricLabelInterner? interner = null) =>
+        Open(filePath, initialCapacity, logger, beforeResize, interner, io: null);
+
+    /// <summary>As the public <see cref="Open(string, long, ILogger, Action{long}, MetricLabelInterner)"/>, with the upgrade's I/O a test can replace.</summary>
+    internal static MetricWriteAheadLog Open(string filePath, long initialCapacity, ILogger? logger,
+                                             Action<long>? beforeResize, MetricLabelInterner? interner,
+                                             UpgradeIo? io)
     {
-        var wal = new MetricWriteAheadLog(filePath, logger, interner);
-        // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
-        // cannot reach — and its double-failure path is exactly what needs the coverage.
-        wal.BeforeResize = beforeResize;
-        wal.OpenOrCreate(initialCapacity);
+        io ??= UpgradeIo.Default;
+        string tmp = filePath + UpgradeSuffix;
+
+        var wal = OpenInstance(filePath, initialCapacity, logger, beforeResize, interner);
+        if (!wal._legacyV1)
+        {
+            // A STALE COPY from an upgrade that died before its move. Never the only copy of
+            // anything: until the move the v1 log is authoritative, and the move is atomic.
+            DeleteQuietly(tmp);
+            return wal;
+        }
+
+        int droppedFuture;
+        try { droppedFuture = wal.WriteUpgradedCopy(tmp); }
+        catch (Exception ex)
+        {
+            DeleteQuietly(tmp);
+            logger?.LogError(ex,
+                "The metric WAL at {Path} is a v1 log and its v2 copy could not be written; it stays v1 "
+              + "(no per-entry checksum) for this run, every point in it replays, and the upgrade is "
+              + "retried at the next start", filePath);
+            return wal;                                  // already open, in the v1 layout
+        }
+        wal.Dispose();                                   // the mapping has to go before the file can
+
+        // THE COMMIT POINT of the upgrade.
+        if (TryMoveWithRetry(tmp, filePath, io) is { } moveFailure)
+        {
+            DeleteQuietly(tmp);
+            logger?.LogError(moveFailure,
+                "The metric WAL at {Path} could not be replaced by its v2 copy after {Attempts} attempts; "
+              + "it stays v1 (no per-entry checksum) for this run, every point in it replays, and the "
+              + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
+        }
+        else
+        {
+            // The rename is atomic, not yet durable: until the directory entry reaches the disk a
+            // power loss can bring the v1 inode back under the name - with the watermark it had at
+            // the upgrade, so every flush since would replay as duplicates, and every point logged
+            // since would be gone. Windows' move is write-through (DurableMove); a POSIX rename is
+            // made durable by fsync on the directory, which is this.
+            if (!SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(filePath))!))
+                logger?.LogWarning(
+                    "The metric WAL at {Path} was upgraded, but its directory could not be synced: until the "
+                  + "file system commits the rename on its own, a power loss can bring the v1 log back.", filePath);
+
+            if (droppedFuture > 0)
+                logger?.LogWarning(
+                    "The metric WAL at {Path} was upgraded to v2 without {Count} v1 entries stamped more than a day "
+                  + "in the future — torn entries, which the replay would have refused anyway, and which the "
+                  + "upgrade's checksum must not vouch for.", filePath, droppedFuture);
+        }
+
+        // Whatever is at the path now: the v2 copy, or — the move is atomic — the v1 log as it was,
+        // which opens in the v1 layout by itself.
+        return OpenInstance(filePath, initialCapacity, logger, beforeResize, interner);
+    }
+
+    /// <summary>
+    /// Test seam: <see cref="OnRelocationStepForTest"/> for the logs this THREAD opens next — the only
+    /// way to reach a relocation the open itself finishes. Thread-static so that no other test's open
+    /// sees it. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<RelocationStep, long>? t_relocationStepForNextOpenForTest;
+
+    /// <summary>Test seam: <see cref="OnPendingStoredForTest"/> for the logs this THREAD opens next. Null in production.</summary>
+    [ThreadStatic] internal static Action<string, ulong>? t_pendingStoredForNextOpenForTest;
+
+    private static MetricWriteAheadLog OpenInstance(string filePath, long initialCapacity, ILogger? logger,
+                                                    Action<long>? beforeResize, MetricLabelInterner? interner)
+    {
+        var wal = new MetricWriteAheadLog(filePath, logger, interner)
+        {
+            // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
+            // cannot reach — and its double-failure path is exactly what needs the coverage.
+            BeforeResize = beforeResize,
+            OnRelocationStepForTest = t_relocationStepForNextOpenForTest,
+            OnPendingStoredForTest  = t_pendingStoredForNextOpenForTest,
+        };
+        try { wal.OpenOrCreate(initialCapacity); }
+        catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
         return wal;
+    }
+
+    /// <summary>
+    /// The pauses between the move's attempts: six attempts over ~0.8 s. Long enough for a scanner
+    /// to let go of a file it opened on creation, short enough that a move which will never succeed
+    /// costs a start less than a second. The span WAL's, for the same reason.
+    /// </summary>
+    private static readonly TimeSpan[] MoveRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>The move, retried on the I/O failures a transient holder causes. Null on success, else the last failure.</summary>
+    private static Exception? TryMoveWithRetry(string from, string to, UpgradeIo io)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                io.Move(from, to);
+                return null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= MoveRetryDelays.Length) return ex;
+                io.Wait(MoveRetryDelays[attempt]);
+            }
+        }
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort: an upgrade truncates it, and it replays nothing */ }
+    }
+
+    /// <summary>
+    /// The upgrade's move and the pause between its attempts, as a seam: a test fails the move
+    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>.
+    /// </summary>
+    internal sealed class UpgradeIo
+    {
+        public static readonly UpgradeIo Default = new();
+
+        public Action<string, string> Move { get; init; } = DurableMove;
+        public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
+    }
+
+    /// <summary>
+    /// The upgrade's commit point: <paramref name="from"/> replaces <paramref name="to"/> atomically
+    /// and, on Windows, durably — <c>MoveFileEx</c> with <c>MOVEFILE_WRITE_THROUGH</c> does not return
+    /// until the move is on the disk, which <see cref="File.Move(string, string, bool)"/> cannot ask
+    /// for. Elsewhere it is <see cref="File.Move(string, string, bool)"/> (rename(2), atomic) and the
+    /// caller fsyncs the directory (<see cref="SyncDirectory"/>). Fails the way File.Move does —
+    /// <see cref="UnauthorizedAccessException"/> for access denied, <see cref="IOException"/>
+    /// otherwise — because the retry around it filters on exactly those two.
+    ///
+    /// <para>The paths go to <c>MoveFileExW</c> in their <c>\\?\</c> form, because without it the call
+    /// is limited to MAX_PATH where File.Move is not — a data directory deep enough would have failed
+    /// the upgrade on every start. <c>MOVEFILE_COPY_ALLOWED</c> is not passed, deliberately: the copy
+    /// sits beside the log, so this is always a rename, and a copy-and-delete (the one case where
+    /// write-through covers less than the data) cannot happen — which is why no FlushFileBuffers of
+    /// the result follows it.</para>
+    /// </summary>
+    internal static void DurableMove(string from, string to)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            File.Move(from, to, overwrite: true);
+            return;
+        }
+
+        const uint MoveFileReplaceExisting = 0x1, MoveFileWriteThrough = 0x8;
+        if (Native.MoveFileEx(ExtendedPath(from), ExtendedPath(to), MoveFileReplaceExisting | MoveFileWriteThrough))
+            return;
+
+        int error = Marshal.GetLastPInvokeError();
+        string message = $"Could not move '{from}' over '{to}': {Marshal.GetPInvokeErrorMessage(error)}";
+        if (error == 5) throw new UnauthorizedAccessException(message);        // ERROR_ACCESS_DENIED
+        throw new IOException(message, unchecked((int)0x80070000) | error);     // HRESULT_FROM_WIN32
+    }
+
+    /// <summary>The Win32 extended-length (<c>\\?\</c>, or <c>\\?\UNC\</c>) form of a path, which the W APIs take past MAX_PATH.</summary>
+    private static string ExtendedPath(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (full.StartsWith(@"\\?\", StringComparison.Ordinal) || full.StartsWith(@"\\.\", StringComparison.Ordinal)) return full;
+        return full.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + full[2..] : @"\\?\" + full;
+    }
+
+    /// <summary>
+    /// fsyncs the directory <paramref name="directory"/>, so a rename inside it survives a power loss.
+    /// True where that happened or where the platform has nothing to do (Windows, whose move was
+    /// write-through); false when it could not be done — a failed call, or no libc to call at all.
+    /// It runs AFTER the rename has committed, so it must not throw: an exception here would fail
+    /// the engine's start over a log that is already upgraded. macOS gets fsync, not F_FULLFSYNC —
+    /// the residual the rest of this log already accepts there.
+    /// </summary>
+    internal static bool SyncDirectory(string directory)
+    {
+        if (OperatingSystem.IsWindows()) return true;
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return false;
+
+        try
+        {
+            int fd = Native.Open(directory, 0 /* O_RDONLY */);
+            if (fd < 0) return false;
+            try { return Native.Fsync(fd) == 0; }
+            finally { Native.Close(fd); }
+        }
+        catch (Exception) { return false; }      // DllNotFoundException, EntryPointNotFoundException, …
+    }
+
+    private static partial class Native
+    {
+        [LibraryImport("kernel32.dll", EntryPoint = "MoveFileExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static partial bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
+        [LibraryImport("libc", EntryPoint = "open", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int Open(string path, int flags);
+
+        [LibraryImport("libc", EntryPoint = "fsync", SetLastError = true)]
+        internal static partial int Fsync(int fd);
+
+        [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
+        internal static partial int Close(int fd);
+    }
+
+    /// <summary>
+    /// Rewrites this (v1) log as v2 at <paramref name="tmpPath"/> and fsyncs it; returns how many
+    /// entries it refused to carry over. Every entry the open-time walk accepted — everything below
+    /// <c>_writeOffset</c>, committed generations included, exactly as the v1 file holds them — is
+    /// copied: its 48 header bytes and its bucket counts verbatim, the checksum computed over them.
+    /// It is sized along the same capacity ladder a reopen at this log's floor would fit it to, so
+    /// the reopen neither grows nor shrinks it.
+    ///
+    /// <para><b>The checksum computed here vouches for whatever the v1 bytes ARE,</b> torn or not,
+    /// so nothing may be copied that v1's own judgement already refuses. The walk stops at a
+    /// generation past the margin and a series index past the cap (the v1 reconcile at open already
+    /// cut the log there), and an entry stamped past <see cref="MetricStorageEngine.FutureLimitNanos"/>
+    /// — the incident's year-2116 head is exactly that — is DROPPED: not copied, while the walk goes
+    /// on with the stride it declares (the far-future guard is the only one of the three that
+    /// judges a value rather than the framing, so the entries after it are no less trustworthy
+    /// than they were). The engine's replay would have refused such a point anyway; before this,
+    /// the upgrade gave it a valid checksum and it replayed from v2 as well. What no check can see
+    /// is a torn v1 entry whose fields all happen to decode plausible — a sane timestamp, a garbage
+    /// value — and that one IS blessed: a v1 entry carries nothing to tell it from a real one.</para>
+    /// </summary>
+    private int WriteUpgradedCopy(string tmpPath)
+    {
+        lock (_writeLock)
+        {
+            if (_ptr is null) throw new InvalidOperationException("Metric WAL has no mapping to upgrade from.");
+
+            using var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                                          bufferSize: 64 * 1024);
+            Span<byte> fileHeader = stackalloc byte[FileHeaderSize];
+            fileHeader.Clear();
+            fs.Write(fileHeader);                        // placeholder; the real one goes in last
+
+            byte* data = _ptr + _headerSize;                 // the v1 map: data at 32
+            Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
+            long pos = 0, written = 0, total;
+            long futureLimit = MetricStorageEngine.FutureLimitNanos();
+            int  dropped     = 0;
+            while ((total = EntryAt(data, pos, _writeOffset, verify: false, out _)) > 0)
+            {
+                if (Unsafe.AsRef<MetricWalEntryHeader>(data + pos).TimestampUnixNano > futureLimit)
+                {
+                    dropped++;
+                    pos += total;
+                    continue;
+                }
+
+                var header  = new ReadOnlySpan<byte>(data + pos, ChecksummedHeaderBytes);
+                var buckets = new ReadOnlySpan<byte>(data + pos + EntryHeaderSizeV1, (int)(total - EntryHeaderSizeV1));
+                BinaryPrimitives.WriteUInt32LittleEndian(crcBytes, Crc32c.Append(Crc32c.Append(0, header), buckets));
+
+                fs.Write(header);
+                fs.Write(crcBytes);
+                fs.Write(buckets);
+                written += EntryHeaderSize + buckets.Length;
+                pos     += total;
+            }
+
+            fs.SetLength(FileHeaderSize + FitCapacity(written));
+
+            var hdr = new WalFileHeader
+            {
+                Magic               = MagicNumber,
+                Version             = WalVersion,
+                WriteOffset         = FileHeaderSize + written,
+                Generation          = _generation,
+                CommittedGeneration = _committedGeneration,
+            };
+            hdr.Crc = hdr.PendingCrc = HeaderChecksum(in hdr);
+            MemoryMarshal.Write(fileHeader, in hdr);
+            fs.Position = 0;
+            fs.Write(fileHeader);
+            fs.Flush(flushToDisk: true);
+            return dropped;
+        }
     }
 
     private void OpenOrCreate(long initialCapacity)
     {
         _floorCapacity = Math.Max(initialCapacity, 1);
         bool exists   = File.Exists(_filePath);
-        long fileSize = FileHeaderSize + initialCapacity;
 
         // ONE handle, held until Dispose, and every mapping is created over it. Reopening by
         // path on each resize is a race with anything that reads the file — and "anything"
@@ -338,30 +777,83 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // what was a routine resize. Measured, not imagined: a retrying reader killed it on its
         // first attempt. Resizes now run against this handle, which nothing can contend.
         _file = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+
+        // The version decides the header's size, and the header's size decides where the data
+        // starts — so it is read off the handle before the mapping is sized.
+        ushort onDisk = exists ? VersionOnDisk(_file) : (ushort)0;
+        bool   known  = onDisk is WalVersion or WalVersionV1;
+        if (onDisk == WalVersionV1)
+        {
+            // Left in the v1 layout, and read with it — BEFORE the walk below, which has to step
+            // with the file's own stride. Open upgrades it once it is open (see there).
+            _legacyV1        = true;
+            _headerSize      = FileHeaderSizeV1;
+            _entryHeaderSize = EntryHeaderSizeV1;
+            _checksummed     = false;
+        }
+
+        long fileSize = _headerSize + initialCapacity;
         if (_file.Length < fileSize) _file.SetLength(fileSize);
         else                         fileSize = _file.Length;   // reopen an already-grown log
 
-        _capacity = fileSize - FileHeaderSize;
+        _capacity = fileSize - _headerSize;
         Map(fileSize);
 
         ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-        if (!exists || hdr.Magic != MagicNumber || hdr.Version != WalVersion)
+        if (known && !_legacyV1 && !HeaderVerifies(in hdr) && IsPreReleaseV2(fileSize))
         {
+            _logger?.LogError(
+                "Metric WAL at {Path} is a v2 log with the 32-byte header of a pre-release build — no release wrote " +
+                "one; v2 is the 64-byte header. It is re-initialised rather than read at the wrong offset, and the " +
+                "points it held are dropped.", _filePath);
+            known = false;
+        }
+
+        if (!known)
+        {
+            // New, foreign or future-versioned file — re-initialise in place, as v2. Anything
+            // already there cannot be replayed under a layout this build does not know.
             hdr.Magic               = MagicNumber;
             hdr.Version             = WalVersion;
-            hdr.WriteOffset         = FileHeaderSize;
+            hdr.WriteOffset         = _headerSize;
             hdr.Generation          = FirstGeneration;
             hdr.CommittedGeneration = 0;
+            hdr.MoveLength          = 0;
+            hdr.MoveFrom            = 0;
+            hdr.MoveDone            = 0;
             _writeOffset            = 0;
             _generation             = FirstGeneration;
             _committedGeneration    = 0;
+            SealHeaderLocked();
         }
         else
         {
-            _writeOffset         = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
+            _writeOffset         = Math.Max(0, hdr.WriteOffset - _headerSize);
             _generation          = hdr.Generation;
             _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
+
+            // Decided before anything below re-seals the header. A v1 header has no checksum.
+            bool counted = _legacyV1 || HeaderVerifies(in hdr);
+
+            // A header that verifies only by its PENDING checksum — the previous process stopped
+            // between a field and its seal — is sealed before anything else is stored: the next
+            // covered store overwrites PendingCrc first, and a second stop before that store's
+            // field would leave a header matching neither slot, a false "does not verify".
+            if (counted) SealHeaderLocked();
+
+            // Nothing below may make a header that did NOT verify verify again before its counters
+            // are rebuilt: a process killed during this open would otherwise leave the old counters
+            // sealed, and the next open would skip the rebuild. Released, and the header sealed
+            // once, at the end of the open.
+            _sealsHeld = !counted;
+
+            // A commit's move of the surviving tail that the process did not live to finish is
+            // finished here, before anything walks the data. See RelocateLocked.
+            if (!_legacyV1) FinishRelocationLocked(ref hdr, trusted: counted);
+
+            // A header whose counters do not verify gets them back from the entries. See there.
+            if (!counted) RebuildCountersLocked(ref hdr);
 
             // The counter must LEAD the watermark. BeginFlush only ever hands out _generation
             // and CommitFlush only ever names a generation it was handed, so a header where the
@@ -375,8 +867,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // (`Generation == 0 ? FirstGeneration : …`) landed for the only case it covered.
             if (_generation <= _committedGeneration)
             {
-                _generation    = _committedGeneration + 1;
-                hdr.Generation = _generation;
+                _generation = _committedGeneration + 1;
+                StoreCovered(HeaderField.Generation, _generation);
             }
 
             // The header's WriteOffset is a CLAIM, and the poisoned-log incident is what
@@ -385,6 +877,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // the data itself say where it ends.
             ReconcileDataEndLocked(ref hdr);
 
+            _sealsHeld = false;
+            SealHeaderLocked();
         }
 
         // A file that grew stays grown across restarts otherwise ("reopen an already-grown log"
@@ -445,21 +939,41 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // index space by any route, and reuse at the ceiling beats reuse from zero.
         //
         // THE INDICES ONLY. Seeding needs the largest index of every record, dead or alive, and
-        // nothing about their text: the walk reads each record's head and steps over its body, so
-        // opening the log interns nothing (see LoadPool for why that matters).
+        // nothing about their text: the walk steps over a v1 record's body and reads a v2 record's
+        // whole only to verify it — never decoding either — so opening the log interns nothing
+        // (see LoadPool for why that matters).
+        //
+        // The pool is therefore read twice on the engine's start: here, for the ceiling, the
+        // clean end and the checksums, and again by ReadAll, for the referenced bodies. Kept so on
+        // purpose: sharing one read means carrying the bodies from the open to the first ReadAll
+        // and knowing when an append has made them stale — state for a second sequential read of a
+        // file that is bounded by the series registered since the log was last empty, and that
+        // the first read has just put in the page cache.
         if (_writeOffset > 0)
         {
-            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne);
+            ReadPoolRecords(keep: null, out long cleanPoolEnd, out ulong poolMaxPlusOne, out int badRecords);
 
             _nextSeriesIndex = (uint)Math.Min(uint.MaxValue,
                                               Math.Max(poolMaxPlusOne, _survivorSeriesSeed));
 
+            if (badRecords > 0)
+                _logger?.LogWarning(
+                    "Metric WAL pool: {Count} series record(s) fail their checksum and are skipped; points that " +
+                    "reference them replay as unresolved, the records after them are read as usual.", badRecords);
+
             // A torn pool tail is not just a lost record: the next WritePoolRecord appends
             // AFTER the garbage, so every record from then on is read at the wrong offset and
             // the whole pool decodes into nonsense. Cutting the file back to the last clean
-            // boundary costs one already-unreadable record and keeps the file parseable.
-            if (cleanPoolEnd < _poolStream.Length)
+            // boundary costs one already-unreadable record and keeps the file parseable. Only
+            // where the FRAMING broke — a record that merely fails its checksum is stepped over
+            // above and cut by nothing.
+            long poolLength = _poolStream.Length;
+            if (cleanPoolEnd < poolLength)
             {
+                _logger?.LogWarning(
+                    "Metric WAL pool: cutting {Bytes} byte(s) of torn records at offset {Offset} — their framing is " +
+                    "unreadable, and a record appended after them would be read at the wrong offset.",
+                    poolLength - cleanPoolEnd, cleanPoolEnd);
                 try
                 {
                     _poolStream.SetLength(cleanPoolEnd);
@@ -473,9 +987,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// Walks the entries from the front and truncates the logical end of data to where the walk
-    /// stops, when the header claims more. The stop conditions are the same three every other
-    /// scan in this class uses — a torn length, the generation-0 end marker, a generation no
-    /// append could have stamped — so after this the header, the scans and the data agree.
+    /// stops, when the header claims more. The stop conditions are <see cref="EntryAt"/>'s — the
+    /// one definition every scan in this class steps with: a torn length, the generation-0 end
+    /// marker, a generation no append could have stamped, a series index no registration could
+    /// have issued, and (v2) a checksum that does not verify — so after this the header, the
+    /// scans and the data agree, and everything below the reconciled end verifies.
     ///
     /// <para>Also plants the end marker at the reconciled offset. Without it the truncation
     /// exists only in the header, and the header page is the one nothing msyncs: a crash could
@@ -483,37 +999,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private void ReconcileDataEndLocked(ref WalFileHeader hdr)
     {
-        byte* data = _ptr + FileHeaderSize;
+        byte* data = _ptr + _headerSize;
 
-        long    pos    = 0;
-        string? reason = null;
-        bool    corrupt = false;
-        ulong   seed    = 0;
+        long     pos     = 0;
+        ulong    seed    = 0;
+        ulong    lastGen = 0;
+        WalkStop stop;
+        long     total;
 
-        while (pos + EntryHeaderSize <= _writeOffset)
+        while ((total = EntryAt(data, pos, _writeOffset, verify: true, out stop)) > 0)
         {
             ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
-            long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
-
-            if (total <= 0 || pos + total > _writeOffset) { reason = "a torn final entry"; break; }
-            // NOT flagged as corruption: two legitimate crash shapes present exactly this way.
-            // Compact plants the marker and stores the header afterwards, so a crash between
-            // the two reopens with the old, larger claim over the survivors' originals; and
-            // nothing msyncs this log, so a lost data page under a persisted header reads as
-            // zeros — the marker — below the claimed end.
-            if (eh.Generation == 0) { reason = "an end-of-data marker"; break; }
-            if (eh.Generation > _generation + GenerationSanityMargin)
-            {
-                reason  = $"an entry whose generation ({eh.Generation}) no append could have stamped";
-                corrupt = true;
-                break;
-            }
-            if (eh.SeriesIndex >= SeriesIndexSanityCap)
-            {
-                reason  = $"an entry whose series index ({eh.SeriesIndex}) no registration could have issued";
-                corrupt = true;
-                break;
-            }
 
             // Every entry the walk accepts pins its series index, committed ones included: a
             // committed entry that is still physically here is replayed by nothing, but the
@@ -521,8 +1017,53 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // the bytes carrying it are still in the file costs nothing to avoid. A gap in the
             // indices is harmless — the pool is a map, not an array — a collision is not.
             if (eh.SeriesIndex + 1UL > seed) seed = eh.SeriesIndex + 1UL;
+            lastGen = eh.Generation;
 
             pos += total;
+        }
+
+        // A CLAIM THAT ENDS INSIDE AN ENTRY WHICH IS WHOLE AND VERIFIES is what rotted, not the
+        // data: every store of the claim lands on an entry boundary (a batch's end, a commit's new
+        // end, a repair's cut), and a power loss can only leave an OLDER claim, which is a boundary
+        // too. Truncating there, as a torn final entry, planted the end marker over a valid entry
+        // and cut every one after it. The claim is not covered by the header checksum (it moves on
+        // every batch), so the data says where the log ends: on through the entries that verify,
+        // for as long as their generations do not go backwards — an older one is what a reset left
+        // behind, not this log's tail.
+        if (stop is WalkStop.Short or WalkStop.Torn && pos < _writeOffset && _checksummed
+            && EntryAt(data, pos, _capacity, verify: true, out _) > 0)
+        {
+            long claimed = _writeOffset, cut = pos;
+            while ((total = EntryAt(data, pos, _capacity, verify: true, out _)) > 0)
+            {
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+                if (eh.Generation < lastGen) break;
+                if (eh.SeriesIndex + 1UL > seed) seed = eh.SeriesIndex + 1UL;
+                lastGen = eh.Generation;
+                pos += total;
+            }
+
+            _logger?.LogError(
+                "Metric WAL header claims {Claimed} bytes of data, which ends inside an entry at {At} that is whole and " +
+                "verifies; the claim is what rotted, and the data runs to {Actual}.", claimed, cut, pos);
+
+            _survivorSeriesSeed = seed;
+            _writeOffset        = pos;
+            hdr.WriteOffset     = _headerSize + pos;
+            if (pos + _entryHeaderSize <= _capacity)
+                Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
+
+            // The counter must cover what the walk just took in. A header that did not verify had
+            // its generation rebuilt from the entries BELOW the rotted claim; the ones found past it
+            // can be newer, and a counter left below them hands the next flush a generation that
+            // does not cover them — they stay above every watermark and replay, beside their own
+            // files, for as long as it takes the counter to catch up.
+            if (lastGen > _generation)
+            {
+                _generation = lastGen;
+                StoreCovered(HeaderField.Generation, _generation);
+            }
+            return;
         }
 
         // Before every return below, including the one that finds the header's claim intact:
@@ -530,11 +1071,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // when the pool tail was lost.
         _survivorSeriesSeed = seed;
 
-        if (reason is null)
+        if (pos == _writeOffset) return;   // the claim checks out — the normal case
+
+        ref var at = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+        string reason = stop switch
         {
-            if (pos == _writeOffset) return;   // the claim checks out — the normal case
-            reason = "a partial entry shorter than a header";
-        }
+            WalkStop.Short          => "a partial entry shorter than a header",
+            WalkStop.Torn           => "a torn final entry",
+            // NOT flagged as corruption: two legitimate crash shapes present exactly this way.
+            // Compact plants the marker and stores the header afterwards, so a crash between
+            // the two reopens with the old, larger claim over the survivors' originals; and
+            // nothing msyncs this log, so a lost data page under a persisted header reads as
+            // zeros — the marker — below the claimed end.
+            WalkStop.EndMarker      => "an end-of-data marker",
+            WalkStop.BadGeneration  => $"an entry whose generation ({at.Generation}) no append could have stamped",
+            WalkStop.BadSeriesIndex => $"an entry whose series index ({at.SeriesIndex}) no registration could have issued",
+            // NOT corruption either, by the same argument: a power loss writes the pages of an
+            // append back in any order, so a claimed entry whose own page did not land is the
+            // ordinary torn write of an unclean stop — v1 replayed it, garbage and all.
+            _                       => "an entry that fails its checksum",
+        };
+        bool corrupt = stop is WalkStop.BadGeneration or WalkStop.BadSeriesIndex;
 
         long orphaned = _writeOffset - pos;
 
@@ -574,10 +1131,85 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 orphaned, reason, pos, _writeOffset);
 
         _writeOffset    = pos;
-        hdr.WriteOffset = FileHeaderSize + pos;
+        hdr.WriteOffset = _headerSize + pos;
 
-        if (pos + EntryHeaderSize <= _capacity)
+        if (pos + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
+    }
+
+    /// <summary>Why <see cref="EntryAt"/> ended a walk.</summary>
+    private enum WalkStop : byte
+    {
+        None,
+        /// <summary>Less than a header left before the end.</summary>
+        Short,
+        /// <summary>The entry's buckets run past the end.</summary>
+        Torn,
+        /// <summary>Generation 0: never written, or the terminator a compaction or a repair planted.</summary>
+        EndMarker,
+        /// <summary>A generation far above the header counter — no append stamped it.</summary>
+        BadGeneration,
+        /// <summary>A series index past <see cref="SeriesIndexSanityCap"/> — no registration issued it.</summary>
+        BadSeriesIndex,
+        /// <summary>v2: the CRC does not match the bytes.</summary>
+        BadChecksum,
+    }
+
+    /// <summary>
+    /// THE ONE STEP EVERY WALK TAKES: the length of the entry at logical offset
+    /// <paramref name="pos"/> of <paramref name="data"/>, or 0 where the data ends before
+    /// <paramref name="end"/>, with <paramref name="stop"/> saying why. The checks run in this
+    /// order and each only reads what the ones before it proved is inside the range: a header
+    /// that does not fit, buckets that do not fit, the generation-0 marker, then — for a
+    /// checksummed log with <paramref name="verify"/> — the CRC, and last a generation or a series
+    /// index nothing could have written.
+    ///
+    /// <para><b>The CRC before the judgement, where there is one,</b> because the two mean
+    /// different things and the reconcile reports them differently. A random tear decodes to a
+    /// random generation, which lands past the margin almost always; judged first, every ordinary
+    /// torn write of an unclean stop was reported as corruption — an Error and a 4 MiB quarantine
+    /// copy — while only garbage that happened to fall inside the margin got the Warning a torn
+    /// write deserves. Checked first, a checksum failure is the torn write, whatever its fields
+    /// decode to, and an impossible generation or series index is corruption only in an entry
+    /// that VERIFIES — bytes written whole, and wrong: the one case the Error is for. Unverified
+    /// walks (Compact, a v1 log) have only the judgement, in the same order as before.</para>
+    ///
+    /// <para><see cref="Compact"/> steps with <paramref name="verify"/> false, deliberately: every
+    /// entry below <c>_writeOffset</c> of a live log was either written by this process under the
+    /// write lock, checksum last, or verified by the open-time walk that set <c>_writeOffset</c>,
+    /// and re-hashing the committed prefix there would add a pass over up to the whole log to a
+    /// commit that holds every lock the log has.</para>
+    /// </summary>
+    private long EntryAt(byte* data, long pos, long end, bool verify, out WalkStop stop)
+    {
+        int headerSize = _entryHeaderSize;
+        if (pos + headerSize > end) { stop = WalkStop.Short; return 0; }
+
+        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+        long total = (long)headerSize + eh.BucketCount * sizeof(long);
+
+        if (pos + total > end)                                    { stop = WalkStop.Torn;           return 0; }
+        if (eh.Generation == 0)                                   { stop = WalkStop.EndMarker;      return 0; }
+        if (verify && _checksummed
+            && Unsafe.ReadUnaligned<uint>(data + pos + ChecksummedHeaderBytes) != EntryChecksum(data + pos, eh.BucketCount))
+                                                                  { stop = WalkStop.BadChecksum;    return 0; }
+        if (eh.Generation > _generation + GenerationSanityMargin) { stop = WalkStop.BadGeneration;  return 0; }
+        if (eh.SeriesIndex >= SeriesIndexSanityCap)               { stop = WalkStop.BadSeriesIndex; return 0; }
+        stop = WalkStop.None;
+        return total;
+    }
+
+    /// <summary>
+    /// The v2 checksum of the entry at <paramref name="entry"/>, from the bytes where they sit:
+    /// CRC32C over its 48 header bytes and then its <paramref name="bucketCount"/> bucket counts,
+    /// which follow the CRC slot. Not the slot itself.
+    /// </summary>
+    private static uint EntryChecksum(byte* entry, int bucketCount)
+    {
+        uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(entry, ChecksummedHeaderBytes));
+        return bucketCount == 0
+            ? crc
+            : Crc32c.Append(crc, new ReadOnlySpan<byte>(entry + EntryHeaderSize, bucketCount * sizeof(long)));
     }
 
     /// <summary>
@@ -601,7 +1233,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private void ShrinkLocked(long targetCapacity, string when)
     {
         long oldCapacity = _capacity;
-        long newFileSize = FileHeaderSize + targetCapacity;
+        long newFileSize = _headerSize + targetCapacity;
 
         Unmap();
         try
@@ -622,10 +1254,10 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // Append/BeginFlush already refuse that state honestly.
             try
             {
-                BeforeResize?.Invoke(oldCapacity + FileHeaderSize);
+                BeforeResize?.Invoke(oldCapacity + _headerSize);
                 long actual = _file!.Length;
                 Map(actual);
-                _capacity = actual - FileHeaderSize;
+                _capacity = actual - _headerSize;
                 _logger?.LogWarning(ex,
                     "Metric WAL shrink at {When} failed; continuing at {MiB:F0} MiB.",
                     when, _capacity / 1048576.0);
@@ -744,11 +1376,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// under its snapshot read lock, and a growth run there held off the threshold flush's write
     /// lock for the length of a file extension.
     /// </summary>
-    public void AppendResolved(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<uint> resolved, long epoch)
-    {
-        OnSeriesResolvedForTest?.Invoke();
+    public void AppendResolved(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<uint> resolved, long epoch) =>
         AppendCore(items, default, resolved, epoch);
-    }
 
     private static SeriesKey KeyOf(MetricIngestItem item) =>
         new(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty, item.Labels ?? LabelSet.Empty);
@@ -764,57 +1393,160 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     {
         if (items.IsEmpty) return;
 
-        // THE BATCH'S SIZE, KNOWN BEFORE THE LOCK — so the log is big enough before the batch
-        // starts, and growing it never happens inside the append's critical section. See Grow.
-        long batchBytes = 0;
-        for (int i = 0; i < items.Length; i++)
+        // THE BATCH'S SIZE AND ITS CHECKSUMS, KNOWN BEFORE THE LOCK — so the log is big enough
+        // before the batch starts, growing it never happens inside the append's critical section
+        // (see GrowTo), and neither does hashing it (see PrecomputeChecksums). Only a batch whose
+        // series were resolved outside the lock can be hashed here: an entry's series index is
+        // one of the bytes the checksum covers.
+        uint[]? crcs          = null;
+        ulong   crcGeneration = 0;
+        if (_checksummed && !preResolved.IsEmpty)
         {
-            long[]? b = points.IsEmpty ? items[i].BucketCounts : points[i].BucketCounts;
-            batchBytes += EntryHeaderSize + (b is null ? 0 : Math.Min(b.Length, MaxBucketCounts)) * sizeof(long);
+            crcs          = ArrayPool<uint>.Shared.Rent(items.Length);
+            crcGeneration = Volatile.Read(ref _generation);
         }
 
-        while (true)
+        try
         {
-            long needed;
-            lock (_writeLock)
+            long batchBytes = PrecomputeChecksums(items, points, preResolved,
+                                                  crcs is null ? default : crcs.AsSpan(0, items.Length), crcGeneration);
+
+            // The window between the lock-free work — the series lookups, the checksums — and the
+            // write lock: a commit can clear the registry in it, and a flush can open a generation.
+            if (!preResolved.IsEmpty) OnSeriesResolvedForTest?.Invoke();
+
+            while (true)
             {
-                if (_disposed) return;                      // shutdown race — dropping is correct
-                if (_ptr is null)
-                    throw new InvalidOperationException(
-                        "Metric WAL has no mapping; the log is not accepting appends.");
-
-                needed = _writeOffset + batchBytes;
-                if (needed <= _capacity)
+                long needed;
+                lock (_writeLock)
                 {
-                    WriteBatchLocked(items, points, preResolved, resolvedAtEpoch);
-                    // Claimed here, RUN by the caller once it holds no lock: see AppendResolved.
-                    WantsPreGrowLocked();
-                    return;
-                }
-            }
+                    if (_disposed) return;                      // shutdown race — dropping is correct
+                    if (_ptr is null)
+                        throw new InvalidOperationException(
+                            "Metric WAL has no mapping; the log is not accepting appends.");
 
-            // Did not fit. Grow OUTSIDE the write lock — every other thread whose batch fits keeps
-            // appending into the mapping it has meanwhile — and try again: somebody else's batch
-            // may have taken the room in between, which the loop simply measures again.
-            lock (_resizeLock) GrowTo(needed);
+                    needed = _writeOffset + batchBytes;
+                    if (needed <= _capacity)
+                    {
+                        WriteBatchLocked(items, points, preResolved, resolvedAtEpoch,
+                                         crcs is null ? default : crcs.AsSpan(0, items.Length), crcGeneration);
+                        // Claimed here, RUN by the caller once it holds no lock: see AppendResolved.
+                        WantsPreGrowLocked();
+                        return;
+                    }
+                }
+
+                // Did not fit. Grow OUTSIDE the write lock — every other thread whose batch fits keeps
+                // appending into the mapping it has meanwhile — and try again: somebody else's batch
+                // may have taken the room in between, which the loop simply measures again.
+                lock (_resizeLock) GrowTo(needed);
+            }
         }
+        finally { if (crcs is not null) ArrayPool<uint>.Shared.Return(crcs); }
     }
 
     /// <summary>
+    /// The batch's size in log bytes, and — into <paramref name="crcs"/>, when it is not empty —
+    /// each entry's checksum, computed from the point in hand rather than from the map, under
+    /// <paramref name="generation"/> and the series index the caller resolved. No lock.
+    ///
+    /// <para><b>WHY OUTSIDE THE LOCK.</b> Every byte an entry's CRC covers is known before the
+    /// write lock except two: the generation, which only <see cref="BeginFlush"/> moves, and the
+    /// series index, which a series not yet registered gets only under the lock. So the hash is
+    /// taken here, against the generation read now and the index resolved before, and
+    /// <see cref="WriteBatchLocked"/> stores it only where both still hold — otherwise it hashes
+    /// that entry from the map, under the lock. Measured on the log alone
+    /// (<c>MetricWalAppendContentionProbe</c>; each run reports the best of five per thread count,
+    /// and these are the medians of ten such runs): hashing every entry from the
+    /// map under the lock cost ~20 ns a point per thread at one and two threads (141 and 151 ns
+    /// against 121 and 134 without a checksum); hashing here, nothing the runs could separate
+    /// from none (117 and 127). Nothing about the entry's POSITION is in the checksum, so neither
+    /// a commit relocating the tail nor a growth swapping the mapping in the window can make a
+    /// precomputed value wrong.</para>
+    ///
+    /// <para><b>What makes "from the point in hand" the same bytes as the map.</b> The locked
+    /// write derives the point through the same <see cref="MetricIngestItem.ToDataPoint"/>, copies
+    /// the same bucket array, and writes <see cref="MetricWalEntryHeader.Reserved"/> as the zero
+    /// this struct carries. The buckets are the caller's, and a caller that mutated them between
+    /// the two would get an entry the next replay stops at; a Debug build checks every precomputed
+    /// value against the map as it is stored.</para>
+    /// </summary>
+    private long PrecomputeChecksums(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
+                                     ReadOnlySpan<uint> preResolved, Span<uint> crcs, ulong generation)
+    {
+        int  headerSize = _entryHeaderSize;
+        long batchBytes = 0;
+        for (int i = 0; i < items.Length; i++)
+        {
+            if (crcs.IsEmpty || preResolved[i] == Unregistered)
+            {
+                long[]? b = points.IsEmpty ? items[i].BucketCounts : points[i].BucketCounts;
+                batchBytes += headerSize + (b is null ? 0 : Math.Min(b.Length, MaxBucketCounts)) * sizeof(long);
+                continue;
+            }
+
+            var point       = points.IsEmpty ? items[i].ToDataPoint() : points[i];
+            int bucketCount = point.BucketCounts is null ? 0 : Math.Min(point.BucketCounts.Length, MaxBucketCounts);
+            batchBytes     += headerSize + bucketCount * sizeof(long);
+
+            var h = new MetricWalEntryHeader
+            {
+                Generation        = generation,
+                SeriesIndex       = preResolved[i],
+                TimestampUnixNano = point.TimestampUnixNano,
+                Value             = point.Value,
+                Count             = point.Count,
+                Sum               = point.Sum,
+                BucketCount       = (ushort)bucketCount,
+            };
+            uint crc = Crc32c.Append(0, MemoryMarshal.AsBytes(new ReadOnlySpan<MetricWalEntryHeader>(in h)));
+            if (bucketCount > 0)
+                crc = Crc32c.Append(crc, MemoryMarshal.AsBytes(new ReadOnlySpan<long>(point.BucketCounts, 0, bucketCount)));
+            crcs[i] = crc;
+        }
+        return batchBytes;
+    }
+
+    /// <summary>
+    /// Test seam fired under the write lock once every entry of a batch — its fields, its buckets
+    /// and its checksum — and the end marker behind them are in the map, and BEFORE the file
+    /// header's write offset claims them, with the batch's end offset. A process that dies here
+    /// leaves nothing a replay reads. Null in production.
+    /// </summary>
+    internal Action<long>? OnBatchWrittenForTest;
+
+    /// <summary>
     /// Writes a batch the caller has checked fits. Caller holds <c>_writeLock</c>. Nothing in here
-    /// can resize the mapping, so <c>_ptr</c> is taken once per entry off a view that stays put.
+    /// can resize the mapping, so <c>_ptr</c> is taken once per batch off a view that stays put.
+    ///
+    /// <para><b>The order of the stores is the crash contract.</b> Per entry: its fields and
+    /// buckets, then its checksum — computed from the bytes now in the map unless
+    /// <see cref="PrecomputeChecksums"/> already has it for exactly these bytes. Per batch: every
+    /// entry, then the end marker behind the batch, then the file header's write offset. So the
+    /// header never claims an entry whose checksum is not already down, in program order — which
+    /// is what a process death sees.
+    /// Across a power loss the pages go in any order, and the checksum is what tells a claimed
+    /// entry that did not land from one that did.</para>
     /// </summary>
     private void WriteBatchLocked(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
-                                  ReadOnlySpan<uint> preResolved, long resolvedAtEpoch)
+                                  ReadOnlySpan<uint> preResolved, long resolvedAtEpoch,
+                                  ReadOnlySpan<uint> crcs, ulong crcGeneration)
     {
         // Block kept from the lock body this was lifted out of, so the diff stays reviewable.
         {
             // The running end of data, committed to the field and the header only once the whole
             // batch is down. See the remarks above for why the partial state must stay unclaimed.
-            long offset = _writeOffset;
+            long offset     = _writeOffset;
+            int  headerSize = _entryHeaderSize;
+            byte* data      = _ptr + _headerSize;
 
             // Did the registry turn over between the caller's lock-free lookups and this lock?
             bool staleResolution = preResolved.IsEmpty || _seriesEpoch != resolvedAtEpoch;
+
+            // The checksums computed before the lock are this batch's only if what they were
+            // computed over is what lands: the same series indices (not stale) and the same
+            // generation (a BeginFlush in the window stamps the next one).
+            bool precomputed = !crcs.IsEmpty && !staleResolution && crcGeneration == _generation;
 
             for (int i = 0; i < items.Length; i++)
             {
@@ -823,13 +1555,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
                 long[]? buckets = point.BucketCounts;
                 int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
-                int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
+                int entrySize   = headerSize + bucketCount * sizeof(long);
 
-                uint seriesIdx = !staleResolution && preResolved[i] != Unregistered
+                bool resolved  = !staleResolution && preResolved[i] != Unregistered;
+                uint seriesIdx = resolved
                     ? preResolved[i]
                     : RegisterSeriesLocked(KeyOf(item), item.BucketBounds);
 
-                byte* dest = _ptr + FileHeaderSize + offset;
+                byte* dest = data + offset;
 
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
                 eh.Generation        = _generation;
@@ -839,16 +1572,38 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 eh.Count             = point.Count;
                 eh.Sum               = point.Sum;
                 eh.BucketCount       = (ushort)bucketCount;
+                eh.Reserved          = 0;
 
                 if (bucketCount > 0)
                     buckets.AsSpan(0, bucketCount)
-                           .CopyTo(new Span<long>(dest + EntryHeaderSize, bucketCount));
+                           .CopyTo(new Span<long>(dest + headerSize, bucketCount));
+
+                // THE CHECKSUM LAST.
+                if (_checksummed)
+                {
+                    uint crc = precomputed && resolved ? crcs[i] : EntryChecksum(dest, bucketCount);
+                    Debug.Assert(crc == EntryChecksum(dest, bucketCount),
+                                 "a checksum computed before the lock does not match the bytes it was stored for");
+                    Unsafe.WriteUnaligned(dest + ChecksummedHeaderBytes, crc);
+                }
 
                 offset += entrySize;
             }
 
+            // THE END MARKER BEHIND EVERY BATCH, before the claim moves over the batch. Past the
+            // claim the file holds whatever was there before: the source copies of a relocation's
+            // survivors (same generation, and they verify), a killed batch that was never claimed.
+            // Nothing reads them while the claim is sound; but a claim that rots into an entry is
+            // read past, through the entries that verify (see ReconcileDataEndLocked), and without a
+            // marker at the true end that walk ran on into those leftovers and replayed them — the
+            // survivors twice. The next batch writes its first entry over this marker.
+            if (offset + headerSize <= _capacity)
+                Unsafe.AsRef<MetricWalEntryHeader>(data + offset).Generation = 0;
+
+            OnBatchWrittenForTest?.Invoke(offset);
+
             _writeOffset = offset;
-            Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+            Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + _writeOffset;
         }
     }
 
@@ -863,6 +1618,25 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         return index;
     }
 
+    /// <summary>
+    /// The top byte of a v2 pool record's length field. A v1 length never reaches it — records
+    /// over <see cref="MaxPoolRecordBytes"/> are refused as torn by every reader — so each record
+    /// says which shape it is, and one file can hold both: the v1 records of the release before,
+    /// and the v2 records appended after the upgrade (see <see cref="Open"/> for why the pool is
+    /// not rewritten).
+    /// </summary>
+    private const uint PoolRecordTagV2   = 0xC5u << 24;
+    private const uint PoolLengthMask    = 0x00FF_FFFF;
+    private const int  PoolHeadV1        = 8;                  // index, length
+    private const int  PoolHeadV2        = PoolHeadV1 + 4;     // index, tagged length, crc
+    private const int  MaxPoolRecordBytes = 8 * 1024 * 1024;
+
+    /// <summary>
+    /// Appends the record for a new series. A checksummed log writes the v2 shape — the CRC32C
+    /// over the index, the tagged length and the body sits after the length — and a log that is
+    /// still v1 (see <see cref="Open"/>) writes the v1 shape, so that the release a rollback goes
+    /// back to can still read every record of the log it can still read.
+    /// </summary>
     private void WritePoolRecord(uint index, SeriesKey key, double[]? bounds)
     {
         if (_poolStream is null) return;
@@ -884,10 +1658,20 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         body.WriteUInt16((ushort)boundsLen);
         for (int i = 0; i < boundsLen; i++) body.WriteDouble(bounds![i]);
 
-        Span<byte> head = stackalloc byte[8];
+        Span<byte> head = stackalloc byte[PoolHeadV2];
         BinaryPrimitives.WriteUInt32LittleEndian(head, index);
-        BinaryPrimitives.WriteUInt32LittleEndian(head[4..], (uint)body.Length);
-        _poolStream.Write(head);
+        if (_checksummed)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(head[4..], PoolRecordTagV2 | ((uint)body.Length & PoolLengthMask));
+            BinaryPrimitives.WriteUInt32LittleEndian(head[PoolHeadV1..],
+                Crc32c.Append(Crc32c.Append(0, head[..PoolHeadV1]), body.Written));
+            _poolStream.Write(head);
+        }
+        else
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(head[4..], (uint)body.Length);
+            _poolStream.Write(head[..PoolHeadV1]);
+        }
         _poolStream.Write(body.Written);
         _poolStream.Flush();
     }
@@ -949,7 +1733,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
             _openFlush  = flushing;
             _generation = flushing + 1;
-            Unsafe.AsRef<WalFileHeader>(_ptr).Generation = _generation;
+            StoreCovered(HeaderField.Generation, _generation);
             return flushing;
         }
     }
@@ -1099,8 +1883,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // still replays exactly the survivors, never the points already in files. It is
             // also the line this method's answer is defined at — past it the generation is
             // committed no matter what the reclaim does.
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.CommittedGeneration = flushedGeneration;
+            StoreCovered(HeaderField.Committed, flushedGeneration);
 
             Compact(flushedGeneration);
             return MetricWalCommit.Committed;
@@ -1122,48 +1905,76 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private void Compact(ulong committed)
     {
-        byte* data = _ptr + FileHeaderSize;
+        byte* data = _ptr + _headerSize;
 
         long firstSurvivor = _writeOffset;
-        long pos = 0;
-        while (pos + EntryHeaderSize <= _writeOffset)
+        long pos = 0, total;
+        // Every stop EntryAt makes is end-of-data here. The one that matters most: a generation
+        // FAR above the header counter cannot have been stamped by any append. It is a
+        // torn/corrupt entry, and everything past it parses off garbage lengths: treat it as
+        // end-of-data so it truncates away. Without this, one such entry (a real incident: a torn
+        // first entry decoding to generation ~155e9) is forever "above the watermark" — never
+        // compacted, the log never empties, and the mmap doubles without bound (8 GiB observed).
+        // The margin, not a strict `> _generation`: nothing msyncs this log, so after power loss
+        // the header page can LAG the data pages — compaction relocates gen-(G+1) survivors below
+        // offsets an older header snapshot (Generation = G) already covers, and a strict guard
+        // would truncate that legitimate replay to nothing. Torn entries decode to effectively
+        // random 64-bit values, which the margin still rejects. No checksum here: see EntryAt.
+        while ((total = EntryAt(data, pos, _writeOffset, verify: false, out _)) > 0)
         {
-            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
-            long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
-            if (total <= 0 || pos + total > _writeOffset) break;
-            if (eh.Generation == 0) break;
-            // A generation FAR above the header counter cannot have been stamped by any
-            // append. It is a torn/corrupt entry, and everything past it parses off garbage
-            // lengths: treat it as end-of-data so it truncates away. Without this, one such
-            // entry (a real incident: a torn first entry decoding to generation ~155e9) is
-            // forever "above the watermark" — never compacted, the log never empties, and
-            // the mmap doubles without bound (8 GiB observed). The margin, not a strict
-            // `> _generation`: nothing msyncs this log, so after power loss the header page
-            // can LAG the data pages — compaction relocates gen-(G+1) survivors below
-            // offsets an older header snapshot (Generation = G) already covers, and a
-            // strict guard would truncate that legitimate replay to nothing. Torn entries
-            // decode to effectively random 64-bit values, which the margin still rejects.
-            if (eh.Generation > _generation + GenerationSanityMargin) break;
-            if (eh.Generation > committed) { firstSurvivor = pos; break; }
+            if (Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation > committed) { firstSurvivor = pos; break; }
             pos += total;
         }
 
         long surviving = _writeOffset - firstSurvivor;
-        if (surviving > 0 && firstSurvivor > 0)
-            Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
+        bool move      = surviving > 0 && firstSurvivor > 0;
 
-        _writeOffset = Math.Max(0, surviving);
+        // A PREFIX FAR SHORTER THAN THE TAIL BEHIND IT IS LEFT WHERE IT IS. The move goes in chunks
+        // no longer than the prefix, each with a header store and two checksums, under both of this
+        // log's locks: a one-entry prefix before an 8 MiB tail was 160 000 of them — 11-26 ms of
+        // stalled ingest, and a tail of hundreds of MiB would be most of a second
+        // (MetricWalAppendContentionProbe.Probe_commit_of_a_long_tail_behind_a_short_prefix). Left in
+        // place, the prefix is dead weight the replay already skips (it is at or below the watermark),
+        // and the next commit reclaims it with everything else — its own prefix is then at least this
+        // whole tail, so the move it makes is a few chunks at most. v1 moves in one copy, with nothing
+        // to seal, and is left as it was. Compared multiplied, not divided: `surviving / 8` floors,
+        // and a tail of 8 prefixes and a little more then passed as nine chunks.
+        if (move && !_legacyV1 && firstSurvivor * MinPrefixToMoveTail < surviving) return;
+
+        if (move && !_legacyV1)
+        {
+            // v2: the move is recorded before its first byte, finished at the next open if the
+            // process dies inside it, and the record is cleared only once the new end is stored.
+            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+            RelocateLocked(ref hdr, data, firstSurvivor, surviving, done: 0);
+            _writeOffset    = surviving;
+            hdr.WriteOffset = _headerSize + _writeOffset;
+            OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, surviving);
+            ClearRelocationLocked();
+            OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, surviving);
+        }
+        else
+        {
+            if (move) Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
+            _writeOffset = Math.Max(0, surviving);
+        }
 
         // The move does not erase its source. A crash before the offset store below would
         // therefore leave the old, larger offset covering BOTH the relocated survivors and
         // the originals they were copied from, and replay would return each twice. Marking
         // the slot past the new end with generation 0 makes such a scan stop exactly where
         // the data now ends — ReadAll already treats 0 as end-of-data. (No room for the
-        // marker means the log is at capacity, where the next append grows it anyway.)
-        if (_writeOffset + EntryHeaderSize <= _capacity)
+        // marker means the log is at capacity, where the next append grows it anyway.) The v2
+        // checksum does not make the marker redundant: the originals are the very bytes that
+        // were moved, and they verify exactly as well as their copies do. In v2 the relocation
+        // record covers the process dying here; the marker stays for the header page that a
+        // power loss may keep older than the data pages. It is planted AFTER the record is
+        // cleared, never before: when the survivors were exactly as long as the prefix, the
+        // marker's slot is the first source entry, which a finish-at-open would still read.
+        if (_writeOffset + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + _writeOffset).Generation = 0;
 
-        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + _writeOffset;
 
         // The pool is only reclaimable once nothing references it. Survivors still carry
         // their series indices, so it is truncated on the flushes that empty the log — which
@@ -1194,6 +2005,340 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         }
     }
 
+    /// <summary>The points of a relocation <see cref="OnRelocationStepForTest"/> fires at, in order.</summary>
+    internal enum RelocationStep : byte
+    {
+        /// <summary>The record is armed and sealed; no byte has moved.</summary>
+        Armed,
+        /// <summary>A chunk is moved and its <see cref="WalFileHeader.MoveDone"/> sealed.</summary>
+        Chunk,
+        /// <summary>The new end is stored; the record is still armed.</summary>
+        EndStored,
+        /// <summary>The record is cleared and sealed; the end marker is not planted yet.</summary>
+        Cleared,
+    }
+
+    /// <summary>A commit moves its surviving tail only when the dead prefix is at least 1/n of it — at most n chunks; see <see cref="Compact"/>.</summary>
+    private const long MinPrefixToMoveTail = 8;
+
+    /// <summary>
+    /// Test seam fired at every <see cref="RelocationStep"/> of a relocation — a commit's, or the one
+    /// the open finishes — with the bytes moved so far. What the file holds at that instant is what
+    /// a process killed there leaves. The states BETWEEN a covered store and its checksum are
+    /// <see cref="OnCoveredStoreForTest"/>'s. Null in production.
+    /// </summary>
+    internal Action<RelocationStep, long>? OnRelocationStepForTest;
+
+    /// <summary>
+    /// Moves the surviving tail <c>[from, from + length)</c> to the front, FROM <paramref name="done"/>
+    /// on, recording its progress in the header so that a process that dies anywhere inside can be
+    /// finished at the next open (<see cref="FinishRelocationLocked"/>). v2 only; caller holds the
+    /// locks (or is the open).
+    ///
+    /// <para><b>Why v1's single <c>Buffer.MemoryCopy</c> was not enough once entries carry
+    /// checksums.</b> The watermark is stored before the move, so a process killed in the middle
+    /// of the copy left the new watermark over the old claim, with the front half overwritten:
+    /// the copies verify, the entry straddling the copy frontier does not, and the open-time walk
+    /// cut the log there. The survivors not yet copied still sat intact further on — acknowledged
+    /// points in no <c>.mts</c> — and nothing would ever read them again. v1 walked on past the
+    /// frontier off garbage lengths and replayed them, with duplicates; v2 made the loss certain.</para>
+    ///
+    /// <para><b>Chunks no longer than <paramref name="from"/>,</b> so that no chunk's destination
+    /// overlaps its own source: a chunk at <c>d</c> writes <c>[d, d + c)</c> and reads
+    /// <c>[from + d, from + d + c)</c>, and <c>c ≤ from</c>. The earlier chunks wrote only below
+    /// <c>d</c>, so a chunk's source is intact until that chunk is done — which is what makes
+    /// redoing the chunk <see cref="WalFileHeader.MoveDone"/> names exact, however far into it the
+    /// process got. When the survivors fit in the gap (the usual case: a flush's tail is smaller
+    /// than its snapshot) this is ONE chunk, the old single copy; a tail longer than the prefix it
+    /// replaces takes <c>length / from</c> of them, one header store each.</para>
+    ///
+    /// <para><b>Order.</b> <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// first, then <see cref="WalFileHeader.MoveLength"/>, which arms the record; then each chunk,
+    /// then its <see cref="WalFileHeader.MoveDone"/>. The caller stores the new end and only then
+    /// clears the record. Program order is what a killed process leaves behind; across a power loss
+    /// the header page and the data pages still reach the disk in any order, the residual the class
+    /// remarks name.</para>
+    /// </summary>
+    private void RelocateLocked(ref WalFileHeader hdr, byte* data, long from, long length, long done)
+    {
+        if (done == 0)
+        {
+            // MoveFrom and MoveDone count only while MoveLength is set (see HeaderChecksum), so
+            // they are written plainly here and the one covered change is the arming.
+            hdr.MoveFrom = from;
+            hdr.MoveDone = 0;
+            StoreCovered(HeaderField.MoveLength, (ulong)length);   // armed
+            OnRelocationStepForTest?.Invoke(RelocationStep.Armed, 0);
+        }
+
+        while (done < length)
+        {
+            long chunk = Math.Min(from, length - done);
+            Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
+            done         += chunk;
+            StoreCovered(HeaderField.MoveDone, (ulong)done);
+            OnRelocationStepForTest?.Invoke(RelocationStep.Chunk, done);
+        }
+    }
+
+    /// <summary>Disarms the relocation record: MoveLength first, a covered store; MoveFrom and MoveDone stop counting with it.</summary>
+    private void ClearRelocationLocked()
+    {
+        StoreCovered(HeaderField.MoveLength, 0);
+        ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        hdr.MoveFrom = 0;
+        hdr.MoveDone = 0;
+    }
+
+    /// <summary>
+    /// Finishes a relocation the previous process was killed inside (<see cref="RelocateLocked"/>):
+    /// redoes the chunk the header's <see cref="WalFileHeader.MoveDone"/> names and every one after
+    /// it, stores the end the commit would have stored, clears the record and plants the marker.
+    /// Runs at open, before any walk. A record whose numbers cannot describe a move inside this file
+    /// is not acted on — moving bytes by it could only destroy data — and is cleared with an Error;
+    /// the walk that follows then decides where the data ends, as it did before the record existed.
+    ///
+    /// <para><b>A record in a header that did not verify</b> (<paramref name="trusted"/> false) has
+    /// to prove it describes the move a commit made, not merely one that would fit: the claim must
+    /// be where that commit left it, with the progress that goes with it: the old end,
+    /// <c>from + length</c>, with <c>done</c> a chunk boundary (a multiple of <c>from</c>, or all of
+    /// it) — the move in flight; or the new end, <c>length</c>, with <c>done == length</c> — the
+    /// move finished and its end stored, only the clear missing. A new end with less done is no
+    /// state a commit leaves, and redoing from there would read source bytes the later chunks have
+    /// already overwritten. Rot that passes, in two fields no store ties together, is not a case
+    /// worth moving bytes for.</para>
+    /// </summary>
+    private void FinishRelocationLocked(ref WalFileHeader hdr, bool trusted)
+    {
+        long from = hdr.MoveFrom, length = hdr.MoveLength, done = hdr.MoveDone;
+        if (length == 0) return;                         // nothing in flight: the normal case
+
+        bool fits    = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
+        bool matches = fits
+                    && ((_writeOffset == from + length && (done % from == 0 || done == length))
+                     || (_writeOffset == length && done == length));
+        if (!fits || (!trusted && !matches))
+        {
+            _logger?.LogError(
+                "Metric WAL header records a relocation it cannot vouch for (from {From}, length {Length}, done {Done}, " +
+                "claim {Claim}, capacity {Capacity}, header verifies: {Verifies}); ignoring it — the walk decides where " +
+                "the data ends.", from, length, done, _writeOffset, _capacity, trusted);
+            ClearRelocationLocked();
+            return;
+        }
+
+        _logger?.LogWarning(
+            "Metric WAL: finishing the relocation of {Length} byte(s) of surviving points that a stop interrupted " +
+            "after {Done} byte(s).", length, done);
+
+        byte* data = _ptr + _headerSize;
+        RelocateLocked(ref hdr, data, from, length, done);
+        _writeOffset    = length;
+        hdr.WriteOffset = _headerSize + length;
+        OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, length);
+        ClearRelocationLocked();
+        OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, length);
+        if (length + _entryHeaderSize <= _capacity)
+            Unsafe.AsRef<MetricWalEntryHeader>(data + length).Generation = 0;
+    }
+
+    /// <summary>
+    /// The header checksum: CRC32C over bytes [0, 8) and [16, 56) of the header — everything but the
+    /// claim — with <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// read as 0 while <see cref="WalFileHeader.MoveLength"/> is 0. That last rule is what makes
+    /// every covered change ONE field: arming writes the other two first, invisibly, and disarming
+    /// clears MoveLength first, after which they are invisible again (see <see cref="StoreCovered"/>).
+    /// </summary>
+    private static uint HeaderChecksum(in WalFileHeader header)
+    {
+        WalFileHeader h = header;
+        if (h.MoveLength == 0) { h.MoveFrom = 0; h.MoveDone = 0; }
+        var bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<WalFileHeader>(in h));
+        return Crc32c.Append(Crc32c.Append(0, bytes[..8]), bytes[16..56]);
+    }
+
+    /// <summary>The header verifies: as it is (<see cref="WalFileHeader.Crc"/>) or as the store in flight when the process stopped was leaving it (<see cref="WalFileHeader.PendingCrc"/>).</summary>
+    private static bool HeaderVerifies(in WalFileHeader header)
+    {
+        uint crc = HeaderChecksum(in header);
+        return header.Crc == crc || header.PendingCrc == crc;
+    }
+
+    /// <summary>The covered header fields that change after the header is first written. See <see cref="StoreCovered"/>.</summary>
+    private enum HeaderField : byte { Generation, Committed, MoveLength, MoveDone }
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after the field is stored and BEFORE the checksum
+    /// that vouches for it — the state a process killed between the two leaves. Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnCoveredStoreForTest;
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after <see cref="WalFileHeader.PendingCrc"/> is
+    /// stored and BEFORE the field — the other state a process killed inside the store leaves.
+    /// Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnPendingStoredForTest;
+
+    /// <summary>
+    /// THE ONE WAY A COVERED HEADER FIELD CHANGES once the header exists: the checksum of the header
+    /// AS IT WILL BE goes into <see cref="WalFileHeader.PendingCrc"/>, then the field, then the same
+    /// value into <see cref="WalFileHeader.Crc"/>. A process killed anywhere in that sequence leaves
+    /// a header that verifies — before the field, by <c>Crc</c>; after it, by <c>PendingCrc</c> — so
+    /// a stop is never mistaken for rot. Storing the field and then sealing, as the first version
+    /// did, left a window after every watermark store in which a kill made the header fail, and the
+    /// rebuild that follows a failing header dropped a watermark that covered every entry — after an
+    /// ordinary periodic flush with nothing surviving, the whole flushed generation replayed beside
+    /// its own files.
+    /// </summary>
+    private void StoreCovered(HeaderField field, ulong value)
+    {
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        if (_legacyV1 || _sealsHeld)
+        {
+            // A v1 header has no checksum (and only the counters); a held one is sealed once, at
+            // the end of the open that is rebuilding it.
+            Set(ref h, field, value);
+            return;
+        }
+
+        WalFileHeader next = h;
+        Set(ref next, field, value);
+        h.PendingCrc = HeaderChecksum(in next);
+        OnPendingStoredForTest?.Invoke(field.ToString(), value);
+        Set(ref h, field, value);
+        OnCoveredStoreForTest?.Invoke(field.ToString(), value);
+        h.Crc = h.PendingCrc;
+
+        static void Set(ref WalFileHeader h, HeaderField field, ulong value)
+        {
+            switch (field)
+            {
+                case HeaderField.Generation: h.Generation          = value;       break;
+                case HeaderField.Committed:  h.CommittedGeneration = value;       break;
+                case HeaderField.MoveLength: h.MoveLength          = (long)value; break;
+                case HeaderField.MoveDone:   h.MoveDone            = (long)value; break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stores the header's checksum, both slots, over the header as it stands — after the open has
+    /// written it whole (a fresh header, the repairs); a single covered field changes through
+    /// <see cref="StoreCovered"/> instead. v2 only (a v1 header is 32 bytes, and byte 56 is data).
+    /// Caller holds the lock, or is the open.
+    ///
+    /// <para><b>Why a checksum on a header the entries already vouch for.</b> One field of it can
+    /// hide every entry without any entry being wrong: a <see cref="WalFileHeader.CommittedGeneration"/>
+    /// at or above the newest entry's generation makes the replay skip them all, and the
+    /// crossed-header repair then raised the counter above it — acknowledged points dropped by a
+    /// rotted or copied header, silently. A header that does not verify has its counters rebuilt
+    /// from the entries instead (<see cref="RebuildCountersLocked"/>).</para>
+    ///
+    /// <para><b>Why not the claim.</b> <see cref="WalFileHeader.WriteOffset"/> moves on every
+    /// batch, and sealing it would put a hash on the append path for a field the open-time walk
+    /// already reconciles against the data (#59).</para>
+    ///
+    /// <para><b>No ordinary stop leaves a header that does not verify.</b> Every covered change
+    /// after the first write is one field through <see cref="StoreCovered"/>, whose two checksum
+    /// slots vouch for the header before and after it; what remains is rot, a copied or restored
+    /// file, and a process killed while the OPEN was rewriting a header it had already found not to
+    /// verify — which the next open rebuilds again.</para>
+    /// </summary>
+    /// <summary>Set by the open while it rewrites a header that did not verify; see <see cref="OpenOrCreate"/>.</summary>
+    private bool _sealsHeld;
+
+    private void SealHeaderLocked()
+    {
+        if (_legacyV1 || _sealsHeld) return;
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        h.PendingCrc = h.Crc = HeaderChecksum(in h);
+    }
+
+    /// <summary>
+    /// The counters of a header that does not verify (<see cref="SealHeaderLocked"/>), taken back
+    /// from the entries — which carry their own checksums, and so are the better witness. The
+    /// walk over the claimed range verifies every entry and ignores the generation margin (it
+    /// judges against the very counter being rebuilt). Then:
+    /// <list type="bullet">
+    /// <item>the generation is the newest entry's — appends continue in it, and the next flush
+    /// covers them; with no entry at all, both counters start over;</item>
+    /// <item>the watermark is kept while it is below the newest entry's generation — it hides at
+    /// most a prefix, which a commit that had not yet compacted leaves in the file — and dropped to
+    /// just below the oldest entry when it would hide every one of them, which is what a rotted
+    /// watermark does. A stop cannot reach this (see <see cref="StoreCovered"/>); a rotted header
+    /// that happens to sit over a committed, uncompacted generation replays it beside its files —
+    /// duplicates, never loss.</item>
+    /// </list>
+    /// An Error says it happened; the open seals the result.
+    /// </summary>
+    private void RebuildCountersLocked(ref WalFileHeader hdr)
+    {
+        byte* data = _ptr + _headerSize;
+        ulong oldest = ulong.MaxValue, newest = 0, headerGeneration = hdr.Generation, headerCommitted = hdr.CommittedGeneration;
+
+        _generation = ulong.MaxValue - GenerationSanityMargin;           // the margin, off
+        for (long pos = 0, total; (total = EntryAt(data, pos, _writeOffset, verify: true, out _)) > 0; pos += total)
+        {
+            ulong g = Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation;
+            if (g < oldest) oldest = g;
+            if (g > newest) newest = g;
+        }
+
+        if (newest == 0)
+        {
+            _generation          = FirstGeneration;
+            _committedGeneration = 0;
+        }
+        else
+        {
+            _generation = newest;
+            if (_committedGeneration >= newest) _committedGeneration = oldest - 1;
+        }
+        hdr.Generation          = _generation;
+        hdr.CommittedGeneration = _committedGeneration;
+
+        _logger?.LogError(
+            "Metric WAL header does not verify (generation {Generation}, watermark {Watermark}); its counters were " +
+            "rebuilt from the entries: generation {NewGeneration}, watermark {NewWatermark}.",
+            headerGeneration, headerCommitted, _generation, _committedGeneration);
+    }
+
+    /// <summary>
+    /// Whether this "v2" file has the 32-byte header the format had for a few commits of its own
+    /// branch, before the relocation record grew it to 64: its first entry then starts at byte 32,
+    /// where a real v2 header keeps the record and its checksums. No release wrote such a file; the
+    /// check exists so that a development build's leftovers are re-initialised with an Error instead
+    /// of being walked 32 bytes out of step (which the entry checksums would stop, silently, at the
+    /// first entry). Asked only of a header that does not verify: a v2 entry that verifies at byte
+    /// 32 is the evidence — and one that verifies at byte 64, where a real v2 log's first entry is,
+    /// is evidence against: that is a v2 log whose header rotted, and it is rebuilt, not thrown away.
+    /// </summary>
+    private bool IsPreReleaseV2(long fileSize)
+    {
+        return EntryVerifiesAt(FileHeaderSizeV1) && !EntryVerifiesAt(FileHeaderSize);
+
+        bool EntryVerifiesAt(long offset)
+        {
+            if (offset + EntryHeaderSize > fileSize) return false;
+            byte* entry = _ptr + offset;
+            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(entry);
+            if (eh.Generation == 0 || offset + EntryHeaderSize + eh.BucketCount * (long)sizeof(long) > fileSize) return false;
+            return Unsafe.ReadUnaligned<uint>(entry + ChecksummedHeaderBytes) == EntryChecksum(entry, eh.BucketCount);
+        }
+    }
+
+    /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a metric WAL at all.</summary>
+    private static ushort VersionOnDisk(FileStream file)
+    {
+        Span<byte> head = stackalloc byte[6];
+        file.Position = 0;
+        int read = file.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+        file.Position = 0;
+        if (read < head.Length || BinaryPrimitives.ReadUInt32LittleEndian(head) != MagicNumber) return 0;
+        return BinaryPrimitives.ReadUInt16LittleEndian(head[4..]);
+    }
+
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1219,7 +2364,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             var referenced = new HashSet<uint>();
             for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
-                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + _headerSize + pos);
                 if (eh.Generation > _committedGeneration) referenced.Add(eh.SeriesIndex);
             }
 
@@ -1227,7 +2372,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
             for (long pos = 0, total; (total = ReplayStrideLocked(pos, end)) > 0; pos += total)
             {
-                byte* src = _ptr + FileHeaderSize + pos;
+                byte* src = _ptr + _headerSize + pos;
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(src);
 
                 if (eh.Generation > _committedGeneration)
@@ -1238,7 +2383,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                         if (eh.BucketCount > 0)
                         {
                             buckets = new long[eh.BucketCount];
-                            new ReadOnlySpan<long>(src + EntryHeaderSize, eh.BucketCount).CopyTo(buckets);
+                            new ReadOnlySpan<long>(src + _entryHeaderSize, eh.BucketCount).CopyTo(buckets);
                         }
 
                         result.Add(new RecoveredPoint(
@@ -1265,22 +2410,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// the real data ends before <paramref name="end"/>. Both passes of <see cref="ReadAll"/> step
     /// with it, so the pass that decides which series to load and the pass that replays them
     /// cannot disagree about which entries exist. Caller holds the lock.
+    ///
+    /// <para>It is <see cref="EntryAt"/> WITH the checksum: an entry that does not verify ends the
+    /// replay, so its fields — garbage, in the torn write this exists for — never reach the hot
+    /// tier, from where a flush would write them into a permanent file. The same holds for a
+    /// generation no append could have stamped (margin semantics: see Compact). The open-time
+    /// walk has already cut the log at the first such entry, so on the engine's one call, right
+    /// after <see cref="Open"/>, this stops exactly where the data ends; it checks again because
+    /// replay is the step whose output becomes points.</para>
     /// </summary>
-    private long ReplayStrideLocked(long pos, long end)
-    {
-        if (pos + EntryHeaderSize > end) return 0;
-        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(_ptr + FileHeaderSize + pos);
-
-        long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
-        if (total <= 0 || pos + total > end) return 0;   // torn tail
-        if (eh.Generation == 0) return 0;                // end of real data
-        // No append can stamp a generation far above the header counter — such an
-        // entry is torn/corrupt, and its fields are garbage: stop instead of
-        // replaying them into the hot tier (from where a flush writes them into
-        // permanent files). Margin semantics: see Compact.
-        if (eh.Generation > _generation + GenerationSanityMargin) return 0;
-        return total;
-    }
+    private long ReplayStrideLocked(long pos, long end) =>
+        EntryAt(_ptr + _headerSize, pos, end, verify: true, out _);
 
     private readonly record struct PoolEntry(
         string Name, MetricKind Kind, string Unit, LabelSet Labels, double[]? Bounds);
@@ -1311,7 +2451,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private Dictionary<uint, PoolEntry> LoadPool(HashSet<uint> referenced)
     {
-        var bodies = ReadPoolRecords(referenced, out _, out _);
+        var bodies = ReadPoolRecords(referenced, out _, out _, out _);
         var map    = new Dictionary<uint, PoolEntry>(bodies.Count);
         var interner = Interner;
         foreach (var (index, body) in bodies)
@@ -1361,52 +2501,106 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// after the torn bytes — appending past them leaves every later record misaligned by the
     /// width of the garbage, which breaks pool parsing for every series registered afterwards,
     /// not just the one that was lost.
+    ///
+    /// <para><b>A v2 record that does not verify is skipped, not decoded</b> — and read whole to
+    /// find out, kept or not, because its checksum covers the body. So a record whose length
+    /// landed and whose body did not never becomes a series with a garbage name and labels that
+    /// the points referencing it would then replay under; they come back as unresolved instead,
+    /// which is honest. When its framing is intact (the length tagged, sane, inside the file) the
+    /// walk steps over it and goes on: every record after it is exactly where it should be, and
+    /// ending the walk there — as this did at first — made every series registered later
+    /// unresolved and let the open cut them off the file. <paramref name="skipped"/> counts them.
+    /// Only broken framing ends the walk. A v1 record (see <see cref="PoolRecordTagV2"/>) has only
+    /// the length check it always had, and its body is still stepped over unread.</para>
     /// </summary>
-    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling)
+    private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling,
+                                                     out int skipped)
     {
         var bodies = new Dictionary<uint, byte[]>();
         cleanEnd     = 0;
         indexCeiling = 0;
+        skipped      = 0;
         if (!File.Exists(_poolPath)) return bodies;
 
+        byte[]? scratch = null;
         try
         {
             _poolStream?.Flush();
             using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             long length = fs.Length;
-            Span<byte> head = stackalloc byte[8];
+            Span<byte> head = stackalloc byte[PoolHeadV2];
 
             // ReadAtLeast/ReadExactly, never a bare Read: Stream.Read may legally return fewer
             // bytes than asked for reasons that are not end-of-file, and this loop's stop is no
             // longer just "give up on the map" — OpenOrCreate TRUNCATES the pool to where it
             // stops. A bare Read turned one under-filled buffer on a slow volume into a
             // permanent cut through real records. Only an actual end-of-stream ends the walk.
-            while (fs.ReadAtLeast(head, 8, throwOnEndOfStream: false) == 8)
+            while (fs.ReadAtLeast(head[..PoolHeadV1], PoolHeadV1, throwOnEndOfStream: false) == PoolHeadV1)
             {
-                uint index = BinaryPrimitives.ReadUInt32LittleEndian(head);
-                uint len   = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
-                if (len == 0 || len > 8 * 1024 * 1024) break;    // torn or bogus record
+                uint index    = BinaryPrimitives.ReadUInt32LittleEndian(head);
+                uint lenField = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
+                bool v2       = (lenField & ~PoolLengthMask) == PoolRecordTagV2;
+                uint len      = v2 ? lenField & PoolLengthMask : lenField;
+                if (len == 0 || len > MaxPoolRecordBytes) break;             // torn or bogus record
+                if (v2 && fs.ReadAtLeast(head[PoolHeadV1..], 4, throwOnEndOfStream: false) != 4) break;
+                if (!FileBounds.LengthFits(len, length - fs.Position)) break;  // truncated tail
 
-                if (keep is not null && keep.Contains(index))
+                bool kept = keep is not null && keep.Contains(index);
+                if (kept || v2)
                 {
-                    var body = new byte[len];
-                    try { fs.ReadExactly(body); }
-                    catch (EndOfStreamException) { break; }      // genuinely truncated tail
-                    bodies[index] = body;                        // later records win
+                    byte[] body;
+                    if (kept) body = new byte[len];
+                    else
+                    {
+                        if (scratch is null || scratch.Length < len)
+                        {
+                            if (scratch is not null) ArrayPool<byte>.Shared.Return(scratch);
+                            scratch = ArrayPool<byte>.Shared.Rent((int)len);
+                        }
+                        body = scratch;
+                    }
+
+                    try { fs.ReadExactly(body, 0, (int)len); }
+                    catch (EndOfStreamException) { break; }                  // genuinely truncated tail
+
+                    if (v2 && BinaryPrimitives.ReadUInt32LittleEndian(head[PoolHeadV1..])
+                              != Crc32c.Append(Crc32c.Append(0, head[..PoolHeadV1]), body.AsSpan(0, (int)len)))
+                    {
+                        // Its framing held — the length is tagged, sane and inside the file — so
+                        // the records after it are where they should be: step over this one, not
+                        // off the end of the walk. Nothing of it is used, not even to let an
+                        // EARLIER record for the same index stand in for it (later records win,
+                        // and this was the later one). Its index still counts toward the ceiling
+                        // below when it could be one, so a new series cannot take it while an
+                        // entry that references it is in the log.
+                        //
+                        // Both of those trust the record's INDEX, which is inside what failed its
+                        // checksum and may itself be what rotted. Neither can do worse than cost one
+                        // good series: a wrong index removes an earlier record of some OTHER series,
+                        // whose points then come back unresolved — never under the wrong name — and
+                        // raises the ceiling a little. An index no registration could have issued is
+                        // not trusted for either.
+                        skipped++;
+                        if (index < SeriesIndexSanityCap)
+                        {
+                            bodies.Remove(index);
+                            if (index + 1UL > indexCeiling) indexCeiling = index + 1UL;
+                        }
+                        cleanEnd = fs.Position;
+                        continue;
+                    }
+
+                    if (kept) bodies[index] = body;                          // later records win
                 }
                 else
-                {
-                    // Stepped over, not read — but a body that runs past the end of the file is the
-                    // same truncated tail the read above would have thrown on.
-                    if (len > length - fs.Position) break;
-                    fs.Seek(len, SeekOrigin.Current);
-                }
+                    fs.Seek(len, SeekOrigin.Current);                        // stepped over, not read
 
                 if (index + 1UL > indexCeiling) indexCeiling = index + 1UL;
                 cleanEnd = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
         catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
+        finally { if (scratch is not null) ArrayPool<byte>.Shared.Return(scratch); }
 
         return bodies;
     }
@@ -1496,7 +2690,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
         long target = capacity;
         while (target < needed) target = NextCapacity(target);
-        long newFileSize = FileHeaderSize + target;
+        long newFileSize = _headerSize + target;
 
         MemoryMappedFile?         mmf  = null;
         MemoryMappedViewAccessor? view = null;
