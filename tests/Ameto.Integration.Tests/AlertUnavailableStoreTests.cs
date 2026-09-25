@@ -256,9 +256,11 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// THE RULES A LINE DOES NOT NAME ARE COUNTED. Three rules skipped on each of two ticks: the
-    /// first line names one and counts one; a minute later the next counts the five skipped in
-    /// between plus its own — six — so a line a minute still accounts for every rule left alone.
+    /// THE RULES A LINE DOES NOT NAME ARE COUNTED. Three rules skipped on each of three ticks: the
+    /// first line is written after the first tick and counts its three — not only the first rule
+    /// of it, which is all a line written at the first skip could count (review F4); the second
+    /// tick is held back by the minute, and the line after it counts both held ticks — six — so a
+    /// line a minute still accounts for every rule left alone.
     /// </summary>
     [Fact]
     public async Task Each_line_counts_the_evaluations_skipped_since_the_last()
@@ -275,7 +277,7 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
 
         var lines = _log.Lines.Where(l => l.Message.Contains("was not evaluated")).Select(l => l.Message).ToList();
         Assert.Equal(2, lines.Count);
-        Assert.Contains("— 1 rule evaluation(s) skipped", lines[0]);
+        Assert.Contains("— 3 rule evaluation(s) skipped", lines[0]);
         Assert.Contains("— 6 rule evaluation(s) skipped", lines[1]);
     }
 
