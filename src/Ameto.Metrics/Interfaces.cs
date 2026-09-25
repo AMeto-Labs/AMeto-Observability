@@ -22,7 +22,7 @@ public interface IMetricIngester
 /// <summary>
 /// Queries stored metric time series.
 /// </summary>
-public interface IMetricQuery
+public interface IMetricQuery : Ameto.Core.IQueryAvailability
 {
     /// <summary>
     /// Returns distinct metric names known to the server,
@@ -122,7 +122,7 @@ public interface IMetricExemplars
 /// group-by, top-K, and histogram heatmaps. Operates on raw series from
 /// <see cref="IMetricQuery"/> so it is independent of the storage format.
 /// </summary>
-public interface IMetricAggregator
+public interface IMetricAggregator : Ameto.Core.IQueryAvailability
 {
     /// <summary>Runs a typed aggregation and returns the resulting series.</summary>
     Task<IReadOnlyList<MetricSeries>> QueryAsync(

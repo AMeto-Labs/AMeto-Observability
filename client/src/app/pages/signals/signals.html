@@ -235,6 +235,8 @@
               value <b>{{ fmtNum(p.value) }}</b> {{ cmpLabel(d.comparator) }} {{ p.threshold }}
               → {{ p.wouldFire ? 'WOULD FIRE' : 'ok' }}
             </span>
+          } @else if (previewError(); as err) {
+            <span class="pv-result unavailable" role="alert">{{ err }}</span>
           }
         </div>
 

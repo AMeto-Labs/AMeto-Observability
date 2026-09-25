@@ -1,13 +1,14 @@
 import { Component, computed, inject, signal, ChangeDetectionStrategy } from '@angular/core';
 import { Router } from '@angular/router';
 import { toSignal, toObservable } from '@angular/core/rxjs-interop';
-import { of, switchMap, catchError } from 'rxjs';
+import { of, switchMap, catchError, map } from 'rxjs';
 import { format } from 'date-fns';
 import { LucideAngularModule } from 'lucide-angular';
 
 import { ApiService } from '../../core/services/api.service';
 import { EventCountsDto, StatsDto, LEVELS } from '../../core/models/event.model';
 import { serviceColor } from '../../shared/utils/service-color';
+import { unavailableMessage } from '../../shared/utils/unavailable';
 import { PageHeaderComponent, EmptyStateComponent } from '../../shared/components/ui';
 
 type RangeKey = '1h' | '6h' | '24h' | '7d';
@@ -36,6 +37,8 @@ interface Bar {
   title: string;
 }
 interface Tick { pct: number; label: string; }
+/** One answer of the counts request: the data, or why there is none (a 503 carries the server's sentence). */
+interface CountsResult { data: EventCountsDto | null; error: string | null; }
 interface SvcStat { service: string; color: string; count: number; pct: number; pctLabel: string; }
 interface LevelRow { level: string; color: string; count: number; pct: number; pctLabel: string; }
 
@@ -81,16 +84,28 @@ export class StatsComponent {
     };
   });
 
-  /** Per-service counts bucketed over the window; refetched whenever the range changes. */
-  private readonly counts = toSignal(
+  /**
+   * Per-service counts bucketed over the window; refetched whenever the range changes. A failure is
+   * an ANSWER here, not a null: a null read as "still loading" for ever, and a 503 — the log store
+   * shut down (#95) — is a sentence the page can show.
+   */
+  private readonly countsResult = toSignal<CountsResult | null, null>(
     toObservable(this.params).pipe(
       switchMap(p =>
-        this.api.getEventCounts({ from: p.from, bucket: p.bucket })
-          .pipe(catchError(() => of(null))),
+        this.api.getEventCounts({ from: p.from, bucket: p.bucket }).pipe(
+          map((data): CountsResult => ({ data, error: null })),
+          catchError(err => of<CountsResult>({
+            data:  null,
+            error: unavailableMessage(err) ?? 'Could not load event counts.',
+          })),
+        ),
       ),
     ),
-    { initialValue: null as EventCountsDto | null },
+    { initialValue: null },
   );
+  private readonly counts   = computed(() => this.countsResult()?.data ?? null);
+  /** Why the counts could not be shown, when they could not. */
+  readonly countsError      = computed(() => this.countsResult()?.error ?? null);
 
   /** Store-level counters (fetched once). */
   private readonly stats = toSignal(
@@ -98,7 +113,7 @@ export class StatsComponent {
     { initialValue: null as StatsDto | null },
   );
 
-  readonly loading = computed(() => this.counts() === null);
+  readonly loading = computed(() => this.countsResult() === null);
   readonly hasData = computed(() => this.totalEvents() > 0);
 
   readonly totalEvents  = computed(() => this.counts()?.total ?? 0);

@@ -19,6 +19,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Ameto.Storage.Tests" />
+    <!-- ColdLoadCompleted: the alert and API tests of #95 wait for the cold scan instead of polling. -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
   </ItemGroup>
 
 </Project>

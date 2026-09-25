@@ -81,13 +81,28 @@ public static class AlertEndpointMapper
         // ── Preview: evaluate the condition value right now ─────────────────────
         // No stored rule is passed, so no masked secret can resolve here; preview
         // only evaluates the condition and never dispatches to a channel.
-        manage.MapPost("/preview", async (AlertRuleUpsertRequest req, AlertEvaluator ev, CancellationToken ct) =>
+        manage.MapPost("/preview", async (AlertRuleUpsertRequest req, AlertEvaluator ev, HttpContext ctx, CancellationToken ct) =>
         {
             if (!TryBuildRule(req.Id, req, null, out var rule, out var error))
                 return Results.BadRequest(new { error });
-            double v  = await ev.PreviewAsync(rule, ct);
-            bool fires = Compare(v, rule.Comparator, rule.Threshold);
-            return Results.Ok(new { value = v, threshold = rule.Threshold, wouldFire = fires });
+            var value = await ev.PreviewAsync(rule, ct);
+
+            // The store the rule reads cannot answer truly (#95): closed, or still loading its cold
+            // tier. A preview of 0 would say "would not fire" about a number nobody measured.
+            if (!value.IsAvailable)
+            {
+                // Retry-After only for Loading, which ends by itself; Closed ends with a restart.
+                if (value.Availability == Ameto.Core.QueryAvailability.Loading)
+                    ctx.Response.Headers.RetryAfter = "5";
+                return Results.Json(
+                    new { error = value.Availability == Ameto.Core.QueryAvailability.Loading
+                        ? $"The {rule.Source.ToString().ToLowerInvariant()} store is still loading its data, so the rule cannot be previewed yet. Try again in a moment."
+                        : $"The {rule.Source.ToString().ToLowerInvariant()} store is shut down, so the rule cannot be previewed." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+
+            bool fires = Compare(value.Value, rule.Comparator, rule.Threshold);
+            return Results.Ok(new { value = value.Value, threshold = rule.Threshold, wouldFire = fires });
         });
 
         // ── Test: send a one-off notification through the rule's channels ────────
