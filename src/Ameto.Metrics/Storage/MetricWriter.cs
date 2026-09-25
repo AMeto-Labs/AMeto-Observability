@@ -514,18 +514,24 @@ internal static class MetricWriter
     private static bool IsNameChar(char c) => char.IsLetterOrDigit(c) || c == '-' || c == '_';
 
     /// <summary>
-    /// The section's msgpack, built in ONE buffer rented from the shared pool for a whole
-    /// <see cref="Write"/> call and reset per file. It grows by renting twice the size and returning
-    /// the old one, and goes back to the pool when the call ends, thrown or not. The pool rather than
-    /// a buffer kept by the writer: this runs on the flush and on every rollup and compaction pass,
-    /// minutes apart, and a buffer held between them is a buffer held for nothing — the pool trims
-    /// what nobody rents.
+    /// The section's msgpack, built in ONE buffer for a whole <see cref="Write"/> call and reset per
+    /// file. It grows by taking twice the size and giving the old one back, and is given back when the
+    /// call ends, thrown or not.
+    ///
+    /// <para><b>Pooled up to <see cref="MaxPooledBytes"/>, and no further</b> (#94). The pool rather
+    /// than a buffer kept by the writer: this runs on the flush and on every rollup and compaction
+    /// pass, minutes apart, and a buffer held between them is held for nothing. But what the shared
+    /// pool is handed it keeps until a full collection under pressure trims it, and a section runs to
+    /// ~15 MB (512 series of a busy histogram): returned, that is 16 MB of gen2 held for the next
+    /// caller who may never come, on a 512 MB stand. So a buffer over a megabyte — the common
+    /// section is a few hundred KB — is allocated for the call and dropped with it, and only the
+    /// small ones go back. <see cref="ReturnedToPoolForTest"/> sees every size handed back.</para>
     /// </summary>
     private sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
     {
         private const int InitialBytes = 64 * 1024;
 
-        private byte[] _buf = ArrayPool<byte>.Shared.Rent(InitialBytes);
+        private byte[] _buf = Take(InitialBytes);
         private int    _len;
 
         public ReadOnlySpan<byte> WrittenSpan => _buf.AsSpan(0, _len);
@@ -548,9 +554,9 @@ internal static class MetricWriter
             int need = Math.Max(sizeHint, 1);
             if (_buf.Length - _len >= need) return;
             long want = Math.Max((long)_len + need, (long)_buf.Length * 2);
-            var  next = ArrayPool<byte>.Shared.Rent((int)Math.Min(want, Array.MaxLength));
+            var  next = Take((int)Math.Min(want, Array.MaxLength));
             _buf.AsSpan(0, _len).CopyTo(next);
-            ArrayPool<byte>.Shared.Return(_buf);
+            Give(_buf);
             _buf = next;
         }
 
@@ -559,7 +565,29 @@ internal static class MetricWriter
             var buf = _buf;
             _buf = [];
             _len = 0;
-            if (buf.Length > 0) ArrayPool<byte>.Shared.Return(buf);
+            if (buf.Length > 0) Give(buf);
+        }
+
+        /// <summary>From the pool up to <see cref="MaxPooledBytes"/> (whose buckets never exceed it); allocated above.</summary>
+        private static byte[] Take(int size) =>
+            size <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent(size) : GC.AllocateUninitializedArray<byte>(size);
+
+        /// <summary>Back to the pool when it is small enough to be worth keeping; left to the collector otherwise.</summary>
+        private static void Give(byte[] buf)
+        {
+            if (buf.Length > MaxPooledBytes) return;
+            ArrayPool<byte>.Shared.Return(buf);
+            ReturnedToPoolForTest?.Invoke(buf.Length);
         }
     }
+
+    /// <summary>The largest section buffer handed back to the shared pool (see <see cref="RentedBufferWriter"/>).</summary>
+    internal const int MaxPooledBytes = 1024 * 1024;
+
+    /// <summary>
+    /// Test seam: the length of every section buffer the writer hands back to the shared pool, on the
+    /// writing thread (the writer is synchronous, so a thread-static reaches only the setting test's
+    /// calls). Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
 }

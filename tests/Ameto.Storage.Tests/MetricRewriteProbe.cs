@@ -129,4 +129,46 @@ public sealed class MetricRewriteProbe : IDisposable
         _out.WriteLine($"WRITE  512 series x 60 points -> one {fileBytes:N0} B file: {best / 1024.0:N1} KB allocated (best of 3)");
         Assert.True(best < 256 * 1024, $"the writer allocated {best:N0} B for one {fileBytes:N0} B file");
     }
+
+    /// <summary>
+    /// What the writer leaves in the SHARED POOL after a large section (#94): nothing over a megabyte.
+    /// The pool keeps what it is handed until a full collection under pressure trims it, so a 4 MB
+    /// section buffer returned after a busy histogram's file was 4 MB of gen2 held for a caller who
+    /// may never come. Buffers up to a megabyte still go back — the common section is a few hundred
+    /// KB — and this sees them too, so a writer that stopped pooling altogether fails as well.
+    /// </summary>
+    [Fact]
+    public void The_writer_hands_the_pool_nothing_over_a_megabyte()
+    {
+        var items = new List<(SeriesKey, HotSeries)>(512);
+        for (int s = 0; s < 512; s++)
+        {
+            var labels = new LabelSet(new Dictionary<string, string> { ["pod"] = "pod-" + s.ToString(CultureInfo.InvariantCulture) });
+            var pts = new List<MetricDataPoint>(400);
+            for (int p = 0; p < 400; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = 1_784_800_020_000_000_000L + p * 15 * S, Value = s + p / 7.0 });
+            items.Add((new SeriesKey("big.gauge", MetricKind.Gauge, "By", labels), new HotSeries(pts)));
+        }
+
+        var returned = new List<int>();
+        MetricWriter.ReturnedToPoolForTest = returned.Add;
+        List<MetricSegmentInfo> outputs;
+        try     { outputs = MetricWriter.Write(_dir, items); }
+        finally { MetricWriter.ReturnedToPoolForTest = null; }
+
+        int section;
+        using (var fs = File.OpenRead(outputs[0].FilePath))
+        {
+            Span<byte> b = stackalloc byte[4];
+            fs.Seek(28, SeekOrigin.Begin);
+            fs.ReadExactly(b);
+            section = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(b);
+        }
+        foreach (var o in outputs) File.Delete(o.FilePath);
+
+        _out.WriteLine($"section {section:N0} B; handed back to the pool: {string.Join(", ", returned.Select(n => n.ToString("N0", CultureInfo.InvariantCulture)))} B");
+        Assert.True(section > 2 * MetricWriter.MaxPooledBytes, $"setup: the section is only {section:N0} B");
+        Assert.NotEmpty(returned);                                         // the small buffers still pooled
+        Assert.All(returned, n => Assert.True(n <= MetricWriter.MaxPooledBytes, $"a {n:N0} B buffer went back to the shared pool"));
+    }
 }
