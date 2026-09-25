@@ -228,6 +228,8 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      // And the eviction that ceiling causes while the total budget still has room,
                      // which no other figure reveals: the cache just rests below its budget.
                      "indexCacheNativeEvicted",
+                     // Entries replaced because a segment file was replaced under its own name.
+                     "indexCacheStaleReplaced",
                      // Inside logsStorageBytes, and the one part of it retention will never free.
                      "logsQuarantinedBytes",
                  })

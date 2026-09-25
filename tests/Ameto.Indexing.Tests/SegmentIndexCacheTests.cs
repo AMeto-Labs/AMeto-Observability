@@ -119,6 +119,127 @@ public sealed class SegmentIndexCacheTests
         Assert.Equal(0, cache.TotalBytes);
     }
 
+    /// <summary>A loaded reader over a small inverted section, and the bucket that grows it.</summary>
+    private static SegmentIndexReader NewLazyReader()
+    {
+        var b = new SegmentInvertedIndex();
+        for (uint o = 0; o < 200; o++) b.Add(o, "P", "v" + (o % 7));
+        return SegmentIndexReader.Load(b.Serialise(), [], []);
+    }
+
+    /// <summary>
+    /// A reader decodes lazily and remembers what it decoded, so it is bigger when a query lets
+    /// go of it than when it was inserted. The cache charges the difference at release, or it
+    /// would hold more than its budget says without knowing.
+    /// </summary>
+    [Fact]
+    public void Release_charges_what_the_reader_learned_while_leased()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var r = NewLazyReader();
+        long inserted = r.ApproxRetainedBytes;
+
+        using (var lease = cache.Insert("a.seg", 0, true, r, inserted))
+            Assert.NotNull(lease.Index.LookupIntersect([("P", "v3")]));
+
+        Assert.True(r.ApproxRetainedBytes > inserted, "the lookup should have grown the memo");
+        Assert.Equal(r.ApproxRetainedBytes, cache.TotalBytes);
+
+        // Asked again, it is answered from the memo: nothing new to charge.
+        long charged = cache.TotalBytes;
+        using (var hit = cache.TryAcquire("a.seg", 0, false)!.Value)
+            Assert.NotNull(hit.Index.LookupIntersect([("P", "v3")]));
+        Assert.Equal(charged, cache.TotalBytes);
+    }
+
+    [Fact]
+    public void Growth_past_the_budget_evicts_the_entry_at_release_and_frees_it()
+    {
+        var r = NewLazyReader();
+        long inserted = r.ApproxRetainedBytes;
+        var cache = new SegmentIndexCache(inserted + 16);   // room for the reader, not for what it learns
+
+        using (var lease = cache.Insert("a.seg", 0, true, r, inserted))
+        {
+            Assert.NotNull(lease.Index.LookupIntersect([("P", "v3")]));
+            Assert.Equal(1, cache.EntryCount);               // still listed while leased
+        }
+
+        Assert.Equal(0, cache.EntryCount);
+        Assert.Equal(0, cache.TotalBytes);
+        Assert.Throws<ObjectDisposedException>(() => r.Bloom.MightContain("v3"));
+    }
+
+    /// <summary>
+    /// The query path's entries are memos that own no section and answer only through a view.
+    /// The public reader API must never hand one out: TryAcquire would return a reader whose
+    /// Lookup throws, and Insert would drop the caller's working reader in favour of it. A memo
+    /// is a miss to TryAcquire, and a reader inserted over one replaces it.
+    /// </summary>
+    [Fact]
+    public void A_memo_is_never_handed_out_through_the_reader_api()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var b = new SegmentInvertedIndex();
+        b.Add(0, "P", "v");
+        byte[] section = b.Serialise();
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, section, default, default)) { }
+        Assert.Equal(1, cache.EntryCount);
+
+        Assert.Null(cache.TryAcquire("a.seg", 0, needTrigram: false));
+
+        var r = SegmentIndexReader.Load(section, [], []);
+        using (var lease = cache.Insert("a.seg", 0, hasTrigram: true, r, r.ApproxRetainedBytes))
+        {
+            Assert.Same(r, lease.Index);
+            Assert.Equal([0u], lease.Index.LookupIntersect([("P", "v")])!);
+        }
+        var hit = cache.TryAcquire("a.seg", 0, needTrigram: false);
+        Assert.NotNull(hit);
+        using (hit.Value) Assert.Same(r, hit.Value.Index);
+    }
+
+    /// <summary>
+    /// An inserted reader has no fingerprint, so the query path cannot check it and replaces it —
+    /// but that is not the cache noticing a file replaced under its path, which is what
+    /// <see cref="SegmentIndexCache.StaleReplacedCount"/> tells an operator. Only an entry that
+    /// knew its bytes counts.
+    /// </summary>
+    [Fact]
+    public void Replacing_an_inserted_reader_is_not_counted_as_stale()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        using (cache.Insert("a.seg", 0, true, NewReader(), 10)) { }
+
+        var fp = new IndexGroupFingerprint(1, default, 100, default, 1, 1);
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, fp)) { }
+        Assert.Equal(0, cache.StaleReplacedCount);
+
+        var other = fp with { LastWriteTicks = 2 };
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, other)) { }
+        Assert.Equal(1, cache.StaleReplacedCount);                  // a memo that knew its bytes: stale
+        Assert.Equal(1, cache.EntryCount);
+    }
+
+    /// <summary>
+    /// Replacing an entry must free what it held. An inserted reader owns native bloom bits; when
+    /// the query path replaces it (another fingerprint under the same path) and nothing holds a
+    /// lease, it is disposed there and then — the replacement's dispose list used to be reset by
+    /// the budget check that followed, and the bits leaked.
+    /// </summary>
+    [Fact]
+    public void A_replaced_unleased_reader_is_disposed()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var r = NewReader();
+        using (cache.Insert("a.seg", 0, true, r, 10)) { }
+
+        var fp = new IndexGroupFingerprint(1, default, 100, default, 1, 1);
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, fp)) { }
+
+        Assert.Throws<ObjectDisposedException>(() => r.Bloom.MightContain("v"));
+    }
+
     [Fact]
     public void Disabled_cache_misses_and_leases_own_the_reader()
     {
