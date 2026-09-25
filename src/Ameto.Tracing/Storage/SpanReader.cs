@@ -1414,15 +1414,24 @@ internal static class SpanReader
         long footerAt = fs.Length - (version >= 3 ? 28 : 20);
         fs.Seek(bloomIdxOffset, SeekOrigin.Begin);
 
-        // Pre-hash the hints once.
-        Span<ulong> hashes = stackalloc ulong[Math.Min(hints.Count, 16)];
-        int nHints = Math.Min(hints.Count, hashes.Length);
+        // Pre-hash the hints for the LEGACY half now; the canonical hashes wait for the fingerprint
+        // (see the section's two halves below) — which hash the bits were built with is only known
+        // once the legacy slots have been read.
+        //
+        // A LEGACY bloom (pre-#86) hashed `value.ToString()` in the WRITER's culture and lowercased
+        // with the WRITER host's casing; where a literal's text could have come out differently —
+        // a number's text, or any character outside ASCII — its value probe degrades to the key
+        // alone, which the old bloom holds exactly. That costs those queries the value skip on old
+        // segments until retention replaces them; it costs no query a row. See
+        // SpanBloom.LegacyValueProbeIsExact.
+        int nHints = Math.Min(hints.Count, 16);
+        Span<ulong> legacy = stackalloc ulong[16];
         for (int i = 0; i < nHints; i++)
         {
             var h = hints[i];
-            hashes[i] = h.LowerValue is null
-                ? SpanBloom.HashKey(h.Key)
-                : SpanBloom.HashKeyValue(h.Key, h.LowerValue);
+            legacy[i] = h.LowerValue is not null && SpanBloom.LegacyValueProbeIsExact(h.LowerValue)
+                ? SpanBloom.LegacyHashKeyValue(h.Key, h.LowerValue)
+                : SpanBloom.LegacyHashKey(h.Key);
         }
 
         // BOUNDED BY THE BYTES THAT COULD HOLD IT. This runs on every TraceQL query carrying an
@@ -1439,16 +1448,7 @@ internal static class SpanReader
             fileBytesPerElement: 4, "Bloom index", filePath);
 
         var allowed = new HashSet<uint>(FileBounds.PreallocFor(blockCount, heapBytesPerElement: 16));
-        for (uint b = 0; b < blockCount; b++)
-        {
-            uint len = br.ReadUInt32();
-            FileBounds.RequireLengthFits(len, fs.Length - fs.Position, $"Bloom bitset for block {b}", filePath);
-            var bitset = len > 0 ? br.ReadBytes((int)len) : [];
-            bool pass = true;
-            for (int i = 0; i < nHints && pass; i++)
-                pass = SpanBloom.MayContain(bitset, hashes[i]);
-            if (pass) allowed.Add(b);
-        }
+        bool legacySlotsEmpty = ProbeBlooms(br, fs, blockCount, legacy[..nHints], allowed, filePath);
 
         // THE SECTION HAS AN EXACT END, and it is the check the offset cannot forge. The bloom
         // index is the last thing before the footer, so a parse that started in the right place
@@ -1456,8 +1456,57 @@ internal static class SpanReader
         // plausible every field it read looked on the way. Null, not a throw: "I cannot tell you
         // which blocks" costs a full scan of the segment, and this method's whole contract is that
         // losing the index costs speed, never rows.
+        //
+        // Ending there after the legacy slots is a segment written before #86: its blooms ARE the
+        // slots, probed above with the legacy hashes.
+        if (fs.Position == footerAt) return allowed;
+
+        // THE CANONICAL HALF (#86): every legacy slot empty, then the marker and the fingerprint of
+        // the fold table that built the bits, then one bloom per block, and then — exactly — the
+        // footer. Anything else is a section this build did not write, and the answer is the same
+        // null as any other unrecognised index.
+        if (!legacySlotsEmpty || footerAt - fs.Position < 12) return null;
+        if (br.ReadUInt32() != SpanBloom.CanonicalMarker) return null;
+
+        // A value probe is trusted only where the segment's fold and this host's comparer both
+        // agree with this build's table; otherwise the hint probes its key alone. See
+        // SpanBloom.CanonicalValueProbeIsExact and SpanBloomFold.
+        bool sameFold = br.ReadUInt64() == SpanBloomFold.Fingerprint;
+        Span<ulong> canonical = stackalloc ulong[16];
+        for (int i = 0; i < nHints; i++)
+        {
+            var h = hints[i];
+            canonical[i] = h.LowerValue is not null && SpanBloom.CanonicalValueProbeIsExact(h.LowerValue, sameFold)
+                ? SpanBloom.HashKeyValue(h.Key, h.LowerValue)
+                : SpanBloom.HashKey(h.Key);
+        }
+
+        allowed.Clear();
+        ProbeBlooms(br, fs, blockCount, canonical[..nHints], allowed, filePath);
         if (fs.Position != footerAt) return null;
         return allowed;
+    }
+
+    /// <summary>
+    /// One run of <paramref name="blockCount"/> per-block bitsets: adds every block whose bloom may
+    /// contain all of <paramref name="hashes"/>, and says whether every bitset was empty.
+    /// </summary>
+    private static bool ProbeBlooms(BinaryReader br, FileStream fs, uint blockCount,
+                                    ReadOnlySpan<ulong> hashes, HashSet<uint> allowed, string filePath)
+    {
+        bool allEmpty = true;
+        for (uint b = 0; b < blockCount; b++)
+        {
+            uint len = br.ReadUInt32();
+            FileBounds.RequireLengthFits(len, fs.Length - fs.Position, $"Bloom bitset for block {b}", filePath);
+            if (len != 0) allEmpty = false;
+            var bitset = len > 0 ? br.ReadBytes((int)len) : [];
+            bool pass = true;
+            for (int i = 0; i < hashes.Length && pass; i++)
+                pass = SpanBloom.MayContain(bitset, hashes[i]);
+            if (pass) allowed.Add(b);
+        }
+        return allEmpty;
     }
 
     /// <returns>0-based block indices containing at least one span from <paramref name="serviceName"/>.</returns>

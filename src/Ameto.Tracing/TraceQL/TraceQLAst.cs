@@ -135,14 +135,18 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// <c>.foo = "bar"</c>, and folding that into <c>false</c> made <c>{ !(.foo = "bar") }</c>
     /// select every span in the system that had never heard of <c>.foo</c>.
     ///
-    /// <para>PRESENT BUT INCOMPARABLE STAYS FALSE, deliberately and narrowly. A string attribute
-    /// met by a numeric comparison (<c>{ .foo &gt; 5 }</c> where <c>.foo</c> is "bananas") is a
-    /// span that HAS the field, so "unknown" would be the wrong word for it, and changing that
-    /// answer is a separate semantic decision from the one this class was fixed for. It leaves a
-    /// smaller version of the same asymmetry standing on type mismatch alone, pinned by
-    /// <c>TraceQLThreeValuedTests.A_type_mismatch_is_still_two_valued</c> and carried as issue #76
-    /// — a docstring is read only by somebody already in this file, which is how the original
-    /// defect lasted as long as it did.</para>
+    /// <para>PRESENT BUT INCOMPARABLE IS UNKNOWN TOO — issue #76, decided. A numeric comparison
+    /// met by a value that is not a number (<c>{ .tenant &gt; 5 }</c> where <c>.tenant</c> is
+    /// "bananas", a boolean, or a double that is NaN) is a question that does not apply to this
+    /// span, which is exactly what <c>null</c> means here. Answering <c>false</c> instead left the
+    /// #66 shape standing on type mismatch alone: <c>{ !(.tenant &gt; 5) }</c> selected every span
+    /// whose tenant was text, which nobody writing that query wants. One consequence to know when
+    /// reading it: a span now needs a COMPARABLE value, not merely the key, to be selected by
+    /// either a comparison or its negation.</para>
+    ///
+    /// <para>A DELIBERATE DEVIATION FROM TEMPO, whose TraceQL answers a type mismatch with false
+    /// (and so selects the span under <c>!</c>). The TraceQL reference page says so. A string
+    /// QUERY met by a number is NOT a mismatch: it compares the number's text, and always has.</para>
     /// </summary>
     /// <summary>
     /// The key as UTF-8, encoded ONCE per parsed query rather than once per span. A TraceQL page
@@ -174,8 +178,8 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// and the same span read back out of a segment are asked the same question by the same page.
     ///
     /// <para>Nothing here allocates. A string attribute is compared as UTF-8 decoded into the
-    /// stack; a number met by a string query is formatted into the stack with the same current-
-    /// culture <c>ToString()</c> the boxed path would have used; and a value no dictionary could
+    /// stack; a number met by a string query is formatted into the stack with the same INVARIANT
+    /// text the boxed path uses and the block bloom hashes (#86); and a value no dictionary could
     /// hold answers null exactly as the boxed path's <c>null</c> does.</para>
     /// </summary>
     internal static bool? CompareAttr(in SpanAttrValue v, TraceQLOp op, in TraceQLValue qv)
@@ -195,7 +199,10 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
                     System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : double.NaN,
                 _                       => double.NaN,   // Boolean: present but incomparable
             };
-            if (double.IsNaN(attrNum)) return false;
+            // Unknown, not false — issue #76; see the class docstring. NaN covers all three ways
+            // in: a string that does not parse, a boolean, and a double that IS NaN (which no
+            // ordering can place either).
+            if (double.IsNaN(attrNum)) return null;
             return CompareOp(attrNum, op, qv.Number);
         }
 
@@ -240,41 +247,76 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
             return string.Compare(v.Boolean ? bool.TrueString : bool.FalseString,
                                   queryText, StringComparison.OrdinalIgnoreCase);
 
-        // long.ToString() and double.ToString() with the ambient culture — the same text
-        // `raw.ToString()` produced on the boxed path, written into the stack instead of the heap.
+        // THE INVARIANT TEXT, NOT THE AMBIENT CULTURE'S — issue #86. `{ .ratio = "0.375" }` has one
+        // answer whatever locale the server was started under, and it is the answer the block
+        // bloom promises (SpanBloom hashes exactly this text): under ru-KZ the culture's text was
+        // "0,375", so the evaluator and a bloom written on another box disagreed, and a server that
+        // moved between locales answered the same query differently for fresh and flushed spans.
+        // The same text the boxed path below produces, written into the stack instead of the heap.
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
         bool ok = v.Kind == SpanAttrKind.Integer
-            ? v.Integer.TryFormat(stack, out int len)
-            : v.Float.TryFormat(stack, out len);
+            ? v.Integer.TryFormat(stack, out int len, default, inv)
+            : v.Float.TryFormat(stack, out len, default, inv);
         if (!ok) return string.Compare(v.Kind == SpanAttrKind.Integer
-                                           ? v.Integer.ToString()
-                                           : v.Float.ToString(),
+                                           ? v.Integer.ToString(inv)
+                                           : v.Float.ToString(inv),
                                        queryText, StringComparison.OrdinalIgnoreCase);
 
         return MemoryExtensions.CompareTo((ReadOnlySpan<char>)stack[..len],
                                           queryText.AsSpan(), StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// The dictionary path — a record built from a dictionary (every fixture, the v2 migration), or
+    /// one whose blob would not decode.
+    ///
+    /// <para>ASKED AS A FLUSH WILL STORE IT, because the same span is asked the same question before
+    /// and after its flush. <c>SpanWriter.WriteAttributes</c> writes <c>int</c>/<c>short</c>/<c>byte</c>
+    /// as a msgpack integer, <c>float</c> as a double, and every type msgpack has no encoding for
+    /// (<c>sbyte</c>, <c>uint</c>, <c>ulong</c>, <c>decimal</c>, <c>DateTime</c>…) as its invariant text
+    /// (<see cref="SpanAttributeBlob.InvariantText"/>); the reader then boxes back only long, double,
+    /// bool and string. So this maps the boxed value onto exactly that shape and asks the blob twin
+    /// above (or, for text, the same string rules the blob twin applies to UTF-8). Answering from the
+    /// boxed type instead made <c>{ .x = "0.1" }</c> match a <c>0.1f</c> in the hot tier and not once
+    /// it was flushed as 0.10000000149011612, and <c>{ .retry = 3 }</c> unknown for a <c>short</c> in
+    /// the hot tier and true once it was a long (review F-C of #86).</para>
+    /// </summary>
     internal static bool? CompareAttr(object? raw, TraceQLOp op, in TraceQLValue qv)
     {
         if (raw is null) return null;
 
+        SpanAttrValue v = default;
+        switch (raw)
+        {
+            case string s: return CompareStoredText(s, op, in qv);
+            case bool b:   v.Kind = SpanAttrKind.Boolean; v.Boolean = b;  break;
+            case long l:   v.Kind = SpanAttrKind.Integer; v.Integer = l;  break;
+            case int n:    v.Kind = SpanAttrKind.Integer; v.Integer = n;  break;
+            case short sh: v.Kind = SpanAttrKind.Integer; v.Integer = sh; break;
+            case byte by:  v.Kind = SpanAttrKind.Integer; v.Integer = by; break;
+            case double d: v.Kind = SpanAttrKind.Float;   v.Float   = d;  break;
+            case float f:  v.Kind = SpanAttrKind.Float;   v.Float   = f;  break;
+            default:       return CompareStoredText(SpanAttributeBlob.InvariantText(raw), op, in qv);
+        }
+        return CompareAttr(in v, op, in qv);
+    }
+
+    /// <summary>
+    /// A text attribute — what the blob twin does with <see cref="SpanAttrKind.Utf8String"/>, on a
+    /// string: a numeric query parses it (invariant, unknown when it does not parse — #76), a string
+    /// query compares it ignoring case.
+    /// </summary>
+    private static bool? CompareStoredText(string attrStr, TraceQLOp op, in TraceQLValue qv)
+    {
         if (qv.IsNumber)
         {
-            double attrNum = raw switch
-            {
-                long   l => (double)l,
-                int    i => (double)i,
-                double d => d,
-                string str when double.TryParse(str,
-                    System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
-                _ => double.NaN,
-            };
-            if (double.IsNaN(attrNum)) return false;
+            if (!double.TryParse(attrStr, System.Globalization.NumberStyles.Any,
+                                 System.Globalization.CultureInfo.InvariantCulture, out double attrNum)
+                || double.IsNaN(attrNum))
+                return null;   // present but incomparable: unknown (#76)
             return CompareOp(attrNum, op, qv.Number);
         }
 
-        string attrStr = raw.ToString() ?? string.Empty;
         int cmp = string.Compare(attrStr, qv.StringVal, StringComparison.OrdinalIgnoreCase);
         return op switch
         {

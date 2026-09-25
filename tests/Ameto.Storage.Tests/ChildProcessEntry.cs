@@ -19,6 +19,9 @@ internal static class ChildProcessEntry
     /// <summary>Prints <see cref="MemoryBudgets.Current"/> as <c>key=value</c> lines.</summary>
     internal const string MemoryBudgetsCommand = "memory-budgets";
 
+    /// <summary>Writes the bloom fold probe's segment into a directory and prints its path.</summary>
+    internal const string WriteFoldSegmentCommand = "write-fold-segment";
+
     public static int Main(string[] args)
     {
         if (args.Length == 1 && args[0] == MemoryBudgetsCommand)
@@ -39,7 +42,16 @@ internal static class ChildProcessEntry
             return 0;
         }
 
-        Console.Error.WriteLine($"usage: {MemoryBudgetsCommand}");
+        // Writes SpanBloomCanonicalTests.FoldProbeCorpus as a segment and prints its path — so a test
+        // can read, in its own globalization mode, a segment flushed under the other one.
+        if (args.Length == 2 && args[0] == WriteFoldSegmentCommand)
+        {
+            var info = Ameto.Tracing.Storage.SpanWriter.Write(args[1], SpanBloomCanonicalTests.FoldProbeCorpus());
+            Console.WriteLine(info.FilePath);
+            return 0;
+        }
+
+        Console.Error.WriteLine($"usage: {MemoryBudgetsCommand} | {WriteFoldSegmentCommand} <dir>");
         return 2;
     }
 }
