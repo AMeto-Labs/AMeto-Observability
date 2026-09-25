@@ -206,6 +206,47 @@ public sealed class MetricFormatV3Tests : IDisposable
             Assert.Equal(expected[s.Labels], s.Points.Count);
     }
 
+    /// <summary>
+    /// The grouping a flush depends on, which the byte goldens cannot see — they write one metric
+    /// per call. Several metrics interleaved in the input come out one file per name (per 512
+    /// series), the names in the order they were first met, each file's series in input order —
+    /// what <c>GroupBy</c> gave before the writer grouped by a counting sort. And a series whose
+    /// points are out of order is written sorted, its file's range taken from the sorted ends.
+    /// </summary>
+    [Fact]
+    public void Write_groups_interleaved_metrics_by_first_seen_name_keeping_input_order()
+    {
+        const long T = 1_784_800_000_000_000_000L, Sec = 1_000_000_000L;
+        string[] input = ["b", "a", "b", "c", "a", "b", "c"];
+        var items = new List<(SeriesKey, HotSeries)>();
+        for (int i = 0; i < input.Length; i++)
+        {
+            var labels = new LabelSet(new Dictionary<string, string> { ["i"] = i.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+            // Series 4 ("a") arrives out of order: 30 s, 10 s, 20 s.
+            List<MetricDataPoint> pts = i == 4
+                ? [new() { TimestampUnixNano = T + 30 * Sec, Value = 3 }, new() { TimestampUnixNano = T + 10 * Sec, Value = 1 }, new() { TimestampUnixNano = T + 20 * Sec, Value = 2 }]
+                : [new() { TimestampUnixNano = T + (i + 1) * Sec, Value = i }];
+            items.Add((new SeriesKey("m." + input[i], MetricKind.Gauge, "1", labels), new HotSeries(pts)));
+        }
+
+        var infos = MetricWriter.Write(_dir, items, MetricGranularity.Raw);
+
+        Assert.Equal(["m.b", "m.a", "m.c"], infos.Select(f => f.MetricName));
+        string[][] expected = [["0", "2", "5"], ["1", "4"], ["3", "6"]];
+        for (int f = 0; f < infos.Count; f++)
+        {
+            var series = MetricReader.ReadAllSync(infos[f].FilePath).ToList();
+            Assert.Equal(expected[f], series.Select(s => s.Labels.ValueAt(0)));
+            Assert.Equal(infos[f].MetricName, MetricReader.ReadSegmentInfo(infos[f].FilePath).MetricName);
+        }
+
+        var a4 = MetricReader.ReadAllSync(infos[1].FilePath).Single(s => s.Labels.ValueAt(0) == "4");
+        Assert.Equal([1d, 2d, 3d], a4.Points.Select(p => p.Value));
+        Assert.Equal(T + 2 * Sec,  infos[1].MinNano);    // series 1's only point
+        Assert.Equal(T + 30 * Sec, infos[1].MaxNano);    // series 4's last point once sorted
+        Assert.Equal(new FileInfo(infos[1].FilePath).Length, infos[1].SizeBytes);
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {

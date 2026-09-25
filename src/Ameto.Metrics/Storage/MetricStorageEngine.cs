@@ -1608,7 +1608,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
-        catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
+        catch (Exception ex) { LogColdScanFailed(_logger, ex, _dataDir); }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
@@ -2859,8 +2859,36 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         }
     }
 
+    /// <summary>
+    /// The cold scan failed AS A WHOLE (#94) — the directory could not be listed, the segment list
+    /// could not be published — so the cold tier holds none of what was on disk (a file that fails
+    /// on its own is handled inside the scan), and nothing will scan again before a restart. The
+    /// engine still completes <see cref="ColdLoadCompleted"/>, so every reader goes on answering from
+    /// the hot tier and whatever flushes have published since: the alert evaluator included, which
+    /// reads a missing window as a quiet one. Said once, as an Error, naming that consequence —
+    /// a store that reports itself degraded, and an evaluator that skips it, is the design filed on
+    /// #94; this line is what an operator has until then.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "The cold metric segment scan of {DataDirectory} failed: the segments on disk are not served until a "
+                + "restart, and metric queries answer from the hot tier and what has been flushed since. Metric ALERT "
+                + "RULES keep being evaluated on that partial data: a missing window reads as a quiet one, so a \"<\" "
+                + "rule can fire and a \">\" rule can resolve on points that exist but were not loaded. Restart once the "
+                + "cause is fixed")]
+    private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
+
+    /// <summary>
+    /// Test seam: an engine constructed while this holds an exception throws it from its cold scan,
+    /// before the directory is listed — the scan failing as a whole, which nothing else produces on
+    /// demand. An <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into
+    /// the flush loop, so it reaches only the engines the setting test constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Exception?> FailColdScanForTest = new();
+
     private void LoadColdSegments()
     {
+        if (FailColdScanForTest.Value is { } fail) throw fail;
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // No *.mts.tmp sweep here, deliberately — see the constructor. This method runs in the
@@ -2900,20 +2928,35 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// Rebuilds the in-memory metric catalog from cold segments on startup so the
     /// Explore catalog / Overview detection work immediately after a restart, instead
     /// of staying blank until the next live export repopulates metadata.
+    ///
+    /// <para><b>Identities from the file, the time from its header</b> (#94). This decoded every
+    /// point of every series of every <c>.mts</c> — every file of the retention window, at every
+    /// start — to take one timestamp per series, its last point's, and fold it into the METRIC's
+    /// <see cref="MetricMeta.LastSeenMs"/> as a maximum. Per file that maximum is the header's
+    /// <see cref="MetricSegmentInfo.MaxNano"/>, exactly: every writer of the format — v3's and the
+    /// one v2 writer there ever was — sets it to the greatest of its series' last points, taken
+    /// from the very lists it then writes, oldest first; a series with no points used the header
+    /// already; and the millisecond is the same one (v3 stores <c>ns / 1e6</c> and reads back
+    /// <c>ms x 1e6</c>, whose <c>/ 1e6</c> is the header's <c>/ 1e6</c>). So the series are read
+    /// for what only they carry — kind, unit, labels, in the same order, for the same
+    /// last-wins and first-N rules — and their bounds and points are walked past, not built
+    /// (<see cref="MetricReader.ReadIdentities"/>). <c>MetricCatalogSeedTests</c> holds the catalog
+    /// to the one the full decode builds. The one difference is a file torn inside its points: the
+    /// full decode stopped at the torn series, this reads the identities past it.</para>
     /// </summary>
     private void SeedCatalogFromCold(List<MetricSegmentInfo> segments)
     {
         int seeded = 0;
         foreach (var seg in segments)
         {
+            long lastMs = seg.MaxNano / 1_000_000L;
             try
             {
-                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+                foreach (var s in MetricReader.ReadIdentities(seg.FilePath))
                 {
                     var meta = _meta.GetOrAdd(s.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
                     meta.Kind = s.Kind;
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
-                    long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
                     if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
                     foreach (var (k, v) in s.Labels)
                     {
@@ -3405,6 +3448,29 @@ internal sealed class HotSeries
             var slice = new List<MetricDataPoint>(hi - lo);
             slice.AddRange(all[lo..hi]);
             return slice;
+        }
+    }
+
+    /// <summary>
+    /// Every point, oldest first, for <c>MetricWriter</c> — IN PLACE when the list is in order,
+    /// which is every series but one two exporters interleave on; an out-of-order list comes back
+    /// as the sorted copy <see cref="GetPoints"/> would have made. The writer used to call
+    /// <see cref="GetPoints"/> twice per series (the file's time range, then the serialisation):
+    /// two full copies of every point it wrote, 2.4 MB per 512-series file of 60 points.
+    ///
+    /// <para><b>Only for a series nothing appends to.</b> The span is over this series' own list
+    /// and is read after the lock is released. The writer's input always is such a series: the
+    /// drain's snapshot (<see cref="FromDrain"/> — its list was handed over, and the live series
+    /// took a fresh one) or a rewrite's batch; never a series in <c>_hot</c>.</para>
+    /// </summary>
+    internal ReadOnlySpan<MetricDataPoint> PointsForWrite()
+    {
+        lock (_lock)
+        {
+            ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_points);
+            return _outOfOrder
+                ? System.Runtime.InteropServices.CollectionsMarshal.AsSpan(SortedSlice(all, long.MinValue, long.MaxValue))
+                : all;
         }
     }
 

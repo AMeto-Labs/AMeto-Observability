@@ -2,6 +2,7 @@ import {
   Component, input, signal, computed, inject, OnChanges, SimpleChanges,
   ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
+import { LucideAngularModule } from 'lucide-angular';
 import { ApiService } from '../../../core/services/api.service';
 
 export interface FlamegraphNode {
@@ -13,15 +14,72 @@ export interface FlamegraphNode {
   totalMs:   number;
   selfMs:    number;
   children:  FlamegraphNode[];
+  /**
+   * The server stopped writing this node's subtree (#99): it sits on the deepest level sent
+   * (4 096) or the node budget ran out. `children` holds what was written — often nothing — while
+   * `totalMs` / `selfMs` still count every descendant. Absent on every other node.
+   */
+  truncated?: boolean;
   // layout (computed)
   _x?:      number; // 0–1 fraction
   _w?:      number; // width fraction
   _depth?:  number;
 }
 
+/**
+ * Lays the tree out left to right — every node's `_depth`, and `_x` / `_w` as fractions of the
+ * root's width — and returns the nodes in pre-order (a node, then each child's subtree in order),
+ * the order the bars are drawn in.
+ *
+ * ITERATIVE, over an explicit stack: the server sends up to 4 096 levels (#99), and the recursive
+ * walk this replaces spent one engine stack frame per level — V8 holds that many, other engines
+ * were never checked. A node's children are placed when the node is taken off the stack, with the
+ * recursive walk's arithmetic in its order (`cw = w * (child / parent)`, `cx += cw`), and pushed
+ * last-first so the first child comes off next: the layout is the recursive one to the bit, which
+ * `flame-graph.spec.ts` checks against a copy of it.
+ */
+export function layoutFlamegraph(root: FlamegraphNode): FlamegraphNode[] {
+  const out: FlamegraphNode[] = [];
+  root._depth = 0;
+  root._x = 0;
+  root._w = 1;
+  const stack: FlamegraphNode[] = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
+    out.push(n);
+    const kids = n.children;
+    let cx = n._x!;
+    for (const c of kids) {
+      const cw = n._w! * (c.totalMs / n.totalMs);
+      c._depth = n._depth! + 1;
+      c._x = cx;
+      c._w = cw;
+      cx += cw;
+    }
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+  }
+  return out;
+}
+
+/** The span ids of `node` and every node below it — iteratively, for the reason above. */
+export function subtreeIds(node: FlamegraphNode): Set<string> {
+  const ids = new Set<string>();
+  const stack: FlamegraphNode[] = [node];
+  while (stack.length) {
+    const n = stack.pop()!;
+    ids.add(n.spanId);
+    for (const c of n.children) stack.push(c);
+  }
+  return ids;
+}
+
+/** What a cut node's title and tooltip say. */
+export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
+
 @Component({
   selector:        'app-flame-graph',
   standalone:      true,
+  imports:         [LucideAngularModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="fg-root">
@@ -40,6 +98,14 @@ export interface FlamegraphNode {
 
         <div class="fg-toolbar">
           <span class="fg-stat">{{ flatNodes().length }} spans · {{ fmtMs(rootMs()) }}</span>
+          @if (cutCount()) {
+            <!-- A cut subtree still counts in its node's width, so the picture LOOKS whole: the
+                 note is what says spans are missing (the partial-result convention). -->
+            <span class="fg-cut-note" title="The trace is deeper than the flame graph is sent; the marked bars' subtrees are not drawn">
+              <lucide-icon name="triangle-alert" [size]="12" />
+              {{ cutCount() }} {{ cutCount() === 1 ? 'branch' : 'branches' }} cut — deeper spans not drawn
+            </span>
+          }
           @if (focused()) {
             <button class="fg-btn" (click)="resetFocus()">
               ↩ Reset zoom
@@ -51,6 +117,9 @@ export interface FlamegraphNode {
               <span class="fg-tt-svc">{{ hovered()!.service }}</span>
               <span class="fg-tt-dur">{{ fmtMs(hovered()!.totalMs) }} total · {{ fmtMs(hovered()!.selfMs) }} self</span>
               <span class="fg-tt-pct">{{ pct(hovered()!.totalMs) }}%</span>
+              @if (hovered()!.truncated) {
+                <span class="fg-tt-cut">{{ CUT_NOTE }}</span>
+              }
             </div>
           }
         </div>
@@ -58,13 +127,14 @@ export interface FlamegraphNode {
         <div class="fg-canvas" #canvas>
           @for (node of visibleNodes(); track node.spanId + node._depth) {
             <div class="fg-bar"
-                 [title]="node.name + ' · ' + fmtMs(node.totalMs)"
+                 [title]="barTitle(node)"
                  [style.left.%]="barLeft(node)"
                  [style.width.%]="barWidth(node)"
                  [style.top.px]="node._depth! * ROW_H"
                  [style.height.px]="ROW_H - 2"
                  [style.background]="barColor(node)"
                  [class.fg-bar--error]="node.status === 'Error'"
+                 [class.fg-bar--cut]="node.truncated"
                  [class.fg-bar--focused]="focused()?.spanId === node.spanId"
                  (mouseenter)="hovered.set(node)"
                  (mouseleave)="hovered.set(null)"
@@ -83,6 +153,11 @@ export interface FlamegraphNode {
           <span class="fg-legend-item">
             <span class="fg-legend-dot" style="background:#ef4444"></span> Error
           </span>
+          @if (cutCount()) {
+            <span class="fg-legend-item">
+              <span class="fg-legend-dot fg-legend-cut" style="background:#38bdf8"></span> Cut — deeper spans not drawn
+            </span>
+          }
           <span class="fg-legend-item fg-legend-hint">Click to zoom · Click again to reset</span>
         </div>
 
@@ -148,6 +223,18 @@ export interface FlamegraphNode {
     .fg-tt-svc  { color: var(--text-muted); }
     .fg-tt-dur  { color: var(--info); font-family: var(--font-ui); }
     .fg-tt-pct  { color: var(--accent); font-weight: 700; }
+    .fg-tt-cut  { color: var(--warning); }
+
+    .fg-cut-note {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--warning);
+      background: var(--warning-soft);
+      border-radius: 5px;
+      padding: 2px 8px;
+    }
 
     .fg-canvas {
       flex: 1;
@@ -169,6 +256,10 @@ export interface FlamegraphNode {
     }
     .fg-bar.fg-bar--error   { outline: 1px solid #ef4444; }
     .fg-bar.fg-bar--focused { outline: 2px solid var(--accent); filter: brightness(1.2); }
+    /* A cut subtree: the bar keeps its width (the server's totalMs counts what was not sent) and
+       its right edge says "continues, not drawn" — a box-shadow, so it survives the inline
+       background and composes with the error and focus outlines. */
+    .fg-bar.fg-bar--cut     { box-shadow: inset -4px 0 0 var(--warning); }
 
     .fg-label {
       display: block;
@@ -195,6 +286,7 @@ export interface FlamegraphNode {
     .fg-legend-item   { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-muted); }
     .fg-legend-dot    { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
     .fg-legend-hint   { margin-left: auto; font-style: italic; }
+    .fg-legend-cut    { box-shadow: inset -3px 0 0 var(--warning); }
   `],
 })
 export class FlamegraphComponent implements OnChanges {
@@ -213,24 +305,18 @@ export class FlamegraphComponent implements OnChanges {
 
   rootMs = computed(() => this.root()?.totalMs ?? 1);
 
+  readonly CUT_NOTE = CUT_NOTE;
+
   flatNodes = computed(() => {
     const r = this.root();
-    if (!r) return [];
-    const out: FlamegraphNode[] = [];
-    const walk = (n: FlamegraphNode, depth: number, x: number, w: number) => {
-      n._depth = depth;
-      n._x = x;
-      n._w = w;
-      out.push(n);
-      let cx = x;
-      for (const c of n.children) {
-        const cw = w * (c.totalMs / n.totalMs);
-        walk(c, depth + 1, cx, cw);
-        cx += cw;
-      }
-    };
-    walk(r, 0, 0, 1);
-    return out;
+    return r ? layoutFlamegraph(r) : [];
+  });
+
+  /** Nodes whose subtree the server did not send (see {@link FlamegraphNode.truncated}). */
+  cutCount = computed(() => {
+    let n = 0;
+    for (const node of this.flatNodes()) if (node.truncated) n++;
+    return n;
   });
 
   /** When a node is focused, show only its subtree re-scaled to full width. */
@@ -239,10 +325,7 @@ export class FlamegraphComponent implements OnChanges {
     const f   = this.focused();
     if (!f) return all;
 
-    // collect subtree
-    const ids = new Set<string>();
-    const collect = (n: FlamegraphNode) => { ids.add(n.spanId); n.children.forEach(collect); };
-    collect(f);
+    const ids = subtreeIds(f);
 
     // re-scale: f._x..f._x+f._w → 0..1
     const ox = f._x ?? 0, ow = f._w ?? 1;
@@ -293,6 +376,11 @@ export class FlamegraphComponent implements OnChanges {
 
   barLeft(n: FlamegraphNode): number  { return (n._x ?? 0) * 100; }
   barWidth(n: FlamegraphNode): number { return Math.max(0.05, (n._w ?? 0) * 100); }
+
+  barTitle(n: FlamegraphNode): string {
+    const t = n.name + ' · ' + this.fmtMs(n.totalMs);
+    return n.truncated ? t + ' · ' + CUT_NOTE : t;
+  }
 
   // ── Colors ────────────────────────────────────────────────────────────────
 
