@@ -187,11 +187,17 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), head + written);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), generation);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(24), committed);
+        if (version != 1) SealHeader(file);
         long at = head;
         foreach (var e in entries) { e.CopyTo(file, at); at += e.Length; }
         File.WriteAllBytes(WalPath, file);
         File.WriteAllBytes(PoolPath, poolRecords.SelectMany(static r => r).ToArray());
     }
+
+    /// <summary>The v2 header checksum: CRC32C over bytes [0, 8) and [16, 56), stored at 56.</summary>
+    private static void SealHeader(byte[] file) =>
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(56),
+            Crc32c.Append(Crc32c.Append(0, file.AsSpan(0, 8)), file.AsSpan(16, 40)));
 
     private static readonly byte[] CpuBody     = PoolBody("cpu",     MetricKind.Gauge,     "ms", [("service.name", "MintRoute.API")], null);
     private static readonly byte[] LatencyBody = PoolBody("latency", MetricKind.Histogram, "s",  [("service.name", "KioskAgent.API")], Bounds);
@@ -550,6 +556,48 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         // And the finish is durable in the file: the next open has nothing left to finish.
         var again = Open(path: Path.Combine(killed, "metrics.wal"));
         Assert.Equal(expected, again.ReadAll(out _).Select(static r => r.Point.Value));
+    }
+
+    // ── The header's own checksum ────────────────────────────────────────────
+
+    /// <summary>
+    /// A HEADER THAT DOES NOT VERIFY HAS ITS COUNTERS REBUILT FROM THE ENTRIES, AND HIDES NONE OF
+    /// THEM. The watermark is written into the header without its checksum. A ROTTED watermark at
+    /// or above every entry's generation hid them all — replay skips what the watermark covers, and
+    /// the crossed-header repair then raised the counter above it — acknowledged points dropped by
+    /// eight bytes of header, silently; now the watermark is rebuilt below the oldest entry and all
+    /// of them replay, with an Error. A watermark BELOW the newest entry is what a commit killed
+    /// between its watermark store and the seal leaves, and it is kept: the committed prefix still
+    /// in the file stays dead and the survivors replay once. The next open finds a header that
+    /// verifies.
+    /// </summary>
+    [Theory]
+    [InlineData(1_000UL, new[] { 1.0, 2.0, 3.0 })]   // rotted: above every entry — rebuilt, all replay
+    [InlineData(1UL,     new[] { 4.0, 5.0 })]        // a commit killed before its seal — kept, survivors only
+    public void A_header_that_does_not_verify_has_its_counters_rebuilt_from_the_entries(ulong watermark, double[] expected)
+    {
+        using (var wal = Open())
+        {
+            wal.Append([Gauge("cpu", 0, 1.0), Gauge("cpu", 1, 2.0), Gauge("cpu", 2, 3.0)]);   // generation 1
+            if (expected.Length == 2)
+            {
+                wal.BeginFlush();                                                          // generation 2 from here
+                wal.Append([Gauge("cpu", 3, 4.0), Gauge("cpu", 4, 5.0)]);
+            }
+        }
+        byte[] file = File.ReadAllBytes(WalPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(24), watermark);             // CommittedGeneration, unsealed
+        File.WriteAllBytes(WalPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+            Assert.Equal(expected, wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
+
+        var quiet = new CapturingLogger();
+        using (var wal = Open(quiet))
+            Assert.Equal(expected, wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.DoesNotContain(quiet.Entries, static e => e.Level >= LogLevel.Warning);
     }
 
     // ── The pool ─────────────────────────────────────────────────────────────

@@ -62,7 +62,8 @@ internal enum MetricWalCommit
 ///      32   MoveFrom            int64   the relocation record: see RelocateLocked
 ///      40   MoveLength          int64   0 = no relocation in flight
 ///      48   MoveDone            int64
-///      56   _reserved           8 bytes
+///      56   Crc                 uint32  CRC32C over bytes [0, 8) and [16, 56): all but the claim
+///      60   _reserved           uint32
 ///     [Entry Header — 48 bytes, Pack = 1, the fields of MetricWalEntryHeader]
 ///     [Crc          — uint32, CRC32C over the 48 header bytes + the bucket counts]
 ///     [BucketCounts — BucketCount × int64]
@@ -247,6 +248,11 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// <para><b>The relocation record</b> (<see cref="MoveFrom"/>, <see cref="MoveLength"/>,
     /// <see cref="MoveDone"/>) is what makes a commit's move of the surviving tail safe against
     /// the process dying in the middle of it. See <see cref="RelocateLocked"/>.</para>
+    ///
+    /// <para><b><see cref="Crc"/></b> covers everything but <see cref="WriteOffset"/>: the counters
+    /// and the record, which change a few times per flush, and not the claim, which every batch
+    /// moves and which the open-time walk checks against the data anyway (#59). See
+    /// <see cref="SealHeaderLocked"/>.</para>
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -261,7 +267,8 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         public long   MoveFrom;          // logical offset the surviving tail is moved from
         public long   MoveLength;        // its length; 0 = no relocation in flight
         public long   MoveDone;          // bytes of it already moved, always a chunk boundary
-        private long  _reserved;
+        public uint   Crc;               // CRC32C over bytes [0, 8) and [16, 56): see SealHeaderLocked
+        private uint  _reserved;
     }
 
     /// <summary>
@@ -715,6 +722,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 CommittedGeneration = _committedGeneration,
             };
             MemoryMarshal.Write(fileHeader, in hdr);
+            BinaryPrimitives.WriteUInt32LittleEndian(fileHeader[56..], HeaderChecksum(fileHeader));
             fs.Position = 0;
             fs.Write(fileHeader);
             fs.Flush(flushToDisk: true);
@@ -771,6 +779,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             _writeOffset            = 0;
             _generation             = FirstGeneration;
             _committedGeneration    = 0;
+            SealHeaderLocked();
         }
         else
         {
@@ -779,9 +788,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
 
+            // Decided before anything below re-seals the header. A v1 header has no checksum.
+            bool counted = _legacyV1 || hdr.Crc == HeaderChecksum(new ReadOnlySpan<byte>(_ptr, FileHeaderSize));
+
             // A commit's move of the surviving tail that the process did not live to finish is
             // finished here, before anything walks the data. See RelocateLocked.
             if (!_legacyV1) FinishRelocationLocked(ref hdr);
+
+            // A header whose counters do not verify gets them back from the entries. See there.
+            if (!counted) RebuildCountersLocked(ref hdr);
 
             // The counter must LEAD the watermark. BeginFlush only ever hands out _generation
             // and CommitFlush only ever names a generation it was handed, so a header where the
@@ -805,6 +820,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // the data itself say where it ends.
             ReconcileDataEndLocked(ref hdr);
 
+            SealHeaderLocked();
         }
 
         // A file that grew stays grown across restarts otherwise ("reopen an already-grown log"
@@ -1594,6 +1610,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             _openFlush  = flushing;
             _generation = flushing + 1;
             Unsafe.AsRef<WalFileHeader>(_ptr).Generation = _generation;
+            SealHeaderLocked();
             return flushing;
         }
     }
@@ -1745,6 +1762,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // committed no matter what the reclaim does.
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             hdr.CommittedGeneration = flushedGeneration;
+            SealHeaderLocked();
 
             Compact(flushedGeneration);
             return MetricWalCommit.Committed;
@@ -1799,6 +1817,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             _writeOffset    = surviving;
             hdr.WriteOffset = _headerSize + _writeOffset;
             ClearRelocation(ref hdr);
+            SealHeaderLocked();
         }
         else
         {
@@ -1897,6 +1916,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             hdr.MoveFrom   = from;
             hdr.MoveDone   = 0;
             hdr.MoveLength = length;                     // armed
+            SealHeaderLocked();
             OnRelocationStepForTest?.Invoke(0);
         }
 
@@ -1906,6 +1926,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
             done         += chunk;
             hdr.MoveDone  = done;
+            SealHeaderLocked();
             OnRelocationStepForTest?.Invoke(done);
         }
     }
@@ -1937,6 +1958,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 "done {Done}, capacity {Capacity}); ignoring it — the walk decides where the data ends.",
                 from, length, done, _capacity);
             ClearRelocation(ref hdr);
+            SealHeaderLocked();
             return;
         }
 
@@ -1949,8 +1971,86 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         _writeOffset    = length;
         hdr.WriteOffset = _headerSize + length;
         ClearRelocation(ref hdr);
+        SealHeaderLocked();
         if (length + _entryHeaderSize <= _capacity)
             Unsafe.AsRef<MetricWalEntryHeader>(data + length).Generation = 0;
+    }
+
+    /// <summary>The header checksum over a 64-byte v2 header: bytes [0, 8) and [16, 56) — everything but the claim.</summary>
+    private static uint HeaderChecksum(ReadOnlySpan<byte> header) =>
+        Crc32c.Append(Crc32c.Append(0, header[..8]), header[16..56]);
+
+    /// <summary>
+    /// Stores the header's checksum after a change to what it covers — the counters or the
+    /// relocation record. v2 only (a v1 header is 32 bytes, and byte 56 is data). Caller holds the
+    /// lock, or is the open.
+    ///
+    /// <para><b>Why a checksum on a header the entries already vouch for.</b> One field of it can
+    /// hide every entry without any entry being wrong: a <see cref="WalFileHeader.CommittedGeneration"/>
+    /// at or above the newest entry's generation makes the replay skip them all, and the
+    /// crossed-header repair then raised the counter above it — acknowledged points dropped by a
+    /// rotted or copied header, silently. A header that does not verify has its counters rebuilt
+    /// from the entries instead (<see cref="RebuildCountersLocked"/>).</para>
+    ///
+    /// <para><b>Why not the claim.</b> <see cref="WalFileHeader.WriteOffset"/> moves on every
+    /// batch, and sealing it would put a hash on the append path for a field the open-time walk
+    /// already reconciles against the data (#59). So a process killed between a covered store and
+    /// this one — the only ordinary way to leave a header that does not verify — can only have
+    /// been inside a BeginFlush, a commit or a relocation step, never inside an append.</para>
+    /// </summary>
+    private void SealHeaderLocked()
+    {
+        if (_legacyV1) return;
+        Unsafe.AsRef<WalFileHeader>(_ptr).Crc = HeaderChecksum(new ReadOnlySpan<byte>(_ptr, FileHeaderSize));
+    }
+
+    /// <summary>
+    /// The counters of a header that does not verify (<see cref="SealHeaderLocked"/>), taken back
+    /// from the entries — which carry their own checksums, and so are the better witness. The
+    /// walk over the claimed range verifies every entry and ignores the generation margin (it
+    /// judges against the very counter being rebuilt). Then:
+    /// <list type="bullet">
+    /// <item>the generation is the newest entry's — appends continue in it, and the next flush
+    /// covers them; with no entry at all, both counters start over;</item>
+    /// <item>the watermark is kept while it is below the newest entry's generation — it hides at
+    /// most a prefix, which is exactly what a process killed between a commit's watermark store and
+    /// its seal left behind — and dropped to just below the oldest entry when it would hide every
+    /// one of them, which is what a rotted watermark does. That second case, reached legitimately,
+    /// is a commit that had nothing surviving and died before its compaction: its points replay
+    /// beside the files it wrote — duplicates of one flush, never loss.</item>
+    /// </list>
+    /// An Error says it happened; the open seals the result.
+    /// </summary>
+    private void RebuildCountersLocked(ref WalFileHeader hdr)
+    {
+        byte* data = _ptr + _headerSize;
+        ulong oldest = ulong.MaxValue, newest = 0, headerGeneration = hdr.Generation, headerCommitted = hdr.CommittedGeneration;
+
+        _generation = ulong.MaxValue - GenerationSanityMargin;           // the margin, off
+        for (long pos = 0, total; (total = EntryAt(data, pos, _writeOffset, verify: true, out _)) > 0; pos += total)
+        {
+            ulong g = Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation;
+            if (g < oldest) oldest = g;
+            if (g > newest) newest = g;
+        }
+
+        if (newest == 0)
+        {
+            _generation          = FirstGeneration;
+            _committedGeneration = 0;
+        }
+        else
+        {
+            _generation = newest;
+            if (_committedGeneration >= newest) _committedGeneration = oldest - 1;
+        }
+        hdr.Generation          = _generation;
+        hdr.CommittedGeneration = _committedGeneration;
+
+        _logger?.LogError(
+            "Metric WAL header does not verify (generation {Generation}, watermark {Watermark}); its counters were " +
+            "rebuilt from the entries: generation {NewGeneration}, watermark {NewWatermark}.",
+            headerGeneration, headerCommitted, _generation, _committedGeneration);
     }
 
     /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a metric WAL at all.</summary>

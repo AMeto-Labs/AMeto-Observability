@@ -126,6 +126,20 @@ public sealed class MetricWalTests : IAsyncLifetime
     private const int Hdr = 64;
 
     /// <summary>
+    /// Recomputes the header checksum after a test has written a counter into it — so the header
+    /// verifies and carries what the test put there, and the repair under test runs rather than
+    /// the rebuild a header that does not verify gets (MetricWalV2Tests pins that one).
+    /// </summary>
+    private void ResealHeader()
+    {
+        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite);
+        var header = new byte[56];
+        fs.ReadExactly(header);
+        fs.Position = 56;
+        fs.Write(BitConverter.GetBytes(Crc32c.Append(Crc32c.Append(0, header.AsSpan(0, 8)), header.AsSpan(16, 40))));
+    }
+
+    /// <summary>
     /// Recomputes the v2 checksum of the entry at <paramref name="fileOffset"/> after a test has
     /// written into it — so the entry VERIFIES and carries what the test put there. That is the
     /// shape the open-time walk classifies as corruption (Error + quarantine); an entry left with
@@ -2687,6 +2701,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Seek(16, SeekOrigin.Begin);               // WalFileHeader.Generation
             fs.Write(new byte[8]);                       // counter behind the standing watermark
         }
+        ResealHeader();                                  // crossed, but a header that verifies
 
         using (var reopened = OpenWal(64 * 1024))
         {
@@ -2728,6 +2743,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Seek(16, SeekOrigin.Begin);               // WalFileHeader.Generation
             fs.Write(new byte[8]);                       // counter lost, watermark kept
         }
+        ResealHeader();                                  // crossed, but a header that verifies
 
         var engine = NewEngine();
         var batch  = SlowFlushBatch(baseNano + 3_600_000_000_000L, "a", series: 10, pointsPerSeries: 10);
