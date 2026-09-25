@@ -59,6 +59,21 @@ public sealed class SegmentReader : ISegmentReader
 
     public SegmentInfo Info { get; }
 
+    /// <summary>
+    /// The file's last-write time (UTC ticks), from the stat <see cref="Open"/> makes anyway. A
+    /// segment is never rewritten in place, so this changes only when the file behind the path is
+    /// replaced — which is what a cache keyed by path needs to notice (#80 review).
+    /// </summary>
+    public long LastWriteTicks { get; }
+
+    /// <summary>
+    /// CRC32C of the block index, computed over the bytes <see cref="Open"/> reads anyway — no
+    /// extra I/O. The format stores no content digest; this one moves whenever any block's
+    /// offset, zone-map timestamp or first ordinal does, i.e. whenever the compressed content is
+    /// laid out differently, even in a file of the same size and group layout.
+    /// </summary>
+    public uint BlockIndexCrc { get; }
+
     /// <param name="computeUncompressedBytes">
     /// When true, <see cref="SegmentInfo.UncompressedBytes"/> is the real sum of the
     /// blocks' uncompressed sizes (two 4-byte reads at each block offset, both in the
@@ -90,7 +105,7 @@ public sealed class SegmentReader : ISegmentReader
         try
         {
             view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
+            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes, fi.LastWriteTimeUtc.Ticks);
             Interlocked.Increment(ref Opens);
             return reader;
         }
@@ -103,11 +118,12 @@ public sealed class SegmentReader : ISegmentReader
     }
 
     private SegmentReader(string filePath, MemoryMappedFile mmf, MemoryMappedViewAccessor view, long fileSize,
-                          bool computeUncompressedBytes)
+                          bool computeUncompressedBytes, long lastWriteTicks)
     {
         _mmf      = mmf;
         _view     = view;
         _fileSize = fileSize;
+        LastWriteTicks = lastWriteTicks;
 
         const int footerSize = 44;
         long footerStart = fileSize - footerSize;
@@ -152,6 +168,7 @@ public sealed class SegmentReader : ISegmentReader
         {
             if (idxBytes > 0) _view.ReadArray(_blockIndexOffset + 4, rented, 0, idxBytes);
             var raw = rented.AsSpan(0, idxBytes);
+            BlockIndexCrc = Crc32c.Append(0, raw);
             for (int i = 0; i < blockCount; i++)
             {
                 var entry   = raw.Slice(i * stride, stride);

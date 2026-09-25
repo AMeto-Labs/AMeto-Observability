@@ -315,8 +315,8 @@ public sealed class SegmentIndexMemoConcurrencyTests
         var groups = BuildGroups(2);
         var (oldBytes, newBytes) = (groups[0], groups[1]);
         var cache  = new SegmentIndexCache(1 << 20);
-        var oldFp  = new IndexGroupFingerprint(1, default, oldBytes.Inverted.Length, default);
-        var newFp  = new IndexGroupFingerprint(1, default, newBytes.Inverted.Length + 1, default);
+        var oldFp  = new IndexGroupFingerprint(1, default, oldBytes.Inverted.Length, default, 0, 0);
+        var newFp  = new IndexGroupFingerprint(1, default, newBytes.Inverted.Length + 1, default, 0, 0);
 
         var held = SegmentIndexView.OverSections(cache, "same.seg", 0, oldBytes.Inverted, oldBytes.Trigram, oldBytes.Bloom, oldFp);
         Assert.True(Same(oldBytes.Expected[0], AskIt(held, Questions[0])));

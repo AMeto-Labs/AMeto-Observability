@@ -5,22 +5,33 @@ namespace Ameto.Indexing;
 
 /// <summary>
 /// What identifies the BYTES behind one (path, group) cache key: the segment's id, node and file
-/// size, and the group's directory record — its section offsets, row range and time bounds.
+/// size, the group's directory record — its section offsets, row range and time bounds — the
+/// file's last-write time, and a CRC of its block index.
 ///
 /// <para>A path is not an identity. A replicated <c>{node}-{id}</c> segment can be re-imported
 /// under the name retention unlinked — a peer wiped and reinstalled under the same NodeId, or two
 /// nodes sharing one — and a memo taught from the old bytes answers for the new ones wrongly: its
 /// postings are ordinals of the old file, its "absent" and its bloom verdicts are about the old
 /// file, so the group loses rows it holds. An entry remembers the fingerprint it learned under,
-/// and a query that opens the key over a different one gets a fresh memo. Two different files
-/// agreeing on all of this — same size, same group layout to the byte offset, same row counts
-/// and the same first and last timestamps — is not a case the cache tries to separate.</para>
+/// and a query that opens the key over a different one gets a fresh memo.</para>
+///
+/// <para>None of the structural fields is content: a peer wiped and reinstalled under the same
+/// NodeId can replay the same id, row counts and timestamps with values of the same lengths, and
+/// its file then agrees on all of them. The format stores no digest, so two cheap signals that
+/// the bytes changed stand in for one. The last-write time comes from the stat the reader makes
+/// anyway: a segment is never rewritten in place, so it moves only when the file is replaced. The
+/// block-index CRC comes from bytes the reader reads anyway: it moves when the compressed blocks
+/// are laid out differently, which also covers a replacement that kept the old timestamp (a
+/// time-preserving copy or restore). A replacement that defeats both is not a case the cache
+/// tries to separate.</para>
 /// </summary>
-public readonly record struct IndexGroupFingerprint(ulong SegmentId, NodeId Node, long FileBytes, SegmentIndexGroup Group)
+public readonly record struct IndexGroupFingerprint(
+    ulong SegmentId, NodeId Node, long FileBytes, SegmentIndexGroup Group, long LastWriteTicks, uint BlockIndexCrc)
 {
     /// <summary>The fingerprint of group <paramref name="group"/> of an open segment.</summary>
     public static IndexGroupFingerprint Of(SegmentReader segment, int group) =>
-        new(segment.Info.Id.Value, segment.Info.NodeId, segment.Info.CompressedBytes, segment.Groups[group]);
+        new(segment.Info.Id.Value, segment.Info.NodeId, segment.Info.CompressedBytes, segment.Groups[group],
+            segment.LastWriteTicks, segment.BlockIndexCrc);
 }
 
 /// <summary>

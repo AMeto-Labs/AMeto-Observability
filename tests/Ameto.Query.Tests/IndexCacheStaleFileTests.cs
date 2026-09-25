@@ -88,6 +88,80 @@ public sealed class IndexCacheStaleFileTests : IDisposable
         Assert.NotEmpty(await KeysAsync(cached, "contains(@mt, 'refund')"));
     }
 
+    /// <summary>
+    /// The replacement that agrees on everything STRUCTURAL: the same id, node, size, group layout,
+    /// row counts and timestamps — here, file A with one index value renamed in place
+    /// ("cust-3" → "cust-9", same length), which is what a peer replaying same-length values
+    /// produces. The format carries no digest, so the fingerprint has two stand-ins: the file's
+    /// write time (a replaced file is written anew), and — for a replacement that kept the old
+    /// write time, as a time-preserving copy or restore does — a CRC of the block index, here
+    /// moved by one zone-map timestamp.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]   // written anew: only the write time differs
+    [InlineData(true)]    // old write time restored: only the block index differs
+    public async Task A_structurally_identical_file_with_other_bytes_is_not_answered_from_the_old_memo(bool keepWriteTime)
+    {
+        var a = await WriteSegmentAsync("a2", events: 300, customer: i => "cust-" + (i % 10), template: "order {k} shipped to {Customer}");
+        string fixedDir = Path.Combine(_root, "served2");
+        Directory.CreateDirectory(fixedDir);
+        string path = Path.Combine(fixedDir, "0-1-segment.seg");
+
+        var provider = new OneSegment(_engines[0]);
+        var cache    = new SegmentIndexCache(64 * 1024 * 1024);
+        var cached   = new QueryExecutor(provider, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
+        var plain    = new QueryExecutor(provider, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        const string Filter = "Customer = 'cust-3'";
+
+        File.Copy(a.FilePath, path);
+        provider.Current = At(a, path);
+        var fromA = await KeysAsync(cached, Filter);
+        Assert.NotEmpty(fromA);
+        Assert.Equal(fromA, await KeysAsync(plain, Filter));
+        DateTime aWritten = File.GetLastWriteTimeUtc(path);
+
+        // B: A's bytes with the bucket renamed, byte for byte the same length.
+        byte[] bytes = File.ReadAllBytes(a.FilePath);
+        RenameInvertedValue(bytes, a.FilePath, "cust-3"u8, (byte)'9');
+        if (keepWriteTime) NudgeFirstZoneMap(bytes);
+        File.Delete(path);
+        File.WriteAllBytes(path, bytes);
+        if (keepWriteTime) File.SetLastWriteTimeUtc(path, aWritten);
+        provider.Current = At(a, path);                    // the catalog cannot tell them apart either
+
+        var expected = await KeysAsync(plain, Filter);
+        Assert.Empty(expected);                           // B's index proves no 'cust-3'
+        Assert.Equal(expected, await KeysAsync(cached, Filter));
+        Assert.Equal(1, cache.StaleReplacedCount);
+    }
+
+    /// <summary>Renames one value of the group's inverted section in place: the length-prefixed
+    /// UTF-8 <paramref name="value"/> gets its last byte replaced.</summary>
+    private static void RenameInvertedValue(byte[] file, string path, ReadOnlySpan<byte> value, byte lastByte)
+    {
+        long off;
+        using (var r = SegmentReader.Open(path)) off = r.Groups[0].InvertedOffset;
+        int len  = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan((int)off));
+        var sect = file.AsSpan((int)off + 4, len);
+
+        Span<byte> needle = stackalloc byte[2 + value.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(needle, (ushort)value.Length);
+        value.CopyTo(needle[2..]);
+        int at = sect.IndexOf(needle);
+        Assert.True(at >= 0, "the value is not in the inverted section");
+        sect[at + needle.Length - 1] = lastByte;
+    }
+
+    /// <summary>Moves the first block's zone-map timestamp one tick earlier: harmless to every
+    /// query (a block may only start later than its zone map says), different block-index bytes.</summary>
+    private static void NudgeFirstZoneMap(byte[] file)
+    {
+        long indexOffset = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(file.AsSpan(file.Length - 44 + 24));
+        var minTs = file.AsSpan((int)indexOffset + 4 + 8, 8);   // entry 0: offset, then min timestamp
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(minTs,
+            System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(minTs) - 1);
+    }
+
     // ── Fixture ───────────────────────────────────────────────────────────────
 
     private async Task<SegmentInfo> WriteSegmentAsync(string name, int events, Func<int, string> customer, string template)
