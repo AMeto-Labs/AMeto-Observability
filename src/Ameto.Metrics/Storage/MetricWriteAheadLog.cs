@@ -54,7 +54,8 @@ internal enum MetricWalCommit
 ///   metrics.wal (v2)
 ///     [File Header — 64 bytes; v1's was the first 32 of them]
 ///       0   Magic               uint32  "RDMW"
-///       4   Version             uint16  2   (1 is still READ: see Open)
+///       4   Version             uint16  2   (1 is still READ: see Open). v2 IS this 64-byte header;
+///                                           see IsPreReleaseV2 for the 32-byte one no release wrote
 ///       6   _pad                uint16
 ///       8   WriteOffset         int64   absolute: includes this header
 ///      16   Generation          uint64  stamped on new appends
@@ -795,6 +796,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         Map(fileSize);
 
         ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        if (known && !_legacyV1 && !HeaderVerifies(in hdr) && IsPreReleaseV2(fileSize))
+        {
+            _logger?.LogError(
+                "Metric WAL at {Path} is a v2 log with the 32-byte header of a pre-release build — no release wrote " +
+                "one; v2 is the 64-byte header. It is re-initialised rather than read at the wrong offset, and the " +
+                "points it held are dropped.", _filePath);
+            known = false;
+        }
+
         if (!known)
         {
             // New, foreign or future-versioned file — re-initialise in place, as v2. Anything
@@ -2248,6 +2258,24 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             "Metric WAL header does not verify (generation {Generation}, watermark {Watermark}); its counters were " +
             "rebuilt from the entries: generation {NewGeneration}, watermark {NewWatermark}.",
             headerGeneration, headerCommitted, _generation, _committedGeneration);
+    }
+
+    /// <summary>
+    /// Whether this "v2" file has the 32-byte header the format had for a few commits of its own
+    /// branch, before the relocation record grew it to 64: its first entry then starts at byte 32,
+    /// where a real v2 header keeps the record and its checksums. No release wrote such a file; the
+    /// check exists so that a development build's leftovers are re-initialised with an Error instead
+    /// of being walked 32 bytes out of step (which the entry checksums would stop, silently, at the
+    /// first entry). Asked only of a header that does not verify: a v2 entry that verifies at byte
+    /// 32 is the evidence.
+    /// </summary>
+    private bool IsPreReleaseV2(long fileSize)
+    {
+        byte* entry = _ptr + FileHeaderSizeV1;
+        if (FileHeaderSizeV1 + EntryHeaderSize > fileSize) return false;
+        ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(entry);
+        if (eh.Generation == 0 || FileHeaderSizeV1 + EntryHeaderSize + eh.BucketCount * (long)sizeof(long) > fileSize) return false;
+        return Unsafe.ReadUnaligned<uint>(entry + ChecksummedHeaderBytes) == EntryChecksum(entry, eh.BucketCount);
     }
 
     /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a metric WAL at all.</summary>

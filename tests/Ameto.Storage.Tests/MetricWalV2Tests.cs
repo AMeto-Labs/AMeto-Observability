@@ -1108,6 +1108,40 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// v2 IS THE 64-BYTE HEADER. For a few commits of its own branch the format had v1's 32-byte
+    /// header with version 2 in it, entries from byte 32; no release wrote one, but a development
+    /// build could have. Such a file is re-initialised with an Error that says what it is — not
+    /// walked from byte 64, 32 bytes out of step with its entries.
+    /// </summary>
+    [Fact]
+    public void A_v2_log_with_the_pre_release_32_byte_header_is_reinitialised_not_misread()
+    {
+        byte[][] entries =
+        [
+            EntryBytes(new RawEntry(1, 0, BaseNano,     1.0), v2: true),
+            EntryBytes(new RawEntry(1, 0, BaseNano + 1, 2.0), v2: true),
+        ];
+        var file = new byte[FileHeaderV1 + Capacity];
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(0), 0x52_44_4D_57);
+        BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(4), 2);
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), FileHeaderV1 + 2 * V2Entry);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 1);
+        entries[0].CopyTo(file, FileHeaderV1);
+        entries[1].CopyTo(file, FileHeaderV1 + V2Entry);
+        File.WriteAllBytes(WalPath, file);
+        File.WriteAllBytes(PoolPath, PoolRecord(0, CpuBody, v2: true));
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+        {
+            Assert.Empty(wal.ReadAll(out _));
+            Assert.Equal(0, wal.WrittenBytes);
+        }
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("pre-release"));
+        Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("header does not verify"));
+    }
+
+    /// <summary>
     /// THE DURABLE MOVE WORKS PAST MAX_PATH. MoveFileExW without the <c>\\?\</c> form is limited to
     /// 260 characters where File.Move is not, so a data directory deep enough failed every upgrade
     /// on Windows — six attempts, then the log left v1 at every start. The move is made into a
