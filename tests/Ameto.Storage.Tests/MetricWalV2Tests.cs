@@ -302,6 +302,36 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A CLAIM THAT ENDS INSIDE AN ENTRY WHICH IS WHOLE AND VERIFIES IS WHAT ROTTED. Every store of
+    /// the claim lands on an entry boundary, and the claim is not under the header's checksum, so
+    /// one that points into the middle of a valid entry can only be damage to the claim. Read as a
+    /// torn final entry, it had the end marker planted over that valid entry and cut everything
+    /// after it; now the data says where the log ends — all five entries replay, with an Error.
+    /// </summary>
+    [Fact]
+    public void A_claim_that_ends_inside_a_valid_entry_is_the_claim_rotting_not_the_data()
+    {
+        long[] at;
+        long end;
+        using (var wal = Open())
+        {
+            at  = AppendFive(wal);
+            end = wal.WrittenBytes;
+        }
+        byte[] file = File.ReadAllBytes(WalPath);
+        BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(8), at[2] + 10);                  // inside entry 2
+        File.WriteAllBytes(WalPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+        {
+            Assert.Equal([0.0, 1.5, 3.0, 2.5, 6.0], wal.ReadAll(out _).Select(static r => r.Point.Value));
+            Assert.Equal(end, wal.WrittenBytes);
+        }
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("the claim is what rotted"));
+    }
+
+    /// <summary>
     /// A TORN ENTRY IS A TORN WRITE, WHATEVER ITS FIELDS DECODE TO; AN ENTRY THAT VERIFIES AND IS
     /// STILL IMPOSSIBLE IS CORRUPTION. The first entry's generation is set to the incident's
     /// ≈155e9. Left with its old checksum it is what a random tear looks like — a Warning, and no

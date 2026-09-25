@@ -960,8 +960,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     {
         byte* data = _ptr + _headerSize;
 
-        long     pos  = 0;
-        ulong    seed = 0;
+        long     pos     = 0;
+        ulong    seed    = 0;
+        ulong    lastGen = 0;
         WalkStop stop;
         long     total;
 
@@ -975,8 +976,42 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // the bytes carrying it are still in the file costs nothing to avoid. A gap in the
             // indices is harmless — the pool is a map, not an array — a collision is not.
             if (eh.SeriesIndex + 1UL > seed) seed = eh.SeriesIndex + 1UL;
+            lastGen = eh.Generation;
 
             pos += total;
+        }
+
+        // A CLAIM THAT ENDS INSIDE AN ENTRY WHICH IS WHOLE AND VERIFIES is what rotted, not the
+        // data: every store of the claim lands on an entry boundary (a batch's end, a commit's new
+        // end, a repair's cut), and a power loss can only leave an OLDER claim, which is a boundary
+        // too. Truncating there, as a torn final entry, planted the end marker over a valid entry
+        // and cut every one after it. The claim is not covered by the header checksum (it moves on
+        // every batch), so the data says where the log ends: on through the entries that verify,
+        // for as long as their generations do not go backwards — an older one is what a reset left
+        // behind, not this log's tail.
+        if (stop is WalkStop.Short or WalkStop.Torn && pos < _writeOffset && _checksummed
+            && EntryAt(data, pos, _capacity, verify: true, out _) > 0)
+        {
+            long claimed = _writeOffset, cut = pos;
+            while ((total = EntryAt(data, pos, _capacity, verify: true, out _)) > 0)
+            {
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+                if (eh.Generation < lastGen) break;
+                if (eh.SeriesIndex + 1UL > seed) seed = eh.SeriesIndex + 1UL;
+                lastGen = eh.Generation;
+                pos += total;
+            }
+
+            _logger?.LogError(
+                "Metric WAL header claims {Claimed} bytes of data, which ends inside an entry at {At} that is whole and " +
+                "verifies; the claim is what rotted, and the data runs to {Actual}.", claimed, cut, pos);
+
+            _survivorSeriesSeed = seed;
+            _writeOffset        = pos;
+            hdr.WriteOffset     = _headerSize + pos;
+            if (pos + _entryHeaderSize <= _capacity)
+                Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
+            return;
         }
 
         // Before every return below, including the one that finds the header's claim intact:
