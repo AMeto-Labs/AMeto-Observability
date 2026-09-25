@@ -226,8 +226,35 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         // instead: the likeliest reason this fact was red there and green in CI with the same tree.
         // The needle read goes through the same buffers and holds one span: its peak is that floor,
         // in this process, in this pool state.
-        var (floor, floorSamples) = await PeakOfTraceRead(TraceLookupSegmentFixture.Needle);
-        var (peak,  samples)      = await PeakOfTraceRead(TraceLookupSegmentFixture.Wide);
+        //
+        // MEASURED ON BOTH SIDES OF THE WIDE READ, because that state can change under it: a machine
+        // near the pressure line (the #89 box runs at 86 % load) can cross it between the needle read
+        // and the wide one, and the buffers — about a block's worth — then count in one reading and not
+        // in the other, moving peak - floor by a block either way: a false red, or a false green over
+        // the very defect below. Two floors a quarter block apart or less mean the state held, and the
+        // lower is subtracted (the stricter). Otherwise the whole measurement is taken once more, and a
+        // second disagreement is reported as INCONCLUSIVE — a failure that says it is about the pool,
+        // never a verdict on the reader either way.
+        long floor = 0, floorAfter = 0, peak = 0;
+        int  floorSamples = 0, samples = 0;
+        bool settled = false;
+        for (int attempt = 1; attempt <= 2 && !settled; attempt++)
+        {
+            (floor, floorSamples) = await PeakOfTraceRead(TraceLookupSegmentFixture.Needle);
+            (peak,  samples)      = await PeakOfTraceRead(TraceLookupSegmentFixture.Wide);
+            (floorAfter, _)       = await PeakOfTraceRead(TraceLookupSegmentFixture.Needle);
+            settled = Math.Abs(floorAfter - floor) <= oneBlock / 4;
+            _out.WriteLine($"attempt {attempt}: floor {floor / 1048576.0:N2} MB before the wide read, "
+                         + $"{floorAfter / 1048576.0:N2} MB after{(settled ? "" : " — the pool's state moved")}");
+        }
+        Assert.True(settled,
+            $"INCONCLUSIVE — not a verdict on the trace reader: twice, the one-span read's floor moved from "
+          + $"{floor / 1048576.0:N2} MB to {floorAfter / 1048576.0:N2} MB across the wide read, more than a "
+          + $"quarter block ({oneBlock / 4 / 1048576.0:N2} MB). The pooled buffers every read goes through counted "
+          + "in one reading and not the other (memory pressure crossing ArrayPool's trim line), so the wide "
+          + "read's peak above the floor could be off by a block either way. Re-run on a machine that is not "
+          + "at the edge of its memory.");
+        floor = Math.Min(floor, floorAfter);
 
         _out.WriteLine($"segment       = {TraceLookupSegmentFixture.Spans:N0} spans, "
                      + $"{TraceLookupSegmentFixture.Blocks} blocks, "
@@ -260,7 +287,9 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         // honest walk peaks at 2.69 MB over a 2.58 MB floor, 0.05-0.06 blocks above it; the defect —
         // the walk materialising each block and selecting from it — peaks at 5.06-5.20 MB over a
         // 3.07-3.16 MB floor (the needle's own block is 848 spans, a fifth of one), 0.83-0.86 blocks
-        // above it. Half a block sits between the two with room on both sides, and the floor makes
+        // above it. On the same box at 74 % load the pool kept its buffers: a 0.06 MB floor, the honest
+        // walk 0.00 blocks above it, the defect 0.80 (a 0.55 MB floor). Half a block sits between the
+        // two with room on both sides in both states, and the floor makes
         // the pool's state cancel out of the comparison instead of deciding it.
         Assert.True(peak - floor < oneBlock / 2,
             $"the wide trace read held {(peak - floor) / 1048576.0:N2} MB above the one-span read's "
