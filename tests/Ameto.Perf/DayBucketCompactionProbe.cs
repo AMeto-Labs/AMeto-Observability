@@ -46,13 +46,25 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         (LogLevel.Fatal,       0.01),
     ];
 
+    /// <summary>
+    /// The engine's own cold-maintenance loop is OFF: this probe compacts through
+    /// <see cref="StorageEngine.MergeSmallSegmentsOnceAsync"/> itself and measures what that did.
+    /// Left at the production three minutes, a slow CI runner (this assembly is in the solution,
+    /// and the test job runs it) reaches the loop's first pass mid-probe; the pass takes the merge
+    /// gate, the probe's merge is Busy and the fixpoint assertion fails — before the gate, the
+    /// same overlap merged batches twice in silence. As in <c>SegmentBucketAdversarialProbe</c>:
+    /// infinite, and asserted never to have started.
+    /// </summary>
+    private static readonly TimeSpan MaintenanceStartDelay = Timeout.InfiniteTimeSpan;
+
     public Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
         _engine = new StorageEngine(
             Options.Create(new ServerOptions { DataDirectory = _dir }),
             new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance)
+            NullLogger<StorageEngine>.Instance,
+            MaintenanceStartDelay)
         {
             _allowIndexlessMerge     = true,
             _mergeTargetPayloadBytes = 512L * 1024 * 1024 / Scale,
@@ -136,13 +148,19 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         var  sw = System.Diagnostics.Stopwatch.StartNew();
         int  merges = 0;
         long written = 0;
-        while (await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None))
+        await _engine.CatalogLoaded;   // the outcome is Busy until the boot scan is done
+        MergeOutcome outcome;
+        while ((outcome = await _engine.MergeSmallSegmentsOnceAsync(CancellationToken.None)) == MergeOutcome.Merged)
         {
             merges++;
             Assert.True(merges < 3000, "compaction did not converge");
             written += _engine.ListSegments().OrderByDescending(s => s.Id.Value).First().UncompressedBytes;
         }
         sw.Stop();
+        // The engine's own loop never ran (see MaintenanceStartDelay), and the loop above ended on
+        // a fixpoint, not on a merge gate someone else held: Busy stops it just as short.
+        Assert.Equal(0, _engine.ColdMaintenancePassesStarted);
+        Assert.Equal(MergeOutcome.NothingToMerge, outcome);
 
         var    after = _engine.ListSegments();
         double amp   = written / (double)Math.Max(1, before.Sum(s => s.UncompressedBytes));
