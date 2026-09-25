@@ -173,14 +173,31 @@ to its configured endpoint. The older `/otlp/v1/…` spellings still work and ar
 
 **Auth:** API key (same as `/api/events`).  
 **Content-Type:** `application/json` (OTLP/JSON) or `application/x-protobuf` (OTLP/Protobuf).  
-**Body:** the corresponding OTLP `Export…ServiceRequest` (`resourceLogs` / `resourceSpans` / `resourceMetrics`). Max body: 8 MB (`Ingestion.MaxOtlpBatchBytes`).
+**Content-Encoding:** none (or `identity`), or `gzip` — which the collector's `otlphttp` exporter sends by default; `x-gzip` is accepted as its alias, and the header is read as the list RFC 9110 defines. Any other coding is `415`. An empty body is an empty request whether or not it says `gzip`.  
+**Body:** the corresponding OTLP `Export…ServiceRequest` (`resourceLogs` / `resourceSpans` / `resourceMetrics`). Max body: 8 MB (`Ingestion.MaxOtlpBatchBytes`) — on the wire, and for a gzip body **also once inflated**.
+
+```bash
+printf '%s' '{"resourceLogs":[…]}' | gzip \
+  | curl -X POST http://localhost:5341/v1/logs -H 'Content-Type: application/json' \
+      -H 'Content-Encoding: gzip' -H 'X-Seq-ApiKey: <key>' --data-binary @-
+```
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
 `resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
 
-**Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length` or proved it by arriving. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
+**Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length`, proved it by arriving, or, gzip-compressed, **inflated** past it. The inflated size is decided on bytes already written, so a body that would inflate to gigabytes (deflate reaches ~1032:1) is stopped after at most one limit of output: no single buffer is ever rented past the limit, and the request holds at most the compressed body plus one and a half limits of inflate buffer — one limit when the gzip trailer states the size honestly, one and a half when it understates it and the buffer doubles its way up (about 20 MiB in all at the 8 MB default); that refusal is also logged as a warning (`OtlpGzipTooLarge`, shared with the gRPC receiver), since it is a misconfigured exporter or a probe — at most once a second, with the count since the last line and the latest sender: its API key as `GET /api/auth/keys` lists it (`keyPreview`, never the key) and its remote address. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
 
-**Response `400 Bad Request`:** the payload could not be decoded — malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
+**Response `415 Unsupported Media Type`:** `Content-Encoding` names a coding other than gzip — `deflate`, `br`, `zstd`, gzip applied twice, anything else. Refused before the body is read, so nothing was ingested. The response carries `Accept-Encoding: gzip, identity` and, encoded like the request (protobuf or JSON), an OTLP `Status` whose `message` names what was sent — the collector prints that message in its own log:
+
+```json
+{ "message": "Content-Encoding 'br' is not supported; send gzip or identity" }
+```
+
+Switch the exporter to gzip or to no compression; retrying the same request will always be refused.
+
+**Response `503 Service Unavailable`:** the server could not inflate a gzip body NOW — it ran out of memory doing it (its own or zlib's; this used to be a `400`, which exporters never retry, so the batch was lost), or the body arrived while the server was already holding as many inflated batches as it allows — at most `min(CPU cores, IngestBufferBytes / Ingestion.MaxOtlpBatchBytes)` at once across the HTTP and gRPC receivers, where `IngestBufferBytes` is the memory model's share for request bodies (**2 on a 512 MB container** at the 8 MB default; up to 16 on a large host). It waits up to a second for a slot first. Nothing was read past the compressed body, and nothing was ingested. The response carries `Retry-After: 1` and an OTLP `Status` message; OTLP exporters retry a 503 with backoff, so the batch is delayed, not lost. Uncompressed bodies are never held here — inflating is the only step where a small request can make the server hold a lot of memory.
+
+**Response `400 Bad Request`:** the payload could not be decoded — a gzip body that does not inflate (not gzip at all, or corrupt: refused before any parser sees it, so nothing of it is ingested) or that was cut off before its trailer (refused the same way, unless the cut happens to leave four bytes that read as a plausible size — possible when the stream was stored rather than compressed, and its last bytes are zeros or the low half of a `1.0` double; the parser then sees a message cut short and answers as below), malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
 
 ### OTLP over gRPC
 
@@ -199,7 +216,9 @@ on the main port would stop the UI, every `/api` call, the live tail and the con
 check from working, since no browser does HTTP/2 without TLS.
 
 **Encodings:** uncompressed and `gzip`. Anything else is answered `UNIMPLEMENTED` (12) with
-`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed.
+`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed. A gzip
+message is held to `Ingestion.MaxOtlpBatchBytes` once inflated, as over HTTP, and one cut off
+before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 
 **Status is in the trailers, not the HTTP status line** — every call answers HTTP 200:
 
@@ -209,6 +228,7 @@ check from working, since no browser does HTTP/2 without TLS.
 | `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
 | `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes` |
 | `12` UNIMPLEMENTED | unsupported compression |
+| `14` UNAVAILABLE | a gzip message arrived while every inflate slot shared with the HTTP receivers stayed taken for a second, or the server ran out of memory inflating it (see the `503` above); retried by exporters |
 | `16` UNAUTHENTICATED | missing or insufficient API key |
 
 ---
