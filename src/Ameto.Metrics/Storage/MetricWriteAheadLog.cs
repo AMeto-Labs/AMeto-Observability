@@ -534,6 +534,13 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         return OpenInstance(filePath, initialCapacity, logger, beforeResize, interner);
     }
 
+    /// <summary>
+    /// Test seam: <see cref="OnRelocationStepForTest"/> for the logs this THREAD opens next — the only
+    /// way to reach a relocation the open itself finishes. Thread-static so that no other test's open
+    /// sees it. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<long>? t_relocationStepForNextOpenForTest;
+
     private static MetricWriteAheadLog OpenInstance(string filePath, long initialCapacity, ILogger? logger,
                                                     Action<long>? beforeResize, MetricLabelInterner? interner)
     {
@@ -542,6 +549,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
             // cannot reach — and its double-failure path is exactly what needs the coverage.
             BeforeResize = beforeResize,
+            OnRelocationStepForTest = t_relocationStepForNextOpenForTest,
         };
         try { wal.OpenOrCreate(initialCapacity); }
         catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
@@ -793,9 +801,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // Decided before anything below re-seals the header. A v1 header has no checksum.
             bool counted = _legacyV1 || HeaderVerifies(in hdr);
 
+            // Nothing below may make a header that did NOT verify verify again before its counters
+            // are rebuilt: a process killed during this open would otherwise leave the old counters
+            // sealed, and the next open would skip the rebuild. Released, and the header sealed
+            // once, at the end of the open.
+            _sealsHeld = !counted;
+
             // A commit's move of the surviving tail that the process did not live to finish is
             // finished here, before anything walks the data. See RelocateLocked.
-            if (!_legacyV1) FinishRelocationLocked(ref hdr);
+            if (!_legacyV1) FinishRelocationLocked(ref hdr, trusted: counted);
 
             // A header whose counters do not verify gets them back from the entries. See there.
             if (!counted) RebuildCountersLocked(ref hdr);
@@ -822,6 +836,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // the data itself say where it ends.
             ReconcileDataEndLocked(ref hdr);
 
+            _sealsHeld = false;
             SealHeaderLocked();
         }
 
@@ -1954,18 +1969,29 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// Runs at open, before any walk. A record whose numbers cannot describe a move inside this file
     /// is not acted on — moving bytes by it could only destroy data — and is cleared with an Error;
     /// the walk that follows then decides where the data ends, as it did before the record existed.
+    ///
+    /// <para><b>A record in a header that did not verify</b> (<paramref name="trusted"/> false) has
+    /// to prove it describes the move a commit made, not merely one that would fit: the claim must
+    /// be where that commit left it — the old end, <c>from + length</c>, until it stored the new
+    /// one, and <c>length</c> after — and <c>done</c> a chunk boundary (a multiple of
+    /// <c>from</c>, or all of it). Rot that passes both, in two fields no store ties together, is
+    /// not a case worth moving bytes for.</para>
     /// </summary>
-    private void FinishRelocationLocked(ref WalFileHeader hdr)
+    private void FinishRelocationLocked(ref WalFileHeader hdr, bool trusted)
     {
         long from = hdr.MoveFrom, length = hdr.MoveLength, done = hdr.MoveDone;
         if (length == 0) return;                         // nothing in flight: the normal case
 
-        if (from <= 0 || length <= 0 || done < 0 || done > length || from > _capacity - length)
+        bool fits    = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
+        bool matches = fits
+                    && (_writeOffset == from + length || _writeOffset == length)
+                    && (done % from == 0 || done == length);
+        if (!fits || (!trusted && !matches))
         {
             _logger?.LogError(
-                "Metric WAL header records a relocation no commit could have started (from {From}, length {Length}, " +
-                "done {Done}, capacity {Capacity}); ignoring it — the walk decides where the data ends.",
-                from, length, done, _capacity);
+                "Metric WAL header records a relocation it cannot vouch for (from {From}, length {Length}, done {Done}, " +
+                "claim {Claim}, capacity {Capacity}, header verifies: {Verifies}); ignoring it — the walk decides where " +
+                "the data ends.", from, length, done, _writeOffset, _capacity, trusted);
             ClearRelocationLocked();
             return;
         }
@@ -2028,9 +2054,11 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     private void StoreCovered(HeaderField field, ulong value)
     {
         ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-        if (_legacyV1)
+        if (_legacyV1 || _sealsHeld)
         {
-            Set(ref h, field, value);                    // a v1 header has no checksum (and only the counters)
+            // A v1 header has no checksum (and only the counters); a held one is sealed once, at
+            // the end of the open that is rebuilding it.
+            Set(ref h, field, value);
             return;
         }
 
@@ -2076,9 +2104,12 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// file, and a process killed while the OPEN was rewriting a header it had already found not to
     /// verify — which the next open rebuilds again.</para>
     /// </summary>
+    /// <summary>Set by the open while it rewrites a header that did not verify; see <see cref="OpenOrCreate"/>.</summary>
+    private bool _sealsHeld;
+
     private void SealHeaderLocked()
     {
-        if (_legacyV1) return;
+        if (_legacyV1 || _sealsHeld) return;
         ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
         h.PendingCrc = h.Crc = HeaderChecksum(in h);
     }

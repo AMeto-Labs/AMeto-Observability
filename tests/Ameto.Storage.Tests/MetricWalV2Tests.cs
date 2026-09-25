@@ -517,34 +517,7 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         int committedEntries, int survivors, int chunksDone, int intoNextChunk)
     {
         long prefix = committedEntries * (long)V2Entry, tail = survivors * (long)V2Entry;
-        long doneAtKill = Math.Min(prefix * chunksDone, tail);
-
-        byte[]? atStep = null, poolAtStep = null;
-        using (var wal = Open())
-        {
-            for (int i = 0; i < committedEntries; i++) wal.Append([Gauge("cpu", i, 100 + i)]);
-            ulong flushing = wal.BeginFlush();
-            for (int j = 0; j < survivors; j++) wal.Append([Gauge("cpu", 50 + j, 200 + j)]);
-
-            wal.OnRelocationStepForTest = done =>
-            {
-                if (done != doneAtKill || atStep is not null) return;
-                atStep     = ReadShared(WalPath);
-                poolAtStep = ReadShared(PoolPath);
-            };
-            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));
-            wal.OnRelocationStepForTest = null;
-            Assert.Equal(tail, wal.WrittenBytes);                               // the live log finished it
-        }
-        Assert.NotNull(atStep);
-
-        long chunk = Math.Min(prefix, tail - doneAtKill);
-        Array.Copy(atStep!, FileHeader + prefix + doneAtKill, atStep!, FileHeader + doneAtKill, Math.Min(intoNextChunk, chunk));
-
-        string killed = Path.Combine(_dir, "killed");
-        Directory.CreateDirectory(killed);
-        File.WriteAllBytes(Path.Combine(killed, "metrics.wal"), atStep!);
-        File.WriteAllBytes(Path.Combine(killed, "metrics.wal.pool"), poolAtStep!);
+        string killed = KilledRelocation(committedEntries, survivors, Math.Min(prefix * chunksDone, tail), intoNextChunk);
 
         double[] expected = Enumerable.Range(0, survivors).Select(static j => 200.0 + j).ToArray();
         var reopened = Open(path: Path.Combine(killed, "metrics.wal"));
@@ -556,6 +529,113 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         // And the finish is durable in the file: the next open has nothing left to finish.
         var again = Open(path: Path.Combine(killed, "metrics.wal"));
         Assert.Equal(expected, again.ReadAll(out _).Select(static r => r.Point.Value));
+    }
+
+    /// <summary>
+    /// Builds, in a directory of its own, the file a process killed inside a commit's relocation
+    /// leaves: <paramref name="committedEntries"/> points (100…) flushed, <paramref name="survivors"/>
+    /// (200…) appended during the flush, the file copied at the relocation seam once
+    /// <paramref name="doneAtKill"/> bytes are moved, and <paramref name="intoNextChunk"/> bytes of the
+    /// next chunk then copied by hand the way a forward memmove leaves them. Returns the directory.
+    /// </summary>
+    private string KilledRelocation(int committedEntries, int survivors, long doneAtKill, int intoNextChunk,
+                                    string name = "killed")
+    {
+        long prefix = committedEntries * (long)V2Entry, tail = survivors * (long)V2Entry;
+        byte[]? atStep = null, poolAtStep = null;
+        using (var wal = Open(path: Path.Combine(_dir, name + "-source.wal")))
+        {
+            for (int i = 0; i < committedEntries; i++) wal.Append([Gauge("cpu", i, 100 + i)]);
+            ulong flushing = wal.BeginFlush();
+            for (int j = 0; j < survivors; j++) wal.Append([Gauge("cpu", 50 + j, 200 + j)]);
+
+            wal.OnRelocationStepForTest = done =>
+            {
+                if (done != doneAtKill || atStep is not null) return;
+                atStep     = ReadShared(Path.Combine(_dir, name + "-source.wal"));
+                poolAtStep = ReadShared(Path.Combine(_dir, name + "-source.wal.pool"));
+            };
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));
+            wal.OnRelocationStepForTest = null;
+            Assert.Equal(tail, wal.WrittenBytes);                               // the live log finished it
+        }
+        Assert.NotNull(atStep);
+
+        long chunk = Math.Min(prefix, tail - doneAtKill);
+        Array.Copy(atStep!, FileHeader + prefix + doneAtKill, atStep!, FileHeader + doneAtKill, Math.Min(intoNextChunk, chunk));
+
+        string killed = Path.Combine(_dir, name);
+        Directory.CreateDirectory(killed);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal"), atStep!);
+        File.WriteAllBytes(Path.Combine(killed, "metrics.wal.pool"), poolAtStep!);
+        return killed;
+    }
+
+    /// <summary>
+    /// A RELOCATION RECORD IN A HEADER THAT DOES NOT VERIFY IS ACTED ON ONLY IF IT DESCRIBES THE MOVE
+    /// A COMMIT MADE. The kill of the three-chunk case, inside the second chunk, with the header's
+    /// generation rotted as well, so the header fails. The record still matches what the commit left
+    /// — the claim at the old end, <c>done</c> a chunk boundary — so the move is finished and every
+    /// survivor replays. With <c>done</c> rotted too (not a chunk boundary) the record is not trusted:
+    /// an Error says so, nothing is moved by it, and the walk keeps what the copy frontier left —
+    /// the two survivors moved before it.
+    /// </summary>
+    [Theory]
+    [InlineData(false, new[] { 200.0, 201.0, 202.0, 203.0, 204.0 })]
+    [InlineData(true,  new[] { 200.0, 201.0 })]
+    public void A_relocation_record_in_a_header_that_does_not_verify_must_match_the_move_it_names(bool rotDone, double[] expected)
+    {
+        string killed = KilledRelocation(committedEntries: 2, survivors: 5, doneAtKill: 2 * V2Entry, intoNextChunk: 30);
+        string walPath = Path.Combine(killed, "metrics.wal");
+        byte[] file = File.ReadAllBytes(walPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);          // Generation: rot
+        if (rotDone) BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(48), 50);                   // MoveDone: rot
+        File.WriteAllBytes(walPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger, walPath))
+            Assert.Equal(expected, wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
+        Assert.Equal(rotDone, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("cannot vouch for")));
+        Assert.Equal(2UL, BinaryPrimitives.ReadUInt64LittleEndian(File.ReadAllBytes(walPath).AsSpan(16)));   // rebuilt
+    }
+
+    /// <summary>
+    /// AN OPEN KILLED WHILE IT FINISHES A RELOCATION UNDER A HEADER THAT DOES NOT VERIFY LEAVES IT
+    /// NOT VERIFYING. The open redoes the move chunk by chunk, storing its progress; if those stores
+    /// sealed the header, the rotted generation would be sealed with them, and the open after a
+    /// second kill would find a header that verifies and skip the rebuild. The file is copied at the
+    /// open's own relocation seam; opening that copy still rebuilds, and every survivor replays.
+    /// </summary>
+    [Fact]
+    public void An_open_killed_while_it_finishes_a_relocation_under_a_rotted_header_still_rebuilds()
+    {
+        string killed = KilledRelocation(committedEntries: 2, survivors: 5, doneAtKill: 2 * V2Entry, intoNextChunk: 30);
+        string walPath = Path.Combine(killed, "metrics.wal");
+        byte[] file = File.ReadAllBytes(walPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), 0xDEAD_BEEF_1234_5678UL);
+        File.WriteAllBytes(walPath, file);
+
+        byte[]? midOpen = null, midOpenPool = null;
+        MetricWriteAheadLog.t_relocationStepForNextOpenForTest = done =>
+        {
+            if (midOpen is not null) return;
+            midOpen     = ReadShared(walPath);
+            midOpenPool = ReadShared(walPath + ".pool");
+        };
+        try { Open(path: walPath).Dispose(); }
+        finally { MetricWriteAheadLog.t_relocationStepForNextOpenForTest = null; }
+        Assert.NotNull(midOpen);
+
+        string twice = Path.Combine(_dir, "twice");
+        Directory.CreateDirectory(twice);
+        File.WriteAllBytes(Path.Combine(twice, "metrics.wal"), midOpen!);
+        File.WriteAllBytes(Path.Combine(twice, "metrics.wal.pool"), midOpenPool!);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger, Path.Combine(twice, "metrics.wal")))
+            Assert.Equal([200.0, 201.0, 202.0, 203.0, 204.0], wal.ReadAll(out _).Select(static r => r.Point.Value));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
     }
 
     // ── The header's own checksum ────────────────────────────────────────────
