@@ -4740,21 +4740,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
-    /// The histogram bounds, read ONCE. <c>HistogramBuckets.Bounds</c> is a <c>ReadOnlySpan&lt;long&gt;</c> property
-    /// over <c>new long[] { ... }</c>, and measured it allocates on every access: 72 B per
-    /// <c>HistogramBuckets.IndexOf</c>, 720 KB for the stats pass over 10 000 spans. The values still come
-    /// from that one list; only the access is cached.
+    /// The histogram bucket of a duration. Was a private copy of the bounds while
+    /// <c>HistogramBuckets.Bounds</c> allocated per access in unoptimized builds (72 B, 720 KB for
+    /// the stats pass over 10 000 spans); it is a span over a static array now, so the canonical
+    /// lookup is free and there is one list of bounds again.
     /// </summary>
-    private static readonly long[] BucketBounds = HistogramBuckets.Bounds.ToArray();
-
-    /// <summary><c>HistogramBuckets.IndexOf</c> without the allocation — see <see cref="BucketBounds"/>.</summary>
-    private static int BucketIndex(long durationNanos)
-    {
-        var bounds = BucketBounds;
-        for (int i = 0; i < bounds.Length; i++)
-            if (durationNanos < bounds[i]) return i;
-        return bounds.Length;
-    }
+    private static int BucketIndex(long durationNanos) => HistogramBuckets.IndexOf(durationNanos);
 
     /// <summary>
     /// The teardown. One caller runs it; the other five — the container holds this instance
