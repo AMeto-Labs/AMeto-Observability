@@ -208,6 +208,46 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
         Assert.True(cache.TotalBytes <= StandBudgetB);
     }
 
+    // ── 4. A fixed filter among one-off lookups ──────────────────────────────
+
+    /// <summary>
+    /// The shape that is NOT a repeated filter: a dashboard's fixed LIKE, refreshed between
+    /// searches for one-off ids (<c>RequestId = 'req-…'</c>, a new value each time). Every one-off
+    /// reads the bloom of every group and leaves a verdict behind in each; those are bounded per
+    /// memo (<c>SegmentIndexReader.MaxBoundedAnswers</c>), so they neither grow the cache nor push
+    /// out the fixed filter. At the stand's budget, the fixed LIKE must keep hitting while the
+    /// one-offs — new questions by definition — miss.
+    /// </summary>
+    [Fact]
+    public async Task FixedFilterAmongUniqueLookups()
+    {
+        const int Rounds = 60;
+        var plain = NewExecutor(null);
+        var expectLike = await DrainAsync(plain, Like);
+        await WarmJitAsync(plain);
+
+        using var cache = new SegmentIndexCache(StandBudgetB, StandNative, TimeSpan.Zero);
+        var cached = NewExecutor(cache);
+
+        long likeHits = 0, likeMisses = 0;
+        for (int r = 0; r < Rounds; r++)
+        {
+            long h0 = cache.HitCount, m0 = cache.MissCount;
+            Assert.Equal(expectLike, await DrainAsync(cached, Like));
+            if (r > 0) { likeHits += cache.HitCount - h0; likeMisses += cache.MissCount - m0; }
+
+            // Not a value the corpus holds: its generator draws twelve random hex digits.
+            Assert.Empty(await DrainAsync(cached, $"RequestId = 'req-zz{r:x10}'"));
+        }
+
+        _out.WriteLine($"fixed LIKE among {Rounds} one-off lookups at 46 MB: {likeHits} hits / {likeMisses} misses " +
+                       $"= {Pct(likeHits, likeHits + likeMisses):F1} %, cache {Mb(cache.TotalBytes):F2} MB in {cache.EntryCount} entries");
+
+        Assert.True(Pct(likeHits, likeHits + likeMisses) >= 95,
+            $"the fixed LIKE hit {Pct(likeHits, likeHits + likeMisses):F1} % among one-off lookups");
+        Assert.True(cache.TotalBytes < 16L << 20, $"one-off lookups grew the cache to {Mb(cache.TotalBytes):F1} MB");
+    }
+
     // ── Executor runs ─────────────────────────────────────────────────────────
 
     private readonly record struct RepeatResult(double WarmHitPct, double WarmMedianMs, long WarmMedianBytes);

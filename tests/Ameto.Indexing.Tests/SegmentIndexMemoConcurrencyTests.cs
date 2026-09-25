@@ -338,6 +338,63 @@ public sealed class SegmentIndexMemoConcurrencyTests
         Assert.Equal(1, cache.EntryCount);
     }
 
+    // ── The bound on answers that grow with the questions ─────────────────────
+
+    /// <summary>
+    /// A stream of one-off values — a verdict and an absent bucket per value — must not grow a
+    /// memo without bound, and must not push out what a repeated filter re-asks. Two thousand
+    /// unique lookups against one group: the bounded answers stop at the cap, the memo stops
+    /// growing, every answer is still the decoded index's, and the filter asked every fiftieth
+    /// time is still answered without reading a section.
+    /// </summary>
+    [Fact]
+    public void Unique_lookups_stay_bounded_and_a_re_asked_answer_survives_them()
+    {
+        var g     = BuildGroups(1)[0];
+        var cache = new SegmentIndexCache(1 << 20);
+        using var oracleBloom = SegmentBloomFilter.Deserialise(g.Bloom);
+        var oracleInv = SegmentInvertedIndex.Deserialise(g.Inverted);
+
+        // Re-asked every 50 values = every 100 bounded answers (a verdict and an absence per
+        // value), inside one turn of the 256-slot clock: each time, it must still be remembered.
+        // A ring without the re-ask mark (plain FIFO) forgets it 256 answers after it was first
+        // learned, however often it is asked.
+        bool AskFixed()
+        {
+            using var v = Open(cache, g);
+            Assert.Equal(g.Expected[10], v.MightContainValue("cust-7"));               // a verdict
+            Assert.Null(v.Lookup("Customer", "nobody"));                               // an absence
+            return v.ReadSections;
+        }
+
+        Assert.True(AskFixed());                                                        // learned once
+        long sizeAt500 = 0;
+        SegmentIndexReader memo;
+        using (var peek = Open(cache, g)) memo = peek.Index;
+
+        for (int i = 0; i < 2_000; i++)
+        {
+            string unique = $"req-{i:x12}";
+            using (var v = Open(cache, g))
+            {
+                Assert.Equal(SegmentIndexReader.MightContainValue(oracleBloom, unique), v.MightContainValue(unique));
+                Assert.Equal(oracleInv.Lookup("Customer", unique), v.Lookup("Customer", unique));
+            }
+            if (i % 50 == 49) Assert.False(AskFixed(), $"the re-asked filter was forgotten by value {i}");
+            if (i == 499) sizeAt500 = memo.ApproxRetainedBytes;
+        }
+
+        Assert.True(memo.BoundedAnswers <= SegmentIndexReader.MaxBoundedAnswers);
+        Assert.Equal(sizeAt500, memo.ApproxRetainedBytes);          // full at 500, and no bigger at 2 000
+        Assert.True(memo.ApproxRetainedBytes < 64 * 1024, $"a memo of {memo.ApproxRetainedBytes} B");
+        Assert.Equal(memo.ApproxRetainedBytes, cache.TotalBytes);   // what it gave back was un-charged
+
+        using var fixedAgain = Open(cache, g);
+        Assert.Equal(g.Expected[10], fixedAgain.MightContainValue("cust-7"));
+        Assert.Null(fixedAgain.Lookup("Customer", "nobody"));
+        Assert.False(fixedAgain.ReadSections);                        // both still remembered
+    }
+
     // ── What a hit is ─────────────────────────────────────────────────────────
 
     /// <summary>

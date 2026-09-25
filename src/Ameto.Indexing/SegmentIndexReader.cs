@@ -73,13 +73,24 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private readonly byte[]?             _trigram;
     private readonly SegmentBloomFilter? _bloom;
 
-    // The memo: grown under _gate, never shrunk, published arrays never written.
+    // The memo: grown under _gate; published arrays never written. Only the ring-bounded answers
+    // below are ever forgotten.
     private readonly Lock                        _gate = new();
     private SegmentInvertedIndex.PackedCatalog?  _catalog;
     private SegmentTrigramIndex.PackedHeader?    _trigramHeader;
-    private Dictionary<long, int[]?>?            _trigrams;       // null value: the section has no such trigram
-    private Dictionary<BucketKey, int[]?>?       _buckets;        // null value: the property has no such value
-    private Dictionary<string, bool>?            _bloomVerdicts;
+    private Dictionary<long, Kept<int[]?>>?      _trigrams;       // null value: the section has no such trigram
+    private Dictionary<BucketKey, Kept<int[]?>>? _buckets;        // null value: the property has no such value
+    private Dictionary<string, Kept<bool>>?      _bloomVerdicts;
+
+    // The bound on answers that grow with the QUESTIONS rather than the data: bloom verdicts and
+    // "absent" answers. A stream of one-off values (a trace id pasted into the search box, a GUID
+    // per request) adds one of each per group per query, for ever, where postings grow only with
+    // what a group actually holds. Unbounded, they would fill a 256 MB budget after ~2 000 unique
+    // searches over 1 000 groups — ~350 at the stand's 46 MB — and then the cache evicts whole
+    // memos, the repeated filters' postings with them. So they share one CLOCK ring per memo: an
+    // answer a query re-asks is marked and survives a sweep, a one-off is recycled.
+    private Slot[]                               _ring = [];
+    private int                                  _ringUsed, _hand;
     private long                                 _memoBytes;
 
     /// <summary>
@@ -164,6 +175,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private const long EntryBytes    = 40;   // a dictionary entry, key and value inline
     private const long ArrayBytes    = 24;   // an int[]'s header
     private const long StringBytes   = 22;   // a string's header and terminator
+    private const long SlotBytes     = 40;   // a ring slot: kind, mark, three references and a long
 
     // ── ISegmentIndex: a loaded reader answers through its own sections ──────
 
@@ -234,15 +246,24 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private bool BloomSays(string text, IIndexSectionSource src)
     {
         lock (_gate)
-            if (_bloomVerdicts is not null && _bloomVerdicts.TryGetValue(text, out bool known)) return known;
+        {
+            if (_bloomVerdicts is not null && _bloomVerdicts.TryGetValue(text, out var known))
+            {
+                _ring[known.Slot].Referenced = true;
+                return known.Value;
+            }
+        }
 
         bool verdict = src.BloomFilter().MightContain(text);
         BeforeRemember?.Invoke();
         lock (_gate)
         {
-            _bloomVerdicts ??= new Dictionary<string, bool>(StringComparer.Ordinal);
-            if (_bloomVerdicts.TryAdd(text, verdict))
-                Interlocked.Add(ref _memoBytes, EntryBytes + StringBytes + 2L * text.Length);
+            _bloomVerdicts ??= new Dictionary<string, Kept<bool>>(StringComparer.Ordinal);
+            if (_bloomVerdicts.ContainsKey(text)) return verdict;   // a racing query remembered it
+            int slot = TakeSlotLocked();
+            _ring[slot] = new Slot { Kind = SlotKind.Verdict, Text = text };
+            _bloomVerdicts.Add(text, new Kept<bool>(verdict, slot));
+            Interlocked.Add(ref _memoBytes, VerdictBytes(text));
         }
         return verdict;
     }
@@ -347,16 +368,28 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     {
         var key = new BucketKey(prop.Name, form);
         lock (_gate)
-            if (_buckets is not null && _buckets.TryGetValue(key, out var known)) return known;
+        {
+            if (_buckets is not null && _buckets.TryGetValue(key, out var known))
+            {
+                if (known.Slot >= 0) _ring[known.Slot].Referenced = true;
+                return known.Value;
+            }
+        }
 
         var found = SegmentInvertedIndex.ScanBucket(src.InvertedSection(), codec, prop.Runs, form);
         BeforeRemember?.Invoke();
         lock (_gate)
         {
             _buckets ??= [];
-            if (!_buckets.TryAdd(key, found)) return _buckets[key];   // a racing query got there first
-            Interlocked.Add(ref _memoBytes,
-                EntryBytes + StringBytes + 2L * form.Length + (found is null ? 0 : ArrayBytes + 4L * found.Length));
+            if (_buckets.TryGetValue(key, out var raced)) return raced.Value;   // a racing query got there first
+            int slot = -1;
+            if (found is null)
+            {
+                slot = TakeSlotLocked();
+                _ring[slot] = new Slot { Kind = SlotKind.AbsentBucket, Bucket = key };
+            }
+            _buckets.Add(key, new Kept<int[]?>(found, slot));
+            Interlocked.Add(ref _memoBytes, BucketEntryBytes(key) + (found is null ? 0 : ArrayBytes + 4L * found.Length));
         }
         return found;
     }
@@ -383,6 +416,8 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     {
         private readonly string _property = property;
         private readonly string _form     = form;
+
+        public int FormLength => _form.Length;
 
         public bool Equals(BucketKey other) =>
             string.Equals(_property, other._property, StringComparison.Ordinal) &&
@@ -430,8 +465,12 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                     long key = SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]);
                     if (_trigrams is not null && _trigrams.TryGetValue(key, out var known))
                     {
-                        if (known is null) return [];              // absent: no candidates
-                        posts[i] = known;
+                        if (known.Value is null)                   // absent: no candidates
+                        {
+                            _ring[known.Slot].Referenced = true;
+                            return [];
+                        }
+                        posts[i] = known.Value;
                     }
                     else
                     {
@@ -525,10 +564,102 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private int[]? RememberTrigramLocked(long key, int[]? postings)
     {
         _trigrams ??= [];
-        if (!_trigrams.TryAdd(key, postings)) return _trigrams[key];
+        if (_trigrams.TryGetValue(key, out var raced)) return raced.Value;
+        int slot = -1;
+        if (postings is null)
+        {
+            slot = TakeSlotLocked();
+            _ring[slot] = new Slot { Kind = SlotKind.AbsentTrigram, Trigram = key };
+        }
+        _trigrams.Add(key, new Kept<int[]?>(postings, slot));
         Interlocked.Add(ref _memoBytes, EntryBytes + (postings is null ? 0 : ArrayBytes + 4L * postings.Length));
         return postings;
     }
+
+    // ── The ring bounding verdicts and absences ──────────────────────────────
+
+    /// <summary>How many bloom verdicts and "absent" answers one memo keeps. A dashboard's filters
+    /// re-ask theirs every refresh and keep them; one-off values cycle through the rest. At the
+    /// cap a memo's bounded answers cost ~256 × 130 B plus the ring, ~45 KB.</summary>
+    internal const int MaxBoundedAnswers = 256;
+
+    /// <summary>Answers of the bounded kinds currently kept — for tests.</summary>
+    internal int BoundedAnswers { get { lock (_gate) return _ringUsed; } }
+
+    private enum SlotKind : byte { Free, Verdict, AbsentBucket, AbsentTrigram }
+
+    /// <summary>One bounded answer: which table holds it, under what key, and whether a query has
+    /// re-asked it since the clock hand last passed.</summary>
+    private struct Slot
+    {
+        public SlotKind  Kind;
+        public bool      Referenced;
+        public string?   Text;
+        public BucketKey Bucket;
+        public long      Trigram;
+    }
+
+    /// <summary>A remembered answer and its ring slot; -1 for the kinds the ring does not bound.</summary>
+    private readonly struct Kept<T>(T value, int slot)
+    {
+        public readonly T   Value = value;
+        public readonly int Slot  = slot;
+    }
+
+    /// <summary>
+    /// A ring slot for a new bounded answer: a fresh one while the ring is short of
+    /// <see cref="MaxBoundedAnswers"/>, then the first the clock hand finds unreferenced — its
+    /// answer forgotten, its bytes given back. A referenced slot is spared once and unmarked, so
+    /// an answer survives exactly as long as queries keep coming back for it.
+    /// </summary>
+    private int TakeSlotLocked()
+    {
+        if (_ringUsed < MaxBoundedAnswers)
+        {
+            if (_ringUsed == _ring.Length)
+            {
+                int grown = Math.Min(MaxBoundedAnswers, Math.Max(8, _ring.Length * 2));
+                Interlocked.Add(ref _memoBytes, (long)(grown - _ring.Length) * SlotBytes);
+                Array.Resize(ref _ring, grown);
+            }
+            return _ringUsed++;
+        }
+
+        while (_ring[_hand].Referenced)
+        {
+            _ring[_hand].Referenced = false;
+            _hand = (_hand + 1) % MaxBoundedAnswers;
+        }
+        int slot = _hand;
+        _hand = (_hand + 1) % MaxBoundedAnswers;
+        ForgetLocked(ref _ring[slot]);
+        return slot;
+    }
+
+    private void ForgetLocked(ref Slot s)
+    {
+        long freed = 0;
+        switch (s.Kind)
+        {
+            case SlotKind.Verdict:
+                _bloomVerdicts!.Remove(s.Text!);
+                freed = VerdictBytes(s.Text!);
+                break;
+            case SlotKind.AbsentBucket:
+                _buckets!.Remove(s.Bucket);
+                freed = BucketEntryBytes(s.Bucket);
+                break;
+            case SlotKind.AbsentTrigram:
+                _trigrams!.Remove(s.Trigram);
+                freed = EntryBytes;
+                break;
+        }
+        Interlocked.Add(ref _memoBytes, -freed);
+        s = default;
+    }
+
+    private static long VerdictBytes(string text)        => EntryBytes + StringBytes + 2L * text.Length;
+    private static long BucketEntryBytes(BucketKey key) => EntryBytes + StringBytes + 2L * key.FormLength;
 
     private SegmentTrigramIndex.PackedHeader TrigramHeader(IIndexSectionSource src)
     {
