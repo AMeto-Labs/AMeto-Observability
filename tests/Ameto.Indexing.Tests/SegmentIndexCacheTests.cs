@@ -221,6 +221,25 @@ public sealed class SegmentIndexCacheTests
         Assert.Equal(1, cache.EntryCount);
     }
 
+    /// <summary>
+    /// Replacing an entry must free what it held. An inserted reader owns native bloom bits; when
+    /// the query path replaces it (another fingerprint under the same path) and nothing holds a
+    /// lease, it is disposed there and then — the replacement's dispose list used to be reset by
+    /// the budget check that followed, and the bits leaked.
+    /// </summary>
+    [Fact]
+    public void A_replaced_unleased_reader_is_disposed()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var r = NewReader();
+        using (cache.Insert("a.seg", 0, true, r, 10)) { }
+
+        var fp = new IndexGroupFingerprint(1, default, 100, default, 1, 1);
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, default, default, default, fp)) { }
+
+        Assert.Throws<ObjectDisposedException>(() => r.Bloom.MightContain("v"));
+    }
+
     [Fact]
     public void Disabled_cache_misses_and_leases_own_the_reader()
     {
