@@ -1713,6 +1713,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal Action<string>? _beforeScanOpensSegment;
 
+    /// <summary>
+    /// Test hook: called by <see cref="LoadSegmentCatalog"/> before the scan begins, inside its
+    /// failure handling — a throw from it is the scan failing as a whole, the case #94's Error line
+    /// is for, which a real disk produces only by failing to list the directory.
+    /// </summary>
+    internal Action? _beforeCatalogScanForTest;
+
     /// <summary>The running background retry loop, or the last one to have run.</summary>
     private Task _segmentDeleteRetryLoop = Task.CompletedTask;
 
@@ -3666,7 +3673,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         try
         {
+            _beforeCatalogScanForTest?.Invoke();
             LoadSegmentCatalogCore();
+        }
+        catch (Exception ex)
+        {
+            // Rethrown: CatalogLoaded faults as it always has. Logged here, where the failure is, and
+            // not by whoever awaits the task — the maintenance loop's warning says only that it goes
+            // on, and a test's await says nothing to an operator.
+            StorageEngineLog.CatalogScanFailed(_logger, ex, _segDir);
+            throw;
         }
         finally
         {

@@ -1608,7 +1608,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
-        catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
+        catch (Exception ex) { LogColdScanFailed(_logger, ex, _dataDir); }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
@@ -2859,8 +2859,36 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         }
     }
 
+    /// <summary>
+    /// The cold scan failed AS A WHOLE (#94) — the directory could not be listed, the segment list
+    /// could not be published — so the cold tier holds none of what was on disk (a file that fails
+    /// on its own is handled inside the scan), and nothing will scan again before a restart. The
+    /// engine still completes <see cref="ColdLoadCompleted"/>, so every reader goes on answering from
+    /// the hot tier and whatever flushes have published since: the alert evaluator included, which
+    /// reads a missing window as a quiet one. Said once, as an Error, naming that consequence —
+    /// a store that reports itself degraded, and an evaluator that skips it, is the design filed on
+    /// #94; this line is what an operator has until then.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "The cold metric segment scan of {DataDirectory} failed: the segments on disk are not served until a "
+                + "restart, and metric queries answer from the hot tier and what has been flushed since. Metric ALERT "
+                + "RULES keep being evaluated on that partial data: a missing window reads as a quiet one, so a \"<\" "
+                + "rule can fire and a \">\" rule can resolve on points that exist but were not loaded. Restart once the "
+                + "cause is fixed")]
+    private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
+
+    /// <summary>
+    /// Test seam: an engine constructed while this holds an exception throws it from its cold scan,
+    /// before the directory is listed — the scan failing as a whole, which nothing else produces on
+    /// demand. An <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into
+    /// the flush loop, so it reaches only the engines the setting test constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Exception?> FailColdScanForTest = new();
+
     private void LoadColdSegments()
     {
+        if (FailColdScanForTest.Value is { } fail) throw fail;
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // No *.mts.tmp sweep here, deliberately — see the constructor. This method runs in the
