@@ -499,32 +499,70 @@ internal sealed class TraceIndexReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads block <paramref name="index"/> and decompresses it into <paramref name="raw"/>, an array
+    /// RENTED from the shared pool that the caller returns (also when this answers false, if it is
+    /// non-null). False when the block will not decode; throws when the file will not open.
+    ///
+    /// <para>THROUGH A HANDLE AND <see cref="RandomAccess"/>, NOT A <c>FileStream</c> (#94). A
+    /// <c>FileStream</c> per block read — the reader reopens the file for every block, see
+    /// <see cref="Retire"/> — cost its strategy objects and an 8 KB read buffer each time: ~9.9 KB
+    /// per block, 29.8 KB for a lookup that hits all three runs (TraceIndexLookupPoolTests). The block
+    /// is two positioned reads, the 8-byte header into the stack and the payload into a pooled
+    /// array, so a buffer in front of them only copied. Still one open per block and nothing held
+    /// between reads: the hold stays on the path, as <see cref="Retire"/> requires.</para>
+    /// </summary>
+    private bool TryReadBlock(int index, out byte[]? raw, out int rawLen)
+    {
+        raw    = null;
+        rawLen = 0;
+        using var handle = File.OpenHandle(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        long at     = _blockOffset[index];
+        long length = RandomAccess.GetLength(handle);
+
+        Span<byte> hdr = stackalloc byte[8];
+        if (!ReadExactlyAt(handle, hdr, at)) return false;
+        at += hdr.Length;
+        int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
+        int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
+
+        // Both lengths bounded before either is used to size anything: the compressed one by
+        // the bytes actually left in the file, the uncompressed one by the constant, because
+        // nothing on disk limits what a payload inflates to.
+        if (!FileBounds.LengthFits(comp, length - at))           return false;
+        if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes) return false;
+
+        byte[] c = ArrayPool<byte>.Shared.Rent(comp);
+        try
+        {
+            if (!ReadExactlyAt(handle, c.AsSpan(0, comp), at)) return false;
+            raw    = ArrayPool<byte>.Shared.Rent(uncomp);
+            rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
+            return rawLen >= 0;
+        }
+        finally { ArrayPool<byte>.Shared.Return(c); }
+    }
+
+    /// <summary>Fills <paramref name="into"/> from <paramref name="offset"/>; false at a premature end of file.</summary>
+    private static bool ReadExactlyAt(Microsoft.Win32.SafeHandles.SafeFileHandle handle, Span<byte> into, long offset)
+    {
+        while (!into.IsEmpty)
+        {
+            int n = RandomAccess.Read(handle, into, offset);
+            if (n <= 0) return false;
+            into    = into[n..];
+            offset += n;
+        }
+        return true;
+    }
+
     /// <summary>One block, fully decoded, or null when it will not decode.</summary>
     private List<(ulong Key, ulong SegmentId, uint[] Offsets)>? ReadWholeBlock(int index)
     {
         byte[]? raw = null;
         try
         {
-            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 8 * 1024);
-            fs.Seek(_blockOffset[index], SeekOrigin.Begin);
-
-            Span<byte> hdr = stackalloc byte[8];
-            fs.ReadExactly(hdr);
-            int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
-            int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
-            if (!FileBounds.LengthFits(comp, fs.Length - fs.Position)) return null;
-            if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes)   return null;
-
-            int rawLen;
-            byte[] c = ArrayPool<byte>.Shared.Rent(comp);
-            try
-            {
-                fs.ReadExactly(c, 0, comp);
-                raw    = ArrayPool<byte>.Shared.Rent(uncomp);
-                rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
-                if (rawLen < 0) return null;
-            }
-            finally { ArrayPool<byte>.Shared.Return(c); }
+            if (!TryReadBlock(index, out raw, out int rawLen)) return null;
 
             var into = new List<(ulong, ulong, uint[])>();
             var cur  = new Cursor(raw.AsSpan(0, rawLen));
@@ -654,32 +692,9 @@ internal sealed class TraceIndexReader : IDisposable
         // thing the reader does is read the bloom's memory and reopen the file.
         _beforeBlockReadForTest?.Invoke(index);
         byte[]? raw = null;
-        int rawLen  = 0;
         try
         {
-            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 8 * 1024);
-            fs.Seek(_blockOffset[index], SeekOrigin.Begin);
-
-            Span<byte> hdr = stackalloc byte[8];
-            fs.ReadExactly(hdr);
-            int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
-            int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
-
-            // Both lengths bounded before either is used to size anything: the compressed one by
-            // the bytes actually left in the file, the uncompressed one by the constant, because
-            // nothing on disk limits what a payload inflates to.
-            if (!FileBounds.LengthFits(comp, fs.Length - fs.Position)) return false;
-            if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes)   return false;
-
-            byte[] c = ArrayPool<byte>.Shared.Rent(comp);
-            try
-            {
-                fs.ReadExactly(c, 0, comp);
-                raw    = ArrayPool<byte>.Shared.Rent(uncomp);
-                rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
-                if (rawLen < 0) return false;
-            }
-            finally { ArrayPool<byte>.Shared.Return(c); }
+            if (!TryReadBlock(index, out raw, out int rawLen)) return false;
 
             var cur = new Cursor(raw.AsSpan(0, rawLen));
             while (cur.Remaining > 0)
