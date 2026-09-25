@@ -529,16 +529,17 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             var section = src.TrigramSection();
             SegmentTrigramIndex.Locate(section, header, wanted, offsets, lengths);
 
-            bool anyAbsent = false;
-            for (int j = 0; j < m; j++)
-                if (offsets[j] < 0) { anyAbsent = true; break; }
-            if (anyAbsent)
+            // One absent trigram is the whole answer, and ONE is all that is remembered: the first
+            // in the term's own order, which the next asking of the same term reaches before any
+            // other. Remembering every absent one let a single long miss — a pasted id spelling
+            // dozens of trigrams the group lacks — take that many slots of the bounded ring, and
+            // push out what a dashboard keeps re-asking.
+            for (int i = 0; i < k; i++)
             {
-                lock (_gate)
-                {
-                    for (int j = 0; j < m; j++)
-                        if (offsets[j] < 0) RememberTrigramLocked(wanted[j], null);
-                }
+                if (posts[i] is not null) continue;
+                long key = SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]);
+                if (offsets[SegmentTrigramIndex.IndexOf(wanted, key)] >= 0) continue;
+                lock (_gate) RememberTrigramLocked(key, null);
                 return false;
             }
 
@@ -593,9 +594,20 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
 
     // ── The ring bounding verdicts and absences ──────────────────────────────
 
-    /// <summary>How many bloom verdicts and "absent" answers one memo keeps. A dashboard's filters
-    /// re-ask theirs every refresh and keep them; one-off values cycle through the rest. At the
-    /// cap a memo's bounded answers cost ~256 × 130 B plus the ring, ~45 KB.</summary>
+    /// <summary>
+    /// How many bloom verdicts and "absent" answers one memo keeps. A dashboard's filters re-ask
+    /// theirs every refresh and keep them; one-off values cycle through the rest. At the cap a
+    /// memo's bounded answers cost ~256 × 130 B plus the ring, ~45 KB.
+    ///
+    /// <para><b>The cliff.</b> The bound is on answers, not on filters, and one literal can leave
+    /// several: a numeric one is probed in every encoding it might be stored under, ~7 verdicts and
+    /// absences when the group holds none of them. So around 35 such literals re-asked against the
+    /// same group — a wide dashboard — fill the ring with answers that are ALL re-asked, the clock
+    /// can spare none, and they start evicting each other: those groups then read their sections
+    /// again on every refresh — the miss path, a section rent and a scan, for that part of the
+    /// dashboard. A cap by bytes, or sized per group from what is re-asked, is the follow-up if that
+    /// shape turns up.</para>
+    /// </summary>
     internal const int MaxBoundedAnswers = 256;
 
     /// <summary>Answers of the bounded kinds currently kept — for tests.</summary>

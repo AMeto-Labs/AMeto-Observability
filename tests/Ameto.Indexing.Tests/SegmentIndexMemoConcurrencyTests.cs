@@ -395,6 +395,34 @@ public sealed class SegmentIndexMemoConcurrencyTests
         Assert.False(fixedAgain.ReadSections);                        // both still remembered
     }
 
+    /// <summary>
+    /// A long miss — a pasted id that spells dozens of trigrams the group lacks — fails on its
+    /// first absent trigram, and that one is all it may leave in the bounded ring: one slot, not
+    /// one per absent trigram. The same miss asked again is answered from that slot.
+    /// </summary>
+    [Fact]
+    public void A_long_trigram_miss_takes_one_slot_and_is_still_remembered()
+    {
+        var g     = BuildGroups(1)[0];
+        var cache = new SegmentIndexCache(1 << 20);
+        const string Miss = "zq0x-9f7e-44ab-b1c2-e8d7a6c5b4f3-qqzz-kkww-jjvv";
+        var expected = SegmentTrigramIndex.Deserialise(g.Trigram).Lookup(Miss);
+        Assert.NotNull(expected);
+        Assert.Empty(expected!);
+
+        SegmentIndexReader memo;
+        using (var v = Open(cache, g))
+        {
+            Assert.Equal(expected, v.LookupTrigram(Miss));
+            memo = v.Index;
+        }
+        Assert.Equal(1, memo.BoundedAnswers);
+
+        using var again = Open(cache, g);
+        Assert.Equal(expected, again.LookupTrigram(Miss));
+        Assert.False(again.ReadSections);
+    }
+
     // ── What a hit is ─────────────────────────────────────────────────────────
 
     /// <summary>
