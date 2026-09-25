@@ -87,4 +87,46 @@ public sealed class MetricRewriteProbe : IDisposable
 
         Assert.Equal((series + 511) / 512, files);
     }
+
+    /// <summary>
+    /// The writer's own share of a rewrite (issue #94): one full 512-series file of 60 points a
+    /// series, the shape each chunk above hands it. It allocated 3.30 MB a file here — two copies
+    /// of every point (<c>GetPoints</c> for the range, again to serialise), a doubling
+    /// <c>ArrayBufferWriter</c> copied out with <c>ToArray</c>, a 64 KB stream buffer — against a
+    /// 9.6 KB file; since the section is built in a rented buffer and the points are read in place
+    /// it allocates what it returns: the compressed payload, the names, the segment info (10 KB).
+    /// The bound is far from both, so it fails on the old shape and on nothing else.
+    /// </summary>
+    [Fact]
+    public void The_writer_allocates_its_output_not_its_working_set()
+    {
+        var items = new List<(SeriesKey, HotSeries)>(512);
+        for (int s = 0; s < 512; s++)
+        {
+            var labels = new LabelSet(new Dictionary<string, string>
+            {
+                ["service.name"] = "svc-" + (s % 10).ToString(CultureInfo.InvariantCulture),
+                ["http.route"]   = "/api/v1/r" + (s % 40).ToString(CultureInfo.InvariantCulture),
+                ["pod"]          = "pod-" + s.ToString(CultureInfo.InvariantCulture),
+            });
+            var pts = new List<MetricDataPoint>(60);
+            for (int p = 0; p < 60; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = 1_784_800_020_000_000_000L + p * 15 * S, Value = s + p });
+            items.Add((new SeriesKey("rw.gauge", MetricKind.Gauge, "By", labels), new HotSeries(pts)));
+        }
+        foreach (var o in MetricWriter.Write(_dir, items)) File.Delete(o.FilePath);   // JIT and pool warm-up
+
+        long best = long.MaxValue, fileBytes = 0;
+        for (int run = 0; run < 3; run++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var outputs = MetricWriter.Write(_dir, items);
+            best = Math.Min(best, GC.GetAllocatedBytesForCurrentThread() - before);
+            fileBytes = outputs[0].SizeBytes;
+            foreach (var o in outputs) File.Delete(o.FilePath);
+        }
+
+        _out.WriteLine($"WRITE  512 series x 60 points -> one {fileBytes:N0} B file: {best / 1024.0:N1} KB allocated (best of 3)");
+        Assert.True(best < 256 * 1024, $"the writer allocated {best:N0} B for one {fileBytes:N0} B file");
+    }
 }

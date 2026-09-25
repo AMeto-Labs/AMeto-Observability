@@ -3408,6 +3408,29 @@ internal sealed class HotSeries
         }
     }
 
+    /// <summary>
+    /// Every point, oldest first, for <c>MetricWriter</c> — IN PLACE when the list is in order,
+    /// which is every series but one two exporters interleave on; an out-of-order list comes back
+    /// as the sorted copy <see cref="GetPoints"/> would have made. The writer used to call
+    /// <see cref="GetPoints"/> twice per series (the file's time range, then the serialisation):
+    /// two full copies of every point it wrote, 2.4 MB per 512-series file of 60 points.
+    ///
+    /// <para><b>Only for a series nothing appends to.</b> The span is over this series' own list
+    /// and is read after the lock is released. The writer's input always is such a series: the
+    /// drain's snapshot (<see cref="FromDrain"/> — its list was handed over, and the live series
+    /// took a fresh one) or a rewrite's batch; never a series in <c>_hot</c>.</para>
+    /// </summary>
+    internal ReadOnlySpan<MetricDataPoint> PointsForWrite()
+    {
+        lock (_lock)
+        {
+            ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_points);
+            return _outOfOrder
+                ? System.Runtime.InteropServices.CollectionsMarshal.AsSpan(SortedSlice(all, long.MinValue, long.MaxValue))
+                : all;
+        }
+    }
+
     /// <summary>First index whose timestamp is at or after <paramref name="nano"/>; the span is sorted.</summary>
     private static int FirstAtOrAfter(ReadOnlySpan<MetricDataPoint> sorted, long nano)
     {
