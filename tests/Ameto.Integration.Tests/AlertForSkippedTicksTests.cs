@@ -42,15 +42,28 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
         return Task.CompletedTask;
     }
 
-    private AlertEvaluator NewEvaluator() => new(
-        _store,
-        new AlertDispatcher(NullLogger<AlertDispatcher>.Instance),
-        new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance),
-        AlertHeaderCountTests.ThrowingProxy.For<IQueryExecutor>(),
-        null!,   // the log engine: no rule here reads it
-        AlertHeaderCountTests.ThrowingProxy.For<Ameto.Metrics.IMetricAggregator>(),
-        _traces,
-        NullLogger<AlertEvaluator>.Instance);
+    /// <summary>
+    /// An evaluator whose timed loop never runs: every tick here is one this class drives at an
+    /// explicit time, and a real one fifteen seconds in (a slow runner) would evaluate the rule at the
+    /// wall clock and move the cycle clock these facts reason about.
+    /// </summary>
+    private AlertEvaluator NewEvaluator()
+    {
+        AlertEvaluator.NoTimedLoopForTest.Value = true;
+        try
+        {
+            return new(
+                _store,
+                new AlertDispatcher(NullLogger<AlertDispatcher>.Instance),
+                new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance),
+                AlertHeaderCountTests.ThrowingProxy.For<IQueryExecutor>(),
+                null!,   // the log engine: no rule here reads it
+                AlertHeaderCountTests.ThrowingProxy.For<Ameto.Metrics.IMetricAggregator>(),
+                _traces,
+                NullLogger<AlertEvaluator>.Instance);
+        }
+        finally { AlertEvaluator.NoTimedLoopForTest.Value = false; }
+    }
 
     private static AlertStateSnapshot StateOf(AlertEvaluator evaluator) =>
         evaluator.GetStates().Single(s => s.RuleId == "spans");
@@ -96,6 +109,11 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
     public async Task Consecutive_ticks_count_in_full_however_far_apart()
     {
         await using var evaluator = NewEvaluator();
+        // The fixture's premise: no timed tick can land between these. The loop returns at once
+        // (a bounded wait for a task that is already done or about to be; a started loop sits in
+        // its 15 s delay and this fails after five).
+        Assert.True(SpinWait.SpinUntil(() => evaluator.LoopEndedForTest, TimeSpan.FromSeconds(5)),
+            "the evaluator's timed loop is running under a test that drives its ticks by hand");
 
         await evaluator.EvaluateOnceAsync(At(0));
         await evaluator.EvaluateOnceAsync(At(0) + TimeSpan.FromSeconds(40));

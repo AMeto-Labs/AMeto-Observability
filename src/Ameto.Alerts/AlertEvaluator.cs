@@ -217,8 +217,18 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     // ── Eval loop ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Test seam: an evaluator constructed while this is true never runs its timed loop, so the only
+    /// ticks it sees are the ones a test drives through <see cref="EvaluateOnceAsync(DateTimeOffset, CancellationToken)"/>
+    /// — a real tick fifteen seconds in would move the cycle clock under a test that sets it. An
+    /// <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into the loop, so it
+    /// reaches only the evaluators the setting test constructs. False in production.
+    /// </summary>
+    internal static readonly AsyncLocal<bool> NoTimedLoopForTest = new();
+
     private async Task EvalLoopAsync()
     {
+        if (NoTimedLoopForTest.Value) return;
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
