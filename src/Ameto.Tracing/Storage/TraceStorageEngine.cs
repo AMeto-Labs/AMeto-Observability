@@ -129,6 +129,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     internal Action? _onWritesClosedForTest;
 
+    /// <summary>
+    /// Test seam: <see cref="GetTraceAsync"/> is about to try the door — the window between an
+    /// endpoint's own availability check and the read, where a closing engine turns a trace into
+    /// "not found". Null in production.
+    /// </summary>
+    internal Action? _beforeTraceReadForTest;
+
     /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
     internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
 
@@ -1340,6 +1347,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         TraceId traceId,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        _beforeTraceReadForTest?.Invoke();
         if (!TryEnterEngine()) yield break;   // shut down: an empty trace, not an ObjectDisposedException
         try
         {

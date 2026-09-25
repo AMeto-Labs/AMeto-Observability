@@ -179,6 +179,41 @@ public sealed class TraceStoreUnavailableTests
         }
     }
 
+    /// <summary>
+    /// THE CLOSE BETWEEN THE ROUTE'S CHECK AND THE READ. Detail, flame graph and compare are gated
+    /// on the route, then read the whole trace before writing a byte. The engine is closed at the
+    /// door of that read — after the route said "open" — so the read is refused and answers empty.
+    /// Asked only on the route, that empty went out as a trace: 200 <c>[]</c> for the detail, 404
+    /// "trace not found" for the flame graph, 200 with two empty arrays for compare. Each asks again
+    /// after its read and answers 503.
+    /// </summary>
+    [Theory]
+    [InlineData("/api/traces/{0}")]
+    [InlineData("/api/traces/{0}/flamegraph")]
+    [InlineData("/api/traces/compare?a={0}&b={0}")]
+    public async Task A_store_closing_after_the_route_check_is_refused_after_the_read(string route)
+    {
+        using var factory = new AmetoWebAppFactory();
+        var client = factory.CreateClient();
+        var engine = factory.Services.GetRequiredService<TraceStorageEngine>();
+        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+        WriteSpans(engine);
+
+        engine._beforeTraceReadForTest = () =>
+        {
+            // Once: compare reads two traces, and the second read meets the same closed door.
+            if (Interlocked.Exchange(ref engine._beforeTraceReadForTest, null) is null) return;
+            engine.DisposeAsync().AsTask().GetAwaiter().GetResult();   // no reader is inside yet
+        };
+
+        using var res = await client.GetAsync(string.Format(route, new TraceId(0, 1).ToString()));
+        string body = await res.Content.ReadAsStringAsync();
+
+        Assert.Equal(QueryAvailability.Closed, engine.Availability);
+        Assert.True(res.StatusCode == HttpStatusCode.ServiceUnavailable, $"{route}: {(int)res.StatusCode} — {body}");
+        Assert.Contains("trace store has shut down", body);
+    }
+
     private static IEnumerable<(string Method, string Url, object? Body)> Requests(string id) =>
     [
         ("GET",  "/api/traces/stats",                         null),

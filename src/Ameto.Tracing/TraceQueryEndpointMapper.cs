@@ -316,6 +316,11 @@ public static class TraceQueryEndpointMapper
                 if ((await body.FlushAsync()).IsCompleted) return;
             }
 
+            // NOTHING CAME BACK, and nothing is written yet: ask again (#95). A store that closed
+            // after the route's check refused this read and answered empty — which is not "a trace
+            // with no spans". A trace that did come back was read whole, inside the engine.
+            if (json is null && TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
+
             json ??= TraceDetailJson.BeginArray(ctx);
             json.WriteEndArray();
             json.Flush();
@@ -352,6 +357,10 @@ public static class TraceQueryEndpointMapper
         var taskB = CollectSpansRawAsync(provider, tidB, ctx.RequestAborted);
         await Task.WhenAll(taskA, taskB);
 
+        // Asked again after the read (#95): the route's check came before it, and a store closing
+        // in between answers empty arrays, not two traces.
+        if (TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
+
         await TraceDetailJson.WriteCompareAsync(ctx, taskA.Result, taskB.Result);
     }
 
@@ -371,6 +380,10 @@ public static class TraceQueryEndpointMapper
         }
         var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
         var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
+
+        // Asked again after the read (#95), before a 404 says "trace not found" about a store that
+        // closed after the route's check and refused the read.
+        if (TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
 
         if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
 
