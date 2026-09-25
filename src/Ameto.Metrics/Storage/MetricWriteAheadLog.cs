@@ -610,6 +610,13 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// caller fsyncs the directory (<see cref="SyncDirectory"/>). Fails the way File.Move does —
     /// <see cref="UnauthorizedAccessException"/> for access denied, <see cref="IOException"/>
     /// otherwise — because the retry around it filters on exactly those two.
+    ///
+    /// <para>The paths go to <c>MoveFileExW</c> in their <c>\\?\</c> form, because without it the call
+    /// is limited to MAX_PATH where File.Move is not — a data directory deep enough would have failed
+    /// the upgrade on every start. <c>MOVEFILE_COPY_ALLOWED</c> is not passed, deliberately: the copy
+    /// sits beside the log, so this is always a rename, and a copy-and-delete (the one case where
+    /// write-through covers less than the data) cannot happen — which is why no FlushFileBuffers of
+    /// the result follows it.</para>
     /// </summary>
     internal static void DurableMove(string from, string to)
     {
@@ -620,7 +627,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         }
 
         const uint MoveFileReplaceExisting = 0x1, MoveFileWriteThrough = 0x8;
-        if (Native.MoveFileEx(Path.GetFullPath(from), Path.GetFullPath(to), MoveFileReplaceExisting | MoveFileWriteThrough))
+        if (Native.MoveFileEx(ExtendedPath(from), ExtendedPath(to), MoveFileReplaceExisting | MoveFileWriteThrough))
             return;
 
         int error = Marshal.GetLastPInvokeError();
@@ -629,21 +636,35 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         throw new IOException(message, unchecked((int)0x80070000) | error);     // HRESULT_FROM_WIN32
     }
 
+    /// <summary>The Win32 extended-length (<c>\\?\</c>, or <c>\\?\UNC\</c>) form of a path, which the W APIs take past MAX_PATH.</summary>
+    private static string ExtendedPath(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (full.StartsWith(@"\\?\", StringComparison.Ordinal) || full.StartsWith(@"\\.\", StringComparison.Ordinal)) return full;
+        return full.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + full[2..] : @"\\?\" + full;
+    }
+
     /// <summary>
     /// fsyncs the directory <paramref name="directory"/>, so a rename inside it survives a power loss.
     /// True where that happened or where the platform has nothing to do (Windows, whose move was
-    /// write-through); false when a POSIX call failed. macOS gets fsync, not F_FULLFSYNC — the
-    /// residual the rest of this log already accepts there.
+    /// write-through); false when it could not be done — a failed call, or no libc to call at all.
+    /// It runs AFTER the rename has committed, so it must not throw: an exception here would fail
+    /// the engine's start over a log that is already upgraded. macOS gets fsync, not F_FULLFSYNC —
+    /// the residual the rest of this log already accepts there.
     /// </summary>
     internal static bool SyncDirectory(string directory)
     {
         if (OperatingSystem.IsWindows()) return true;
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return false;
 
-        int fd = Native.Open(directory, 0 /* O_RDONLY */);
-        if (fd < 0) return false;
-        try { return Native.Fsync(fd) == 0; }
-        finally { Native.Close(fd); }
+        try
+        {
+            int fd = Native.Open(directory, 0 /* O_RDONLY */);
+            if (fd < 0) return false;
+            try { return Native.Fsync(fd) == 0; }
+            finally { Native.Close(fd); }
+        }
+        catch (Exception) { return false; }      // DllNotFoundException, EntryPointNotFoundException, …
     }
 
     private static partial class Native

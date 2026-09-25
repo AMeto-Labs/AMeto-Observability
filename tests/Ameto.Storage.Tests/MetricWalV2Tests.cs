@@ -1107,6 +1107,29 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// THE DURABLE MOVE WORKS PAST MAX_PATH. MoveFileExW without the <c>\\?\</c> form is limited to
+    /// 260 characters where File.Move is not, so a data directory deep enough failed every upgrade
+    /// on Windows — six attempts, then the log left v1 at every start. The move is made into a
+    /// directory whose path alone is over 260 characters.
+    /// </summary>
+    [Fact]
+    public void The_durable_move_works_past_max_path()
+    {
+        string deep = _dir;
+        while (deep.Length < 300) deep = Path.Combine(deep, "a-directory-name-of-forty-characters-xx");
+        Directory.CreateDirectory(deep);
+        string from = Path.Combine(deep, "metrics.wal.upgrade.tmp"), to = Path.Combine(deep, "metrics.wal");
+        File.WriteAllBytes(from, [1, 2, 3]);
+        File.WriteAllBytes(to,   [9]);
+
+        MetricWriteAheadLog.DurableMove(from, to);
+
+        Assert.Equal([1, 2, 3], File.ReadAllBytes(to));
+        Assert.False(File.Exists(from));
+        Assert.True(MetricWriteAheadLog.SyncDirectory(deep));
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         public readonly List<(LogLevel Level, string Text, Exception? Error)> Entries = [];
