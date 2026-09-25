@@ -267,7 +267,7 @@ public sealed class SegmentIndexMemoConcurrencyTests
         Assert.True(Same(g.Expected[question], first));
         Assert.True(Same(g.Expected[question], second));
         Assert.Equal(soloBytes, cache.TotalBytes);
-        Assert.Equal(memo.ApproxRetainedBytes, cache.TotalBytes);
+        Assert.Equal(memo.ApproxRetainedBytes + SegmentIndexCache.EntryOverheadBytes, cache.TotalBytes);
 
         // And the memo now answers without a section.
         using var again = Open(cache, g);
@@ -287,7 +287,7 @@ public sealed class SegmentIndexMemoConcurrencyTests
         long empty;
         using (var probe = SegmentIndexView.OverSections(null, "x", 0, g.Inverted, g.Trigram, g.Bloom))
             empty = probe.Index.ApproxRetainedBytes;
-        var cache = new SegmentIndexCache(empty + 64);        // room for an empty memo, not a taught one
+        var cache = new SegmentIndexCache(empty + SegmentIndexCache.EntryOverheadBytes + 64);       // room for an empty memo, not a taught one
 
         var a = Open(cache, g);
         var b = Open(cache, g);
@@ -387,7 +387,7 @@ public sealed class SegmentIndexMemoConcurrencyTests
         Assert.True(memo.BoundedAnswers <= SegmentIndexReader.MaxBoundedAnswers);
         Assert.Equal(sizeAt500, memo.ApproxRetainedBytes);          // full at 500, and no bigger at 2 000
         Assert.True(memo.ApproxRetainedBytes < 64 * 1024, $"a memo of {memo.ApproxRetainedBytes} B");
-        Assert.Equal(memo.ApproxRetainedBytes, cache.TotalBytes);   // what it gave back was un-charged
+        Assert.Equal(memo.ApproxRetainedBytes + SegmentIndexCache.EntryOverheadBytes, cache.TotalBytes);   // what it gave back was un-charged
 
         using var fixedAgain = Open(cache, g);
         Assert.Equal(g.Expected[10], fixedAgain.MightContainValue("cust-7"));

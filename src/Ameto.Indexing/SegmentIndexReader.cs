@@ -169,8 +169,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         FixedBytes + (_inverted?.Length ?? 0) + (_trigram?.Length ?? 0) + ApproxNativeBytes
         + Interlocked.Read(ref _memoBytes);
 
-    // The reader, its lock and the memo's (lazily made) dictionary shells.
-    private const long FixedBytes    = 160;
+    // MEASURED (Release, GC.GetTotalMemory over 20 000 instances): a bare memo — the reader and
+    // its lock — retains 176 B, and each memo table, once made, a 176 B shell before its first
+    // entry. The cache adds its own per-entry bookkeeping on top (SegmentIndexCache).
+    private const long FixedBytes    = 176;
+    private const long ShellBytes    = 176;   // a Dictionary and its first bucket and entry arrays
     private const long HeaderBytes   = 40;
     private const long EntryBytes    = 40;   // a dictionary entry, key and value inline
     private const long ArrayBytes    = 24;   // an int[]'s header
@@ -258,7 +261,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         BeforeRemember?.Invoke();
         lock (_gate)
         {
-            _bloomVerdicts ??= new Dictionary<string, Kept<bool>>(StringComparer.Ordinal);
+            if (_bloomVerdicts is null)
+            {
+                _bloomVerdicts = new Dictionary<string, Kept<bool>>(StringComparer.Ordinal);
+                Interlocked.Add(ref _memoBytes, ShellBytes);
+            }
             if (_bloomVerdicts.ContainsKey(text)) return verdict;   // a racing query remembered it
             int slot = TakeSlotLocked();
             _ring[slot] = new Slot { Kind = SlotKind.Verdict, Text = text };
@@ -380,7 +387,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         BeforeRemember?.Invoke();
         lock (_gate)
         {
-            _buckets ??= [];
+            if (_buckets is null)
+            {
+                _buckets = [];
+                Interlocked.Add(ref _memoBytes, ShellBytes);
+            }
             if (_buckets.TryGetValue(key, out var raced)) return raced.Value;   // a racing query got there first
             int slot = -1;
             if (found is null)
@@ -563,7 +574,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// and returns what the memo holds.</summary>
     private int[]? RememberTrigramLocked(long key, int[]? postings)
     {
-        _trigrams ??= [];
+        if (_trigrams is null)
+        {
+            _trigrams = [];
+            Interlocked.Add(ref _memoBytes, ShellBytes);
+        }
         if (_trigrams.TryGetValue(key, out var raced)) return raced.Value;
         int slot = -1;
         if (postings is null)

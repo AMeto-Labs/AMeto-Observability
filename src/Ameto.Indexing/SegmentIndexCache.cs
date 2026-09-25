@@ -239,6 +239,15 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     private enum Outcome : byte { None, Hit, Miss }
 
     /// <summary>
+    /// What the cache itself keeps per query-path entry, beyond the memo: the entry, its LRU node
+    /// and its share of the map. MEASURED (Release, 5 000 entries): an empty memo entry retains
+    /// ~453 B, of which the memo is 176 B. With entries of a few hundred bytes to a few KB this is
+    /// no longer a rounding error, so it is charged. <see cref="Insert"/> keeps charging exactly
+    /// what its caller passes.
+    /// </summary>
+    internal const long EntryOverheadBytes = 280;
+
+    /// <summary>
     /// The query path's entry point: a lease on the group's memo, created empty when the group has
     /// none. Never a miss by itself — whether the memo could answer is only known once the query
     /// is done with the group, so the hit or miss is counted by <see cref="Lease.Complete"/>.
@@ -272,12 +281,13 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                 Interlocked.Increment(ref _staleReplaced);
             }
 
-            var reader = SegmentIndexReader.CreateMemo();
-            long size  = reader.ApproxRetainedBytes;
+            var  reader = SegmentIndexReader.CreateMemo();
+            long charged = reader.ApproxRetainedBytes;
+            long size    = charged + EntryOverheadBytes;
             e = new Entry
             {
                 Key = key, Reader = reader, HasTrigram = true,   // a memo reads any section it needs
-                Size = size, Charged = size, RefCount = 1, LastTouched = _time.GetTimestamp(),
+                Size = size, Charged = charged, RefCount = 1, LastTouched = _time.GetTimestamp(),
                 Fingerprint = fingerprint,
             };
             e.Node       = _lru.AddFirst(e);
