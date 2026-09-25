@@ -332,6 +332,39 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A ROTTED CLAIM IS READ PAST ONLY AS FAR AS THE TRUE END. After a commit moves four
+    /// survivors to the front, their source copies still sit further on — same generation,
+    /// checksums intact — and two new points appended over the gap end exactly where those copies
+    /// begin. With the claim rotted into the last new point, the walk that reads past a rotted
+    /// claim ran on into the copies and replayed the survivors twice. The end marker every batch
+    /// now leaves behind itself stops it at the true end: six points, each once.
+    /// </summary>
+    [Fact]
+    public void A_rotted_claim_is_read_past_only_to_the_true_end_not_into_a_relocations_leftovers()
+    {
+        using (var wal = Open())
+        {
+            for (int i = 0; i < 6; i++) wal.Append([Gauge("cpu", i, 100 + i)]);
+            ulong flushing = wal.BeginFlush();
+            for (int j = 0; j < 4; j++) wal.Append([Gauge("cpu", 10 + j, 200 + j)]);
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(flushing));   // 4 survivors to the front
+            wal.Append([Gauge("cpu", 20, 300.0), Gauge("cpu", 21, 301.0)]);    // ends where the copies begin
+            Assert.Equal(6L * V2Entry, wal.WrittenBytes);
+        }
+        byte[] file = File.ReadAllBytes(WalPath);
+        BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(8), FileHeader + 5 * V2Entry + 10);   // into the last point
+        File.WriteAllBytes(WalPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+        {
+            Assert.Equal([200.0, 201.0, 202.0, 203.0, 300.0, 301.0], wal.ReadAll(out _).Select(static r => r.Point.Value));
+            Assert.Equal(6L * V2Entry, wal.WrittenBytes);
+        }
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("the claim is what rotted"));
+    }
+
+    /// <summary>
     /// A TORN ENTRY IS A TORN WRITE, WHATEVER ITS FIELDS DECODE TO; AN ENTRY THAT VERIFIES AND IS
     /// STILL IMPOSSIBLE IS CORRUPTION. The first entry's generation is set to the incident's
     /// ≈155e9. Left with its old checksum it is what a random tear looks like — a Warning, and no

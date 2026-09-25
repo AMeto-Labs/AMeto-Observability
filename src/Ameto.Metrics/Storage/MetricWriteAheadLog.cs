@@ -1488,9 +1488,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// Test seam fired under the write lock once every entry of a batch — its fields, its buckets
-    /// and its checksum — is in the map, and BEFORE the file header's write offset claims them,
-    /// with the batch's end offset. A process that dies here leaves nothing a replay reads. Null
-    /// in production.
+    /// and its checksum — and the end marker behind them are in the map, and BEFORE the file
+    /// header's write offset claims them, with the batch's end offset. A process that dies here
+    /// leaves nothing a replay reads. Null in production.
     /// </summary>
     internal Action<long>? OnBatchWrittenForTest;
 
@@ -1501,8 +1501,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// <para><b>The order of the stores is the crash contract.</b> Per entry: its fields and
     /// buckets, then its checksum — computed from the bytes now in the map unless
     /// <see cref="PrecomputeChecksums"/> already has it for exactly these bytes. Per batch: every
-    /// entry, then the file header's write offset. So the header never claims an entry whose
-    /// checksum is not already down, in program order — which is what a process death sees.
+    /// entry, then the end marker behind the batch, then the file header's write offset. So the
+    /// header never claims an entry whose checksum is not already down, in program order — which
+    /// is what a process death sees.
     /// Across a power loss the pages go in any order, and the checksum is what tells a claimed
     /// entry that did not land from one that did.</para>
     /// </summary>
@@ -1567,6 +1568,16 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
                 offset += entrySize;
             }
+
+            // THE END MARKER BEHIND EVERY BATCH, before the claim moves over the batch. Past the
+            // claim the file holds whatever was there before: the source copies of a relocation's
+            // survivors (same generation, and they verify), a killed batch that was never claimed.
+            // Nothing reads them while the claim is sound; but a claim that rots into an entry is
+            // read past, through the entries that verify (see ReconcileDataEndLocked), and without a
+            // marker at the true end that walk ran on into those leftovers and replayed them — the
+            // survivors twice. The next batch writes its first entry over this marker.
+            if (offset + headerSize <= _capacity)
+                Unsafe.AsRef<MetricWalEntryHeader>(data + offset).Generation = 0;
 
             OnBatchWrittenForTest?.Invoke(offset);
 
