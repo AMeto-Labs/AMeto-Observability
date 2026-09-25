@@ -302,6 +302,8 @@ What each page stores: **logs** — the filter expression as typed; **traces** �
 through the TraceQL box); **metrics** — the committed builder tuple as
 `metric=…&agg=…[&q=…][&gb=…][&filters=…]`, the same encoding the page's own URL uses.
 
+> **Changed in this release — TraceQL numeric literals.** A minus sign is now part of the number: `{ .x = -3 }` asks for −3 (it used to drop the sign and ask for 3), and exponents parse (`-1e3`, `2.5E-1`). A literal that cannot mean a number — `1.2.3`, a stray `-` as in `.x = - 3`, `1e999` — and a negative span duration (`duration > -1ms`, `duration > -5`) are now a **query error** (`400`, or a `query-error` frame on the streams) instead of a silently wrong answer (`1.2.3` used to become 0). A saved or pinned trace query written that way fails on replay until it is corrected. Comparing an *attribute* with a negative duration (`.clock.skew < -5ms`) is an ordinary number comparison.
+
 All require JWT Bearer.
 
 ---

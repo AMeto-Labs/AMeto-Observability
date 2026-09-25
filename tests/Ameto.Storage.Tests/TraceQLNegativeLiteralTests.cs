@@ -8,8 +8,9 @@ namespace Ameto.Storage.Tests;
 /// NEGATIVE NUMERIC LITERALS (#94). The lexer had no sign: a '-' fell into "skip unknown", so
 /// <c>{ .x = -3 }</c> was <c>{ .x = 3 }</c> and <c>{ .code &lt; -1 }</c> was <c>{ .code &lt; 1 }</c> —
 /// not an error and not a miss, an answer to a different question. The sign is part of the
-/// literal now, and so is an exponent (<c>-1e3</c>); a negative DURATION is refused by name, since
-/// no span has one and the comparison would silently select all or nothing.
+/// literal now, and so is an exponent (<c>-1e3</c>); a negative duration is refused by the
+/// <c>duration</c> intrinsic, since no span has one and the comparison would silently select all or
+/// nothing — an ATTRIBUTE compared with one (<c>.clock.skew &lt; -5ms</c>) is an ordinary number.
 ///
 /// <para>Every positive case is asked of the same attribute twice: from a dictionary (the hot tier's
 /// fixtures) and from the msgpack blob a flushed span is read back as, because the two are
@@ -43,6 +44,8 @@ public sealed class TraceQLNegativeLiteralTests
     [InlineData("{ .x > -1e3 }",    -999.5,  true)]
     [InlineData("{ .x != -3 }",      3L,     true)]
     [InlineData("{ .x = -3 }",      "-3",    true)]    // a numeric string compares as its number
+    [InlineData("{ .x < -1ms }",    -2_000_000L, true)]   // an attribute may hold a negative duration (a clock skew)…
+    [InlineData("{ .x < -1ms }",     0L,          false)]  // …and is compared with it; only `duration` refuses one
     public void A_signed_literal_compares_as_the_number_it_spells(string query, object value, bool expected)
     {
         var pred = TraceQLParser.Parse(query);
@@ -63,7 +66,6 @@ public sealed class TraceQLNegativeLiteralTests
     [InlineData("{ duration > -1ms }")]
     [InlineData("{ duration < -1s }")]
     [InlineData("{ duration > -5 }")]          // the nanosecond spelling of the same thing
-    [InlineData("{ .latency > -1ms }")]        // a negative duration literal is refused everywhere
     [InlineData("{ .x = - 3 }")]               // a sign that is not attached to a number
     [InlineData("{ .x = -abc }")]
     [InlineData("{ .x = 1.2.3 }")]             // was the number 0

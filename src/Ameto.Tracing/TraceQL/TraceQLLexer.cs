@@ -145,8 +145,9 @@ public static class TraceQLLexer
 
     /// <summary>
     /// <c>-?digits[.digits][e[+-]digits][suffix]</c>. The sign and the exponent are part of the
-    /// literal — <c>-3</c>, <c>-0.5</c>, <c>-1e3</c> — and a duration keeps its sign so the parser
-    /// can refuse <c>-1ms</c> by name rather than read it as something else.
+    /// literal — <c>-3</c>, <c>-0.5</c>, <c>-1e3</c> — and a duration keeps its sign:
+    /// <c>{ .clock.skew &lt; -5ms }</c> is a real question of an attribute, and only the
+    /// <c>duration</c> intrinsic refuses a negative one.
     ///
     /// <para>TEXT THAT DOES NOT PARSE IS AN ERROR, not the number 0 it used to become:
     /// <c>{ .version = 1.2.3 }</c> read as <c>.version = 0</c>.</para>
@@ -178,7 +179,7 @@ public static class TraceQLLexer
             throw new TraceQLException($"'{numText}' at position {start} is not a number");
 
         // Check for duration suffix. A bool, not "nanos >= 0": a negative duration is still a
-        // duration, and the parser refuses it by name.
+        // duration (an attribute may be compared with one; the duration intrinsic refuses it).
         if (TryParseDurationSuffix(src, ref pos, num, out long nanos))
             return new Token(TokenKind.Duration, src[start..pos].ToString(), nanos);
 
