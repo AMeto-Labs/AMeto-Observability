@@ -304,6 +304,40 @@ public sealed class SegmentIndexMemoConcurrencyTests
         Assert.Equal(0, cache.TotalBytes);
     }
 
+    /// <summary>
+    /// The same path over different bytes: the entry taught from the old bytes is replaced, not
+    /// consulted — while a query that still holds it keeps its answers about the old bytes, which
+    /// is what it opened.
+    /// </summary>
+    [Fact]
+    public void Different_bytes_under_one_path_get_a_fresh_memo_and_the_old_lease_keeps_its_own()
+    {
+        var groups = BuildGroups(2);
+        var (oldBytes, newBytes) = (groups[0], groups[1]);
+        var cache  = new SegmentIndexCache(1 << 20);
+        var oldFp  = new IndexGroupFingerprint(1, default, oldBytes.Inverted.Length, default);
+        var newFp  = new IndexGroupFingerprint(1, default, newBytes.Inverted.Length + 1, default);
+
+        var held = SegmentIndexView.OverSections(cache, "same.seg", 0, oldBytes.Inverted, oldBytes.Trigram, oldBytes.Bloom, oldFp);
+        Assert.True(Same(oldBytes.Expected[0], AskIt(held, Questions[0])));
+
+        using (var next = SegmentIndexView.OverSections(cache, "same.seg", 0, newBytes.Inverted, newBytes.Trigram, newBytes.Bloom, newFp))
+        {
+            Assert.NotSame(held.Index, next.Index);
+            for (int q = 0; q < Questions.Length; q++)
+                Assert.True(Same(newBytes.Expected[q], AskIt(next, Questions[q])), $"new bytes, question {q}");
+        }
+        Assert.Equal(1, cache.StaleReplacedCount);
+
+        Assert.True(Same(oldBytes.Expected[0], AskIt(held, Questions[0])));   // still the old file's answer
+        held.Dispose();
+
+        using var again = SegmentIndexView.OverSections(cache, "same.seg", 0, newBytes.Inverted, newBytes.Trigram, newBytes.Bloom, newFp);
+        Assert.True(Same(newBytes.Expected[0], AskIt(again, Questions[0])));
+        Assert.False(again.ReadSections);                                      // the new memo, kept
+        Assert.Equal(1, cache.EntryCount);
+    }
+
     // ── What a hit is ─────────────────────────────────────────────────────────
 
     /// <summary>

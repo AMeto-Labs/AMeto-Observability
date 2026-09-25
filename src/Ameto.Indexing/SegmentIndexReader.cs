@@ -5,9 +5,10 @@ namespace Ameto.Indexing;
 
 /// <summary>
 /// Where a <see cref="SegmentIndexReader"/> gets its group's packed sections when its memo cannot
-/// answer. Every source for one (file, group) hands out the same bytes — a segment is immutable and
-/// its name is never reused — which is what lets a memo filled through one source answer through
-/// another.
+/// answer. A memo filled through one source answers through another only if both hand out the
+/// same bytes: a segment file is immutable, but its path can be reused for a different file, so
+/// the cache pairs a memo with the <see cref="IndexGroupFingerprint"/> of the bytes it learned
+/// from and never lends it to a source with a different one.
 /// </summary>
 internal interface IIndexSectionSource
 {

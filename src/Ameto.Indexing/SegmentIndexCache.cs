@@ -6,9 +6,11 @@ namespace Ameto.Indexing;
 /// Cross-query LRU cache of per-group segment indexes.
 ///
 /// <para>Without it, every query re-read every surviving group's sections and re-derived what
-/// the query before it had derived. Segments are immutable and their file names carry
-/// never-reused ids, so a (path, group) key can never serve stale data; entries for files
-/// deleted by merge or retention are simply never requested again and age out of the LRU.</para>
+/// the query before it had derived. Segments are immutable, and entries for files deleted by merge
+/// or retention are simply never requested again and age out of the LRU. A PATH, though, can come
+/// back with different bytes — a replicated segment re-imported under the name retention
+/// unlinked — so the query path's entries carry an <see cref="IndexGroupFingerprint"/> of the bytes
+/// they learned from, and one opened over different bytes is replaced, not trusted.</para>
 ///
 /// <para><b>What an entry is.</b> On the query path (<see cref="AcquireOrAdd"/>, through
 /// <see cref="SegmentIndexView"/>) an entry is a MEMO: what queries worked out about the group —
@@ -75,6 +77,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     private          long                                     _idleEvicted;
     private          long                                     _shedEvicted;
     private          long                                     _nativeEvicted;
+    private          long                                     _staleReplaced;
     private          IDisposable?                             _shedRegistration;
 
     public SegmentIndexCache(long budgetBytes) : this(budgetBytes, 0, default) { }
@@ -191,6 +194,11 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// </summary>
     public long NativeEvictedCount => Interlocked.Read(ref _nativeEvicted);
 
+    /// <summary>Entries replaced because their path now holds different bytes (see
+    /// <see cref="IndexGroupFingerprint"/>). Rare by construction; a count that climbs means
+    /// segment files are being replaced under their own names.</summary>
+    public long StaleReplacedCount => Interlocked.Read(ref _staleReplaced);
+
     internal sealed class Entry
     {
         public required (string Path, int Group) Key;
@@ -199,6 +207,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         public required long                     Size;
         public          long                     NativeSize;  // the part of Size that is NativeMemory
         public          long                     Charged;     // Reader.ApproxRetainedBytes when Size last caught up with it
+        public          IndexGroupFingerprint    Fingerprint; // the bytes the reader answers for; default for Insert
         public int  RefCount;                    // guarded by the cache lock
         public bool Doomed;                      // evicted/replaced — dispose at RefCount 0
         public long LastTouched;                 // the cache clock's timestamp of the last acquire
@@ -235,8 +244,13 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     ///
     /// <para>A new memo is a few hundred bytes. Charged at that and inserted at the LRU head, it
     /// can only push out the tail; what it grows to is charged when the lease is released.</para>
+    ///
+    /// <para><paramref name="fingerprint"/> names the bytes the caller is about to lend the memo.
+    /// An entry that learned from different bytes under the same path — the file was replaced —
+    /// is unlisted like an eviction (a query still holding it keeps it until released) and a fresh
+    /// memo takes its place. See <see cref="IndexGroupFingerprint"/>.</para>
     /// </summary>
-    internal Lease AcquireOrAdd(string path, int group)
+    internal Lease AcquireOrAdd(string path, int group, in IndexGroupFingerprint fingerprint)
     {
         List<SegmentIndexReader>? toDispose = null;
         Lease lease;
@@ -245,11 +259,16 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
             var key = (path, group);
             if (_map.TryGetValue(key, out var e))
             {
-                e.RefCount++;
-                e.LastTouched = _time.GetTimestamp();
-                _lru.Remove(e.Node!);
-                _lru.AddFirst(e.Node!);
-                return new Lease(this, e);
+                if (e.Fingerprint == fingerprint)
+                {
+                    e.RefCount++;
+                    e.LastTouched = _time.GetTimestamp();
+                    _lru.Remove(e.Node!);
+                    _lru.AddFirst(e.Node!);
+                    return new Lease(this, e);
+                }
+                RemoveLocked(e, toDispose = []);                 // other bytes behind this path now
+                Interlocked.Increment(ref _staleReplaced);
             }
 
             var reader = SegmentIndexReader.CreateMemo();
@@ -258,11 +277,12 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
             {
                 Key = key, Reader = reader, HasTrigram = true,   // a memo reads any section it needs
                 Size = size, Charged = size, RefCount = 1, LastTouched = _time.GetTimestamp(),
+                Fingerprint = fingerprint,
             };
             e.Node       = _lru.AddFirst(e);
             _map[key]    = e;
             _totalBytes += size;
-            EvictLocked(toDispose = []);
+            EvictLocked(toDispose ??= []);
             lease = new Lease(this, e);
         }
         foreach (var r in toDispose) r.Dispose();
@@ -511,7 +531,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                     e.Charged   = now;
                     e.Size     += grown;
                     _totalBytes += grown;
-                    if (grown > 0) EvictLocked(toDispose = []);
+                    if (grown > 0) EvictLocked(toDispose ??= []);
                 }
             }
             else if (e.Doomed && e.RefCount == 0)

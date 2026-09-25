@@ -4,6 +4,26 @@ using Ameto.Storage;
 namespace Ameto.Indexing;
 
 /// <summary>
+/// What identifies the BYTES behind one (path, group) cache key: the segment's id, node and file
+/// size, and the group's directory record — its section offsets, row range and time bounds.
+///
+/// <para>A path is not an identity. A replicated <c>{node}-{id}</c> segment can be re-imported
+/// under the name retention unlinked — a peer wiped and reinstalled under the same NodeId, or two
+/// nodes sharing one — and a memo taught from the old bytes answers for the new ones wrongly: its
+/// postings are ordinals of the old file, its "absent" and its bloom verdicts are about the old
+/// file, so the group loses rows it holds. An entry remembers the fingerprint it learned under,
+/// and a query that opens the key over a different one gets a fresh memo. Two different files
+/// agreeing on all of this — same size, same group layout to the byte offset, same row counts
+/// and the same first and last timestamps — is not a case the cache tries to separate.</para>
+/// </summary>
+public readonly record struct IndexGroupFingerprint(ulong SegmentId, NodeId Node, long FileBytes, SegmentIndexGroup Group)
+{
+    /// <summary>The fingerprint of group <paramref name="group"/> of an open segment.</summary>
+    public static IndexGroupFingerprint Of(SegmentReader segment, int group) =>
+        new(segment.Info.Id.Value, segment.Info.NodeId, segment.Info.CompressedBytes, segment.Groups[group]);
+}
+
+/// <summary>
 /// One query's use of one index group: the group's memo — the cached one when there is a cache,
 /// found or created, otherwise a throwaway — answering through the segment this query already
 /// has open.
@@ -72,21 +92,23 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
     {
         if (cache is { Enabled: true })
         {
-            var lease = cache.AcquireOrAdd(path, group);
+            var lease = cache.AcquireOrAdd(path, group, IndexGroupFingerprint.Of(segment, group));
             return new SegmentIndexView(lease.Index, lease, leased: true, segment, group);
         }
         return new SegmentIndexView(SegmentIndexReader.CreateMemo(), default, leased: false, segment, group);
     }
 
     /// <summary>A view over sections already in hand — for tests, which need no segment file to
-    /// exercise the memo, the cache and their races.</summary>
+    /// exercise the memo, the cache and their races. <paramref name="fingerprint"/> stands for the
+    /// bytes: a test that swaps them passes a different one.</summary>
     internal static SegmentIndexView OverSections(
         SegmentIndexCache? cache, string path, int group,
-        ReadOnlyMemory<byte> inverted, ReadOnlyMemory<byte> trigram, ReadOnlyMemory<byte> bloom)
+        ReadOnlyMemory<byte> inverted, ReadOnlyMemory<byte> trigram, ReadOnlyMemory<byte> bloom,
+        IndexGroupFingerprint fingerprint = default)
     {
         if (cache is { Enabled: true })
         {
-            var lease = cache.AcquireOrAdd(path, group);
+            var lease = cache.AcquireOrAdd(path, group, fingerprint);
             return new SegmentIndexView(lease.Index, lease, leased: true, null, group, inverted, trigram, bloom);
         }
         return new SegmentIndexView(SegmentIndexReader.CreateMemo(), default, leased: false, null, group,
