@@ -313,46 +313,76 @@ public sealed class TraceIndexCompactionTests : IDisposable
 
     /// <summary>
     /// THE ENTRY CAP FOLLOWS THE MERGE BUDGET (#94): two million at the cap — the large host keeps
-    /// exactly what it had — and that share of it below. The stand's derived budget (384 MB heap)
-    /// asks for about a third.
+    /// exactly what it had — and that share of it below, down to the share of the smallest budget a
+    /// host derives (16 MiB: 459 649 entries). The stand's derived budget (384 MB heap) asks for about
+    /// a third.
     /// </summary>
     [Fact]
     public void The_index_merge_entry_cap_scales_with_the_merge_budget()
     {
         long stand = Ameto.Core.MemoryBudgets.Derive(managedLimitBytes: 384L << 20, physicalLimitBytes: 512L << 20).TraceMergeBytes;
         long large = Ameto.Core.MemoryBudgets.Derive(64L << 30, 64L << 30).TraceMergeBytes;
+        long least = Ameto.Core.MemoryBudgets.Derive(managedLimitBytes: 256L << 20, physicalLimitBytes: 512L << 20).TraceMergeBytes;
         int  atStand = TraceIndexCompactor.MaxEntriesPerMergeFor(stand);
         _out.WriteLine($"merge budget {stand:N0} B (stand) → {atStand:N0} entries; {large:N0} B (large) → "
-                     + $"{TraceIndexCompactor.MaxEntriesPerMergeFor(large):N0}");
+                     + $"{TraceIndexCompactor.MaxEntriesPerMergeFor(large):N0}; floor {least:N0} B → "
+                     + $"{TraceIndexCompactor.MaxEntriesPerMergeFor(least):N0}");
 
         Assert.Equal(Ameto.Core.MemoryBudgets.TraceMergeCapBytes, large);
         Assert.Equal(TraceIndexCompactor.MaxEntriesPerMerge, TraceIndexCompactor.MaxEntriesPerMergeFor(large));
         Assert.Equal(TraceIndexCompactor.MaxEntriesPerMerge, TraceIndexCompactor.MaxEntriesPerMergeFor(10 * large));
         Assert.Equal(TraceIndexCompactor.MaxEntriesPerMerge * stand / large, atStand);
         Assert.True(atStand < TraceIndexCompactor.MaxEntriesPerMerge / 2);
-        Assert.Equal(1, TraceIndexCompactor.MaxEntriesPerMergeFor(0));
+
+        // The floor is MemoryBudgets' own smallest derived budget, and nothing goes below its share.
+        Assert.Equal(TraceIndexCompactor.MinMergeBudgetBytes, least);
+        Assert.Equal(459_649, TraceIndexCompactor.MaxEntriesPerMergeFor(least));
+        Assert.Equal(459_649, TraceIndexCompactor.MaxEntriesPerMergeFor(0));
+        Assert.Equal(459_649, TraceIndexCompactor.MaxEntriesPerMergeFor(14_600));
     }
 
     /// <summary>
-    /// …AND THE ENGINE MERGES BY IT. Ten L1 runs of 100 entries under a merge budget whose cap is
-    /// 400: one merge takes four runs, not ten. Reverted (the engine selecting by the constant):
-    /// all ten merge into one run.
+    /// …AND THE ENGINE CARRIES ITS OWN BUDGET'S CAP. A run of a stand-sized budget cannot be built
+    /// here (it takes 661 895 entries to reach), so the selector is asked with the engine's figure
+    /// over runs that only claim their sizes: three of ten 200 000-entry runs fit under the stand's
+    /// cap, where the constant took all ten.
     /// </summary>
     [Fact]
-    public void The_engine_caps_an_index_merge_by_its_own_merge_budget()
+    public void The_engine_plans_an_index_merge_by_its_own_merge_budget()
     {
-        // 2 000 000 × budget / 73 MB = 400 entries.
-        long budget = Ameto.Core.MemoryBudgets.TraceMergeCapBytes * 400 / TraceIndexCompactor.MaxEntriesPerMerge;
+        long stand = Ameto.Core.MemoryBudgets.Derive(managedLimitBytes: 384L << 20, physicalLimitBytes: 512L << 20).TraceMergeBytes;
         using var e = new TraceStorageEngine(Dir("budget-cap"), NullLogger<TraceStorageEngine>.Instance,
                                              writeSegmentFormatV4: false, indexEnabled: true,
-                                             new Ameto.Core.TracesOptions { MergeBudgetBytes = budget });
-        Assert.Equal(400, e.IndexMergeMaxEntries);
+                                             new Ameto.Core.TracesOptions { MergeBudgetBytes = stand });
+        Assert.Equal(TraceIndexCompactor.MaxEntriesPerMergeFor(stand), e.IndexMergeMaxEntries);
+
+        var runs = new List<TraceIndexRun>();
+        for (int i = 0; i < 10; i++)
+            runs.Add(new TraceIndexRun(1, $"L1-{i}.tix", 0x1000, 0x9000, 200_000, [(ulong)(i + 1)]));
+        Assert.Equal(3,  TraceIndexCompactor.SelectMergeBatch(runs, e.IndexMergeMaxEntries).Count);
+        Assert.Equal(10, TraceIndexCompactor.SelectMergeBatch(runs).Count);
+    }
+
+    /// <summary>
+    /// A TINY EXPLICIT BUDGET DOES NOT STARVE THE INDEX MERGE (review of this branch).
+    /// <c>Traces:MergeBudgetBytes</c> has no floor, and 14 600 B used to scale the cap to 400 entries:
+    /// ten L1 runs of 100 entries merged four at a time, and under fast flushes the L1 run count
+    /// grew without bound. The cap now stops at the smallest derived budget's share, so the level
+    /// merges whole. Reverted (no floor): 7 runs left after one merge, not 1.
+    /// </summary>
+    [Fact]
+    public void A_tiny_explicit_merge_budget_still_merges_a_level_whole()
+    {
+        using var e = new TraceStorageEngine(Dir("budget-tiny"), NullLogger<TraceStorageEngine>.Instance,
+                                             writeSegmentFormatV4: false, indexEnabled: true,
+                                             new Ameto.Core.TracesOptions { MergeBudgetBytes = 14_600 });
+        Assert.Equal(459_649, e.IndexMergeMaxEntries);
 
         Build(e, segments: 10, tracesPer: 100);
         Assert.Equal(10, e.IndexStatsForTest.Runs);
 
         Assert.True(e.CompactIndexOnce());
-        _out.WriteLine($"cap {e.IndexMergeMaxEntries} entries: 10 runs of 100 → {e.IndexStatsForTest.Runs} runs");
-        Assert.Equal(10 - 4 + 1, e.IndexStatsForTest.Runs);
+        _out.WriteLine($"cap {e.IndexMergeMaxEntries} entries: 10 runs of 100 → {e.IndexStatsForTest.Runs} run(s)");
+        Assert.Equal(1, e.IndexStatsForTest.Runs);
     }
 }

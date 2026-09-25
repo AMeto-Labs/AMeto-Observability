@@ -67,13 +67,25 @@ internal sealed class TraceIndexCompactor
     /// merge beside it, a chore of the same kind on the same heap, asked a large host's 150 MB of
     /// the stand too. Scaled, the large host keeps exactly two million and the stand asks for about
     /// a third of it.</para>
+    ///
+    /// <para>AND NEVER BELOW THE SHARE OF THE SMALLEST BUDGET A HOST DERIVES (<see cref="MinMergeBudgetBytes"/>,
+    /// 459 649 entries). An explicit <c>Traces:MergeBudgetBytes</c> has no floor of its own, and a
+    /// tiny one scaled the cap down to a handful of entries: every L1 merge then took just its two
+    /// runs, the L1 run count grew with the flush rate, and the index stopped doing the one thing it
+    /// merges for. The budget still shrinks the segment compactor's pass; it no longer starves this.</para>
     /// </summary>
     internal static int MaxEntriesPerMergeFor(long mergeBudgetBytes)
     {
-        if (mergeBudgetBytes >= Ameto.Core.MemoryBudgets.TraceMergeCapBytes) return MaxEntriesPerMerge;
-        long scaled = MaxEntriesPerMerge * Math.Max(0, mergeBudgetBytes) / Ameto.Core.MemoryBudgets.TraceMergeCapBytes;
-        return (int)Math.Max(1, scaled);
+        long budget = Math.Clamp(mergeBudgetBytes, MinMergeBudgetBytes, Ameto.Core.MemoryBudgets.TraceMergeCapBytes);
+        return (int)(MaxEntriesPerMerge * budget / Ameto.Core.MemoryBudgets.TraceMergeCapBytes);
     }
+
+    /// <summary>
+    /// The smallest trace merge budget <see cref="Ameto.Core.MemoryBudgets"/> derives for any host,
+    /// 16 MiB — its <c>MinTraceMergeBytes</c>, which is private there (MemoryBudgets is not this
+    /// class's to change); <c>TraceIndexCompactionTests</c> pins that the two agree.
+    /// </summary>
+    internal const long MinMergeBudgetBytes = 16L * 1024 * 1024;
 
     private readonly string  _dir;
     private readonly ILogger _logger;
