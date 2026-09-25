@@ -27,6 +27,8 @@
          same segments the functional tests assert over, and a second copy of the setup here
          would be a second thing to keep true with nothing checking it. -->
     <Compile Include="..\Ameto.Query.Tests\QuerySegmentFixtures.cs" Link="QuerySegmentFixtures.cs" />
+    <!-- MetricLabelPoolChurnProbe moves time past the label pool's reset interval. -->
+    <Compile Include="..\Shared\ManualTimeProvider.cs" Link="Shared\ManualTimeProvider.cs" />
   </ItemGroup>
 
   <ItemGroup>

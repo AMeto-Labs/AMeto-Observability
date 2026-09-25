@@ -250,6 +250,14 @@ public static class DiagnosticsEndpointMapper
                 // Exemplars dropped because MaxExemplarMetrics names already own a ring. A hint,
                 // never data — this counter is the only place the refusal shows.
                 metricsExemplarMetricsRefused   = metrics?.ExemplarMetricsRefused,
+                // The metric label intern pool (#88): its fill, its cap, how many of its epochs
+                // filled up and how many times it was reset. A full pool drops nothing — each new
+                // label then costs its own string until the next reset (at most one an hour) — so
+                // resets climbing hour after hour say the LIVE label set outgrows the pool.
+                metricsLabelPoolStrings         = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Strings.ClaimedCount,
+                metricsLabelPoolMaxStrings      = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Strings.MaxPoolSize,
+                metricsLabelPoolSaturations     = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Saturations,
+                metricsLabelPoolResets          = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Resets,
 
                 // ── Traces: the EFFECTIVE budgets, and the ring's back-pressure ─
                 // Refusals by cause, because they are different problems: RefusedForBytes is a

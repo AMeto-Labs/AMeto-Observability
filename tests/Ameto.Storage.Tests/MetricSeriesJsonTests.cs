@@ -136,22 +136,62 @@ public sealed class MetricSeriesJsonTests
         }
     }
 
+    /// <summary>
+    /// A label set with a repeated key — stored before ingest collapsed them (#92), or built by hand —
+    /// is written with the key ONCE, its ordinal-greatest value (the last of its sorted run), where the DTO path threw and failed
+    /// the whole answer. The value is the one <c>JSON.parse</c> keeps for a key sent twice; the
+    /// series around it are written exactly as before.
+    /// </summary>
     [Fact]
-    public void It_fails_where_the_DTO_path_failed()
+    public void A_repeated_label_key_is_written_once_with_the_last_value()
     {
-        var dup = new MetricSeries { Name = "m", Labels = new LabelSet([new("k", "1"), new("k", "2")]) };
-        Assert.Throws<ArgumentException>(() => Oracle([dup]));
-        Assert.Throws<ArgumentException>(() => Written([dup]));
+        var dup = new MetricSeries
+        {
+            Name   = "m",
+            Labels = new LabelSet([new("z", "0"), new("k", "2"), new("a", "a"), new("k", "1"), new("k", "3")]),
+            Points = [new MetricDataPoint { TimestampUnixNano = 1, Value = 1.5 }],
+        };
+        Assert.Throws<ArgumentException>(() => Oracle([dup]));   // what the endpoints used to do with it
 
+        var valid = new MetricSeries { Name = "v", Labels = new LabelSet([new("k", "1")]) };
+        Assert.Equal(
+            """[{"name":"v","kind":"Counter","unit":"","labels":{"k":"1"},"points":[]},"""
+          + """{"name":"m","kind":"Counter","unit":"","labels":{"a":"a","k":"3","z":"0"},"points":[{"ts":1,"value":1.5,"count":0,"sum":0}]},"""
+          + """{"name":"v","kind":"Counter","unit":"","labels":{"k":"1"},"points":[]}]""",
+            Written([valid, dup, valid]));
+    }
+
+    /// <summary>
+    /// NaN and ±Infinity — which the DTO path threw on, failing the whole answer — are written as
+    /// <c>null</c>, per field and per point (#92); the finite fields of the same point, and the
+    /// points around it, are written exactly as before.
+    /// </summary>
+    [Fact]
+    public void A_non_finite_value_or_sum_is_written_as_null()
+    {
         foreach (double bad in new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity })
         {
-            var valued = new MetricSeries { Name = "m", Points = [new MetricDataPoint { Value = bad }] };
-            var summed = new MetricSeries { Name = "m", Points = [new MetricDataPoint { Sum = bad }] };
-            Assert.Throws<ArgumentException>(() => Oracle([valued]));
-            Assert.Throws<ArgumentException>(() => Written([valued]));
+            var valued = new MetricSeries { Name = "m", Points = [new MetricDataPoint { TimestampUnixNano = 7, Value = bad, Count = 3, Sum = 0.5 }] };
+            var summed = new MetricSeries { Name = "m", Points = [new MetricDataPoint { TimestampUnixNano = 7, Value = 0.5, Count = 3, Sum = bad }] };
+            Assert.Throws<ArgumentException>(() => Oracle([valued]));   // what the endpoints used to do with it
             Assert.Throws<ArgumentException>(() => Oracle([summed]));
-            Assert.Throws<ArgumentException>(() => Written([summed]));
+
+            Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":7,"value":null,"count":3,"sum":0.5}]}]""",
+                         Written([valued]));
+            Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":7,"value":0.5,"count":3,"sum":null}]}]""",
+                         Written([summed]));
         }
+
+        var mixed = new MetricSeries
+        {
+            Name   = "m",
+            Points = [new MetricDataPoint { TimestampUnixNano = 1, Value = 1e300 },
+                      new MetricDataPoint { TimestampUnixNano = 2, Value = double.NaN, Sum = double.NegativeInfinity },
+                      new MetricDataPoint { TimestampUnixNano = 3, Value = -0.0, Sum = 5e-324 }],
+        };
+        Assert.Equal("""[{"name":"m","kind":"Counter","unit":"","labels":{},"points":[{"ts":1,"value":1E+300,"count":0,"sum":0},"""
+                   + """{"ts":2,"value":null,"count":0,"sum":null},{"ts":3,"value":-0,"count":0,"sum":5E-324}]}]""",
+                     Written([mixed]));
     }
 
     /// <summary>

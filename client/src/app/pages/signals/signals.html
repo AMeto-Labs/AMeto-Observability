@@ -233,7 +233,7 @@
           @if (preview(); as p) {
             <span class="pv-result" [class.fires]="p.wouldFire">
               value <b>{{ fmtNum(p.value) }}</b> {{ cmpLabel(d.comparator) }} {{ p.threshold }}
-              → {{ p.wouldFire ? 'WOULD FIRE' : 'ok' }}
+              → {{ previewVerdict(p) }}
             </span>
           }
         </div>
