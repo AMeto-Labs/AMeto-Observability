@@ -1,5 +1,6 @@
 using Ameto.Core;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
 using MessagePack;
@@ -21,38 +22,76 @@ internal static class MetricReader
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
 
+    /// <summary>
+    /// A file's header and name — what the startup scan registers it by. Positioned reads into the
+    /// stack (#94): these are 27 bytes at the start, 12 at the end and the name, and they used to
+    /// be read through <see cref="OpenRead"/>'s 64 KB buffer, allocated per file — 64 MB for a
+    /// thousand files at every start, to read 40 bytes of each. Checked in the order the
+    /// <see cref="BinaryReader"/> read them, so a short or foreign file fails where it did; a name
+    /// the file ends inside is what <c>ReadBytes</c> gave, the bytes that are there.
+    /// </summary>
     public static MetricSegmentInfo ReadSegmentInfo(string filePath)
     {
-        using var fs = OpenRead(filePath);
-        using var br = new BinaryReader(fs);
+        using var handle = File.OpenHandle(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        long length = RandomAccess.GetLength(handle);
 
-        uint magic = br.ReadUInt32();
+        Span<byte> head = stackalloc byte[27];
+        int got = ReadAt(handle, head, 0);
+        if (got < 4) throw new EndOfStreamException();
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(head);
         if (magic != Magic) throw new InvalidDataException($"Invalid .mts magic in {filePath}");
-
-        ushort version = br.ReadUInt16();
+        if (got < 6) throw new EndOfStreamException();
+        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(head[4..]);
         if (version is not (2 or 3)) throw new InvalidDataException($"Unsupported .mts version {version} in {filePath}");
-        var granularity = (MetricGranularity)br.ReadByte();
-        br.ReadUInt32();  // seriesCount
-        long minNano = br.ReadInt64();
-        long maxNano = br.ReadInt64();
+        if (got < 27) throw new EndOfStreamException();
+        var  granularity = (MetricGranularity)head[6];
+        long minNano     = BinaryPrimitives.ReadInt64LittleEndian(head[11..]);
+        long maxNano     = BinaryPrimitives.ReadInt64LittleEndian(head[19..]);
 
-        // Read metric name from name index
-        long nameIdxOffset = ReadNameIdxOffset(fs, br);
-        fs.Seek(nameIdxOffset, SeekOrigin.Begin);
-        br.ReadUInt32(); // nameCount
-        ushort nameLen = br.ReadUInt16();
-        string metricName = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+        // Footer: the name index's offset and the footer magic, the file's last 12 bytes.
+        Span<byte> footer = stackalloc byte[12];
+        if (length < 12 || ReadAt(handle, footer, length - 12) < 12) throw new EndOfStreamException();
+        long nameIdxOffset = (long)BinaryPrimitives.ReadUInt64LittleEndian(footer);
+        if (BinaryPrimitives.ReadUInt32LittleEndian(footer[8..]) != FooterMagic) throw new InvalidDataException("Invalid .mts footer magic");
 
-        return new MetricSegmentInfo
+        // Name index: nameCount uint32 | nameLen uint16 | name bytes.
+        Span<byte> nameHead = stackalloc byte[6];
+        if (nameIdxOffset < 0) throw new IOException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
+        if (ReadAt(handle, nameHead, nameIdxOffset) < 6) throw new EndOfStreamException();
+        int     nameLen = BinaryPrimitives.ReadUInt16LittleEndian(nameHead[4..]);
+        byte[]? rented  = nameLen > 256 ? ArrayPool<byte>.Shared.Rent(nameLen) : null;
+        try
         {
-            FilePath      = filePath,
-            MetricName    = metricName,
-            MinNano       = minNano,
-            MaxNano       = maxNano,
-            Granularity   = granularity,
-            FormatVersion = version,
-            SizeBytes     = fs.Length,
-        };
+            Span<byte> name = (rented is null ? stackalloc byte[256] : rented)[..nameLen];
+            int nameGot = ReadAt(handle, name, nameIdxOffset + 6);
+            return new MetricSegmentInfo
+            {
+                FilePath      = filePath,
+                MetricName    = System.Text.Encoding.UTF8.GetString(name[..nameGot]),
+                MinNano       = minNano,
+                MaxNano       = maxNano,
+                Granularity   = granularity,
+                FormatVersion = version,
+                SizeBytes     = length,
+            };
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Fills <paramref name="buffer"/> from <paramref name="offset"/> until it is full or the file ends; the bytes read.</summary>
+    private static int ReadAt(Microsoft.Win32.SafeHandles.SafeFileHandle handle, Span<byte> buffer, long offset)
+    {
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int n = RandomAccess.Read(handle, buffer[total..], offset + total);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
     }
 
     /// <summary>
@@ -100,9 +139,23 @@ internal static class MetricReader
         await Task.CompletedTask;
     }
 
-    /// <summary>Every series in the file, every point, labels unfiltered — the rollup's and the catalog seed's read.</summary>
+    /// <summary>Every series in the file, every point, labels unfiltered.</summary>
     public static IEnumerable<MetricSeries> ReadAllSync(string filePath) =>
         Read(filePath, metricName: null, ReadWindow.All, CancellationToken.None);
+
+    /// <summary>
+    /// Every series' IDENTITY — kind, unit and labels — in file order, and nothing else: its bucket
+    /// bounds and points are walked past structurally, never decoded, and each series comes back
+    /// with no points and no bounds. The catalog seed's read (#94): it decoded every point of every
+    /// <c>.mts</c> at startup to learn one timestamp per series, which the file's header already
+    /// answers (see <c>MetricStorageEngine.SeedCatalogFromCold</c>). The labels cannot be had
+    /// without inflating the block — they live in it — so this is not a header-only read, but it
+    /// builds nothing a catalog does not keep.
+    /// </summary>
+    internal static IEnumerable<MetricSeries> ReadIdentities(string filePath) =>
+        Read(filePath, metricName: null,
+             new ReadWindow(long.MinValue, long.MaxValue, null, buckets: false, identities: true),
+             CancellationToken.None);
 
     /// <summary>As <see cref="ReadAllSync(string)"/>, with label text looked up in <paramref name="interner"/> — for tests.</summary>
     internal static IEnumerable<MetricSeries> ReadAllSync(string filePath, MetricLabelInterner interner) =>
@@ -142,9 +195,12 @@ internal static class MetricReader
     internal readonly struct ReadWindow(
         long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets,
         bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue,
-        MetricLabelInterner? interner = null)
+        MetricLabelInterner? interner = null, bool identities = false)
     {
         public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
+
+        /// <summary>Only kind, unit and labels are decoded; bounds and points are skipped (<see cref="ReadIdentities"/>).</summary>
+        public bool Identities { get; } = identities;
 
         public long FromNano { get; } = fromNano;
         public long ToNano   { get; } = toNano;
@@ -408,9 +464,14 @@ internal static class MetricReader
                     return null;
                 }
             }
-            else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
+            else if (key.SequenceEqual("bnds"u8))
+            {
+                if (window.Identities) r.Skip();
+                else bounds = ReadBounds(ref r);
+            }
             else if (key.SequenceEqual("pts"u8))
             {
+                if (window.Identities) { r.Skip(); continue; }
                 if (window.KeyOf is { } keyOf && (have & HaveIdentity) == HaveIdentity)
                 {
                     keyIndex = keyOf(new SeriesKey(metricName, kind, unit, labels));
@@ -420,6 +481,11 @@ internal static class MetricReader
             }
             else r.Skip();
         }
+
+        // Identity only: no list for the points it never read (Points is the shared empty default).
+        if (window.Identities)
+            return new MetricSeries { Name = metricName, Kind = kind, Unit = unit, Labels = labels };
+
         points ??= [];
         if (window.KeyOf is { } lateKeyOf && keyIndex < 0)
             keyIndex = lateKeyOf(new SeriesKey(metricName, kind, unit, labels));

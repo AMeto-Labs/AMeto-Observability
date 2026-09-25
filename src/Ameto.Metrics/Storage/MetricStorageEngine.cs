@@ -2900,20 +2900,35 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// Rebuilds the in-memory metric catalog from cold segments on startup so the
     /// Explore catalog / Overview detection work immediately after a restart, instead
     /// of staying blank until the next live export repopulates metadata.
+    ///
+    /// <para><b>Identities from the file, the time from its header</b> (#94). This decoded every
+    /// point of every series of every <c>.mts</c> — every file of the retention window, at every
+    /// start — to take one timestamp per series, its last point's, and fold it into the METRIC's
+    /// <see cref="MetricMeta.LastSeenMs"/> as a maximum. Per file that maximum is the header's
+    /// <see cref="MetricSegmentInfo.MaxNano"/>, exactly: every writer of the format — v3's and the
+    /// one v2 writer there ever was — sets it to the greatest of its series' last points, taken
+    /// from the very lists it then writes, oldest first; a series with no points used the header
+    /// already; and the millisecond is the same one (v3 stores <c>ns / 1e6</c> and reads back
+    /// <c>ms x 1e6</c>, whose <c>/ 1e6</c> is the header's <c>/ 1e6</c>). So the series are read
+    /// for what only they carry — kind, unit, labels, in the same order, for the same
+    /// last-wins and first-N rules — and their bounds and points are walked past, not built
+    /// (<see cref="MetricReader.ReadIdentities"/>). <c>MetricCatalogSeedTests</c> holds the catalog
+    /// to the one the full decode builds. The one difference is a file torn inside its points: the
+    /// full decode stopped at the torn series, this reads the identities past it.</para>
     /// </summary>
     private void SeedCatalogFromCold(List<MetricSegmentInfo> segments)
     {
         int seeded = 0;
         foreach (var seg in segments)
         {
+            long lastMs = seg.MaxNano / 1_000_000L;
             try
             {
-                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+                foreach (var s in MetricReader.ReadIdentities(seg.FilePath))
                 {
                     var meta = _meta.GetOrAdd(s.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
                     meta.Kind = s.Kind;
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
-                    long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
                     if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
                     foreach (var (k, v) in s.Labels)
                     {
