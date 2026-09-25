@@ -117,10 +117,16 @@ internal static class SpanWriter
     /// derived from a second, independent pass is an index that can disagree with the segment it
     /// describes. Handing over the writer's own is the only version that cannot.
     /// </param>
+    /// <param name="scratch">
+    /// The engine's own scratch arrays (#90), or null for the shared pool. See
+    /// <see cref="SpanWriteScratch"/>: a thread-pool flush otherwise missed the pool slot its last
+    /// flush left on another thread, and allocated its biggest arrays on the LOH again.
+    /// </param>
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
                                         Action<string>? onNamed = null,
                                         Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null,
-                                        ushort version = DefaultVersion)
+                                        ushort version = DefaultVersion,
+                                        SpanWriteScratch? scratch = null)
     {
         int count = spans.Count;
         if (count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
@@ -154,8 +160,8 @@ internal static class SpanWriter
         // those comparison results. The permutation is therefore the same one, and
         // TraceFlushProbe's corpus — 12 000 spans over 500 start times, 24 ties apiece — is what
         // holds that claim to the byte.
-        int[]  order = ArrayPool<int>.Shared.Rent(count);
-        long[] keys  = ArrayPool<long>.Shared.Rent(count);
+        int[]  order = scratch?.RentOrder(count) ?? ArrayPool<int>.Shared.Rent(count);
+        long[] keys  = scratch?.RentKeys(count)  ?? ArrayPool<long>.Shared.Rent(count);
         try
         {
             for (int i = 0; i < count; i++)
@@ -166,12 +172,16 @@ internal static class SpanWriter
             order.AsSpan(0, count).Sort((a, b) => keys[a].CompareTo(keys[b]));
 
             var batch = new OrderedSpans(spans, order, count);
-            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version);
+            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch);
         }
         finally
         {
-            ArrayPool<long>.Shared.Return(keys);
-            ArrayPool<int>.Shared.Return(order);
+            if (scratch is not null) { scratch.Return(keys); scratch.Return(order); }
+            else
+            {
+                ArrayPool<long>.Shared.Return(keys);
+                ArrayPool<int>.Shared.Return(order);
+            }
         }
     }
 
@@ -182,7 +192,7 @@ internal static class SpanWriter
     private static SpanSegmentInfo WriteOrdered(string dataDir, in OrderedSpans spans, bool recoverable,
                                                 Action<string>? onNamed,
                                                 Action<Dictionary<TraceId, List<uint>>>? onTraceIndex,
-                                                ushort version)
+                                                ushort version, SpanWriteScratch? scratch)
     {
         int  count   = spans.Count;
         long minNano = spans[0].StartTimeUnixNano;
@@ -352,7 +362,7 @@ internal static class SpanWriter
             //    nothing — an empty stats/edge set produces no file at all.
             WriteStatsSidecar(statsFinal + ".tmp", svcStats);
             ServiceGraphSidecar.WriteOrdered(trcPath, in spans, svcgraphFinal + ".tmp", spanSvc);
-            TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp");
+            TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp", scratch);
 
             // ── Publish: sidecars first, the .trc last — a visible .trc implies its
             //    sidecars are complete.

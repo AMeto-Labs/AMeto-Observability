@@ -559,6 +559,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     private readonly SpanStringPools _pools;
 
+    /// <summary>
+    /// The segment writer's largest scratch arrays, kept here between flushes rather than in the
+    /// slot of whichever thread-pool thread returned them last (#90) — see <see cref="SpanWriteScratch"/>.
+    /// </summary>
+    private readonly SpanWriteScratch _writeScratch = new();
+
+    /// <summary>Test hook: the writer scratch this engine's flushes and merges rent from.</summary>
+    internal SpanWriteScratch WriteScratchForTest => _writeScratch;
+
     /// <summary>Test hook: the intern pools this engine resolves names and services through.</summary>
     internal SpanStringPools PoolsForTest => _pools;
 
@@ -2632,7 +2641,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
                                     onTraceIndex: map  => traceIndex = map,
-                                    version:      _segmentVersion);
+                                    version:      _segmentVersion,
+                                    scratch:      _writeScratch);
             // Weighed while the spans are still at hand, so the compaction planner prices this
             // segment by what it holds rather than by its span count.
             info = info.WithWeight(ReadBackBytesOf(CollectionsMarshal.AsSpan(snapshot)));
@@ -3818,7 +3828,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
                                           onTraceIndex: map => mergedTraceIndex = map,
-                                          version: _segmentVersion)
+                                          version: _segmentVersion, scratch: _writeScratch)
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);

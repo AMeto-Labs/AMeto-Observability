@@ -50,6 +50,8 @@ public sealed class FileBoundsConventionTests
     {
         ["SpanWriter.cs"]  = "writes files rather than reading them; every size is our own",
         ["SpanStats.cs"]   = "a static table of bucket bounds; no file involved",
+        ["SpanWriteScratch.cs"] = "the segment WRITER's scratch arrays: every size is a batch's own span count or a body "
+                                + "sized from in-memory counts; it reads no file",
         ["MetricWriter.cs"] = "writes files rather than reading them",
     };
 
