@@ -3652,9 +3652,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private HashSet<string>? CompactionQuarantineSnapshot()
     {
         lock (_compactionQuarantine)
-            return _compactionQuarantine.Count == 0
-                ? null
-                : new HashSet<string>(_compactionQuarantine, StringComparer.Ordinal);
+        {
+            if (_compactionQuarantine.Count == 0) return null;
+            var copy = new HashSet<string>(StringComparer.Ordinal);
+            copy.UnionWith(_compactionQuarantine);
+            return copy;
+        }
     }
 
     /// <summary>
