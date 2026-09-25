@@ -170,6 +170,35 @@ public sealed class SegmentIndexCacheTests
         Assert.Throws<ObjectDisposedException>(() => r.Bloom.MightContain("v3"));
     }
 
+    /// <summary>
+    /// The query path's entries are memos that own no section and answer only through a view.
+    /// The public reader API must never hand one out: TryAcquire would return a reader whose
+    /// Lookup throws, and Insert would drop the caller's working reader in favour of it. A memo
+    /// is a miss to TryAcquire, and a reader inserted over one replaces it.
+    /// </summary>
+    [Fact]
+    public void A_memo_is_never_handed_out_through_the_reader_api()
+    {
+        var cache = new SegmentIndexCache(1 << 20);
+        var b = new SegmentInvertedIndex();
+        b.Add(0, "P", "v");
+        byte[] section = b.Serialise();
+        using (SegmentIndexView.OverSections(cache, "a.seg", 0, section, default, default)) { }
+        Assert.Equal(1, cache.EntryCount);
+
+        Assert.Null(cache.TryAcquire("a.seg", 0, needTrigram: false));
+
+        var r = SegmentIndexReader.Load(section, [], []);
+        using (var lease = cache.Insert("a.seg", 0, hasTrigram: true, r, r.ApproxRetainedBytes))
+        {
+            Assert.Same(r, lease.Index);
+            Assert.Equal([0u], lease.Index.LookupIntersect([("P", "v")]));
+        }
+        var hit = cache.TryAcquire("a.seg", 0, needTrigram: false);
+        Assert.NotNull(hit);
+        using (hit.Value) Assert.Same(r, hit.Value.Index);
+    }
+
     [Fact]
     public void Disabled_cache_misses_and_leases_own_the_reader()
     {

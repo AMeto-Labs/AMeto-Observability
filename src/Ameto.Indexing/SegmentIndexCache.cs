@@ -20,7 +20,8 @@ namespace Ameto.Indexing;
 /// has mapped anyway. Until #80 an entry was the group's index decoded whole — 128 MB for a
 /// prop-dense group against a 256 MB budget, which is why the cache held two groups and hit 2 %
 /// of the time. <see cref="Insert"/> still takes any reader, and <see cref="TryAcquire"/> still
-/// finds it, for callers and tests that build a reader themselves.</para>
+/// finds it, for callers and tests that build a reader themselves; neither ever hands out a memo,
+/// which to them is a miss, and an inserted reader replaces one.</para>
 ///
 /// <para>Ownership: a <see cref="SegmentIndexReader"/> made by <c>Load</c> holds NATIVE memory
 /// (the bloom bits), so an entry is disposed exactly once — on eviction if unreferenced,
@@ -298,7 +299,9 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         if (!Enabled) return null;
         lock (_lock)
         {
-            if (!_map.TryGetValue((path, group), out var e) || (needTrigram && !e.HasTrigram))
+            // A memo (the query path's entry) owns no section and answers only through a view: to
+            // this API it is not there.
+            if (!_map.TryGetValue((path, group), out var e) || !e.Reader.OwnsSections || (needTrigram && !e.HasTrigram))
             {
                 Interlocked.Increment(ref _misses);
                 return null;
@@ -337,7 +340,9 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         lock (_lock)
         {
             var key = (path, group);
-            if (_map.TryGetValue(key, out var existing) && (existing.HasTrigram || !hasTrigram))
+            // An existing memo is never the better entry: it cannot answer through this API, and the
+            // caller's reader can answer through a view as well.
+            if (_map.TryGetValue(key, out var existing) && existing.Reader.OwnsSections && (existing.HasTrigram || !hasTrigram))
             {
                 // Lost the race to an equal-or-better entry — serve that one, drop ours.
                 (toDispose ??= []).Add(reader);
