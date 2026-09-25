@@ -82,9 +82,10 @@ internal enum MetricWalCommit
 /// year-2116 garbage point did on every restart. The CRC is stored after the 48 header bytes and
 /// written LAST, and every walk that decides what the data is — the open-time reconciliation,
 /// both passes of <see cref="ReadAll"/> — stops at the first entry that does not verify. The
-/// judgement checks stay, ahead of it: they still classify what they catch as corruption (an
-/// Error and a quarantine copy) where a checksum failure is reported as the torn write an
-/// unclean stop leaves, and they are all a log that could not be upgraded has (see
+/// judgement checks stay, BEHIND it (see <see cref="EntryAt"/>): a checksum failure is reported as
+/// the torn write an unclean stop leaves, whatever its fields decode to, and an impossible
+/// generation or series index is classified as corruption (an Error and a quarantine copy) only
+/// in an entry that verifies. They are all a log that could not be upgraded has (see
 /// <see cref="Open"/>).</para>
 ///
 /// <para><b>Durability, stated because it is a choice.</b> Nothing msyncs this log: not an
@@ -955,9 +956,19 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <paramref name="pos"/> of <paramref name="data"/>, or 0 where the data ends before
     /// <paramref name="end"/>, with <paramref name="stop"/> saying why. The checks run in this
     /// order and each only reads what the ones before it proved is inside the range: a header
-    /// that does not fit, buckets that do not fit, the generation-0 marker, a generation or a
-    /// series index nothing could have written, and — last, and only for a checksummed log with
-    /// <paramref name="verify"/> — the CRC.
+    /// that does not fit, buckets that do not fit, the generation-0 marker, then — for a
+    /// checksummed log with <paramref name="verify"/> — the CRC, and last a generation or a series
+    /// index nothing could have written.
+    ///
+    /// <para><b>The CRC before the judgement, where there is one,</b> because the two mean
+    /// different things and the reconcile reports them differently. A random tear decodes to a
+    /// random generation, which lands past the margin almost always; judged first, every ordinary
+    /// torn write of an unclean stop was reported as corruption — an Error and a 4 MiB quarantine
+    /// copy — while only garbage that happened to fall inside the margin got the Warning a torn
+    /// write deserves. Checked first, a checksum failure is the torn write, whatever its fields
+    /// decode to, and an impossible generation or series index is corruption only in an entry
+    /// that VERIFIES — bytes written whole, and wrong: the one case the Error is for. Unverified
+    /// walks (Compact, a v1 log) have only the judgement, in the same order as before.</para>
     ///
     /// <para><see cref="Compact"/> steps with <paramref name="verify"/> false, deliberately: every
     /// entry below <c>_writeOffset</c> of a live log was either written by this process under the
@@ -975,11 +986,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
         if (pos + total > end)                                    { stop = WalkStop.Torn;           return 0; }
         if (eh.Generation == 0)                                   { stop = WalkStop.EndMarker;      return 0; }
-        if (eh.Generation > _generation + GenerationSanityMargin) { stop = WalkStop.BadGeneration;  return 0; }
-        if (eh.SeriesIndex >= SeriesIndexSanityCap)               { stop = WalkStop.BadSeriesIndex; return 0; }
         if (verify && _checksummed
             && Unsafe.ReadUnaligned<uint>(data + pos + ChecksummedHeaderBytes) != EntryChecksum(data + pos, eh.BucketCount))
                                                                   { stop = WalkStop.BadChecksum;    return 0; }
+        if (eh.Generation > _generation + GenerationSanityMargin) { stop = WalkStop.BadGeneration;  return 0; }
+        if (eh.SeriesIndex >= SeriesIndexSanityCap)               { stop = WalkStop.BadSeriesIndex; return 0; }
         stop = WalkStop.None;
         return total;
     }

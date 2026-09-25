@@ -296,6 +296,40 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A TORN ENTRY IS A TORN WRITE, WHATEVER ITS FIELDS DECODE TO; AN ENTRY THAT VERIFIES AND IS
+    /// STILL IMPOSSIBLE IS CORRUPTION. The first entry's generation is set to the incident's
+    /// ≈155e9. Left with its old checksum it is what a random tear looks like — a Warning, and no
+    /// 4 MiB quarantine copy of an ordinary unclean stop. With the checksum recomputed over it,
+    /// the bytes were written whole and are still wrong: the Error and the quarantine are for
+    /// that. Judging the generation before the checksum reported every random tear as corruption
+    /// and only in-margin garbage as a torn write.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_torn_entry_is_reported_as_a_torn_write_and_only_a_verifying_impossible_one_as_corruption(bool verifies)
+    {
+        using (var wal = Open()) wal.Append([Gauge("cpu", 0, 1.0), Gauge("cpu", 1, 2.0)]);
+        byte[] file = File.ReadAllBytes(WalPath);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(FileHeader), 155_000_000_000UL);
+        if (verifies)
+            BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(FileHeader + 48),
+                Crc32c.Append(0, file.AsSpan(FileHeader, 48)));
+        File.WriteAllBytes(WalPath, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger))
+        {
+            Assert.Empty(wal.ReadAll(out _));
+            Assert.Equal(0, wal.WrittenBytes);
+        }
+
+        Assert.Equal(verifies, logger.Entries.Any(static e => e.Level == LogLevel.Error));
+        Assert.Equal(!verifies, logger.Entries.Any(static e => e.Level == LogLevel.Warning && e.Text.Contains("fails its checksum")));
+        Assert.Equal(verifies, File.Exists(WalPath + ".quarantine"));
+    }
+
+    /// <summary>
     /// THE INCIDENT #56 HEAD, AS A v2 LOG TEARS, DOES NOT REPLAY. Reconstructed from the stand's
     /// forensics (the bytes themselves were not kept in the repo): header generation 3 705 over
     /// watermark 3 704, the first entry torn — its bucket count reading 8, so the stride lands on

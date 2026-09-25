@@ -125,6 +125,25 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// <summary>The v2 file header (v1's was 32 bytes): where the first entry starts, and what a file's size adds to its capacity.</summary>
     private const int Hdr = 64;
 
+    /// <summary>
+    /// Recomputes the v2 checksum of the entry at <paramref name="fileOffset"/> after a test has
+    /// written into it — so the entry VERIFIES and carries what the test put there. That is the
+    /// shape the open-time walk classifies as corruption (Error + quarantine); an entry left with
+    /// its old checksum is a torn write, reported as one (MetricWalV2Tests pins both).
+    /// </summary>
+    private void ResealEntry(long fileOffset)
+    {
+        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite);
+        var head = new byte[48];
+        fs.Position = fileOffset;
+        fs.ReadExactly(head);
+        var buckets = new byte[BitConverter.ToUInt16(head, 44) * 8];
+        fs.Position = fileOffset + 52;
+        fs.ReadExactly(buckets);
+        fs.Position = fileOffset + 48;
+        fs.Write(BitConverter.GetBytes(Crc32c.Append(Crc32c.Append(0, head), buckets)));
+    }
+
     private static LabelSet Labels(params (string K, string V)[] pairs) =>
         new(pairs.Select(p => new KeyValuePair<string, string>(p.K, p.V)));
 
@@ -2093,6 +2112,9 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// deployment below the flush thresholds a commit can be arbitrarily far away, and until
     /// one runs, every point appended after a poisoned open lands PAST the unreachable region,
     /// where no replay will ever find it. Acknowledged, logged, unreplayable from birth.
+    ///
+    /// <para>In a v2 log the torn head fails its checksum, so it is reported as the torn write it
+    /// is — a Warning naming the discarded bytes — not as corruption; either way it is reported.</para>
     /// </summary>
     [Fact]
     public void Poisoned_head_is_reconciled_and_shrunk_at_open()
@@ -2112,9 +2134,9 @@ public sealed class MetricWalTests : IAsyncLifetime
         var logger   = new RecordingLogger();
         var reopened = OpenWal(4 * 1024, logger);
 
-        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error,
-                "Metric WAL header claims", out _),
-            "corruption was repaired without being reported");
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Warning,
+                "Metric WAL: discarding", out _),
+            "the torn head was repaired without being reported");
         Assert.Empty(reopened.ReadAll(out _));
         Assert.Equal(0, reopened.WrittenBytes);
         // The grown corpse gave its space back instead of surviving its own cause.
@@ -2455,6 +2477,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Seek(Hdr + 8, SeekOrigin.Begin);              // entry 0's SeriesIndex field
             fs.Write(BitConverter.GetBytes(uint.MaxValue - 3));
         }
+        ResealEntry(Hdr);                                    // written whole, and wrong: corruption
 
         var logger   = new RecordingLogger();
         var reopened = OpenWal(logger: logger);
@@ -2494,6 +2517,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Seek(Hdr, SeekOrigin.Begin);                  // entry 0's Generation field
             fs.Write(BitConverter.GetBytes(155_000_000_000UL));
         }
+        ResealEntry(Hdr);                                    // written whole, and wrong: corruption
 
         OpenWal(logger: new RecordingLogger());
 
