@@ -506,9 +506,11 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
 | `GET /api/traces/compare` | Compare two traces / time windows. |
 | `GET /api/traces/{traceId}` | Full span tree for one trace. |
-| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace. |
+| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace: the root node `{ spanId, name, service, kind, status, totalMs, selfMs, children: [ …nodes ] }` (`null` when no span qualifies as root, `404` for an unknown trace). Any depth up to 4 096 levels; a node on level 4 096 that still has children is sent with `children: []` and `"truncated": true` (the only node that ever carries the field), its own `totalMs` / `selfMs` still counting them. |
 | `GET /api/traces/{traceId}/logs` | Logs correlated to the trace (via `@tr`). |
 | `GET /api/spans/{spanId}/logs` | Logs correlated to a single span (via `@sp`). |
+
+The trace list also streams as Server-Sent Events: `GET /api/traces/stream` (the filters of `GET /api/traces`) and `GET /api/traces/query/stream?ql=` (TraceQL). Each row is one `data:` line carrying **the same JSON bytes** the REST answers carry for it — ASP.NET Core's relaxed encoder: non-ASCII text, `<`, `&`, `'` and `+` go out as UTF-8; `"` and `\` as `\"` and `\\`; control characters as `\n`, `\r`, `\t` or `\uXXXX`; U+2028, U+2029 and characters outside the BMP (a surrogate pair) as `\uXXXX` — so a `data:` line never contains a raw line break of any kind. The stream ends with `event: done` or `event: query-error`.
 
 ---
 
