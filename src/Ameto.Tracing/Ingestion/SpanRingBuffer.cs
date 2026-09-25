@@ -529,7 +529,8 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// </summary>
     private int AcquireChunk()
     {
-        var spin = new SpinWait();
+        var  spin        = new SpinWait();
+        bool lowReread = false;
         while (true)
         {
             int epoch = Volatile.Read(ref _trimEpoch);
@@ -542,7 +543,21 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             // one decommit call): an empty list then means "wait", not "full". Full only if no trim
             // was running at any point while we looked — the epoch is odd during one, and moves at
             // either end, so a trim that finished between the look and this check is seen too.
-            if ((epoch & 1) == 0 && Volatile.Read(ref _trimEpoch) == epoch) return -1;
+            if ((epoch & 1) == 0 && Volatile.Read(ref _trimEpoch) == epoch)
+            {
+                // …AND THE LOW LIST IS STILL EMPTY (#94). The two lists are read one after the other,
+                // not together: between the low read and the high read, a drained span can free a low
+                // chunk while another producer takes the last high one — so this thread saw both
+                // empty with a chunk free the whole time, and refused a span for want of an arena
+                // that had room. One more look at the low head before refusing closes that; once per
+                // acquisition, so a refusal under real exhaustion stays one read away.
+                if (!lowReread && unchecked((int)Volatile.Read(ref _cursors[LowFree].Value)) >= 0)
+                {
+                    lowReread = true;
+                    continue;
+                }
+                return -1;
+            }
 
             // Wait, never refuse — with SpinWait's DEFAULT escalation (spin, then yield, then
             // Sleep(1)), not a pure spin: if the drainer is descheduled mid-trim, a pure spin burns
