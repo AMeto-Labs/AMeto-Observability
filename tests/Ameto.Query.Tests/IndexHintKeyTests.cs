@@ -316,6 +316,38 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void QuotedIntegerSpelledAsDecimal() => AssertIndexPath("Score = '12345.0'", 9001);
     [Fact] public void QuotedIntegerWithLeadingZero()  => AssertIndexPath("Score = '012345'", 9001);
 
+    /// <summary>
+    /// The THIRD plain form, the host culture's spelling, and the only one a segment written before
+    /// the index went invariant can match: on a <c>ru-KZ</c> host that build filed 2.5 as "2,5" in
+    /// the bloom and "\0d2,5" in the bucket. <c>Ratio = '2.50'</c> probes "2.50", then "2.5", then
+    /// "2,5" — third. No segment this build writes can need the third form (an integral double's
+    /// round-trip spelling is its digits, already the second), so this one is built by hand, in
+    /// the old shape, and the culture is pinned: on an en-US or invariant host the culture form
+    /// does not exist.
+    /// </summary>
+    [Fact]
+    public void QuotedDecimalAgainstALegacySegmentSpelledInTheHostCulture()
+    {
+        var saved = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("ru-KZ");
+        try
+        {
+            var inv = new SegmentInvertedIndex();
+            inv.AddSpan(0, "Ratio", "\u0000d2,5");
+            var bloom = SegmentBloomFilter.Create(64);
+            bloom.Add("2,5");
+            byte[] invBytes = inv.Serialise(), bloomBytes = bloom.Serialise();
+            bloom.Dispose();
+
+            var filter = CompiledFilter.Compile("Ratio = '2.50'");
+            using var index = SegmentIndexView.OverSections(null, "legacy.seg", 0, invBytes, default, bloomBytes);
+            Assert.True(QueryExecutor.PassesBloomGate(filter, index), "the bloom gate dropped a legacy segment holding the value");
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, out uint[]? candidates));
+            Assert.Equal([0u], candidates!);
+        }
+        finally { System.Globalization.CultureInfo.CurrentCulture = saved; }
+    }
+
     [Fact]
     public void WrongNumericValue_StillSkipsTheSegment()
     {
