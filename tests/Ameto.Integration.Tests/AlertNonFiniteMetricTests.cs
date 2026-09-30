@@ -87,7 +87,7 @@ public sealed class AlertNonFiniteMetricTests
         Assert.DoesNotContain(rig.Evaluator.GetHistory(), h => h.State == AlertState.Firing);
 
         // The preview claims no value either — it answered 0 here, and "0 < 5" previewed as "would fire".
-        Assert.Null(await rig.Evaluator.PreviewAsync(rig.Rule));
+        Assert.True(NoValue(await rig.Evaluator.PreviewAsync(rig.Rule)));
     }
 
     [Fact]
@@ -115,7 +115,7 @@ public sealed class AlertNonFiniteMetricTests
         await using var rig = new Rig(Rule(AlertComparator.GreaterThan, 50));
         rig.Metrics.Points = [double.NaN, double.NaN];
 
-        for (int i = 0; i < 3; i++) Assert.Null(await rig.Evaluator.PreviewAsync(rig.Rule));
+        for (int i = 0; i < 3; i++) Assert.True(NoValue(await rig.Evaluator.PreviewAsync(rig.Rule)));
         Assert.Equal(0, rig.Warnings(undetermined: true) + rig.Warnings(undetermined: false));
         Assert.Equal(0, rig.Evaluator.NonFiniteWarnedCountForTest);
 
@@ -153,7 +153,7 @@ public sealed class AlertNonFiniteMetricTests
         rig.Metrics.Points = [];
         await rig.Evaluator.EvaluateOnceAsync();                 // an EMPTY window is still 0
         Assert.Equal(AlertState.Ok, rig.State().State);
-        Assert.Equal(0, await rig.Evaluator.PreviewAsync(rig.Rule));
+        var empty = await rig.Evaluator.PreviewAsync(rig.Rule);
         Assert.Equal(0, rig.Warnings(undetermined: false) + rig.Warnings(undetermined: true));
     }
 
@@ -214,8 +214,15 @@ public sealed class AlertNonFiniteMetricTests
 
         Assert.NotEqual(AlertState.Firing, rig.State().State);                 // not on the stale 9
         Assert.Equal(1, rig.Warnings(undetermined: true));
-        Assert.Null(await rig.Evaluator.PreviewAsync(rule));
+        Assert.True(NoValue(await rig.Evaluator.PreviewAsync(rule)));
     }
+
+    /// <summary>
+    /// The preview's "no value" (#92): the store ANSWERED (available, #95) and the answer holds no
+    /// finite point — the endpoint then says <c>value: null, wouldFire: false</c>. Both halves are
+    /// asserted, so a preview that reported the store unavailable does not pass for it.
+    /// </summary>
+    private static bool NoValue(AlertValue pv) => pv.IsAvailable && double.IsNaN(pv.Value);
 
     private static LabelSet Pod(string pod) =>
         new([new("service.name", "checkout"), new("pod", pod)]);

@@ -27,6 +27,13 @@ public sealed class MetricAggregator : IMetricAggregator
 
     public MetricAggregator(IMetricQuery query) => _query = query;
 
+    /// <summary>
+    /// The store's, because every answer here is computed from the store's answer: an aggregation
+    /// over a closed store's empty result is an empty result, and over a loading store's partial one
+    /// a partial one (#95).
+    /// </summary>
+    public Ameto.Core.QueryAvailability Availability => _query.Availability;
+
     public Task<IReadOnlyList<MetricSeries>> QueryAsync(
         MetricQueryRequest request,
         CancellationToken  ct = default) =>

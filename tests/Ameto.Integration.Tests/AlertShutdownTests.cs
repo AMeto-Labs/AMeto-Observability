@@ -69,6 +69,11 @@ public sealed class AlertShutdownTests
             var store     = factory.Services.GetRequiredService<AlertRuleStore>();
             var persist   = factory.Services.GetRequiredService<AlertPersistence>();
 
+            // The evaluator does not act on a trace store still scanning its cold tier (#95), and
+            // the host starts that scan in the background — so the firing tick below waits for it
+            // rather than racing it.
+            await traces.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
             for (int i = 0; i < Spans; i++)
                 Assert.True(traces.WriteSpan(new SpanIngestItem

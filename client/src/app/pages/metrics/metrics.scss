@@ -155,7 +155,10 @@
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--accent); pointer-events: none;
   &.muted { color: var(--text-muted); font-size: 13px; }
+  // A 503: the store cannot answer — said, not drawn as an empty chart.
+  &.unavailable { color: var(--error); font-size: 13px; text-align: center; padding: 0 24px; }
 }
+.panel-empty.unavailable { color: var(--error); }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
