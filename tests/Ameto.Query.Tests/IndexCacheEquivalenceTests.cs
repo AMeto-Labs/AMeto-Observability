@@ -54,9 +54,10 @@ public sealed class IndexCacheEquivalenceTests : IDisposable
                 TimestampUtcTicks        = baseTicks + i * TimeSpan.TicksPerSecond,
                 // 7 is coprime with the Customer cycle (10): every customer value occurs at
                 // BOTH levels, so both level-pure segments pass the bloom gate for any
-                // `Customer = ...` filter — bloom-rejected groups are (by design) never
-                // cached, and the strict no-new-misses assertion below needs cacheable
-                // groups in every segment.
+                // `Customer = ...` filter and every segment's memo learns postings, not only a
+                // bloom verdict. (Since #80 a bloom-rejected group is cached too — its memo keeps
+                // the verdict — so this is no longer what makes the no-new-misses assertion
+                // below hold; it keeps that assertion about postings.)
                 Level                    = i % 7 == 0 ? LogLevel.Error : LogLevel.Information,
                 MessageTemplatePoolIndex = _engine.TemplatePool.Intern("widget {k} shipped to {Customer}"),
                 ServiceNamePoolIndex     = _engine.TemplatePool.Intern("Svc.Ship"),

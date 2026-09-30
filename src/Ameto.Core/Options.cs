@@ -117,7 +117,9 @@ public sealed class IngestionOptions
     public int MaxEventPayloadBytes { get; init; } = 64 * 1024;
 
     /// <summary>
-    /// Max HTTP body for the OTLP ingest endpoints (<c>/otlp/v1/*</c>). Larger → 413.
+    /// Max HTTP body for the OTLP ingest endpoints (<c>/v1/*</c>, <c>/otlp/v1/*</c>, gRPC), and the
+    /// max INFLATED size of a gzip-compressed one — a bomb is refused on bytes already written,
+    /// never after it has been inflated. Larger → 413 (gRPC: RESOURCE_EXHAUSTED).
     /// Default: 8 MB.
     /// </summary>
     public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;

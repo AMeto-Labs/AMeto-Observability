@@ -11,8 +11,9 @@ namespace Ameto.Query;
 ///
 /// Execution pipeline for cold-tier segments:
 ///   1. Time-range filter on <see cref="SegmentInfo"/> (skip segments outside window).
-///   2. Index fast-skip: load <see cref="SegmentIndexReader"/> and call
-///      <see cref="ISegmentIndex.MightContain"/> — skip segments where index says no match.
+///   2. Index fast-skip: open each group's <see cref="SegmentIndexView"/> — the cached memo of
+///      what earlier queries worked out, reading a section only for a new question — and call
+///      <see cref="ISegmentIndex.MightContain"/>; skip groups where the index says no match.
 ///   3. Candidate narrowing: trigram (<see cref="ISegmentIndex.LookupTrigram"/>) and
 ///      inverted (<see cref="ISegmentIndex.LookupIntersect"/>) posting lists yield
 ///      candidate event ordinals (file order, v5 segments) — the reader skips blocks
@@ -566,130 +567,47 @@ public sealed class QueryExecutor : IQueryExecutor
 
                             groupsConsidered++;
 
-                            // A cache hit skips every section read below: the group's bloom,
-                            // inverted and (when cached full) trigram indexes are already decoded.
-                            // needTrigram misses on a trigram-less entry on purpose — the full
-                            // reader built below then REPLACES it (see SegmentIndexCache).
-                            bool needTrigram = trigramHints.Count > 0;
-                            if (_indexCache?.TryAcquire(info.FilePath, g, needTrigram) is { } hit)
-                            {
-                                using (hit)
-                                {
-                                    var cached = hit.Index;
-                                    if (hasIndexHint && !PassesBloomGate(filter, cached.Bloom))
-                                        continue;
-                                    if (levelHints is not null && !AnyLevelMaybePresent(levelHints, cached.Bloom))
-                                        continue;
-                                    if (!TryNarrowWithIndex(filter, cached, levelHints, grp.EventCount,
-                                                            out var cachedCandidates, out bool cachedEveryRow))
-                                        continue;
+                            // The group's index as this query sees it: the cached memo for (file,
+                            // group) when there is a cache — found, or created empty — else a
+                            // throwaway one. It answers from what earlier queries worked out and
+                            // reads a section of the group, out of the reader opened above, only for
+                            // a question it has not been asked before; then it decodes the one
+                            // bucket or trigram asked for, never the section (#80). Disposed at the
+                            // end of this iteration, `continue` included: the rented sections go
+                            // back to the pool, a bloom it had to deserialise is freed, and the
+                            // cache learns whether this group was a hit (no section read) and what
+                            // the memo grew by.
+                            using var index = _indexFactory.OpenGroup(_indexCache, info.FilePath, g, reader);
 
-                                    Accept(cachedCandidates, cachedEveryRow, grp.FirstOrdinal, grp.EventCount);
-                                }
+                            // Phase 1: the bloom gate on the equality hint — and on the level set —
+                            // before any inverted or trigram lookup. The verdict is per probed text
+                            // and remembered, so a repeated filter pays nothing here; a new value
+                            // reads this group's bloom section once.
+                            //
+                            // "Cheap" is relative: MEASURED by BloomSizingProbe, bloom is 15.6 % of
+                            // a prop-dense group's three sections and 26.6 % of a thin one's. What
+                            // keeps it on the path is not its size but its answer: it is keyless, so
+                            // it rejects a group where the value appears under no property at all —
+                            // including groups where the inverted index would only have said "this
+                            // property is unknown here, scan". The gate lives in PassesBloomGate
+                            // rather than inline: it has to probe every value form the scan would
+                            // accept, and an inline copy of that decision is exactly what once let
+                            // the index prune rows a scan would have matched.
+                            if (hasIndexHint && !PassesBloomGate(filter, index))
                                 continue;
-                            }
+                            // No level of the set can be present in this group (no false negatives
+                            // in the bloom) — skip it before the inverted lookups.
+                            if (levelHints is not null && !AnyLevelMaybePresent(levelHints, index))
+                                continue;
 
-                            // Both phases read the bloom section, so it is rented ONCE per group and
-                            // held across them. It used to be rented twice, and a section is not a
-                            // small thing to rent twice: it is a multi-megabyte read out of the
-                            // mapped file into the rented buffer, once per group, per segment, in
-                            // parallel across the catalog.
-                            //
-                            // This comment used to justify itself with a 1 MB pooling ceiling in
-                            // ArrayPool<byte>.Shared. There is no such ceiling — .NET 6 raised the
-                            // shared pool's largest bucket to 1 GiB — so the rent is not an LOH
-                            // allocation and the reason to do it once is the READ, not the pool.
-                            // Do not size anything here around the old number.
-                            //
-                            // Unconditional: the fast path above already returned for a filter with
-                            // no hint of any kind, so every group reaching here reads this section in
-                            // one phase or the other.
-                            using var bloomSec = reader.RentBloomFilterBytes(g);
-
-                            // Phase 1: the cheap bloom-only check for the equality hint. For a
-                            // high-cardinality value (e.g. a GUID), bloom rejects ~99% of groups
-                            // here without ever loading the inverted and trigram sections.
-                            //
-                            // "Cheap" is relative and was once documented as absolute — "bloom bytes
-                            // are ~a few KB; inverted/trigram can be MB". They are all MB. MEASURED
-                            // by BloomSizingProbe over an 8-source merge, as a share of a group's
-                            // three index sections: bloom is 15.6% of a prop-dense group and 26.6%
-                            // of a thin-event one, so rejecting in phase 1 costs 6.4x and 3.8x less
-                            // than reaching phase 2 — not the three orders of magnitude the old
-                            // comment implied, but the right side of a decision that is taken once
-                            // per group of every segment a query touches.
-                            //
-                            // That ratio is something the write side has to keep earning. The filter
-                            // is sized from a forecast, and while that forecast assumed a fixed 64
-                            // terms per event, a thin-event group's bloom was 62% of its own index
-                            // and phase 1 saved only 1.6x — the split had very nearly stopped paying
-                            // for itself. Sizing groups from measured terms (SegmentWriter.EnsureSink)
-                            // is what puts it back at 3.8x.
-                            //
-                            // The gate itself lives in PassesBloomGate rather than inline: it has
-                            // to fold case and probe every value form the scan would accept, and
-                            // an inline copy of that decision is exactly what let the index prune
-                            // rows a scan would have matched.
-                            if (hasIndexHint || levelHints is not null)
-                            {
-                                using var bloom = SegmentBloomFilter.Deserialise(bloomSec.Span);
-                                if (hasIndexHint && !PassesBloomGate(filter, bloom))
-                                    continue;
-                                // No level of the set can be present in this group (no false
-                                // negatives in the bloom) — skip it before the big sections.
-                                if (levelHints is not null && !AnyLevelMaybePresent(levelHints, bloom))
-                                    continue;
-                            }
-
-                            // Phase 2: only groups that survived (or filters without
-                            // an equality hint) load the big indexes for trigram offset
-                            // lookup and the inverted-index definitive check.
-                            uint[]? groupCandidates = null;
-                            bool    groupEveryRow   = false;
-                            if (needTrigram || hasIndexHint || hasInvHints || levelHints is not null)
-                            {
-                                // Pooled: sections are copied out inside the deserialisers, so the
-                                // rented buffers go back to the pool as soon as the index is built.
-                                using var invSec = reader.RentInvertedIndexBytes(g);
-                                // The trigram section is the biggest thing in the file (~43% of it)
-                                // and every posting list is materialised into int[] on load. Only
-                                // pay for it when the filter actually has a substring predicate —
-                                // an `@l = 'Error'` query used to deserialise the whole thing.
-                                using var triSec = needTrigram
-                                    ? reader.RentTrigramIndexBytes(g)
-                                    : default;
-                                var built = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
-
-                                // A group that is provably empty for this filter is skipped, not
-                                // the whole segment — the next group may still hold matches.
-                                if (_indexCache is { } cache)
-                                {
-                                    // Charged at the reader's RETAINED size, not the section
-                                    // lengths it decoded from: postings expand ~3-8x out of their
-                                    // varint packing, and budgeting by the packed size pinned
-                                    // several times the index-cache budget of managed heap. That
-                                    // budget is Query.EffectiveIndexCacheBytes, which is what the
-                                    // cache is constructed with; Query.IndexCacheBytes is the
-                                    // OPTION, nullable and null unless an operator sets it, with
-                                    // the figure otherwise derived from the memory this process
-                                    // may use.
-                                    // Insert may hand back a concurrently inserted winner for this
-                                    // group and dispose `built` — use it only through the lease.
-                                    using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
-                                    if (!TryNarrowWithIndex(filter, lease.Index, levelHints, grp.EventCount,
-                                                            out groupCandidates, out groupEveryRow))
-                                        continue;
-                                }
-                                else
-                                {
-                                    using (built)
-                                    {
-                                        if (!TryNarrowWithIndex(filter, built, levelHints, grp.EventCount,
-                                                                out groupCandidates, out groupEveryRow))
-                                            continue;
-                                    }
-                                }
-                            }
+                            // Phase 2: trigram offsets and the inverted-index narrowing. The fast
+                            // path above already returned for a filter with no hint of any kind, so
+                            // every group reaching here has something to look up. A group that is
+                            // provably empty for this filter is skipped, not the whole segment —
+                            // the next group may still hold matches.
+                            if (!TryNarrowWithIndex(filter, index, levelHints, grp.EventCount,
+                                                    out var groupCandidates, out bool groupEveryRow))
+                                continue;
 
                             Accept(groupCandidates, groupEveryRow, grp.FirstOrdinal, grp.EventCount);
                         }
@@ -784,18 +702,21 @@ public sealed class QueryExecutor : IQueryExecutor
     }
 
     /// <summary>
-    /// Phase 1 of the prefilter: the cheap bloom-only gate on the equality hint. False drops
-    /// the segment without ever loading the multi-megabyte index sections.
+    /// Phase 1 of the prefilter: the bloom gate on the equality hint, through the group's view —
+    /// every value form the scan would accept is probed, each verdict answered from the group's
+    /// memo when an earlier query already asked and from its bloom section when not. False drops
+    /// the group before any inverted or trigram lookup.
     ///
     /// <para>Factored out of the parallel body together with <see cref="TryNarrowWithIndex"/>
     /// so the tests that assert "the index never costs a query its rows" can run the decision
     /// this method makes instead of a copy of it. A copy passed while the original was
-    /// reverted, which is the one thing those tests exist to catch.</para>
+    /// reverted, which is the one thing those tests exist to catch — and so is a test that runs a
+    /// DIFFERENT overload than production does, which is why there is only this one.</para>
     /// </summary>
-    internal static bool PassesBloomGate(CompiledFilter filter, SegmentBloomFilter bloom)
+    internal static bool PassesBloomGate(CompiledFilter filter, SegmentIndexView index)
     {
         if (!filter.TryGetIndexHint(out _, out object? hintVal)) return true;
-        return SegmentIndexReader.MightContainValue(bloom, hintVal);
+        return index.MightContainValue(hintVal);
     }
 
     /// <summary>
@@ -809,11 +730,11 @@ public sealed class QueryExecutor : IQueryExecutor
     internal static bool TryNarrowWithIndex(CompiledFilter filter, ISegmentIndex idx, out uint[]? candidates)
         => TryNarrowWithIndex(filter, idx, levelHints: null, out candidates);
 
-    /// <summary>True when at least one level of the set might be present per the bloom filter.</summary>
-    private static bool AnyLevelMaybePresent((string, object?)[][] levelHints, SegmentBloomFilter bloom)
+    /// <summary>True when at least one level of the set might be present per the group's bloom.</summary>
+    private static bool AnyLevelMaybePresent((string, object?)[][] levelHints, SegmentIndexView index)
     {
         for (int i = 0; i < levelHints.Length; i++)
-            if (SegmentIndexReader.MightContainValue(bloom, levelHints[i][0].Item2))
+            if (index.MightContainValue(levelHints[i][0].Item2))
                 return true;
         return false;
     }

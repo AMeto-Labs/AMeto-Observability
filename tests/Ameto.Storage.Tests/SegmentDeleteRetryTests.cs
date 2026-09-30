@@ -34,7 +34,7 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
 
     private string SegDir => Path.Combine(_dir, "segments");
 
-    public Task InitializeAsync()
+    public async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
         _engine = new StorageEngine(
@@ -46,7 +46,10 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
             // attempt cannot race its assertions. The tests of the background path shorten it.
             SegmentDeleteRetryInitialDelay = TimeSpan.FromHours(1),
         };
-        return Task.CompletedTask;
+        // Every fact here imports and deletes files; the boot catalog scan enumerates the same
+        // directory and holds files open while it runs, so an import or a retried delete that lands
+        // inside it reads Unreadable or meets the scan's handle (2 in 20 pinned to two cores).
+        await _engine.CatalogLoaded;
     }
 
     public async Task DisposeAsync()
@@ -106,6 +109,9 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     {
         if (!OperatingSystem.IsWindows()) return;
 
+        // The boot scan may still hold segment files open; a retry landing on its handle instead of
+        // the reader's is the flake this fact showed 2 in 20 on two cores (the other facts here wait).
+        await _engine.CatalogLoaded;
         var (path, key) = ImportPeerSegment(11);
 
         var reader = SegmentReader.Open(path);   // a query mid-flight
@@ -504,7 +510,8 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         await _engine.CatalogLoaded;
         var (path, key) = ParkThroughTheSeam(17);
 
-        Assert.False(await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // setup: nothing to merge
+        // setup: the pass RAN (a Busy pass skips its sweeps too) and had nothing to merge
+        Assert.Equal(MergeOutcome.NothingToMerge, await _engine.RunColdMaintenancePassAsync(CancellationToken.None));
 
         Assert.Equal(0, _engine.PendingSegmentDeleteCount);
         Assert.False(File.Exists(path), "a maintenance pass left a parked segment file on disk");
