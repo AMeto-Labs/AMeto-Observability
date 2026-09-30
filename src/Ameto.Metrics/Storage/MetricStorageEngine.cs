@@ -1309,8 +1309,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         meta.Kind = item.Kind;
         if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
-        foreach (var (k, v) in item.Labels)
+        ReadOnlySpan<string> kv = item.Labels.Interleaved;
+        for (int i = 0; i < kv.Length; i += 2)
         {
+            if (!IsLastOfItsRun(kv, i)) continue;
+            string k = kv[i], v = kv[i + 1];
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
             // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
             // table, and the cap only needs checking for a value that is actually new.
@@ -1322,6 +1325,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         Interlocked.Increment(ref _metaRegistrations);
         return meta;
     }
+
+    /// <summary>
+    /// Whether pair <paramref name="i"/> of canonically sorted pairs is the one the catalog records
+    /// for its key: always, unless the key repeats — a set stored before ingest collapsed repeated
+    /// keys (#92) — and then only the LAST of its run, the ordinal-greatest value, which is the value
+    /// the answers write and a filter matches (<see cref="MetricReader.MatchesLabels"/>). Recording
+    /// the others offered, in <c>/labels/{key}/values</c>, a value no filter ever selects.
+    /// </summary>
+    private static bool IsLastOfItsRun(ReadOnlySpan<string> kv, int i) =>
+        i + 2 >= kv.Length || !string.Equals(kv[i], kv[i + 2]);
 
     // ── IMetricCatalog ────────────────────────────────────────────────────────
 
@@ -2938,10 +2951,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
                     long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
                     if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
-                    foreach (var (k, v) in s.Labels)
+                    ReadOnlySpan<string> kv = s.Labels.Interleaved;
+                    for (int i = 0; i < kv.Length; i += 2)
                     {
-                        var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
+                        if (!IsLastOfItsRun(kv, i)) continue;   // a stored repeated key: see IsLastOfItsRun
+                        var values = meta.LabelValues.GetOrAdd(kv[i], static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(kv[i + 1], 0);
                     }
                     meta.AddSeries(s.Labels.GetHashCode());
                     seeded++;
