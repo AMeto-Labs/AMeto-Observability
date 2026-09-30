@@ -206,7 +206,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     public async Task<double?> PreviewAsync(AlertRule rule, CancellationToken ct = default)
     {
-        double value = await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+        double value = await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct, preview: true);
         return double.IsNaN(value) ? null : value;
     }
 
@@ -295,7 +295,23 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 _logger.LogWarning(ex, "Failed to evaluate alert rule {Rule}", rule.Id);
             }
         }
+        ForgetDeletedRules();
     }
+
+    /// <summary>
+    /// Drops the once-only non-finite warnings of rules that no longer exist — a rule deleted, or
+    /// replaced under a new id — so the set holds at most the saved rules' entries (two each). Once a
+    /// tick, and only when the set is not empty.
+    /// </summary>
+    private void ForgetDeletedRules()
+    {
+        if (_nonFiniteWarned.IsEmpty) return;
+        foreach (var entry in _nonFiniteWarned)
+            if (_store.GetById(entry.Key.RuleId) is null) _nonFiniteWarned.TryRemove(entry.Key, out _);
+    }
+
+    /// <summary>Test hook: how many once-only non-finite warnings are remembered.</summary>
+    internal int NonFiniteWarnedCountForTest => _nonFiniteWarned.Count;
 
     // ── State machine ───────────────────────────────────────────────────────────
 
@@ -420,12 +436,14 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     // ── Value computation per source ────────────────────────────────────────────
 
-    private async Task<double> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct)
+    /// <param name="preview">The editor's preview, not an evaluation: says nothing in the log (see
+    /// <see cref="WarnNonFinite"/>).</param>
+    private async Task<double> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct, bool preview = false)
     {
         var from = now - rule.Window;
         return rule.Source switch
         {
-            AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
+            AlertSource.Metric => await MetricValueAsync(rule, from, now, ct, preview),
             AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
             _                  => await LogValueAsync(rule, from, now, ct),
         };
@@ -602,7 +620,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private readonly record struct HeaderShape(bool HeaderOnly, HashSet<LogLevel>? Levels, string? Service);
 
-    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct, bool preview)
     {
         if (string.IsNullOrWhiteSpace(rule.Metric)) return 0;
         var series = await _metrics.QueryAsync(new MetricQueryRequest
@@ -635,7 +653,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
             }
 
-        if (skipped > 0) WarnNonFinite(rule, skipped, undetermined: double.IsNaN(acc));
+        if (skipped > 0 && !preview) WarnNonFinite(rule, skipped, undetermined: double.IsNaN(acc));
 
         // Points, and not one of them finite: there is no value to compare, and 0 — the answer for
         // an empty window — would decide the rule on data that says nothing. NaN tells the caller
@@ -649,9 +667,18 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// met non-finite values. Once, because an exporter that sends NaN sends it every interval, and a
     /// line every 15 s for the life of the rule would bury the log; the operator needs to learn it
     /// happens, and which rule it touches.
+    ///
+    /// <para>Evaluations only, never the editor's preview: a preview of an UNSAVED rule gets a fresh
+    /// random id on every click, so each one used to add a permanent entry here, and a preview of a
+    /// saved rule spent that rule's only warning on something that decided nothing — and logged "the
+    /// rule was not evaluated and keeps its state" for it. Entries of deleted rules are dropped each
+    /// tick (<see cref="ForgetDeletedRules"/>), and the set is bounded besides, as
+    /// <see cref="_headerShapes"/> is: past <see cref="MaxNonFiniteWarned"/> it is cleared wholesale
+    /// (a rule may then say it once more).</para>
     /// </summary>
     private void WarnNonFinite(AlertRule rule, int skipped, bool undetermined)
     {
+        if (_nonFiniteWarned.Count >= MaxNonFiniteWarned) _nonFiniteWarned.Clear();
         if (!_nonFiniteWarned.TryAdd((rule.Id, undetermined), 0)) return;
         if (undetermined)
             _logger.LogWarning(
@@ -666,6 +693,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
     }
 
     private readonly ConcurrentDictionary<(string RuleId, bool Undetermined), byte> _nonFiniteWarned = new();
+    private const int MaxNonFiniteWarned = 512;
 
     private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {

@@ -104,6 +104,43 @@ public sealed class AlertNonFiniteMetricTests
         Assert.Equal(1, rig.Warnings(undetermined: true));
     }
 
+    /// <summary>
+    /// The preview decides nothing, so it says nothing (PR #101 review F2): it neither logs "the rule
+    /// was not evaluated" nor spends the saved rule's once-only warning — the evaluation that follows
+    /// still says it — and it leaves nothing behind (an unsaved rule's preview gets a new id per click).
+    /// </summary>
+    [Fact]
+    public async Task A_preview_leaves_the_warning_to_the_evaluation()
+    {
+        await using var rig = new Rig(Rule(AlertComparator.GreaterThan, 50));
+        rig.Metrics.Points = [double.NaN, double.NaN];
+
+        for (int i = 0; i < 3; i++) Assert.Null(await rig.Evaluator.PreviewAsync(rig.Rule));
+        Assert.Equal(0, rig.Warnings(undetermined: true) + rig.Warnings(undetermined: false));
+        Assert.Equal(0, rig.Evaluator.NonFiniteWarnedCountForTest);
+
+        await rig.Evaluator.EvaluateOnceAsync();
+        Assert.Equal(1, rig.Warnings(undetermined: true));
+    }
+
+    /// <summary>A deleted rule's once-only warnings are forgotten on the next tick; a rule saved again under that id warns anew.</summary>
+    [Fact]
+    public async Task A_deleted_rule_leaves_no_warning_behind()
+    {
+        await using var rig = new Rig(Rule(AlertComparator.GreaterThan, 50));
+        rig.Metrics.Points = [1, double.NaN];
+        await rig.Evaluator.EvaluateOnceAsync();
+        Assert.Equal(1, rig.Evaluator.NonFiniteWarnedCountForTest);
+
+        Assert.True(rig.Store.Delete(rig.Rule.Id));
+        await rig.Evaluator.EvaluateOnceAsync();
+        Assert.Equal(0, rig.Evaluator.NonFiniteWarnedCountForTest);
+
+        rig.Store.Upsert(rig.Rule);
+        await rig.Evaluator.EvaluateOnceAsync();
+        Assert.Equal(2, rig.Warnings(undetermined: false));
+    }
+
     [Fact]
     public async Task A_finite_window_is_evaluated_as_before()
     {
@@ -232,13 +269,14 @@ public sealed class AlertNonFiniteMetricTests
         public FixedWindow    Metrics   { get; } = new();
         public AlertEvaluator Evaluator { get; }
         public AlertRule      Rule      { get; }
+        public AlertRuleStore Store     { get; }
 
         /// <param name="aggregator">What the evaluator queries: <see cref="Metrics"/>' single fixed
         /// series unless a test hands it the real aggregator.</param>
         public Rig(AlertRule rule, IMetricAggregator? aggregator = null)
         {
             Directory.CreateDirectory(_dir);
-            var store = new AlertRuleStore(_dir, new NoopProtector(), NullLogger<AlertRuleStore>.Instance);
+            var store = Store = new AlertRuleStore(_dir, new NoopProtector(), NullLogger<AlertRuleStore>.Instance);
             Evaluator = new AlertEvaluator(
                 store,
                 new AlertDispatcher(NullLogger<AlertDispatcher>.Instance),
