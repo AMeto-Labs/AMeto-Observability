@@ -136,6 +136,30 @@ public sealed class MetricLabelPoolResetTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE BRIDGE ENDS ON ITS INTERVAL WITH NO TRAFFIC AT ALL. The miss path ends it only on text new
+    /// to both pools; when churn stops right after a reset that never comes, so the engine's flush tick
+    /// calls <see cref="MetricLabelInterner.EndBridgeIfDue"/> too. Before the interval it stays.
+    /// </summary>
+    [Fact]
+    public void The_bridge_ends_on_its_interval_without_a_miss()
+    {
+        var clock    = new ManualTimeProvider();
+        var interner = new MetricLabelInterner(maxStrings: 8, labelSetSlots: 16, clock);
+        Fill(interner, "a-");
+        clock.Advance(MetricLabelInterner.ResetInterval);
+        Assert.Equal(-1, interner.Intern("reset", out _));
+        Assert.NotNull(interner.BridgeForTest);
+
+        clock.Advance(MetricLabelInterner.ResetInterval - Tick);
+        interner.EndBridgeIfDue();
+        Assert.NotNull(interner.BridgeForTest);
+
+        clock.Advance(Tick);
+        interner.EndBridgeIfDue();
+        Assert.Null(interner.BridgeForTest);
+    }
+
+    /// <summary>
     /// A STALE TAKE-DOWN LEAVES A NEWER BRIDGE STANDING. The bridge ends when text new to both pools
     /// arrives an interval after the reset — a read of the reset time, then a store; between the two
     /// another thread can reset again and raise a new bridge. The late take-down is replayed through

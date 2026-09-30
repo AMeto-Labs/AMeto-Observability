@@ -3,12 +3,13 @@ import { MetricSparkComponent } from './metric-spark';
 import { MetricSeriesDto } from '../../../core/models/metric.model';
 
 /**
- * A NULL VALUE IS A GAP, NOT A ZERO (#92).
+ * A NULL VALUE IS LEFT OUT, NOT DRAWN AS ZERO (#92).
  *
  * <p>The server answers a NaN or ±Infinity point value as `null`. The spark used to keep such a point:
  * `null < minV` is `0 < minV`, so the null became the minimum, and the line was drawn down to it — a
  * drop to zero that never happened. The spark now leaves value-less points out of its scale, its line
- * and its "value at event".</p>
+ * and its "value at event", and JOINS the points either side of it — a trend glyph; the Metrics chart,
+ * unlike the spark, draws a gap there.</p>
  */
 function series(values: (number | null)[]): MetricSeriesDto {
   return {
@@ -25,7 +26,7 @@ function spark(values: (number | null)[], eventTsMs: number): MetricSparkCompone
   return fixture.componentInstance;
 }
 
-describe('metric spark — a null value is a gap, not a zero', () => {
+describe('metric spark — a null value is left out, not drawn as zero', () => {
   it('scales and draws only the points that carry a value', () => {
     const c = spark([1, null, 3], 2000);
     // min 1 at the bottom (y 40), max 3 at the top (y 4); the null point is not on the line.

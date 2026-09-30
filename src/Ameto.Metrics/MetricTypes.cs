@@ -358,7 +358,10 @@ public sealed class MetricLabelInterner
     /// and a label set whose strings all came over is found in the OLD table and re-published as the
     /// very instance the stored keys hold. A string nobody sends is never carried over. Re-keying the
     /// stored keys instead would take a remove-and-add under concurrent appenders — a window in which
-    /// a point could open a second series. Null outside the bridge window.
+    /// a point could open a second series. Null outside the bridge window, which ends on the first of:
+    /// text new to both pools an interval after the reset (the miss path), the metric engine's flush
+    /// tick an interval after it (<see cref="EndBridgeIfDue"/> — the path sure to run when churn has
+    /// stopped), or the next reset.
     /// </summary>
     private Bridge? _bridge;   // read with Volatile.Read, taken down by compare-exchange (EndBridge)
 
@@ -491,6 +494,20 @@ public sealed class MetricLabelInterner
     /// </summary>
     internal void EndBridge(object observed) =>
         Interlocked.CompareExchange(ref _bridge, null, observed as Bridge);
+
+    /// <summary>
+    /// Ends the bridge once <see cref="ResetInterval"/> has passed since the reset that raised it.
+    /// The miss path ends it too, but only on text new to both pools — which, when churn stops right
+    /// after a reset, may never come, and the replaced pool, its label-set table and the id map would
+    /// outlive their interval for the life of the process. So a path SURE to run calls this as well:
+    /// the metric engine's flush tick. One volatile read when there is no bridge.
+    /// </summary>
+    public void EndBridgeIfDue()
+    {
+        if (Volatile.Read(ref _bridge) is { } bridge
+            && _time.GetElapsedTime(Volatile.Read(ref _lastReset)) >= ResetInterval)
+            EndBridge(bridge);
+    }
 
     /// <summary>Test seam: the bridge in place, if any — opaque, for <see cref="EndBridge"/>.</summary>
     internal object? BridgeForTest => Volatile.Read(ref _bridge);

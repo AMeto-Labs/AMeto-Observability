@@ -156,7 +156,8 @@ public sealed class MetricAggregatorGoldenTests
         var ungrouped = await agg.QueryAsync(new MetricQueryRequest { Metric = "c", Aggregation = MetricAggregation.Increase });
         Assert.Equal(new[] { double.NaN, 20.0 }, Values(ungrouped[0]));
 
-        // The expression sums series per timestamp the same way; top-K ranks by the last finite value.
+        // The expression sums series per timestamp the same way; top-K ranks by the latest point (a
+        // non-finite one ranks last).
         var expr = await agg.EvalExprAsync(new MetricExprRequest
         {
             Left  = new MetricQueryRequest { Metric = "g" },

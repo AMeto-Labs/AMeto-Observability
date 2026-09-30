@@ -1641,6 +1641,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             // logs its own failures; this is only here so that the loop outlives them.
             try { await FlushIfDueAsync(); }
             catch (Exception ex) { _logger.LogError(ex, "Periodic metric flush failed; the loop continues"); }
+
+            // The label pool's reset bridge ends on its interval even when churn has stopped and no
+            // new label arrives to end it (see MetricLabelInterner.EndBridgeIfDue): a volatile read
+            // per tick while there is no bridge.
+            MetricLabelInterner.Shared.EndBridgeIfDue();
         }
         // Final flush on shutdown — unconditional, so a clean stop leaves nothing to replay.
         try { await FlushHotTierAsync(); }
