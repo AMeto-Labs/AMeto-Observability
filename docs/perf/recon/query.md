@@ -67,7 +67,7 @@ Verified still in place (not re-reported): index LRU cache by retained bytes, bl
 - Risk: Windows delete semantics (a cached mmap blocks retention delete — see the `MergingSegmentEventSource` ownership comment); `LazySegmentPrimingTests` count opens by allocation.
 - Measure: `LazySegmentPrimingProbe`; add an open counter next to `PooledSectionRents`.
 
-### 8. Cache miss deserialises the ENTIRE inverted section (every bucket, every posting) to answer one bucket — CONFIRMED
+### 8. Cache miss deserialises the ENTIRE inverted section (every bucket, every posting) to answer one bucket — CONFIRMED; DONE in #80 (lazy catalog + per-bucket scan, memo-per-group cache — see `SegmentIndexReader`, `SegmentIndexView`)
 - `SegmentInvertedIndex.Deserialise :444-493`: string per value + `int[]` per posting list + dictionaries for all properties, including high-cardinality `@tr`/`@sp`/request-id buckets (one 32 B array each). A prop-dense group is tens of MB managed and hundreds of thousands of objects, all promoted into the 256 MB cache; the first query after start or any eviction churn pays it in parallel x8.
 - Fix: lazy per-property decode — keep the packed section bytes (copied once, 3-8x smaller than expanded), build a `Dictionary<string, (int off, int len)>` property directory on load, decode a property's value map on first touch; charge the cache in packed bytes. Bigger step: a v8 section layout with a bucket directory.
 - Risk: `IndexCacheEquivalenceTests`, `ApproxRetainedBytes` budget semantics.
