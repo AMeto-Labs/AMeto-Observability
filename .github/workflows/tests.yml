@@ -148,8 +148,9 @@ jobs:
   # call, its errno and the smaps check behind it were exercised by no CI run at all.
   #
   # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
-  # madvise(MADV_DONTNEED) on Linux — see the second step). The whole suite already runs above; this job
-  # exists for the code that only does anything on Linux.
+  # madvise(MADV_DONTNEED) on Linux — see the second step), and the span bloom under invariant
+  # globalization, the Docker image's mode (the third step). The whole suite already runs above; this job
+  # exists for the code that only does anything on Linux, or only in production's mode.
   #
   # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
   # to read — and the skip guard above explains why that is invisible: an early return is reported
@@ -209,6 +210,45 @@ jobs:
                    A_payload_goes_through_the_ring_and_comes_back_byte_for_byte; do
             if ! grep -q "Passed Ameto.Storage.Tests.SpanRingRawTests.$t" ring-output.txt; then
               echo "::error::SpanRingRawTests.$t did not run and pass; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE SPAN BLOOM UNDER THE GLOBALIZATION MODE PRODUCTION RUNS. The Docker image is published
+      # with InvariantGlobalization (install/docker/Dockerfile), so its casing is .NET's own Unicode
+      # data, while every other CI run is ICU. The bloom's case fold is a table compiled into the
+      # binary (SpanBloomFold) precisely so the two cannot disagree; this step is where that table is
+      # checked against the runtime's invariant fold (The_embedded_fold_is_the_runtimes_invariant_fold
+      # goes red the day a .NET update brings new casing), and where a segment written by an ICU child
+      # process is read by an invariant one. AMETO_REQUIRE_INVARIANT_GLOBALIZATION=1 turns "this
+      # process is not invariant" into a failure instead of an early return; the grep is the same
+      # "did not run and pass" guard as above. PREDEFINED_CULTURES_ONLY=false lets the facts pin
+      # ru-KZ / sv-SE, which invariant mode otherwise refuses to construct — BUT UNDER INVARIANT
+      # GLOBALIZATION EVERY CULTURE FORMATS LIKE THE INVARIANT ONE, so the ru-KZ / sv-SE rows here
+      # assert nothing culture-specific: a decimal comma or a U+2212 minus never appears. They are
+      # listed for what they still check (the fold, the segment round trip); the culture half of
+      # them runs for real in the Windows (ICU) backend job above.
+      - name: Test the span bloom under invariant globalization (Debug)
+        shell: bash
+        env:
+          DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: '1'
+          DOTNET_SYSTEM_GLOBALIZATION_PREDEFINED_CULTURES_ONLY: 'false'
+          AMETO_REQUIRE_INVARIANT_GLOBALIZATION: '1'
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~SpanBloomCanonicalTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee bloom-output.txt
+
+          for t in The_embedded_fold_is_the_runtimes_invariant_fold \
+                   A_segment_written_under_the_other_globalization_mode_loses_no_row \
+                   A_segment_folded_by_another_table_loses_no_row \
+                   Every_pair_OrdinalIgnoreCase_calls_equal_hashes_equal \
+                   A_literal_and_its_lowercase_probe_the_same_bits \
+                   Every_value_hashes_the_same_from_the_writer_and_from_the_query_that_matches_it \
+                   A_segment_flushed_under_ru_KZ_answers_in_full_under_another_culture; do
+            if ! grep -q "Passed Ameto.Storage.Tests.SpanBloomCanonicalTests.$t" bloom-output.txt; then
+              echo "::error::SpanBloomCanonicalTests.$t did not run and pass under invariant globalization."
               exit 1
             fi
           done
