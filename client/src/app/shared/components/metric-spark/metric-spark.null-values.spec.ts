@@ -13,8 +13,7 @@ import { MetricSeriesDto } from '../../../core/models/metric.model';
 function series(values: (number | null)[]): MetricSeriesDto {
   return {
     name: 'm', kind: 'Gauge', unit: '', labels: {},
-    // The DTO types value as number; null is what the server sends for a non-finite one.
-    points: values.map((v, i) => ({ ts: (i + 1) * 1e9, value: v as number, count: 0, sum: 0 })),
+    points: values.map((v, i) => ({ ts: (i + 1) * 1e9, value: v, count: 0, sum: 0 })),
   };
 }
 

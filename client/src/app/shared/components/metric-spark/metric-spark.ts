@@ -1,5 +1,10 @@
 import { Component, computed, input, ChangeDetectionStrategy } from '@angular/core';
-import { MetricSeriesDto } from '../../../core/models/metric.model';
+import { MetricPointDto, MetricSeriesDto } from '../../../core/models/metric.model';
+
+/** A point whose value is a number — the type guard behind the spark's filter. */
+function hasValue(p: MetricPointDto): p is MetricPointDto & { value: number } {
+  return p.value !== null;
+}
 
 const W = 220;
 const H = 44;
@@ -57,9 +62,10 @@ export class MetricSparkComponent {
 
   /**
    * The points that carry a value. The server answers a NaN or ±Infinity as `null` (#92); kept, a
-   * null entered the min/max as 0 and drew the line down to it. The spark bridges the gap instead.
+   * null entered the min/max as 0 and drew the line down to it. The spark JOINS its neighbours
+   * across the missing point — a trend glyph, unlike the Metrics chart, which draws a gap.
    */
-  readonly pts = computed(() => this.series().points.filter(p => p.value != null));
+  readonly pts = computed(() => this.series().points.filter(hasValue));
 
   private bounds = computed(() => {
     const pts = this.pts();
