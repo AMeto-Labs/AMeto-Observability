@@ -98,7 +98,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// the nanosecond, and two hand-expanded copies of the formula were one edited unit away
     /// from quietly disagreeing.
     /// </summary>
-    private static long FutureLimitNanos()
+    internal static long FutureLimitNanos()
         => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
