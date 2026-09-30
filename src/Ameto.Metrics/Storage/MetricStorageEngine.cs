@@ -1144,6 +1144,9 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
 
+    /// <summary>Test hook: one rollup pass, now — what the rollup loop runs on its timer.</summary>
+    internal Task PerformRollupForTest() => PerformRollupAsync(CancellationToken.None);
+
     /// <summary>
     /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
     /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
@@ -2787,15 +2790,33 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         }
     }
 
-    /// <summary>One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.</summary>
+    /// <summary>
+    /// One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.
+    ///
+    /// <para><b>A NaN or ±Infinity value is no measurement here either</b> (#92), as in every reducer
+    /// of <c>MetricAggregator</c>: a gauge averages its FINITE values, and a counter or a histogram
+    /// takes its latest point with a finite value (a cumulative snapshot, so an earlier one of the
+    /// same bucket loses nothing — the next step's delta carries the rest). A bucket with no finite
+    /// value answers NaN — null on the wire, a gap — as its latest point did. Folded in, one NaN made
+    /// the gauge's whole bucket NaN and a counter bucket ending on one NaN, in every stepped read
+    /// (the Metrics page always sends a step: one bad sample blanked ~7 minutes of a 24-hour chart)
+    /// and in the 5-minute and 1-hour rollups — which then delete the raw file, so the bucket's
+    /// finite samples were gone for good. On finite buckets every value is what it was, to the bit.</para>
+    /// </summary>
     private static MetricDataPoint Reduce(ReadOnlySpan<MetricDataPoint> bucket, long key, bool takeLast)
     {
         if (takeLast)
         {
-            int best = 0;
-            for (int i = 1; i < bucket.Length; i++)
-                if (bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano) best = i;
-            ref readonly var last = ref bucket[best];
+            // The latest point with a finite value (the later of equal timestamps, as before); the
+            // latest point outright when none has one.
+            int best = -1, latest = 0;
+            for (int i = 0; i < bucket.Length; i++)
+            {
+                if (i > 0 && bucket[i].TimestampUnixNano >= bucket[latest].TimestampUnixNano) latest = i;
+                if (double.IsFinite(bucket[i].Value)
+                    && (best < 0 || bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano)) best = i;
+            }
+            ref readonly var last = ref bucket[best >= 0 ? best : latest];
             return new MetricDataPoint
             {
                 TimestampUnixNano = key,
@@ -2806,19 +2827,21 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             };
         }
 
-        double value = bucket[0].Value;           // Average's seed: the first element
-        long   count = 0;                         // Sum's seed: zero
-        double sum   = 0.0;
+        double value  = double.NaN;               // Average's seed: the first FINITE element
+        int    finite = 0;
+        long   count  = 0;                        // Sum's seed: zero
+        double sum    = 0.0;
         for (int i = 0; i < bucket.Length; i++)
         {
-            if (i > 0) value += bucket[i].Value;
+            double v = bucket[i].Value;
+            if (double.IsFinite(v)) { value = finite == 0 ? v : value + v; finite++; }
             count = checked(count + bucket[i].Count);
             sum  += bucket[i].Sum;
         }
         return new MetricDataPoint
         {
             TimestampUnixNano = key,
-            Value             = value / bucket.Length,
+            Value             = finite == 0 ? double.NaN : value / finite,   // no finite value: NaN (null)
             Count             = count,
             Sum               = sum,
         };

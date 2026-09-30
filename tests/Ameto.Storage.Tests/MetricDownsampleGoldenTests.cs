@@ -157,12 +157,32 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
         Same(0.0,  only.Sum);
     }
 
+    /// <summary>
+    /// A NaN or ±Infinity is NO MEASUREMENT in either rule (#92) — re-pinned on purpose: this fact was
+    /// <c>NaN_survives_both_rules</c>, which kept the rules' old answer. A gauge averages its finite
+    /// values; a counter or a histogram takes its latest point with a finite value; a bucket with none
+    /// is NaN (null, a gap). The ROLLUP is where it mattered most: it writes the 5-minute and 1-hour
+    /// files and then deletes the raw ones, so the NaN a bucket folded in was the only thing left of
+    /// its finite samples, for good.
+    /// </summary>
     [Fact]
-    public void NaN_survives_both_rules()
+    public void NaN_is_no_measurement_in_either_rule()
     {
-        Same(double.NaN, Assert.Single(Down([P(T0, 1), P(T0 + S, double.NaN)], Minute, MetricKind.Gauge)).Value);
-        Same(double.NaN, Assert.Single(Down([P(T0, 1), P(T0 + S, double.NaN)], Minute, MetricKind.Counter)).Value);
+        Same(1.0,        Assert.Single(Down([P(T0, 1), P(T0 + S, double.NaN)], Minute, MetricKind.Gauge)).Value);
+        Same(1.0,        Assert.Single(Down([P(T0, 1), P(T0 + S, double.NaN)], Minute, MetricKind.Counter)).Value);
         Same(1.0,        Assert.Single(Down([P(T0, double.NaN), P(T0 + S, 1)], Minute, MetricKind.Counter)).Value);
+        Same(2.0,        Assert.Single(Down([P(T0, 1), P(T0 + S, double.PositiveInfinity), P(T0 + 2 * S, 3)], Minute, MetricKind.Gauge)).Value);
+        Same(double.NaN, Assert.Single(Down([P(T0, double.NaN), P(T0 + S, double.NegativeInfinity)], Minute, MetricKind.Gauge)).Value);
+        Same(double.NaN, Assert.Single(Down([P(T0, double.NaN), P(T0 + S, double.NaN)], Minute, MetricKind.Counter)).Value);
+
+        // The latest FINITE point carries its own fields: a histogram's counts come with it.
+        var hist = Assert.Single(Down([P(T0, 0.5, count: 2, sum: 1, buckets: [1, 1]), P(T0 + S, double.NaN, count: 3, sum: double.NaN, buckets: [1, 2])],
+                                      Minute, MetricKind.Histogram));
+        Assert.Equal((0.5, 2L), (hist.Value, hist.Count));
+
+        // THE LOSS POINT: the 5-minute rollup of [1, NaN, 3].
+        Same(2.0, Assert.Single(MetricStorageEngine.RollupPoints([P(T0, 1), P(T0 + S, double.NaN), P(T0 + 2 * S, 3)], TimeSpan.FromMinutes(5), MetricKind.Gauge)).Value);
+        Same(3.0, Assert.Single(MetricStorageEngine.RollupPoints([P(T0, 1), P(T0 + S, 3), P(T0 + 2 * S, double.NaN)], TimeSpan.FromMinutes(5), MetricKind.Counter)).Value);
     }
 
     // ── Shape: empty, single, order, boundaries ───────────────────────────────
@@ -333,7 +353,9 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
     /// magnitudes that make summation order visible, shared and null bucket arrays, negative
     /// timestamps. Deterministic from the seed.
     /// </summary>
-    internal static List<MetricDataPoint> RandomPoints(GoldenRng rng, MetricKind kind)
+    /// <param name="finite">The NaN draws replaced by a finite value, the random stream untouched — the
+    /// corpus whose every answer must be what it was before a non-finite value was skipped (#92).</param>
+    internal static List<MetricDataPoint> RandomPoints(GoldenRng rng, MetricKind kind, bool finite = false)
     {
         int  n    = rng.Next(5) == 0 ? rng.Next(4) : rng.Next(240);
         long ts   = rng.Chance(10) ? -rng.Next(1_000_000) * 1_000_000L : T0 + rng.Next(3_600_000) * 1_000_000L;
@@ -344,7 +366,7 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
             ts += rng.Chance(15) ? 0 : rng.Next(40_000) * 1_000_000L + (rng.Chance(10) ? rng.Next(999_999) : 0);
             double v = rng.Next(12) switch
             {
-                0 => double.NaN,
+                0 => finite ? 42.5 : double.NaN,
                 1 => -0.0,
                 2 => 1e16 * (rng.Chance(50) ? 1 : -1),
                 3 => rng.Next(1000),
@@ -366,20 +388,29 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
         return pts;
     }
 
+    /// <summary>The seeded corpus WITH its NaN points — re-captured for #92 (see <see cref="NaN_is_no_measurement_in_either_rule"/>).</summary>
     [Fact]
-    public void Downsample_answers_what_it_answered_on_seeded_input()
+    public void Downsample_answers_what_it_answered_on_seeded_input() =>
+        Assert.Equal("23A4E8A91C4E1486", DownsampleHash(finite: false));   // C5BCB1C237CBCC06 before #92
+
+    /// <summary>The same corpus with its NaN draws made finite, captured BEFORE #92: every finite answer is what it was, to the bit.</summary>
+    [Fact]
+    public void Downsample_answers_what_it_answered_on_seeded_finite_input() =>
+        Assert.Equal("2A5DFC53A1F3724B", DownsampleHash(finite: true));
+
+    private static string DownsampleHash(bool finite)
     {
         var rng = new GoldenRng(0xD0_5A_3F_1E);
         using var h = NewHash();
         for (int c = 0; c < 600; c++)
         {
             var kind = (MetricKind)(c % 3);
-            var pts  = RandomPoints(rng, kind);
+            var pts  = RandomPoints(rng, kind, finite);
             var step = Steps[rng.Next(Steps.Length)];
             Add(h, (long)c);
             Add(h, MetricStorageEngine.Downsample(pts, step, kind));
         }
-        Assert.Equal("C5BCB1C237CBCC06", Finish(h));
+        return Finish(h);
     }
 
     // ── The rollup's transform: a stable sort, then Downsample ────────────────
@@ -403,22 +434,31 @@ public sealed class MetricDownsampleGoldenTests : IDisposable
         Assert.Empty(MetricStorageEngine.RollupPoints([], TimeSpan.FromMinutes(5), MetricKind.Counter));
     }
 
+    /// <summary>The seeded corpus WITH its NaN points — re-captured for #92.</summary>
     [Fact]
-    public void The_rollup_transform_answers_what_it_answered_on_seeded_input()
+    public void The_rollup_transform_answers_what_it_answered_on_seeded_input() =>
+        Assert.Equal("B670C96F8EF16621", RollupHash(finite: false));        // ECA15E4E548D3D11 before #92
+
+    /// <summary>The same corpus with its NaN draws made finite, captured BEFORE #92: bit-identical.</summary>
+    [Fact]
+    public void The_rollup_transform_answers_what_it_answered_on_seeded_finite_input() =>
+        Assert.Equal("9C4559B91BAC546E", RollupHash(finite: true));
+
+    private static string RollupHash(bool finite)
     {
         var rng = new GoldenRng(0x0B_17_CA_FE);
         using var h = NewHash();
         for (int c = 0; c < 600; c++)
         {
             var kind = (MetricKind)(c % 3);
-            var pts  = RandomPoints(rng, kind);
+            var pts  = RandomPoints(rng, kind, finite);
             var bucket = rng.Chance(50) ? TimeSpan.FromMinutes(5) : TimeSpan.FromHours(1);
             var input  = new List<MetricDataPoint>(pts);
             Add(h, (long)c);
             Add(h, MetricStorageEngine.RollupPoints(input, bucket, kind));
             Add(h, input);                    // what the transform leaves of its argument
         }
-        Assert.Equal("ECA15E4E548D3D11", Finish(h));
+        return Finish(h);
     }
 
     // ── The compaction's transform: last wins ─────────────────────────────────
