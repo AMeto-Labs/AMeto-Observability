@@ -188,14 +188,21 @@
         <!-- Chart / Heatmap -->
         <div class="chart-card">
           @if (mode() === 'query' && isHistogram() && viewMode() === 'heatmap') {
-            <app-heatmap [data]="heatmap()" [scale]="scale()" (cellClick)="onHeatmapCell($event)" />
+            @if (unavailable(); as msg) {
+              <!-- Instead of the heatmap, not above it: its own empty state says "No histogram data". -->
+              <div class="panel-empty sm unavailable" role="alert">{{ msg }}</div>
+            } @else {
+              <app-heatmap [data]="heatmap()" [scale]="scale()" (cellClick)="onHeatmapCell($event)" />
+            }
           } @else {
             <div class="chart-wrap">
               <canvas #chartCanvas></canvas>
               @if (loading()) {
                 <div class="chart-overlay"><lucide-icon name="loader" class="spin" [size]="18" /></div>
               }
-              @if (!loading() && !series().length) {
+              @if (!loading() && unavailable(); as msg) {
+                <div class="chart-overlay unavailable" role="alert">{{ msg }}</div>
+              } @else if (!loading() && !series().length) {
                 <div class="chart-overlay muted">No data in this window</div>
               }
             </div>

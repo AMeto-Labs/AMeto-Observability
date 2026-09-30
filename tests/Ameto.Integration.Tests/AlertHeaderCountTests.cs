@@ -48,6 +48,10 @@ public sealed class AlertHeaderCountTests : IAsyncLifetime
             NullLogger<StorageEngine>.Instance);
         _engine.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
 
+        // The evaluator does not act on a log store still scanning its catalog (#95), and the
+        // engine starts that scan in the background — so the ticks below wait for it, not race it.
+        await _engine.CatalogLoaded.WaitAsync(TimeSpan.FromSeconds(60));
+
         // Minutes ago, one second apart: every segment lies wholly inside a one-hour window.
         long baseTicks = DateTimeOffset.UtcNow.AddMinutes(-10).UtcTicks;
         byte[] payload = [0x81, 0xA1, (byte)'k', 0x00];    // msgpack {"k": 0}

@@ -6,6 +6,7 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
+import { unavailableMessage } from '../../shared/utils/unavailable';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
   AlertSilence, AlertChannel, AlertSource, AlertSeverity, AlertComparator,
@@ -83,6 +84,8 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   editing  = signal<RuleDraft | null>(null);
   preview  = signal<AlertPreviewResult | null>(null);
   previewing = signal(false);
+  /** The server's sentence when the preview was refused with 503. */
+  previewError = signal<string | null>(null);
   testStatus = signal<string>('');
 
   readonly sources: AlertSource[] = ['Log', 'Metric', 'Trace'];
@@ -231,9 +234,9 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   ruleName(id: string): string { return this.rules().find(r => r.id === id)?.name ?? id; }
 
   // ── Editor ──────────────────────────────────────────────────────────────────
-  newRule() { this.editing.set(this.blankDraft()); this.preview.set(null); this.testStatus.set(''); }
-  edit(r: AlertRule) { this.editing.set(this.fromRule(r)); this.preview.set(null); this.testStatus.set(''); }
-  cancel() { this.editing.set(null); this.preview.set(null); this.testStatus.set(''); }
+  newRule() { this.editing.set(this.blankDraft()); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
+  edit(r: AlertRule) { this.editing.set(this.fromRule(r)); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
+  cancel() { this.editing.set(null); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
 
   addChannel(type: ChannelType) {
     const d = this.editing(); if (!d) return;
@@ -249,9 +252,17 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   runPreview() {
     const d = this.editing(); if (!d) return;
     this.previewing.set(true);
+    this.previewError.set(null);
     this.api.previewAlert(this.toRequest(d)).subscribe({
       next: p => { this.preview.set(p); this.previewing.set(false); this.cdr.markForCheck(); },
-      error: () => { this.previewing.set(false); this.cdr.markForCheck(); },
+      // A 503 is the rule's store saying it cannot answer (#95: shut down, or still loading) —
+      // shown, in place of a stale result, rather than dropped.
+      error: err => {
+        const message = unavailableMessage(err);
+        if (message) { this.preview.set(null); this.previewError.set(message); }
+        this.previewing.set(false);
+        this.cdr.markForCheck();
+      },
     });
   }
 

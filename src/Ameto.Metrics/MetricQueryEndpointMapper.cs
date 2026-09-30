@@ -61,6 +61,7 @@ public static class MetricQueryEndpointMapper
                 return Results.BadRequest("'metric' is required");
 
             var series = await agg.QueryAsync(ToRequest(dto), ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             return MetricSeriesJson.Array(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
@@ -81,6 +82,7 @@ public static class MetricQueryEndpointMapper
                 Name  = dto.Name,
             };
             var series = await agg.EvalExprAsync(req, ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             return MetricSeriesJson.Single(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
@@ -93,6 +95,7 @@ public static class MetricQueryEndpointMapper
             var filters = ParseFilters(ctx.Request.Query["filters"]);
 
             var hm      = await agg.HeatmapAsync(name, from, to, step, filters, ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             var columns = new HeatmapColumnDto[hm.Columns.Length];
             for (int i = 0; i < columns.Length; i++)
                 columns[i] = new HeatmapColumnDto { Ts = hm.Columns[i].Ts, Counts = hm.Columns[i].Counts };
@@ -132,6 +135,7 @@ public static class MetricQueryEndpointMapper
             var from = ParseDate(ctx.Request.Query["from"]);
             var to   = ParseDate(ctx.Request.Query["to"]);
             var step = ParseStep(ctx.Request.Query["step"]);
+            if (MetricStoreGate.IsClosed(query)) return MetricStoreGate.Closed;   // streamed: asked before it starts
 
             // Each series is written as storage produces it; none is held once written. The answer
             // carries ts / value / count / sum only, so the storage need build no bucket arrays.

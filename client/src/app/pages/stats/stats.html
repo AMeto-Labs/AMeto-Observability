@@ -70,6 +70,8 @@
       </div>
     } @else if (loading()) {
       <div class="stat-loading">Loading…</div>
+    } @else if (countsError(); as err) {
+      <app-empty-state icon="triangle-alert" [text]="err" role="alert"></app-empty-state>
     } @else {
       <app-empty-state icon="chart-pie" text="No events in this window"></app-empty-state>
     }
