@@ -599,7 +599,7 @@ the full suites.
   `Content-Encoding` handling anywhere in `src/`. The collector's `otlphttp` exporter **defaults to
   `compression: gzip`**, so a gzipped `POST /v1/traces` or `/v1/metrics` fails the parse and gets
   400. gRPC handles `grpc-encoding`; HTTP does not. A functional gap on all three signals, carried
-  over unclosed from the logs round.
+  over unclosed from the logs round. **Closed by issue #82.**
 - **`MetricWriter` `LZ4Codec.Encode` into a pooled buffer** instead of `LZ4Pickler.Pickle` — touches
   the section bytes, so it needs a format note; WP7 takes the pooled `IBufferWriter` without it.
 - **Deployment** — `GCHeapHardLimitPercent` and `PublishReadyToRun` on 512 MB hosts, as already

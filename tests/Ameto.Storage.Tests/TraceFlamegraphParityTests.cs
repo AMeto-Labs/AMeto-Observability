@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text;
 using System.Text.Json;
 using Ameto.Tracing;
@@ -6,14 +7,16 @@ using Xunit.Abstractions;
 namespace Ameto.Storage.Tests;
 
 /// <summary>
-/// THE FLAME GRAPH BUILDER IS THE OLD ONE, BYTE FOR BYTE, over seeded random traces — the fuzz half
-/// of the flame graph's parity, beside <c>TraceDetailShapeTests</c>' fixed traces through the live
-/// endpoint.
+/// THE FLAME GRAPH WRITER WRITES WHAT THE OLD BUILDER AND SERIALISER WROTE, BYTE FOR BYTE, over
+/// seeded random traces — the fuzz half of the flame graph's parity, beside
+/// <c>TraceDetailShapeTests</c>' fixed traces through the live endpoint.
 ///
 /// <para>The reference is the builder as it stood before TS#11 (2525d34), copied here verbatim:
-/// two dictionaries, a list per span, LINQ per node. Both trees are serialised under ASP.NET Core's
-/// HTTP JSON options — what the endpoint writes them with — and must be the same bytes, or both
-/// must be refused by the serialiser (a trace more than 32 levels deep is, today).</para>
+/// two dictionaries, a list per span, LINQ per node, its tree serialised under ASP.NET Core's HTTP
+/// JSON options — what the endpoint used to answer with. The writer (<c>TraceFlamegraphJson</c>,
+/// issue #91) must produce the same bytes. A trace more than 32 levels deep, which that serialiser
+/// REFUSED (a 500), is held to the same reference serialised with the depth limit lifted: the
+/// bytes the old code would have written had it been allowed to.</para>
 ///
 /// <para>The generator draws the shapes the provider can actually hand over, which is to say
 /// span ids unique except the EMPTY id (the provider dedupes the rest) — and inside that: several
@@ -27,6 +30,10 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
 {
     private static readonly JsonSerializerOptions Host =
         new Microsoft.AspNetCore.Http.Json.JsonOptions().SerializerOptions;
+
+    /// <summary><see cref="Host"/> with room for every level the writer writes — see <see cref="Reference"/>.</summary>
+    private static readonly JsonSerializerOptions HostUnbounded =
+        new(Host) { MaxDepth = 2 * TraceFlamegraphJson.MaxLevels + 2 };
 
     // ── The reference: TraceQueryEndpointMapper.BuildFlamegraph at 2525d34 ──
 
@@ -123,38 +130,194 @@ public sealed class TraceFlamegraphParityTests(ITestOutputHelper output)
         return spans;
     }
 
-    private static string Outcome(Func<FlamegraphNode?> build)
+    /// <summary>
+    /// The reference tree, serialised by the host's options with the depth limit LIFTED — what the
+    /// old serialiser would have written for a deep tree had it been allowed to, and so what the
+    /// writer must write. For every tree the host's own limit admits, the two serialisations are
+    /// asserted to be the same bytes: that is the claim "nothing that worked before changed".
+    /// </summary>
+    private static string Reference(List<SpanRecord> spans, out bool refusedBefore)
     {
-        FlamegraphNode? node = build();
-        try   { return Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(node, Host)); }
-        catch (JsonException) { return "<refused by the serialiser: too deep>"; }
+        FlamegraphNode? node = ReferenceBuild(spans);
+        string unbounded = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(node, HostUnbounded));
+        try
+        {
+            Assert.Equal(unbounded, Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(node, Host)));
+            refusedBefore = false;
+        }
+        catch (JsonException) { refusedBefore = true; }   // deeper than 32 levels: a 500 before #91
+        return unbounded;
+    }
+
+    /// <summary>
+    /// What the endpoint writes, through the writer settings it uses — in one go, and ALSO resumed
+    /// after every node (a 1-byte step), which must be the same bytes: the endpoint stops the walk at
+    /// every flush and resumes it, and nothing else would compare that path byte for byte.
+    /// </summary>
+    private static string Written(List<SpanRecord> spans)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var w = new Utf8JsonWriter(buffer, TraceFlamegraphJson.WithRoom(TraceDetailJson.WriterOptions(Host))))
+            TraceFlamegraphJson.Write(w, spans);
+        string once = Encoding.UTF8.GetString(buffer.WrittenSpan);
+        Assert.Equal(once, WrittenInSteps(spans, 1, out _));
+        return once;
+    }
+
+    /// <summary>The walk stopped every <paramref name="stepBytes"/> and resumed (<c>WriteInSteps</c>).</summary>
+    private static string WrittenInSteps(List<SpanRecord> spans, int stepBytes, out int resumes)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var w = new Utf8JsonWriter(buffer, TraceFlamegraphJson.WithRoom(TraceDetailJson.WriterOptions(Host))))
+            resumes = TraceFlamegraphJson.WriteInSteps(w, spans, stepBytes);
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 
     [Fact]
-    public void Every_generated_trace_builds_the_tree_the_old_builder_built()
+    public void Every_generated_trace_is_written_as_the_old_builder_and_serialiser_wrote_it()
     {
         const int Traces = 4_000;
         var rng = new Random(20260923);
-        int nulls = 0, refused = 0, roundingMattered = 0;
+        int nulls = 0, refusedBefore = 0, roundingMattered = 0;
+        long resumes = 0;
 
         for (int t = 0; t < Traces; t++)
         {
             var spans = RandomTrace(rng);
-            string want = Outcome(() => ReferenceBuild(spans));
-            string got  = Outcome(() => TraceQueryEndpointMapper.BuildFlamegraph(spans));
+            string want = Reference(spans, out bool refused);
+            string got  = Written(spans);                                   // one go, and every node
             if (want != got)
                 output.WriteLine($"trace {t}: {spans.Count} spans");
             Assert.Equal(want, got);
 
+            // Resumed at uneven points too, in the middle of a node's bytes as often as not.
+            Assert.Equal(want, WrittenInSteps(spans, 16 + t % 97, out int r));
+            resumes += r;
+
             if (want == "null") nulls++;
-            if (want.StartsWith('<')) refused++;
+            if (refused) refusedBefore++;
             if (RoundingMatters(spans)) roundingMattered++;
         }
 
-        output.WriteLine($"{Traces:N0} traces identical: {nulls:N0} with no root, {refused:N0} too deep "
-                       + $"for the serialiser, {roundingMattered:N0} where rounded and raw child sums differ");
-        Assert.True(nulls > 0 && refused > 0 && roundingMattered > Traces / 4,
+        output.WriteLine($"{Traces:N0} traces identical: {nulls:N0} with no root, {refusedBefore:N0} too deep "
+                       + $"for the old serialiser (a 500 before #91, now written), {roundingMattered:N0} where "
+                       + $"rounded and raw child sums differ; the uneven-step walks resumed {resumes:N0} times");
+        Assert.True(nulls > 0 && refusedBefore > 0 && roundingMattered > Traces / 4 && resumes > Traces,
             "the generator stopped producing one of the shapes this test exists for");
+    }
+
+    // ── The cut ──────────────────────────────────────────────────────────────
+
+    private static SpanRecord Span(ulong id, ulong parent, long start, long durNanos, string name) => new()
+    {
+        TraceId           = new TraceId(1, 2),
+        SpanId            = new SpanId(id),
+        ParentSpanId      = new SpanId(parent),
+        StartTimeUnixNano = start,
+        DurationNanos     = durNanos,
+        Name              = name,
+        ServiceName       = "s",
+        Kind              = SpanKind.Internal,
+        Status            = SpanStatusCode.Ok,
+    };
+
+    /// <summary>
+    /// A chain longer than <see cref="TraceFlamegraphJson.MaxLevels"/> is CUT on the last level —
+    /// the node there written whole, its <c>totalMs</c> and <c>selfMs</c> still counting the child
+    /// that is not drawn, <c>"children":[]</c> and <c>"truncated":true</c> — and not a byte of the
+    /// subtree below it. No other node carries the flag.
+    /// </summary>
+    [Fact]
+    public void A_chain_past_the_level_limit_is_cut_on_the_last_level_and_says_so()
+    {
+        const int Max = TraceFlamegraphJson.MaxLevels;
+        var spans = new List<SpanRecord>(Max + 5);
+        for (int level = 1; level <= Max + 5; level++)
+            spans.Add(Span((ulong)level, level == 1 ? 0 : (ulong)(level - 1), level, 3_000_000, "l" + level));
+
+        string json = Written(spans);
+        using var doc = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 2 * Max + 2 });
+
+        var node = doc.RootElement;
+        for (int level = 1; level < Max; level++)
+        {
+            Assert.Equal("l" + level, node.GetProperty("name").GetString());
+            Assert.False(node.TryGetProperty("truncated", out _), $"level {level} is not the cut");
+            Assert.Equal(1, node.GetProperty("children").GetArrayLength());
+            node = node.GetProperty("children")[0];
+        }
+
+        Assert.Equal("l" + Max, node.GetProperty("name").GetString());
+        Assert.Equal(0, node.GetProperty("children").GetArrayLength());
+        Assert.True(node.GetProperty("truncated").GetBoolean());
+        Assert.Equal(3, node.GetProperty("totalMs").GetDouble());
+        Assert.Equal(0, node.GetProperty("selfMs").GetDouble());        // its child still counted
+        Assert.Contains(                                                   // the flag's place: after children
+            "\"name\":\"l" + Max + "\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\","
+          + "\"totalMs\":3,\"selfMs\":0,\"children\":[],\"truncated\":true}]}", json);
+        Assert.DoesNotContain("\"l" + (Max + 1) + "\"", json);          // nothing below the cut
+        Assert.Equal(1, CountOf(json, "\"truncated\""));
+    }
+
+    /// <summary>
+    /// A NON-empty span id repeated so that a span becomes its own descendant — which the
+    /// provider's dedupe rules out, and which the old recursive builder would have followed until
+    /// the stack overflowed and took the process with it. The walk opens no level deeper than
+    /// the trace has spans, so it is cut there instead: a bounded answer, flagged.
+    /// </summary>
+    [Fact]
+    public void A_repeated_span_id_that_would_recurse_for_ever_is_cut_not_followed()
+    {
+        List<SpanRecord> spans =
+        [
+            Span(1, 0, 1, 10_000_000, "R"),
+            Span(2, 1, 2,  5_000_000, "A"),
+            Span(2, 2, 3,  1_000_000, "B"),   // shares A's id and names it as parent: its own child
+        ];
+
+        Assert.Equal(
+            "{\"spanId\":\"0000000000000001\",\"name\":\"R\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":10,\"selfMs\":5,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"A\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":5,\"selfMs\":4,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"B\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":1,\"selfMs\":0,\"children\":[],\"truncated\":true}]}]}",
+            Written(spans));
+    }
+
+    /// <summary>
+    /// THE CUT BOUNDS SIZE AS WELL AS DEPTH. A repeated NON-empty span id with TWO spans naming it
+    /// as parent makes every copy the parent of both, so a walk bounded only by depth writes 2^level
+    /// nodes — 1 + 1 + 2 + 4 here, 2^4 096 at the level limit. The walk writes at most one node per
+    /// span of the trace — no tree the provider can hand over (span ids deduped) has more — and a
+    /// node whose remaining children it had no budget for is closed with <c>"truncated":true</c>.
+    /// </summary>
+    [Fact]
+    public void A_repeated_branching_span_id_writes_no_more_nodes_than_the_trace_has_spans()
+    {
+        List<SpanRecord> spans =
+        [
+            Span(1, 0, 1, 10_000_000, "R"),
+            Span(2, 1, 2,  5_000_000, "A"),
+            Span(2, 2, 3,  1_000_000, "B"),   // both name id 2 as parent: every copy of id 2
+            Span(2, 2, 4,  1_000_000, "C"),   // has children B and C
+        ];
+
+        string json = Written(spans);
+        Assert.Equal(spans.Count, CountOf(json, "\"spanId\""));
+        Assert.Equal(
+            "{\"spanId\":\"0000000000000001\",\"name\":\"R\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":10,\"selfMs\":5,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"A\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":5,\"selfMs\":3,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"B\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":1,\"selfMs\":0,\"children\":["
+          + "{\"spanId\":\"0000000000000002\",\"name\":\"B\",\"service\":\"s\",\"kind\":\"Internal\",\"status\":\"Ok\",\"totalMs\":1,\"selfMs\":0,\"children\":[],\"truncated\":true}"
+          + "],\"truncated\":true}],\"truncated\":true}]}",
+            json);
+    }
+
+    private static int CountOf(string haystack, string needle)
+    {
+        int n = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+             i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            n++;
+        return n;
     }
 
     /// <summary>

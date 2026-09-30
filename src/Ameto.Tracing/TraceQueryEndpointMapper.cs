@@ -345,7 +345,13 @@ public static class TraceQueryEndpointMapper
         await TraceDetailJson.WriteCompareAsync(ctx, taskA.Result, taskB.Result);
     }
 
-    /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
+    /// <summary>
+    /// <c>GET /api/traces/{traceId}/flamegraph</c> — a method for the same reason as
+    /// <see cref="WriteTraceDetailAsync"/>. The tree is written by <see cref="TraceFlamegraphJson"/>,
+    /// iteratively and with the host's encoder, where it used to be a <see cref="FlamegraphNode"/>
+    /// graph handed to the reflection serialiser — which answered 500 for any trace deeper than 32
+    /// levels (issue #91).
+    /// </summary>
     internal static async Task WriteFlamegraphAsync(HttpContext ctx, string traceId)
     {
         if (!TraceId.TryParseHex(traceId, out var tid))
@@ -358,8 +364,7 @@ public static class TraceQueryEndpointMapper
 
         if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
 
-        var flame = BuildFlamegraph(spans);
-        await ctx.Response.WriteAsJsonAsync(flame);
+        await TraceFlamegraphJson.WriteAsync(ctx, spans);
     }
 
     // ── SSE streaming ─────────────────────────────────────────────────────────
@@ -561,6 +566,10 @@ public static class TraceQueryEndpointMapper
         using var deadline = new DeadlineScope(ct, StreamDeadline);
         var scanCt = deadline.Token;
 
+        // Each row in the host's encoding, byte for byte what GET /api/traces and POST /api/traces/query
+        // send for it — not the SSE writer's default one (issue #93; see TraceStreamRowJson).
+        using var rowJson = new TraceStreamRowJson(ctx);
+
         // NOTHING HERE MAY GROW WITH THE NUMBER OF MATCHES IN THE WINDOW. The dedupe set is
         // capped by `max` and each page by `pageSize`; a month-wide query on a busy service is
         // the shape that killed a 512 MB server when a collection was allowed to track matches
@@ -700,7 +709,7 @@ public static class TraceQueryEndpointMapper
                 }
 
                 if (!seen.Add(row.TraceId)) continue;
-                await sse.WriteEventAsync(row, TraceStreamJson.Default.TraceRowDto, ct);
+                await rowJson.WriteAsync(sse, row, ct);   // the REST answers' bytes (issue #93)
                 if (row.StartTimeUnixNano < oldestEmitted) oldestEmitted = row.StartTimeUnixNano;
                 // Not Complete: the window was NOT read out, the ceiling was hit. Saying `done`
                 // for both makes a truncated list indistinguishable from an exhausted one for
@@ -1231,156 +1240,6 @@ public static class TraceQueryEndpointMapper
     private static long? ParseLong(string? s) =>
         long.TryParse(s, out var v) && v > 0 ? v : null;
 
-    // ── Flamegraph builder ────────────────────────────────────────────────────
-
-    /// <summary>
-    /// The flame graph's tree, WITHOUT the index it used to be built through: a
-    /// <c>Dictionary&lt;SpanId, SpanRecord&gt;</c>, a <c>Dictionary&lt;SpanId, List&lt;SpanRecord&gt;&gt;</c>
-    /// holding a fresh list per span, and a LINQ <c>Select</c>/<c>ToArray</c>/<c>Sum</c> per node.
-    /// The index is now one sort of the span ids (pooled arrays, no comparer) and the child lists
-    /// are linked through pooled int arrays, so what is left per span is what the response is made
-    /// of: the node, its id string, its children array.
-    ///
-    /// <para>THE SAME TREE, rule for rule, and <c>TraceDetailShapeTests</c> holds it byte for byte:
-    /// a span whose parent is empty or names no span of the trace is a root candidate, and the LAST
-    /// candidate in the provider's order is the root; the children of a node are every span naming
-    /// its id as parent, in the provider's order — GROUPED BY ID, as the dictionary was, so two spans
-    /// sharing an id (only the empty id can, after the provider's dedupe) share one child list;
-    /// <c>selfMs</c> is the node's total less the sum, left to right, of its children's ROUNDED
-    /// totals, floored at zero.</para>
-    ///
-    /// <para>STILL <see cref="FlamegraphNode"/> OBJECTS, STILL THE HOST SERIALISER — deliberately.
-    /// Writing the tree straight into the response would drop the last per-node allocations, but it
-    /// would also change what a trace deeper than 32 levels gets: the serialiser refuses anything
-    /// past its MaxDepth of 64 (a node is an object and an array), and today that is a 500. Making
-    /// deep traces draw is a behaviour the client would see — a fix, not a performance change — so
-    /// it is reported, not taken here. A source-generated context was not taken either: byte parity
-    /// needs the host's encoder (UnsafeRelaxedJsonEscaping), which a context's attribute options
-    /// cannot carry; and of the 336 208 B this request allocates of its own for 2 000 spans
-    /// (<c>TraceDetailAllocProbe</c>), the nodes, their id strings, the children arrays and the
-    /// span list account for 333 000 B of it (80 + 56 per node, 56 per parent, 33 008 of list),
-    /// leaving ~3 KB for the serialiser and the state machines — nothing left to buy back.</para>
-    /// </summary>
-    internal static FlamegraphNode? BuildFlamegraph(List<SpanRecord> spans)
-    {
-        int n = spans.Count;
-        if (n == 0) return null;
-
-        ulong[] ids     = ArrayPool<ulong>.Shared.Rent(n);
-        int[]   scratch = ArrayPool<int>.Shared.Rent(n * 6);
-        try
-        {
-            var order   = scratch.AsSpan(0,     n);   // sorted position -> span index
-            var groupOf = scratch.AsSpan(n,     n);   // span index -> its id's group (first sorted position)
-            var head    = scratch.AsSpan(2 * n, n);   // group -> first child's span index, or -1
-            var tail    = scratch.AsSpan(3 * n, n);   // group -> last child's span index
-            var count   = scratch.AsSpan(4 * n, n);   // group -> number of children
-            var next    = scratch.AsSpan(5 * n, n);   // span index -> next sibling's span index, or -1
-
-            for (int i = 0; i < n; i++) { ids[i] = spans[i].SpanId.RawValue; order[i] = i; }
-            Array.Sort(ids, scratch, 0, n);           // the keys, carrying their span indexes in `order`
-
-            for (int p = 0, run = 0; p < n; p++)
-            {
-                if (p > 0 && ids[p] != ids[p - 1]) run = p;
-                groupOf[order[p]] = run;
-            }
-            head.Fill(-1);
-            count.Clear();
-            next.Fill(-1);
-
-            var sortedIds = new ReadOnlySpan<ulong>(ids, 0, n);
-            int root = -1;
-            for (int i = 0; i < n; i++)
-            {
-                var parent = spans[i].ParentSpanId;
-                int g = parent.IsEmpty ? -1 : FindGroup(sortedIds, parent.RawValue);
-                if (g < 0) { root = i; continue; }   // the last candidate wins, as it always did
-
-                if (head[g] < 0) head[g] = i;
-                else             next[tail[g]] = i;
-                tail[g] = i;
-                count[g]++;
-            }
-
-            return root < 0 ? null : BuildNode(spans, groupOf, head, next, count, root);
-        }
-        finally
-        {
-            ArrayPool<int>.Shared.Return(scratch);
-            ArrayPool<ulong>.Shared.Return(ids);
-        }
-    }
-
-    /// <summary>The first sorted position holding <paramref name="id"/>, or -1 — the group's key.</summary>
-    private static int FindGroup(ReadOnlySpan<ulong> sortedIds, ulong id)
-    {
-        int lo = 0, hi = sortedIds.Length;
-        while (lo < hi)
-        {
-            int mid = (int)(((uint)lo + (uint)hi) >> 1);
-            if (sortedIds[mid] < id) lo = mid + 1;
-            else                     hi = mid;
-        }
-        return lo < sortedIds.Length && sortedIds[lo] == id ? lo : -1;
-    }
-
-    private static FlamegraphNode BuildNode(
-        List<SpanRecord> spans, ReadOnlySpan<int> groupOf, ReadOnlySpan<int> head,
-        ReadOnlySpan<int> next, ReadOnlySpan<int> count, int index)
-    {
-        var span = spans[index];
-        int g    = groupOf[index];
-
-        FlamegraphNode[] kidNodes = count[g] == 0 ? [] : new FlamegraphNode[count[g]];
-        int k = 0;
-        for (int c = head[g]; c >= 0; c = next[c])
-            kidNodes[k++] = BuildNode(spans, groupOf, head, next, count, c);
-
-        double totalMs = span.DurationNanos / 1_000_000.0;
-        double childMs = 0;
-        foreach (var kid in kidNodes) childMs += kid.TotalMs;   // left to right, as Sum did
-        double selfMs  = Math.Max(0, totalMs - childMs);
-
-        return new FlamegraphNode
-        {
-            SpanId   = HexId(span.SpanId.RawValue),
-            Name     = span.Name,
-            Service  = span.ServiceName,
-            Kind     = (byte)span.Kind   < KindText.Length   ? KindText[(byte)span.Kind]     : span.Kind.ToString(),
-            Status   = (byte)span.Status < StatusText.Length ? StatusText[(byte)span.Status] : span.Status.ToString(),
-            TotalMs  = Math.Round(totalMs, 3),
-            SelfMs   = Math.Round(selfMs,  3),
-            Children = kidNodes,
-        };
-    }
-
-    /// <summary><c>SpanId.ToString()</c> in one allocation: the string itself.</summary>
-    private static string HexId(ulong value) =>
-        string.Create(16, value, static (chars, v) =>
-        {
-            for (int i = 15; i >= 0; i--)
-            {
-                chars[i] = "0123456789abcdef"[(int)(v & 0xF)];
-                v >>= 4;
-            }
-        });
-
-    /// <summary><c>ToString()</c> of every value up to the largest defined one, taken once — no box
-    /// per node. A value past it (a producer can send kind 9) is rare and takes <c>ToString()</c>.</summary>
-    private static readonly string[] KindText   = EnumTexts<SpanKind>();
-    private static readonly string[] StatusText = EnumTexts<SpanStatusCode>();
-
-    private static string[] EnumTexts<T>() where T : struct, Enum
-    {
-        int max = 0;
-        foreach (var v in Enum.GetValues<T>())
-            max = Math.Max(max, Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture));
-        var texts = new string[max + 1];
-        for (int i = 0; i <= max; i++) texts[i] = ((T)Enum.ToObject(typeof(T), i)).ToString();
-        return texts;
-    }
-
     // ── Misc helpers ──────────────────────────────────────────────────────────
 
     private static async Task<List<SpanRecord>> CollectSpansRawAsync(
@@ -1432,6 +1291,12 @@ public static class TraceQueryEndpointMapper
 /// options do, so they must not be borrowed here — would turn "no status" into "field missing" on
 /// the wire. JsonSourceGenerationOptions leaves DefaultIgnoreCondition at Never, so the property
 /// stays; TraceStreamEndpointTests pins it.
+///
+/// <para>NOT THE ENCODER. The options here only pre-escape the (ASCII) property names; every string
+/// VALUE is escaped by the writer the contract is serialised into, and <see cref="TraceStreamRowJson"/>
+/// hands it one over the host's options — so the rows go out in the REST answers' bytes (issue #93).
+/// A <c>Web</c> instance of this context with the relaxed encoder, the way <c>MetricJson.Web</c>
+/// serves the metrics answers, changes nothing on this route: measured.</para>
 /// </remarks>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(TraceRowDto))]
@@ -1509,7 +1374,7 @@ internal static class TraceDetailJson
     internal const int FlushThresholdBytes = 16 * 1024;
 
     /// <summary>What <c>WriteAsJsonAsync</c> sets, and so what the client has always been sent.</summary>
-    private const string ContentType = "application/json; charset=utf-8";
+    internal const string ContentType = "application/json; charset=utf-8";
 
     private static readonly JsonEncodedText PTraceId           = JsonEncodedText.Encode("traceId");
     private static readonly JsonEncodedText PSpanId            = JsonEncodedText.Encode("spanId");
@@ -1527,10 +1392,12 @@ internal static class TraceDetailJson
     /// The enum names, as <c>ToString()</c> spells them, for every DEFINED value — derived from the
     /// enums rather than typed out, so a renamed member cannot put a different word on the wire
     /// than the DTO did. An undefined value (a producer can send kind 9) is rare and takes
-    /// <c>ToString()</c> itself, which prints its number.
+    /// <c>ToString()</c> itself, which prints its number. The flame graph writes these same tables
+    /// (<see cref="TraceFlamegraphJson"/>) — its own string copies are gone (issue #91), so the two
+    /// views cannot spell one span two ways.
     /// </summary>
-    private static readonly JsonEncodedText[] KindNames   = EnumNames<SpanKind>();
-    private static readonly JsonEncodedText[] StatusNames = EnumNames<SpanStatusCode>();
+    internal static readonly JsonEncodedText[] KindNames   = EnumNames<SpanKind>();
+    internal static readonly JsonEncodedText[] StatusNames = EnumNames<SpanStatusCode>();
 
     private static JsonEncodedText[] EnumNames<T>() where T : struct, Enum
     {
@@ -1653,7 +1520,7 @@ internal static class TraceDetailJson
         w.WriteEndObject();
     }
 
-    private static void WriteEnum<T>(Utf8JsonWriter w, JsonEncodedText property, byte value,
+    internal static void WriteEnum<T>(Utf8JsonWriter w, JsonEncodedText property, byte value,
                                      JsonEncodedText[] names, T boxedOnlyWhenUndefined) where T : struct, Enum
     {
         if (value < names.Length) w.WriteString(property, names[value]);
@@ -1964,7 +1831,15 @@ internal static class TraceDetailJson
     }
 }
 
-/// <summary>Single node in a trace flamegraph tree.</summary>
+/// <summary>
+/// One node of the flame graph — the shape the Angular client reads from
+/// <c>GET /api/traces/{id}/flamegraph</c>, plus a <c>truncated</c> flag this type does not carry
+/// (it appears only on a node cut at <see cref="TraceFlamegraphJson.MaxLevels"/>). NO ENDPOINT
+/// SERIALISES IT ANY MORE: the tree is written by <see cref="TraceFlamegraphJson"/> straight from
+/// the span index (issue #91). It stays as the definition of that shape and as the REFERENCE the
+/// writer is held to byte for byte: <c>TraceFlamegraphParityTests</c> serialises the old builder's
+/// tree of these next to the writer's output.
+/// </summary>
 public sealed class FlamegraphNode
 {
     public string          SpanId   { get; init; } = string.Empty;

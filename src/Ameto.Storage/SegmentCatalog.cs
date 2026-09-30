@@ -20,6 +20,10 @@ namespace Ameto.Storage;
 /// while a snapshot is being built bumps the version past the one that build is tagged
 /// with, so the next reader rebuilds — the stale build is served for at most that one
 /// read, exactly as a per-call walk racing the same mutation would have been.</para>
+///
+/// <para>That is enough for a mutation of ONE entry, whose torn read is simply the read from
+/// before it. It is not enough for a change of several entries that is only correct whole — a
+/// merge's output appearing and its sources going — which is what <see cref="Swap"/> is for.</para>
 /// </summary>
 internal sealed class SegmentCatalog
 {
@@ -44,9 +48,20 @@ internal sealed class SegmentCatalog
     // ── Map surface (unchanged signatures) ────────────────────────────────────
 
     public int  Count                                                  => _map.Count;
-    public ICollection<SegmentInfo> Values                             => _map.Values;
     public bool ContainsKey(SegmentKey key)                            => _map.ContainsKey(key);
     public bool TryGetValue(SegmentKey key, out SegmentInfo info)      => _map.TryGetValue(key, out info!);
+
+    /// <summary>
+    /// Every entry, as one catalog generation. <c>ConcurrentDictionary.Values</c> copies the map
+    /// under the dictionary's own locks, which makes a single mutation atomic to the copy but not
+    /// a <see cref="Swap"/>: a copy taken halfway through one lists a merge's output beside its
+    /// sources. So it is taken under <see cref="_buildLock"/>, which a swap holds throughout. Not
+    /// a hot path: the merge planner, retention and <c>ListSegments</c> read it; queries do not.
+    /// </summary>
+    public ICollection<SegmentInfo> Values
+    {
+        get { lock (_buildLock) return _map.Values; }
+    }
 
     public bool TryAdd(SegmentKey key, SegmentInfo info)
     {
@@ -75,6 +90,59 @@ internal sealed class SegmentCatalog
         Interlocked.Increment(ref _version);
         return true;
     }
+
+    /// <summary>
+    /// Registers <paramref name="add"/> and unlists every key in <paramref name="remove"/> as ONE
+    /// catalog generation: a merge's commit, in which its output appears and its sources go in
+    /// the same step, so that no reader can list both and count the batch twice.
+    ///
+    /// <para>What makes it one step is <see cref="_buildLock"/>, not the single version bump at
+    /// the end. A snapshot build reads the version and walks the map under that lock. Were it not
+    /// held here, a build could read the version before the bump, walk the map halfway through
+    /// the swap and tag the torn result with that version; the bump then retires it only for the
+    /// readers that come after it, and every reader until then is served the output beside its
+    /// sources. Held here, every build sees the map wholly before the swap or wholly after it, and
+    /// <see cref="Values"/> takes it for the same reason. The section is N + 1 dictionary
+    /// operations and no I/O; a reader of an unchanged catalog never takes the lock.</para>
+    ///
+    /// <para>The add is the compare-and-swap the engine's <c>PublishLocalSegment</c> performs: it
+    /// always ends with the entry <paramref name="add"/>'s, and an entry it displaced is returned
+    /// for the caller to judge and report. A key in <paramref name="remove"/> that holds nothing
+    /// is reported as null in <paramref name="removed"/>: its entry went some other way first.
+    /// <paramref name="remove"/> must not hold <paramref name="add"/>'s own key.</para>
+    /// </summary>
+    /// <param name="removed">Receives, index for index with <paramref name="remove"/>, the entry each key held, or null.</param>
+    /// <returns>The entry <paramref name="add"/> displaced under its own key, or null.</returns>
+    public SegmentInfo? Swap(SegmentInfo add, ReadOnlySpan<SegmentKey> remove, Span<SegmentInfo?> removed)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(removed.Length, remove.Length);
+        var          key       = SegmentKey.Of(add);
+        SegmentInfo? displaced = null;
+
+        lock (_buildLock)
+        {
+            while (true)
+            {
+                if (_map.TryAdd(key, add)) break;
+                if (!_map.TryGetValue(key, out var existing)) continue;   // removed under us
+                if (_map.TryUpdate(key, add, existing)) { displaced = existing; break; }
+            }
+
+            _afterSwapAdd?.Invoke();
+
+            for (int i = 0; i < remove.Length; i++)
+                removed[i] = _map.TryRemove(remove[i], out var gone) ? gone : null;
+
+            Interlocked.Increment(ref _version);
+        }
+        return displaced;
+    }
+
+    /// <summary>
+    /// Test hook: called by <see cref="Swap"/> under its lock, after the add and before the
+    /// removes — the instant at which a read that did not wait for the swap lists both.
+    /// </summary>
+    internal Action? _afterSwapAdd;
 
     // ── Read side ─────────────────────────────────────────────────────────────
 

@@ -310,6 +310,44 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void QuotedDoubleLiteral()  => AssertIndexPath("Ratio = '2.5'", 9001);
     [Fact] public void DoubleLiteral()        => AssertIndexPath("Ratio = 2.5", 9001);
 
+    // A quoted numeral spelled otherwise than the stored number: the scan coerces both sides to
+    // a double, but the bloom holds only the stored spelling, "12345" — which is the SECOND plain
+    // form of these literals, not the first. A gate that probed one form dropped the segment.
+    [Fact] public void QuotedIntegerSpelledAsDecimal() => AssertIndexPath("Score = '12345.0'", 9001);
+    [Fact] public void QuotedIntegerWithLeadingZero()  => AssertIndexPath("Score = '012345'", 9001);
+
+    /// <summary>
+    /// The THIRD plain form, the host culture's spelling, and the only one a segment written before
+    /// the index went invariant can match: on a <c>ru-KZ</c> host that build filed 2.5 as "2,5" in
+    /// the bloom and "\0d2,5" in the bucket. <c>Ratio = '2.50'</c> probes "2.50", then "2.5", then
+    /// "2,5" — third. No segment this build writes can need the third form (an integral double's
+    /// round-trip spelling is its digits, already the second), so this one is built by hand, in
+    /// the old shape, and the culture is pinned: on an en-US or invariant host the culture form
+    /// does not exist.
+    /// </summary>
+    [Fact]
+    public void QuotedDecimalAgainstALegacySegmentSpelledInTheHostCulture()
+    {
+        var saved = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("ru-KZ");
+        try
+        {
+            var inv = new SegmentInvertedIndex();
+            inv.AddSpan(0, "Ratio", "\u0000d2,5");
+            var bloom = SegmentBloomFilter.Create(64);
+            bloom.Add("2,5");
+            byte[] invBytes = inv.Serialise(), bloomBytes = bloom.Serialise();
+            bloom.Dispose();
+
+            var filter = CompiledFilter.Compile("Ratio = '2.50'");
+            using var index = SegmentIndexView.OverSections(null, "legacy.seg", 0, invBytes, default, bloomBytes);
+            Assert.True(QueryExecutor.PassesBloomGate(filter, index), "the bloom gate dropped a legacy segment holding the value");
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, out uint[]? candidates));
+            Assert.Equal([0u], candidates!);
+        }
+        finally { System.Globalization.CultureInfo.CurrentCulture = saved; }
+    }
+
     [Fact]
     public void WrongNumericValue_StillSkipsTheSegment()
     {
@@ -430,14 +468,12 @@ public sealed class IndexHintKeyTests : IDisposable
         if (!hasIndexHint && invertedHints.Count == 0 && trigramHints.Count == 0)
             return true;
 
-        if (hasIndexHint)
-        {
-            using var bloom = SegmentBloomFilter.Deserialise(_bloomBytes);
-            if (!QueryExecutor.PassesBloomGate(filter, bloom)) return false;
-        }
+        // The view production opens per group — here over this fixture's sections, with a memo
+        // of its own — so the gate and the narrowing below are the very calls the executor makes.
+        using var index = SegmentIndexView.OverSections(null, "fixture.seg", 0, _invertedBytes, _trigramBytes, _bloomBytes);
+        if (hasIndexHint && !QueryExecutor.PassesBloomGate(filter, index)) return false;
 
-        var idx = SegmentIndexReader.Load(_invertedBytes, _trigramBytes, _bloomBytes);
-        return QueryExecutor.TryNarrowWithIndex(filter, idx, out candidates);
+        return QueryExecutor.TryNarrowWithIndex(filter, index, out candidates);
     }
 
     // ── Fixture helpers ───────────────────────────────────────────────────────

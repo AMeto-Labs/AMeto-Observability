@@ -157,6 +157,10 @@ public static class DiagnosticsEndpointMapper
                 // cache capped this way looks healthy in every other figure — it simply sits
                 // below its budget and misses — so without this there is nothing to read.
                 indexCacheNativeEvicted     = indexCache.NativeEvictedCount,
+                // Entries replaced because their path now held different bytes — a segment file
+                // replaced under its own name (a re-imported replica). Rare by construction; a
+                // count that climbs is worth finding the cause of.
+                indexCacheStaleReplaced     = indexCache.StaleReplacedCount,
 
                 // Storage
                 segmentCount         = segs.Count,

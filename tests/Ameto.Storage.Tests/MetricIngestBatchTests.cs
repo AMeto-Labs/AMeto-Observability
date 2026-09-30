@@ -33,7 +33,7 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
 
     /// <summary>
     /// One MiB of log — the floor <see cref="MetricsOptions"/> allows — so a batch of 20 000
-    /// 48-byte entries has to grow it, which is the fault this class injects. The hot-tier
+    /// 52-byte entries has to grow it, which is the fault this class injects. The hot-tier
     /// threshold is left at the budget cap so nothing flushes underneath the test.
     /// </summary>
     private static readonly MetricsOptions SmallLog = new()
@@ -204,7 +204,7 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
         var engine = NewEngine(_dir, SmallLog);
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
-        // Fill most of the 1 MiB log (21 845 entries of room at 48 B) without needing a grow.
+        // Fill most of the 1 MiB log (20 164 entries of room at 52 B) without needing a grow.
         var filler = new MetricIngestItem[15_000];
         for (int i = 0; i < filler.Length; i++)
             filler[i] = Scalar("filler.metric", baseNano + i * 1_000L, 1.0, Labels(("s", (i & 7).ToString())));
@@ -332,7 +332,7 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
         {
             HotTierBytes    = 100_000,        // 1 563 scalar points at 64 B
             MinFlushBytes   = 100_000,
-            WalInitialBytes = 128 * 1024,     // 2 730 entries of 48 B; the 3/4 mark at 2 048
+            WalInitialBytes = 128 * 1024,     // 2 520 entries of 52 B; the 3/4 mark at 1 890
         });
 
         int me = Environment.CurrentManagedThreadId;
@@ -355,7 +355,7 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
             exemplarPassesAtSchedule = engine.ExemplarPasses;
         };
 
-        // 2 100 points: 100 800 B of log (past the 98 304 mark, inside 131 072) and 134 400 B of
+        // 2 100 points: 109 200 B of log (past the 98 304 mark, inside 131 072) and 134 400 B of
         // tier (past 100 000) — one call crosses both. The first carries an exemplar.
         long now   = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         var  batch = new MetricIngestItem[2_100];

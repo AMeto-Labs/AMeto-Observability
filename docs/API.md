@@ -173,14 +173,31 @@ to its configured endpoint. The older `/otlp/v1/…` spellings still work and ar
 
 **Auth:** API key (same as `/api/events`).  
 **Content-Type:** `application/json` (OTLP/JSON) or `application/x-protobuf` (OTLP/Protobuf).  
-**Body:** the corresponding OTLP `Export…ServiceRequest` (`resourceLogs` / `resourceSpans` / `resourceMetrics`). Max body: 8 MB (`Ingestion.MaxOtlpBatchBytes`).
+**Content-Encoding:** none (or `identity`), or `gzip` — which the collector's `otlphttp` exporter sends by default; `x-gzip` is accepted as its alias, and the header is read as the list RFC 9110 defines. Any other coding is `415`. An empty body is an empty request whether or not it says `gzip`.  
+**Body:** the corresponding OTLP `Export…ServiceRequest` (`resourceLogs` / `resourceSpans` / `resourceMetrics`). Max body: 8 MB (`Ingestion.MaxOtlpBatchBytes`) — on the wire, and for a gzip body **also once inflated**.
+
+```bash
+printf '%s' '{"resourceLogs":[…]}' | gzip \
+  | curl -X POST http://localhost:5341/v1/logs -H 'Content-Type: application/json' \
+      -H 'Content-Encoding: gzip' -H 'X-Seq-ApiKey: <key>' --data-binary @-
+```
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
 `resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
 
-**Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length` or proved it by arriving. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
+**Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length`, proved it by arriving, or, gzip-compressed, **inflated** past it. The inflated size is decided on bytes already written, so a body that would inflate to gigabytes (deflate reaches ~1032:1) is stopped after at most one limit of output: no single buffer is ever rented past the limit, and the request holds at most the compressed body plus one and a half limits of inflate buffer — one limit when the gzip trailer states the size honestly, one and a half when it understates it and the buffer doubles its way up (about 20 MiB in all at the 8 MB default); that refusal is also logged as a warning (`OtlpGzipTooLarge`, shared with the gRPC receiver), since it is a misconfigured exporter or a probe — at most once a second, with the count since the last line and the latest sender: its API key as `GET /api/auth/keys` lists it (`keyPreview`, never the key) and its remote address. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
 
-**Response `400 Bad Request`:** the payload could not be decoded — malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
+**Response `415 Unsupported Media Type`:** `Content-Encoding` names a coding other than gzip — `deflate`, `br`, `zstd`, gzip applied twice, anything else. Refused before the body is read, so nothing was ingested. The response carries `Accept-Encoding: gzip, identity` and, encoded like the request (protobuf or JSON), an OTLP `Status` whose `message` names what was sent — the collector prints that message in its own log:
+
+```json
+{ "message": "Content-Encoding 'br' is not supported; send gzip or identity" }
+```
+
+Switch the exporter to gzip or to no compression; retrying the same request will always be refused.
+
+**Response `503 Service Unavailable`:** the server could not inflate a gzip body NOW — it ran out of memory doing it (its own or zlib's; this used to be a `400`, which exporters never retry, so the batch was lost), or the body arrived while the server was already holding as many inflated batches as it allows — at most `min(CPU cores, IngestBufferBytes / Ingestion.MaxOtlpBatchBytes)` at once across the HTTP and gRPC receivers, where `IngestBufferBytes` is the memory model's share for request bodies (**2 on a 512 MB container** at the 8 MB default; up to 16 on a large host). It waits up to a second for a slot first. Nothing was read past the compressed body, and nothing was ingested. The response carries `Retry-After: 1` and an OTLP `Status` message; OTLP exporters retry a 503 with backoff, so the batch is delayed, not lost. Uncompressed bodies are never held here — inflating is the only step where a small request can make the server hold a lot of memory.
+
+**Response `400 Bad Request`:** the payload could not be decoded — a gzip body that does not inflate (not gzip at all, or corrupt: refused before any parser sees it, so nothing of it is ingested) or that was cut off before its trailer (refused the same way, unless the cut happens to leave four bytes that read as a plausible size — possible when the stream was stored rather than compressed, and its last bytes are zeros or the low half of a `1.0` double; the parser then sees a message cut short and answers as below), malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
 
 ### OTLP over gRPC
 
@@ -199,7 +216,9 @@ on the main port would stop the UI, every `/api` call, the live tail and the con
 check from working, since no browser does HTTP/2 without TLS.
 
 **Encodings:** uncompressed and `gzip`. Anything else is answered `UNIMPLEMENTED` (12) with
-`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed.
+`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed. A gzip
+message is held to `Ingestion.MaxOtlpBatchBytes` once inflated, as over HTTP, and one cut off
+before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 
 **Status is in the trailers, not the HTTP status line** — every call answers HTTP 200:
 
@@ -209,6 +228,7 @@ check from working, since no browser does HTTP/2 without TLS.
 | `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
 | `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes` |
 | `12` UNIMPLEMENTED | unsupported compression |
+| `14` UNAVAILABLE | a gzip message arrived while every inflate slot shared with the HTTP receivers stayed taken for a second, or the server ran out of memory inflating it (see the `503` above); retried by exporters |
 | `16` UNAUTHENTICATED | missing or insufficient API key |
 
 ---
@@ -348,15 +368,17 @@ Server health snapshot.
   "logsStorageBytes": 134217728,
   "logsQuarantinedBytes": 0,
 
-  "indexCacheEntries": 12,
-  "indexCacheBytes": 41943040,
+  "indexCacheEntries": 240,
+  "indexCacheBytes": 1468006,
   "indexCacheBudgetBytes": 60129542,
   "indexCacheHits": 1843,
   "indexCacheMisses": 57,
   "indexCacheIdleEvicted": 3,
-  "indexCacheNativeBytes": 6291456,
+  "indexCacheNativeBytes": 0,
   "indexCacheNativeBudgetBytes": 26843545,
   "indexCacheShedEvicted": 0,
+  "indexCacheNativeEvicted": 0,
+  "indexCacheStaleReplaced": 0,
 
   "ingestBufferPooledBytes": 4194304,
   "ingestBufferBudgetBytes": 134217728,
@@ -392,9 +414,9 @@ Server health snapshot.
 
 The response carries more fields than are shown here (disk, GC, per-signal storage, ingest counters); **new fields are added without notice**, so parse it permissively.
 
-The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the decoded-index cache (the budget is what the cache was BUILT with, not a fresh derivation), `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — the deepest slab ever used times the slab size, never given back, so it is a resting level rather than a peak. On Windows that figure is the arena's commit charge (what a job object's memory limit counts). On Linux it is an upper bound on the arena's resident memory, not a measurement of it: pages become resident only when written, and a small event writes only the first page of its slab. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
+The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the index cache — per index group, a memo of what searches worked out, kilobytes each (the budget is what the cache was BUILT with, not a fresh derivation); `indexCacheHits` / `indexCacheMisses` count group uses answered without reading any of the group's index sections and those that had to read one; `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — the deepest slab ever used times the slab size, never given back, so it is a resting level rather than a peak. On Windows that figure is the arena's commit charge (what a job object's memory limit counts). On Linux it is an upper bound on the arena's resident memory, not a measurement of it: pages become resident only when written, and a small event writes only the first page of its slab. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
 
-`indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — the segment bloom filters' bits, 4–8 % of a cached entry — with its own ceiling. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-decode indexes on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves.
+`indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — segment bloom filter bits — with its own ceiling. Since #80 a search caches the bloom's verdicts rather than its bits, so on a server this reads 0; the ceiling is a backstop. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-read index sections on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves. `indexCacheStaleReplaced` counts cached index entries thrown away because the segment file behind their path had been replaced by a different one (a replica re-imported under the same name); it should stay at or near 0, and a number that climbs means segment files are being replaced under their own names.
 
 The `metrics*` and `traces*` budget fields are the **effective** figures the engines enforce — after an explicit `Ameto:Metrics` / `Ameto:Traces` value, the derivation from the memory limits and the floors — so they are what to read after tuning those knobs; each signal also prints them once at startup (`Metric budgets:`, `Trace budgets:`). They are `null` when the signal is disabled. `metricsExemplarMetricsRefused` counts exemplars dropped because `metricsMaxExemplarMetrics` names already own a ring (a correlation hint, never data). `metricsLabelPool*` is the metric label intern pool: `metricsLabelPoolStrings` of `metricsLabelPoolMaxStrings` distinct label strings held. Churning labels (`k8s.pod.name`, `container.id`, …) fill it over time; a full pool drops nothing, but each label it has not seen then costs its own string on every export. When it is full and an hour has passed since the last reset, it is emptied and refilled from live traffic — series are unaffected. `metricsLabelPoolSaturations` counts the times it filled, `metricsLabelPoolResets` the resets; resets climbing every hour mean the *live* label set is larger than the pool. The span ring's refusals are counted by cause, because they are different problems: `tracesRingRefusedForBytes` is a burst heavier than `tracesRingMaxBytes`, `tracesRingRefusedNoSlot` a drainer that fell behind, and `tracesRingRefusedNoArena` a payload mix the ring's 64 KiB chunks pack badly (see `RingMaxBytes` in CONFIGURATION.md). `tracesInternPoolSaturations`, `tracesUnpooledSpanNames` and `tracesUnpooledServiceNames` say a span-name or service intern pool filled up: nothing is dropped, but each span past that point keeps its own string.
 
@@ -504,15 +526,17 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /api/traces` | List/search traces (root spans) by service, name, tag filter, duration, time range. |
-| `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). A field a span does not carry matches **no** comparison, including a negated one — `{ .attr != nil }` / `{ .attr = nil }` test presence. |
+| `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). A field a span does not carry matches **no** comparison, including a negated one — `{ .attr != nil }` / `{ .attr = nil }` test presence. Nor does a value that cannot be compared: `{ .tenant > 5 }` and `{ !(.tenant > 5) }` both skip a span whose `.tenant` is text (Tempo answers `false` there, so its negation matches; this is deliberate). A quoted string against a numeric attribute compares the number's invariant text — `{ .ratio = "0.375" }`, never `"0,375"` — whatever the server's locale. |
 | `GET /api/traces/stats` | Aggregate trace stats (counts, error rate, latency) over a window. |
 | `GET /api/traces/latency` | Latency distribution / percentiles by service or operation. |
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
 | `GET /api/traces/compare` | Compare two traces / time windows. |
 | `GET /api/traces/{traceId}` | Full span tree for one trace. |
-| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace. |
+| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace: the root node `{ spanId, name, service, kind, status, totalMs, selfMs, children: [ …nodes ] }` (`null` when no span qualifies as root, `404` for an unknown trace). Any depth up to 4 096 levels; a node on level 4 096 that still has children is sent with `children: []` and `"truncated": true` (the only node that ever carries the field), its own `totalMs` / `selfMs` still counting them. |
 | `GET /api/traces/{traceId}/logs` | Logs correlated to the trace (via `@tr`). |
 | `GET /api/spans/{spanId}/logs` | Logs correlated to a single span (via `@sp`). |
+
+The trace list also streams as Server-Sent Events: `GET /api/traces/stream` (the filters of `GET /api/traces`) and `GET /api/traces/query/stream?ql=` (TraceQL). Each row is one `data:` line carrying **the same JSON bytes** the REST answers carry for it — ASP.NET Core's relaxed encoder: non-ASCII text, `<`, `&`, `'` and `+` go out as UTF-8; `"` and `\` as `\"` and `\\`; control characters as `\n`, `\r`, `\t` or `\uXXXX`; U+2028, U+2029 and characters outside the BMP (a surrogate pair) as `\uXXXX` — so a `data:` line never contains a raw line break of any kind. The stream ends with `event: done` or `event: query-error`.
 
 ---
 

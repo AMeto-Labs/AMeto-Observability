@@ -37,12 +37,24 @@ public static class OtlpGrpcEndpointMapper
     private const int StatusInvalidArgument   = 3;
     private const int StatusResourceExhausted = 8;
     private const int StatusUnimplemented     = 12;
+    private const int StatusUnavailable       = 14;
     private const int StatusUnauthenticated   = 16;
+
+    /// <summary>What UNAVAILABLE says when every inflate slot stayed taken — retried by every OTLP exporter.</summary>
+    internal const string GateFullMessage = "the server is inflating as many gzip batches as it can hold; retry";
+
+    /// <summary>What UNAVAILABLE says when the inflate ran out of memory.</summary>
+    internal const string MemoryShortMessage = "the server ran short of memory inflating this batch; retry";
 
     public static void MapOtlpGrpcEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
     {
+        // The SAME gate the HTTP receivers inflate under — one bound on inflated buffers for the
+        // process, whichever port a compressed batch arrived on.
+        OtlpInflateGate     inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
+        OtlpGzipTooLargeLog tooLargeLog = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
+
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, static (c, msg) =>
+            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, static (c, msg) =>
             {
                 var (_, dropped) = OtlpLogProtoParser.Parse(
                     msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
@@ -51,12 +63,12 @@ public static class OtlpGrpcEndpointMapper
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, tooLargeLog, static (c, msg) =>
                     IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, static (c, msg) =>
                 {
                     var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
                     int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
@@ -87,11 +99,14 @@ public static class OtlpGrpcEndpointMapper
 
     /// <summary>
     /// The shape every Export call shares: check the content type, check the key, unframe, hand
-    /// the protobuf to that signal's own decoder, and answer in trailers.
+    /// the protobuf to that signal's own decoder, and answer in trailers. Internal so the
+    /// gate's answer can be tested over a plain context — see <c>OtlpInflateGateTests</c>.
     /// </summary>
-    private static async Task HandleAsync(
+    internal static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
+        OtlpInflateGate inflateGate,
+        OtlpGzipTooLargeLog tooLargeLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
@@ -135,14 +150,33 @@ public static class OtlpGrpcEndpointMapper
         }
 
         byte[]? inflated = null;
+        bool holdsSlot   = false;
         try
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
             string? encoding = ctx.Request.Headers["grpc-encoding"];
+
+            // A message that will be inflated waits for a slot of the gate the HTTP receivers
+            // share (OtlpInflateGate); an identity frame never does. Full past the wait is
+            // UNAVAILABLE, the code an exporter retries with backoff — the batch is delayed, not
+            // refused. The slot is given back with the inflated buffer — as soon as nothing reads
+            // it any more, and always BEFORE a response is written (see ReleaseInflate).
+            if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
+            {
+                if (!await inflateGate.TryEnterAsync(ctx.RequestAborted))
+                {
+                    await FinishAsync(ctx, StatusUnavailable, GateFullMessage);
+                    return;
+                }
+                holdsSlot = true;
+            }
+
             var unframed = OtlpGrpcFraming.TryUnframe(body.AsMemory(0, bodyLen), encoding, maxBytes,
                                                       out var message, out inflated, out int inflatedLen);
             if (unframed != UnframeResult.Ok)
             {
+                // A refused unframe leaves no inflated buffer, but it may hold a slot.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 switch (unframed)
                 {
                     case UnframeResult.UnsupportedEncoding:
@@ -154,11 +188,15 @@ public static class OtlpGrpcEndpointMapper
                     case UnframeResult.TooLarge:
                         // Logged, not swallowed: a compressed batch that inflates past the limit
                         // is either a misconfigured exporter or someone probing, and both are
-                        // worth being able to see afterwards.
-                        ctx.RequestServices.GetRequiredService<ILoggerFactory>()
-                           .CreateLogger("Ameto.Otel.Grpc")
-                           .LogWarning("OTLP/gRPC: a compressed batch inflated past {Limit} bytes and was refused", maxBytes);
+                        // worth being able to see afterwards — at most once a second, with the
+                        // count and the latest sender, in the line the HTTP receiver writes too.
+                        tooLargeLog.Note(ctx, maxBytes);
                         await FinishAsync(ctx, StatusResourceExhausted, "batch exceeds the configured OTLP limit");
+                        break;
+                    case UnframeResult.Unavailable:
+                        // Out of memory inflating it — the server's failure. UNAVAILABLE is retried;
+                        // INVALID_ARGUMENT, which this used to be, made the exporter drop the batch.
+                        await FinishAsync(ctx, StatusUnavailable, MemoryShortMessage);
                         break;
                     default:
                         await FinishAsync(ctx, StatusInvalidArgument, "malformed gRPC frame");
@@ -178,12 +216,23 @@ public static class OtlpGrpcEndpointMapper
             }
             catch (Exception ex)
             {
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 ctx.RequestServices.GetRequiredService<ILoggerFactory>()
                    .CreateLogger("Ameto.Otel.Grpc")
                    .LogWarning(ex, "OTLP/gRPC: failed to decode {Bytes} bytes", segment.Count);
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
             }
+
+            // The decoder has returned, and the sinks copy what they keep: nothing reads the
+            // inflated message any more. Its buffer and its slot go back NOW, before a byte of the
+            // response is written — not after. A client that stops reading (an HTTP/2 stream
+            // window of 0 is enough) would otherwise hold both until Kestrel timed the stalled
+            // write out, and on the stand's two slots two such streams turned every other
+            // compressed batch, HTTP or gRPC, into a one-second wait and a 503 / UNAVAILABLE.
+            // The HTTP receivers release theirs in the parse finally, before WriteJsonOk, for the
+            // same reason.
+            ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
 
             if (!ok)
             {
@@ -202,7 +251,25 @@ public static class OtlpGrpcEndpointMapper
         finally
         {
             IngestBufferPool.Return(body);
-            if (inflated is not null) IngestBufferPool.Return(inflated);
+            ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
+        }
+    }
+
+    /// <summary>
+    /// Gives back the inflated buffer and the gate slot it holds, if either is still held — and
+    /// clears both, so the finally that calls it again after an earlier release does nothing.
+    /// </summary>
+    private static void ReleaseInflate(ref byte[]? inflated, ref bool holdsSlot, OtlpInflateGate gate)
+    {
+        if (inflated is not null)
+        {
+            IngestBufferPool.Return(inflated);
+            inflated = null;
+        }
+        if (holdsSlot)
+        {
+            gate.Exit();
+            holdsSlot = false;
         }
     }
 

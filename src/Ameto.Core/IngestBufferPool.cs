@@ -5,7 +5,7 @@ namespace Ameto.Core;
 
 /// <summary>
 /// The buffer pool the ingest receivers read their request bodies into — CLEF
-/// <c>POST /api/events</c>, OTLP/HTTP, OTLP/gRPC, and the gRPC gzip inflate target.
+/// <c>POST /api/events</c>, OTLP/HTTP, OTLP/gRPC, and the OTLP gzip inflate target (both receivers).
 ///
 /// <para>These buffers are large and they are rented one per request.
 /// <see cref="ArrayPool{T}.Shared"/> is the wrong shape for that: it keeps one array per

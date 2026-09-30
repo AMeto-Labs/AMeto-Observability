@@ -223,64 +223,108 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
     }
 
     /// <summary>
-    /// A MERGE WHOSE OUTPUT THE SNAPSHOT ALREADY LISTS IS NOT A FLOOR. The merge publishes its
-    /// output and then deletes its sources one by one, so a scan whose snapshot is taken in
-    /// between lists the output AND a source still to be deleted. The output holds that source's
-    /// events and the scan reads them there; the source it then fails to open lost nothing, and
-    /// calling the count a floor made an exact total look partial.
+    /// AT THE MERGE'S SWAP EVERY READER COUNTS THE BATCH ONCE (#85). The merge used to publish
+    /// its output and then delete its sources one by one, so every reader that listed the catalog
+    /// in between — <c>GetSegments</c> (every query and the live tail), <c>ListSegments</c>, the
+    /// header aggregation behind <c>/api/events/counts</c> — counted the batch twice: 240 events
+    /// where 120 exist. The output now goes in and the sources come out as one catalog
+    /// generation, and the files are unlinked after. Read from inside that window — swap done, no
+    /// source file unlinked yet — all three answer 120, and the count is neither a floor nor
+    /// partial.
     ///
-    /// <para>The scan starts right after the merge removed its first source's entry, so its
-    /// snapshot lists the output and the second source; every worker waits for the merge to
-    /// finish, so the second source's file is gone when it is opened.</para>
+    /// <para>This replaces a test of the state the old order produced — a snapshot listing the
+    /// output and one source still to be deleted — which can no longer arise.</para>
     /// </summary>
     [Fact]
-    public async Task A_merge_source_deleted_after_a_snapshot_that_lists_its_output_is_not_a_floor()
+    public async Task At_the_merge_swap_every_reader_counts_the_batch_once()
     {
         var sources = await MergeablePairAsync();
 
-        using var firstRemoved = new ManualResetEventSlim();
-        using var scanning     = new ManualResetEventSlim();
-        using var mergeDone    = new ManualResetEventSlim();
-        int removals = 0;
-        _engine._afterSegmentEntryRemoved = () =>
+        long served = -1, listed = -1;
+        LogVolumeCounts? counts = null;
+        bool sourcesOnDisk = false;
+        _engine._afterMergeSwap = () =>
         {
-            if (Interlocked.Increment(ref removals) != 1) return;
-            firstRemoved.Set();
-            Assert.True(scanning.Wait(TimeSpan.FromSeconds(30)), "the scan never took its snapshot");
+            // Values kept, not asserted: a throw here is the merge's, and ends it.
+            sourcesOnDisk = sources.All(s => File.Exists(s.FilePath));
+            served        = _engine.GetSegments(null, null).Sum(s => (long)s.EventCount);
+            listed        = _engine.ListSegments().Sum(s => (long)s.EventCount);
+            counts        = CountAsync().AsTask().GetAwaiter().GetResult();
         };
-        var merge = Task.Run(async () =>
-        {
-            try     { return await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
-            finally { mergeDone.Set(); }
-        });
-        Assert.True(firstRemoved.Wait(TimeSpan.FromSeconds(30)), "the merge never removed a source");
+        bool merged;
+        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        finally { _engine._afterMergeSwap = null; }
 
-        IReadOnlyList<SegmentInfo>? listed = null;
-        _engine._beforeHeaderSegmentOpen = _ =>
+        Assert.True(merged, "setup: the merge pass did not merge the pair");
+        Assert.True(sourcesOnDisk, "setup: the hook did not run between the swap and the unlinks");
+        Assert.Equal(120, served);    // 240 = the output AND both of its sources
+        Assert.Equal(120, listed);
+        Assert.NotNull(counts);
+        Assert.Equal(120, counts!.Total);
+        Assert.Equal(0,   counts.MergedAwaySegments);
+        Assert.Equal(0,   counts.SkippedSegments);
+        Assert.Empty(HeaderWarnings());
+
+        Assert.Equal(120u, Assert.Single(_engine.ListSegments()).EventCount);
+        foreach (var s in sources) Assert.False(File.Exists(s.FilePath), "a source file survived the merge");
+    }
+
+    /// <summary>
+    /// A SCAN THAT BEGINS BETWEEN THE RECORDS AND THE SWAP STILL CALLS AN EVICTED SOURCE A FLOOR.
+    /// The merge records every source before its swap, so a scan can take its mark after the
+    /// records and its snapshot before the swap. With room for ONE record the second source's
+    /// evicts the first's; the window holds the first source alone, so that source's verdict is
+    /// the whole answer. Its record is gone, and "may have been merged" rests on the mark: had
+    /// the mark counted the records as they were made (as it did while the merge recorded and
+    /// deleted one source at a time) it would stand above the evicted record, eviction would
+    /// not have "reached" it, and the removal would pass for retention — 0 events, presented as
+    /// exact, where 60 sit in the output.
+    /// </summary>
+    [Fact]
+    public async Task A_scan_that_began_between_the_records_and_the_swap_still_calls_an_evicted_source_a_floor()
+    {
+        _engine.MergedAwaySegmentCap = 1;
+        var sources = await MergeablePairAsync();
+        var older   = sources.OrderBy(s => s.MinTimestampTicks).First();   // recorded first, evicted by the second
+        var newer   = sources.OrderBy(s => s.MinTimestampTicks).Last();
+        var to      = new DateTimeOffset(older.MaxTimestampTicks, TimeSpan.Zero);
+        Assert.True(newer.MinTimestampTicks > to.UtcTicks, "setup: the window must hold the older source alone");
+
+        using var mergeDone = new ManualResetEventSlim();
+        var opened = new List<SegmentKey>();
+        _engine._beforeHeaderSegmentOpen = info =>
         {
-            // Read before the merge is released, and kept only from the worker that got here
-            // first: a later worker's read may already see the second source gone.
-            Interlocked.CompareExchange(ref listed, _engine.ListSegments(), null);
-            scanning.Set();
+            lock (opened) opened.Add(SegmentKey.Of(info));
             mergeDone.Wait(TimeSpan.FromSeconds(30));
         };
+        // The synchronous part of the aggregation takes the mark and the snapshot and hands the
+        // segments to workers, which wait above until the merge has swapped and unlinked.
+        Task<LogVolumeCounts>? scan = null;
+        _engine._beforeMergeSwap = () =>
+            scan = _engine.AggregateLogVolumeAsync(From, to, minBucket: 0, bucketSeconds: 1, nBuckets: 1, serviceFilter: null).AsTask();
+
+        bool merged;
         LogVolumeCounts counts;
-        try     { counts = await CountAsync(); }
-        finally { _engine._beforeHeaderSegmentOpen = null; _engine._afterSegmentEntryRemoved = null; }
+        try
+        {
+            merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+            mergeDone.Set();
+            Assert.NotNull(scan);
+            counts = await scan!.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            mergeDone.Set();
+            _engine._beforeMergeSwap = null;
+            _engine._beforeHeaderSegmentOpen = null;
+        }
 
-        Assert.True(await merge, "setup: the merge pass did not merge the pair");
-        var output = Assert.Single(_engine.ListSegments());
-        Assert.Equal(120u, output.EventCount);
-        Assert.Equal(2, removals);
-        Assert.NotNull(listed);
-        // The catalog the scan's workers saw: the output and one source, never both sources.
-        Assert.Contains(listed!, s => SegmentKey.Of(s) == SegmentKey.Of(output));
-        Assert.Single(listed!, s => sources.Any(src => SegmentKey.Of(src) == SegmentKey.Of(s)));
-        foreach (var s in sources) Assert.False(File.Exists(s.FilePath), "setup: a source survived the merge");
-
-        Assert.Equal(120, counts.Total);               // every event, read in the output
-        Assert.Equal(0,   counts.MergedAwaySegments);  // …so the missed source is no floor
-        Assert.Equal(0,   counts.SkippedSegments);
+        Assert.True(merged, "setup: the merge pass did not merge the pair");
+        Assert.Equal([SegmentKey.Of(older)], opened);   // setup: the scan's snapshot listed the older source, alone
+        Assert.False(File.Exists(older.FilePath), "setup: the source was still on disk when the scan opened it");
+        Assert.Equal(0, counts.Total);
+        Assert.Equal(1, counts.MergedAwaySegments);   // 0: the low count passes for exact
+        Assert.Equal(0, counts.SkippedSegments);
         Assert.Empty(HeaderWarnings());
     }
 

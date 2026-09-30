@@ -712,8 +712,22 @@ internal static class SpanAttributeBlob
     }
 
     /// <summary>
+    /// THE TEXT OF A VALUE msgpack HAS NO TYPE FOR — a <c>DateTime</c>, a <c>decimal</c>, a <c>ulong</c>,
+    /// whatever a dictionary-built record carries — and the ONE definition of it: what
+    /// <c>SpanWriter.WriteAttributes</c> stores as a string, what <c>SpanBloom.AddAttr</c> hashes, and
+    /// what <c>AttributePredicate</c> compares for the same value still in the hot tier. Invariant for
+    /// anything that formats (review F2 of #86): with the process culture, a ru-KZ writer stored
+    /// <c>0.5m</c> as "0,5" while the hot tier compared "0.5", so one query answered differently for a
+    /// span before and after its flush.
+    /// </summary>
+    internal static string InvariantText(object value) =>
+        value is IFormattable f
+            ? f.ToString(null, System.Globalization.CultureInfo.InvariantCulture)
+            : value.ToString() ?? string.Empty;
+
+    /// <summary>
     /// One attribute value, boxed exactly as <c>SpanReader</c>'s block decoder boxes it. Used by
-    /// <see cref="Decode"/> and by the flush path that feeds <c>SpanBloom</c>.
+    /// <see cref="Decode"/> and <see cref="TryWalk{TState}"/>.
     /// </summary>
     internal static object? ReadBoxedValue(ref MessagePackReader r)
     {
@@ -855,8 +869,12 @@ internal static class SpanAttributeBlob
     /// <summary>
     /// Walks the map and hands every pair to <paramref name="onPair"/>, boxing one value at a time
     /// instead of a whole dictionary. False when the blob is not exactly one well-formed msgpack
-    /// map — which is what lets the flush decide whether the bytes are safe to copy through
-    /// verbatim.
+    /// map.
+    ///
+    /// <para>NO LONGER ON THE FLUSH PATH: the flush feeds the bloom from the bytes
+    /// (<c>SpanBloom.TryAddBlob</c>, #86/TS#12). Kept as the REFERENCE for what that walk must
+    /// accept — its answer decides whether a blob is copied through verbatim, so the two are held
+    /// to the same verdict by <c>SpanBloomCanonicalTests</c>.</para>
     /// </summary>
     internal static bool TryWalk<TState>(
         ReadOnlyMemory<byte> blob, TState state, Action<TState, string, object?> onPair)

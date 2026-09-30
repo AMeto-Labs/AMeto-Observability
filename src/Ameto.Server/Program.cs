@@ -131,7 +131,10 @@ builder.Services
     .AddAmetoStorage()
     .AddAmetoIndexing()
     .AddAmetoIngestion()
-    .AddAmetoQuery();
+    .AddAmetoQuery()
+    // What the OTLP receivers share — HTTP and gRPC alike: the bound on gzip bodies held
+    // inflated at once (OtlpInflateGate). Their mappers require it.
+    .AddOtlpReceivers();
 
 // Short-TTL cache for GET /api/events/counts header-scan responses.
 builder.Services.AddSingleton<LogVolumeCountsCache>();
