@@ -400,7 +400,7 @@ internal sealed class ProbeLogEventDto
     [System.Text.Json.Serialization.JsonPropertyName("id")]           public string Id              { get; init; } = "";
     [System.Text.Json.Serialization.JsonPropertyName("@tr")]          public string? TraceId        { get; init; }
     [System.Text.Json.Serialization.JsonPropertyName("@sp")]          public string? SpanId         { get; init; }
-    [System.Text.Json.Serialization.JsonPropertyName("service.name")] public string? ServiceName    { get; init; }
+    [System.Text.Json.Serialization.JsonPropertyName("@service")]     public string? ServiceName    { get; init; }   // the server's key since @service
     [System.Text.Json.Serialization.JsonPropertyName("props")]        public ProbeEventProps? Properties { get; init; }
 
     public static ProbeLogEventDto From(LogEvent ev) => new()
