@@ -269,11 +269,11 @@ OTEL_RESOURCE_ATTRIBUTES=env=prod,prid=wallet
 
 | Signal | Behaviour |
 |--------|-----------|
-| Logs | all resource attributes become event properties (filter: `env = 'prod'`) |
+| Logs | all resource attributes become event properties (filter: `env = 'prod'`) — except `service.name`, which becomes the event's `@service` header field (filter: `@service = 'wallet'`) and is not kept as a property as well |
 | Traces | all resource attributes are merged into every span's attributes (span's own keys win) |
 | Metrics | all resource attributes become series labels (point attributes win). Note: adding a new resource attribute changes series identity, so existing series continue without it and new ones appear with it |
 
-`service.name` is always extracted into the dedicated service field/label, and the SDK's self-description (`telemetry.sdk.*` / `telemetry.distro.*`) is excluded from metric labels — the sender never sets those explicitly, and an SDK upgrade would otherwise fork every series.
+`service.name` is always extracted into the dedicated service field/label; for logs that is the event's `@service` (changed in this release: it used to be repeated among the event's properties as well). The SDK's self-description (`telemetry.sdk.*` / `telemetry.distro.*`) is excluded from metric labels — the sender never sets those explicitly, and an SDK upgrade would otherwise fork every series.
 
 ---
 

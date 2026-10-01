@@ -256,14 +256,19 @@ before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 Event JSON:
 ```json
 {
-  "@t":    "2026-05-20T10:00:00.0000000+00:00",
-  "@mt":   "Request {Path} failed",
-  "@l":    "Error",
-  "@x":    { "type": "System.InvalidOperationException", "message": "Boom", "stack": "...", "inner": null },
-  "id":    "123456789",
-  "props": { "Path": "/api/users", "StatusCode": 500 }
+  "@t":       "2026-05-20T10:00:00.0000000+00:00",
+  "@mt":      "Request {Path} failed",
+  "@l":       "Error",
+  "@x":       { "type": "System.InvalidOperationException", "message": "Boom", "stack": "...", "inner": null },
+  "id":       "123456789",
+  "@tr":      "4bf92f3577b34da6a3ce929d0e0e4736",
+  "@sp":      "00f067aa0ba902b7",
+  "@service": "orders-api",
+  "props":    { "Path": "/api/users", "StatusCode": 500 }
 }
 ```
+
+`@x`, `@tr`, `@sp` and `@service` are present only when the event has them. **Changed in this release:** the service is sent as `@service`; it used to be sent as `service.name`, in the same place. An OTLP event no longer repeats it as `props["service.name"]` either — events stored before the change still carry that property.
 
 ### `GET /api/events/live` (SSE live tail)
 
