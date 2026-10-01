@@ -4,6 +4,7 @@ using Ameto.Core;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using Microsoft.Extensions.Logging;
+using Xunit.Abstractions;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Storage.Tests;
@@ -26,7 +27,13 @@ public sealed class SpanWalV3Tests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-swal3-" + Guid.NewGuid().ToString("N"));
     private readonly List<SpanWriteAheadLog> _wals = [];
 
-    public SpanWalV3Tests() => Directory.CreateDirectory(_dir);
+    private readonly ITestOutputHelper _out;
+
+    public SpanWalV3Tests(ITestOutputHelper output)
+    {
+        _out = output;
+        Directory.CreateDirectory(_dir);
+    }
 
     public void Dispose()
     {
@@ -63,7 +70,7 @@ public sealed class SpanWalV3Tests : IDisposable
     /// A span whose log entry is exactly <see cref="Entry"/> bytes — a 10-byte name, a 6-byte service and
     /// 16 attribute bytes — so a chunk boundary is an entry boundary and the rows below can name them.
     /// </summary>
-    private static SpanIngestItem Span(int id)
+    private static SpanIngestItem Span(int id, string? name = null)
     {
         var attrs = new byte[16];
         BinaryPrimitives.WriteInt64LittleEndian(attrs, id * 31L);
@@ -75,7 +82,7 @@ public sealed class SpanWalV3Tests : IDisposable
             ParentSpanId      = new SpanId((ulong)id + 7),
             StartTimeUnixNano = BaseNano + id,
             DurationNanos     = 1_000 + id,
-            Name              = $"op-{id:D7}",
+            Name              = name ?? $"op-{id:D7}",
             ServiceName       = "svc-01",
             Kind              = SpanKind.Server,
             Status            = SpanStatusCode.Unset,
@@ -152,7 +159,9 @@ public sealed class SpanWalV3Tests : IDisposable
             wal.OnCoveredStoreForTest   = null;
             wal.RangeFlushedForTest     = null;
             if (point == "committed") Take();
-            Assert.Equal(length, wal.WrittenBytes);                                    // the live log finished it
+            // The live log finished it: the tail moved to the front — or, a prefix under an eighth
+            // of it (dead by construction here: one generation, below the stamp), stayed behind it.
+            Assert.Equal(prefix * 8 < length ? prefix + length : length, wal.WrittenBytes);
         }
         Assert.True(atPoint is not null, $"the kill point {point} at {done} was never reached");
 
@@ -529,6 +538,221 @@ public sealed class SpanWalV3Tests : IDisposable
         using (var wal = Open(logger: logger))
             Assert.Equal(Ids(100, 4), IdsOf(wal.ReadAll()));
         Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
+    }
+
+    // ── A short prefix stays: at most eight chunks ───────────────────────────
+
+    /// <summary>
+    /// A DEAD PREFIX FAR SHORTER THAN THE TAIL BEHIND IT IS LEFT IN PLACE, NOT MOVED IN THOUSANDS OF
+    /// SEALED CHUNKS. One flushed span before nine appended during the flush: moving them would take
+    /// nine one-entry chunks, each a header store and two checksums under the append lock — at 8 MiB
+    /// of minimal spans, 120 000 of them. The commit leaves the log as it is (no relocation step
+    /// fires, the length is unchanged), the replay skips the dead span by its generation, and the
+    /// next commit reclaims everything. Without the rule the tail moves (eleven steps) and the log
+    /// is nine spans long.
+    /// </summary>
+    [Fact]
+    public void A_dead_prefix_far_shorter_than_its_tail_is_left_in_place_until_the_next_commit()
+    {
+        long steps = 0;
+        using (var wal = Open())
+        {
+            wal.Append(Span(100));
+            wal.BeginFlush();
+            for (int j = 0; j < 9; j++) wal.Append(Span(200 + j));
+
+            wal.OnRelocationStepForTest = (_, _) => steps++;
+            wal.CommitFlush();
+            Assert.Equal(0, steps);
+            Assert.Equal(10L * Entry, wal.WrittenBytes);                                   // nothing moved
+            Assert.Equal(Ids(200, 9), IdsOf(wal.ReadAll()));
+        }
+
+        using (var wal = Open())
+        {
+            Assert.Equal(Ids(200, 9), IdsOf(wal.ReadAll()));
+            wal.BeginFlush();
+            wal.CommitFlush();
+            Assert.Equal(0, wal.WrittenBytes);                                            // reclaimed with the rest
+        }
+        using (var wal = Open())
+            Assert.Empty(wal.ReadAll());
+    }
+
+    /// <summary>
+    /// THE BOUND IS EIGHT CHUNKS, NOT NINE. A one-entry prefix (100 B) before eight spans and one a
+    /// byte longer (801 B): `prefix &lt; tail / 8` floors 801 / 8 to 100 and lets the move run — nine
+    /// chunks. Compared multiplied (100 × 8 = 800 &lt; 801), the prefix stays. A tail of exactly eight
+    /// prefixes still moves, in exactly eight chunks.
+    /// </summary>
+    [Theory]
+    [InlineData(true,  0)]      // 801 B: stays
+    [InlineData(false, 8)]      // 800 B: moves, eight chunks
+    public void A_tail_just_over_eight_prefixes_is_not_moved(bool oneByteMore, int chunks)
+    {
+        long chunkSteps = 0;
+        using var wal = Open();
+        wal.Append(Span(100));
+        wal.BeginFlush();
+        for (int j = 0; j < 7; j++) wal.Append(Span(200 + j));
+        wal.Append(Span(207, oneByteMore ? "op-00000207" : null));
+        wal.OnRelocationStepForTest = (step, _) => { if (step == SpanWriteAheadLog.RelocationStep.Chunk) chunkSteps++; };
+        wal.CommitFlush();
+        Assert.Equal(chunks, chunkSteps);
+        Assert.Equal(Ids(200, 8), IdsOf(wal.ReadAll()));
+    }
+
+    /// <summary>
+    /// A RETRIED FLUSH MOVES ITS TAIL HOWEVER LONG IT IS: ITS PREFIX HOLDS THE GENERATION IT STAMPS.
+    /// The first attempt is abandoned (the segment write failed); a span arrives before the retry's
+    /// Begin, which reuses the bumped generation — so the retry's prefix holds a span of the very
+    /// generation the commit then stamps, and the replay accepts it. The tail is more than eight
+    /// prefixes long, which would leave the prefix in place by length alone; left there, span 101 —
+    /// in the retry's segment — replays beside it on every restart. The commit must move.
+    /// </summary>
+    [Fact]
+    public void A_retried_flush_moves_its_tail_however_long_since_its_prefix_holds_the_stamps_generation()
+    {
+        long steps = 0;
+        using (var wal = Open())
+        {
+            wal.Append(Span(100));                                                       // generation 1
+            wal.BeginFlush();
+            wal.AbandonFlush();                                                          // the write failed
+            wal.Append(Span(101));                                                       // generation 2, before the retry
+            wal.BeginFlush();                                                            // the retry: no bump, 2 is reused
+            for (int j = 0; j < 17; j++) wal.Append(Span(200 + j));                      // 1 700 B behind a 200 B prefix
+
+            wal.OnRelocationStepForTest = (_, _) => steps++;
+            wal.CommitFlush();
+        }
+        Assert.True(steps > 0, "the retry's prefix was left in front of its tail");
+
+        using var reopened = Open();
+        Assert.Equal(Ids(200, 17), IdsOf(reopened.ReadAll()));
+    }
+
+    /// <summary>
+    /// A FLUSH AFTER A RESTART MID-FLUSH MOVES ITS TAIL: ITS PREFIX HOLDS THE SUCCESSOR'S ENTRIES. The
+    /// process died between a Begin and its commit — two spans of generation 1, one of 2 — and the
+    /// restart replays all three and appends under the header's generation, 1. Its first flush bumps
+    /// to 2 and stamps 2: the pre-crash span of 2, in that flush's segment, sits in its prefix, live
+    /// under the stamp. A long tail would leave it there by length alone. The commit must move.
+    /// </summary>
+    [Fact]
+    public void A_flush_after_a_restart_mid_flush_moves_since_its_prefix_holds_the_successors_entries()
+    {
+        using (var wal = Open())
+        {
+            wal.Append(Span(100));
+            wal.Append(Span(101));
+            wal.BeginFlush();
+            wal.Append(Span(102));                                                       // generation 2
+        }                                                                                 // killed before the commit
+
+        long steps = 0;
+        using (var wal = Open())
+        {
+            Assert.Equal(Ids(100, 3), IdsOf(wal.ReadAll()));                            // the tier gets all three back
+            wal.BeginFlush();                                                            // they are in this flush's segment
+            for (int j = 0; j < 25; j++) wal.Append(Span(200 + j));                      // 2 500 B behind a 300 B prefix
+            wal.OnRelocationStepForTest = (_, _) => steps++;
+            wal.CommitFlush();
+        }
+        Assert.True(steps > 0, "the prefix holding the successor's span was left in front of the tail");
+
+        using var reopened = Open();
+        Assert.Equal(Ids(200, 25), IdsOf(reopened.ReadAll()));
+    }
+
+    /// <summary>
+    /// A PREFIX THAT DOES NOT VERIFY IS NOT LEFT IN FRONT OF THE TAIL. A log opened over an entry
+    /// that fails its checksum and never replayed (so its claim was never cut back) flushes a short
+    /// prefix before a long tail. Kept in place, that entry would stand in front of the tail, and the
+    /// replay — which stops at the first entry that does not verify — would never reach a span the
+    /// commit kept. The commit must move the tail over it.
+    /// </summary>
+    [Fact]
+    public void A_prefix_that_does_not_verify_is_not_left_in_front_of_the_tail()
+    {
+        byte[] torn = EntryBytes(Span(100), 1, checksummed: true);
+        torn[EntryHead + 2] ^= 0x5A;
+        WriteV3Log(1, seal: true, torn);
+
+        using (var wal = Open())                                                         // no ReadAll: the claim stands
+        {
+            wal.BeginFlush();
+            for (int j = 0; j < 9; j++) wal.Append(Span(200 + j));
+            wal.CommitFlush();
+            Assert.Equal(9L * Entry, wal.WrittenBytes);                                  // moved
+        }
+        using var reopened = Open();
+        Assert.Equal(Ids(200, 9), IdsOf(reopened.ReadAll()));
+    }
+
+    /// <summary>
+    /// A COMMIT THAT LEAVES ITS PREFIX IN PLACE, KILLED ANYWHERE. Nothing moves, so the stamp is the
+    /// commit: killed before it — the data barrier, the stamp's pending checksum — the old header
+    /// replays both generations (the documented duplicate window); killed after its field, the
+    /// header verifies by its pending checksum and replays the tail alone — read as rot instead, the
+    /// rebuild would accept the dead prefix's generation and replay it beside its segment. A rotted
+    /// header over a kept prefix does exactly that: duplicates, never loss.
+    /// </summary>
+    [Theory]
+    [InlineData("before",         false, true)]
+    [InlineData("barrier",        false, true)]
+    [InlineData("stamp-pending",  false, true)]
+    [InlineData("stamp-unsealed", false, false)]
+    [InlineData("stamp-unsealed", true,  true)]
+    [InlineData("committed",      false, false)]
+    [InlineData("committed",      true,  true)]
+    public void A_commit_that_keeps_its_prefix_killed_anywhere_loses_nothing(string point, bool rotHeader, bool prefixReplays)
+    {
+        string killed = KilledCommit(1, 9, point, done: 0, intoNextChunk: 0);
+        if (rotHeader) RotGeneration(killed);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(killed, logger))
+        {
+            Assert.Equal([.. prefixReplays ? Ids(100, 1) : [], .. Ids(200, 9)], IdsOf(wal.ReadAll()));
+            Assert.Equal(10L * Entry, wal.WrittenBytes);
+        }
+        Assert.Equal(rotHeader, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify")));
+        Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("finishing the relocation"));
+    }
+
+    /// <summary>
+    /// WHAT THE BOUND SAVES, printed: a one-entry prefix before ~8 MiB of minimal spans (68 B, 120 000
+    /// of them) — the shape the rule keeps in place — committed with the rule, and the same tail behind
+    /// a prefix as long as it, which moves in one chunk. Asserted only that the first moved nothing.
+    /// Measured on the development box (Release): the many-chunk move it replaces held the append
+    /// lock 10-12.5 ms against 3.3 ms for the one-chunk move, its drive flush 2 ms.
+    /// </summary>
+    [Fact]
+    public void Probe_commit_of_a_long_tail_behind_a_short_prefix()
+    {
+        static SpanIngestItem Minimal(int id) => new()
+        {
+            TraceId = new TraceId((ulong)id + 1, 7), SpanId = new SpanId((ulong)id), StartTimeUnixNano = BaseNano + id,
+            DurationNanos = 1, Name = "", ServiceName = "", AttributesBytes = [],
+        };
+
+        foreach (int prefix in (int[])[1, 120_000])
+        {
+            string path = Path.Combine(_dir, $"probe-{prefix}.wal");
+            using var wal = SpanWriteAheadLog.Open(path, 32L * 1024 * 1024, 1L << 26);
+            for (int i = 0; i < prefix; i++) wal.Append(Minimal(i));
+            wal.BeginFlush();
+            for (int j = 0; j < 120_000; j++) wal.Append(Minimal(1_000_000 + j));
+
+            long steps = 0;
+            wal.OnRelocationStepForTest = (_, _) => steps++;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            wal.CommitFlush();
+            double ms = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            _out.WriteLine($"prefix {prefix} x 68 B before 120 000 x 68 B: {steps} relocation step(s), commit {ms:N2} ms");
+            if (prefix == 1) Assert.Equal(0, steps);
+        }
     }
 
     // ── The format: v3, and the logs before it ───────────────────────────────

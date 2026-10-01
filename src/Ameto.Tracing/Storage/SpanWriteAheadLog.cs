@@ -790,7 +790,10 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// and every one after it, stores the end and clears the record (<see cref="FinishRelocationLocked"/>)
     /// — the surviving tail replays once, the flushed generation not at all. Killed after the clear:
     /// the header's claim is the relocated end, the terminator or the claim stops the walk there,
-    /// and the old generation in the header still accepts the tail's.</para>
+    /// and the old generation in the header still accepts the tail's. A flushed prefix far shorter
+    /// than its tail, provably dead under the stamp, stays where it is and nothing moves
+    /// (<see cref="PrefixStaysLocked"/>): killed before the stamp, both generations replay, as before
+    /// a record; after it, the tail alone.</para>
     ///
     /// <para><b>What it forces to disk, and where.</b> It used to hand FlushViewOfFile the WHOLE
     /// view, twice, for a commit whose own dirty bytes are the relocated tail and one header page.
@@ -833,7 +836,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             long tail     = _writeOffset - boundary;     // appended while the segment was written
             ref var hdr   = ref Unsafe.AsRef<WalFileHeader>(_ptr);
 
-            if (tail > 0 && boundary > 0)
+            // A dead prefix far shorter than the tail behind it stays where it is, and so does the
+            // tail: nothing moves, the stamp alone kills the prefix. See PrefixStaysLocked.
+            bool keeps = tail > 0 && boundary > 0 && PrefixStaysLocked(boundary, tail);
+            long end   = keeps ? boundary + tail : tail;
+
+            if (tail > 0 && boundary > 0 && !keeps)
             {
                 if (_legacyVersion != 0)
                 {
@@ -854,16 +862,16 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                 }
             }
 
-            // From here the log ends where the relocated tail does — in memory and in the header's
-            // claim, before the barrier. A barrier that fails below therefore leaves the next append
-            // landing over the terminator rather than past it: the version of this path before v2
-            // left the write offset where it was, beyond the generation-0 marker, so every span
-            // appended after a failed barrier landed where the next replay stops short of —
-            // acknowledged, queryable, and gone at the next restart. The flushed generation's spans
-            // are not in the log any more, which is fine: their segment was published before this
-            // commit ran.
-            _writeOffset    = tail;
-            hdr.WriteOffset = _headerSize + tail;
+            // From here the log ends where the relocated tail does (or, kept in place, where it
+            // always did) — in memory and in the header's claim, before the barrier. A barrier that
+            // fails below therefore leaves the next append landing over the terminator rather than
+            // past it: the version of this path before v2 left the write offset where it was, beyond
+            // the generation-0 marker, so every span appended after a failed barrier landed where
+            // the next replay stops short of — acknowledged, queryable, and gone at the next restart.
+            // The flushed generation's spans are not in the log any more, which is fine: their
+            // segment was published before this commit ran.
+            _writeOffset    = end;
+            hdr.WriteOffset = _headerSize + end;
 
             // The move does not erase its source, and the old header's generation still accepts the
             // relocated tail's: a generation-0 marker at the new end stops any walk exactly where
@@ -873,8 +881,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             // source entry, which a finish at open would still read. It always fits after a move
             // (the tail is shorter than the log by at least the flushed prefix, and that prefix
             // holds at least one entry); with nothing flushed before it there was no move, and no
-            // room for it means only that the log is full, where the claim alone ends the walk.
-            PlantEndMarkerLocked(tail);
+            // room for it means only that the log is full, where the claim alone ends the walk. A
+            // kept tail moved nothing, so there is no source behind it to stop a walk short of.
+            if (!keeps) PlantEndMarkerLocked(end);
 
             // ── PERSISTENCE BARRIER. The relocation and the header live on different
             //    pages, and dirty mmap pages reach the platter in whatever order the OS
@@ -891,10 +900,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             //    THE RANGE IS [0, relocated tail + terminator), page-aligned outwards. It
             //    starts at the file's first byte, so the header page is in it; the tail is
             //    all the commit dirtied besides the header. Nothing past it is claimed by
-            //    anything this commit writes.
+            //    anything this commit writes. A kept tail takes its dead prefix with it: the
+            //    replay walks through that prefix to reach the tail, and a page of it torn by a
+            //    power loss would end the replay in front of every span the commit kept.
             try
             {
-                FlushRangeLocked(0, _headerSize + tail + EntryHeaderSize);
+                FlushRangeLocked(0, _headerSize + end + EntryHeaderSize);
                 FlushHandle(_fileStream!);
             }
             catch (Exception ex)
@@ -985,6 +996,56 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// sees it. Null in production.
     /// </summary>
     [ThreadStatic] internal static Action<RelocationStep, long>? t_relocationStepForNextOpenForTest;
+
+    /// <summary>A commit moves its tail only when the flushed prefix is at least 1/n of it — at most n chunks; see <see cref="PrefixStaysLocked"/>.</summary>
+    private const long MinPrefixToMoveTail = 8;
+
+    /// <summary>
+    /// Whether this commit leaves the flushed prefix <c>[0, boundary)</c> where it is, and with it the
+    /// tail behind it, instead of moving the tail to the front. Caller holds the lock.
+    ///
+    /// <para><b>Why a prefix may stay.</b> The move goes in chunks no longer than the prefix, each
+    /// with a covered header store, under the append lock: a one-entry prefix before an 8 MiB tail
+    /// of minimal spans is 120 000 of them — measured 10-12.5 ms of commit against 3.3 ms for the
+    /// same tail moved in one chunk, where this box's drive flush is 2 ms. Left in place, the prefix
+    /// is dead weight the replay skips, and the next commit reclaims it with everything else — its
+    /// own prefix is then at least this whole tail, so the move it makes is a few chunks at most.
+    /// The metric WAL's rule (61c1f02, d5f7411): the tail moves only when the prefix is at least an
+    /// eighth of it, compared multiplied, so at most eight chunks.</para>
+    ///
+    /// <para><b>Why the span WAL has to check what the metric WAL could assume.</b> There a prefix is
+    /// dead by construction: it is at or below the watermark, and the watermark is what the replay
+    /// filters on. Here the replay accepts a WINDOW — the header's generation and its successor —
+    /// and the prefix is not always outside the window the stamp opens. After an abandoned flush,
+    /// the retry's Begin reuses the bumped generation, so the spans appended between the two Begins
+    /// sit in the retry's prefix with the very generation this commit stamps; after a restart that
+    /// followed a crash mid-flush, the prefix holds the successor's entries from before the crash
+    /// behind appends of the header's own. Left in place, either would replay beside the segment
+    /// that holds it — on every restart until a later commit moved past it. So a prefix stays only
+    /// if the walk over it proves what the replay will do with it under the new header: no entry
+    /// of the stamp's generation or its successor. And only if every entry of it verifies: a kept
+    /// prefix sits IN FRONT of the tail, and the replay stops at the first entry that does not
+    /// verify — a torn one there would cut off every span this commit kept. A walk that does not
+    /// end exactly on the boundary proves neither, and the tail moves.</para>
+    ///
+    /// <para>The walk reads the prefix once, with checksums: at most an eighth of the tail, which
+    /// this commit has just been spared moving. v1 and v2 logs kept in their own layout move as they
+    /// always did.</para>
+    /// </summary>
+    private bool PrefixStaysLocked(long boundary, long tail)
+    {
+        if (_legacyVersion != 0 || boundary * MinPrefixToMoveTail >= tail) return false;
+
+        uint stamp = _generation, successor = Next(stamp);
+        long pos = 0, total;
+        while (pos < boundary && (total = EntryAt(pos, boundary, _entryHeaderSize, _checksummed)) > 0)
+        {
+            uint g = Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + pos).Generation;
+            if (g == stamp || g == successor) return false;
+            pos += total;
+        }
+        return pos == boundary;
+    }
 
     /// <summary>
     /// Moves the surviving tail <c>[from, from + length)</c> to the front, FROM <paramref name="done"/>
