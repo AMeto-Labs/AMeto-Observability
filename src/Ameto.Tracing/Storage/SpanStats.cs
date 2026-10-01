@@ -8,9 +8,21 @@ namespace Ameto.Tracing.Storage;
 /// </summary>
 public static class HistogramBuckets
 {
-    // Upper-exclusive bounds in nanoseconds
-    internal static ReadOnlySpan<long> Bounds => new long[]
-    {
+    /// <summary>
+    /// Upper-exclusive bounds in nanoseconds, as a span over ONE static array.
+    ///
+    /// <para>NOT <c>=&gt; new long[] { ... }</c>, which it used to be. The compiler lowers that to
+    /// <c>RuntimeHelpers.CreateSpan</c>, and only an optimizing JIT expands the intrinsic: code
+    /// compiled unoptimized — every Debug build, which is where CI runs the allocation probes —
+    /// takes the managed fallback and allocates on every access (measured: 72 B per
+    /// <see cref="IndexOf"/> and per <see cref="Percentile"/> in Debug, 0 B in Release). A span over
+    /// a static array costs nothing in either, so no probe measures a cost production never pays
+    /// and no caller has to cache the bounds to stay off it.</para>
+    /// </summary>
+    internal static ReadOnlySpan<long> Bounds => s_bounds;
+
+    private static readonly long[] s_bounds =
+    [
               1_000_000L, //  1 ms
               5_000_000L, //  5 ms
              10_000_000L, // 10 ms
@@ -29,7 +41,7 @@ public static class HistogramBuckets
         300_000_000_000L, //   5 min
         600_000_000_000L, //  10 min
       1_800_000_000_000L, //  30 min
-    };
+    ];
 
     public const int Count = 19; // buckets = Bounds.Length + 1
 

@@ -1606,7 +1606,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     // than the user saw. A search touching either field is therefore not recorded at
     // all: no entry beats an entry that lies about what it will find, in either direction.
     if (this.filterName) return '';
-    if (this.filterHttpStatus && !/^d+$/.test(this.filterHttpStatus)) return '';
+    if (this.filterHttpStatus && !/^\d+$/.test(this.filterHttpStatus)) return '';
 
     const parts: string[] = [];
     if (this.filterService) parts.push(this.tqlPredicate('service', this.filterService, false));

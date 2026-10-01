@@ -171,7 +171,7 @@ public static class TraceQueryEndpointMapper
             if (TraceStoreGate.RefuseIfClosed(ctx, provider) is { } closed) { await closed; return; }
 
             await BeginEventStreamAsync(ctx);
-            using var sse = new SseJsonWriter(ctx.Response.Body);
+            using var sse = new SseJsonWriter(ctx.Response.Body, TraceDetailJson.WriterOptions(ctx));   // done / query-error in the host encoding (#94)
             try
             {
                 SpanPredicate predicate;
@@ -219,7 +219,7 @@ public static class TraceQueryEndpointMapper
             if (TraceStoreGate.RefuseIfClosed(ctx, summaryProvider) is { } closed) { await closed; return; }
 
             await BeginEventStreamAsync(ctx);
-            using var sse = new SseJsonWriter(ctx.Response.Body);
+            using var sse = new SseJsonWriter(ctx.Response.Body, TraceDetailJson.WriterOptions(ctx));   // done / query-error in the host encoding (#94)
             try
             {
                 var end = await StreamTracePagesAsync(ctx, sse, max, FilterStreamPageSize, from, to,

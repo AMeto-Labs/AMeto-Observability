@@ -25,7 +25,8 @@ public readonly struct TraceQLValue
 
     public static TraceQLValue FromString(string s)   => new(s,    0,   false, false);
     public static TraceQLValue FromNumber(double n)   => new(null, n,   true,  false);
-    public static TraceQLValue FromDuration(long ns)  => new(null, ns,  true,  true);
+    /// <summary>Nanoseconds as the literal spelled them — not truncated, so a sub-nanosecond negative keeps its sign.</summary>
+    public static TraceQLValue FromDuration(double ns) => new(null, ns, true,  true);
     public static TraceQLValue FromIdent(string s)    => new(s,    0,   false, false, isIdent: true);
 
     public override string ToString() =>

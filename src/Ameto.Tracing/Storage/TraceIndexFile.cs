@@ -155,6 +155,36 @@ internal sealed class TraceIndexWriter
         _entries.Add((key, segmentId, offsets));
     }
 
+    /// <summary>
+    /// Records every trace of one segment, straight from the writer's sorted refs (TS#7(c)) — one
+    /// entry per trace, its offsets copied out of the run. The refs are sorted by id and then by
+    /// offset (<see cref="TraceIndexPairs"/>), so each offset list is ascending as it is copied and
+    /// the entries arrive in key order.
+    ///
+    /// <para>THE <c>.tix</c> BYTES ARE THOSE OF THE DICTIONARY PATH, with one exception that changes
+    /// no answer: two traces of one segment sharing a key (the id's high half — a producer varying
+    /// only the low half, or a collision). Entries are sorted by (key, segment), which ties for
+    /// those two, and the unstable sort resolves the tie from the order entries were added —
+    /// first-seen before, id order now. A lookup returns every entry under the key either way.</para>
+    /// </summary>
+    public void AddSegment(TraceIndexPairs pairs, ulong segmentId)
+    {
+        var refs = pairs.Refs;
+        _entries.EnsureCapacity(_entries.Count + pairs.Traces);
+        int i = 0;
+        while (i < refs.Length)
+        {
+            var id  = refs[i].TraceId;
+            int end = i + 1;
+            while (end < refs.Length && refs[end].TraceId.Equals(id)) end++;
+
+            var offsets = new uint[end - i];
+            for (int k = i; k < end; k++) offsets[k - i] = refs[k].Offset;
+            _entries.Add((TraceIndexFile.KeyOf(id), segmentId, offsets));
+            i = end;
+        }
+    }
+
     private static bool IsAscending(uint[] o)
     {
         for (int i = 1; i < o.Length; i++)
@@ -499,32 +529,70 @@ internal sealed class TraceIndexReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads block <paramref name="index"/> and decompresses it into <paramref name="raw"/>, an array
+    /// RENTED from the shared pool that the caller returns (also when this answers false, if it is
+    /// non-null). False when the block will not decode; throws when the file will not open.
+    ///
+    /// <para>THROUGH A HANDLE AND <see cref="RandomAccess"/>, NOT A <c>FileStream</c> (#94). A
+    /// <c>FileStream</c> per block read — the reader reopens the file for every block, see
+    /// <see cref="Retire"/> — cost its strategy objects and an 8 KB read buffer each time: ~9.9 KB
+    /// per block, 29.8 KB for a lookup that hits all three runs (TraceIndexLookupPoolTests). The block
+    /// is two positioned reads, the 8-byte header into the stack and the payload into a pooled
+    /// array, so a buffer in front of them only copied. Still one open per block and nothing held
+    /// between reads: the hold stays on the path, as <see cref="Retire"/> requires.</para>
+    /// </summary>
+    private bool TryReadBlock(int index, out byte[]? raw, out int rawLen)
+    {
+        raw    = null;
+        rawLen = 0;
+        using var handle = File.OpenHandle(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        long at     = _blockOffset[index];
+        long length = RandomAccess.GetLength(handle);
+
+        Span<byte> hdr = stackalloc byte[8];
+        if (!ReadExactlyAt(handle, hdr, at)) return false;
+        at += hdr.Length;
+        int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
+        int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
+
+        // Both lengths bounded before either is used to size anything: the compressed one by
+        // the bytes actually left in the file, the uncompressed one by the constant, because
+        // nothing on disk limits what a payload inflates to.
+        if (!FileBounds.LengthFits(comp, length - at))           return false;
+        if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes) return false;
+
+        byte[] c = ArrayPool<byte>.Shared.Rent(comp);
+        try
+        {
+            if (!ReadExactlyAt(handle, c.AsSpan(0, comp), at)) return false;
+            raw    = ArrayPool<byte>.Shared.Rent(uncomp);
+            rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
+            return rawLen >= 0;
+        }
+        finally { ArrayPool<byte>.Shared.Return(c); }
+    }
+
+    /// <summary>Fills <paramref name="into"/> from <paramref name="offset"/>; false at a premature end of file.</summary>
+    private static bool ReadExactlyAt(Microsoft.Win32.SafeHandles.SafeFileHandle handle, Span<byte> into, long offset)
+    {
+        while (!into.IsEmpty)
+        {
+            int n = RandomAccess.Read(handle, into, offset);
+            if (n <= 0) return false;
+            into    = into[n..];
+            offset += n;
+        }
+        return true;
+    }
+
     /// <summary>One block, fully decoded, or null when it will not decode.</summary>
     private List<(ulong Key, ulong SegmentId, uint[] Offsets)>? ReadWholeBlock(int index)
     {
         byte[]? raw = null;
         try
         {
-            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 8 * 1024);
-            fs.Seek(_blockOffset[index], SeekOrigin.Begin);
-
-            Span<byte> hdr = stackalloc byte[8];
-            fs.ReadExactly(hdr);
-            int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
-            int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
-            if (!FileBounds.LengthFits(comp, fs.Length - fs.Position)) return null;
-            if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes)   return null;
-
-            int rawLen;
-            byte[] c = ArrayPool<byte>.Shared.Rent(comp);
-            try
-            {
-                fs.ReadExactly(c, 0, comp);
-                raw    = ArrayPool<byte>.Shared.Rent(uncomp);
-                rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
-                if (rawLen < 0) return null;
-            }
-            finally { ArrayPool<byte>.Shared.Return(c); }
+            if (!TryReadBlock(index, out raw, out int rawLen)) return null;
 
             var into = new List<(ulong, ulong, uint[])>();
             var cur  = new Cursor(raw.AsSpan(0, rawLen));
@@ -654,32 +722,9 @@ internal sealed class TraceIndexReader : IDisposable
         // thing the reader does is read the bloom's memory and reopen the file.
         _beforeBlockReadForTest?.Invoke(index);
         byte[]? raw = null;
-        int rawLen  = 0;
         try
         {
-            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 8 * 1024);
-            fs.Seek(_blockOffset[index], SeekOrigin.Begin);
-
-            Span<byte> hdr = stackalloc byte[8];
-            fs.ReadExactly(hdr);
-            int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
-            int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
-
-            // Both lengths bounded before either is used to size anything: the compressed one by
-            // the bytes actually left in the file, the uncompressed one by the constant, because
-            // nothing on disk limits what a payload inflates to.
-            if (!FileBounds.LengthFits(comp, fs.Length - fs.Position)) return false;
-            if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes)   return false;
-
-            byte[] c = ArrayPool<byte>.Shared.Rent(comp);
-            try
-            {
-                fs.ReadExactly(c, 0, comp);
-                raw    = ArrayPool<byte>.Shared.Rent(uncomp);
-                rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
-                if (rawLen < 0) return false;
-            }
-            finally { ArrayPool<byte>.Shared.Return(c); }
+            if (!TryReadBlock(index, out raw, out int rawLen)) return false;
 
             var cur = new Cursor(raw.AsSpan(0, rawLen));
             while (cur.Remaining > 0)

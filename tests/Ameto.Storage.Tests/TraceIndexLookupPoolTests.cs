@@ -168,4 +168,45 @@ public sealed class TraceIndexLookupPoolTests : IDisposable
             + "working lists per call again");
         store.Dispose();
     }
+
+    /// <summary>
+    /// A HIT IN EVERY RUN READS ITS BLOCKS WITHOUT A STREAM BUFFER (#94). Each block read reopens the
+    /// run's file (the hold is on the path — see <c>TraceIndexReader.Retire</c>), and it used to open
+    /// a <c>FileStream</c>, whose strategy objects and 8 KB buffer were allocated per block: 29 768 B
+    /// for one lookup that hits all three runs (measured, Debug). Two positioned reads through a
+    /// handle need no buffer. What is left is the answer itself — a hit and its offsets per run — and
+    /// a file handle per block read.
+    ///
+    /// <para>Warm and best of five, so a first rent from the pool is not counted. Reverted (a
+    /// <c>FileStream</c> per block): ~30 KB a lookup, past the gate.</para>
+    /// </summary>
+    [Fact]
+    public void A_lookup_that_hits_every_run_allocates_no_stream_buffers()
+    {
+        var store = new TraceIndexStore(NullLogger.Instance);
+        var runs  = new[] { WriteRun("hit-a.tix", 1), WriteRun("hit-b.tix", 2), WriteRun("hit-c.tix", 3) };
+        foreach (var r in runs) Assert.True(store.Add(r));
+
+        var ids = new TraceId[50];
+        for (int i = 0; i < ids.Length; i++) ids[i] = Id(i * 173);
+        for (int w = 0; w < 20; w++) foreach (var id in ids) store.Lookup(id);   // warm, and seed the pool
+
+        long best = long.MaxValue;
+        for (int pass = 0; pass < 5; pass++)
+        {
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            foreach (var id in ids)
+            {
+                var a = store.Lookup(id);
+                if (a.Hits.Count != runs.Length || a.Unanswerable is not null) Assert.Fail("a planted id was not found in every run");
+            }
+            best = Math.Min(best, GC.GetAllocatedBytesForCurrentThread() - a0);
+        }
+
+        double perLookup = (double)best / ids.Length;
+        _out.WriteLine($"hit-in-all-{runs.Length}-runs lookups: {best:N0} B for {ids.Length} ({perLookup:N0} B/lookup, best of 5)");
+        Assert.True(perLookup < 2_048,
+            $"a lookup that hits {runs.Length} runs allocated {perLookup:N0} B — a block read is buffering again");
+        store.Dispose();
+    }
 }

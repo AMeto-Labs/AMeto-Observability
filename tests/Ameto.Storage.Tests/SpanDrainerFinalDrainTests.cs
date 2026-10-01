@@ -158,4 +158,152 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
         await foreach (var _ in engine.GetTraceAsync(trace)) found++;
         Assert.Equal(1, found);
     }
+
+    /// <summary>
+    /// A DRAIN LOOP THAT ENDS IN A FAULT STILL ENDS IN THE DRAINER'S OWN FLUSH (#94, review F3).
+    /// <c>DisposeAsync</c> caught only <c>OperationCanceledException</c> around the join: any other
+    /// exception out of the drain task left the disposal, and the <c>FlushHotTier</c> after it never
+    /// ran. bd43e15 met it through a final drain that threw; both drains now catch per batch (the
+    /// next fact), so what can still fault the task is a throw outside them.
+    ///
+    /// <para>At the seams: the first park publishes one span and returns, so the loop writes it into
+    /// the hot tier; the second park — the loop is idle again — throws an
+    /// <see cref="InvalidOperationException"/>, which no catch in the loop takes, and the task
+    /// faults. The span is then in the tier and nowhere else.</para>
+    ///
+    /// <para>Reverted (only the cancellation caught at the join): <c>DisposeAsync</c> throws the
+    /// seam's exception, and the span is still in the hot tier with no cold segment.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_drain_loop_that_faults_is_logged_and_the_tier_is_still_flushed()
+    {
+        var pools = new SpanStringPools();
+        using var ring   = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024, pools);
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance, false, true, null, pools);
+        var trace  = new TraceId(0xD2A3, 11);
+        var logger = new CapturingLogger();
+
+        int parks = 0;
+        var faulted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // `await using` after the ring and the engine, as above: the loop is joined before the ring is freed.
+        await using var drainer = new SpanDrainer(ring, engine, logger, startLoop: true,
+            beforeParkForTest: _ =>
+            {
+                int park = Interlocked.Increment(ref parks);
+                if (park == 1)
+                {
+                    var h = new SpanHeader
+                    {
+                        TraceId           = trace,
+                        SpanId            = new SpanId(1),
+                        StartTimeUnixNano = 1_785_000_000_000_000_000L,
+                        DurationNanos     = 1_000,
+                        Kind              = SpanKind.Server,
+                    };
+                    Assert.True(ring.TryEnqueueRaw(in h, "GET /faulted"u8, -1, "gateway"u8, []));
+                    ring.EndBatch();
+                    return;                                       // the loop drains it into the tier
+                }
+                if (park != 2) return;
+                faulted.TrySetResult();
+                throw new InvalidOperationException("park fault (test seam)");
+            });
+
+        await faulted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.True(engine.HotBytesForTest > 0, "the span did not reach the hot tier before the fault");
+        var disposal = await Record.ExceptionAsync(() => drainer.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.Null(disposal);                                   // the fault stayed inside the disposal
+        Assert.Equal(2, Volatile.Read(ref parks));               // the loop parked twice, and the second one faulted it
+        Assert.Equal(0, engine.HotBytesForTest);                 // the drainer's own flush ran
+        Assert.Equal(1, engine.ColdSegmentCountForTest);
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && e.Error is InvalidOperationException);
+        int found = 0;
+        await foreach (var _ in engine.GetTraceAsync(trace)) found++;
+        Assert.Equal(1, found);
+    }
+
+    /// <summary>
+    /// A BATCH THAT THROWS IN THE FINAL DRAIN DOES NOT STRAND THE BATCHES BEHIND IT (review of this
+    /// branch). The pass ended at the first batch that threw, and every span queued after it — all of
+    /// them acknowledged to their exporters — stayed in the ring and was never written.
+    ///
+    /// <para>At the seams: the park seam publishes three batches' worth (1 536 spans) and cancels, so
+    /// the final drain has three batches to take; the engine's after-hold seam throws once, in the
+    /// first batch's first hold (128 spans in the tier, the rest of that batch released). Reverted
+    /// (the pass stops at the throw): 1 024 spans left in the ring, 128 written.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_batch_that_throws_in_the_final_drain_does_not_strand_the_batches_behind_it()
+    {
+        const int Published = 3 * 512;
+        var pools = new SpanStringPools();
+        using var ring   = new SpanRingBuffer(capacity: 4_096, maxBytes: 8 * 1024 * 1024, pools);
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance, false, true, null, pools);
+        var logger = new CapturingLogger();
+
+        int holds = 0;
+        engine._afterWriteHoldForTest = _ =>
+        {
+            if (Interlocked.Increment(ref holds) == 1)
+                throw new InvalidOperationException("one bad batch (test seam)");
+        };
+
+        int parks = 0;
+        var cancelledWhileParking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var drainer = new SpanDrainer(ring, engine, logger, startLoop: true,
+            beforeParkForTest: cts =>
+            {
+                if (Interlocked.Increment(ref parks) != 1) return;
+                for (int i = 0; i < Published; i++)
+                {
+                    var h = new SpanHeader
+                    {
+                        TraceId           = new TraceId(0xD2A4, (ulong)(i + 1)),
+                        SpanId            = new SpanId((ulong)(i + 1)),
+                        StartTimeUnixNano = 1_785_000_000_000_000_000L + i,
+                        DurationNanos     = 1_000,
+                        Kind              = SpanKind.Server,
+                    };
+                    Assert.True(ring.TryEnqueueRaw(in h, "GET /batch"u8, -1, "gateway"u8, []));
+                }
+                ring.EndBatch();
+                cts.Cancel();
+                cancelledWhileParking.TrySetResult();
+            });
+
+        await cancelledWhileParking.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await drainer.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+
+        long written = 0;
+        foreach (var s in engine.ColdSegmentsForTest) written += s.SpanCount;
+        Assert.Equal(0, ring.ApproximateCount);                              // nothing left behind
+        Assert.Equal(128 + 2 * 512, written);                                 // the batches after the bad one
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && e.Error is InvalidOperationException);
+        int found = 0;
+        await foreach (var _ in engine.GetTraceAsync(new TraceId(0xD2A4, Published))) found++;
+        Assert.Equal(1, found);                                               // the very last span
+    }
+
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<SpanDrainer>
+    {
+        private readonly List<(Microsoft.Extensions.Logging.LogLevel Level, Exception? Error)> _entries = [];
+
+        public IReadOnlyList<(Microsoft.Extensions.Logging.LogLevel Level, Exception? Error)> Entries
+        {
+            get { lock (_entries) return [.. _entries]; }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level,
+                                Microsoft.Extensions.Logging.EventId eventId, TState state,
+                                Exception? error, Func<TState, Exception?, string> formatter)
+        {
+            lock (_entries) _entries.Add((level, error));
+        }
+    }
 }

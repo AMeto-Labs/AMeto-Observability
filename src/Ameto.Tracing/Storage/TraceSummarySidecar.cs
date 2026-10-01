@@ -93,7 +93,9 @@ internal static class TraceSummarySidecar
     /// in INSERTION order, and "the first empty-parent span wins the root slot" is a statement
     /// about the walk.
     /// </summary>
-    internal static void WriteOrdered(string baseTrcPath, in OrderedSpans spans, string? outputPath = null)
+    /// <param name="scratch">The engine's scratch the body is rented from and returned to (#90), or null for the shared pool.</param>
+    internal static void WriteOrdered(string baseTrcPath, in OrderedSpans spans, string? outputPath = null,
+                                      SpanWriteScratch? scratch = null)
     {
         int spanCount = spans.Count;
         if (spanCount == 0) return;
@@ -200,7 +202,8 @@ internal static class TraceSummarySidecar
         // service index per span — so it grows at most once or twice rather than a dozen times.
         int    rawLength;
         byte[] compBody;
-        var body = new PooledBody(ArrayPool<byte>.Shared.Rent(traces.Count * 80 + spans.Count * 4 + 256));
+        var body = new PooledBody(scratch?.RentBody(traces.Count * 80 + spans.Count * 4 + 256)
+                                  ?? ArrayPool<byte>.Shared.Rent(traces.Count * 80 + spans.Count * 4 + 256), scratch);
         try
         {
             body.UInt32((uint)poolArr.Count);
@@ -590,8 +593,9 @@ internal static class TraceSummarySidecar
     /// </summary>
     private ref struct PooledBody
     {
-        private byte[] _buf;
-        private int    _len;
+        private byte[]                     _buf;
+        private int                        _len;
+        private readonly SpanWriteScratch? _scratch;
 
         /// <param name="rented">
         /// The first buffer, rented BY THE CALLER, where the size it is rented at can be seen to be
@@ -599,10 +603,12 @@ internal static class TraceSummarySidecar
         /// rent sized by a parameter reads to it as a size that may have come from a file). Owned
         /// from here on: <see cref="Dispose"/> returns it, or whatever it grew into.
         /// </param>
-        public PooledBody(byte[] rented)
+        /// <param name="scratch">Where <see cref="Dispose"/> gives the final buffer back — the engine's scratch, or null for the shared pool.</param>
+        public PooledBody(byte[] rented, SpanWriteScratch? scratch)
         {
-            _buf = rented;
-            _len = 0;
+            _buf     = rented;
+            _len     = 0;
+            _scratch = scratch;
         }
 
         public readonly int                Length  => _len;
@@ -637,7 +643,10 @@ internal static class TraceSummarySidecar
 
         public void Dispose()
         {
-            ArrayPool<byte>.Shared.Return(_buf);
+            // Every buffer this held came from ArrayPool.Shared.Rent (the scratch rents there too),
+            // so the one it ends with may go to either.
+            if (_scratch is not null) _scratch.ReturnBody(_buf);
+            else                      ArrayPool<byte>.Shared.Return(_buf);
             _buf = [];
             _len = 0;
         }
