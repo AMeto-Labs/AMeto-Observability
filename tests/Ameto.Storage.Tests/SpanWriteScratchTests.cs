@@ -109,4 +109,39 @@ public sealed class SpanWriteScratchTests : IDisposable
         s.Return(a);
         Assert.Same(a, s.HeldForTest.Order);                              // the last given back is kept
     }
+
+    /// <summary>
+    /// A RENTER LARGER THAN THE KEPT ARRAY DOES NOT EVICT IT (review F5). Every compaction pass over
+    /// 65 536 spans is one: the kept flush-sized array went to the shared pool, the pass's own array
+    /// (past the cap) went there too, and the next flush found every slot empty — ~2 MB of LOH again.
+    /// The too-small array now stays in its slot, and the large one is the shared pool's alone.
+    /// Reverted (evicted): the slots are empty after the pass.
+    /// </summary>
+    [Fact]
+    public void A_renter_larger_than_the_kept_array_leaves_it_for_the_next_flush()
+    {
+        var s = new SpanWriteScratch();
+        var order = s.RentOrder(SpanWriteScratch.MaxKeptElements);
+        var keys  = s.RentKeys(SpanWriteScratch.MaxKeptElements);
+        var refs  = s.RentPairs(SpanWriteScratch.MaxKeptElements);
+        s.Return(order);
+        s.Return(keys);
+        s.Return(refs);
+
+        // A compaction pass of 120 000 spans: every array it rents is past the kept ones.
+        var bigOrder = s.RentOrder(120_000);
+        var bigKeys  = s.RentKeys(120_000);
+        var bigRefs  = s.RentPairs(120_000);
+        Assert.NotSame(order, bigOrder);
+        Assert.Same(order, s.HeldForTest.Order);                          // still there while the pass runs
+        s.Return(bigOrder);
+        s.Return(bigKeys);
+        s.Return(bigRefs);
+
+        var held = s.HeldForTest;                                         // …and after it
+        Assert.Same(order, held.Order);
+        Assert.Same(keys,  held.Keys);
+        Assert.Same(refs,  held.Pairs);
+        Assert.Same(order, s.RentOrder(50_000));                          // the next flush gets it
+    }
 }

@@ -64,7 +64,13 @@ internal sealed class SpanWriteScratch
         if (held is not null)
         {
             if (held.Length >= n) return held;
-            ArrayPool<T>.Shared.Return(held);     // too small for this one: the shared pool may place it
+
+            // TOO SMALL FOR THIS RENTER, NOT FOR THE NEXT FLUSH (review F5). Handed to the shared pool,
+            // the kept array was lost to every compaction pass over 65 536 spans — whose own array is
+            // past the cap and goes there too — so the next flush found the slot empty and paid
+            // ~2 MB of LOH again. Put back, unless a Give filled the slot meanwhile.
+            if (Interlocked.CompareExchange(ref slot, held, null) is not null)
+                ArrayPool<T>.Shared.Return(held);
         }
         return ArrayPool<T>.Shared.Rent(n);
     }
