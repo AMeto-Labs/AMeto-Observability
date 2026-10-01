@@ -11,8 +11,10 @@ namespace Ameto.Query;
 ///
 /// Execution pipeline for cold-tier segments:
 ///   1. Time-range filter on <see cref="SegmentInfo"/> (skip segments outside window).
-///   2. Index fast-skip: open each group's <see cref="SegmentIndexView"/> — the cached memo of
-///      what earlier queries worked out, reading a section only for a new question — and call
+///   2. Index fast-skip, in the order the merge consumes segments and only as far as the page
+///      reaches (a batch at a time, see <see cref="MergeSourcesAsync"/>): open each group's
+///      <see cref="SegmentIndexView"/> — the cached memo of what earlier queries worked out,
+///      reading a section only for a new question — and call
 ///      <see cref="ISegmentIndex.MightContain"/>; skip groups where the index says no match.
 ///   3. Candidate narrowing: trigram (<see cref="ISegmentIndex.LookupTrigram"/>) and
 ///      inverted (<see cref="ISegmentIndex.LookupIntersect"/>) posting lists yield
@@ -222,37 +224,42 @@ public sealed class QueryExecutor : IQueryExecutor
         ScanPace                             pace,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        // Open one async iterator per segment that survives index/trigram fast-skip.
-        // Run the prefilter (bloom/inverted + trigram-offsets) in parallel across
-        // segments — each segment opens its mmap independently and we typically
-        // discard most of them via bloom. Doing this sequentially across hundreds
-        // of segments was the dominant query cost (~7-10s for 217 segments).
-        List<PrefilterResult> prefiltered = segInfos.Count == 0
-            ? []
-            : await PrefilterSegmentsAsync(
-                  segInfos, filter, levels,
-                  from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
+        long fromTicks = from?.UtcTicks ?? long.MinValue;
+        long toTicks   = to?.UtcTicks   ?? long.MaxValue;
 
-        // From here on the prefilter's readers are owned by this method's finally, so
-        // everything that could throw has to be inside the try — building the priming
-        // order included. The finally releases them through `prefiltered`, so they are
-        // released even when the ordered array below was never built.
-        var iterators = new List<IAsyncEnumerator<LogEvent>>(prefiltered.Count + 1);
+        // Priming order, for EVERY segment of the window and before any of them is opened: the
+        // merge front moves one way through time, so segments are consumed in that order too —
+        // newest MaxTs first going backward, oldest MinTs first going forward. The prefilter
+        // walks the same order (see PrimeAsync), which is what lets it stop where the page does.
+        // Stable like the OrderBy it replaces (ties keep catalog order): the key carries the
+        // input index, so an unstable Array.Sort cannot reorder ties.
+        var keyed = new PrimeEntry[segInfos.Count];
+        for (int i = 0; i < keyed.Length; i++)
+        {
+            var s = segInfos[i];
+            keyed[i] = new PrimeEntry(forward ? s.MinTimestampTicks : s.MaxTimestampTicks, i, s);
+        }
+        keyed.AsSpan().Sort(new PrimeOrder(descending: !forward));
+        var order = new SegmentInfo[keyed.Length];
+        for (int i = 0; i < order.Length; i++) order[i] = keyed[i].Info;
+
+        // The priming queue: the segments that survived the prefilter, in priming order, each
+        // with the reader the prefilter opened. It is also the only OWNER of those readers — the
+        // finally closes every one of them, primed or not. A filter with nothing to ask an index
+        // has every segment survive without opening any, so it skips the prefilter outright.
+        bool prefilter   = NeedsPrefilter(filter, levels);
+        var  survivors   = new List<PrefilterResult>(prefilter ? Math.Min(order.Length, PrefilterParallelism) : order.Length);
+        int  checkedUpTo = 0;                    // order[..checkedUpTo] has been through the prefilter
+        int  batch       = PrefilterParallelism; // the next prefilter batch; doubles each time
+        if (!prefilter)
+        {
+            foreach (var s in order) survivors.Add(new PrefilterResult(s, null, null));
+            checkedUpTo = order.Length;
+        }
+
+        var iterators = new List<IAsyncEnumerator<LogEvent>>();
         try
         {
-            // Priming order: the merge front moves one way through time, so segments are
-            // consumed in that order too — newest MaxTs first going backward, oldest MinTs
-            // first going forward.
-            // Stable like the OrderBy it replaces (ties keep prefilter order = catalog order):
-            // the key carries the input index, so an unstable Array.Sort cannot reorder ties.
-            var ordered = new PrimeEntry[prefiltered.Count];
-            for (int i = 0; i < ordered.Length; i++)
-            {
-                var p = prefiltered[i];
-                ordered[i] = new PrimeEntry(forward ? p.Info.MinTimestampTicks : p.Info.MaxTimestampTicks, i, p);
-            }
-            ordered.AsSpan().Sort(new PrimeOrder(descending: !forward));
-
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
             // the comparer; .NET's PriorityQueue is a min-heap.
             var comparer = forward ? MergeAsc : MergeDesc;
@@ -273,30 +280,59 @@ public sealed class QueryExecutor : IQueryExecutor
                 await hotIt.DisposeAsync();
             }
 
+            // A segment can only matter while it could still beat the merge front: going
+            // backward its MaxTs is an upper bound on anything it can produce, so once the
+            // heap's best is newer than that, neither it nor any later segment (they are
+            // ordered) can contribute. Ties prime, so equal timestamps are never dropped. An
+            // empty heap has no front yet, and anything could beat it.
+            bool CouldBeat(SegmentInfo info) =>
+                !heap.TryPeek(out _, out var best)
+                || (forward ? info.MinTimestampTicks <= best.ts : info.MaxTimestampTicks >= best.ts);
+
             // Open segments LAZILY. Priming every surviving segment up front is what made a
             // page cost the whole catalog: an unfiltered `count=50` takes GetSegments(null,
             // null) — every segment there is — memory-maps all of them and decompresses a
             // block from each, only to serve 50 events off the top of the heap. On the
             // sandbox stand that is 291 opens for one page.
             //
-            // A segment can only matter while it could still beat the merge front: going
-            // backward its MaxTs is an upper bound on anything it can produce, so once the
-            // heap's best is newer than that, neither it nor any later segment (they are
-            // ordered) can contribute. Ties prime, so equal timestamps are never dropped.
+            // PREFILTER them lazily too, for the same reason one step earlier. The prefilter
+            // used to run over every segment of the window before the first row — open the
+            // file, read each group's bloom, copy its inverted section — and a 50-row page then
+            // primed the newest handful of them. A filtered page cost the WINDOW, not the page:
+            // on a copy of the sandbox stand, in a 512 MB two-core container with a cold page
+            // cache, `['service.name'] = 'Axiom.API'` took 0.10 s over a day and 0.95 s over 90
+            // days for the same 50 rows, nearly all of it prefilter. The queue is now filled a
+            // batch of the priming order at a time — only when it runs dry, and only while the
+            // next unchecked segment could still beat the front: the bound priming already uses,
+            // and the order makes that one check answer for every segment after it.
+            //
+            // Batches double from one wave of the prefilter's parallelism. A page the newest k
+            // segments can fill checks fewer than 2k + PrefilterParallelism of them; a filter
+            // that has to see the whole window — a rare value, or one that is not there — still
+            // gets through it in parallel, in log2(n) rounds instead of one.
             async ValueTask PrimeAsync()
             {
-                while (next < ordered.Length)
+                while (true)
                 {
-                    if (heap.Count > 0 && heap.TryPeek(out _, out var best))
+                    if (next == survivors.Count)
                     {
-                        var info = ordered[next].Entry.Info;
-                        bool couldBeat = forward
-                            ? info.MinTimestampTicks <= best.ts
-                            : info.MaxTimestampTicks >= best.ts;
-                        if (!couldBeat) return;
+                        if (checkedUpTo == order.Length || !CouldBeat(order[checkedUpTo])) return;
+
+                        int take   = Math.Min(batch, order.Length - checkedUpTo);
+                        var passed = await PrefilterSegmentsAsync(
+                            new ArraySegment<SegmentInfo>(order, checkedUpTo, take),
+                            filter, levels, fromTicks, toTicks, ct);
+                        // Survivors come back in input order and the input is the next slice
+                        // of the priming order, so appending keeps the queue ordered.
+                        survivors.AddRange(passed);
+                        checkedUpTo += take;
+                        batch        = Math.Min(batch * 2, order.Length);
+                        continue;
                     }
 
-                    var (segInfo, candidateOffsets, segReader) = ordered[next++].Entry;
+                    if (!CouldBeat(survivors[next].Info)) return;
+
+                    var (segInfo, candidateOffsets, segReader) = survivors[next++];
                     // The reader is BORROWED — the finally below owns every one of them,
                     // primed or not, so the scan must not dispose what it did not open.
                     var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets, segReader,
@@ -342,13 +378,14 @@ public sealed class QueryExecutor : IQueryExecutor
                 try { await it.DisposeAsync(); } catch { /* best-effort */ }
             }
 
-            // …and every reader the prefilter opened, INCLUDING the segments that never
-            // primed — most of them, for a small page. This is the only owner: the scan
-            // borrows, the iterator above closes only what it opened itself. Until this
-            // runs, those files cannot be deleted on Windows; the merge already handles a
-            // source held open by an in-flight query (manifest kept, recovery sweep
-            // finishes), and the hold is bounded by this query either way.
-            foreach (var p in prefiltered)
+            // …and every reader the prefilter carried, INCLUDING survivors that never primed —
+            // the rest of the last batch, for a small page. This is the only owner: the scan
+            // borrows, the iterator above closes only what it opened itself, and a batch that
+            // failed closed its own before throwing. Until this runs, those files cannot be
+            // deleted on Windows; the merge already handles a source held open by an in-flight
+            // query (manifest kept, recovery sweep finishes), and the hold is bounded by this
+            // query either way.
+            foreach (var p in survivors)
             {
                 if (p.Reader is { } r)
                 {
@@ -381,8 +418,8 @@ public sealed class QueryExecutor : IQueryExecutor
     /// </summary>
     private readonly record struct PrefilterResult(SegmentInfo Info, uint[]? CandidateOffsets, SegmentReader? Reader);
 
-    /// <summary>A prefilter survivor keyed for the priming order (see <see cref="PrimeOrder"/>).</summary>
-    private readonly record struct PrimeEntry(long Key, int Index, PrefilterResult Entry);
+    /// <summary>A window segment keyed for the priming order (see <see cref="PrimeOrder"/>).</summary>
+    private readonly record struct PrimeEntry(long Key, int Index, SegmentInfo Info);
 
     /// <summary>
     /// The priming order — MinTs ascending going forward, MaxTs descending going backward
@@ -399,13 +436,31 @@ public sealed class QueryExecutor : IQueryExecutor
     }
 
     /// <summary>
-    /// Runs bloom/inverted fast-skip and trigram offset lookup for every cold
-    /// segment in parallel, opening each segment's mmap exactly once. Survivors come
+    /// How many segments the prefilter works on at once: one per core, at most 8 — each one in
+    /// flight holds index sections of several MB (see <see cref="PrefilterSegmentsAsync"/>). It is
+    /// also the merge's FIRST prefilter batch, one wave of this parallelism, so a page the newest
+    /// few segments can fill pays for no more of them than that.
+    /// </summary>
+    internal static readonly int PrefilterParallelism = Math.Min(Environment.ProcessorCount, 8);
+
+    /// <summary>
+    /// Whether <see cref="PrefilterSegmentsAsync"/> has anything to ask an index: an equality or
+    /// inverted hint, a substring predicate, or a level set. Without one every segment passes
+    /// through unopened, and the merge does that without calling it.
+    /// </summary>
+    private static bool NeedsPrefilter(CompiledFilter filter, HashSet<Ameto.Core.LogLevel>? levels) =>
+        (!filter.IsMatchAll && filter.TryGetIndexHint(out _, out _))
+        || filter.GetInvertedHints().Count > 0
+        || filter.GetTrigramHints().Count > 0
+        || levels is { Count: > 0 };
+
+    /// <summary>
+    /// Runs bloom/inverted fast-skip and trigram offset lookup for one batch of cold
+    /// segments in parallel, opening each segment's mmap exactly once. Survivors come
     /// back in <paramref name="segInfos"/> order — results are written into a slot per
-    /// input index, so the parallel completion order does not leak out — but that is
-    /// only determinism, not a priority: <see cref="MergeColdSegmentsAsync"/> re-sorts
-    /// by MinTs or MaxTs for the lazy-priming order before it opens anything, so
-    /// nothing downstream reads any meaning into the order returned here.
+    /// input index, so the parallel completion order does not leak out — and the merge
+    /// RELIES on that: it hands over consecutive slices of its priming order and appends
+    /// what survives to its priming queue as is (<see cref="MergeSourcesAsync"/>).
     ///
     /// <para>The unit of prefiltering is the INDEX GROUP, not the file. A single bloom
     /// stretched over 24 h answers "maybe" to everything, so a day-scale segment would
@@ -422,6 +477,16 @@ public sealed class QueryExecutor : IQueryExecutor
         long                          toTicks,
         CancellationToken             ct)
     {
+        // Fast path: nothing to prefilter — pass every segment through. The merge never asks
+        // (it primes such a filter straight from the catalog); this keeps the method whole.
+        if (!NeedsPrefilter(filter, levels))
+        {
+            var passthrough = new List<PrefilterResult>(segInfos.Count);
+            foreach (var info in segInfos)
+                passthrough.Add(new PrefilterResult(info, null, null));
+            return passthrough;
+        }
+
         // GetTrigramHints() returns a pre-computed list — no .ToList() allocation needed.
         var trigramHints   = filter.GetTrigramHints();
         var invertedHints  = filter.GetInvertedHints();
@@ -443,15 +508,6 @@ public sealed class QueryExecutor : IQueryExecutor
                 levelHints[li++] = [(ClefFields.Level, l.ToSeqString())];
         }
 
-        // Fast path: nothing to prefilter — pass every segment through.
-        if (!hasIndexHint && !hasInvHints && trigramHints.Count == 0 && levelHints is null)
-        {
-            var passthrough = new List<PrefilterResult>(segInfos.Count);
-            foreach (var info in segInfos)
-                passthrough.Add(new PrefilterResult(info, null, null));
-            return passthrough;
-        }
-
         var results = new PrefilterResult?[segInfos.Count];
 
         // Bound parallelism conservatively — each in-flight prefilter holds
@@ -459,8 +515,7 @@ public sealed class QueryExecutor : IQueryExecutor
         // so a high degree of parallelism over hundreds of segments blows
         // working-set memory into the gigabytes. ProcessorCount, capped at 8,
         // is a good balance between throughput and RAM.
-        int degree = Math.Min(Math.Min(Environment.ProcessorCount, 8), segInfos.Count);
-        if (degree < 1) degree = 1;
+        int degree = Math.Max(1, Math.Min(PrefilterParallelism, segInfos.Count));
 
         try
         {

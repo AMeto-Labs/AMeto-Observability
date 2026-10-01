@@ -139,6 +139,72 @@ internal static class QuerySegmentFixtures
         return (engine, query);
     }
 
+    // ── Many small INDEXED segments ───────────────────────────────────────────
+
+    /// <summary>Events in <see cref="ManyIndexedSegmentsAsync"/>: one more in every fifth segment.</summary>
+    public const int ManyIndexedEvents = ManySegments * EventsPerSegment + ManySegments / 5;
+
+    /// <summary>
+    /// The many-segments shape again, written through the production index wiring so a filter
+    /// goes through the index prefilter, with a property shape for each thing a lazy prefilter
+    /// has to get right:
+    /// <list type="bullet">
+    /// <item><c>Customer</c> cycles through four values in every segment, so the newest segment
+    /// alone fills a small page and everything older is work the page does not need.</item>
+    /// <item><c>Batch = 'first'</c> holds in the OLDEST segment only, so a newest-first page has to
+    /// check the whole window to find it, and must still find it.</item>
+    /// <item>Every fifth segment carries one more event three minutes past its own, so time ranges
+    /// overlap and the priming order (by MaxTs) is not the catalog order.</item>
+    /// </list>
+    /// </summary>
+    public static async Task<(StorageEngine Engine, QueryExecutor Query)> ManyIndexedSegmentsAsync(string dir)
+    {
+        Directory.CreateDirectory(dir);
+        var engine = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = dir }),
+            new RetentionStore(new ServerOptions { DataDirectory = dir }, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        engine.IndexSinkFactory = static (estimatedEventCount, termsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
+        var query = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+
+        long baseTicks = new DateTimeOffset(2026, 7, 30, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+        int  tmplIdx   = engine.TemplatePool.Intern("evt {n}");
+        int  svcIdx    = engine.TemplatePool.Intern("Svc.A");
+        var  buf       = new ArrayBufferWriter<byte>(128);
+
+        void Write(int segment, long n, long ticks)
+        {
+            buf.ResetWrittenCount();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(3);
+            w.Write("n");        w.Write(n);
+            w.Write("Customer"); w.Write("cust-" + (n % 4));
+            w.Write("Batch");    w.Write(segment == 0 ? "first" : "later");
+            w.Flush();
+
+            Assert.True(engine.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)n).RawValue,
+                TimestampUtcTicks        = ticks,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = tmplIdx,
+                ServiceNamePoolIndex     = svcIdx,
+            }, buf.WrittenSpan.ToArray()));
+        }
+
+        for (int s = 0; s < ManySegments; s++)
+        {
+            for (int i = 0; i < EventsPerSegment; i++)
+                Write(s, s * EventsPerSegment + i, baseTicks + s * TimeSpan.TicksPerMinute + i * TimeSpan.TicksPerSecond);
+            if (s % 5 == 0)
+                Write(s, 100_000 + s, baseTicks + (s + 3) * TimeSpan.TicksPerMinute + 30 * TimeSpan.TicksPerSecond);
+            await engine.FlushHotTierAsync();
+        }
+        Assert.Equal(ManySegments, engine.ListSegments().Count);
+        return (engine, query);
+    }
+
     // ── Shared query helper ───────────────────────────────────────────────────
 
     /// <summary>Drains a query, stopping at <paramref name="count"/>.</summary>
