@@ -643,7 +643,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// The entry cap of one trace-index merge, from the same budget as a compaction pass: the two
     /// are background chores on one heap. 2 000 000 at the cap; see <see cref="TraceIndexCompactor.MaxEntriesPerMergeFor"/>.
     /// </summary>
-    internal int IndexMergeMaxEntries => TraceIndexCompactor.MaxEntriesPerMergeFor(_mergeBudgetBytes);
+    internal int IndexMergeMaxEntries =>
+        _indexMergeMaxEntriesForTest ?? TraceIndexCompactor.MaxEntriesPerMergeFor(_mergeBudgetBytes);
+
+    /// <summary>
+    /// Test seam: an index-merge entry cap in place of the budget's. A cap a unit test can reach
+    /// with real runs — the smallest budget's is 459 649 entries — so a test can see the merge
+    /// plan by THIS figure rather than the constant (review F2).
+    /// </summary>
+    internal int? _indexMergeMaxEntriesForTest;
 
     /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
     internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;

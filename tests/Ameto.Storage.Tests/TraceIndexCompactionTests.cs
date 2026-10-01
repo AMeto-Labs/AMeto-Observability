@@ -364,6 +364,28 @@ public sealed class TraceIndexCompactionTests : IDisposable
     }
 
     /// <summary>
+    /// …AND A MERGE IS PLANNED BY THAT CAP, NOT BY THE CONSTANT (review F2). The two facts above ask
+    /// the selector themselves; nothing went through <c>CompactIndexOnce</c>, so the engine planning
+    /// by the fixed 2 000 000 again kept the suite green. Here the engine's cap is set to 250 entries
+    /// (a seam: a budget's own cap takes 459 649 entries to reach) over ten L1 runs of 100: one merge
+    /// takes two runs, and nine remain. Reverted (the engine plans with the constant): all ten
+    /// merge, one run remains.
+    /// </summary>
+    [Fact]
+    public void The_engine_merges_by_its_own_entry_cap_not_the_constant()
+    {
+        using var e = new TraceStorageEngine(Dir("engine-cap"), NullLogger<TraceStorageEngine>.Instance,
+                                             writeSegmentFormatV4: false, indexEnabled: true);
+        e._indexMergeMaxEntriesForTest = 250;
+        Build(e, segments: 10, tracesPer: 100);
+        Assert.Equal(10, e.IndexStatsForTest.Runs);
+
+        Assert.True(e.CompactIndexOnce());
+        _out.WriteLine($"cap {e.IndexMergeMaxEntries} entries: 10 runs of 100 → {e.IndexStatsForTest.Runs} run(s)");
+        Assert.Equal(9, e.IndexStatsForTest.Runs);                        // 100 + 100 fit under 250; a third does not
+    }
+
+    /// <summary>
     /// A TINY EXPLICIT BUDGET DOES NOT STARVE THE INDEX MERGE (review of this branch).
     /// <c>Traces:MergeBudgetBytes</c> has no floor, and 14 600 B used to scale the cap to 400 entries:
     /// ten L1 runs of 100 entries merged four at a time, and under fast flushes the L1 run count
