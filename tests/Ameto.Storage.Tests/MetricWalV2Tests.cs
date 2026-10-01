@@ -1219,40 +1219,6 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
-    /// THE UPGRADE'S COMMIT POINT REPLACES THE LOG, AND FAILS THE WAY ITS RETRY EXPECTS. On Windows
-    /// the default move is MoveFileEx with MOVEFILE_WRITE_THROUGH — a durable rename, which
-    /// File.Move cannot ask for; elsewhere it is File.Move and the directory is fsynced after it.
-    /// Durability itself is not observable from a test; what is pinned is the contract the upgrade
-    /// leans on: the file is replaced, a destination held open fails as IOException or
-    /// UnauthorizedAccessException (the two the retry filters on, where a Win32Exception would
-    /// escape it and fail the start), and the directory sync succeeds.
-    /// </summary>
-    [Fact]
-    public void The_durable_move_replaces_the_log_and_fails_the_way_the_retry_expects()
-    {
-        string from = Path.Combine(_dir, "a.tmp"), to = Path.Combine(_dir, "b.wal");
-        File.WriteAllBytes(from, [1, 2, 3]);
-        File.WriteAllBytes(to,   [9]);
-
-        MetricWriteAheadLog.DurableMove(from, to);
-        Assert.Equal([1, 2, 3], File.ReadAllBytes(to));
-        Assert.False(File.Exists(from));
-        Assert.True(MetricWriteAheadLog.SyncDirectory(_dir));
-
-        var missing = Record.Exception(() => MetricWriteAheadLog.DurableMove(from, to));
-        Assert.True(missing is IOException, $"a missing source threw {missing?.GetType().Name}");
-
-        if (OperatingSystem.IsWindows())
-        {
-            File.WriteAllBytes(from, [4]);
-            using var held = new FileStream(to, FileMode.Open, FileAccess.Read, FileShare.None);
-            var locked = Record.Exception(() => MetricWriteAheadLog.DurableMove(from, to));
-            Assert.True(locked is IOException or UnauthorizedAccessException,
-                $"a held destination threw {locked?.GetType().Name}");
-        }
-    }
-
-    /// <summary>
     /// v2 IS THE 64-BYTE HEADER. For a few commits of its own branch the format had v1's 32-byte
     /// header with version 2 in it, entries from byte 32; no release wrote one, but a development
     /// build could have. Such a file is re-initialised with an Error that says what it is — not
@@ -1284,29 +1250,6 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         }
         Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("pre-release"));
         Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("header does not verify"));
-    }
-
-    /// <summary>
-    /// THE DURABLE MOVE WORKS PAST MAX_PATH. MoveFileExW without the <c>\\?\</c> form is limited to
-    /// 260 characters where File.Move is not, so a data directory deep enough failed every upgrade
-    /// on Windows — six attempts, then the log left v1 at every start. The move is made into a
-    /// directory whose path alone is over 260 characters.
-    /// </summary>
-    [Fact]
-    public void The_durable_move_works_past_max_path()
-    {
-        string deep = _dir;
-        while (deep.Length < 300) deep = Path.Combine(deep, "a-directory-name-of-forty-characters-xx");
-        Directory.CreateDirectory(deep);
-        string from = Path.Combine(deep, "metrics.wal.upgrade.tmp"), to = Path.Combine(deep, "metrics.wal");
-        File.WriteAllBytes(from, [1, 2, 3]);
-        File.WriteAllBytes(to,   [9]);
-
-        MetricWriteAheadLog.DurableMove(from, to);
-
-        Assert.Equal([1, 2, 3], File.ReadAllBytes(to));
-        Assert.False(File.Exists(from));
-        Assert.True(MetricWriteAheadLog.SyncDirectory(deep));
     }
 
     private sealed class CapturingLogger : ILogger

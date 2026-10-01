@@ -149,7 +149,8 @@ jobs:
   #
   # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
   # madvise(MADV_DONTNEED) on Linux — see the second step), and the span bloom under invariant
-  # globalization, the Docker image's mode (the third step). The whole suite already runs above; this job
+  # globalization, the Docker image's mode (the third step), and the WALs' durable upgrade rename and
+  # the span WAL's relocation record (the fourth). The whole suite already runs above; this job
   # exists for the code that only does anything on Linux, or only in production's mode.
   #
   # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
@@ -249,6 +250,36 @@ jobs:
                    A_segment_flushed_under_ru_KZ_answers_in_full_under_another_culture; do
             if ! grep -q "Passed Ameto.Storage.Tests.SpanBloomCanonicalTests.$t" bloom-output.txt; then
               echo "::error::SpanBloomCanonicalTests.$t did not run and pass under invariant globalization."
+              exit 1
+            fi
+          done
+
+      # THE WRITE-AHEAD LOGS' UPGRADE AND RELOCATION, ON LINUX. Both WALs commit a format upgrade with
+      # a rename made durable by DurableFile (Ameto.Core): MoveFileEx write-through on Windows, which
+      # the backend job above runs, and on Linux File.Move followed by an fsync of the directory —
+      # the path the Linux stand and the Docker image take, and one no CI run exercised (#103 moved it
+      # to Core from the metric WAL and gave it to the span WAL). The span WAL's v3 facts run here
+      # too: the relocation record and its finish at open, which this platform forces to disk with
+      # msync rather than FlushViewOfFile, and every kill-matrix row, which reads the log through a
+      # second handle while it is mapped — coherent through the page cache here, through the cache
+      # manager on Windows. Same guard as above: each named fact must appear as Passed.
+      - name: Test the WALs' durable upgrade and the span WAL's relocation (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~DurableFileTests|FullyQualifiedName~SpanWalV3Tests" \
+            --logger "console;verbosity=normal" 2>&1 | tee wal-output.txt
+
+          for t in DurableFileTests.The_durable_move_replaces_the_log_and_fails_the_way_the_retry_expects \
+                   DurableFileTests.The_durable_move_works_past_max_path \
+                   DurableFileTests.Both_write_ahead_logs_upgrade_through_the_durable_move \
+                   SpanWalV3Tests.A_v2_log_deep_in_a_long_path_is_upgraded_through_the_durable_move \
+                   SpanWalV3Tests.A_v2_log_is_upgraded_to_v3_and_replays_every_span \
+                   SpanWalV3Tests.A_process_killed_anywhere_inside_a_commit_replays_every_surviving_span_once \
+                   SpanWalV3Tests.The_open_that_finishes_a_relocation_forces_it_to_disk; do
+            if ! grep -q "Passed Ameto.Storage.Tests.$t" wal-output.txt; then
+              echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1
             fi
           done

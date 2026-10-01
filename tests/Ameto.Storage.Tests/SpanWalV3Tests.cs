@@ -785,7 +785,10 @@ public sealed class SpanWalV3Tests : IDisposable
     }
 
     /// <summary>Writes a v1 or v2 log by hand — a 32-byte header, then the entries — at 64 KB of capacity.</summary>
-    private void WriteLegacyLog(ushort version, uint headerGeneration, params byte[][] entries)
+    private void WriteLegacyLog(ushort version, uint headerGeneration, params byte[][] entries) =>
+        WriteLegacyLogAt(WalPath, version, headerGeneration, entries);
+
+    private static void WriteLegacyLogAt(string path, ushort version, uint headerGeneration, params byte[][] entries)
     {
         long written = entries.Sum(static e => (long)e.Length);
         var file = new byte[FileHeaderV2 + 64 * 1024];
@@ -795,14 +798,44 @@ public sealed class SpanWalV3Tests : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(16), headerGeneration);
         long at = FileHeaderV2;
         foreach (var e in entries) { e.CopyTo(file, at); at += e.Length; }
-        File.WriteAllBytes(WalPath, file);
+        File.WriteAllBytes(path, file);
     }
 
     /// <summary>The v2 log the previous release leaves: header generation 7, one dead entry, two of 7, two of 8 (mid-flush).</summary>
-    private void WriteV2Log() => WriteLegacyLog(2, 7,
+    private static byte[][] V2Entries() =>
+    [
         EntryBytes(Span(100), 6, checksummed: true),                                       // an older generation: dead
         EntryBytes(Span(101), 7, checksummed: true), EntryBytes(Span(102), 7, checksummed: true),
-        EntryBytes(Span(103), 8, checksummed: true), EntryBytes(Span(104), 8, checksummed: true));
+        EntryBytes(Span(103), 8, checksummed: true), EntryBytes(Span(104), 8, checksummed: true),
+    ];
+
+    private void WriteV2Log() => WriteLegacyLog(2, 7, V2Entries());
+
+    /// <summary>
+    /// THE UPGRADE COMMITS THROUGH THE DURABLE MOVE, AT ANY PATH LENGTH. A v2 log in a directory whose
+    /// path alone is over 260 characters, opened with the production I/O: the move is MoveFileExW
+    /// write-through in its <c>\\?\</c> form on Windows and a rename plus a directory fsync elsewhere,
+    /// and either way the log comes out v3 with every live span, the copy gone, and no Warning — the
+    /// Warning is what a directory sync that failed says. (The backend-linux CI job runs this class.)
+    /// </summary>
+    [Fact]
+    public void A_v2_log_deep_in_a_long_path_is_upgraded_through_the_durable_move()
+    {
+        string deep = _dir;
+        while (deep.Length < 300) deep = Path.Combine(deep, "a-directory-name-of-forty-characters-xx");
+        Directory.CreateDirectory(deep);
+        string path = Path.Combine(deep, "spans.wal");
+        WriteLegacyLogAt(path, 2, 7, V2Entries());
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(path, logger))
+        {
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
+            Assert.Equal(Ids(101, 4), IdsOf(wal.ReadAll()));
+        }
+        Assert.False(File.Exists(path + SpanWriteAheadLog.UpgradeSuffix));
+        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Warning);
+    }
 
     private static ushort VersionOnDisk(string path) => BinaryPrimitives.ReadUInt16LittleEndian(ReadShared(path).AsSpan(4));
 

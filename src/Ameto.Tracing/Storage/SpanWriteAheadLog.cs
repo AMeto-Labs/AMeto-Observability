@@ -289,7 +289,11 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// acknowledged and never flushed. So such a file is opened in its own layout (v1: 64-byte
     /// entries without a checksum; v2: v3's entries; both behind a 32-byte header), rewritten as v3
     /// into <c>spans.wal.upgrade.tmp</c> — each entry's bytes verbatim, a v1 entry now with its
-    /// checksum, a v2 entry with the one it has — fsynced, and moved over the original. The move is
+    /// checksum, a v2 entry with the one it has — fsynced, and moved over the original — durably: a
+    /// write-through move on Windows, a directory fsync after the rename elsewhere
+    /// (<see cref="DurableFile"/>), because an atomic rename the disk has not committed can come
+    /// undone in a power loss and bring the old log back under the name, with the generation it had
+    /// at the upgrade, and every span logged to the new file since would be gone. The move is
     /// the commit point: a crash before it leaves the old file untouched and the next start upgrades
     /// it again; a crash after it leaves a complete v3 file. The upgrade copies what the old release
     /// would have replayed, and only that: a v2 log is copied up to the first entry that does not
@@ -369,6 +373,16 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             return OpenInstance(filePath, initialCapacity, growthStepCap, logger);
         }
 
+        // The rename is atomic, not yet durable: until the directory entry reaches the disk a power
+        // loss can bring the old inode back under the name. Windows' move is write-through
+        // (DurableFile.Replace); a POSIX rename is made durable by fsync on the directory, which is
+        // this. It cannot throw: the log is upgraded, and failing the start over it would be worse
+        // than the window the Warning names.
+        if (!DurableFile.SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(filePath))!))
+            logger?.LogWarning(
+                "The span WAL at {Path} was upgraded, but its directory could not be synced: until the file "
+              + "system commits the rename on its own, a power loss can bring the v{Version} log back.", filePath, legacy);
+
         return OpenInstance(filePath, capacity, growthStepCap, logger);
     }
 
@@ -416,13 +430,15 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 
     /// <summary>
     /// The upgrade's rename and the pause between its attempts, as a seam: a test fails the rename
-    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>.
+    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>,
+    /// whose move is <see cref="DurableFile.Replace"/> — the metric WAL's durable rename (44797aa,
+    /// bedba1b), shared. It was a plain <c>File.Move</c>: atomic, and not durable.
     /// </summary>
     internal sealed class UpgradeIo
     {
         public static readonly UpgradeIo Default = new();
 
-        public Action<string, string> Move { get; init; } = static (from, to) => File.Move(from, to, overwrite: true);
+        public Action<string, string> Move { get; init; } = DurableFile.Replace;
         public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
     }
 
