@@ -3428,11 +3428,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // iteration + startup) finishes the deletion once the reader closes.
         // Deleting it unconditionally would resurrect those files as
         // duplicate segments after a restart.
+        //
+        // Information, not Warning: it is not a fault. A query pins every segment of its window
+        // for its whole run (#114), so on Windows a merge that lands under a query over its
+        // window ALWAYS finds sources held, on a perfectly healthy server; the parked retry
+        // deletes them once the query ends, and is what warns if one outlives its window.
         bool allGone = consumed.All(s => !File.Exists(s.FilePath));
         if (allGone)
             try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
         else
-            _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
+            _logger.LogInformation("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
                 consumed.Count(s => File.Exists(s.FilePath)));
 
         _logger.LogInformation(
@@ -3728,6 +3733,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                     foreach (var name in File.ReadAllLines(manifest))
                     {
                         var src = Path.Combine(_segDir, name);
+                        // A source still PARKED already has an owner: the retry its commit parked
+                        // it for (SettleMergedSources), which deletes it once nothing holds it, under
+                        // _importLock and against the catalog, and says so at Warning once its
+                        // window is spent. Tried here as well it failed again on every pass, at
+                        // Warning per source. Since a query pins every segment of its window for its
+                        // whole run (#114), a merge under a long query leaves every source it reached
+                        // parked — on Windows, where the pin fails the unlink — and each 15 s pass
+                        // then logged up to MergeMaxSources Warnings for a delete that was already
+                        // being retried and would succeed the moment the query ended. Left to the
+                        // park, the manifest simply waits a pass longer. Nothing is parked at boot,
+                        // so the start-up sweep is unchanged.
+                        if (_pendingSegmentDeletes.ContainsKey(src)) { allGone = false; continue; }
                         try { if (File.Exists(src)) File.Delete(src); }
                         catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery: failed to delete {File}", src); }
                         if (File.Exists(src)) allGone = false;

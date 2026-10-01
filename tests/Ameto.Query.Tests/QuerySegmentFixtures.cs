@@ -156,14 +156,17 @@ internal static class QuerySegmentFixtures
     /// <item>Every fifth segment carries one more event three minutes past its own, so time ranges
     /// overlap and the priming order (by MaxTs) is not the catalog order.</item>
     /// </list>
+    /// <paramref name="engineLog"/> is the engine's logger, for a test that asserts what the
+    /// storage side says while queries run over these segments; null logs nowhere.
     /// </summary>
-    public static async Task<(StorageEngine Engine, QueryExecutor Query)> ManyIndexedSegmentsAsync(string dir)
+    public static async Task<(StorageEngine Engine, QueryExecutor Query)> ManyIndexedSegmentsAsync(
+        string dir, Microsoft.Extensions.Logging.ILogger<StorageEngine>? engineLog = null)
     {
         Directory.CreateDirectory(dir);
         var engine = new StorageEngine(
             Options.Create(new ServerOptions { DataDirectory = dir }),
             new RetentionStore(new ServerOptions { DataDirectory = dir }, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance);
+            engineLog ?? NullLogger<StorageEngine>.Instance);
         engine.IndexSinkFactory = static (estimatedEventCount, termsPerEvent) =>
             new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
         var query = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);

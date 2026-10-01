@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Query.Filtering;
@@ -10,6 +11,9 @@ namespace Ameto.Query;
 /// Executes a <see cref="QueryRequest"/> against the storage engine.
 ///
 /// Execution pipeline for cold-tier segments:
+///   0. Pin: every segment of the window snapshot gets a file handle straight away, and every
+///      later open maps from it — a merge or retention under the query cannot take a file the
+///      query has yet to open (#114; see <see cref="ExecuteAsync"/>).
 ///   1. Time-range filter on <see cref="SegmentInfo"/> (skip segments outside window).
 ///   2. Index fast-skip, in the order the merge consumes segments and only as far as the page
 ///      reaches (a batch at a time, see <see cref="MergeSourcesAsync"/>): open each group's
@@ -131,16 +135,7 @@ public sealed class QueryExecutor : IQueryExecutor
         // client's next-page keyset cursor is the last emitted (ts, id), so every
         // not-yet-served cold event on the wrong side of a mis-ordered boundary
         // failed the cursor on all subsequent pages — silently unreachable rows.
-        using var hotReader = _segments.OpenHotTierReader();
-        var covered   = hotReader.CoveredSegmentKeys;
-
-        // ONE pace for every source below, the hot tier and each segment scan: the scan hands its
-        // consumer a pending step at least every ScanYieldInterval of synchronous work, wherever
-        // in the merge that work is spent. Without it no step of a real scan is ever pending, and
-        // a consumer that sends while the scan works never gets the chance (see ScanPace).
-        var pace      = new ScanPace(ScanYieldInterval);
-        var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, pace, ct);
-
+        //
         // ── Cold-tier segments (k-way merge) ─────────────────────────────────
         // After Variant B, every segment's blocks are individually sorted by @t,
         // but two segments can overlap in [MinTs..MaxTs] (e.g. a flush that captured
@@ -152,17 +147,319 @@ public sealed class QueryExecutor : IQueryExecutor
         // window (registered cold segment + still-frozen hot tier overlap).
         long fromTicksGlobal = from?.UtcTicks ?? long.MinValue;
         long toTicksGlobal   = to?.UtcTicks   ?? long.MaxValue;
-        var segInfos = _segments.GetSegments(from, to)
-            .Where(s => !covered.Contains(SegmentKey.Of(s)))
-            .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
-            .ToList();
 
-        await foreach (var ev in MergeSourcesAsync(hotStream, segInfos, filter, levels, from, to, afterTs, afterId, forward, pace, ct))
+        // ── The plan: the hot snapshot, the catalog snapshot, and a PIN on every segment ──
+        // The merge opens its segments LAZILY, a batch at a time as its front reaches them, and
+        // the catalog does not stand still meanwhile: a merge can swap a batch of the window's
+        // segments out for its output and unlink them between this snapshot and their open
+        // (#114). Opened by path, such a source was simply gone — the prefilter fell back, the
+        // scan's own open failed and skipped it without a word — and the output holding its rows
+        // was not in this snapshot either. Measured over 40 segments with a merge after the first
+        // row: 50 of 252 rows for a filtered query and 25 of 1008 unfiltered, each a stream that
+        // ended normally. Until the lazy prefilter (#109) a filtered query mapped every window
+        // segment before its first row, which kept the files by accident; an unfiltered one never
+        // had even that.
+        //
+        // So every segment of the window is pinned straight after the snapshot, with a bare
+        // handle — an open and a close, ~13 µs a segment measured on Windows, no mapping and no
+        // read — and every later open maps FROM the pin rather than resolving the path again. The
+        // file then outlives a merge or a retention delete under the query: on Linux the inode
+        // survives the unlink; on Windows the unlink fails (see PinShare) and is parked for the
+        // retry, which deletes the file once this query lets go — the road a held mapping always
+        // took.
+        //
+        // The pins are THIS method's: released in the finally below, after the merge's own
+        // finally has closed every reader mapped from them — the await foreach disposes the merge
+        // before control gets there, on every exit: a full page, a consumer stopping early,
+        // cancellation, a throw.
+        IHotTierReader?   hotReader = null;
+        List<SegmentInfo> window    = [];
+        SafeFileHandle?[] pins      = [];
+        try
         {
-            if (ct.IsCancellationRequested || count >= limit) yield break;
-            yield return ev;
-            count++;
+            for (int attempt = 1; ; attempt++)
+            {
+                hotReader = _segments.OpenHotTierReader();
+                window    = SnapshotWindow(hotReader.CoveredSegmentKeys, from, to, fromTicksGlobal, toTicksGlobal);
+                pins      = window.Count == 0 ? [] : new SafeFileHandle?[window.Count];
+                if (BeforePinForTest is { } beforePin) await beforePin(window);
+
+                // A segment that left the catalog before its pin was retired on purpose, by a merge
+                // or by retention, and the catalog says which of the two by what it lists NOW: the
+                // output, or nothing. So the plan is taken again — the hot snapshot with it, which
+                // is what keeps the retake from double-reading a tier flushed in between: a cold
+                // re-read alone could list the segments of the tier this hot snapshot still holds
+                // as current, which no `covered` set names. Nothing has been read or yielded yet,
+                // so a retake costs a catalog read and the pins, and is invisible to the consumer.
+                if (!PinWindow(window, pins, from, to, mayRetake: attempt < MaxPlanAttempts)) break;
+
+                ReleasePins(pins);
+                hotReader.Dispose();
+                hotReader = null;
+            }
+
+            // ONE pace for every source below, the hot tier and each segment scan: the scan hands its
+            // consumer a pending step at least every ScanYieldInterval of synchronous work, wherever
+            // in the merge that work is spent. Without it no step of a real scan is ever pending, and
+            // a consumer that sends while the scan works never gets the chance (see ScanPace).
+            var pace      = new ScanPace(ScanYieldInterval);
+            var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, pace, ct);
+
+            await foreach (var ev in MergeSourcesAsync(hotStream, window, pins, filter, levels, from, to, afterTs, afterId, forward, pace, ct))
+            {
+                if (ct.IsCancellationRequested || count >= limit) yield break;
+                yield return ev;
+                count++;
+            }
         }
+        finally
+        {
+            ReleasePins(pins);
+            hotReader?.Dispose();
+        }
+    }
+
+    // ── Window snapshot and pins (#114) ───────────────────────────────────────
+
+    /// <summary>
+    /// How a pin shares its file: <see cref="FileShare.Read"/>, exactly what a by-path
+    /// <see cref="SegmentReader.Open(string, bool)"/> takes (its <c>CreateFromFile</c> opens the
+    /// path for read, sharing read), so a pin is no more and no less permissive than the mapping it
+    /// stands in for, and the merge planner's and the header scan's own by-path opens go on working
+    /// beside it.
+    ///
+    /// <para>NOT <see cref="FileShare.Delete"/>, deliberately. Without it a Windows unlink of a
+    /// pinned file fails with a sharing violation, and the storage engine already has the road for
+    /// that: the delete is parked and retried until the query lets go (StorageEngine
+    /// ParkSegmentDelete, SettleMergedSources), the merge keeps its manifest for the recovery sweep.
+    /// With it the unlink would SUCCEED, and what that leaves depends on the volume — measured on
+    /// NTFS here, POSIX semantics take the name at once, even while the file is mapped; under
+    /// legacy semantics (FAT, many SMB shares) the file turns delete-pending, keeping its name, failing
+    /// every new open and answering <c>File.Exists</c> true — a state the merge's manifest check, the
+    /// recovery sweep and the boot scan do not model. Linux ignores the flag either way: the unlink
+    /// succeeds and the inode lives as long as the pin.</para>
+    ///
+    /// <para>NOT <see cref="FileShare.Write"/>: nothing writes a published segment, and a pin
+    /// should not be what lets something start.</para>
+    /// </summary>
+    private const FileShare PinShare = FileShare.Read;
+
+    /// <summary>
+    /// How many times a query takes its plan — the hot snapshot, the catalog snapshot, the pins —
+    /// for a segment that left the catalog between the snapshot and its pin
+    /// (<see cref="PinWindow"/>). One retake answers a merge commit or a retention delete landing in
+    /// that window, which is as long as pinning the window takes; a third attempt means it happened
+    /// twice in a row, and the last plan goes ahead with what it could pin.
+    /// </summary>
+    private const int MaxPlanAttempts = 3;
+
+    /// <summary>
+    /// Test seam: called with the window's catalog snapshot after it is taken and before any of it
+    /// is pinned — the window in which a merge or a retention delete can take a segment out from
+    /// under the plan. Called again for every retake. Null in production.
+    /// </summary>
+    internal Func<IReadOnlyList<SegmentInfo>, ValueTask>? BeforePinForTest { get; set; }
+
+    /// <summary>
+    /// Process-wide count of segment files pinned by a query (<see cref="PinWindow"/>), with the
+    /// caveats of <see cref="SegmentReader.Opens"/>: a test that reads it needs the assembly's
+    /// parallelisation switched off.
+    /// </summary>
+    internal static long Pins;
+
+    /// <summary>
+    /// The other half of <see cref="Pins"/>: pins released, each exactly once
+    /// (<see cref="ReleasePins"/> takes the handle out of its slot before closing it). A pin is a
+    /// handle with no mapping behind it, so a leaked one is invisible to the reader counters —
+    /// and on Windows it is a segment file that can never be deleted while the process lives.
+    /// </summary>
+    internal static long Unpins;
+
+    /// <summary>
+    /// The catalog snapshot of the window: segments overlapping it, minus those the hot snapshot's
+    /// frozen tiers still cover. A loop, not the LINQ chain it replaces — two iterators and a
+    /// growing list per query, for a list whose size the catalog already gave.
+    /// </summary>
+    private List<SegmentInfo> SnapshotWindow(
+        IReadOnlySet<SegmentKey> covered, DateTimeOffset? from, DateTimeOffset? to, long fromTicks, long toTicks)
+    {
+        var listed = _segments.GetSegments(from, to);
+        var window = new List<SegmentInfo>(listed.Count);
+        for (int i = 0; i < listed.Count; i++)
+        {
+            var s = listed[i];
+            if (covered.Contains(SegmentKey.Of(s))) continue;
+            if (s.MaxTimestampTicks < fromTicks || s.MinTimestampTicks > toTicks) continue;
+            window.Add(s);
+        }
+        return window;
+    }
+
+    /// <summary>
+    /// Pins every segment of <paramref name="window"/> into the slot of <paramref name="pins"/> with
+    /// the same index. True when the plan has to be taken again: a segment's file was gone and the
+    /// catalog no longer lists it.
+    ///
+    /// <para>A missing file is sorted the way the header aggregation sorts one it meets mid-scan
+    /// (StorageEngine.OnHeaderSegmentUnreadable): by whether the catalog STILL SERVES the segment
+    /// under its key and at its path.</para>
+    /// <list type="bullet">
+    /// <item><b>It does not</b>: a merge swapped it out for its output, or retention removed it, and
+    /// either way unlinked the file after the entry went. The two mean opposite things for the rows
+    /// — in an output this snapshot does not list, or gone — and the header scan has to tell them
+    /// apart after the fact, to call a count a floor. Here nothing has been read yet, so the plan is
+    /// simply taken again: the next snapshot lists the output, or nothing, and either answer is
+    /// whole. Debug, as a race: nothing is damaged.</item>
+    /// <item><b>It does</b>: the file went behind the catalog's back, or an import has published its
+    /// entry and not landed the file yet (ImportSegment publishes before its move). The segment stays
+    /// in the plan unpinned, and its open BY PATH when the merge front reaches it is the retry —
+    /// late enough for an import to have landed, and warned by name if it fails too
+    /// (<see cref="ReportUnopenable"/>): the header scan's "unreadable", never a silent skip.</item>
+    /// </list>
+    /// <para>On the last attempt a retired segment stays in the plan unpinned as well, and meets the
+    /// same Warning if the query reaches it.</para>
+    ///
+    /// <para>A file that is there but refuses the open — a sharing violation from another process,
+    /// an ACL, the descriptor limit — stays in the plan unpinned too, for the same retry.</para>
+    /// </summary>
+    private bool PinWindow(
+        List<SegmentInfo> window, SafeFileHandle?[] pins, DateTimeOffset? from, DateTimeOffset? to, bool mayRetake)
+    {
+        List<int>? missing = null;
+        for (int i = 0; i < window.Count; i++)
+        {
+            try
+            {
+                pins[i] = File.OpenHandle(window[i].FilePath, FileMode.Open, FileAccess.Read, PinShare);
+                Interlocked.Increment(ref Pins);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                (missing ??= new List<int>(1)).Add(i);
+            }
+            catch (Exception ex)
+            {
+                // Anything else, never the whole query's failure: one segment's open never was.
+                // Debug: if the open by path fails as well, ReportUnopenable names the file at
+                // Warning, and one refusal logged twice at that level is noise.
+                _logger.LogDebug(ex,
+                    "Query could not pin segment {File}; it is opened by path if the query reaches it",
+                    window[i].FilePath);
+            }
+        }
+        if (missing is null) return false;
+
+        // ONE read of the catalog answers for every missing file, and only a query that met one
+        // pays for it.
+        var  catalog = _segments.GetSegments(from, to);
+        bool retired = false;
+        foreach (int i in missing)
+        {
+            var info = window[i];
+            if (Lists(catalog, info))
+            {
+                _logger.LogDebug(
+                    "Segment {File} is in the catalog but its file was not there to pin; it is opened by path if the query reaches it",
+                    info.FilePath);
+            }
+            else
+            {
+                retired = true;
+                _logger.LogDebug(
+                    "Segment {File} left the catalog between the query's snapshot and its pin (a merge or retention) — {Action}",
+                    info.FilePath, mayRetake
+                        ? "taking the plan again"
+                        : "out of plan attempts; it is opened by path if the query reaches it");
+            }
+        }
+        return retired && mayRetake;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="catalog"/> holds <paramref name="info"/>'s segment under its key AND
+    /// at its path — the test StorageEngine.CatalogServes makes, for the same reason: a key served
+    /// from another path is another file.
+    /// </summary>
+    private static bool Lists(IReadOnlyList<SegmentInfo> catalog, SegmentInfo info)
+    {
+        var key = SegmentKey.Of(info);
+        for (int i = 0; i < catalog.Count; i++)
+        {
+            var c = catalog[i];
+            if (SegmentKey.Of(c) == key && string.Equals(c.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Releases every pin still in <paramref name="pins"/>, emptying each slot first, so a second
+    /// call — the retake path, then the finally — closes and counts nothing twice.
+    /// </summary>
+    private static void ReleasePins(SafeFileHandle?[] pins)
+    {
+        for (int i = 0; i < pins.Length; i++)
+        {
+            if (pins[i] is not { } pin) continue;
+            pins[i] = null;
+            try { pin.Dispose(); } catch { /* best-effort */ }
+            Interlocked.Increment(ref Unpins);
+        }
+    }
+
+    /// <summary>
+    /// Opens a window segment for the prefilter or the scan: mapped from its pin when the plan
+    /// holds one, by path when it could not take one (see <see cref="PinWindow"/>).
+    /// </summary>
+    private static SegmentReader OpenSegment(SegmentInfo info, SafeFileHandle? pin) =>
+        pin is not null ? SegmentReader.Open(pin, info.FilePath) : SegmentReader.Open(info.FilePath);
+
+    // ── Segments that cannot be opened ────────────────────────────────────────
+
+    /// <summary>Places under the warn-once rule of <see cref="ReportUnopenable"/>; past it, Debug only.</summary>
+    private const int WarnedUnopenableCap = 1024;
+
+    /// <summary>
+    /// Files <see cref="ReportUnopenable"/> has already named at Warning, by file and by site (the
+    /// prefilter's fallback and the scan's skip say different things). Never cleared to make room,
+    /// for the reason the header aggregation's set is not: clearing a full set made every file past
+    /// the cap warn again on every poll.
+    /// </summary>
+    private readonly HashSet<(string File, bool Scan)> _warnedUnopenable = new();
+    private readonly System.Threading.Lock _warnedUnopenableGate = new();
+
+    /// <summary>
+    /// A window segment that could not be opened, named at Warning with its file — ONCE per file and
+    /// site, Debug after that.
+    ///
+    /// <para>It used to be Debug in the prefilter and nothing at all in the scan, which then skipped
+    /// the segment: its rows were missing and the stream ended as if whole. Opened by path, a
+    /// failure there could be a merge or retention racing the query, and a race is not damage — but
+    /// that silence is also exactly how a merge took rows from queries unseen (#114). A PINNED file
+    /// cannot have been unlinked under the query, so failing to map it is no race: the bytes are
+    /// torn, or the mapping itself failed. And a segment that could not be pinned is one the catalog
+    /// still served with no file behind it — the header aggregation's "unreadable", which that path
+    /// names at Warning too.</para>
+    ///
+    /// <para>Once, and not per query, for the header aggregation's reason: the live tail polls, alert
+    /// rules tick every 15 s, and a torn file stays in the catalog until the next start quarantines
+    /// it — a Warning per query would bury the log.</para>
+    /// </summary>
+    private void ReportUnopenable(Exception ex, SegmentInfo info, bool pinned, bool scan)
+    {
+        bool first;
+        lock (_warnedUnopenableGate)
+            first = _warnedUnopenable.Count < WarnedUnopenableCap && _warnedUnopenable.Add((info.FilePath, scan));
+
+        var level = first ? Microsoft.Extensions.Logging.LogLevel.Warning : Microsoft.Extensions.Logging.LogLevel.Debug;
+        if (scan)
+            _logger.Log(level, ex,
+                "Segment {File} could not be opened (pinned by the query: {Pinned}) — its rows are missing from this query's result",
+                info.FilePath, pinned);
+        else
+            _logger.Log(level, ex,
+                "Index prefilter could not open segment {File} (pinned by the query: {Pinned}) — falling back to a full scan of it",
+                info.FilePath, pinned);
     }
 
     /// <summary>
@@ -211,9 +508,16 @@ public sealed class QueryExecutor : IQueryExecutor
     /// stream blocks lazily; for unsorted legacy segments (v1) we materialise the whole
     /// segment, sort it once, then merge with the rest.
     /// </summary>
+    /// <param name="pins">
+    /// Index for index with <paramref name="segInfos"/>: the handle pinning each segment's file
+    /// since the snapshot, or null where none could be taken (see <see cref="PinWindow"/>). BORROWED
+    /// — the caller owns and releases them, after this method's finally has closed every reader
+    /// mapped from one.
+    /// </param>
     private async IAsyncEnumerable<LogEvent> MergeSourcesAsync(
         IAsyncEnumerable<LogEvent>           hotStream,
         IReadOnlyList<SegmentInfo>           segInfos,
+        SafeFileHandle?[]                    pins,
         CompiledFilter                       filter,
         HashSet<Ameto.Core.LogLevel>?       levels,
         DateTimeOffset?                      from,
@@ -240,8 +544,11 @@ public sealed class QueryExecutor : IQueryExecutor
             keyed[i] = new PrimeEntry(forward ? s.MinTimestampTicks : s.MaxTimestampTicks, i, s);
         }
         keyed.AsSpan().Sort(new PrimeOrder(descending: !forward));
-        var order = new SegmentInfo[keyed.Length];
-        for (int i = 0; i < order.Length; i++) order[i] = keyed[i].Info;
+        // Each segment travels with its pin from here on — through the prefilter, the priming
+        // queue and the scan — so that whichever of them opens it maps the file the snapshot
+        // named, not whatever the path holds by then (#114).
+        var order = new WindowSegment[keyed.Length];
+        for (int i = 0; i < order.Length; i++) order[i] = new WindowSegment(keyed[i].Info, pins[keyed[i].Index]);
 
         // The priming queue: the segments that survived the prefilter, in priming order, each
         // with the reader the prefilter opened. It is also the only OWNER of those readers — the
@@ -253,7 +560,7 @@ public sealed class QueryExecutor : IQueryExecutor
         int  batch       = PrefilterParallelism; // the next prefilter batch; doubles each time
         if (!prefilter)
         {
-            foreach (var s in order) survivors.Add(new PrefilterResult(s, null, null));
+            foreach (var s in order) survivors.Add(new PrefilterResult(s.Info, null, null, s.Pin));
             checkedUpTo = order.Length;
         }
 
@@ -316,11 +623,11 @@ public sealed class QueryExecutor : IQueryExecutor
                 {
                     if (next == survivors.Count)
                     {
-                        if (checkedUpTo == order.Length || !CouldBeat(order[checkedUpTo])) return;
+                        if (checkedUpTo == order.Length || !CouldBeat(order[checkedUpTo].Info)) return;
 
                         int take   = Math.Min(batch, order.Length - checkedUpTo);
                         var passed = await PrefilterSegmentsAsync(
-                            new ArraySegment<SegmentInfo>(order, checkedUpTo, take),
+                            new ArraySegment<WindowSegment>(order, checkedUpTo, take),
                             filter, levels, fromTicks, toTicks, ct);
                         // Survivors come back in input order and the input is the next slice
                         // of the priming order, so appending keeps the queue ordered.
@@ -332,10 +639,11 @@ public sealed class QueryExecutor : IQueryExecutor
 
                     if (!CouldBeat(survivors[next].Info)) return;
 
-                    var (segInfo, candidateOffsets, segReader) = survivors[next++];
+                    var (segInfo, candidateOffsets, segReader, segPin) = survivors[next++];
                     // The reader is BORROWED — the finally below owns every one of them,
-                    // primed or not, so the scan must not dispose what it did not open.
-                    var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets, segReader,
+                    // primed or not, so the scan must not dispose what it did not open. So is
+                    // the pin, which the scan maps its own reader from when there is none.
+                    var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets, segReader, segPin,
                                                   from, to, afterTs, afterId, !forward, pace, ct);
                     var newIt = stream.GetAsyncEnumerator(ct);
                     if (await newIt.MoveNextAsync())
@@ -381,10 +689,12 @@ public sealed class QueryExecutor : IQueryExecutor
             // …and every reader the prefilter carried, INCLUDING survivors that never primed —
             // the rest of the last batch, for a small page. This is the only owner: the scan
             // borrows, the iterator above closes only what it opened itself, and a batch that
-            // failed closed its own before throwing. Until this runs, those files cannot be
-            // deleted on Windows; the merge already handles a source held open by an in-flight
-            // query (manifest kept, recovery sweep finishes), and the hold is bounded by this
-            // query either way.
+            // failed closed its own before throwing. The PINS are not released here but by
+            // ExecuteAsync, which took them, once this has run: a pin outlives every reader
+            // mapped from it. Until both have gone those files cannot be deleted on Windows; the
+            // merge already handles a source held open by an in-flight query (the delete parked
+            // and retried, the manifest kept for the recovery sweep), and the hold is bounded by
+            // this query either way.
             foreach (var p in survivors)
             {
                 if (p.Reader is { } r)
@@ -415,8 +725,20 @@ public sealed class QueryExecutor : IQueryExecutor
     /// sweep finishes the job once the reader closes. What changes is which segments are held:
     /// the survivors rather than only the primed ones. Anything longer-lived than a query would
     /// need refcounting against the catalog, which is deliberately not attempted here.</para>
+    ///
+    /// <para><paramref name="Pin"/> is the segment's pin, carried for the scan to map its own
+    /// reader from when <paramref name="Reader"/> is null; borrowed like everything else here
+    /// (see <see cref="WindowSegment"/>).</para>
     /// </summary>
-    private readonly record struct PrefilterResult(SegmentInfo Info, uint[]? CandidateOffsets, SegmentReader? Reader);
+    private readonly record struct PrefilterResult(
+        SegmentInfo Info, uint[]? CandidateOffsets, SegmentReader? Reader, SafeFileHandle? Pin);
+
+    /// <summary>
+    /// A window segment and the handle pinning its file since the catalog snapshot (#114), or null
+    /// where none could be taken. The pin belongs to <see cref="ExecuteAsync"/>, which releases it
+    /// after every reader mapped from it is closed; everything downstream only borrows it.
+    /// </summary>
+    private readonly record struct WindowSegment(SegmentInfo Info, SafeFileHandle? Pin);
 
     /// <summary>A window segment keyed for the priming order (see <see cref="PrimeOrder"/>).</summary>
     private readonly record struct PrimeEntry(long Key, int Index, SegmentInfo Info);
@@ -470,7 +792,7 @@ public sealed class QueryExecutor : IQueryExecutor
     /// one group, so they take the same path with the same result as before.</para>
     /// </summary>
     private async Task<List<PrefilterResult>> PrefilterSegmentsAsync(
-        IReadOnlyList<SegmentInfo>    segInfos,
+        IReadOnlyList<WindowSegment>  segInfos,
         CompiledFilter                filter,
         HashSet<Ameto.Core.LogLevel>? levels,
         long                          fromTicks,
@@ -482,8 +804,8 @@ public sealed class QueryExecutor : IQueryExecutor
         if (!NeedsPrefilter(filter, levels))
         {
             var passthrough = new List<PrefilterResult>(segInfos.Count);
-            foreach (var info in segInfos)
-                passthrough.Add(new PrefilterResult(info, null, null));
+            foreach (var seg in segInfos)
+                passthrough.Add(new PrefilterResult(seg.Info, null, null, seg.Pin));
             return passthrough;
         }
 
@@ -524,7 +846,8 @@ public sealed class QueryExecutor : IQueryExecutor
                 new ParallelOptions { MaxDegreeOfParallelism = degree, CancellationToken = ct },
                 (i, innerCt) =>
                 {
-                    var info = segInfos[i];
+                    var seg  = segInfos[i];
+                    var info = seg.Info;
                     // NOT a `using`: a surviving segment hands its reader to the scan through
                     // PrefilterResult (see the record's ownership note) and the merge disposes it.
                     // Every other exit from this body disposes it here — `keep` is the one flag
@@ -533,7 +856,9 @@ public sealed class QueryExecutor : IQueryExecutor
                     bool keep = false;
                     try
                     {
-                        reader = SegmentReader.Open(info.FilePath);
+                        // From the pin: the file the snapshot named, whatever a merge or retention
+                        // has done to the path since (#114).
+                        reader = OpenSegment(info, seg.Pin);
 
                         // Accumulated across the surviving groups. Posting offsets are FILE
                         // ordinals in every group (SegmentIndexBuilder.Build writes
@@ -709,7 +1034,7 @@ public sealed class QueryExecutor : IQueryExecutor
                             candidateOffsets = ContiguousOrdinals(everyRowGroups);
                         }
 
-                        results[i] = new PrefilterResult(info, candidateOffsets, reader);
+                        results[i] = new PrefilterResult(info, candidateOffsets, reader, seg.Pin);
                         keep = true;
                     }
                     catch (Exception ex)
@@ -718,8 +1043,17 @@ public sealed class QueryExecutor : IQueryExecutor
                         // so we never silently lose data due to a transient I/O hiccup. The
                         // reader is NOT carried over: whatever went wrong may be the mapping
                         // itself, and the scan's own Open is the retry.
-                        _logger.LogDebug(ex, "Index prefilter failed for segment {Id}, falling back to full scan", info.Id);
-                        results[i] = new PrefilterResult(info, null, null);
+                        //
+                        // An OPEN that failed is not that hiccup any more: a pinned file cannot
+                        // have been unlinked under the query, and an unpinned one is a file the
+                        // catalog served without one behind it (see PinWindow). Named at Warning,
+                        // once per file. A failure past the open — reading the index — keeps its
+                        // Debug: the full scan reads the blocks without it, and loses nothing.
+                        if (reader is null)
+                            ReportUnopenable(ex, info, pinned: seg.Pin is not null, scan: false);
+                        else
+                            _logger.LogDebug(ex, "Index prefilter failed for segment {Id}, falling back to full scan", info.Id);
+                        results[i] = new PrefilterResult(info, null, null, seg.Pin);
                     }
                     finally { if (!keep) reader?.Dispose(); }
                     return ValueTask.CompletedTask;
@@ -987,12 +1321,18 @@ public sealed class QueryExecutor : IQueryExecutor
     /// FileInfo stat, a CreateFromFile, a CreateViewAccessor over the whole file and a
     /// block-index parse, 40 of them for a 20-segment query.
     /// </param>
-    private static async IAsyncEnumerable<LogEvent> ScanSegmentAsync(
+    /// <param name="pin">
+    /// The handle pinning the segment's file since the snapshot, or null; what this method maps its
+    /// own reader from when <paramref name="borrowed"/> is null. Borrowed as well: the query
+    /// releases it, after this iterator's reader has gone.
+    /// </param>
+    private async IAsyncEnumerable<LogEvent> ScanSegmentAsync(
         SegmentInfo info,
         CompiledFilter filter,
         HashSet<Ameto.Core.LogLevel>? levels,
         uint[]? candidateOffsets,
         SegmentReader? borrowed,
+        SafeFileHandle? pin,
         DateTimeOffset? from,
         DateTimeOffset? to,
         long? afterTs,
@@ -1006,10 +1346,15 @@ public sealed class QueryExecutor : IQueryExecutor
         {
             try
             {
-                opened = SegmentReader.Open(info.FilePath);
+                opened = OpenSegment(info, pin);
             }
-            catch
+            catch (Exception ex)
             {
+                // The segment's rows are lost to this query. This used to happen without a word —
+                // a bare `catch { yield break; }` — which is how a merge under the query could take
+                // 202 of 252 rows from a filtered search and leave nothing in the log (#114). The
+                // pin closes that race; whatever still fails here is named (ReportUnopenable).
+                ReportUnopenable(ex, info, pinned: pin is not null, scan: true);
                 yield break;
             }
         }
