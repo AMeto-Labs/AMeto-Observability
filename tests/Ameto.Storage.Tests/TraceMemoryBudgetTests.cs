@@ -497,6 +497,64 @@ public sealed class TraceMemoryBudgetTests : IDisposable
     }
 
     /// <summary>
+    /// RUNNING OUT OF MEMORY WHILE READING A SEGMENT IS RETRIED, NOT QUARANTINED (review F1).
+    /// <c>SpanReader.ReadAll</c> reports an out-of-memory as an <see cref="InvalidDataException"/>
+    /// carrying it, and the quarantine took that for damage: a healthy segment, read while trace
+    /// queries held the heap, was put out of planning until the next restart.
+    ///
+    /// <para>At the seam: every read of the first of two readable 3-span segments fails, during the
+    /// first run only, with exactly what the reader throws on running out. The second run must merge
+    /// the pair. Reverted (an out-of-memory counts as content): the first segment is quarantined, the
+    /// second run plans nothing, and two segments remain.</para>
+    /// </summary>
+    [Fact]
+    public void Running_out_of_memory_while_reading_a_segment_is_retried_not_quarantined()
+    {
+        string dir = Dir("oom-read");
+        string? first = null;
+        for (int s = 0; s < 2; s++)
+        {
+            var spans = new List<SpanRecord>();
+            for (int t = 0; t < 3; t++)                                    // 3 spans: tier 0, one window
+                spans.Add(new SpanRecord
+                {
+                    TraceId = new TraceId(0xE8, (ulong)(s * 10 + t + 1)), SpanId = new SpanId((ulong)(s * 10 + t + 1)),
+                    StartTimeUnixNano = _baseNano + (s * 10 + t) * Ms, DurationNanos = Ms,
+                    Name = "op", ServiceName = "billing", Kind = SpanKind.Server,
+                });
+            var info = SpanWriter.Write(dir, spans);
+            first ??= info.FilePath;
+        }
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        e.LoadColdSegments();
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+
+        bool outOfMemory = true;
+        int  failed      = 0;
+        e._beforeCompactionReadForTest = seg =>
+        {
+            if (!outOfMemory || seg.FilePath != first) return;
+            failed++;
+            throw SpanReader.OutOfMemoryReading(0, 4_096, new OutOfMemoryException());
+        };
+
+        e.CompactSmallSegments();                                         // the heap is short: nothing merges
+        Assert.True(failed > 0, "the seam never failed a read");
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+        Assert.True(File.Exists(first));
+
+        outOfMemory = false;
+        e.CompactSmallSegments();                                         // the next run: the heap is back
+
+        var after = e.ColdSegmentsForTest;
+        _out.WriteLine($"{failed} failed read(s); after the second run: {after.Length} segment(s) "
+                     + $"({string.Join(", ", after.Select(static s => $"{s.SpanCount} spans"))})");
+        Assert.Single(after);
+        Assert.Equal(6, after[0].SpanCount);
+    }
+
+    /// <summary>
     /// AN UNWEIGHED SEGMENT IS NEVER PRICED BELOW ITS OWN FILE. Five thousand spans are 3 MB by the
     /// count; a 40 MB file of them cannot weigh less than 40 MB read back, so it is not a candidate —
     /// it is kept out of the plan before anything has had to read it to find that out. The file floor

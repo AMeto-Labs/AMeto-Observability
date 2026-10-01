@@ -194,6 +194,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal Action? _inCompactionRunForTest;
 
     /// <summary>
+    /// Test seam: called on the compaction thread just before a pass reads a segment in full. A throw
+    /// from it is that read's failure — the way to give a pass a fault no file on disk can produce on
+    /// demand (running out of memory).
+    /// </summary>
+    internal Action<SpanSegmentInfo>? _beforeCompactionReadForTest;
+
+    /// <summary>
     /// Claims a heavy-phase slot, or refuses because the teardown has begun. The re-check after
     /// the increment is not belt-and-braces: the teardown samples the counter AFTER setting the
     /// flag, so a phase that incremented on the other side of that store would run unwatched.
@@ -3892,6 +3899,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             try
             {
                 int before = allSpans.Count;
+                _beforeCompactionReadForTest?.Invoke(seg);
                 allSpans.AddRange(SpanReader.ReadAll(seg.FilePath));
                 long measured = ReadBackBytesOf(CollectionsMarshal.AsSpan(allSpans)[before..]);
                 // AT LEAST ONE BYTE (review L1): 0 is the "never measured" value, so a segment that reads
@@ -3927,7 +3935,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 loadedBytes += measured;
                 processed.Add(seg);
             }
-            catch (Exception ex) when (FileBounds.DescribesContent(ex))
+            catch (Exception ex) when (FileBounds.DescribesContent(ex) && ex.InnerException is not OutOfMemoryException)
             {
                 // A READ THAT FAILS ON THE FILE'S CONTENT FAILS THE SAME WAY ON EVERY PASS. It was
                 // logged and nothing else: the segment was neither weighed nor put out of planning,
@@ -3936,6 +3944,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // and everything behind it waited for retention. Quarantined as an empty read is.
                 // A fault of the MACHINE (an IOException: a locked file, a mount blip) is not: it
                 // is logged below and the next run tries again.
+                //
+                // RUNNING OUT OF MEMORY IS THE MACHINE TOO (review F1), though it arrives dressed as
+                // the file: ReadAll reports it as an InvalidDataException carrying the
+                // OutOfMemoryException (SpanReader.OutOfMemoryReading). On the 384 MB stand a pass
+                // that met trace queries holding the heap quarantined a healthy segment until the
+                // next restart — each such episode one more small file no pass would merge.
                 QuarantineFromCompaction(seg, ex);
                 quarantined = true;
             }
