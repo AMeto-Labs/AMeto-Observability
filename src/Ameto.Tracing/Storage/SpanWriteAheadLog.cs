@@ -33,7 +33,8 @@ namespace Ameto.Tracing.Storage;
 ///    32   MoveFrom           int64   the relocation record: see <see cref="RelocateLocked"/>
 ///    40   MoveLength         int64   0 = no relocation in flight
 ///    48   MoveDone           int64
-///    56   _reserved          int64
+///    56   Crc                uint32  CRC32C over bytes [0, 8) and [16, 56): all but the claim
+///    60   PendingCrc         uint32  the same, of the state a store in progress is writing
 ///
 ///   [Entry 0 …]  — unchanged since v2
 ///     [Entry Header — 64 bytes, Pack = 1, carries the generation it was written under]
@@ -61,6 +62,13 @@ namespace Ameto.Tracing.Storage;
 /// open before anything is replayed (<see cref="RelocateLocked"/>,
 /// <see cref="FinishRelocationLocked"/>). The entries did not change: an upgraded v2 log is its
 /// entries, byte for byte, behind a longer header.</para>
+///
+/// <para><b>The v3 header carries its own checksum.</b> One field of it can hide every entry without
+/// any entry being wrong: a rotted or copied <see cref="WalFileHeader.Generation"/> that is neither
+/// the entries' generation nor its predecessor makes the replay skip them all, silently — and a
+/// rotted record would move bytes. A header that does not verify has its generation rebuilt from
+/// the entries, which carry checksums of their own, and its record is acted on only in a state a
+/// commit can leave (<see cref="SealHeaderLocked"/>, <see cref="FinishRelocationLocked"/>).</para>
 ///
 /// <para><b>Names and services longer than 65 535 bytes are logged EMPTY.</b> v2 kept v1's 16-bit
 /// <c>NameLength</c> and <c>ServiceLength</c>, and an append clamps such a field out of the log
@@ -120,7 +128,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     private const ushort WalVersionV2    = 2;
     private const ushort WalVersionV1    = 1;
 
-    /// <summary>A v3 file header: v2's 32 bytes, then the relocation record. See <see cref="WalFileHeader"/>.</summary>
+    /// <summary>A v3 file header: v2's 32 bytes, then the relocation record and the header's checksums. See <see cref="WalFileHeader"/>.</summary>
     private const int    FileHeaderSize       = 64;
 
     /// <summary>A v1 or v2 file header. Its data starts right after it, so such a log's offsets are 32 lower.</summary>
@@ -152,6 +160,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <para><b>The relocation record</b> (<see cref="MoveFrom"/>, <see cref="MoveLength"/>,
     /// <see cref="MoveDone"/>) is what makes a commit's move of the surviving tail safe against the
     /// process dying in the middle of it. See <see cref="RelocateLocked"/>.</para>
+    ///
+    /// <para><b><see cref="Crc"/></b> covers everything but <see cref="WriteOffset"/>: the identity,
+    /// the generation and the record, which change a few times per flush, and not the claim, which
+    /// every append moves and which the replay checks against the data anyway (it stops at the
+    /// first entry that does not verify, and truncates the claim to there). See
+    /// <see cref="SealHeaderLocked"/>.</para>
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -167,7 +181,8 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         public long   MoveFrom;          // logical offset the surviving tail is moved from: the flush boundary
         public long   MoveLength;        // its length; 0 = no relocation in flight
         public long   MoveDone;          // bytes of it already moved, always a chunk boundary
-        private long  _reserved2;
+        public uint   Crc;               // CRC32C over bytes [0, 8) and [16, 56): see SealHeaderLocked
+        public uint   PendingCrc;        // the same, of the header as the store in progress leaves it
     }
 
     /// <summary>
@@ -257,8 +272,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         _growthStepCap = Math.Max(4096, growthStepCap);
         _logger        = logger;
         // Armed before OpenOrCreate, which is where a relocation interrupted by the previous
-        // process is finished: the only way a test reaches that relocation.
+        // process is finished: the only way a test reaches that relocation and its stores.
         OnRelocationStepForTest = t_relocationStepForNextOpenForTest;
+        OnPendingStoredForTest  = t_pendingStoredForNextOpenForTest;
     }
 
     /// <summary>
@@ -461,16 +477,39 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             hdr.Generation  = FirstGeneration;
             _writeOffset    = 0;
             _generation     = FirstGeneration;
+            SealHeaderLocked();
             return;
         }
 
         _writeOffset = Math.Max(0, hdr.WriteOffset - _headerSize);
         _generation  = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
         if (_writeOffset > _capacity) _writeOffset = _capacity;  // truncated file — replay what is mapped
+        if (_legacyVersion != 0) return;                         // left untouched: Open upgrades it
+
+        // Decided before anything below stores into the header. A v1 or v2 header has no checksum.
+        bool verifies = HeaderVerifies(in hdr);
+
+        // A header that verifies only by its PENDING checksum — the previous process stopped between
+        // a field and its seal — is sealed before anything else is stored: the next covered store
+        // overwrites PendingCrc first, and a second stop before that store's field would leave a
+        // header matching neither slot, a false "does not verify" (the metric WAL's 6327634).
+        if (verifies) SealHeaderLocked();
+
+        // Nothing below may make a header that did NOT verify verify again before its generation is
+        // rebuilt: an open killed during the finish would otherwise leave the rotted generation
+        // sealed, and the next open would skip the rebuild (c4fadf7). Released, and the header
+        // sealed once, at the end of the open.
+        _sealsHeld = !verifies;
 
         // A commit's move of the surviving tail that the process did not live to finish is
         // finished here, before anything walks the data. See RelocateLocked.
-        if (_legacyVersion == 0) FinishRelocationLocked(ref hdr);
+        FinishRelocationLocked(ref hdr, trusted: verifies);
+
+        // A header whose generation does not verify gets it back from the entries. See there.
+        if (!verifies) RebuildGenerationLocked(ref hdr);
+
+        _sealsHeld = false;
+        SealHeaderLocked();
     }
 
     /// <summary>
@@ -519,6 +558,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                 WriteOffset = FileHeaderSize + written,
                 Generation  = _generation,
             };
+            hdr.Crc = hdr.PendingCrc = HeaderChecksum(in hdr);
             MemoryMarshal.Write(fileHeader, in hdr);
             fs.Position = 0;
             fs.Write(fileHeader);
@@ -870,7 +910,10 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                     "span WAL commit barrier failed; the log keeps the flushed generation in its header", ex);
             }
 
-            hdr.Generation = _generation;
+            // THE STAMP, between two checksums like every covered store (StoreCovered): a process
+            // killed inside it leaves a header that verifies, as the generation was before it or
+            // as it is after, never one that reads as rot.
+            StoreCovered(HeaderField.Generation, _generation);
 
             // Only now is the cycle over: every step that can throw is behind us, so the
             // in-memory generation and the header can no longer drift apart (a Begin that
@@ -917,20 +960,22 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <summary>The points of a relocation <see cref="OnRelocationStepForTest"/> fires at, in order.</summary>
     internal enum RelocationStep : byte
     {
-        /// <summary>The record is armed; no byte has moved.</summary>
+        /// <summary>The record is armed and sealed; no byte has moved.</summary>
         Armed,
-        /// <summary>A chunk is moved and its <see cref="WalFileHeader.MoveDone"/> stored.</summary>
+        /// <summary>A chunk is moved and its <see cref="WalFileHeader.MoveDone"/> sealed.</summary>
         Chunk,
         /// <summary>The new end is stored; the record is still armed.</summary>
         EndStored,
-        /// <summary>The record is cleared; the end marker is not planted yet.</summary>
+        /// <summary>The record is cleared and sealed; the end marker is not planted yet.</summary>
         Cleared,
     }
 
     /// <summary>
     /// Test seam fired at every <see cref="RelocationStep"/> of a relocation — a commit's, or the one
     /// the open finishes — with the bytes moved so far. What the file holds at that instant is what
-    /// a process killed there leaves. Null in production.
+    /// a process killed there leaves. The states BETWEEN a covered store and its checksum are
+    /// <see cref="OnCoveredStoreForTest"/>'s and <see cref="OnPendingStoredForTest"/>'s. Null in
+    /// production.
     /// </summary>
     internal Action<RelocationStep, long>? OnRelocationStepForTest;
 
@@ -973,8 +1018,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// remarks name.</para>
     ///
     /// <para><b>Program order is pinned, not assumed.</b> Every store of the record is a
-    /// <see cref="Volatile.Write(ref long, long)"/>: a release, so neither the compiler nor the CPU
-    /// can let a store the protocol puts BEFORE it — the record's other fields, a chunk's bytes —
+    /// <see cref="Volatile.Write(ref long, long)"/> (the covered ones inside
+    /// <see cref="StoreCovered"/>): a release, so neither the compiler nor the CPU can let a store the
+    /// protocol puts BEFORE it — the record's other fields, a chunk's bytes, a pending checksum —
     /// land after it. A plain store sequence is what the JIT is free to reorder, and a reordered
     /// arming (<c>MoveLength</c> before <c>MoveFrom</c>) is a record a killed process leaves naming
     /// a move that is not the one in flight.</para>
@@ -984,9 +1030,11 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         byte* data = _ptr + _headerSize;
         if (done == 0)
         {
+            // MoveFrom and MoveDone count only while MoveLength is set (see HeaderChecksum), so
+            // they are written plainly here and the one covered change is the arming.
             Volatile.Write(ref hdr.MoveFrom, from);
             Volatile.Write(ref hdr.MoveDone, 0);
-            Volatile.Write(ref hdr.MoveLength, length);                 // armed
+            StoreCovered(HeaderField.MoveLength, (ulong)length);       // armed
             OnRelocationStepForTest?.Invoke(RelocationStep.Armed, 0);
         }
 
@@ -995,17 +1043,17 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             long chunk = Math.Min(from, length - done);
             Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
             done += chunk;
-            Volatile.Write(ref hdr.MoveDone, done);
+            StoreCovered(HeaderField.MoveDone, (ulong)done);
             OnRelocationStepForTest?.Invoke(RelocationStep.Chunk, done);
         }
     }
 
-    /// <summary>Disarms the relocation record: MoveLength first; MoveFrom and MoveDone mean nothing without it.</summary>
-    private static void ClearRelocationLocked(ref WalFileHeader hdr)
+    /// <summary>Disarms the relocation record: MoveLength first, a covered store; MoveFrom and MoveDone stop counting with it.</summary>
+    private void ClearRelocationLocked(ref WalFileHeader hdr)
     {
-        Volatile.Write(ref hdr.MoveLength, 0);
-        Volatile.Write(ref hdr.MoveFrom,   0);
-        Volatile.Write(ref hdr.MoveDone,   0);
+        StoreCovered(HeaderField.MoveLength, 0);
+        Volatile.Write(ref hdr.MoveFrom, 0);
+        Volatile.Write(ref hdr.MoveDone, 0);
     }
 
     /// <summary>
@@ -1022,19 +1070,32 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// not stamped over yet. It accepts the relocated tail's generation as its successor, so the
     /// replay is the same as after a stamp, and the flushed generation's entries are gone from the
     /// log either way: overwritten by the move, or past its end.</para>
+    ///
+    /// <para><b>A record in a header that did not verify</b> (<paramref name="trusted"/> false) has
+    /// to prove it describes the move a commit made, not merely one that would fit: the claim must
+    /// be where that commit left it, with the progress that goes with it — the old end,
+    /// <c>from + length</c>, with <c>done</c> a chunk boundary (a multiple of <c>from</c>, or all of
+    /// it): the move in flight; or the new end, <c>length</c>, with <c>done == length</c>: the move
+    /// finished and its end stored, only the clear missing. A new end with less done is no state a
+    /// commit leaves, and redoing from there would read source bytes the later chunks have already
+    /// overwritten (the metric WAL's 83f849f). Rot that passes, in two fields no store ties
+    /// together, is not a case worth moving bytes for.</para>
     /// </summary>
-    private void FinishRelocationLocked(ref WalFileHeader hdr)
+    private void FinishRelocationLocked(ref WalFileHeader hdr, bool trusted)
     {
         long from = hdr.MoveFrom, length = hdr.MoveLength, done = hdr.MoveDone;
         if (length == 0) return;                         // nothing in flight: the normal case
 
-        bool fits = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
-        if (!fits)
+        bool fits    = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
+        bool matches = fits
+                    && ((_writeOffset == from + length && (done % from == 0 || done == length))
+                     || (_writeOffset == length && done == length));
+        if (!fits || (!trusted && !matches))
         {
             _logger?.LogError(
                 "Span WAL at {Path} records a relocation it cannot vouch for (from {From}, length {Length}, done {Done}, " +
-                "claim {Claim}, capacity {Capacity}); ignoring it — the walk decides where the data ends.",
-                _filePath, from, length, done, _writeOffset, _capacity);
+                "claim {Claim}, capacity {Capacity}, header verifies: {Verifies}); ignoring it — the walk decides where " +
+                "the data ends.", _filePath, from, length, done, _writeOffset, _capacity, trusted);
             ClearRelocationLocked(ref hdr);
             return;
         }
@@ -1080,6 +1141,177 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + at).Generation = 0;
     }
 
+    // ── The header's own checksum (v3) ───────────────────────────────────────
+
+    /// <summary>
+    /// The header checksum: CRC32C over bytes [0, 8) and [16, 56) of the header — everything but the
+    /// claim — with <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// read as 0 while <see cref="WalFileHeader.MoveLength"/> is 0. That last rule is what makes
+    /// every covered change ONE field: arming writes the other two first, invisibly, and disarming
+    /// clears MoveLength first, after which they are invisible again (see <see cref="StoreCovered"/>).
+    /// The metric WAL's header checksum, field for field (29718e4).
+    /// </summary>
+    private static uint HeaderChecksum(in WalFileHeader header)
+    {
+        WalFileHeader h = header;
+        if (h.MoveLength == 0) { h.MoveFrom = 0; h.MoveDone = 0; }
+        var bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<WalFileHeader>(in h));
+        return Crc32c.Append(Crc32c.Append(0, bytes[..8]), bytes[16..56]);
+    }
+
+    /// <summary>The header verifies: as it is (<see cref="WalFileHeader.Crc"/>) or as the store in flight when the process stopped was leaving it (<see cref="WalFileHeader.PendingCrc"/>).</summary>
+    private static bool HeaderVerifies(in WalFileHeader header)
+    {
+        uint crc = HeaderChecksum(in header);
+        return header.Crc == crc || header.PendingCrc == crc;
+    }
+
+    /// <summary>The covered header fields that change after the header is first written. See <see cref="StoreCovered"/>.</summary>
+    private enum HeaderField : byte { Generation, MoveLength, MoveDone }
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after the field is stored and BEFORE the checksum
+    /// that vouches for it — the state a process killed between the two leaves. Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnCoveredStoreForTest;
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after <see cref="WalFileHeader.PendingCrc"/> is
+    /// stored and BEFORE the field — the other state a process killed inside the store leaves.
+    /// Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnPendingStoredForTest;
+
+    /// <summary>Test seam: <see cref="OnPendingStoredForTest"/> for the logs this THREAD opens next. Null in production.</summary>
+    [ThreadStatic] internal static Action<string, ulong>? t_pendingStoredForNextOpenForTest;
+
+    /// <summary>
+    /// THE ONE WAY A COVERED HEADER FIELD CHANGES once the header exists: the checksum of the header
+    /// AS IT WILL BE goes into <see cref="WalFileHeader.PendingCrc"/>, then the field, then the same
+    /// value into <see cref="WalFileHeader.Crc"/>. A process killed anywhere in that sequence leaves
+    /// a header that verifies — before the field, by <c>Crc</c>; after it, by <c>PendingCrc</c> — so
+    /// a stop is never mistaken for rot (the metric WAL's 1599bf4: its first version stored the
+    /// field and then sealed, and a kill in between made the header fail and the rebuild drop a
+    /// watermark that was right). Each of the three is a release store, so the order is the one
+    /// written here and not the JIT's. v1 and v2 headers have no checksum; a held header (the open
+    /// rebuilding one that did not verify) is sealed once, at the end of that open.
+    /// </summary>
+    private void StoreCovered(HeaderField field, ulong value)
+    {
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        if (_legacyVersion != 0 || _sealsHeld)
+        {
+            Set(ref h, field, value);
+            return;
+        }
+
+        WalFileHeader next = h;
+        Set(ref next, field, value);
+        Volatile.Write(ref h.PendingCrc, HeaderChecksum(in next));
+        OnPendingStoredForTest?.Invoke(field.ToString(), value);
+        Set(ref h, field, value);
+        OnCoveredStoreForTest?.Invoke(field.ToString(), value);
+        Volatile.Write(ref h.Crc, h.PendingCrc);
+
+        static void Set(ref WalFileHeader h, HeaderField field, ulong value)
+        {
+            switch (field)
+            {
+                case HeaderField.Generation: Volatile.Write(ref h.Generation, (uint)value); break;
+                case HeaderField.MoveLength: Volatile.Write(ref h.MoveLength, (long)value); break;
+                case HeaderField.MoveDone:   Volatile.Write(ref h.MoveDone,   (long)value); break;
+            }
+        }
+    }
+
+    /// <summary>Set by the open while it rewrites a header that did not verify; see <see cref="OpenOrCreate"/>.</summary>
+    private bool _sealsHeld;
+
+    /// <summary>
+    /// Stores the header's checksum, both slots, over the header as it stands — after the open has
+    /// written it whole (a fresh header, a rebuilt one, or one that verified only by its pending
+    /// checksum); a single covered field changes through <see cref="StoreCovered"/> instead. v3 only.
+    /// Caller holds the lock, or is the open.
+    ///
+    /// <para><b>Why a checksum on a header the entries already vouch for.</b> One field of it can hide
+    /// every entry without any entry being wrong: the replay accepts the header's generation and its
+    /// successor, so a rotted <see cref="WalFileHeader.Generation"/> two or more away from the
+    /// entries' makes it skip them all — acknowledged spans dropped by four bytes of header,
+    /// silently (#103's second half). And a rotted relocation record would move bytes at the next
+    /// open. A header that does not verify has its generation rebuilt from the entries instead
+    /// (<see cref="RebuildGenerationLocked"/>), and its record is trusted only in a state a commit
+    /// leaves (<see cref="FinishRelocationLocked"/>).</para>
+    ///
+    /// <para><b>Why not the claim.</b> <see cref="WalFileHeader.WriteOffset"/> moves on every append,
+    /// and sealing it would put a hash on the append path for a field the replay already checks
+    /// against the data: the walk stops at the first entry that does not verify, wherever the claim
+    /// says the log ends.</para>
+    ///
+    /// <para><b>No ordinary stop leaves a header that does not verify.</b> Every covered change after
+    /// the first write is one field through <see cref="StoreCovered"/>, whose two checksum slots
+    /// vouch for the header before and after it; what remains is rot, a copied or restored file,
+    /// and a process killed while the OPEN was rewriting a header it had already found not to
+    /// verify — which the next open rebuilds again.</para>
+    /// </summary>
+    private void SealHeaderLocked()
+    {
+        if (_legacyVersion != 0 || _sealsHeld) return;
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        h.PendingCrc = h.Crc = HeaderChecksum(in h);
+    }
+
+    /// <summary>
+    /// The generation of a header that does not verify (<see cref="SealHeaderLocked"/>), taken back
+    /// from the entries — which carry their own checksums, and so are the better witness. The walk
+    /// over the claimed range verifies every entry and finds the NEWEST generation among them; the
+    /// header gets its predecessor, so the replay accepts the newest and the one before it. That
+    /// covers every live entry: the live generations are the header's and its successor, and the
+    /// newest entry carries one of the two. If it carries the header's (no flush was in flight), the
+    /// generation before it is accepted too — a committed generation still in the file, at most,
+    /// which replays beside its segment: duplicates, never loss. With no entry at all the
+    /// generation starts over.
+    ///
+    /// <para>NEWEST, NOT LAST. A restart after a crash mid-flush appends under the header's
+    /// generation BEHIND entries of its successor, so the last entry can be the older of the two;
+    /// taken as the newest, it would have rebuilt a window that drops the successor's entries. The
+    /// order is the generation cycle's (<see cref="IsAfter"/>), not the number's, so a wrap past
+    /// <see cref="uint.MaxValue"/> does not read as the oldest.</para>
+    ///
+    /// <para>An Error says it happened; the open seals the result.</para>
+    /// </summary>
+    private void RebuildGenerationLocked(ref WalFileHeader hdr)
+    {
+        uint rotted = hdr.Generation, newest = 0;
+        for (long pos = 0, total; (total = EntryAt(pos, _writeOffset, _entryHeaderSize, _checksummed)) > 0; pos += total)
+        {
+            uint g = Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + pos).Generation;
+            if (newest == 0 || IsAfter(g, newest)) newest = g;
+        }
+
+        _generation    = newest == 0 ? FirstGeneration : Prev(newest);
+        hdr.Generation = _generation;
+
+        _logger?.LogError(
+            "Span WAL at {Path}: the header does not verify (generation {Generation}); its generation was rebuilt " +
+            "from the entries: {NewGeneration}, whose spans and its successor's replay.",
+            _filePath, rotted, _generation);
+    }
+
+    private static uint Prev(uint g) => g == FirstGeneration ? uint.MaxValue : g - 1;
+
+    /// <summary>
+    /// <paramref name="a"/> comes after <paramref name="b"/> on the generation cycle — 1, 2, …,
+    /// <see cref="uint.MaxValue"/>, 1, … (0 is never a generation), uint.MaxValue values long — by
+    /// less than half of it. The generations a log holds at once are a handful of neighbours, so
+    /// "less than half the cycle ahead" is "newer".
+    /// </summary>
+    private static bool IsAfter(uint a, uint b)
+    {
+        uint x = a - 1, y = b - 1;                       // positions on the cycle, 0-based
+        uint d = x >= y ? x - y : x - y - 1;             // (x - y) mod uint.MaxValue: the wrap added 2^32, the cycle is 2^32 - 1
+        return d != 0 && d < 0x8000_0000u;
+    }
+
     // ── Reset ────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1099,10 +1331,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             _flushOpen        = false;
             _flushBoundary    = 0;
 
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.Generation  = _generation;                // must land before the offset
-            hdr.WriteOffset = _headerSize;
-            _writeOffset    = 0;
+            StoreCovered(HeaderField.Generation, _generation);   // must land before the offset
+            Volatile.Write(ref Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset, _headerSize);
+            _writeOffset = 0;
         }
     }
 

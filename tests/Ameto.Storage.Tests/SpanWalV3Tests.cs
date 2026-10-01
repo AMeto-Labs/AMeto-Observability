@@ -102,11 +102,13 @@ public sealed class SpanWalV3Tests : IDisposable
     /// Builds, in a directory of its own, the file a process killed inside a commit leaves:
     /// <paramref name="flushed"/> spans (ids 100…) flushed, <paramref name="tail"/> (200…) appended
     /// while the segment was written, and the file copied at <paramref name="point"/> — "before" the
-    /// commit, a <see cref="SpanWriteAheadLog.RelocationStep"/> ("armed", "chunk", "end-stored",
-    /// "cleared") with <paramref name="done"/> bytes moved, the data "barrier" (its msync, before
-    /// the drive flush and the stamp), or "committed" — then <paramref name="intoNextChunk"/> bytes
-    /// of the next chunk copied by hand, the way a forward memmove killed part-way leaves them.
-    /// Returns the copy's path.
+    /// commit; a <see cref="SpanWriteAheadLog.RelocationStep"/> ("armed", "chunk", "end-stored",
+    /// "cleared") with <paramref name="done"/> bytes moved; a state between a covered store's
+    /// pending checksum and its field ("armed-pending", "stamp-pending") or between the field and the
+    /// checksum that vouches for it ("armed-unsealed", "chunk-unsealed", "clear-unsealed",
+    /// "stamp-unsealed"); the data "barrier" (its msync, before the drive flush and the stamp); or
+    /// "committed" — then <paramref name="intoNextChunk"/> bytes of the next chunk copied by hand,
+    /// the way a forward memmove killed part-way leaves them. Returns the copy's path.
     /// </summary>
     private string KilledCommit(int flushed, int tail, string point, long done, int intoNextChunk, string name = "killed")
     {
@@ -131,9 +133,23 @@ public sealed class SpanWalV3Tests : IDisposable
                                   or ("end-stored", SpanWriteAheadLog.RelocationStep.EndStored)
                                   or ("cleared",    SpanWriteAheadLog.RelocationStep.Cleared)) Take();
             };
+            wal.OnPendingStoredForTest = (field, value) =>
+            {
+                if ((point, field) is ("armed-pending", "MoveLength") && value != 0) Take();
+                if ((point, field) is ("stamp-pending", "Generation")) Take();
+            };
+            wal.OnCoveredStoreForTest = (field, value) =>
+            {
+                if ((point, field) is ("armed-unsealed", "MoveLength") && value != 0) Take();
+                if ((point, field) is ("chunk-unsealed", "MoveDone") && (long)value == done) Take();
+                if ((point, field) is ("clear-unsealed", "MoveLength") && value == 0) Take();
+                if ((point, field) is ("stamp-unsealed", "Generation")) Take();
+            };
             wal.RangeFlushedForTest = (_, _) => { if (point == "barrier") Take(); };   // the first is the data barrier's
             wal.CommitFlush();
             wal.OnRelocationStepForTest = null;
+            wal.OnPendingStoredForTest  = null;
+            wal.OnCoveredStoreForTest   = null;
             wal.RangeFlushedForTest     = null;
             if (point == "committed") Take();
             Assert.Equal(length, wal.WrittenBytes);                                    // the live log finished it
@@ -151,52 +167,97 @@ public sealed class SpanWalV3Tests : IDisposable
         return path;
     }
 
+    /// <summary>Rots the header's generation (bytes 16..20), unsealed: the header no longer verifies.</summary>
+    private static void RotGeneration(string path)
+    {
+        byte[] file = File.ReadAllBytes(path);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(16), 0xDEAD_BEEFu);
+        File.WriteAllBytes(path, file);
+    }
+
+    /// <summary>The v3 header checksum over a file's first 64 bytes, into both slots: CRC32C over [0, 8) and [16, 56), the record's From/Done read as 0 while its Length is 0.</summary>
+    private static void Seal(byte[] file)
+    {
+        byte[] h = file.AsSpan(0, FileHeader).ToArray();
+        if (BinaryPrimitives.ReadInt64LittleEndian(h.AsSpan(40)) == 0) { h.AsSpan(32, 8).Clear(); h.AsSpan(48, 8).Clear(); }
+        uint crc = Crc32c.Append(Crc32c.Append(0, h.AsSpan(0, 8)), h.AsSpan(16, 40));
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(56), crc);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(60), crc);
+    }
+
     /// <summary>
     /// A PROCESS KILLED ANYWHERE INSIDE A COMMIT LOSES NO SPAN, AND REPLAYS NONE TWICE. The file is
     /// copied at every point of the commit a process can die at: before it recorded anything; once
-    /// the record is armed; after each chunk of the move, including the last (all moved, nothing
-    /// stored after); after the new end is stored with the record still armed; after the record is
-    /// cleared, before the end marker; at the data barrier; and after the stamp. Where a chunk can
-    /// be in flight the kill is completed by hand the way a forward memmove leaves it —
+    /// the record is armed — sealed, or on either side of the arming store's field; after each chunk
+    /// of the move — sealed, or between its <c>MoveDone</c> and the checksum — including the last
+    /// (all moved, nothing stored after); after the new end is stored with the record still armed;
+    /// between the disarming and its checksum; after the record is cleared, before the end marker;
+    /// at the data barrier; on either side of the stamp's field; and after the stamp. Where a chunk
+    /// can be in flight the kill is completed by hand the way a forward memmove leaves it —
     /// <c>intoNextChunk</c> bytes of the next chunk copied. Two shapes: a tail that fits in the
     /// flushed prefix (one chunk) and one longer than it (three chunks: 200, 200 and 100 bytes).
+    /// Some rows also rot the header's generation, so the header fails its checksum — with a record
+    /// armed, or without one.
     ///
     /// <para>Opening each copy must replay every span appended during the flush exactly once, leave
     /// the log finished (its length the tail's), say so with a Warning when it had a move to finish,
-    /// and leave nothing for the next open to finish. The flushed spans come back only from the
-    /// kill BEFORE the record: nothing had moved, and the old header still accepts the flushed
+    /// log an Error only for a rotted header (and never "cannot vouch for": every record a commit
+    /// leaves matches its claim), and leave nothing for the next open to finish or rebuild. The
+    /// flushed spans come back only from a kill BEFORE the record (the pending checksum of the
+    /// arming is not the arming): nothing had moved, and the old header still accepts the flushed
     /// generation — the one window in which a commit duplicates spans of the segment it follows
     /// (the read paths drop the repeat by span id). From the record on, they are gone from the log.</para>
     ///
     /// <para>Without the finish at open (v2), the copies verify, the entry straddling the copy front
     /// does not, and every tail span behind it is lost — the rows killed inside a chunk; the rows
-    /// killed between chunks replay the flushed spans the move had not yet overwritten.</para>
+    /// killed between chunks replay the flushed spans the move had not yet overwritten. Without the
+    /// pending checksum, every unsealed row reads as rot (an Error and a rebuild of a header that was
+    /// right); without the rebuild, every rotted row replays nothing.</para>
     /// </summary>
     [Theory]
-    [InlineData(6, 4, "before",     0,   0)]    // nothing recorded: both generations replay
-    [InlineData(6, 4, "armed",      0,   0)]    // one chunk (the tail fits in the flushed prefix)
-    [InlineData(6, 4, "armed",      0,   150)]  // …killed 1.5 entries into it
-    [InlineData(6, 4, "chunk",      400, 0)]    // all moved: done == tail
-    [InlineData(6, 4, "end-stored", 400, 0)]    // the new end stored, the record still armed
-    [InlineData(6, 4, "cleared",    400, 0)]    // disarmed, the end marker not planted
-    [InlineData(6, 4, "barrier",    400, 0)]    // marker planted, data msynced, not stamped
-    [InlineData(6, 4, "committed",  400, 0)]    // stamped
-    [InlineData(2, 5, "before",     0,   0)]
-    [InlineData(2, 5, "armed",      0,   50)]   // a tail longer than the prefix: chunks of 200, 200, 100
-    [InlineData(2, 5, "chunk",      200, 0)]    // after the first chunk, on its boundary
-    [InlineData(2, 5, "chunk",      200, 130)]  // …and 1.3 entries into the second
-    [InlineData(2, 5, "chunk",      400, 99)]   // inside the last, one byte short of it
-    [InlineData(2, 5, "chunk",      500, 0)]    // after the last: done == tail
-    [InlineData(2, 5, "end-stored", 500, 0)]
-    [InlineData(2, 5, "cleared",    500, 0)]
-    [InlineData(2, 5, "barrier",    500, 0)]
-    [InlineData(2, 5, "committed",  500, 0)]
+    [InlineData(6, 4, "before",         0,   0,   false)]   // nothing recorded: both generations replay
+    [InlineData(6, 4, "before",         0,   0,   true)]
+    [InlineData(6, 4, "armed-pending",  0,   0,   false)]   // the arming's checksum stored, not the arming
+    [InlineData(6, 4, "armed",          0,   0,   false)]   // one chunk (the tail fits in the flushed prefix)
+    [InlineData(6, 4, "armed",          0,   150, false)]   // …killed 1.5 entries into it
+    [InlineData(6, 4, "armed",          0,   150, true)]    // …and the header rotted
+    [InlineData(6, 4, "armed-unsealed", 0,   0,   false)]   // between arming and its checksum
+    [InlineData(6, 4, "armed-unsealed", 0,   0,   true)]
+    [InlineData(6, 4, "chunk",          400, 0,   false)]   // all moved: done == tail
+    [InlineData(6, 4, "chunk-unsealed", 400, 0,   false)]
+    [InlineData(6, 4, "end-stored",     400, 0,   false)]   // the new end stored, the record still armed
+    [InlineData(6, 4, "end-stored",     400, 0,   true)]
+    [InlineData(6, 4, "clear-unsealed", 400, 0,   false)]   // between disarming and its checksum
+    [InlineData(6, 4, "clear-unsealed", 400, 0,   true)]
+    [InlineData(6, 4, "cleared",        400, 0,   false)]   // disarmed, the end marker not planted
+    [InlineData(6, 4, "barrier",        400, 0,   false)]   // marker planted, data msynced, not stamped
+    [InlineData(6, 4, "stamp-pending",  400, 0,   false)]   // the stamp's checksum stored, not the stamp
+    [InlineData(6, 4, "stamp-unsealed", 400, 0,   false)]   // the stamp stored, its checksum not
+    [InlineData(6, 4, "stamp-unsealed", 400, 0,   true)]
+    [InlineData(6, 4, "committed",      400, 0,   false)]   // stamped
+    [InlineData(6, 4, "committed",      400, 0,   true)]
+    [InlineData(2, 5, "before",         0,   0,   false)]
+    [InlineData(2, 5, "armed",          0,   50,  false)]   // a tail longer than the prefix: chunks of 200, 200, 100
+    [InlineData(2, 5, "armed",          0,   50,  true)]
+    [InlineData(2, 5, "chunk",          200, 0,   false)]   // after the first chunk, on its boundary
+    [InlineData(2, 5, "chunk",          200, 130, false)]   // …and 1.3 entries into the second
+    [InlineData(2, 5, "chunk",          200, 130, true)]
+    [InlineData(2, 5, "chunk-unsealed", 200, 0,   false)]
+    [InlineData(2, 5, "chunk-unsealed", 200, 0,   true)]
+    [InlineData(2, 5, "chunk",          400, 99,  false)]   // inside the last, one byte short of it
+    [InlineData(2, 5, "chunk",          500, 0,   false)]   // after the last: done == tail
+    [InlineData(2, 5, "end-stored",     500, 0,   false)]
+    [InlineData(2, 5, "cleared",        500, 0,   false)]
+    [InlineData(2, 5, "barrier",        500, 0,   false)]
+    [InlineData(2, 5, "committed",      500, 0,   false)]
     public void A_process_killed_anywhere_inside_a_commit_replays_every_surviving_span_once(
-        int flushed, int tail, string point, long done, int intoNextChunk)
+        int flushed, int tail, string point, long done, int intoNextChunk, bool rotHeader)
     {
         string killed = KilledCommit(flushed, tail, point, done, intoNextChunk);
-        bool before   = point == "before";
-        bool finishes = point is "armed" or "chunk" or "end-stored";
+        if (rotHeader) RotGeneration(killed);
+
+        bool before   = point is "before" or "armed-pending";
+        bool finishes = point is "armed" or "armed-unsealed" or "chunk" or "chunk-unsealed" or "end-stored";
         ulong[] expected = [.. before ? Ids(100, flushed) : [], .. Ids(200, tail)];
 
         var logger = new CapturingLogger();
@@ -206,9 +267,10 @@ public sealed class SpanWalV3Tests : IDisposable
             Assert.Equal(Entry * (long)(before ? flushed + tail : tail), wal.WrittenBytes);   // finished, not just read past
         }
         Assert.Equal(finishes, logger.Entries.Any(static e => e.Level == LogLevel.Warning && e.Text.Contains("finishing the relocation")));
-        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Error);
+        Assert.Equal(rotHeader, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify")));
+        Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("cannot vouch for"));
 
-        // And the finish is in the file: the next open has nothing left to finish.
+        // And the finish is in the file: the next open has nothing left to finish or rebuild.
         var quiet = new CapturingLogger();
         using (var again = Open(killed, quiet))
             Assert.Equal(expected, IdsOf(again.ReadAll()));
@@ -239,10 +301,11 @@ public sealed class SpanWalV3Tests : IDisposable
     }
 
     /// <summary>
-    /// A RECORD THAT CANNOT DESCRIBE A MOVE INSIDE THE FILE MOVES NOTHING. A relocation record whose
-    /// source runs past the mapping (a copied, truncated or damaged file) is cleared with an Error
-    /// naming its numbers, and the walk decides where the data ends — as it did before the record
-    /// existed. Acting on it would copy bytes from outside the log over the spans at its front.
+    /// A RECORD THAT CANNOT DESCRIBE A MOVE INSIDE THE FILE MOVES NOTHING, EVEN IN A HEADER THAT
+    /// VERIFIES. A relocation record whose source runs past the mapping (a copied or truncated file;
+    /// sealed here, so it is the checksum's blind spot and not rot) is cleared with an Error naming
+    /// its numbers, and the walk decides where the data ends — as it did before the record existed.
+    /// Acting on it would copy bytes from outside the log over the spans at its front.
     /// </summary>
     [Fact]
     public void A_record_that_does_not_fit_the_file_is_cleared_and_moves_nothing()
@@ -251,13 +314,221 @@ public sealed class SpanWalV3Tests : IDisposable
         byte[] file = File.ReadAllBytes(killed);
         BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(32), 600);                     // MoveFrom: the flush boundary
         BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(40), file.Length);              // MoveLength: past the file
+        Seal(file);
         File.WriteAllBytes(killed, file);
 
         var logger = new CapturingLogger();
         using (var wal = Open(killed, logger))
             Assert.Equal([.. Ids(100, 6), .. Ids(200, 4)], IdsOf(wal.ReadAll()));
         Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("cannot vouch for"));
+        Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("header does not verify"));
         Assert.Equal(0L, BinaryPrimitives.ReadInt64LittleEndian(ReadShared(killed).AsSpan(40)));   // cleared
+    }
+
+    /// <summary>
+    /// A RELOCATION RECORD IN A HEADER THAT DOES NOT VERIFY IS ACTED ON ONLY IF IT DESCRIBES THE MOVE
+    /// A COMMIT MADE. The three-chunk kill inside the second chunk, with the header's generation
+    /// rotted as well, so the header fails. The record still matches what the commit left — the claim
+    /// at the old end, <c>done</c> a chunk boundary — so the move is finished and every tail span
+    /// replays, under the generation rebuilt from the entries. With <c>done</c> rotted too (not a
+    /// chunk boundary) the record is not trusted: an Error says so, nothing is moved by it, and the
+    /// walk keeps what the copy front left — the three tail spans moved whole before it. Moving by
+    /// the rotted record would have read a source the second chunk had already begun to overwrite.
+    /// </summary>
+    [Theory]
+    [InlineData(false, new ulong[] { 200, 201, 202, 203, 204 })]
+    [InlineData(true,  new ulong[] { 200, 201, 202 })]
+    public void A_relocation_record_in_a_header_that_does_not_verify_must_match_the_move_it_names(bool rotDone, ulong[] expected)
+    {
+        string killed = KilledCommit(2, 5, "chunk", 200, 130);
+        byte[] file = File.ReadAllBytes(killed);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(16), 0xDEAD_BEEFu);              // Generation: rot
+        if (rotDone) BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan(48), 50);            // MoveDone: rot
+        File.WriteAllBytes(killed, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(killed, logger))
+            Assert.Equal(expected, IdsOf(wal.ReadAll()));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
+        Assert.Equal(rotDone, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("cannot vouch for")));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(ReadShared(killed).AsSpan(16)));   // rebuilt: the flushed generation
+    }
+
+    /// <summary>
+    /// A RECORD THAT SAYS THE NEW END IS STORED BUT THE MOVE IS NOT DONE IS NO STATE A COMMIT LEAVES.
+    /// The three-chunk move killed after its new end was stored (the record still armed, all of it
+    /// done), then the header's generation rotted and MoveDone rotted to a lower chunk boundary. The
+    /// claim equals the move's length and <c>done</c> is a multiple of <c>from</c>, so a check that
+    /// took them separately would trust it — and redoing from there reads source bytes the later
+    /// chunks have already overwritten, corrupting spans that were whole and in place (203 lost, 204
+    /// twice). The record is refused; the five tail spans, already in place, replay.
+    /// </summary>
+    [Fact]
+    public void A_record_claiming_the_new_end_with_the_move_unfinished_is_not_redone()
+    {
+        string killed = KilledCommit(2, 5, "end-stored", 500, 0);
+        byte[] file = File.ReadAllBytes(killed);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(16), 0xDEAD_BEEFu);              // Generation: rot
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(48), 200);                       // MoveDone: rot, a boundary
+        File.WriteAllBytes(killed, file);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(killed, logger))
+            Assert.Equal(Ids(200, 5), IdsOf(wal.ReadAll()));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("cannot vouch for"));
+    }
+
+    /// <summary>
+    /// THE DOUBLE STOP. The first kill leaves a header that verifies only by its pending checksum, or
+    /// a record the open has to finish; the open that finishes it is killed in turn, inside its first
+    /// covered store, after it wrote that store's pending checksum and before the field. Unless the
+    /// open sealed the header before storing anything, that file matches neither slot and the next
+    /// open reports rot that is not there. It must verify, finish, and replay every tail span once.
+    /// </summary>
+    [Theory]
+    [InlineData(6, 4, "armed-unsealed", 0)]
+    [InlineData(2, 5, "chunk-unsealed", 200)]
+    [InlineData(6, 4, "end-stored",     400)]
+    public void A_second_stop_inside_the_open_that_finishes_a_first_leaves_a_header_that_verifies(
+        int flushed, int tail, string point, long done)
+    {
+        string killed = KilledCommit(flushed, tail, point, done, intoNextChunk: 0);
+
+        byte[]? secondStop = null;
+        SpanWriteAheadLog.t_pendingStoredForNextOpenForTest = (_, _) => secondStop ??= ReadShared(killed);
+        try { Open(killed).Dispose(); }
+        finally { SpanWriteAheadLog.t_pendingStoredForNextOpenForTest = null; }
+        Assert.NotNull(secondStop);
+
+        string twice = Path.Combine(_dir, "twice");
+        Directory.CreateDirectory(twice);
+        File.WriteAllBytes(Path.Combine(twice, "spans.wal"), secondStop!);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(Path.Combine(twice, "spans.wal"), logger))
+            Assert.Equal(Ids(200, tail), IdsOf(wal.ReadAll()));
+        Assert.DoesNotContain(logger.Entries, static e => e.Level >= LogLevel.Error);
+    }
+
+    /// <summary>
+    /// AN OPEN KILLED WHILE IT FINISHES A RELOCATION UNDER A HEADER THAT DOES NOT VERIFY LEAVES IT NOT
+    /// VERIFYING. The open redoes the move chunk by chunk, storing its progress; if those stores
+    /// sealed the header, the rotted generation would be sealed with them, and the open after a second
+    /// kill would find a header that verifies, skip the rebuild — and replay nothing, the rotted
+    /// generation accepting no entry. The file is copied at the open's own relocation seam; opening
+    /// that copy still rebuilds, and every tail span replays.
+    /// </summary>
+    [Fact]
+    public void An_open_killed_while_it_finishes_a_relocation_under_a_rotted_header_still_rebuilds()
+    {
+        string killed = KilledCommit(2, 5, "chunk", 200, 130);
+        RotGeneration(killed);
+
+        byte[]? midOpen = null;
+        SpanWriteAheadLog.t_relocationStepForNextOpenForTest = (_, _) => midOpen ??= ReadShared(killed);
+        try { Open(killed).Dispose(); }
+        finally { SpanWriteAheadLog.t_relocationStepForNextOpenForTest = null; }
+        Assert.NotNull(midOpen);
+
+        string twice = Path.Combine(_dir, "twice");
+        Directory.CreateDirectory(twice);
+        File.WriteAllBytes(Path.Combine(twice, "spans.wal"), midOpen!);
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(Path.Combine(twice, "spans.wal"), logger))
+            Assert.Equal(Ids(200, 5), IdsOf(wal.ReadAll()));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
+    }
+
+    // ── The header's own checksum ────────────────────────────────────────────
+
+    /// <summary>
+    /// ONE FLIPPED BIT IN ANY FIELD OF THE HEADER LOSES NO SPAN. The log is mid-flush — three spans
+    /// of the header's generation, two of its successor appended after BeginFlush — and one bit of
+    /// the header is flipped on disk. Every field the checksum covers fails it and has the generation
+    /// rebuilt from the entries (an Error), except the record's From and Done while no record is
+    /// armed, which the checksum reads as zero and nothing reads at all; a flip in either checksum
+    /// leaves the other slot verifying. The claim is not covered — every append moves it — and a
+    /// claim flipped past the data is cut back by the walk to where the entries end. Every row
+    /// replays all five spans and leaves a header the next open finds quiet.
+    ///
+    /// <para>Without the checksum the generation row replays NOTHING: a generation two or more away
+    /// from the entries' accepts none of them (#103's second half — "a garbage generation hides every
+    /// entry"). Magic and version are not rows: they identify the file before any checksum is read,
+    /// and one that does not read as a span WAL is a foreign file, re-initialised, as in every
+    /// version of this log.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("pad",            6,  0x01, true)]
+    [InlineData("generation",     17, 0x40, true)]    // 1 → 0x4001: accepts no entry
+    [InlineData("reserved",       20, 0x01, true)]
+    [InlineData("reserved, high", 31, 0x80, true)]
+    [InlineData("move from",      33, 0x01, false)]   // no record armed: read as 0
+    [InlineData("move length",    40, 0x08, true)]    // a record armed by rot: from 0, refused
+    [InlineData("move done",      48, 0x10, false)]
+    [InlineData("crc",            57, 0x01, false)]   // the pending slot still verifies
+    [InlineData("pending crc",    62, 0x01, false)]
+    [InlineData("claim",          13, 0x01, false)]   // not covered: 2^40 bytes past the data
+    public void A_flipped_bit_in_any_header_field_loses_no_span(string field, int offset, byte mask, bool rebuilds)
+    {
+        using (var wal = Open())
+        {
+            for (int i = 0; i < 3; i++) wal.Append(Span(100 + i));
+            wal.BeginFlush();
+            for (int i = 3; i < 5; i++) wal.Append(Span(100 + i));
+        }
+        byte[] file = File.ReadAllBytes(WalPath);
+        file[offset] ^= mask;
+        File.WriteAllBytes(WalPath, file);
+
+        var logger = new CapturingLogger();
+        ulong[] replayed;
+        using (var wal = Open(logger: logger)) replayed = IdsOf(wal.ReadAll());
+        Assert.True(Ids(100, 5).SequenceEqual(replayed), $"{field}: replayed [{string.Join(", ", replayed)}]");
+        Assert.Equal(rebuilds, logger.Entries.Any(static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify")));
+
+        var quiet = new CapturingLogger();
+        using (var wal = Open(logger: quiet))
+            Assert.Equal(Ids(100, 5), IdsOf(wal.ReadAll()));
+        Assert.DoesNotContain(quiet.Entries, static e => e.Level >= LogLevel.Warning);
+    }
+
+    /// <summary>Writes a v3 log by hand — a 64-byte header with the given generation, sealed unless rotted — then the entries.</summary>
+    private void WriteV3Log(uint headerGeneration, bool seal, params byte[][] entries)
+    {
+        long written = entries.Sum(static e => (long)e.Length);
+        var file = new byte[FileHeader + 64 * 1024];
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(0), 0x52_44_53_57);               // "RDSW"
+        BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(4), 3);
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(8), FileHeader + written);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(16), headerGeneration);
+        if (seal) Seal(file);
+        long at = FileHeader;
+        foreach (var e in entries) { e.CopyTo(file, at); at += e.Length; }
+        File.WriteAllBytes(WalPath, file);
+    }
+
+    /// <summary>
+    /// THE REBUILD TAKES THE NEWEST GENERATION ON THE CYCLE, NOT THE LAST ONE IN THE FILE AND NOT THE
+    /// LARGEST NUMBER. Two logs whose header rotted: a restart after a crash mid-flush, which appended
+    /// under the header's generation (4) BEHIND entries of its successor (5) — the last entry is the
+    /// older one; and a flush in flight across the wrap, uint.MaxValue followed by 1 — the largest
+    /// number is the older one. Either wrong reading rebuilds a window that drops the newer entries;
+    /// both logs must replay every entry.
+    /// </summary>
+    [Theory]
+    [InlineData(5u, 4u)]                  // the last entry is the older generation
+    [InlineData(uint.MaxValue, 1u)]       // the newer generation is the smaller number
+    public void The_rebuild_takes_the_newest_generation_on_the_cycle(uint first, uint then)
+    {
+        WriteV3Log(0xDEAD_BEEFu, seal: false,
+            EntryBytes(Span(100), first, checksummed: true), EntryBytes(Span(101), first, checksummed: true),
+            EntryBytes(Span(102), then,  checksummed: true), EntryBytes(Span(103), then,  checksummed: true));
+
+        var logger = new CapturingLogger();
+        using (var wal = Open(logger: logger))
+            Assert.Equal(Ids(100, 4), IdsOf(wal.ReadAll()));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("header does not verify"));
     }
 
     // ── The format: v3, and the logs before it ───────────────────────────────
