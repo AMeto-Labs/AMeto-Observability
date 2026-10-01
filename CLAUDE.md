@@ -1,8 +1,18 @@
 # Project guidance
 
-## Skills — always use
+## Stack
+- Angular 21 client in `client/`: zoneless, standalone, state in `@ngrx/signals`, no SSR.
+- Before writing or reviewing backend C#, load the `aspnetcore-developer` skill.
+- Before writing or reviewing code in `client/`, load the `angular-developer` skill.
 
-- **angular-developer** — invoke for ANY Angular work (components, services, routing, forms, templates, SSR, testing, build config). Always follow its modern-Angular conventions (signals, standalone, zoneless, `@if`/`@for`, `inject()`).
-- **aspnetcore-developer** — invoke for ANY ASP.NET Core / backend C# work. Always follow its zero-allocation / GC-free architecture rules (spans, `ValueTask`, `ArrayPool`, Minimal APIs, source-generated JSON).
+## Code style
+- Zero-allocation rules apply to hot paths only: Ameto.Ingestion, Ameto.Otel decoders, Ameto.Storage, Ameto.Indexing, Ameto.Query, SSE writers.
+- Outside hot paths (alerts, auth, settings and admin endpoints) plain C# is fine, including LINQ and anonymous-type `Results.*` responses.
+- Hot or streaming JSON payloads use a source-generated `JsonSerializerContext`.
 
-When a task touches Angular frontend or ASP.NET Core backend code, load and apply the matching skill before writing or reviewing code.
+## Tests
+- Run tests as CI does: `dotnet test -c Debug` at the repo root (all six projects, Ameto.Perf included).
+
+## Prohibitions
+- Do not change the GC settings in `src/Ameto.Server/Ameto.Server.csproj`: Workstation GC is deliberate for small hosts.
+- No MVC controllers: new endpoints go into a `*EndpointMapper.cs`.
