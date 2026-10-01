@@ -64,6 +64,42 @@ public sealed class ClefServiceKeyTests
         Assert.Equal("OrderId", Assert.Single(map.Keys));
     }
 
+    /// <summary>
+    /// A service that is not a string — a number, a map, an array — REJECTS the event, under either
+    /// key, on both readers: the header field has no other type to hold. That was already true of
+    /// `service.name`; before `@service` was a header key, `{"@service": 123}` was an ordinary
+    /// property of any type and went through. Deliberate, and documented in API.md: the batch is
+    /// answered 400 with `failedAtElement` pointing here, and the elements before it are already
+    /// ingested — the streaming reader's ordinary contract for a malformed element.
+    /// </summary>
+    [Theory]
+    [InlineData("@service",     "int")]
+    [InlineData("@service",     "map")]
+    [InlineData("@service",     "array")]
+    [InlineData("service.name", "int")]
+    [InlineData("service.name", "map")]
+    public void A_service_that_is_not_a_string_rejects_the_element_on_both_readers(string key, string kind)
+    {
+        byte[] body = ThreeEventBatch(key, kind);
+
+        // Streaming: the first element is in, the second is the fault, and it is the BODY's
+        // fault — not the sink's — which is what makes the endpoint answer 400, not 500.
+        var sink     = new CaptureSink();
+        var progress = default(LogEventSerializer.ClefBatchProgress);
+        Assert.ThrowsAny<Exception>(() => LogEventSerializer.StreamBatch(body, sink, ref progress));
+        Assert.Equal(1, progress.Ingested);
+        Assert.Equal(1, progress.ElementIndex);
+        Assert.False(progress.InSink);
+        Assert.Equal("first-api", Assert.Single(sink.Events).Service);
+
+        // Materialising: the same element throws.
+        var events = new List<LogEvent>();
+        uint seq   = 1;
+        Assert.ThrowsAny<Exception>(() =>
+            LogEventSerializer.DeserializeBatch(new ReadOnlySequence<byte>(body), 0, ref seq, events));
+        Assert.Single(events);
+    }
+
     [Fact]
     public void The_json_writer_sends_the_service_as_at_service()
     {
@@ -127,6 +163,30 @@ public sealed class ClefServiceKeyTests
             if (value is null) w.WriteNil(); else w.Write(value);
         }
         w.Write("OrderId"); w.Write(4711L);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
+    /// <summary>Three events; the middle one carries <paramref name="key"/> with a non-string value.</summary>
+    private static byte[] ThreeEventBatch(string key, string kind)
+    {
+        var buf = new ArrayBufferWriter<byte>(256);
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(3);
+        for (int i = 0; i < 3; i++)
+        {
+            w.WriteMapHeader(3);
+            w.Write("@t");  w.Write("2026-10-01T09:00:00.0000000Z");
+            w.Write("@mt"); w.Write("event");
+            if (i != 1) { w.Write("@service"); w.Write(i == 0 ? "first-api" : "third-api"); continue; }
+            w.Write(key);
+            switch (kind)
+            {
+                case "int":   w.Write(123); break;
+                case "map":   w.WriteMapHeader(1); w.Write("name"); w.Write("api"); break;
+                default:      w.WriteArrayHeader(1); w.Write("api"); break;
+            }
+        }
         w.Flush();
         return buf.WrittenSpan.ToArray();
     }

@@ -142,7 +142,7 @@ Ingest a batch of log events.
 | `@l` | string | Level: `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`. |
 | `@m` | string | Ingest-only fallback for `@mt`. Never re-emitted by the server. |
 | `@x` | string or object | Exception. String is auto-wrapped; or `{type, message?, stack?, inner?}` recursive up to depth 3. |
-| `@service` | string | The service the event came from. `service.name` is accepted too (what the Serilog sink and older clients send); with both present, `@service` wins whatever the order. Either way it is stored as the event's `@service` header field, never as a property. |
+| `@service` | string | The service the event came from. `service.name` is accepted too (what the Serilog sink and older clients send); with both present, `@service` wins whatever the order, and an empty or nil `@service` counts as absent, so a `service.name` beside it still applies. Either way it is stored as the event's `@service` header field, never as a property. A value that is not a string (a number, a map, an array) under either key is a malformed element: the batch is answered `400` with `failedAtElement` pointing at it, and the elements before it are already ingested (see below). Before `@service` was a header key, a non-string `@service` went through as an ordinary property; a non-string `service.name` was already refused. |
 | *(any)* | any | Structured properties. |
 
 **Response `200 OK`:**
