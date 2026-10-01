@@ -157,6 +157,10 @@
       <ul class="path-list">
         <li>Operators: <code>= != &lt; &lt;= &gt; &gt;=</code> · logic <code>&amp;&amp;</code> <code>||</code> <code>!</code> and <code>( )</code></li>
         <li>Durations: <code>200ms</code> <code>1.5s</code> <code>500us</code> <code>2m</code> <code>1h</code> <code>ns</code></li>
+        <li>Numbers: <code>3</code> <code>-3</code> <code>0.5</code> <code>1e3</code> <code>-2.5E-1</code> — the sign
+        touches its digits (<code>- 3</code> is an error), and <code>duration</code> refuses a negative value.
+        Any other character outside a quoted string is an error, named by its code point — including the
+        <code>−</code> (U+2212) that documents and chat tools paste for a minus.</li>
         <li>Strings: <code>'…'</code> <code>"…"</code> or backticks · <code>=~</code> is treated as <code>=</code> (regex not evaluated)</li>
         <li>Presence: <code>.attr != nil</code> has the attribute · <code>.attr = nil</code> does not.
         The only way to ask about a missing one — comparisons never match it. Intrinsics are on

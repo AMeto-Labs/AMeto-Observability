@@ -532,9 +532,14 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         var spin = new SpinWait();
         while (true)
         {
-            int epoch = Volatile.Read(ref _trimEpoch);
+            int  epoch   = Volatile.Read(ref _trimEpoch);
+            long lowSeen = Volatile.Read(ref _cursors[LowFree].Value);   // the VERSIONED head, before the look
             int c = TryPop(ref _cursors[LowFree].Value);
-            if (c == PopEmpty) c = TryPop(ref _cursors[HighFree].Value);
+            if (c == PopEmpty)
+            {
+                _betweenListLooksForTest?.Invoke();
+                c = TryPop(ref _cursors[HighFree].Value);
+            }
             if (c != PopEmpty) return c == PopNoCommit ? -1 : c;
             _afterListsFoundEmptyForTest?.Invoke();
 
@@ -542,7 +547,22 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             // one decommit call): an empty list then means "wait", not "full". Full only if no trim
             // was running at any point while we looked — the epoch is odd during one, and moves at
             // either end, so a trim that finished between the look and this check is seen too.
-            if ((epoch & 1) == 0 && Volatile.Read(ref _trimEpoch) == epoch) return -1;
+            if ((epoch & 1) == 0 && Volatile.Read(ref _trimEpoch) == epoch)
+            {
+                // …AND THE LOW LIST NEVER MOVED WHILE WE LOOKED (#94, review F4). The two lists are
+                // read one after the other, not together: between the low read and the high read a
+                // drained span can free a low chunk while another producer takes the last high one,
+                // and this thread saw both empty with a chunk free the whole time. Re-reading the low
+                // INDEX once only narrowed that — the low chunk can be taken again by a third
+                // producer, and a high chunk freed meanwhile, before the re-read. Every push and pop
+                // bumps the head's version, so a head equal to the one read before the look means
+                // no chunk entered or left the low list from then until now: it was empty at the
+                // instant the high list was found empty, and both were empty together — exhaustion,
+                // not an interleaving. Anything else is looked at again. (A 32-bit version would
+                // have to wrap exactly within one look to fool this.)
+                if (Volatile.Read(ref _cursors[LowFree].Value) != lowSeen) continue;
+                return -1;
+            }
 
             // Wait, never refuse — with SpinWait's DEFAULT escalation (spin, then yield, then
             // Sleep(1)), not a pure spin: if the drainer is descheduled mid-trim, a pure spin burns
@@ -601,6 +621,9 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
 
     /// <summary>Test seam: a producer has just found both free lists empty, and has not yet decided whether to wait.</summary>
     internal Action? _afterListsFoundEmptyForTest;
+
+    /// <summary>Test seam: a producer has found the low free list empty, and has not yet looked at the high one.</summary>
+    internal Action? _betweenListLooksForTest;
 
     /// <summary>
     /// Gives back the arena above the highest chunk still in use (and above <see cref="LowWaterChunks"/>)

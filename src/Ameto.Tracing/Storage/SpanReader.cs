@@ -794,6 +794,17 @@ internal static class SpanReader
 
     // ── ReadAll (compaction) ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// What <see cref="ReadAll"/> throws when a block runs the process out of memory: an
+    /// <see cref="InvalidDataException"/> CARRYING the <see cref="OutOfMemoryException"/>. The type
+    /// says "this file", the inner exception says "this machine" — and the inner one is the truth: a
+    /// block's lengths are bounded against the file before anything is rented, so what is left to run
+    /// out is the heap. A caller deciding between "damaged" and "ask me again" reads the inner one
+    /// (the compaction pass does — see <c>TraceStorageEngine.CompactOnePass</c>).
+    /// </summary>
+    internal static InvalidDataException OutOfMemoryReading(uint blockIdx, uint compSize, OutOfMemoryException ex) =>
+        new($"Out of memory while processing block {blockIdx} (size: {compSize} bytes)", ex);
+
     internal static List<SpanRecord> ReadAll(string filePath)
     {
         const long MaxTotalBytes = 500_000_000; // 500MB limit for safety
@@ -876,7 +887,7 @@ internal static class SpanReader
             }
             catch (OutOfMemoryException ex)
             {
-                throw new InvalidDataException($"Out of memory while processing block {blockIdx} (size: {compSize} bytes)", ex);
+                throw OutOfMemoryReading(blockIdx, compSize, ex);
             }
             finally
             {

@@ -35,8 +35,10 @@ namespace Ameto.Tracing;
 /// the relaxed one still escapes U+2028, U+2029 and U+0085 (<c>\u2028</c>…), which some SSE and
 /// JavaScript parsers treat as line breaks (<c>TraceStreamEncodingTests</c>,
 /// <c>TraceDetailShapeTests</c>' 32-level golden). The terminal <c>done</c> / <c>query-error</c>
-/// frames and the keepalives are the SSE writer's own and keep its default encoder: they have no
-/// REST twin to match.</para>
+/// frames are the SSE writer's own, and are in the host's encoding too — the trace endpoints hand
+/// <see cref="SseJsonWriter"/> the host's writer options for them, Indented forced off (#94,
+/// 644c954), so a parse error naming the user's literal reads as REST would write it. The keepalives
+/// carry no text to encode.</para>
 /// </summary>
 internal sealed class TraceStreamRowJson : IDisposable
 {
