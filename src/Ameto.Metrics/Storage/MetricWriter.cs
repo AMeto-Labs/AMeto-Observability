@@ -143,6 +143,7 @@ internal static class MetricWriter
             {
                 int    end        = ends[g];
                 string metricName = series[order[start]].Key.Name;   // the group's key, as GroupBy's was: its first item's
+                string namePart   = FileNamePart(metricName);
                 for (int from = start; from < end; from += MaxSeriesPerFile)
                 {
                     ReadOnlySpan<int> items = order.AsSpan(from, Math.Min(MaxSeriesPerFile, end - from));
@@ -182,7 +183,7 @@ internal static class MetricWriter
                     // parsed back (all metadata is read from the file's own header/index).
                     Guid.NewGuid().TryFormat(nonceChars, out _, "N");
                     ReadOnlySpan<char> nonce = nonceChars[..8];
-                    string fileName = $"metrics-{SanitizeName(metricName)}-{minNano}-{maxNano}-{Suffix(granularity)}-{nonce}.mts";
+                    string fileName = $"metrics-{namePart}-{minNano}-{maxNano}-{Suffix(granularity)}-{nonce}.mts";
                     string filePath = Path.Combine(dataDir, fileName);
                     string tmpPath  = filePath + TempSuffix;
 
@@ -497,6 +498,55 @@ internal static class MetricWriter
             w.Write((long)v);
         else
             w.Write(v);
+    }
+
+    /// <summary>
+    /// The UTF-8 bytes a file name gives the metric's name (see <see cref="FileNamePart"/>): the rest
+    /// of the name is at most ~75 bytes, so a file name stays far below the 255 that NTFS counts in
+    /// UTF-16 units and ext4 in BYTES.
+    /// </summary>
+    internal const int MaxNamePartBytes = 64;
+
+    /// <summary>
+    /// The metric's part of a <c>.mts</c> file name: the sanitized name, when its UTF-8 form fits
+    /// <see cref="MaxNamePartBytes"/>; otherwise its longest prefix that leaves room for <c>~</c> and
+    /// eight hex digits of a stable hash of the FULL name (FNV-1a over its UTF-16 units), so two long
+    /// names that share the prefix still read apart.
+    ///
+    /// <para><b>Capped, because the whole name used to go in</b> (#106 review, P1). OpenTelemetry
+    /// allows 255-character metric names; past ~186 ASCII characters (~90 Cyrillic on Linux, where the
+    /// limit is bytes and sanitizing keeps letters) the file name passed 255, <c>File.Create</c> threw,
+    /// and the whole <see cref="Write"/> was retracted — the flush failed and put its snapshot back,
+    /// every flush after it failed the same way for as long as that series stayed in the tier, and
+    /// the other metrics' files of each of those flushes were deleted with it. Nothing reads the
+    /// name back — the catalog, queries and compaction take the metric from the file's own index —
+    /// so a cap changes the path and not a byte inside the file.</para>
+    /// </summary>
+    internal static string FileNamePart(string metricName)
+    {
+        string sanitized = SanitizeName(metricName);
+        if (Encoding.UTF8.GetByteCount(sanitized) <= MaxNamePartBytes) return sanitized;
+
+        // Every character left is a BMP non-surrogate (SanitizeName replaces surrogates), so 1-3 bytes.
+        int budget = MaxNamePartBytes - 9, bytes = 0, n = 0;
+        while (n < sanitized.Length)
+        {
+            char c = sanitized[n];
+            int  b = c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+            if (bytes + b > budget) break;
+            bytes += b;
+            n++;
+        }
+
+        uint hash = 2166136261;
+        foreach (char c in metricName) { hash ^= c; hash *= 16777619; }
+
+        return string.Create(n + 9, (sanitized, n, hash), static (span, s) =>
+        {
+            s.sanitized.AsSpan(0, s.n).CopyTo(span);
+            span[s.n] = '~';
+            s.hash.TryFormat(span[(s.n + 1)..], out _, "x8", System.Globalization.CultureInfo.InvariantCulture);
+        });
     }
 
     /// <summary>The name with every character but a letter, a digit, '-' and '_' replaced by '_' — the name itself when there is none to replace.</summary>

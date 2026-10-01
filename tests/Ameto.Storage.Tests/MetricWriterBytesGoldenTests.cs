@@ -22,8 +22,11 @@ namespace Ameto.Storage.Tests;
 /// <item>a metric name over 482 UTF-8 bytes, whose index and footer no longer fit the writer's
 /// stack buffer and go through a rented one.</item>
 /// </list>
-/// Each hash covers, per output file in order: the name as written less its random nonce, the
-/// metric, granularity, format, range, size and every byte.
+/// Each hash covers, per output file in order: the metric, granularity, format, range, size and every
+/// byte — NOT the file's name, which is no part of the format (nothing reads it back) and changed on
+/// purpose when a long metric name stopped going into it whole (#106 review, P1); the hashes were
+/// captured again from the old writer without it. The name has tests of its own in
+/// <c>MetricFormatV3Tests</c>.
 /// </summary>
 public sealed class MetricWriterBytesGoldenTests(ITestOutputHelper output) : IDisposable
 {
@@ -78,8 +81,6 @@ public sealed class MetricWriterBytesGoldenTests(ITestOutputHelper output) : IDi
         Add(h, (long)outputs.Count);
         foreach (var o in outputs)
         {
-            string name = Path.GetFileName(o.FilePath);
-            Add(h, name[..^13]);   // all but "-{nonce8}.mts"
             AddFile(h, o);
         }
         return Finish(h);
@@ -142,11 +143,11 @@ public sealed class MetricWriterBytesGoldenTests(ITestOutputHelper output) : IDi
     }
 
     [Theory]
-    [InlineData("flush",     "3E8C071B2154B3EE")]
-    [InlineData("65535",     "5C8499D047341876")]
-    [InlineData("65536",     "6C8DC9BAB3E2A33B")]
-    [InlineData("65537",     "0636C6BB957DCD53")]
-    [InlineData("long-name", "86EDD5157CD060EA")]
+    [InlineData("flush",     "1274549FDA791BFF")]
+    [InlineData("65535",     "BBCBF4C7A455B573")]
+    [InlineData("65536",     "8CE6A97A2F3F9BF8")]
+    [InlineData("65537",     "2A06DA8A6A561307")]
+    [InlineData("long-name", "9906EABE3A340184")]
     public void The_writer_writes_the_bytes_the_writer_before_it_wrote(string shape, string expected)
     {
         Directory.CreateDirectory(_dir);

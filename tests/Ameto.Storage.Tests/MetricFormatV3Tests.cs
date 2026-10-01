@@ -247,6 +247,70 @@ public sealed class MetricFormatV3Tests : IDisposable
         Assert.Equal(new FileInfo(infos[1].FilePath).Length, infos[1].SizeBytes);
     }
 
+    /// <summary>
+    /// A METRIC NAME TOO LONG FOR A FILE NAME (#106 review, P1). The whole sanitized name went into
+    /// the file name, so a name past ~186 characters — OpenTelemetry allows 255; on Linux, where the
+    /// limit is 255 BYTES, a Cyrillic one past ~90 — made <c>File.Create</c> throw, retracted the whole
+    /// flush, deleted the other metrics' files of it, and failed every flush after it the same way.
+    /// Here one flush carries a 200-character ASCII name, a 150-character Cyrillic one and an ordinary
+    /// one: all three land, each file name fits 255 bytes, and each reads back under its full name.
+    /// </summary>
+    [Fact]
+    public async Task Metric_names_too_long_for_a_file_name_still_flush_and_read_back()
+    {
+        string ascii    = "otel." + new string('a', 195);       // 200 characters
+        string cyrillic = new string('\u0436', 150);            // 150 characters, 300 UTF-8 bytes
+        string ordinary = "beside.them";
+        long   ts       = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        await using (var engine = new MetricStorageEngine(_dir,
+                         Microsoft.Extensions.Logging.Abstractions.NullLogger<MetricStorageEngine>.Instance))
+        {
+            MetricIngestItem Item(string name) => new()
+            {
+                Name = name, Kind = MetricKind.Gauge, Unit = "1", TimestampUnixNano = ts, ScalarValue = 42,
+                Labels = new LabelSet(new Dictionary<string, string> { ["service.name"] = "T" }),
+            };
+            engine.Ingest([Item(ascii), Item(cyrillic), Item(ordinary)]);
+        }   // the final flush: one flush, all three metrics
+
+        var files = Directory.GetFiles(_dir, "*.mts");
+        Assert.Equal(3, files.Length);
+        foreach (string name in new[] { ascii, cyrillic, ordinary })
+        {
+            string file = Assert.Single(files, f => MetricReader.ReadSegmentInfo(f).MetricName == name);
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(Path.GetFileName(file) + MetricWriter.TempSuffix) <= 255,
+                $"{Path.GetFileName(file)} is longer than a file name may be on ext4");
+            var series = Assert.Single(MetricReader.ReadAllSync(file));
+            Assert.Equal(name, series.Name);
+            Assert.Equal(42, Assert.Single(series.Points).Value);
+        }
+        Assert.Single(files, f => Path.GetFileName(f).StartsWith("metrics-beside_them-", StringComparison.Ordinal));   // a short name is as it was
+    }
+
+    /// <summary>
+    /// The cap keeps names apart: two long names that share far more than the kept prefix differ in
+    /// the hash of the whole name, and a name of three-byte letters is cut by bytes, not characters.
+    /// </summary>
+    [Fact]
+    public void Long_names_that_share_a_prefix_get_different_file_names_within_the_byte_budget()
+    {
+        string a = new string('m', 80) + ".alpha", b = new string('m', 80) + ".beta", cjk = new string('\u4E2D', 100);
+        foreach (string name in new[] { a, b, cjk })
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(MetricWriter.FileNamePart(name)) <= MetricWriter.MaxNamePartBytes, name);
+        Assert.NotEqual(MetricWriter.FileNamePart(a), MetricWriter.FileNamePart(b));
+        Assert.Equal(MetricWriter.FileNamePart(a), MetricWriter.FileNamePart(a));                 // stable
+        Assert.Equal("http_server_duration", MetricWriter.FileNamePart("http.server.duration"));  // short: unchanged
+
+        const long T = 1_784_800_000_000_000_000L;
+        var items = new List<(SeriesKey, HotSeries)>();
+        foreach (string name in new[] { a, b })
+            items.Add((new SeriesKey(name, MetricKind.Gauge, "1", new LabelSet(new Dictionary<string, string> { ["k"] = "v" })),
+                       new HotSeries([new MetricDataPoint { TimestampUnixNano = T, Value = 1 }])));
+        var infos = MetricWriter.Write(_dir, items, MetricGranularity.Raw);
+        Assert.Equal([a, b], infos.Select(i => MetricReader.ReadSegmentInfo(i.FilePath).MetricName));
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {
