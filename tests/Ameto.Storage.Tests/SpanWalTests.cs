@@ -147,7 +147,7 @@ public sealed class SpanWalTests : IDisposable
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);
-            fs.Write(BitConverter.GetBytes(32 + flushedBytes + liveBytes));
+            fs.Write(BitConverter.GetBytes(64 + flushedBytes + liveBytes));   // the v3 header is 64 bytes
         }
 
         var reopened = SpanWriteAheadLog.Open(WalPath);
@@ -198,7 +198,7 @@ public sealed class SpanWalTests : IDisposable
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
             fs.Seek(8, SeekOrigin.Begin);                   // WalFileHeader.WriteOffset
-            fs.Write(BitConverter.GetBytes(32 + real + overshoot));
+            fs.Write(BitConverter.GetBytes(64 + real + overshoot));   // the v3 header is 64 bytes
         }
 
         var reopened = SpanWriteAheadLog.Open(WalPath);
@@ -514,23 +514,24 @@ public sealed class SpanWalTests : IDisposable
     [Fact]
     public void Recovery_truncates_to_where_replay_stopped_so_later_appends_survive()
     {
-        // The state a crash between the commit's data barrier and its header store leaves:
+        // The state a header page that lags its data pages leaves after a commit (a power loss;
+        // a killed process cannot leave it — since v3 the claim is stored before the barrier):
         // the front is relocated and terminated by the generation-0 marker, but the header
         // still carries the OLD generation and the OLD, longer offset. Replay handles that
         // — and must also FIX the offset, or the next append lands past the terminator,
-        // where the following recovery stops before reaching it.
+        // where the following recovery stops before reaching it. The whole pre-commit header
+        // comes back, as a lost page would bring it: its own state, whole.
         var wal = SpanWriteAheadLog.Open(WalPath);
         for (int i = 0; i < 5; i++) wal.Append(Item(i, BaseNano + i));
         wal.BeginFlush();
         for (int i = 5; i < 8; i++) wal.Append(Item(i, BaseNano + i));
 
-        long oldOffset = ReadHeaderInt64(8);      // covers flushed entries + the tail
-        uint oldGen    = ReadHeaderUInt32(16);    // the generation being flushed
+        byte[] oldHeader = ReadHeader();          // covers flushed entries + the tail, the flushed generation
+        Assert.Equal(64 + wal.WrittenBytes, BitConverter.ToInt64(oldHeader, 8));
 
         wal.CommitFlush();
         wal.Dispose();
-        PatchHeader(offset: 8,  value: BitConverter.GetBytes(oldOffset));   // header store "lost"
-        PatchHeader(offset: 16, value: BitConverter.GetBytes(oldGen));
+        PatchHeader(offset: 0, value: oldHeader);                           // header stores "lost"
 
         var reopened = SpanWriteAheadLog.Open(WalPath);
         Assert.Equal(3, reopened.ReadAll().Count);            // the relocated tail, stopping at the marker
@@ -549,22 +550,13 @@ public sealed class SpanWalTests : IDisposable
                      replayed.Select(r => r.StartTimeUnixNano));
     }
 
-    private long ReadHeaderInt64(int offset)
+    /// <summary>The v3 file header, all 64 bytes, as the file holds it now.</summary>
+    private byte[] ReadHeader()
     {
         using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        Span<byte> buf = stackalloc byte[8];
-        fs.Seek(offset, SeekOrigin.Begin);
+        var buf = new byte[64];
         fs.ReadExactly(buf);
-        return BitConverter.ToInt64(buf);
-    }
-
-    private uint ReadHeaderUInt32(int offset)
-    {
-        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        Span<byte> buf = stackalloc byte[4];
-        fs.Seek(offset, SeekOrigin.Begin);
-        fs.ReadExactly(buf);
-        return BitConverter.ToUInt32(buf);
+        return buf;
     }
 
     private void PatchHeader(int offset, byte[] value)
