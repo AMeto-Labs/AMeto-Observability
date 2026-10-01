@@ -28,8 +28,8 @@ namespace Ameto.Otel;
 /// wire into the properties blob, and nothing else is materialised at all.</para>
 ///
 /// <para>Property order — resource attributes, then record attributes, then <c>@tr</c> and
-/// <c>@sp</c> — and the <c>service.name</c> capture (first one wins, string values only,
-/// and it stays in the properties map as well) match <c>OtlpLogMapper</c> byte for byte;
+/// <c>@sp</c> — and the <c>service.name</c> capture (the first one decides; a non-empty string
+/// becomes the <c>@service</c> header and leaves the properties map) match <c>OtlpLogMapper</c> byte for byte;
 /// <c>OtlpLogProtoParityTests</c> pins that. Two deliberate differences, both toward the
 /// JSON path: a record with no properties gets an empty msgpack map rather than no bytes,
 /// and array / kvlist attribute values are encoded instead of being written as nil — the
@@ -309,7 +309,8 @@ public static class OtlpLogProtoParser
     /// <summary>
     /// Writes one KeyValue as a msgpack key + value pair. Returns false — writing nothing —
     /// when the message carries no key, which is the mapper's <c>kv.Key is not null</c> test
-    /// and the reason the map header is counted the same way.
+    /// and the reason the map header is counted the same way; and when it is the resource's
+    /// service, which goes to the header instead of the map.
     ///
     /// <para>Two passes over the (tiny) KeyValue rather than one, because the wire format
     /// allows the value to precede the key and the msgpack pair cannot.</para>
@@ -333,14 +334,16 @@ public static class OtlpLogProtoParser
         }
         if (!haveKey) return false;
 
-        // service.name: the FIRST one decides, string values only, and it is NOT removed from
-        // the property map. All three are the MAPPER's behaviour, which is what this path is
-        // pinned to. The JSON parser differs on the first of them — it overwrites, so the last
-        // service.name wins there — and that difference is not introduced here to fix it.
+        // service.name: the FIRST one decides, and only a non-empty string_value becomes the
+        // service. That one is the event's header field (@service) and is NOT written to the
+        // property map — the header is the one copy. Anything else stays an ordinary property,
+        // as does every later service.name. All of it is the MAPPER's behaviour, which is what
+        // this path is pinned to (and the JSON parser's too).
         if (captureService && !st.ServiceSeen && key.SequenceEqual("service.name"u8))
         {
             st.ServiceSeen = true;
             st.Service     = StringValueOf(value);
+            if (!st.Service.IsEmpty) return false;
         }
 
         WriteUtf8(ref w, key);

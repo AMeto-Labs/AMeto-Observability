@@ -21,6 +21,10 @@ namespace Ameto.Otel;
 /// conformant exporter. Out-of-order input degrades gracefully (missing resource attrs),
 /// it never corrupts. Nested array/kvlist attribute values (rare in logs) take a small
 /// pooled buffer; the scalar hot path is allocation-free.
+///
+/// <para>The resource's <c>service.name</c> becomes the event's <c>@service</c> header and
+/// leaves the property map, exactly as the mapper and the protobuf parser do it — see
+/// <see cref="ServiceCapture"/>.</para>
 /// </summary>
 public static class OtlpLogStreamParser
 {
@@ -47,7 +51,9 @@ public static class OtlpLogStreamParser
         var recBuf = _tRec ??= new ArrayBufferWriter<byte>(8192);   // record attrs + @tr/@sp (msgpack KV pairs)
         var outBuf = _tOut ??= new ArrayBufferWriter<byte>(8192);   // assembled map: header + resBuf + recBuf
         resBuf.ResetWrittenCount(); recBuf.ResetWrittenCount(); outBuf.ResetWrittenCount();
-        byte[] svcBuf  = ArrayPool<byte>.Shared.Rent(256);   // captured service.name bytes (per resource)
+        // The resource's service.name, captured per resource; its buffer grows (rent, then return)
+        // for a long name, so the one to give back is whatever it holds when the parse ends.
+        var    svc     = new ServiceCapture { Buf = ArrayPool<byte>.Shared.Rent(256) };
         byte[] tmplBuf = ArrayPool<byte>.Shared.Rent(4096);  // captured body/template bytes (per record)
         byte[] trBuf   = ArrayPool<byte>.Shared.Rent(32);    // traceId bytes (per record)
         byte[] spBuf   = ArrayPool<byte>.Shared.Rent(16);    // spanId bytes (per record)
@@ -66,7 +72,7 @@ public static class OtlpLogStreamParser
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                         ParseResourceLogs(ref reader, sink, resBuf, recBuf, outBuf,
-                            svcBuf, ref tmplBuf, trBuf, spBuf, ref ingested, ref dropped);
+                            ref svc, ref tmplBuf, trBuf, spBuf, ref ingested, ref dropped);
                 }
                 else
                 {
@@ -84,7 +90,7 @@ public static class OtlpLogStreamParser
             // to wait out the drain loop's 1 s missed-signal timeout.
             if (ingested > 0) sink.NotifyBatchEnqueued();
 
-            ArrayPool<byte>.Shared.Return(svcBuf);
+            ArrayPool<byte>.Shared.Return(svc.Buf);
             ArrayPool<byte>.Shared.Return(tmplBuf);
             ArrayPool<byte>.Shared.Return(trBuf);
             ArrayPool<byte>.Shared.Return(spBuf);
@@ -95,14 +101,15 @@ public static class OtlpLogStreamParser
     private static void ParseResourceLogs(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
         ArrayBufferWriter<byte> resBuf, ArrayBufferWriter<byte> recBuf, ArrayBufferWriter<byte> outBuf,
-        byte[] svcBuf, ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf,
+        ref ServiceCapture svc, ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf,
         ref int ingested, ref int dropped)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
         resBuf.ResetWrittenCount();
         int resKeyCount = 0;
-        int svcLen      = 0; // >0 ⇒ service.name captured in svcBuf
+        svc.Len  = 0;       // >0 ⇒ this resource's service.name is in svc.Buf
+        svc.Seen = false;
         // The service name is a property of THIS resource, shared by every record under it:
         // intern it once here instead of re-hashing the same bytes per record.
         int svcIdx      = -1;
@@ -115,8 +122,8 @@ public static class OtlpLogStreamParser
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                 {
-                    ParseResourceAttributes(ref reader, resBuf, ref resKeyCount, svcBuf, ref svcLen);
-                    svcIdx = svcLen > 0 ? sink.InternService(svcBuf.AsSpan(0, svcLen)) : -1;
+                    ParseResourceAttributes(ref reader, resBuf, ref resKeyCount, ref svc);
+                    svcIdx = svc.Len > 0 ? sink.InternService(svc.Buf.AsSpan(0, svc.Len)) : -1;
                 }
                 else
                     reader.Skip();
@@ -126,7 +133,7 @@ public static class OtlpLogStreamParser
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen, svcIdx,
+                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svc.Buf, svc.Len, svcIdx,
                             recBuf, outBuf, ref tmplBuf, trBuf, spBuf, ref ingested, ref dropped);
                 }
                 else reader.Skip();
@@ -139,8 +146,7 @@ public static class OtlpLogStreamParser
     }
 
     private static void ParseResourceAttributes(
-        ref Utf8JsonReader reader, ArrayBufferWriter<byte> resBuf, ref int keyCount,
-        byte[] svcBuf, ref int svcLen)
+        ref Utf8JsonReader reader, ArrayBufferWriter<byte> resBuf, ref int keyCount, ref ServiceCapture svc)
     {
         var w = new MessagePackWriter(resBuf);
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -149,11 +155,29 @@ public static class OtlpLogStreamParser
             if (reader.ValueTextEquals("attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteKeyValue(ref reader, ref w, svcBuf, ref svcLen)) keyCount++;
+                    if (WriteKeyValue(ref reader, ref w, ref svc, captureService: true)) keyCount++;
             }
             else reader.Skip();
         }
         w.Flush();
+    }
+
+    /// <summary>
+    /// The resource's <c>service.name</c>, as the mapper reads it: the FIRST attribute of that
+    /// name decides (<see cref="Seen"/>), and only a non-empty <c>stringValue</c> becomes the
+    /// service (<see cref="Len"/> &gt; 0). That attribute is the event's <c>@service</c> header
+    /// and is NOT written to the property map — the header is the one copy. Anything else stays an
+    /// ordinary property, as does every later <c>service.name</c>. (This parser used to let the
+    /// LAST string one win, unlike the mapper and the protobuf parser; with the attribute now
+    /// leaving the map, which one is captured decides which one is missing from it, so all three
+    /// agree.)
+    /// </summary>
+    private struct ServiceCapture
+    {
+        /// <summary>Pooled; grown (rent, then return) for a long name, returned by <see cref="Parse"/>.</summary>
+        public byte[] Buf;
+        public int    Len;
+        public bool   Seen;
     }
 
     // ── scopeLogs[] element ────────────────────────────────────────────────────
@@ -201,7 +225,6 @@ public static class OtlpLogStreamParser
         recBuf.ResetWrittenCount();
         var w = new MessagePackWriter(recBuf);
         int recKeyCount = 0;
-        int svcDummy = 0; // record attrs never capture service.name (that comes from the resource)
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -243,7 +266,7 @@ public static class OtlpLogStreamParser
             else if (reader.ValueTextEquals("attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteKeyValue(ref reader, ref w, svcBuf: null, svcLen: ref svcDummy)) recKeyCount++;
+                    if (WriteKeyValue(ref reader, ref w)) recKeyCount++;   // records never carry the service
             }
             else
             {
@@ -285,11 +308,28 @@ public static class OtlpLogStreamParser
     }
 
     // ── KeyValue { "key": "...", "value": { AnyValue } } → msgpack key + value ──
-    private static bool WriteKeyValue(ref Utf8JsonReader reader, ref MessagePackWriter w, byte[]? svcBuf, ref int svcLen)
+
+    /// <summary>A record or kvlist attribute: never the service.</summary>
+    private static bool WriteKeyValue(ref Utf8JsonReader reader, ref MessagePackWriter w)
+    {
+        ServiceCapture none = default;   // untouched: capture is off
+        return WriteKeyValue(ref reader, ref w, ref none, captureService: false);
+    }
+
+    /// <summary>
+    /// Writes one KeyValue as a msgpack pair and returns whether it wrote one. With
+    /// <paramref name="captureService"/>, the resource's first <c>service.name</c> is decided here
+    /// (see <see cref="ServiceCapture"/>): its key is held back until the value is known, and a
+    /// value that becomes the service writes nothing at all — the pair is not in the map.
+    /// </summary>
+    private static bool WriteKeyValue(
+        ref Utf8JsonReader reader, ref MessagePackWriter w, ref ServiceCapture svc, bool captureService)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return false; }
 
-        bool wroteKey = false, isService = false, wrote = false;
+        bool wroteKey = false, wrote = false;
+        bool heldKey  = false;   // the service.name key, not yet written
+        bool captured = false;   // …and its value became the service: write neither
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -299,17 +339,27 @@ public static class OtlpLogStreamParser
                 reader.Read();
                 if (reader.TokenType == JsonTokenType.String)
                 {
-                    isService = svcBuf is not null && reader.ValueTextEquals("service.name"u8);
-                    WriteJsonStringToMsgpack(ref reader, ref w);
+                    if (captureService && !svc.Seen && reader.ValueTextEquals("service.name"u8))
+                    {
+                        svc.Seen = true;
+                        heldKey  = true;
+                    }
+                    else WriteJsonStringToMsgpack(ref reader, ref w);
                     wroteKey = true;
                 }
                 else reader.Skip();
             }
             else if (reader.ValueTextEquals("value"u8))
             {
-                if (!wroteKey) { reader.Skip(); continue; } // value before key (non-standard) — skip
+                if (!wroteKey || captured) { reader.Skip(); continue; } // value before key (non-standard) — skip
+                if (heldKey)
+                {
+                    heldKey = false;
+                    if (TryCaptureService(ref reader, ref svc)) { captured = true; continue; }
+                    w.WriteString("service.name"u8);   // not the service: an ordinary property after all
+                }
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    WriteAnyValue(ref reader, ref w, isService ? svcBuf : null, ref svcLen);
+                    WriteAnyValue(ref reader, ref w);
                 else
                     w.WriteNil();
                 wrote = true;
@@ -317,12 +367,45 @@ public static class OtlpLogStreamParser
             else reader.Skip();
         }
 
+        if (captured) return false;
+        if (heldKey) w.WriteString("service.name"u8);   // a held key whose value never came
         if (wroteKey && !wrote) w.WriteNil(); // key with no value object
         return wroteKey;
     }
 
+    /// <summary>
+    /// With the reader on a held <c>service.name</c>'s <c>"value"</c> property: when the AnyValue
+    /// carries a non-empty <c>stringValue</c>, copies it into <see cref="ServiceCapture.Buf"/>,
+    /// moves the reader past the value and returns true. Otherwise leaves the reader where it was
+    /// and returns false, and the caller writes the pair as usual. The look-ahead runs on a COPY of
+    /// the reader — a struct over the whole body, so the copy is a checkpoint and costs nothing.
+    /// </summary>
+    private static bool TryCaptureService(ref Utf8JsonReader reader, ref ServiceCapture svc)
+    {
+        var peek = reader;
+        if (!peek.Read() || peek.TokenType != JsonTokenType.StartObject) return false;
+
+        int len = 0;
+        while (peek.Read() && peek.TokenType != JsonTokenType.EndObject)
+        {
+            if (peek.TokenType != JsonTokenType.PropertyName) { peek.Skip(); continue; }
+            if (peek.ValueTextEquals("stringValue"u8))
+            {
+                peek.Read();
+                if (peek.TokenType == JsonTokenType.String) len = CopyStringGrow(ref peek, ref svc.Buf);
+                else peek.Skip();
+            }
+            else peek.Skip();
+        }
+        if (len == 0) return false;
+
+        svc.Len = len;
+        reader.Skip();   // on the "value" property name: past its whole AnyValue
+        return true;
+    }
+
     // ── AnyValue { stringValue | intValue | boolValue | doubleValue | array | kvlist } ──
-    private static void WriteAnyValue(ref Utf8JsonReader reader, ref MessagePackWriter w, byte[]? svcBuf, ref int svcLen)
+    private static void WriteAnyValue(ref Utf8JsonReader reader, ref MessagePackWriter w)
     {
         bool wrote = false;
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -332,7 +415,6 @@ public static class OtlpLogStreamParser
             if (reader.ValueTextEquals("stringValue"u8))
             {
                 reader.Read();
-                if (svcBuf is not null) svcLen = CopyString(ref reader, svcBuf);
                 WriteJsonStringToMsgpack(ref reader, ref w);
                 wrote = true;
             }
@@ -387,10 +469,10 @@ public static class OtlpLogStreamParser
             {
                 var tmp = new ArrayBufferWriter<byte>(256);
                 var tw  = new MessagePackWriter(tmp);
-                int n = 0, dummy = 0;
+                int n = 0;
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
-                    if (reader.TokenType == JsonTokenType.StartObject) { WriteAnyValue(ref reader, ref tw, null, ref dummy); n++; }
+                    if (reader.TokenType == JsonTokenType.StartObject) { WriteAnyValue(ref reader, ref tw); n++; }
                     else reader.Skip();
                 }
                 tw.Flush();
@@ -410,9 +492,9 @@ public static class OtlpLogStreamParser
             {
                 var tmp = new ArrayBufferWriter<byte>(256);
                 var tw  = new MessagePackWriter(tmp);
-                int n = 0, dummy = 0;
+                int n = 0;
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteKeyValue(ref reader, ref tw, null, ref dummy)) n++;
+                    if (WriteKeyValue(ref reader, ref tw)) n++;
                 tw.Flush();
                 w.WriteMapHeader(n);
                 w.WriteRaw(tmp.WrittenSpan);

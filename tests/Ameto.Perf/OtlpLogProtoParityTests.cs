@@ -68,7 +68,8 @@ public sealed class OtlpLogProtoParityTests
         Assert.Equal(0xb7ad6b7169203300UL, first.Sp);
 
         var props = Props(first.Props);
-        Assert.Equal("Etisalat.API", props["service.name"]);  // stays in the map as well
+        Assert.False(props.ContainsKey("service.name"));     // it is the header (@service), not a property too
+        Assert.False(props.ContainsKey("@service"));
         Assert.Equal("0af7651916cd43dd8448eb211c80009c", props["@tr"]);
         Assert.Equal("b7ad6b7169203300", props["@sp"]);
         Assert.Equal(500L, props["http.response.status_code"]);

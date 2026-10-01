@@ -14,7 +14,9 @@ namespace Ameto.Otel;
 /// - <c>body.stringValue</c>     → <c>@mt</c> (message template)
 /// - <c>severityNumber</c>       → <c>@l</c>  (log level)
 /// - <c>attributes</c>           → structured properties
-/// - <c>resource.attributes</c>  → added as properties (service.name, etc.)
+/// - <c>resource.attributes</c>  → added as properties, except the first <c>service.name</c>
+///   when it is a non-empty string: that becomes the event's <c>@service</c> header field instead
+///   (one copy, not two)
 /// - <c>traceId</c> / <c>spanId</c> → properties <c>TraceId</c> / <c>SpanId</c>
 ///   (enables log↔trace correlation in the query UI)
 ///
@@ -70,18 +72,27 @@ public static class OtlpLogMapper
         TraceIdHelper.TryParseTraceId(rec.TraceId, out ulong traceIdHi, out ulong traceIdLo);
         TraceIdHelper.TryParseSpanId(rec.SpanId, out ulong spanId);
 
-        // Extract service.name from resource attributes
+        // The service: the FIRST resource attribute named service.name decides. A non-empty
+        // string becomes the event's header field (@service) and leaves the property map — the
+        // header is the event's one copy, and every filter spelling of the service reads it, so
+        // a property beside it was a duplicate nothing could reach. Any other value gives no
+        // service and stays an ordinary property, as does every later service.name.
         string? serviceName = null;
+        int     serviceAttr = -1;
         if (resourceAttrs is not null)
             for (int j = 0; j < resourceAttrs.Count; j++)
-                if (resourceAttrs[j].Key == "service.name")
+                if (resourceAttrs[j].Key == ClefFields.LegacyServiceName)
                 {
-                    serviceName = resourceAttrs[j].Value?.StringValue;
+                    if (resourceAttrs[j].Value?.StringValue is { Length: > 0 } service)
+                    {
+                        serviceName = service;
+                        serviceAttr = j;
+                    }
                     break;
                 }
 
         // Serialize all props directly — no intermediate Dictionary<> clone per record
-        var rawProps = SerializeAllProps(resourceAttrs, rec.Attributes, rec.TraceId, rec.SpanId);
+        var rawProps = SerializeAllProps(resourceAttrs, serviceAttr, rec.Attributes, rec.TraceId, rec.SpanId);
 
         return new LogEvent
         {
@@ -105,13 +116,17 @@ public static class OtlpLogMapper
     /// cloning into an intermediate <see cref="Dictionary{TKey,TValue}"/>.
     /// Uses <see cref="ArrayBufferWriter{T}"/> to avoid MemoryStream + ToArray() double-copy.
     /// </summary>
+    /// <param name="skipResourceAttr">Index of the resource attribute that became the header
+    /// service, which the map does not repeat; -1 when none did.</param>
     private static ReadOnlyMemory<byte> SerializeAllProps(
         List<OtlpKeyValue>? resourceAttrs,
+        int skipResourceAttr,
         List<OtlpKeyValue>? recordAttrs,
         string? traceId,
         string? spanId)
     {
-        int count = CountValidKeys(resourceAttrs) + CountValidKeys(recordAttrs)
+        int count = CountValidKeys(resourceAttrs) - (skipResourceAttr >= 0 ? 1 : 0)
+                  + CountValidKeys(recordAttrs)
                   + (string.IsNullOrEmpty(traceId) ? 0 : 1)
                   + (string.IsNullOrEmpty(spanId)  ? 0 : 1);
         if (count == 0) return ReadOnlyMemory<byte>.Empty;
@@ -119,8 +134,8 @@ public static class OtlpLogMapper
         var buf = new ArrayBufferWriter<byte>(count * 32);
         var w   = new MessagePackWriter(buf);
         w.WriteMapHeader(count);
-        WriteKeyValues(ref w, resourceAttrs);
-        WriteKeyValues(ref w, recordAttrs);
+        WriteKeyValues(ref w, resourceAttrs, skipResourceAttr);
+        WriteKeyValues(ref w, recordAttrs, skip: -1);
         if (!string.IsNullOrEmpty(traceId)) { w.Write("@tr"); w.Write(traceId); }
         if (!string.IsNullOrEmpty(spanId))  { w.Write("@sp"); w.Write(spanId);  }
         w.Flush();
@@ -136,13 +151,13 @@ public static class OtlpLogMapper
         return c;
     }
 
-    private static void WriteKeyValues(ref MessagePackWriter w, List<OtlpKeyValue>? kvs)
+    private static void WriteKeyValues(ref MessagePackWriter w, List<OtlpKeyValue>? kvs, int skip)
     {
         if (kvs is null) return;
         for (int i = 0; i < kvs.Count; i++)
         {
             var kv = kvs[i];
-            if (kv.Key is null) continue;
+            if (kv.Key is null || i == skip) continue;
             w.Write(kv.Key);
             WriteAnyValue(ref w, kv.Value);
         }
