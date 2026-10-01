@@ -106,7 +106,8 @@ export interface AlertSilence {
 }
 
 export interface AlertPreviewResult {
-  value:     number;
+  /** null: the window holds no finite value — no verdict (see previewVerdict). */
+  value:     number | null;
   threshold: number;
   wouldFire: boolean;
 }

@@ -206,11 +206,15 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     /// <summary>
     /// Evaluate a rule's value right now without affecting state (for the editor preview). The
-    /// same answer a tick would act on — including "the store cannot say", which a tick skips and
-    /// the preview endpoint turns into a 503 rather than a 0 that "would not fire".
+    /// same answer a tick would act on — including "the store cannot say" (#95), which a tick skips
+    /// and the preview endpoint turns into a 503 rather than a 0 that "would not fire"; and an
+    /// available NaN, a metric window with points and not one finite (#92), which a tick also skips
+    /// and the endpoint answers as <c>value: null, wouldFire: false</c> — never a verdict the
+    /// evaluator would not reach. An EMPTY window is 0, as the evaluator reads it. A preview logs no
+    /// non-finite warning (see <see cref="WarnNonFinite"/>).
     /// </summary>
     public ValueTask<AlertValue> PreviewAsync(AlertRule rule, CancellationToken ct = default)
-        => ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+        => ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct, preview: true);
 
     /// <summary>
     /// Dispatches a one-off TEST notification through the rule's channels — bypasses the
@@ -293,6 +297,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
                     continue;
                 }
 
+                // Available, and still no value to compare (#92): a metric window whose every point
+                // is NaN or infinite (MetricValueAsync has said so in the log). The rule keeps its
+                // state: a comparison against NaN is false, and "not breached" would resolve it. A
+                // SEPARATE test from the one above, and after it — NaN is never the availability test.
+                if (double.IsNaN(value.Value)) continue;
+
                 Transition(rule, value.Value, now);
             }
             catch (OperationCanceledException) when (IsStopping)
@@ -308,7 +318,23 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // After the tick's last rule, so a line counts every rule the tick skipped (a cycle cut
         // short by the host stopping returns above and says nothing).
         FlushUnavailableWarnings();
+        ForgetDeletedRules();
     }
+
+    /// <summary>
+    /// Drops the once-only non-finite warnings of rules that no longer exist — a rule deleted, or
+    /// replaced under a new id — so the set holds at most the saved rules' entries (two each). Once a
+    /// tick, and only when the set is not empty.
+    /// </summary>
+    private void ForgetDeletedRules()
+    {
+        if (_nonFiniteWarned.IsEmpty) return;
+        foreach (var entry in _nonFiniteWarned)
+            if (_store.GetById(entry.Key.RuleId) is null) _nonFiniteWarned.TryRemove(entry.Key, out _);
+    }
+
+    /// <summary>Test hook: how many once-only non-finite warnings are remembered.</summary>
+    internal int NonFiniteWarnedCountForTest => _nonFiniteWarned.Count;
 
     // ── State machine ───────────────────────────────────────────────────────────
 
@@ -465,8 +491,13 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// failure with a stack trace on every tick. A read the store's own close cut short is now the
     /// Closed answer it is: skipped, and said once a minute. An ObjectDisposedException from a store
     /// that is NOT closed is still a failure, and still reported as one.</para>
+    ///
+    /// <para>An AVAILABLE value can still be NaN (#92): a metric window with points and not one
+    /// finite. The caller tests <see cref="AlertValue.IsAvailable"/> first and NaN second.</para>
     /// </summary>
-    private async ValueTask<AlertValue> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct)
+    /// <param name="preview">The editor's preview, not an evaluation: says nothing in the log (see
+    /// <see cref="WarnNonFinite"/>).</param>
+    private async ValueTask<AlertValue> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct, bool preview = false)
     {
         IQueryAvailability? store = rule.Source switch
         {
@@ -484,7 +515,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
         {
             value = rule.Source switch
             {
-                AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
+                AlertSource.Metric => await MetricValueAsync(rule, from, now, ct, preview),
                 AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
                 _                  => await LogValueAsync(rule, from, now, ct),
             };
@@ -732,7 +763,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private readonly record struct HeaderShape(bool HeaderOnly, HashSet<LogLevel>? Levels, string? Service);
 
-    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct, bool preview)
     {
         if (string.IsNullOrWhiteSpace(rule.Metric)) return 0;
         var series = await _metrics.QueryAsync(new MetricQueryRequest
@@ -748,16 +779,64 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // Reduce over the whole window (not just the last point — a quiet final
         // interval would read 0 and miss the spike). For ">" thresholds take the
         // peak; for "<" thresholds take the trough.
+        //
+        // A NaN or ±Infinity point is SKIPPED (#92): it is no measurement — an exporter's division
+        // by zero, an empty histogram's mean — and the panel shows it as a gap (the JSON writes it
+        // as null). Folded in, it did damage both ways: Math.Max(acc, NaN) is NaN, which reset the
+        // reduction and dropped the peak before it, and a NaN last in the window came out as 0 —
+        // resolving a firing ">" rule, or firing a "<" rule, with nothing in the log.
         bool wantMax = rule.Comparator is AlertComparator.GreaterThan or AlertComparator.GreaterOrEqual;
         double acc = double.NaN;
+        int skipped = 0;
         foreach (var s in series)
             foreach (var p in s.Points)
             {
+                if (!double.IsFinite(p.Value)) { skipped++; continue; }
                 if (double.IsNaN(acc)) acc = p.Value;
                 else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
             }
-        return double.IsNaN(acc) ? 0 : acc;
+
+        if (skipped > 0 && !preview) WarnNonFinite(rule, skipped, undetermined: double.IsNaN(acc));
+
+        // Points, and not one of them finite: there is no value to compare, and 0 — the answer for
+        // an empty window — would decide the rule on data that says nothing. NaN tells the caller
+        // to leave the rule's state as it is (see EvaluateAllAsync).
+        if (double.IsNaN(acc)) return skipped > 0 ? double.NaN : 0;
+        return acc;
     }
+
+    /// <summary>
+    /// Says ONCE per rule — per kind: some points skipped, or no value at all — that a metric rule
+    /// met non-finite values. Once, because an exporter that sends NaN sends it every interval, and a
+    /// line every 15 s for the life of the rule would bury the log; the operator needs to learn it
+    /// happens, and which rule it touches.
+    ///
+    /// <para>Evaluations only, never the editor's preview: a preview of an UNSAVED rule gets a fresh
+    /// random id on every click, so each one used to add a permanent entry here, and a preview of a
+    /// saved rule spent that rule's only warning on something that decided nothing — and logged "the
+    /// rule was not evaluated and keeps its state" for it. Entries of deleted rules are dropped each
+    /// tick (<see cref="ForgetDeletedRules"/>), and the set is bounded besides, as
+    /// <see cref="_headerShapes"/> is: past <see cref="MaxNonFiniteWarned"/> it is cleared wholesale
+    /// (a rule may then say it once more).</para>
+    /// </summary>
+    private void WarnNonFinite(AlertRule rule, int skipped, bool undetermined)
+    {
+        if (_nonFiniteWarned.Count >= MaxNonFiniteWarned) _nonFiniteWarned.Clear();
+        if (!_nonFiniteWarned.TryAdd((rule.Id, undetermined), 0)) return;
+        if (undetermined)
+            _logger.LogWarning(
+                "Alert rule {Rule}: every point of metric {Metric} in the window is NaN or infinite ({Skipped} point(s)), "
+              + "so the rule was not evaluated and keeps its state. Said once per rule",
+                rule.Id, rule.Metric, skipped);
+        else
+            _logger.LogWarning(
+                "Alert rule {Rule}: skipped {Skipped} NaN or infinite point(s) of metric {Metric}; the rule is evaluated "
+              + "on the finite ones. Said once per rule",
+                rule.Id, skipped, rule.Metric);
+    }
+
+    private readonly ConcurrentDictionary<(string RuleId, bool Undetermined), byte> _nonFiniteWarned = new();
+    private const int MaxNonFiniteWarned = 512;
 
     private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
@@ -837,6 +916,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
 /// for a measured 0 in a log line or a preview. It is NOT a safe value to act on: NaN compares
 /// false against every threshold, and the state machine reads "not breached" as a resolve. A caller
 /// asks <see cref="IsAvailable"/>.</para>
+///
+/// <para><b>NaN also means "available, but no finite point"</b> (#92): a metric window whose every
+/// point is NaN or infinite answers <c>Of(NaN)</c> — the store answered truly, and the answer holds
+/// no value. So NaN is NEVER the availability test: a caller asks <see cref="IsAvailable"/> first
+/// (a store that cannot say: skip, #95), then <c>double.IsNaN(Value)</c> (no value to compare:
+/// skip, #92), and acts on <see cref="Value"/> only after both.</para>
 /// </summary>
 public readonly record struct AlertValue(double Value, QueryAvailability Availability)
 {

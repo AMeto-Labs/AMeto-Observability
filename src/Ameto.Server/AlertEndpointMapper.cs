@@ -101,8 +101,11 @@ public static class AlertEndpointMapper
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
 
-            bool fires = Compare(value.Value, rule.Comparator, rule.Threshold);
-            return Results.Ok(new { value = value.Value, threshold = rule.Threshold, wouldFire = fires });
+            // Available, and value null: the window holds no finite value, so there is no verdict —
+            // as the evaluator, which leaves such a rule's state alone (#92). The client prints "no data".
+            double? v  = double.IsNaN(value.Value) ? null : value.Value;
+            bool fires = v is { } x && Compare(x, rule.Comparator, rule.Threshold);
+            return Results.Ok(new { value = v, threshold = rule.Threshold, wouldFire = fires });
         });
 
         // ── Test: send a one-off notification through the rule's channels ────────

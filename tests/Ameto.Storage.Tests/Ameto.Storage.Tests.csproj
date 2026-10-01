@@ -23,6 +23,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The metric label pool's reset interval is measured on TimeProvider timestamps
+         (MetricLabelPoolResetTests); MetricTestClock moves wall time only. -->
+    <Compile Include="..\Shared\ManualTimeProvider.cs" Link="Shared\ManualTimeProvider.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Metrics\Ameto.Metrics.csproj" />
