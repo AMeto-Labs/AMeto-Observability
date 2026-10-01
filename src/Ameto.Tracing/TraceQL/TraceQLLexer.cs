@@ -73,12 +73,13 @@ public static class TraceQLLexer
                 case '&':
                     if (pos + 1 < input.Length && input[pos + 1] == '&')
                     { tokens.Add(new Token(TokenKind.And, "&&")); pos += 2; }
-                    else pos++;
+                    else throw new TraceQLException($"'&' at position {pos} is not an operator; 'and' is written '&&'");
                     break;
                 case '|':
                     if (pos + 1 < input.Length && input[pos + 1] == '|')
                     { tokens.Add(new Token(TokenKind.Or, "||")); pos += 2; }
-                    else pos++;
+                    else throw new TraceQLException(
+                        $"'|' at position {pos} is not an operator; 'or' is written '||' (pipelines such as '| count()' are not supported)");
                     break;
                 case '"': case '\'': case '`':
                     tokens.Add(ReadString(input, ref pos, c));
@@ -98,19 +99,48 @@ public static class TraceQLLexer
                         throw new TraceQLException(
                             $"'-' at position {pos} is not followed by a number; a negative literal is written '-3', '-0.5' or '-1e3'");
                     break;
+                case '+':
+                    // A SIGN THAT CHANGES NOTHING, kept: `{ .x = +3 }` was 3 when '+' was skipped,
+                    // and is 3 now. Only directly before a digit, as for '-'.
+                    if (pos + 1 < input.Length && char.IsAsciiDigit(input[pos + 1]))
+                        tokens.Add(ReadNumberOrDuration(input, ref pos));
+                    else
+                        throw new TraceQLException($"'+' at position {pos} is not followed by a number");
+                    break;
                 default:
                     if (char.IsDigit(c))
                         tokens.Add(ReadNumberOrDuration(input, ref pos));
                     else if (char.IsLetter(c) || c == '_')
                         tokens.Add(ReadIdent(input, ref pos));
                     else
-                        pos++; // skip unknown
+                        throw UnknownCharacter(input, pos);
                     break;
             }
         }
 
         tokens.Add(new Token(TokenKind.Eof, ""));
         return tokens;
+    }
+
+    /// <summary>
+    /// A CHARACTER THIS GRAMMAR HAS NO MEANING FOR, OUTSIDE A STRING, IS REFUSED (review F8). It
+    /// used to be skipped, and a skipped character changes the question without a word: U+2212
+    /// MINUS SIGN — what documentation, chat tools and word processors paste for "−3" — left
+    /// <c>{ .x = −3 }</c> asking <c>.x = 3</c>. Named by its code point, since the ones that get
+    /// here are the ones that look like something else (or like nothing at all: U+200B).
+    /// </summary>
+    private static TraceQLException UnknownCharacter(ReadOnlySpan<char> input, int pos)
+    {
+        // A whole code point, so an emoji is named as itself and not as half a surrogate pair (a
+        // lone surrogate cannot even be written into the query-error frame's JSON).
+        if (System.Text.Rune.DecodeFromUtf16(input[pos..], out var rune, out _) != System.Buffers.OperationStatus.Done)
+            return new TraceQLException($"Position {pos} holds an unpaired surrogate (U+{(int)input[pos]:X4}), which is not text");
+
+        string what = $"'{rune}' (U+{rune.Value:X4}) at position {pos}";
+        return new TraceQLException(
+            rune.Value == 0x2212 || System.Text.Rune.GetUnicodeCategory(rune) == System.Globalization.UnicodeCategory.DashPunctuation
+                ? $"{what} is not the minus sign TraceQL reads; a negative number is written with '-' (U+002D), as in '-3'"
+                : $"{what} has no meaning in TraceQL outside a quoted string");
     }
 
     // ── Attribute: .key.sub-key ────────────────────────────────────────────────
@@ -144,7 +174,7 @@ public static class TraceQLLexer
     // ── Number or duration ─────────────────────────────────────────────────────
 
     /// <summary>
-    /// <c>-?digits[.digits][e[+-]digits][suffix]</c>. The sign and the exponent are part of the
+    /// <c>[-+]?digits[.digits][e[+-]digits][suffix]</c>. The sign and the exponent are part of the
     /// literal — <c>-3</c>, <c>-0.5</c>, <c>-1e3</c> — and a duration keeps its sign:
     /// <c>{ .clock.skew &lt; -5ms }</c> is a real question of an attribute, and only the
     /// <c>duration</c> intrinsic refuses a negative one.
@@ -155,7 +185,7 @@ public static class TraceQLLexer
     private static Token ReadNumberOrDuration(ReadOnlySpan<char> src, ref int pos)
     {
         int start = pos;
-        if (src[pos] == '-') pos++;
+        if (src[pos] is '-' or '+') pos++;
         while (pos < src.Length && (char.IsDigit(src[pos]) || src[pos] == '.'))
             pos++;
 

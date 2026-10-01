@@ -75,6 +75,37 @@ public sealed class TraceQLNegativeLiteralTests
     public void A_literal_that_cannot_mean_what_it_says_is_a_parse_error(string query) =>
         Assert.Throws<TraceQLException>(() => TraceQLParser.Parse(query));
 
+    /// <summary>
+    /// A CHARACTER TRACEQL HAS NO MEANING FOR, OUTSIDE A STRING, IS REFUSED (review F8). The lexer
+    /// skipped it: <c>{ .x = −3 }</c> typed with U+2212 MINUS SIGN — what documentation and chat
+    /// tools paste — silently asked <c>.x = 3</c>. Reverted (skip unknown): every case parses.
+    /// </summary>
+    [Theory]
+    [InlineData("{ .x = −3 }",          "U+2212")]   // MINUS SIGN
+    [InlineData("{ .x = –3 }",          "U+2013")]   // EN DASH
+    [InlineData("{ .x = 3​ }",          "U+200B")]   // ZERO WIDTH SPACE: invisible, and not whitespace
+    [InlineData("{ .x = 3; }",               "U+003B")]
+    [InlineData("{ .x = 3 \U0001F600 }",     "U+1F600")]  // a whole code point, not half a surrogate pair
+    [InlineData("{ .x = 1 & .y = 2 }",       "'&&'")]
+    [InlineData("{ .x = 1 } | count() > 2",  "'||'")]
+    [InlineData("{ .x = + 3 }",              "'+'")]
+    public void A_character_TraceQL_has_no_meaning_for_is_a_parse_error(string query, string named)
+    {
+        var ex = Assert.Throws<TraceQLException>(() => TraceQLParser.Parse(query));
+        Assert.Contains(named, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("{ .x = +3 }",       3L,    true)]    // a plus sign changes nothing, as when it was skipped
+    [InlineData("{ .x = 1e+3 }",     1000L, true)]
+    [InlineData("{ .x = \"−3\" }", "−3", true)]  // inside a string every character is the string's
+    public void A_plus_sign_and_any_character_inside_a_string_still_mean_what_they_did(string query, object value, bool expected)
+    {
+        var pred = TraceQLParser.Parse(query);
+        Assert.Equal(expected, pred.Evaluate(Span(value, blob: false)));
+        Assert.Equal(expected, pred.Evaluate(Span(value, blob: true)));
+    }
+
     [Theory]
     [InlineData("{ duration > 1ms }")]
     [InlineData("{ duration > 0 }")]
