@@ -131,8 +131,8 @@ internal static class MetricWriter
         int published = 0;
 
         int   count = series.Count;
-        int[] order = ArrayPool<int>.Shared.Rent(Math.Max(count, 1));
-        int[] ends  = ArrayPool<int>.Shared.Rent(Math.Max(count, 1));
+        int[] order = TakeInts(Math.Max(count, 1));
+        int[] ends  = TakeInts(Math.Max(count, 1));
         using var raw = new RentedBufferWriter();
         Span<char> nonceChars = stackalloc char[32];
         try
@@ -246,8 +246,8 @@ internal static class MetricWriter
         }
         finally
         {
-            ArrayPool<int>.Shared.Return(order);
-            ArrayPool<int>.Shared.Return(ends);
+            GiveInts(order);
+            GiveInts(ends);
         }
 
         return result;
@@ -277,7 +277,7 @@ internal static class MetricWriter
         }
 
         var   groupOf = new Dictionary<string, int>(StringComparer.Ordinal);
-        int[] groupAt = ArrayPool<int>.Shared.Rent(n);
+        int[] groupAt = TakeInts(n);
         try
         {
             int groups = 0;
@@ -297,7 +297,7 @@ internal static class MetricWriter
             for (int i = 0; i < n; i++) order[ends[groupAt[i]]++] = i;
             return groups;
         }
-        finally { ArrayPool<int>.Shared.Return(groupAt); }
+        finally { GiveInts(groupAt); }
     }
 
     /// <summary>
@@ -631,13 +631,35 @@ internal static class MetricWriter
         }
     }
 
-    /// <summary>The largest section buffer handed back to the shared pool (see <see cref="RentedBufferWriter"/>).</summary>
+    /// <summary>
+    /// The largest buffer the writer hands back to the shared pool, in bytes — the section buffer
+    /// (see <see cref="RentedBufferWriter"/>) and the grouping's index arrays alike.
+    /// </summary>
     internal const int MaxPooledBytes = 1024 * 1024;
 
     /// <summary>
-    /// Test seam: the length of every section buffer the writer hands back to the shared pool, on the
-    /// writing thread (the writer is synchronous, so a thread-static reaches only the setting test's
-    /// calls). Null in production.
+    /// An index array for the grouping (<c>order</c>, <c>ends</c>, <c>groupAt</c>): pooled up to
+    /// <see cref="MaxPooledBytes"/>, allocated above it (#106 review, F2). They are sized by the
+    /// whole snapshot, and a flush of more than 262 144 series parked three arrays of a megabyte or
+    /// more in <c>ArrayPool&lt;int&gt;.Shared</c> for good — the retention the section buffer's cap
+    /// removed, by another door.
+    /// </summary>
+    private static int[] TakeInts(int count) =>
+        (long)count * sizeof(int) <= MaxPooledBytes ? ArrayPool<int>.Shared.Rent(count) : GC.AllocateUninitializedArray<int>(count);
+
+    /// <summary>Back to the pool when it is small enough to be worth keeping; left to the collector otherwise.</summary>
+    private static void GiveInts(int[] array)
+    {
+        long bytes = (long)array.Length * sizeof(int);
+        if (bytes > MaxPooledBytes) return;
+        ArrayPool<int>.Shared.Return(array);
+        ReturnedToPoolForTest?.Invoke((int)bytes);
+    }
+
+    /// <summary>
+    /// Test seam: the size in bytes of every buffer the writer hands back to the shared pool — section
+    /// buffers and index arrays — on the writing thread (the writer is synchronous, so a thread-static
+    /// reaches only the setting test's calls). Null in production.
     /// </summary>
     [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
 }

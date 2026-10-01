@@ -171,4 +171,31 @@ public sealed class MetricRewriteProbe : IDisposable
         Assert.NotEmpty(returned);                                         // the small buffers still pooled
         Assert.All(returned, n => Assert.True(n <= MetricWriter.MaxPooledBytes, $"a {n:N0} B buffer went back to the shared pool"));
     }
+
+    /// <summary>
+    /// The same rule for the grouping's index arrays (#106 review, F2): they are sized by the whole
+    /// snapshot, so a flush of more than 262 144 series rented three arrays of a megabyte or more —
+    /// <c>order</c>, <c>ends</c> and, with two names or more, <c>groupAt</c> — and parked them in the
+    /// shared pool. 270 000 series under two names, none with a point (no file is written; the
+    /// grouping runs all the same).
+    /// </summary>
+    [Fact]
+    public void The_grouping_hands_the_pool_no_index_array_over_a_megabyte()
+    {
+        const int Series = 270_000;
+        var labels = new LabelSet(new Dictionary<string, string> { ["k"] = "v" });
+        var items  = new List<(SeriesKey, HotSeries)>(Series);
+        for (int s = 0; s < Series; s++)
+            items.Add((new SeriesKey((s & 1) == 0 ? "wide.a" : "wide.b", MetricKind.Gauge, "1", labels), new HotSeries(new List<MetricDataPoint>())));
+
+        var returned = new List<int>();
+        MetricWriter.ReturnedToPoolForTest = returned.Add;
+        try     { Assert.Empty(MetricWriter.Write(_dir, items)); }
+        finally { MetricWriter.ReturnedToPoolForTest = null; }
+
+        _out.WriteLine($"{Series:N0} series; handed back to the pool: {string.Join(", ", returned.Select(n => n.ToString("N0", CultureInfo.InvariantCulture)))} B");
+        Assert.True((long)Series * sizeof(int) > MetricWriter.MaxPooledBytes, "setup: the index arrays would fit the pool");
+        Assert.NotEmpty(returned);                                         // the section buffer still pooled
+        Assert.All(returned, n => Assert.True(n <= MetricWriter.MaxPooledBytes, $"a {n:N0} B buffer went back to the shared pool"));
+    }
 }
