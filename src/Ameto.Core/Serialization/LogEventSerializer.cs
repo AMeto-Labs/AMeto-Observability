@@ -410,7 +410,7 @@ public static class LogEventSerializer
         ClefFields.Exception       => ClefField.Exception,
         ClefFields.TraceId         => ClefField.TraceId,
         ClefFields.SpanId          => ClefField.SpanId,
-        ClefFields.ServiceName     => ClefField.ServiceName,
+        ClefFields.LegacyServiceName => ClefField.ServiceName,
         _                          => ClefField.Unknown,
     };
 

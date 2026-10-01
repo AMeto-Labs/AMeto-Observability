@@ -63,6 +63,19 @@ public sealed class HeaderOnlyShapeTests
         Assert.Equal("checkout", service);
     }
 
+    [Theory]
+    [InlineData("@service = 'checkout'")]
+    [InlineData("ServiceName = 'checkout'")]
+    [InlineData("['service.name'] = 'checkout'")]
+    [InlineData("@service = 'checkout' and service.name = 'CHECKOUT'")]   // one service, two spellings
+    public void Every_service_spelling_is_the_same_header_shape(string filter)
+    {
+        var (ok, levels, service) = Shape(filter);
+        Assert.True(ok);
+        Assert.Null(levels);
+        Assert.Equal("checkout", service, ignoreCase: true);
+    }
+
     [Fact]
     public void Anded_level_constraints_intersect()
     {
@@ -100,6 +113,8 @@ public sealed class HeaderOnlyShapeTests
     [InlineData("service.name = ''")]
     [InlineData("service.name = '(unknown)'")]
     [InlineData("service.name = '(Unknown)'")]
+    [InlineData("@service = ''")]
+    [InlineData("@service = '(unknown)'")]
     public void A_service_literal_the_aggregator_would_misread_is_refused(string filter)
     {
         Assert.False(Shape(filter).Ok);
@@ -114,6 +129,7 @@ public sealed class HeaderOnlyShapeTests
     [InlineData("not (@l = 'Error')")]                          // negation
     [InlineData("@l != 'Error'")]                               // a comparison that is not equality
     [InlineData("service.name = 'a' and service.name = 'b'")]   // matches nothing; not expressible
+    [InlineData("@service = 'a' and service.name = 'b'")]       // the same, across the two spellings
     [InlineData("@l = 'Nonsense'")]                             // not a level at all
     [InlineData("@x.type = 'System.Exception'")]                // exception fields
     [InlineData("@t >= '2026-08-01T00:00:00Z'")]                // time is the caller's window, not ours

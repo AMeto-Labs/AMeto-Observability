@@ -59,6 +59,12 @@ public sealed class HotHeaderPushdownTests : IDisposable
         { "service.name in ['Svc.A', 'Svc.C']",                        true  },
         { "service.name = null",                                       true  },   // events without a service
         { "service.name != null",                                      true  },
+        { "@service = 'Svc.B'",                                        true  },   // the canonical spelling
+        { "not @service = 'svc.b'",                                    true  },
+        { "@service in ['Svc.A', 'Svc.C']",                            true  },
+        { "@service = null",                                           true  },
+        { "ServiceName != 'Svc.B'",                                    true  },
+        { "['service.name'] = 'Svc.B'",                                true  },
         { "@tr = '" + TraceA + "'",                                    true  },
         { "@tr = '" + TraceA.ToUpperInvariant() + "'",                 true  },   // literal case must not matter
         { "@tr != '" + TraceA + "'",                                   true  },   // includes events with no trace id
@@ -73,6 +79,7 @@ public sealed class HotHeaderPushdownTests : IDisposable
         { "@l = 'Error' and Route = '/api/pay'",                       true  },   // level pushed, property left to the evaluator
         { "@l = 'Error' or Route = '/api/pay'",                        false },   // OR across fields: must NOT push
         { "@l = 'Error' or service.name = 'Svc.A'",                    false },
+        { "@l = 'Error' or @service = 'Svc.A'",                        false },
         { "not (@l = 'Error' and Route = '/api/pay')",                 false },   // not(a and b) is a disjunction
         { "not (@l = 'Error' or Route = '/api/pay')",                  true  },   // not(a or b) = not a and not b: level half pushes
         { "Route = '/api/pay'",                                        false },

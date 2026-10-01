@@ -50,8 +50,8 @@ public enum BuiltinField : byte
 /// <para>Adding an alias here automatically teaches the evaluator to accept it AND teaches
 /// the hint builder where it lives in the index, so the two cannot disagree by
 /// construction. That also means a built-in SHADOWS a user property of the same name, as it
-/// did before this table existed: <c>service.name</c> is the header field, not a nested
-/// <c>service</c> map, and <c>@x.type</c> is the exception type, not a CLEF property that
+/// did before this table existed: <c>@service</c> and its alias <c>service.name</c> are the
+/// header field, not a nested <c>service</c> map, and <c>@x.type</c> is the exception type, not a CLEF property that
 /// happens to be spelled that way. Both tiers agree on the shadowing — the evaluator and the
 /// hint builder read the same row — so it costs no rows, only that one spelling.</para>
 /// </summary>
@@ -126,11 +126,14 @@ public static class BuiltinFields
         new(BuiltinField.EventId, null, BloomIndexed: false, TrigramIndexed: false,
             ["@id", "Id"]),
 
-        // "service.name" is one opaque key on both sides; the parser turns the dotted
-        // spelling into an encoded path, so both forms are listed. "ServiceName" completes
-        // the table's own convention — every other field answers to its PascalCase name.
+        // `@service` is the field's own name, like `@tr` and `@sp`, and the bucket the builder
+        // files it in (old groups' `service.name` bucket is the readers' business — see
+        // SegmentInvertedIndex.LegacyBucket). `service.name`, its name before, stays an alias
+        // in both forms the parser can hand over: the bracket escape keeps it one opaque key,
+        // the bare dotted spelling becomes an encoded path. "ServiceName" completes the
+        // table's own convention — every other field answers to its PascalCase name.
         new(BuiltinField.ServiceName, ClefFields.ServiceName, BloomIndexed: true, TrigramIndexed: false,
-            [ClefFields.ServiceName, "service" + Sep + "name", "ServiceName"]),
+            [ClefFields.ServiceName, ClefFields.LegacyServiceName, "service" + Sep + "name", "ServiceName"]),
     ];
 
     // Declaration order matters: static initialisers run top-to-bottom, and the two

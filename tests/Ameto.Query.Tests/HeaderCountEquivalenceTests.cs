@@ -123,6 +123,8 @@ public sealed class HeaderCountEquivalenceTests : IDisposable
     [InlineData("@l = 'Error' and service.name = 'checkout'")]
     [InlineData("service.name = 'gateway' and @l = 'Error'")]     // a pair with no events
     [InlineData("@l = 'Information' and service.name = 'gateway'")]
+    [InlineData("@service = 'checkout'")]                         // the canonical spelling
+    [InlineData("@l = 'Error' and @service = 'checkout'")]
     [InlineData("@l in ['Error', 'Fatal'] and @l = 'Fatal'")]
     public async Task The_header_count_equals_the_scan_count(string? filter)
     {
