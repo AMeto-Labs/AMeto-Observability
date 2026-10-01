@@ -10,7 +10,7 @@ import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto } from '../../../../core/models/event.model';
+import { EventDto, eventService } from '../../../../core/models/event.model';
 import { SpanDto } from '../../../../core/models/span.model';
 import { MetricSeriesDto } from '../../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
@@ -74,8 +74,12 @@ function joinPath(prefix: string, key: string): string {
   return `${prefix}['${escaped}']`;
 }
 
-/** Top-level keys promoted to dedicated rows in the detail panel — skip in the generic props list. */
-const PROMOTED_KEYS = new Set(['@tr', '@sp', 'service.name']);
+/**
+ * Top-level keys promoted to dedicated rows in the detail panel — skip in the generic props list.
+ * `service.name` stays here for events an older server stored with the service repeated among
+ * their properties (OTLP did that until the service became `@service`).
+ */
+const PROMOTED_KEYS = new Set(['@tr', '@sp', '@service', 'service.name']);
 
 /**
  * Builds the flat top-level property list. Scalar values become text rows;
@@ -326,9 +330,7 @@ export class EventDetailComponent {
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
 
-  service = computed(() =>
-    (this.event()['service.name'] as string | undefined) ?? ''
-  );
+  service = computed(() => eventService(this.event()) ?? '');
 
   /** Stable per-service colour, shared with the list rows / dropdown / waterfall. */
   svcColor = computed(() => serviceColor(this.service()));
@@ -366,7 +368,8 @@ export class EventDetailComponent {
     if (ev['@x']           !== undefined) view['@x']           = ev['@x'];
     if (ev['@tr']          !== undefined) view['@tr']          = ev['@tr'];
     if (ev['@sp']          !== undefined) view['@sp']          = ev['@sp'];
-    if (ev['service.name'] !== undefined) view['service.name'] = ev['service.name'];
+    const service = eventService(ev);
+    if (service            !== undefined) view['@service']     = service;
     Object.assign(view, ev.props ?? {});
     return view;
   });
@@ -762,14 +765,14 @@ export class EventDetailComponent {
   filterService(): void {
     const svc = this.service();
     if (!svc) return;
-    this.filterSelected.emit(`['service.name'] = ${jvLiteral(svc)}`);
+    this.filterSelected.emit(`@service = ${jvLiteral(svc)}`);
     this.menuType.set(null);
   }
 
   excludeService(): void {
     const svc = this.service();
     if (!svc) return;
-    this.filterSelected.emit(`['service.name'] <> ${jvLiteral(svc)}`);
+    this.filterSelected.emit(`@service <> ${jvLiteral(svc)}`);
     this.menuType.set(null);
   }
 

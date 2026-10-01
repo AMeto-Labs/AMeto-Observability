@@ -8,7 +8,7 @@ import {
 
 import { ApiService } from '../../../core/services/api.service';
 import { SearchHistoryService } from '../../../core/services/search-history.service';
-import { EventDto, LEVELS, AggregationDto } from '../../../core/models/event.model';
+import { EventDto, LEVELS, AggregationDto, eventService } from '../../../core/models/event.model';
 import {
   TimePreset,
   parseLevelsFromFilter, parseServicesFromFilter,
@@ -196,7 +196,7 @@ export const EventsStore = signalStore(
     const displayedEvents = computed(() => {
       let evs = store.events();
       const svcs = selectedServices();
-      if (svcs.size > 0) evs = evs.filter(e => svcs.has((e['service.name'] as string) ?? ''));
+      if (svcs.size > 0) evs = evs.filter(e => svcs.has(eventService(e) ?? ''));
       const q = store.quickSearch().trim().toLowerCase();
       if (q) evs = evs.filter(e => (e['@mt'] ?? '').toLowerCase().includes(q));
       return evs;
@@ -206,7 +206,7 @@ export const EventsStore = signalStore(
       // Merge backend-known services with any additional ones seen in current events.
       const svcs = new Set<string>(store.backendServices());
       for (const ev of store.events()) {
-        const svc = ev['service.name'] as string | undefined;
+        const svc = eventService(ev);
         if (svc) svcs.add(svc);
       }
       return [...svcs].sort();
@@ -224,7 +224,7 @@ export const EventsStore = signalStore(
     const serviceCounts = computed(() => {
       const counts: Record<string, number> = {};
       for (const ev of store.events()) {
-        const svc = ev['service.name'] as string | undefined;
+        const svc = eventService(ev);
         if (svc) counts[svc] = (counts[svc] ?? 0) + 1;
       }
       return counts;

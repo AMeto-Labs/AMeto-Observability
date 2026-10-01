@@ -13,9 +13,13 @@ export const PREFIX_RE = /[@A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/
 const LEVEL_CLAUSE_RE =
   /@l\s+not\s+in\s*\[[^\]]*\]|@l\s+in\s*\[[^\]]*\]|@l\s*(?:<>|!=|=)\s*'[^']*'/gi;
 
-/** Matches a `['service.name']` clause (and the legacy OR-form) for splicing. */
+/**
+ * Matches the service clause for splicing: the `@service = …` / `@service in […]` this page
+ * writes, and the forms it wrote before — `['service.name'] = …` / `in […]` and the older
+ * OR-form — which saved searches, history and shared URLs still carry.
+ */
 const SERVICE_CLAUSE_RE =
-  /\['service\.name'\]\s*=\s*'[^']*'|\['service\.name'\]\s*in\s*\[[^\]]*\]|\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)/g;
+  /@service\s*=\s*'[^']*'|@service\s+in\s*\[[^\]]*\]|\['service\.name'\]\s*=\s*'[^']*'|\['service\.name'\]\s*in\s*\[[^\]]*\]|\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)/g;
 
 /** Milliseconds between .NET DateTime min (0001-01-01 UTC) and Unix epoch (1970-01-01 UTC). */
 const DOTNET_TICKS_UNIX_EPOCH_MS = 62_135_596_800_000;
@@ -23,7 +27,7 @@ const DOTNET_TICKS_UNIX_EPOCH_MS = 62_135_596_800_000;
 /** Built-in tokens always offered by the filter autocomplete popup. */
 export const BUILTIN_SUGGESTIONS = [
   '@l', '@mt', '@t', '@x', '@x.Type', '@x.Message', '@x.StackTrace',
-  '@i', '@r', '@sp', '@tr',
+  '@i', '@r', '@sp', '@tr', '@service',
   'and', 'or', 'not', 'in', 'like',
   'true', 'false', 'null',
   'has(', 'isDefined(', 'startsWith(', 'contains(', 'endsWith(',
@@ -153,15 +157,18 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
   return ALL_LEVELS();
 }
 
-/** Selected service names in a filter expression. */
+/** The service field as the picker's clauses spell it: `@service`, or the older `['service.name']`. */
+const SERVICE_FIELD = String.raw`(?:@service|\['service\.name'\])`;
+
+/** Selected service names in a filter expression (either spelling of the service clause). */
 export function parseServicesFromFilter(expr: string): Set<string> {
-  const inMatch = expr.match(/\['service\.name'\]\s+in\s*\[([^\]]+)\]/i);
+  const inMatch = expr.match(new RegExp(String.raw`${SERVICE_FIELD}\s+in\s*\[([^\]]+)\]`, 'i'));
   if (inMatch) {
     const svcs = new Set<string>();
     for (const m of inMatch[1].matchAll(/'([^']+)'/g)) svcs.add(m[1]);
     return svcs;
   }
-  const eqMatch = expr.match(/\['service\.name'\]\s*=\s*'([^']+)'/i);
+  const eqMatch = expr.match(new RegExp(String.raw`${SERVICE_FIELD}\s*=\s*'([^']+)'`, 'i'));
   if (eqMatch) return new Set([eqMatch[1]]);
   return new Set<string>();
 }
@@ -183,16 +190,17 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 }
 
 /**
- * Rewrites the `['service.name']` clause of `expr`. Bracket notation keeps the
- * parser treating it as one segment (matches the backend ServiceName fast-path).
- * Placed after any `@l` clause, before the rest of the user's expression.
+ * Rewrites the service clause of `expr` as `@service = …` / `@service in […]` — the built-in
+ * field's own name, which the server answers from the event header and its index. A clause in
+ * the older `['service.name']` spelling is replaced, not duplicated. Placed after any `@l`
+ * clause, before the rest of the user's expression.
  */
 export function setServicesClause(expr: string, svcs: Set<string>): string {
   const stripped = stripFilterClause(expr, SERVICE_CLAUSE_RE);
   if (svcs.size === 0) return stripped;
   const clause = svcs.size === 1
-    ? `['service.name'] = '${[...svcs][0]}'`
-    : `['service.name'] in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
+    ? `@service = '${[...svcs][0]}'`
+    : `@service in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
   const lvlMatch = stripped.match(/^(@l\s+(?:not\s+in|in)\s*\[[^\]]+\]|@l\s*(?:<>|!=|=)\s*'[^']*')(\s+and\s+|$)/i);
   if (lvlMatch) {
     const rest = stripped.slice(lvlMatch[0].length).trim();

@@ -51,7 +51,7 @@ export class ReferenceComponent {
     { name: '@tr', desc: 'Trace id (W3C hex).', ex: `@tr = '4bf92f...'` },
     { name: '@sp', desc: 'Span id (hex).', ex: `@sp = 'a3ce9f...'` },
     { name: '@id', desc: 'Event id.', ex: `@id = '01H...'` },
-    { name: `['service.name']`, desc: 'Service name (bracket form — dotted key).', ex: `['service.name'] = 'api'` },
+    { name: '@service', desc: 'Service the event came from. service.name and ServiceName are accepted aliases.', ex: `@service = 'api'` },
   ];
 
   // ── Operators & keywords ───────────────────────────────────────────────────
