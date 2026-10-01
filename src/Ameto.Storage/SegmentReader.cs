@@ -408,7 +408,7 @@ public sealed class SegmentReader : ISegmentReader
 
     /// <summary>
     /// Counts events into <paramref name="agg"/> by decoding only the timestamp (@t), level (@l)
-    /// and service (service.name) columns of each block. The message-template, exception and
+    /// and service (@service) columns of each block. The message-template, exception and
     /// properties columns are skipped entirely — no UTF-8 template decode, no MessagePack
     /// deserialisation, no <see cref="LogEvent"/> allocation. The block still has to be
     /// LZ4-decompressed (all columns share one compressed frame in the v4 format), but that is a
@@ -456,7 +456,7 @@ public sealed class SegmentReader : ISegmentReader
         }
     }
 
-    /// <summary>Parses a decompressed columnar block, extracting only @t / @l / service.name.</summary>
+    /// <summary>Parses a decompressed columnar block, extracting only @t / @l / @service.</summary>
     private static void ScanBlockHeaders(ReadOnlySpan<byte> span, LogVolumeAggregator agg, long fromTicks, long toTicks)
     {
         int   pos        = 0;
@@ -475,12 +475,12 @@ public sealed class SegmentReader : ISegmentReader
             {
                 case 1: colT   = data; break;   // @t  int64 deltas
                 case 2: colL   = data; break;   // @l  byte levels
-                case 9: colSvc = data; break;   // service.name string column
+                case 9: colSvc = data; break;   // @service string column
                 default: break;                 // @i/@mt/@x/props/@tr/@sp: skipped, never decoded
             }
         }
 
-        // service.name is a string column: (eventCount+1) uint32 offsets, then the UTF-8 payload.
+        // @service is a string column: (eventCount+1) uint32 offsets, then the UTF-8 payload.
         int  offsetsBytes = (eventCount + 1) * 4;
         bool hasSvc       = colSvc.Length >= offsetsBytes;
         var  svcOffsets   = hasSvc ? colSvc.Slice(0, offsetsBytes) : default;

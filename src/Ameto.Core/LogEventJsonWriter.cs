@@ -24,6 +24,11 @@ namespace Ameto.Core;
 /// <c>LogEventJsonParityTests</c>, which serialises the same events both ways — through a
 /// frozen copy of the DTO road, which no stream in the server takes any more — compares the
 /// bytes, compares a live tail's whole stream frame for frame, and checks golden frames.</para>
+///
+/// <para>ONE DELIBERATE MOVE since: the service goes out as <c>@service</c>, not
+/// <c>service.name</c> — it became a built-in field with that name (see
+/// <see cref="ClefFields.ServiceName"/>). The frozen DTO and the golden frames moved with it, and
+/// in the same place: the key still follows <c>@sp</c> and precedes <c>props</c>.</para>
 /// </summary>
 public static class LogEventJsonWriter
 {
@@ -34,7 +39,7 @@ public static class LogEventJsonWriter
     private static readonly JsonEncodedText NameId          = JsonEncodedText.Encode("id");
     private static readonly JsonEncodedText NameTraceId     = JsonEncodedText.Encode("@tr");
     private static readonly JsonEncodedText NameSpanId      = JsonEncodedText.Encode("@sp");
-    private static readonly JsonEncodedText NameServiceName = JsonEncodedText.Encode("service.name");
+    private static readonly JsonEncodedText NameServiceName = JsonEncodedText.Encode(ClefFields.ServiceName);   // "@service"
     private static readonly JsonEncodedText NameProps       = JsonEncodedText.Encode("props");
 
     private static readonly JsonEncodedText NameExType    = JsonEncodedText.Encode("type");

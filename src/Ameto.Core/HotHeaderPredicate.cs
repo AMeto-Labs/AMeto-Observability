@@ -27,7 +27,7 @@ public interface IHotHeaderPredicate
     bool HasServicePredicate { get; }
 
     /// <summary>
-    /// Verdict on the resolved <c>service.name</c> alone (<c>null</c> when the event carries
+    /// Verdict on the resolved <c>@service</c> alone (<c>null</c> when the event carries
     /// none — the same value the materialised event would expose). <c>false</c> = cannot match.
     /// </summary>
     bool ServiceMayMatch(string? serviceName);

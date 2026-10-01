@@ -525,6 +525,9 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// both, so the index must too — pruning on one spelling while the scan matches the other
     /// is the same silent false negative in a new place. The union is complete: a bucket that
     /// does not exist describes no event.</para>
+    ///
+    /// <para>The same holds across a rename: a key whose bucket an older builder wrote under
+    /// another name (<see cref="LegacyBucket"/>) is resolved against both.</para>
     /// </summary>
     private int[]? PostingsForKey(string property, object? value, out bool known)
     {
@@ -552,8 +555,40 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             }
         }
 
+        // The name an older builder filed this bucket under (see LegacyBucket).
+        if (LegacyBucket(property) is { } legacy && _postings.TryGetValue(legacy, out var legacyValues))
+        {
+            known = true;
+            if (PostingsFor(legacyValues, value) is { } legacyOffsets)
+                acc = acc is null ? legacyOffsets : UnionAscending(acc, legacyOffsets);
+        }
+
         return acc;
     }
+
+    /// <summary>
+    /// The bucket a builder before the rename filed <paramref name="property"/> under, or null
+    /// when the hint key never had another name. Today that is one key: the service, filed as
+    /// <c>@service</c> (<see cref="ClefFields.ServiceName"/>) and before that as
+    /// <c>service.name</c> (<see cref="ClefFields.LegacyServiceName"/>). Segments are never
+    /// rewritten to the new name, so without this a <c>@service</c> hint finds no bucket in an
+    /// old group — no information, a full scan — or, where the group happens to hold an
+    /// <c>@service</c> USER property, a bucket without the value: "proven empty", and the group's
+    /// rows are dropped.
+    ///
+    /// <para>UNIONED, not merely tried when the new name is missing, for that second case: a
+    /// group may hold both names — an old one whose client sent a literal <c>@service</c>
+    /// property, or a new one whose OTLP record carries a <c>service.name</c> attribute — and the
+    /// union is the only answer that is a superset of the header's postings in every group. The
+    /// scan re-checks every candidate against the header, so a looser list costs time, never
+    /// rows. Both readers — this decoded index and <see cref="SegmentIndexReader"/>'s packed
+    /// catalog — ask here, so they cannot disagree about it; a memo keys each bucket by its own
+    /// name, so the two names never share a cached answer.</para>
+    /// </summary>
+    internal static string? LegacyBucket(string property) =>
+        string.Equals(property, ClefFields.ServiceName, StringComparison.Ordinal)
+            ? ClefFields.LegacyServiceName
+            : null;
 
     /// <summary>Longest path given a flat alternate — matches
     /// <c>FilterEvaluator.MaxFlatKeyChars</c>, which decides the same thing on the scan side.</summary>

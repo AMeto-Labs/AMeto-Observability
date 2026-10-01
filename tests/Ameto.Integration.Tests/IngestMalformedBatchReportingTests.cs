@@ -70,6 +70,32 @@ public sealed class IngestMalformedBatchReportingTests : IClassFixture<AmetoWebA
         Assert.Equal(good, doc.RootElement.GetProperty("failedAtElement").GetInt32());
     }
 
+    /// <summary>
+    /// A service that is not a string is a malformed element under either key — the header field
+    /// has no other type to hold (documented in API.md). The answer is this endpoint's ordinary
+    /// one for a malformed element: 400, the prefix already ingested, <c>failedAtElement</c> on it.
+    /// </summary>
+    [Theory]
+    [InlineData("@service")]
+    [InlineData("service.name")]
+    public async Task NonStringService_Answers400_AtThatElement(string key)
+    {
+        var buf = new ArrayBufferWriter<byte>(256);
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(3);
+        w.WriteMapHeader(2); w.Write("@mt"); w.Write("service probe ok"); w.Write("@service"); w.Write("probe-api");
+        w.WriteMapHeader(2); w.Write("@mt"); w.Write("service probe bad"); w.Write(key);      w.Write(123);
+        w.WriteMapHeader(1); w.Write("@mt"); w.Write("service probe after");
+        w.Flush();
+
+        var resp = await _factory.CreateClient().PostAsync("/api/events", Content(buf.WrittenSpan.ToArray()));
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Equal(1, doc.RootElement.GetProperty("ingested").GetInt32());
+        Assert.Equal(1, doc.RootElement.GetProperty("failedAtElement").GetInt32());
+    }
+
     [Fact]
     public async Task MalformedTail_WakesTheDrainerForThePrefix()
     {

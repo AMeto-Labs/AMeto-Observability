@@ -203,7 +203,8 @@ public static class LogEventSerializer
         ReadOnlySpan<byte> tmplUtf8  = default;
         ReadOnlySpan<byte> levelUtf8 = default;
         ReadOnlySpan<byte> msgUtf8   = default;   // CLEF @m — template fallback only
-        ReadOnlySpan<byte> svcUtf8   = default;
+        ReadOnlySpan<byte> svcUtf8   = default;   // @service
+        ReadOnlySpan<byte> legacySvc = default;   // service.name — see ServiceTieRule
         ExceptionInfo? exception     = null;
         ulong traceIdHi = 0, traceIdLo = 0, spanId = 0;
 
@@ -224,7 +225,8 @@ public static class LogEventSerializer
                 case ClefField.MessageTemplate: tmplUtf8  = ReadUtf8Value(ref reader); break;
                 case ClefField.Level:           levelUtf8 = ReadUtf8Value(ref reader); break;
                 case ClefField.Message:         msgUtf8   = ReadUtf8Value(ref reader); break;
-                case ClefField.ServiceName:     svcUtf8   = ReadUtf8Value(ref reader); break;
+                case ClefField.ServiceName:       svcUtf8   = ReadUtf8Value(ref reader); break;
+                case ClefField.LegacyServiceName: legacySvc = ReadUtf8Value(ref reader); break;
                 case ClefField.Exception:
                     exception = ExceptionInfo.Read(ref reader);
                     break;
@@ -274,6 +276,9 @@ public static class LogEventSerializer
 
         // CLEF @m fallback: a client that sent only a rendered message gets it as template.
         ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
+
+        // ServiceTieRule: @service, unless it is absent or empty, then service.name.
+        if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
 
         // Every read of the body is behind us: from here to the end of the call, a throw is the
         // sink's. Deliberately not cleared in a finally — the caller reads the flag AFTER the
@@ -386,32 +391,50 @@ public static class LogEventSerializer
     private enum ClefField : byte
     {
         Unknown = 0, Timestamp, MessageTemplate, Level, Message, Exception, TraceId, SpanId, ServiceName,
+        LegacyServiceName,
     }
+
+    // ── ServiceTieRule ────────────────────────────────────────────────────────
+    //
+    // The service has two CLEF keys: `@service` (ClefFields.ServiceName), the header field's own
+    // name, and `service.name` (ClefFields.LegacyServiceName), what it was called before — and
+    // what the Serilog sink and every Seq-era client still send. Both set the HEADER, and
+    // neither is ever kept as a user property: the header is the event's one copy of the
+    // service, and a `service.name` property beside it would be unreachable anyway (every
+    // filter spelling of it resolves to the header).
+    //
+    // When a map carries both, `@service` wins WHATEVER THE ORDER: it is the explicit key, while
+    // `service.name` is also the natural name for an enricher-added property, and a map's key
+    // order is no basis for a rule. An empty or nil `@service` counts as absent, so it does not
+    // erase a `service.name` sent beside it. A key repeated in one map keeps its last value, as
+    // every repeated CLEF key always has. Both the streaming path and ReadEvent apply it.
 
     /// <summary>Classifies a CLEF key from its raw UTF-8 bytes — zero allocation (hot path).</summary>
     private static ClefField ClassifyKey(ReadOnlySpan<byte> key) =>
-        key.SequenceEqual("@t"u8)            ? ClefField.Timestamp       :
-        key.SequenceEqual("@mt"u8)           ? ClefField.MessageTemplate :
-        key.SequenceEqual("@l"u8)            ? ClefField.Level           :
-        key.SequenceEqual("@m"u8)            ? ClefField.Message         :
-        key.SequenceEqual("@x"u8)            ? ClefField.Exception       :
-        key.SequenceEqual("@tr"u8)           ? ClefField.TraceId         :
-        key.SequenceEqual("@sp"u8)           ? ClefField.SpanId          :
-        key.SequenceEqual("service.name"u8)  ? ClefField.ServiceName     :
+        key.SequenceEqual("@t"u8)            ? ClefField.Timestamp         :
+        key.SequenceEqual("@mt"u8)           ? ClefField.MessageTemplate   :
+        key.SequenceEqual("@l"u8)            ? ClefField.Level             :
+        key.SequenceEqual("@m"u8)            ? ClefField.Message           :
+        key.SequenceEqual("@x"u8)            ? ClefField.Exception         :
+        key.SequenceEqual("@tr"u8)           ? ClefField.TraceId           :
+        key.SequenceEqual("@sp"u8)           ? ClefField.SpanId            :
+        key.SequenceEqual("@service"u8)      ? ClefField.ServiceName       :
+        key.SequenceEqual("service.name"u8)  ? ClefField.LegacyServiceName :
         ClefField.Unknown;
 
     /// <summary>Fallback classifier for the rare non-contiguous-key path.</summary>
     private static ClefField ClassifyKey(string? key) => key switch
     {
-        ClefFields.Timestamp       => ClefField.Timestamp,
-        ClefFields.MessageTemplate => ClefField.MessageTemplate,
-        ClefFields.Level           => ClefField.Level,
-        ClefFields.Message         => ClefField.Message,
-        ClefFields.Exception       => ClefField.Exception,
-        ClefFields.TraceId         => ClefField.TraceId,
-        ClefFields.SpanId          => ClefField.SpanId,
-        ClefFields.ServiceName     => ClefField.ServiceName,
-        _                          => ClefField.Unknown,
+        ClefFields.Timestamp         => ClefField.Timestamp,
+        ClefFields.MessageTemplate   => ClefField.MessageTemplate,
+        ClefFields.Level             => ClefField.Level,
+        ClefFields.Message           => ClefField.Message,
+        ClefFields.Exception         => ClefField.Exception,
+        ClefFields.TraceId           => ClefField.TraceId,
+        ClefFields.SpanId            => ClefField.SpanId,
+        ClefFields.ServiceName       => ClefField.ServiceName,
+        ClefFields.LegacyServiceName => ClefField.LegacyServiceName,
+        _                            => ClefField.Unknown,
     };
 
     private static LogEvent ReadEvent(ref MessagePackReader reader, EventId id)
@@ -428,7 +451,8 @@ public static class LogEventSerializer
         string? messageFallback = null;   // CLEF @m — promoted to @mt only if @mt missing
         ExceptionInfo? exception = null;
         ulong   traceIdHi = 0, traceIdLo = 0, spanId = 0;
-        string? serviceName = null;
+        string? serviceName = null;          // @service
+        string? legacyServiceName = null;    // service.name — see ServiceTieRule
 
         ArrayBufferWriter<byte>? rawPropsBuf = null;
         int                      rawPropsCount = 0;
@@ -480,6 +504,9 @@ public static class LogEventSerializer
                 }
                 case ClefField.ServiceName:
                     serviceName = reader.ReadString();
+                    break;
+                case ClefField.LegacyServiceName:
+                    legacyServiceName = reader.ReadString();
                     break;
                 default:
                     // Skip the value without decoding it; then copy the raw
@@ -551,7 +578,8 @@ public static class LogEventSerializer
             TraceIdHi       = traceIdHi,
             TraceIdLo       = traceIdLo,
             SpanId          = spanId,
-            ServiceName     = serviceName,
+            // ServiceTieRule: @service, unless it is absent or empty, then service.name.
+            ServiceName     = string.IsNullOrEmpty(serviceName) ? legacyServiceName ?? serviceName : serviceName,
         };
     }
 

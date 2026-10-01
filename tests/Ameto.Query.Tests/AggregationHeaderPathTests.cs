@@ -144,6 +144,12 @@ public sealed class AggregationHeaderPathTests : IDisposable
     [InlineData("select count(*), count(n) group by ['service.name']")]          // not every column is count(*)
     [InlineData("select sum(n) group by ['service.name']")]
     [InlineData("select count(*) group by ['service.name'], @l")]                // two keys
+    // The canonical spelling takes exactly the same roads.
+    [InlineData("select count(*) where @service = 'billing'")]
+    [InlineData("select count(*) where @service = 'billing' group by @l")]
+    [InlineData("select count(*) group by @service")]
+    [InlineData("select count(*) group by @service, @l")]
+    [InlineData("select count(*) where @l = 'Error' group by @service")]
     public async Task Both_roads_answer_the_same_table(string text)
     {
         Assert.True(AggregationParser.TryParse(text, out var q));
@@ -179,10 +185,13 @@ public sealed class AggregationHeaderPathTests : IDisposable
     /// <para>So the assertion is the scan road's, and that the shortcut did not take the query:
     /// if it ever does, the group count drops and this fails.</para>
     /// </summary>
-    [Fact]
-    public async Task Grouping_by_service_keeps_the_scan_road_and_its_ordinal_groups()
+    [Theory]
+    [InlineData("select count(*) group by ['service.name']")]
+    [InlineData("select count(*) group by @service")]          // the canonical spelling: the same decline
+    [InlineData("select count(*) group by ServiceName")]
+    public async Task Grouping_by_service_keeps_the_scan_road_and_its_ordinal_groups(string text)
     {
-        Assert.True(AggregationParser.TryParse("select count(*) group by ['service.name']", out var q));
+        Assert.True(AggregationParser.TryParse(text, out var q));
         var result = await _withHeader.ExecuteAsync(q!, From, To);
 
         // checkout, billing, Billing, "", gateway, and the absent one.
@@ -406,6 +415,7 @@ public sealed class AggregationHeaderPathTests : IDisposable
     [InlineData("select count(*) group by @l")]
     [InlineData("select count(*) where ['service.name'] = 'billing'")]
     [InlineData("select count(*) where ['service.name'] = 'billing' group by @l")]
+    [InlineData("select count(*) where @service = 'billing' group by @l")]
     public async Task A_filter_with_no_level_keeps_the_header_road(string text)
     {
         Assert.True(AggregationParser.TryParse(text, out var q));

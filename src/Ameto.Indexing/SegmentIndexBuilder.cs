@@ -226,6 +226,8 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         }
 
         // ServiceName — interned, so memoised by reference: one transcode per distinct service.
+        // Filed under `@service` (ClefFields.ServiceName). Groups built before that filed it
+        // under `service.name`; the readers fall back to that bucket for them.
         string? service = ev.ServiceName;
         if (!string.IsNullOrEmpty(service))
         {
@@ -237,7 +239,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 _serviceRef = service;
             }
             var svc = _serviceUtf8.AsSpan(0, _serviceLen);
-            if (_inverted.AddUtf8(offset, "service.name"u8, svc) != IndexAddOutcome.Existing) _bloom.AddUtf8(svc);
+            if (_inverted.AddUtf8(offset, "@service"u8, svc) != IndexAddOutcome.Existing) _bloom.AddUtf8(svc);
             _bloomPresented++;
         }
     }

@@ -118,6 +118,7 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void TraceIdAlias()              => AssertIndexPath($"TraceId = '{TraceHex}'", 9001);
     [Fact] public void SpanIdAlias()               => AssertIndexPath($"SpanId = '{SpanHex}'", 9001);
     [Fact] public void ServiceNameDotted()         => AssertIndexPath("service.name = 'Auth.API'", 9002);
+    [Fact] public void ServiceNamePascal()         => AssertIndexPath("ServiceName = 'Auth.API'", 9002);
 
     // ── Coverage axis: fields no inverted bucket holds ────────────────────────
     // The hint must be suppressed entirely. A hint here is unanswerable, and the index
@@ -182,6 +183,9 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void UserProperty()     => AssertIndexPath("Region = 'ae-dxb'", 9001);
     [Fact] public void BareLevelKeyword() => AssertIndexPath("Error", 9001);
     [Fact] public void ServiceNameBracketed() => AssertIndexPath("['service.name'] = 'Auth.API'", 9002);
+    [Fact] public void CanonicalService()     => AssertIndexPath("@service = 'Auth.API'", 9002);
+    [Fact] public void CanonicalServiceIn()   => AssertIndexPath("@service in ['Auth.API']", 9002);
+    [Fact] public void CanonicalServiceCase() => AssertIndexPath("@service = 'auth.api'", 9002);
 
     // ── Reversed operands: the only entry that returned too MANY rows ─────────
 
@@ -275,6 +279,8 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void ContainsStackTrace()   => AssertIndexPath("contains(@x.stack, 'Wallet.Api')", 9001);
     [Fact] public void ContainsServiceName()  => AssertIndexPath("contains(service.name, 'allet')", 9001, 9003);
     [Fact] public void LikeServiceName()      => AssertIndexPath("service.name like 'Wallet%'", 9001, 9003);
+    [Fact] public void ContainsService()      => AssertIndexPath("contains(@service, 'allet')", 9001, 9003);
+    [Fact] public void StartsWithService()    => AssertIndexPath("startsWith(@service, 'Walle')", 9001, 9003);
     [Fact] public void ContainsInnerType()    => AssertIndexPath("contains(@x.inner.type, 'Sockets')", 9001);
 
     /// <summary>A msgpack integer is not a string, and the scan stringifies it anyway.</summary>

@@ -108,6 +108,18 @@ public sealed class AggregationParserTests
     }
 
     [Fact]
+    public void Group_by_the_canonical_service_names_its_column_as_typed()
+    {
+        var q = Parse("select count(*) group by @service, @l");
+
+        Assert.Equal(2, q.Keys.Count);
+        Assert.Equal("@service", q.Keys[0].Property);
+        Assert.Equal("@service", q.Keys[0].Alias);
+        Assert.True(BuiltinFields.TryResolve(q.Keys[0].Property, out var field));
+        Assert.Equal(BuiltinField.ServiceName, field);
+    }
+
+    [Fact]
     public void The_where_clause_is_kept_verbatim_for_the_ordinary_scan()
     {
         // Not re-serialised from a tree: the text goes to the executor as-is, so the

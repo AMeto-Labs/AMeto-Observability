@@ -319,8 +319,9 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     }
 
     /// <summary>
-    /// Every bucket a hint key could name — the key itself, and its dotted spelling when it has
-    /// one (<see cref="SegmentInvertedIndex.TryFlatSpelling"/>) — unioned over every encoding of the
+    /// Every bucket a hint key could name — the key itself, its dotted spelling when it has one
+    /// (<see cref="SegmentInvertedIndex.TryFlatSpelling"/>), and the name an older builder filed it
+    /// under (<see cref="SegmentInvertedIndex.LegacyBucket"/>) — unioned over every encoding of the
     /// value (<see cref="IndexValueForms.Serialised"/>). <paramref name="known"/> is false when no
     /// candidate property exists; the return is null when they exist and none holds the value.
     /// The same rules, in the same order, as the decoded index's <c>PostingsForKey</c>.
@@ -351,6 +352,18 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             if (n < 0) n = IndexValueForms.Serialised(value, forms);
             if (PostingsFor(flatProp, forms[..n], catalog.Codec, src) is { } flatOffsets)
                 acc = acc is null ? flatOffsets : SegmentInvertedIndex.UnionAscending(acc, flatOffsets);
+        }
+
+        // The bucket's pre-rename name (SegmentInvertedIndex.LegacyBucket): `@service` hints also
+        // read an old group's `service.name`. Memo entries are keyed by the catalog's own name, so
+        // the two buckets' answers are remembered apart.
+        if (SegmentInvertedIndex.LegacyBucket(property) is { } legacy &&
+            catalog.Properties.TryGetValue(legacy, out var legacyProp))
+        {
+            known = true;
+            if (n < 0) n = IndexValueForms.Serialised(value, forms);
+            if (PostingsFor(legacyProp, forms[..n], catalog.Codec, src) is { } legacyOffsets)
+                acc = acc is null ? legacyOffsets : SegmentInvertedIndex.UnionAscending(acc, legacyOffsets);
         }
 
         return acc;

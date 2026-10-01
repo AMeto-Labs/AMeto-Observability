@@ -40,7 +40,7 @@ public struct LogEventHeader
     /// <summary>Byte length of the msgpack properties blob.</summary>
     public int    PropertiesByteLength;
 
-    /// <summary>Intern-pool index of the <c>service.name</c> / service identifier string (-1 if absent).</summary>
+    /// <summary>Intern-pool index of the event's <c>@service</c> string (-1 if absent).</summary>
     public int    ServiceNamePoolIndex;
 
     /// <summary>Log level.</summary>
@@ -242,7 +242,7 @@ public sealed class LogEvent
     /// <summary>64-bit SpanId (0 when absent).</summary>
     public ulong SpanId      { get; init; }
 
-    /// <summary>Service name (<c>service.name</c> from OTLP resource attributes, or Serilog SourceContext namespace).</summary>
+    /// <summary>Service name — the event's <c>@service</c> (from CLEF <c>@service</c> or <c>service.name</c>, or the OTLP resource attribute <c>service.name</c>).</summary>
     public string? ServiceName { get; init; }
 }
 
@@ -274,8 +274,23 @@ public static class ClefFields
     public const string SpanId          = "@sp";
     /// <summary>Per-event 64-bit Snowflake EventId (Ameto extension to CLEF, persisted in cold-tier).</summary>
     public const string EventId         = "@i";
-    /// <summary>Service/application name — OTLP resource attribute key and Ameto canonical property key.</summary>
-    public const string ServiceName     = "service.name";
+    /// <summary>
+    /// The service/application name, a header field like <c>@tr</c> and <c>@sp</c>: the key
+    /// every event JSON carries it under, the key CLEF ingest reads it from, the inverted-index
+    /// bucket it is filed in, and the canonical filter spelling.
+    /// </summary>
+    public const string ServiceName     = "@service";
+
+    /// <summary>
+    /// The service's spelling before <see cref="ServiceName"/>, and still OpenTelemetry's: the
+    /// OTLP resource attribute the service is READ from, a key CLEF ingest still accepts (the
+    /// Serilog sink writes it), a filter alias, and the inverted-index bucket segments built
+    /// before <c>@service</c> filed the service in. Those segments are never rewritten, so the
+    /// index readers fall back to this bucket when a group has no <see cref="ServiceName"/>
+    /// one. Metric labels and span attributes keep this name — it is the semantic convention
+    /// there, and only the log event's header field was renamed.
+    /// </summary>
+    public const string LegacyServiceName = "service.name";
 
     // ── Segment-index bucket names for the structured exception ───────────────
     // An exception is not one indexable value: the builder writes the type, the inner

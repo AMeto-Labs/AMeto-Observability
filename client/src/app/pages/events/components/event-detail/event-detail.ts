@@ -10,7 +10,7 @@ import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto } from '../../../../core/models/event.model';
+import { EventDto, eventService } from '../../../../core/models/event.model';
 import { SpanDto } from '../../../../core/models/span.model';
 import { MetricSeriesDto } from '../../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
@@ -75,19 +75,29 @@ function joinPath(prefix: string, key: string): string {
 }
 
 /** Top-level keys promoted to dedicated rows in the detail panel — skip in the generic props list. */
-const PROMOTED_KEYS = new Set(['@tr', '@sp', 'service.name']);
+const PROMOTED_KEYS = new Set(['@tr', '@sp']);
+
+/**
+ * Property keys that may hold a COPY of the event's service: an older server stored OTLP events
+ * with the service repeated as a `service.name` property, and a client that predates `@service`
+ * may have sent it as a property of that name. Hidden only when the value IS the header's — on
+ * a current event such a property is never a copy (a record attribute, a later duplicate, a
+ * non-string value), and hiding it would lose it.
+ */
+const SERVICE_COPY_KEYS = new Set(['@service', 'service.name']);
 
 /**
  * Builds the flat top-level property list. Scalar values become text rows;
  * non-empty objects/arrays become a single structured row rendered by the
  * inline JSON viewer (Seq/Datalust-style — collapsed to one line, expandable).
  * Nesting is handled by the viewer itself, so values are no longer flattened
- * into many indented rows.
+ * into many indented rows. `service` is the event's header service, whose copies are skipped.
  */
-function buildProps(obj: Record<string, unknown>): PropEntry[] {
+export function buildProps(obj: Record<string, unknown>, service?: string): PropEntry[] {
   const out: PropEntry[] = [];
   for (const [k, v] of Object.entries(obj)) {
     if (PROMOTED_KEYS.has(k)) continue;
+    if (SERVICE_COPY_KEYS.has(k) && service !== undefined && v === service) continue;
     const structured = v !== null && typeof v === 'object' && Object.keys(v as object).length > 0;
     out.push({
       path: joinPath('', k),
@@ -98,6 +108,28 @@ function buildProps(obj: Record<string, unknown>): PropEntry[] {
     });
   }
   return out;
+}
+
+/**
+ * CLEF-style flat view of an event for the JSON tab: header fields and user properties at one
+ * level, as the filter language addresses them. `@service` there IS the header field, so it is
+ * written before the properties — for its place among the header fields — and again after them,
+ * so a property of the same name (from a client that sent `@service` before it was a header key)
+ * cannot replace it.
+ */
+export function buildClefView(ev: EventDto): Record<string, unknown> {
+  const view: Record<string, unknown> = {};
+  if (ev['@t']  !== undefined) view['@t']  = ev['@t'];
+  if (ev['@l']  !== undefined) view['@l']  = ev['@l'];
+  if (ev['@mt'] !== undefined) view['@mt'] = ev['@mt'];
+  if (ev['@x']  !== undefined) view['@x']  = ev['@x'];
+  if (ev['@tr'] !== undefined) view['@tr'] = ev['@tr'];
+  if (ev['@sp'] !== undefined) view['@sp'] = ev['@sp'];
+  const service = eventService(ev);
+  if (service !== undefined) view['@service'] = service;
+  Object.assign(view, ev.props ?? {});
+  if (service !== undefined) view['@service'] = service;
+  return view;
 }
 
 function wfFmtMs(ms: number): string {
@@ -326,9 +358,7 @@ export class EventDetailComponent {
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
 
-  service = computed(() =>
-    (this.event()['service.name'] as string | undefined) ?? ''
-  );
+  service = computed(() => eventService(this.event()) ?? '');
 
   /** Stable per-service colour, shared with the list rows / dropdown / waterfall. */
   svcColor = computed(() => serviceColor(this.service()));
@@ -357,19 +387,7 @@ export class EventDetailComponent {
    * Used by the JSON tab so filter-path expressions are correct (e.g.
    * `Headers.Authorization`, not `props.Headers.Authorization`).
    */
-  clefView = computed<Record<string, unknown>>(() => {
-    const ev = this.event();
-    const view: Record<string, unknown> = {};
-    if (ev['@t']           !== undefined) view['@t']           = ev['@t'];
-    if (ev['@l']           !== undefined) view['@l']           = ev['@l'];
-    if (ev['@mt']          !== undefined) view['@mt']          = ev['@mt'];
-    if (ev['@x']           !== undefined) view['@x']           = ev['@x'];
-    if (ev['@tr']          !== undefined) view['@tr']          = ev['@tr'];
-    if (ev['@sp']          !== undefined) view['@sp']          = ev['@sp'];
-    if (ev['service.name'] !== undefined) view['service.name'] = ev['service.name'];
-    Object.assign(view, ev.props ?? {});
-    return view;
-  });
+  clefView = computed<Record<string, unknown>>(() => buildClefView(this.event()));
 
   /**
    * Flat top-level property list:
@@ -377,7 +395,7 @@ export class EventDetailComponent {
    *  - Object/array   → structured row rendered inline by the JSON viewer
    *                     (collapsed to one line, expandable — Seq/Datalust-style)
    */
-  allProps = computed(() => buildProps(this.event().props ?? {}));
+  allProps = computed(() => buildProps(this.event().props ?? {}, eventService(this.event())));
 
   hasException  = computed(() => !!this.event()['@x']);
 
@@ -762,14 +780,14 @@ export class EventDetailComponent {
   filterService(): void {
     const svc = this.service();
     if (!svc) return;
-    this.filterSelected.emit(`['service.name'] = ${jvLiteral(svc)}`);
+    this.filterSelected.emit(`@service = ${jvLiteral(svc)}`);
     this.menuType.set(null);
   }
 
   excludeService(): void {
     const svc = this.service();
     if (!svc) return;
-    this.filterSelected.emit(`['service.name'] <> ${jvLiteral(svc)}`);
+    this.filterSelected.emit(`@service <> ${jvLiteral(svc)}`);
     this.menuType.set(null);
   }
 

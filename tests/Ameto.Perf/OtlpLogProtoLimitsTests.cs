@@ -114,7 +114,7 @@ public sealed class OtlpLogProtoLimitsTests
         var sink = Parse(OtlpProtoPayloads.Logs_Realistic(records: 3), out int ingested);
         Assert.Equal(3, ingested);
         Assert.Equal("Etisalat.API", sink.Records[0].Svc);
-        Assert.Equal(14, Props(sink.Records[0].Props).Count);   // 6 resource + 6 record + @tr + @sp
+        Assert.Equal(13, Props(sink.Records[0].Props).Count);   // 6 resource less service.name (the header) + 6 record + @tr + @sp
     }
 
     // ── Truncated input ───────────────────────────────────────────────────────
@@ -140,15 +140,15 @@ public sealed class OtlpLogProtoLimitsTests
         // First resource_logs: the resource was written AFTER the records it applies to.
         var first = Props(sink.Records[0].Props);
         Assert.Equal("First.Service", sink.Records[0].Svc);
-        Assert.Equal("First.Service", first["service.name"]);
+        Assert.False(first.ContainsKey("service.name"));     // the header carries it, the map does not
         Assert.Equal("host-a", first["host.name"]);
 
         // Second: its own service, and NOT the first one's host.name.
         var second = Props(sink.Records[1].Props);
         Assert.Equal("Second.Service", sink.Records[1].Svc);
-        Assert.Equal("Second.Service", second["service.name"]);
+        Assert.False(second.ContainsKey("service.name"));
         Assert.False(second.ContainsKey("host.name"));
-        Assert.Single(second);
+        Assert.Empty(second);                                // its only attribute was the service
 
         // Third: no resource at all, so no resource attributes and no service name.
         Assert.Null(sink.Records[2].Svc);
@@ -177,8 +177,8 @@ public sealed class OtlpLogProtoLimitsTests
         // the later string one does not get a second chance at the dedicated column.
         Assert.Null(sink.Records[0].Svc);
 
-        // Both attributes are still IN the map, duplicate key and all — the mapper wrote every
-        // resource attribute it was given and so does this. Decoding that map into a dictionary
+        // Neither became the service, so both are still IN the map, duplicate key and all — only
+        // a service.name that becomes the header leaves it. Decoding that map into a dictionary
         // is what collapses them, last one winning; the byte-level agreement is pinned by
         // The_dom_oracle_agrees_about_the_ambiguous_shapes.
         Assert.Equal("Too.Late", props["service.name"]);

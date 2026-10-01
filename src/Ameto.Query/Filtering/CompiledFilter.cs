@@ -507,7 +507,7 @@ public sealed class CompiledFilter : IPreparedFilter
     /// <para>It has to be asked separately and it has to be asked at all:
     /// <c>SegmentTrigramIndex.Lookup</c> returns an empty array for a trigram it does not
     /// hold, and <c>QueryExecutor</c> reads that as proof and drops the segment. So a
-    /// <c>contains</c> on <c>@tr</c>, <c>@sp</c>, <c>@l</c>, <c>@id</c>, <c>service.name</c>
+    /// <c>contains</c> on <c>@tr</c>, <c>@sp</c>, <c>@l</c>, <c>@id</c>, <c>@service</c>
     /// or the exception stack — none of which is ever trigrammed — returned rows while the
     /// events were hot and zero the moment the segment flushed. Same shape as the seed
     /// defect, different index.</para>

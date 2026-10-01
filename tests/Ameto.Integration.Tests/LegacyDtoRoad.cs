@@ -103,7 +103,9 @@ internal static class LegacyDtoRoad
         [JsonPropertyName("id")]            public string Id              { get; init; } = "";
         [JsonPropertyName("@tr")]           public string? TraceId        { get; init; }
         [JsonPropertyName("@sp")]           public string? SpanId         { get; init; }
-        [JsonPropertyName("service.name")]  public string? ServiceName    { get; init; }
+        // The one edit since 42108b4, made with the wire it pins: the service went out as
+        // "service.name" until it became the built-in @service (ClefFields.ServiceName).
+        [JsonPropertyName("@service")]      public string? ServiceName    { get; init; }
         [JsonPropertyName("props")]         public EventProps? Properties { get; init; }
 
         public static LogEventDto From(LogEvent ev) => new()

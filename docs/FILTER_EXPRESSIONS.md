@@ -43,9 +43,9 @@ and is asked of `GET /api/events/aggregate` rather than the search endpoint.
 
 ```
 select count(*)
-select count(*) where @l = 'Error' group by ['service.name']
+select count(*) where @l = 'Error' group by @service
 select count(*) as events, avg(Elapsed), max(Elapsed) group by @l limit 20
-select count(*) group by ['service.name'] as service, @l as level
+select count(*) group by @service as service, @l as level
 ```
 
 Aggregates: `count(*)`, `count(P)` (events that carry `P`), `sum(P)`, `min(P)`, `max(P)`,
@@ -136,6 +136,9 @@ Inside the brackets, escape a literal single quote with `\'`.
 | `@x.inner.message` | | Inner exception message. |
 | `@x.exists` | | `true` when the event has an exception. |
 | `@t` | `Timestamp` | ISO-8601 timestamp string. |
+| `@service` | `ServiceName`, `service.name` | The service the event came from (OTLP resource attribute `service.name`, or CLEF `@service` / `service.name`). `=` and `in` use the index; `contains` / `like` on it scan. |
+
+`service.name` and `ServiceName` remain accepted aliases of `@service` — bare (`service.name = 'api'`) or bracketed (`['service.name'] = 'api'`) — and all of them mean the header field, not a property of that name.
 
 ## Functions
 
@@ -370,5 +373,5 @@ contains(@x, 'SqlException')
 @x.type = 'System.Data.SqlClient.SqlException'
 
 # High-severity events from a specific service
-ServiceName = 'payments' and @l in ['Error', 'Fatal']
+@service = 'payments' and @l in ['Error', 'Fatal']
 ```

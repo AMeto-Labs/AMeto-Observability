@@ -19,7 +19,7 @@ namespace Ameto.Query.Filtering;
 /// their masks is then exact too. An OR reaching any other field (<c>@l = 'Error' or
 /// Foo = 1</c>) is not representable and is ignored, i.e. answers "maybe". Under a
 /// <c>not</c>, De Morgan turns an OR into conjuncts, so <c>not (@l = 'Debug' or
-/// service.name = 'x')</c> pushes both halves.</para>
+/// @service = 'x')</c> pushes both halves.</para>
 /// </summary>
 internal sealed class HeaderPredicate : IHotHeaderPredicate
 {

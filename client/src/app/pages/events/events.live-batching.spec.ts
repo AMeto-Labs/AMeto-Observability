@@ -34,7 +34,7 @@ function makeEvent(n: number): EventDto {
     '@t': new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0) + n * 1000).toISOString(),
     '@mt': `event ${n}`,
     '@l': 'Information',
-    'service.name': 'svc',
+    '@service': 'svc',
     id: `e${String(n).padStart(5, '0')}`,
   } as EventDto;
 }
@@ -205,7 +205,7 @@ describe('Events live tail — one publication per frame, newest first', () => {
     // An aggregation ends the tail. Retry then belongs to the table on screen — reopening the
     // stream would send `select … group by …` to an endpoint that refuses it by design, and
     // the aggregation branch of loadEvents returns before the line that used to clear this.
-    store.applyFilter("select count(*) group by ['service.name']");
+    store.applyFilter('select count(*) group by @service');
     expect(store.live()).toBe(false);
     const before = opened;
 

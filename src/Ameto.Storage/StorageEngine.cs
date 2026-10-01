@@ -4395,7 +4395,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // names and recovery force-interns this WAL's own rows into it, so slot 0 is
                 // ordinarily this WAL's first template: every recovered event was stamped with
                 // it, and the flush below wrote that string permanently into the recovery
-                // segment's @svc column, where it answers service.name queries and skews
+                // segment's @svc column, where it answers @service queries and skews
                 // per-service counts.
                 ServiceNamePoolIndex     = -1,
             };

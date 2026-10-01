@@ -205,7 +205,7 @@ public sealed class AggregationExecutor(
     /// <c>/api/events/counts</c> already reads exactly those three columns, in parallel across
     /// segments, and the alert evaluator already trusts <c>TryGetHeaderOnlyShape</c> to say when
     /// a filter is expressible that way. This routes the aggregation down the same road. The
-    /// shape that motivated it, <c>group by ['service.name']</c>, is NOT one of them: it is
+    /// shape that motivated it, <c>group by @service</c>, is NOT one of them: it is
     /// declined for the reasons given below.</para>
     ///
     /// <para>DELIBERATELY NARROW; anything unrecognised returns null and the ordinary scan runs.
@@ -223,7 +223,7 @@ public sealed class AggregationExecutor(
     /// partial answer with no rows at all. The header road is taken exactly where the scan has
     /// nothing to narrow with.</para>
     ///
-    /// <para>GROUPING BY <c>service.name</c> IS DECLINED, although it is the shape that would
+    /// <para>GROUPING BY <c>@service</c> (under any of its spellings) IS DECLINED, although it is the shape that would
     /// gain most, because the header aggregator cannot reproduce the scan's groups exactly and
     /// an aggregation is read as a fact. It keys services case-INSENSITIVELY and a series keeps
     /// whichever casing reached it first, which the aggregator's own contract admits can flap
@@ -262,7 +262,7 @@ public sealed class AggregationExecutor(
         if (keys.Count == 1)
         {
             if (!BuiltinFields.TryResolve(keys[0].Property, out var field)) return null;
-            if (field != BuiltinField.Level) return null;       // including service.name — see above
+            if (field != BuiltinField.Level) return null;       // including @service — see above
             grouping = HeaderGrouping.Level;
         }
 

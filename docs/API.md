@@ -142,6 +142,7 @@ Ingest a batch of log events.
 | `@l` | string | Level: `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`. |
 | `@m` | string | Ingest-only fallback for `@mt`. Never re-emitted by the server. |
 | `@x` | string or object | Exception. String is auto-wrapped; or `{type, message?, stack?, inner?}` recursive up to depth 3. |
+| `@service` | string | The service the event came from. `service.name` is accepted too (what the Serilog sink and older clients send); with both present, `@service` wins whatever the order, and an empty or nil `@service` counts as absent, so a `service.name` beside it still applies. Either way it is stored as the event's `@service` header field, never as a property. A value that is not a string (a number, a map, an array) under either key is a malformed element: the batch is answered `400` with `failedAtElement` pointing at it, and the elements before it are already ingested (see below). Before `@service` was a header key, a non-string `@service` went through as an ordinary property; a non-string `service.name` was already refused. |
 | *(any)* | any | Structured properties. |
 
 **Response `200 OK`:**
@@ -183,7 +184,7 @@ printf '%s' '{"resourceLogs":[…]}' | gzip \
 ```
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
-`resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
+`resource.attributes["service.name"]` becomes the event's `@service` (the first one, when it is a non-empty string — it is then not repeated among the event's properties); `traceId` / `spanId` are indexed for log↔trace correlation.
 
 **Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length`, proved it by arriving, or, gzip-compressed, **inflated** past it. The inflated size is decided on bytes already written, so a body that would inflate to gigabytes (deflate reaches ~1032:1) is stopped after at most one limit of output: no single buffer is ever rented past the limit, and the request holds at most the compressed body plus one and a half limits of inflate buffer — one limit when the gzip trailer states the size honestly, one and a half when it understates it and the buffer doubles its way up (about 20 MiB in all at the 8 MB default); that refusal is also logged as a warning (`OtlpGzipTooLarge`, shared with the gRPC receiver), since it is a misconfigured exporter or a probe — at most once a second, with the count since the last line and the latest sender: its API key as `GET /api/auth/keys` lists it (`keyPreview`, never the key) and its remote address. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
 
@@ -255,14 +256,19 @@ before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 Event JSON:
 ```json
 {
-  "@t":    "2026-05-20T10:00:00.0000000+00:00",
-  "@mt":   "Request {Path} failed",
-  "@l":    "Error",
-  "@x":    { "type": "System.InvalidOperationException", "message": "Boom", "stack": "...", "inner": null },
-  "id":    "123456789",
-  "props": { "Path": "/api/users", "StatusCode": 500 }
+  "@t":       "2026-05-20T10:00:00.0000000+00:00",
+  "@mt":      "Request {Path} failed",
+  "@l":       "Error",
+  "@x":       { "type": "System.InvalidOperationException", "message": "Boom", "stack": "...", "inner": null },
+  "id":       "123456789",
+  "@tr":      "4bf92f3577b34da6a3ce929d0e0e4736",
+  "@sp":      "00f067aa0ba902b7",
+  "@service": "orders-api",
+  "props":    { "Path": "/api/users", "StatusCode": 500 }
 }
 ```
+
+`@x`, `@tr`, `@sp` and `@service` are present only when the event has them. **Changed in this release:** the service is sent as `@service`; it used to be sent as `service.name`, in the same place. An OTLP event no longer repeats it as `props["service.name"]` either — events stored before the change still carry that property.
 
 ### `GET /api/events/live` (SSE live tail)
 
@@ -283,7 +289,7 @@ Returns a sorted array of distinct property names seen in the last 24 h (up to 5
 
 ### `GET /api/events/services`
 
-Returns the distinct `service.name` values seen, for the services dropdown/filter.
+Returns the distinct `@service` values seen, for the services dropdown/filter. (Unchanged shape: a sorted array of strings.)
 
 **Auth:** JWT Bearer.
 
