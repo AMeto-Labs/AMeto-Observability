@@ -61,7 +61,7 @@ public enum SegmentImportOutcome
 /// This class is the central coordinator — it implements ISegmentProvider for
 /// the query layer and ISegmentManager for the admin API.
 /// </summary>
-public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDisposable
+public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAvailability, IAsyncDisposable
 {
     /// <summary>
     /// Creates the index sink for ONE INDEX GROUP. Injected by the Indexing layer at startup to
@@ -539,6 +539,37 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal Task CatalogLoaded => _catalogLoad;
 
+    /// <summary>
+    /// Whether a read issued now gets a TRUE answer (#95) — for a caller that ACTS on the answer,
+    /// the alert evaluator, which turns a count into a threshold decision.
+    ///
+    /// <para><see cref="QueryAvailability.Loading"/> until the constructor's catalog scan
+    /// (<see cref="CatalogLoaded"/>) has ended: before that, a count covers the hot tier and
+    /// whichever segments the scan has registered SO FAR — after a restart, whose final flush put
+    /// everything on disk, that is a partial count of the whole window. A scan that FAULTS ends the
+    /// state too; the segments it could not reach are missing either way, and holding "loading"
+    /// for ever would stop every log alert from ever being evaluated.</para>
+    ///
+    /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
+    /// step of the teardown after its final flush. Conservative by a few steps — reads stay whole
+    /// until <see cref="_snapshotsClosed"/>, after which <see cref="SnapshotTiers"/> THROWS rather
+    /// than answering — but past it nothing a caller acts on is worth reading.</para>
+    ///
+    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// </summary>
+    public QueryAvailability Availability =>
+        Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
+      : !_catalogLoad.IsCompleted             ? QueryAvailability.Loading
+      :                                         QueryAvailability.Available;
+
+    /// <summary>
+    /// Test seam: an engine constructed while this holds a task starts its catalog scan only once
+    /// that task completes — the only way to hold <see cref="QueryAvailability.Loading"/> open. An
+    /// <see cref="AsyncLocal{T}"/>, so it reaches only the engines the setting test constructs and
+    /// never one a parallel test builds. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Task?> HoldCatalogScanForTest = new();
+
     // Hot tiers that have been frozen but whose cold-tier segment file is still
     // being written (or has just been registered but we haven't released the
     // reference yet). Queries must read from these to avoid a visibility gap
@@ -812,9 +843,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 "Quarantined segments present: {Count} file(s), {Bytes:N0} bytes in {Dir} — " +
                 "unreadable at some earlier start, kept for an operator to inspect or remove.",
                 corrupt.Length, corrupt.Sum(static f => new FileInfo(f).Length), _segDir);
-        _catalogLoad = bootScanHeldUntil is null
-            ? Task.Run(LoadSegmentCatalog)
-            : LoadSegmentCatalogOnceReleasedAsync(bootScanHeldUntil);
+        // Two seams, one hold: #97's constructor parameter for a test that builds the engine itself,
+        // and #95's AsyncLocal for one that gets it from the container (the host's DI).
+        var heldUntil = bootScanHeldUntil ?? HoldCatalogScanForTest.Value;
+        _catalogLoad  = heldUntil is null ? Task.Run(LoadSegmentCatalog) : LoadSegmentCatalogOnceReleasedAsync(heldUntil);
         ReplayOrphanedWals();
         var (bootWal, bootSegId) = OpenWalCore();
         _write = new WriteState(_write.Hot, bootWal, bootSegId);
@@ -1117,8 +1149,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             Interlocked.Increment(ref _activeReaders);
         }
+        _afterReaderSnapshotForTest?.Invoke();
         return (current, frozen, covered);
     }
+
+    /// <summary>
+    /// Test seam: called by <see cref="SnapshotTiers"/> once a reader holds its snapshot and before
+    /// it reads anything — the instant a read has begun on a store that can still close under it.
+    /// Null in production.
+    /// </summary>
+    internal Action? _afterReaderSnapshotForTest;
 
     /// <summary>
     /// Near-zero-allocation log-volume aggregation: buckets <c>(bucket, service, level)</c> event

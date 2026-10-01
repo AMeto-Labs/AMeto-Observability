@@ -37,6 +37,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private readonly ITraceStatsProvider   _traceStats;
     private readonly ILogger<AlertEvaluator> _logger;
 
+    /// <summary>
+    /// The clock the unavailable-store warning is rate-limited on. A seam, so that "a second line
+    /// after a minute" is a test that advances a clock rather than one that waits a minute.
+    /// </summary>
+    private readonly TimeProvider _time;
+
     private readonly ConcurrentDictionary<string, MutableState> _states = new();
     private readonly ConcurrentDictionary<string, AlertSilence> _silences = new();
     private readonly ConcurrentDictionary<string, MaintenanceWindow> _maintenance = new();
@@ -69,11 +75,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
         IQueryExecutor logQuery, StorageEngine storage,
         IMetricAggregator metrics, ITraceStatsProvider traceStats,
-        ILogger<AlertEvaluator> logger)
+        ILogger<AlertEvaluator> logger, TimeProvider? time = null)
     {
         _store = store; _dispatcher = dispatcher; _persist = persist;
         _logQuery = logQuery; _storage = storage; _metrics = metrics; _traceStats = traceStats;
         _logger = logger;
+        _time   = time ?? TimeProvider.System;
         LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
     }
@@ -197,9 +204,17 @@ public sealed class AlertEvaluator : IAsyncDisposable
         return false;
     }
 
-    /// <summary>Evaluate a rule's value right now without affecting state (for the editor preview).</summary>
-    public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
-        => await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+    /// <summary>
+    /// Evaluate a rule's value right now without affecting state (for the editor preview). The
+    /// same answer a tick would act on — including "the store cannot say" (#95), which a tick skips
+    /// and the preview endpoint turns into a 503 rather than a 0 that "would not fire"; and an
+    /// available NaN, a metric window with points and not one finite (#92), which a tick also skips
+    /// and the endpoint answers as <c>value: null, wouldFire: false</c> — never a verdict the
+    /// evaluator would not reach. An EMPTY window is 0, as the evaluator reads it. A preview logs no
+    /// non-finite warning (see <see cref="WarnNonFinite"/>).
+    /// </summary>
+    public ValueTask<AlertValue> PreviewAsync(AlertRule rule, CancellationToken ct = default)
+        => ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct, preview: true);
 
     /// <summary>
     /// Dispatches a one-off TEST notification through the rule's channels — bypasses the
@@ -262,7 +277,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
             if (!rule.Enabled) { _states.TryRemove(rule.Id, out _); continue; }
             try
             {
-                double value = await ComputeValueAsync(rule, now, ct);
+                var value = await ComputeValueAsync(rule, now, ct);
 
                 // CHECKED AFTER THE VALUE, NOT ONLY BEFORE THE CYCLE. An engine closes only after
                 // _stopping is set (ApplicationStopping, or this evaluator's own disposal, precedes
@@ -270,7 +285,25 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 // here with the flag up. Checking only at the top of the cycle left the case that
                 // matters: a tick that began while the host was running and read its 0 after.
                 if (IsStopping) return;
-                Transition(rule, value, now);
+
+                // THE SAME CASE WITHOUT A HOST STOP (#95). The flag above covers an engine closed by
+                // the host's own shutdown; this covers every other way a store can stop answering
+                // truly — closed by something else, or still loading its cold tier — because the
+                // store says so itself. Nothing about the rule changes: not its state, not its last
+                // value, not its evaluation time. A skipped tick is a tick that did not happen.
+                if (!value.IsAvailable)
+                {
+                    WarnUnavailable(rule, value.Availability);
+                    continue;
+                }
+
+                // Available, and still no value to compare (#92): a metric window whose every point
+                // is NaN or infinite (MetricValueAsync has said so in the log). The rule keeps its
+                // state: a comparison against NaN is false, and "not breached" would resolve it. A
+                // SEPARATE test from the one above, and after it — NaN is never the availability test.
+                if (double.IsNaN(value.Value)) continue;
+
+                Transition(rule, value.Value, now);
             }
             catch (OperationCanceledException) when (IsStopping)
             {
@@ -281,7 +314,27 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 _logger.LogWarning(ex, "Failed to evaluate alert rule {Rule}", rule.Id);
             }
         }
+
+        // After the tick's last rule, so a line counts every rule the tick skipped (a cycle cut
+        // short by the host stopping returns above and says nothing).
+        FlushUnavailableWarnings();
+        ForgetDeletedRules();
     }
+
+    /// <summary>
+    /// Drops the once-only non-finite warnings of rules that no longer exist — a rule deleted, or
+    /// replaced under a new id — so the set holds at most the saved rules' entries (two each). Once a
+    /// tick, and only when the set is not empty.
+    /// </summary>
+    private void ForgetDeletedRules()
+    {
+        if (_nonFiniteWarned.IsEmpty) return;
+        foreach (var entry in _nonFiniteWarned)
+            if (_store.GetById(entry.Key.RuleId) is null) _nonFiniteWarned.TryRemove(entry.Key, out _);
+    }
+
+    /// <summary>Test hook: how many once-only non-finite warnings are remembered.</summary>
+    internal int NonFiniteWarnedCountForTest => _nonFiniteWarned.Count;
 
     // ── State machine ───────────────────────────────────────────────────────────
 
@@ -370,8 +423,16 @@ public sealed class AlertEvaluator : IAsyncDisposable
         if (IsSilenced(rule.Id)) return;
         if (IsInMaintenance(rule, now)) return;
         var fired = new AlertFiredEvent { Rule = rule, State = state, Value = value, At = now, IsEscalation = escalation };
+        _onDispatchForTest?.Invoke(fired);
         _ = Task.Run(() => _dispatcher.DispatchAsync(fired));
     }
+
+    /// <summary>
+    /// Test seam: every notification the state machine decides to send, on the evaluating thread,
+    /// BEFORE it is handed to the pool — so "nothing was dispatched" is a count a test reads when the
+    /// tick returns, not a fire-and-forget it has to wait out. Null in production.
+    /// </summary>
+    internal Action<AlertFiredEvent>? _onDispatchForTest;
 
     private void Record(AlertRule rule, AlertState state, double value, DateTimeOffset now)
     {
@@ -406,17 +467,131 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     // ── Value computation per source ────────────────────────────────────────────
 
-    private async Task<double> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct)
+    /// <summary>
+    /// The rule's value — or, when the store behind it could not answer truly, which way it could
+    /// not (#95). A store that has closed answers EMPTY and one still loading answers a PART, and
+    /// either, taken as a number, is a 0 (or a low count) that resolves every firing "&gt;" rule and
+    /// fires every "&lt;" one. The store is asked instead of the answer being guessed at.
+    ///
+    /// <para><b>Asked twice, around the read, and each question catches one state.</b> Availability
+    /// only moves forward — Loading → Available → Closed — so:</para>
+    /// <list type="bullet">
+    /// <item>BEFORE the read catches <see cref="QueryAvailability.Loading"/>. A read that ran while the
+    /// store loaded began while it loaded, so this question, asked earlier still, saw it too. Asked
+    /// only AFTER, it would miss a load that finished during the read — the read's snapshot of the
+    /// cold tier was taken before it.</item>
+    /// <item>AFTER the read catches <see cref="QueryAvailability.Closed"/>. A read that met a closed
+    /// door is followed by this question, which sees the same door. Asked only BEFORE, it misses the
+    /// tick that began open and read after the close — the race #84 closed for the host stop.</item>
+    /// </list>
+    ///
+    /// <para><b>The log store differs in one way: closed, it THROWS.</b> Once its teardown has
+    /// collected its hot tiers, its reader snapshot raises <see cref="ObjectDisposedException"/>
+    /// instead of answering. The rule was never resolved by that, but every rule over it logged a
+    /// failure with a stack trace on every tick. A read the store's own close cut short is now the
+    /// Closed answer it is: skipped, and said once a minute. An ObjectDisposedException from a store
+    /// that is NOT closed is still a failure, and still reported as one.</para>
+    ///
+    /// <para>An AVAILABLE value can still be NaN (#92): a metric window with points and not one
+    /// finite. The caller tests <see cref="AlertValue.IsAvailable"/> first and NaN second.</para>
+    /// </summary>
+    /// <param name="preview">The editor's preview, not an evaluation: says nothing in the log (see
+    /// <see cref="WarnNonFinite"/>).</param>
+    private async ValueTask<AlertValue> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct, bool preview = false)
     {
-        var from = now - rule.Window;
-        return rule.Source switch
+        IQueryAvailability? store = rule.Source switch
         {
-            AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
-            AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
-            _                  => await LogValueAsync(rule, from, now, ct),
+            AlertSource.Metric => _metrics,
+            AlertSource.Trace  => _traceStats,
+            _                  => _storage,
         };
+
+        var before = store?.Availability ?? QueryAvailability.Available;
+        if (before != QueryAvailability.Available) return AlertValue.Unavailable(before);
+
+        var from = now - rule.Window;
+        double value;
+        try
+        {
+            value = rule.Source switch
+            {
+                AlertSource.Metric => await MetricValueAsync(rule, from, now, ct, preview),
+                AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
+                _                  => await LogValueAsync(rule, from, now, ct),
+            };
+        }
+        catch (ObjectDisposedException) when (store?.Availability == QueryAvailability.Closed)
+        {
+            return AlertValue.Unavailable(QueryAvailability.Closed);
+        }
+
+        var after = store?.Availability ?? QueryAvailability.Available;
+        if (after != QueryAvailability.Available) return AlertValue.Unavailable(after);
+
+        return AlertValue.Of(value);
     }
 
+    /// <summary>
+    /// Records that a rule was left as it was because its store cannot answer. Nothing is logged
+    /// here: the tick's skips are counted per (source, Loading or Closed) and said once, by
+    /// <see cref="FlushUnavailableWarnings"/> after the tick's last rule — so a line counts the
+    /// whole tick, not the first rule of it.
+    /// </summary>
+    private void WarnUnavailable(AlertRule rule, QueryAvailability why)
+    {
+        int i = ((int)rule.Source % SourceCount) * 2 + (why == QueryAvailability.Closed ? 1 : 0);
+        Interlocked.Increment(ref _unavailableSkipped[i]);
+        Volatile.Write(ref _unavailableLastRule[i], rule.Id);
+    }
+
+    /// <summary>
+    /// Says, once a tick and at most once a minute per SOURCE AND STATE, that rules are being left
+    /// as they were because their store cannot answer. Not per rule: a closed store skips every
+    /// rule that reads it, on every tick, and a line per rule per tick would bury the log for as
+    /// long as the store stays down. Loading and Closed have a slot each, so a store that finishes
+    /// loading and then closes within the minute is still reported closed at once; and each line
+    /// counts every evaluation its slot skipped since its last line — the ticks it was held back
+    /// included — so the rules it does not name are accounted for.
+    /// </summary>
+    private void FlushUnavailableWarnings()
+    {
+        long now = _time.GetTimestamp();
+        for (int i = 0; i < _unavailableSkipped.Length; i++)
+        {
+            if (Volatile.Read(ref _unavailableSkipped[i]) == 0) continue;
+
+            long last = Volatile.Read(ref _unavailableWarnedAt[i]);
+            if (last != 0 && _time.GetElapsedTime(last, now) < UnavailableWarnInterval) continue;   // held: it keeps counting
+            if (Interlocked.CompareExchange(ref _unavailableWarnedAt[i], now, last) != last) continue;
+
+            int skipped = Interlocked.Exchange(ref _unavailableSkipped[i], 0);
+            var why     = i % 2 == 1 ? QueryAvailability.Closed : QueryAvailability.Loading;
+            _logger.LogWarning(
+                "Alert rule {Rule} was not evaluated: the {Source} store is {Availability}, so its answer "
+              + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
+              + "since the last such line. Rules keep their state and nothing is sent. Said at most once "
+              + "a minute per source and state",
+                Volatile.Read(ref _unavailableLastRule[i]), (AlertSource)(i / 2), why,
+                why == QueryAvailability.Loading ? "partial" : "empty", skipped);
+        }
+    }
+
+    private static readonly TimeSpan UnavailableWarnInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>The <see cref="AlertSource"/> values: Log, Metric, Trace.</summary>
+    private const int SourceCount = 3;
+
+    /// <summary>
+    /// Last <see cref="_time"/> timestamp a warning was logged, per (<see cref="AlertSource"/>,
+    /// Loading or Closed) — index <c>source * 2 + (closed ? 1 : 0)</c>; 0 = never.
+    /// </summary>
+    private readonly long[] _unavailableWarnedAt = new long[SourceCount * 2];
+
+    /// <summary>Evaluations skipped per slot of <see cref="_unavailableWarnedAt"/> since its last line.</summary>
+    private readonly int[] _unavailableSkipped = new int[SourceCount * 2];
+
+    /// <summary>The most recent rule skipped per slot — the one a line names.</summary>
+    private readonly string?[] _unavailableLastRule = new string?[SourceCount * 2];
     /// <summary>
     /// Safety bound for the scanning fallback. It replaces a hard 10 000 that was NOT a
     /// safety bound but a silent ceiling: a rule counting more than that reported exactly
@@ -588,7 +763,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private readonly record struct HeaderShape(bool HeaderOnly, HashSet<LogLevel>? Levels, string? Service);
 
-    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct, bool preview)
     {
         if (string.IsNullOrWhiteSpace(rule.Metric)) return 0;
         var series = await _metrics.QueryAsync(new MetricQueryRequest
@@ -604,16 +779,64 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // Reduce over the whole window (not just the last point — a quiet final
         // interval would read 0 and miss the spike). For ">" thresholds take the
         // peak; for "<" thresholds take the trough.
+        //
+        // A NaN or ±Infinity point is SKIPPED (#92): it is no measurement — an exporter's division
+        // by zero, an empty histogram's mean — and the panel shows it as a gap (the JSON writes it
+        // as null). Folded in, it did damage both ways: Math.Max(acc, NaN) is NaN, which reset the
+        // reduction and dropped the peak before it, and a NaN last in the window came out as 0 —
+        // resolving a firing ">" rule, or firing a "<" rule, with nothing in the log.
         bool wantMax = rule.Comparator is AlertComparator.GreaterThan or AlertComparator.GreaterOrEqual;
         double acc = double.NaN;
+        int skipped = 0;
         foreach (var s in series)
             foreach (var p in s.Points)
             {
+                if (!double.IsFinite(p.Value)) { skipped++; continue; }
                 if (double.IsNaN(acc)) acc = p.Value;
                 else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
             }
-        return double.IsNaN(acc) ? 0 : acc;
+
+        if (skipped > 0 && !preview) WarnNonFinite(rule, skipped, undetermined: double.IsNaN(acc));
+
+        // Points, and not one of them finite: there is no value to compare, and 0 — the answer for
+        // an empty window — would decide the rule on data that says nothing. NaN tells the caller
+        // to leave the rule's state as it is (see EvaluateAllAsync).
+        if (double.IsNaN(acc)) return skipped > 0 ? double.NaN : 0;
+        return acc;
     }
+
+    /// <summary>
+    /// Says ONCE per rule — per kind: some points skipped, or no value at all — that a metric rule
+    /// met non-finite values. Once, because an exporter that sends NaN sends it every interval, and a
+    /// line every 15 s for the life of the rule would bury the log; the operator needs to learn it
+    /// happens, and which rule it touches.
+    ///
+    /// <para>Evaluations only, never the editor's preview: a preview of an UNSAVED rule gets a fresh
+    /// random id on every click, so each one used to add a permanent entry here, and a preview of a
+    /// saved rule spent that rule's only warning on something that decided nothing — and logged "the
+    /// rule was not evaluated and keeps its state" for it. Entries of deleted rules are dropped each
+    /// tick (<see cref="ForgetDeletedRules"/>), and the set is bounded besides, as
+    /// <see cref="_headerShapes"/> is: past <see cref="MaxNonFiniteWarned"/> it is cleared wholesale
+    /// (a rule may then say it once more).</para>
+    /// </summary>
+    private void WarnNonFinite(AlertRule rule, int skipped, bool undetermined)
+    {
+        if (_nonFiniteWarned.Count >= MaxNonFiniteWarned) _nonFiniteWarned.Clear();
+        if (!_nonFiniteWarned.TryAdd((rule.Id, undetermined), 0)) return;
+        if (undetermined)
+            _logger.LogWarning(
+                "Alert rule {Rule}: every point of metric {Metric} in the window is NaN or infinite ({Skipped} point(s)), "
+              + "so the rule was not evaluated and keeps its state. Said once per rule",
+                rule.Id, rule.Metric, skipped);
+        else
+            _logger.LogWarning(
+                "Alert rule {Rule}: skipped {Skipped} NaN or infinite point(s) of metric {Metric}; the rule is evaluated "
+              + "on the finite ones. Said once per rule",
+                rule.Id, skipped, rule.Metric);
+    }
+
+    private readonly ConcurrentDictionary<(string RuleId, bool Undetermined), byte> _nonFiniteWarned = new();
+    private const int MaxNonFiniteWarned = 512;
 
     private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
@@ -680,4 +903,32 @@ public sealed class AlertEvaluator : IAsyncDisposable
         public DateTimeOffset? FiringSince;
         public bool            Escalated;
     }
+}
+
+/// <summary>
+/// A rule's condition value, or the statement that the store behind it could not give one (#95).
+///
+/// <para>An explicit result rather than an exception: a closed store is not an error in the rule,
+/// and the evaluator meets it on every tick for as long as the store stays down — a throw per rule
+/// per tick is a cost and a log line nobody needs.</para>
+///
+/// <para><see cref="Value"/> is NaN when <see cref="IsAvailable"/> is false, so it can never pass
+/// for a measured 0 in a log line or a preview. It is NOT a safe value to act on: NaN compares
+/// false against every threshold, and the state machine reads "not breached" as a resolve. A caller
+/// asks <see cref="IsAvailable"/>.</para>
+///
+/// <para><b>NaN also means "available, but no finite point"</b> (#92): a metric window whose every
+/// point is NaN or infinite answers <c>Of(NaN)</c> — the store answered truly, and the answer holds
+/// no value. So NaN is NEVER the availability test: a caller asks <see cref="IsAvailable"/> first
+/// (a store that cannot say: skip, #95), then <c>double.IsNaN(Value)</c> (no value to compare:
+/// skip, #92), and acts on <see cref="Value"/> only after both.</para>
+/// </summary>
+public readonly record struct AlertValue(double Value, QueryAvailability Availability)
+{
+    /// <summary>True when <see cref="Value"/> is the store's whole, true answer.</summary>
+    public bool IsAvailable => Availability == QueryAvailability.Available;
+
+    internal static AlertValue Of(double value) => new(value, QueryAvailability.Available);
+
+    internal static AlertValue Unavailable(QueryAvailability why) => new(double.NaN, why);
 }

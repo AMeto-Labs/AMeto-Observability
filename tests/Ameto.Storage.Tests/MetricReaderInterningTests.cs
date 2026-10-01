@@ -130,6 +130,39 @@ public sealed class MetricReaderInterningTests : IDisposable
         Assert.Same(string.Empty, first.Unit);
     }
 
+    /// <summary>
+    /// ONE LENGTH RULE, IN UTF-8 BYTES, ON EVERY PATH (#94). The JSON mapper interns strings, and
+    /// that path counted CHARS, while a cold read and the protobuf parser count BYTES: a Cyrillic
+    /// value of 100 chars (200 bytes) was pooled through JSON and then never found by a cold read —
+    /// a pool slot no lookup could match. Now the string path measures the bytes the string encodes
+    /// to: the 100-char value is pooled by no path, and a 64-char one (128 bytes, the limit) by every
+    /// path, where the cold read hands back the very instance the JSON path pooled.
+    /// </summary>
+    [Fact]
+    public void The_JSON_path_and_a_cold_read_measure_a_label_by_the_same_bytes()
+    {
+        var interner = new MetricLabelInterner(1_024, 64);
+        string fits = new('Ж', 64);            // 128 UTF-8 bytes: the longest Cyrillic value the pool takes
+        string over = new('Ж', 100);           // 200 bytes, 100 chars: the char count used to take it
+
+        Assert.True(interner.Intern(fits, out string pooled) >= 0);        // what the JSON mapper calls
+        Assert.Equal(-1, interner.Intern(over, out string kept));
+        Assert.Same(over, kept);
+        int claimed = interner.Strings.ClaimedCount;
+
+        // The protobuf parser decides the same, from the bytes on the wire.
+        Assert.Equal(-1, interner.Intern(System.Text.Encoding.UTF8.GetBytes(over), out _));
+        Assert.True(interner.Intern(System.Text.Encoding.UTF8.GetBytes(fits), out string viaBytes) >= 0);
+        Assert.Same(pooled, viaBytes);
+
+        // And a cold read: the pooled value comes back as the JSON path's instance, the other by value.
+        string file = WriteOne(new LabelSet([new("fits", Copy(fits)), new("over", Copy(over))]), "");
+        var got = Assert.Single(MetricReader.ReadAllSync(file, interner));
+        Assert.Same(pooled, got.Labels.ValueAt(0));                           // "fits" < "over"
+        Assert.Equal(over, got.Labels.ValueAt(1));
+        Assert.Equal(claimed, interner.Strings.ClaimedCount);
+    }
+
     [Fact]
     public void A_label_set_too_large_to_intern_is_decoded_whole()
     {

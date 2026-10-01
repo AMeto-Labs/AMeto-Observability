@@ -1,10 +1,11 @@
 export type MetricKind = 'Counter' | 'Gauge' | 'Histogram';
 
+/** `value` and `sum` are null where the server has no finite number for them (NaN or ±Infinity). */
 export interface MetricPointDto {
   ts:    number;
-  value: number;
+  value: number | null;
   count: number;
-  sum:   number;
+  sum:   number | null;
 }
 
 export interface MetricSeriesDto {
@@ -59,7 +60,7 @@ export interface HeatmapColumnDto {
 }
 
 export interface HeatmapDto {
-  bounds:  number[];           // bucket upper bounds
+  bounds:  (number | null)[];  // bucket upper bounds; null for one the server cannot represent
   unit:    string;
   columns: HeatmapColumnDto[];
 }
@@ -67,7 +68,7 @@ export interface HeatmapDto {
 /** An exemplar: a sampled measurement linked to the trace that produced it. */
 export interface ExemplarDto {
   ts:      number;             // unix nanos
-  value:   number;
+  value:   number | null;      // null for NaN / ±Infinity
   traceId: string;
   spanId:  string;
   labels:  Record<string, string>;

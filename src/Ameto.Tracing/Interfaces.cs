@@ -101,7 +101,7 @@ public sealed class SpanIngestItem
 /// Returns a service dependency graph for a time window.
 /// Built from .svcgraph sidecar files — no span deserialisation.
 /// </summary>
-public interface IServiceGraphProvider
+public interface IServiceGraphProvider : Ameto.Core.IQueryAvailability
 {
     Task<ServiceGraphDto> GetServiceGraphAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
@@ -137,7 +137,7 @@ public sealed class ServiceGraphDto
 /// <summary>
 /// Returns pre-aggregated per-service stats (from .stats sidecar files — no span scan).
 /// </summary>
-public interface ITraceStatsProvider
+public interface ITraceStatsProvider : Ameto.Core.IQueryAvailability
 {
     /// <summary>
     /// Merges per-service histograms for all segments in [from, to].
@@ -151,7 +151,7 @@ public interface ITraceStatsProvider
 /// Pre-aggregated trace-level views built from <c>.tracesum</c> sidecars — the list rows
 /// and the volume sparkline are served without deserialising any spans.
 /// </summary>
-public interface ITraceSummaryProvider
+public interface ITraceSummaryProvider : Ameto.Core.IQueryAvailability
 {
     /// <summary>
     /// Newest-first, filtered trace summaries for the list view. Merges the hot tier with
@@ -366,15 +366,16 @@ public sealed class TraceVolume
 /// <summary>
 /// A necessary attribute condition extracted from a TraceQL AND-chain, used to
 /// skip storage blocks via their attribute blooms. <see cref="LowerValue"/> is the
-/// lowercased string value for equality predicates, or null for key-presence-only
-/// (any other operator still requires the key to exist on the span).
+/// lowercased (<c>ToLowerInvariant</c>) string value for equality predicates, or null for
+/// key-presence-only (any other operator still requires the key to exist on the span). The bloom
+/// probe folds it further — see <c>SpanBloom</c>.
 /// </summary>
 public readonly record struct AttrHint(string Key, string? LowerValue);
 
 /// <summary>
 /// Provides access to stored trace/span data.
 /// </summary>
-public interface ITraceProvider
+public interface ITraceProvider : Ameto.Core.IQueryAvailability
 {
     /// <summary>
     /// Returns all spans belonging to the given trace, ordered by StartTimeUnixNano.

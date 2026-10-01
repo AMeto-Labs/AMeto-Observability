@@ -115,21 +115,143 @@ public sealed class TraceQLThreeValuedTests
         Assert.Null(Eval("{ !(.region = \"eu\") }",  span));
     }
 
+    // ── Present but incomparable: unknown as well — issue #76 ──────────────────
+
     /// <summary>
-    /// PRESENT BUT INCOMPARABLE IS STILL TWO-VALUED, and this test exists so that stays a decision
-    /// rather than an oversight. A span that HAS the attribute is not a span that cannot answer, so
-    /// a type mismatch keeps returning false — which does leave a narrower version of the same
-    /// asymmetry standing, visible in the second pair below. Changing it is a separate semantic
-    /// question from the one #74 asked; if it is ever changed, this test is where it announces
-    /// itself.
+    /// THE QUESTION #76 ASKED, ANSWERED. <c>{ .tenant &gt; 5 }</c> against a tenant that is text is a
+    /// question that does not apply to the span, and it now answers the way an absent tenant does:
+    /// unknown, so neither the comparison nor its negation selects the span. Before #76 the first
+    /// was false and the second TRUE — "every span whose tenant is not above five" returned every
+    /// span whose tenant was a name.
+    ///
+    /// <para>Revert <c>return null</c> to <c>return false</c> in <c>AttributePredicate.CompareAttr</c>
+    /// and the negation answers true here again.</para>
     /// </summary>
     [Fact]
-    public void A_type_mismatch_is_still_two_valued()
+    public void A_type_mismatch_answers_neither_the_comparison_nor_its_negation()
     {
         var span = WithTenant("bananas");
 
-        Assert.False(Eval("{ .tenant > 5 }",    span));
-        Assert.True (Eval("{ !(.tenant > 5) }", span));   // the residual asymmetry, pinned
+        bool? cmp = UnderCulture("ru-KZ", () => Eval("{ .tenant > 5 }",    span));
+        bool? neg = UnderCulture("ru-KZ", () => Eval("{ !(.tenant > 5) }", span));
+
+        _out.WriteLine($"{{ .tenant > 5 }} → {cmp?.ToString() ?? "unknown"}, "
+                     + $"{{ !(.tenant > 5) }} → {neg?.ToString() ?? "unknown"}");
+        Assert.Null(cmp);
+        Assert.Null(neg);
+    }
+
+    /// <summary>
+    /// EVERY OPERATOR AGAINST EVERY VALUE THAT CANNOT BE PLACED ON A NUMBER LINE, from the blob (what
+    /// storage hands out) and from the dictionary (what a fixture or a legacy caller gets) — the two
+    /// paths are separate code and each had its own <c>return false</c>. A text that does not parse,
+    /// a boolean, a double that IS NaN, and a duration literal against text; for each, the
+    /// comparison and its negation are both unknown.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IncomparablePairs))]
+    public void Every_operator_against_an_incomparable_value_is_unknown(string op, string shape, string literal)
+    {
+        foreach (bool dictionary in (bool[])[false, true])
+        {
+            var span = SpanWithShape(shape, dictionary);
+            bool? cmp = UnderCulture("en-US", () => Eval($"{{ .x {op} {literal} }}",    span));
+            bool? neg = UnderCulture("en-US", () => Eval($"{{ !(.x {op} {literal}) }}", span));
+
+            Assert.True(cmp is null, $"{{ .x {op} {literal} }} over {shape} ({(dictionary ? "dict" : "blob")}) answered {cmp}");
+            Assert.True(neg is null, $"{{ !(.x {op} {literal}) }} over {shape} ({(dictionary ? "dict" : "blob")}) answered {neg}");
+        }
+    }
+
+    /// <summary>
+    /// The control that keeps the theory above from passing vacuously: the SAME operators against
+    /// values that CAN be compared — an integer, a double, a numeric text, and a number met by a
+    /// string query (which compares the number's text and is therefore not a mismatch) — always
+    /// answer. Break the parse or the numeric switch and these go unknown.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ComparablePairs))]
+    public void Every_operator_against_a_comparable_value_answers(string op, string shape, string literal)
+    {
+        foreach (bool dictionary in (bool[])[false, true])
+        {
+            var span = SpanWithShape(shape, dictionary);
+            bool? cmp = UnderCulture("en-US", () => Eval($"{{ .x {op} {literal} }}",    span));
+            bool? neg = UnderCulture("en-US", () => Eval($"{{ !(.x {op} {literal}) }}", span));
+
+            Assert.True(cmp is not null, $"{{ .x {op} {literal} }} over {shape} ({(dictionary ? "dict" : "blob")}) did not answer");
+            Assert.Equal(!cmp, neg);
+        }
+    }
+
+    private static readonly string[] Operators = ["=", "!=", "<", "<=", ">", ">="];
+
+    public static TheoryData<string, string, string> IncomparablePairs()
+    {
+        var data = new TheoryData<string, string, string>();
+        foreach (var op in Operators)
+        {
+            data.Add(op, "text",    "5");
+            data.Add(op, "boolean", "5");
+            data.Add(op, "nan",     "5");
+            data.Add(op, "text",    "1s");   // a duration is a number of nanoseconds
+        }
+        return data;
+    }
+
+    public static TheoryData<string, string, string> ComparablePairs()
+    {
+        var data = new TheoryData<string, string, string>();
+        foreach (var op in Operators)
+        {
+            data.Add(op, "integer",      "5");
+            data.Add(op, "double",       "5");
+            data.Add(op, "numeric-text", "5");
+            data.Add(op, "integer",      "\"7\"");   // a number met by a string query compares its text
+            data.Add(op, "boolean",      "\"true\"");
+        }
+        return data;
+    }
+
+    /// <summary>A span whose only attribute <c>.x</c> has the named shape, as a blob or as its decode.</summary>
+    private static SpanRecord SpanWithShape(string shape, bool dictionary)
+    {
+        var buf = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var w   = new MessagePack.MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write("x");
+        switch (shape)
+        {
+            case "text":         w.Write("bananas");  break;
+            case "boolean":      w.Write(true);       break;
+            case "nan":          w.Write(double.NaN); break;
+            case "integer":      w.Write(7L);         break;
+            case "double":       w.Write(7.5);        break;
+            case "numeric-text": w.Write("7");        break;
+            default: throw new ArgumentOutOfRangeException(nameof(shape), shape, null);
+        }
+        w.Flush();
+        byte[] blob = buf.WrittenSpan.ToArray();
+
+        return dictionary
+            ? new SpanRecord
+            {
+                TraceId = new TraceId(1, 2), SpanId = new SpanId(3), Name = "op", ServiceName = "svc",
+                Attributes = Ameto.Tracing.SpanAttributeBlob.Decode(blob),
+            }
+            : new SpanRecord
+            {
+                TraceId = new TraceId(1, 2), SpanId = new SpanId(3), Name = "op", ServiceName = "svc",
+                AttributesBytes = blob,
+            };
+    }
+
+    private static T UnderCulture<T>(string culture, Func<T> body)
+    {
+        var saved = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo(culture);
+        try { return body(); }
+        finally { System.Globalization.CultureInfo.CurrentCulture = saved; }
     }
 
     // ── Presence, the question three-valued logic makes necessary ─────────────

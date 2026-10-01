@@ -76,14 +76,22 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
 }
 
 /// <summary>
-/// Factory that creates <see cref="SegmentIndexReader"/> instances from raw bytes.
-/// Registered as a singleton so the query layer can inject it.
+/// How the query layer gets at a group's index. Registered as a singleton so it can be injected.
 /// </summary>
 public sealed class SegmentIndexReaderFactory
 {
+    /// <summary>A self-contained reader over copies of one group's sections.</summary>
     public SegmentIndexReader Create(
         ReadOnlySpan<byte> invertedBytes,
         ReadOnlySpan<byte> trigramBytes,
         ReadOnlySpan<byte> bloomBytes)
         => SegmentIndexReader.Load(invertedBytes, trigramBytes, bloomBytes);
+
+    /// <summary>
+    /// One query's view of one group: the cached memo when <paramref name="cache"/> is enabled,
+    /// answering through <paramref name="segment"/>, which the query keeps open. See
+    /// <see cref="SegmentIndexView"/>.
+    /// </summary>
+    public SegmentIndexView OpenGroup(SegmentIndexCache? cache, string path, int group, SegmentReader segment)
+        => SegmentIndexView.Open(cache, path, group, segment);
 }

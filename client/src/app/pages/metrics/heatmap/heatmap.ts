@@ -81,16 +81,6 @@ export class HeatmapComponent implements OnDestroy {
     const xMin = cols[0].ts;
     const xMax = cols[cols.length - 1].ts;
 
-    const boundLabel = (bi: number): string => {
-      if (bi <= 0) return '0';
-      if (bi > d.bounds.length) return '∞';
-      return fmtNum((d.bounds[bi - 1] ?? 0) * scale);
-    };
-    const bucketRange = (bi: number): string => {
-      const lo = bi === 0 ? 0 : d.bounds[bi - 1] * scale;
-      const hi = bi < d.bounds.length ? d.bounds[bi] * scale : Infinity;
-      return hi === Infinity ? `> ${fmtNum(lo)}` : `${fmtNum(lo)}–${fmtNum(hi)}`;
-    };
 
     const ChartCtor = await loadChart();
     if (seq !== this.renderSeq) return; // superseded by a newer render while loading
@@ -118,8 +108,9 @@ export class HeatmapComponent implements OnDestroy {
           const raw = (this.chart!.data.datasets[0].data as any[])[els[0].index];
           if (!raw) return;
           const bi = raw.y as number;
-          const lo = bi === 0 ? 0 : d.bounds[bi - 1] * scale;
-          const hi = bi < d.bounds.length ? d.bounds[bi] * scale : Number.POSITIVE_INFINITY;
+          // A null bound (#92, see boundLabel): no lower limit / no upper limit on the trace search.
+          const lo = bi === 0 ? 0 : (d.bounds[bi - 1] ?? 0) * scale;
+          const hi = bi < d.bounds.length ? (d.bounds[bi] ?? Number.POSITIVE_INFINITY) * scale : Number.POSITIVE_INFINITY;
           this.cellClick.emit({ tsMs: raw.x as number, loMs: lo, hiMs: hi, count: raw.v as number });
         },
         scales: {
@@ -136,7 +127,7 @@ export class HeatmapComponent implements OnDestroy {
             min: -0.5, max: nBuckets - 0.5,
             offset: false,
             ticks: { color: '#64748b', font: { size: 9 }, stepSize: 1,
-                     callback: (v: any) => boundLabel(Math.round(Number(v))) },
+                     callback: (v: any) => boundLabel(d.bounds, Math.round(Number(v)), scale) },
             grid: { display: false }, border: { display: false },
           },
         },
@@ -147,7 +138,7 @@ export class HeatmapComponent implements OnDestroy {
             titleColor: '#e2e8f0', bodyColor: '#94a3b8', padding: 8,
             callbacks: {
               title: (items: any) => format(new Date(Number(items[0].raw.x)), 'HH:mm:ss'),
-              label: (item: any) => `${bucketRange(item.raw.y)}: ${item.raw.v}`,
+              label: (item: any) => `${bucketRange(d.bounds, item.raw.y, scale)}: ${item.raw.v}`,
             },
           },
         },
@@ -158,6 +149,28 @@ export class HeatmapComponent implements OnDestroy {
     // transition; force a resize once layout settles so Chart.js re-measures (avoids a 0×0 canvas).
     requestAnimationFrame(() => this.chart?.resize());
   }
+}
+
+/**
+ * The y-axis label of bucket `bi`: its lower bound, scaled. The server answers a bound it cannot
+ * represent (NaN, an exporter's explicit ±Infinity) as `null` (#92); `?? 0` labelled it "0", a real
+ * bound it is not — it is marked "—".
+ */
+export function boundLabel(bounds: readonly (number | null)[], bi: number, scale: number): string {
+  if (bi <= 0) return '0';
+  if (bi > bounds.length) return '∞';
+  const lower = bounds[bi - 1];
+  return lower == null ? '—' : fmtNum(lower * scale);
+}
+
+/** The tooltip range of bucket `bi`, scaled; "—" when either end is a null bound (see boundLabel). */
+export function bucketRange(bounds: readonly (number | null)[], bi: number, scale: number): string {
+  const lower = bi === 0 ? 0 : bounds[bi - 1];
+  const upper = bi < bounds.length ? bounds[bi] : Infinity;
+  if (lower == null || upper == null) return '—';
+  const lo = lower * scale;
+  const hi = upper === Infinity ? Infinity : upper * scale;
+  return hi === Infinity ? `> ${fmtNum(lo)}` : `${fmtNum(lo)}–${fmtNum(hi)}`;
 }
 
 function fmtNum(v: number): string {

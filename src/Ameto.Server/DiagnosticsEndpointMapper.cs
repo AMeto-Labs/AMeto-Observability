@@ -157,6 +157,10 @@ public static class DiagnosticsEndpointMapper
                 // cache capped this way looks healthy in every other figure — it simply sits
                 // below its budget and misses — so without this there is nothing to read.
                 indexCacheNativeEvicted     = indexCache.NativeEvictedCount,
+                // Entries replaced because their path now held different bytes — a segment file
+                // replaced under its own name (a re-imported replica). Rare by construction; a
+                // count that climbs is worth finding the cause of.
+                indexCacheStaleReplaced     = indexCache.StaleReplacedCount,
 
                 // Storage
                 segmentCount         = segs.Count,
@@ -250,6 +254,14 @@ public static class DiagnosticsEndpointMapper
                 // Exemplars dropped because MaxExemplarMetrics names already own a ring. A hint,
                 // never data — this counter is the only place the refusal shows.
                 metricsExemplarMetricsRefused   = metrics?.ExemplarMetricsRefused,
+                // The metric label intern pool (#88): its fill, its cap, how many of its epochs
+                // filled up and how many times it was reset. A full pool drops nothing — each new
+                // label then costs its own string until the next reset (at most one an hour) — so
+                // resets climbing hour after hour say the LIVE label set outgrows the pool.
+                metricsLabelPoolStrings         = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Strings.ClaimedCount,
+                metricsLabelPoolMaxStrings      = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Strings.MaxPoolSize,
+                metricsLabelPoolSaturations     = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Saturations,
+                metricsLabelPoolResets          = metrics is null ? (int?)null : Ameto.Metrics.MetricLabelInterner.Shared.Resets,
 
                 // ── Traces: the EFFECTIVE budgets, and the ring's back-pressure ─
                 // Refusals by cause, because they are different problems: RefusedForBytes is a

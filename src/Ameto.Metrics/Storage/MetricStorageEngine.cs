@@ -98,7 +98,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// the nanosecond, and two hand-expanded copies of the formula were one edited unit away
     /// from quietly disagreeing.
     /// </summary>
-    private static long FutureLimitNanos()
+    internal static long FutureLimitNanos()
         => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
@@ -467,6 +467,36 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
     /// <summary>Completes once the background cold-segment scan has published its result.</summary>
     internal Task ColdLoadCompleted => _coldLoaded.Task;
+
+    /// <summary>
+    /// Whether a query issued now gets a TRUE answer (#95) — for a caller that ACTS on the answer
+    /// (the alert evaluator, through <see cref="MetricAggregator"/>) and so must not take the empty
+    /// answer of a closed tier, or the hot-only answer of one not yet scanned, for a measurement.
+    ///
+    /// <para><see cref="QueryAvailability.Closed"/> from the <see cref="_coldClosed"/> fence, the
+    /// instant from which <see cref="TryEnterColdRead"/> answers "no cold segments". Not earlier:
+    /// until then the teardown's final flush has moved the hot tier to cold and every query is
+    /// still whole. After it, a query sees at most the points that arrived after that flush.</para>
+    ///
+    /// <para><see cref="QueryAvailability.Loading"/> until the background cold scan has ended — the
+    /// window this engine already documents on <see cref="_coldLoaded"/>. The scan publishes its
+    /// segments before it completes that, so Available is never seen ahead of them; a scan that
+    /// FAILS ends the window too, as it always has for <see cref="ColdLoadCompleted"/>.</para>
+    ///
+    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// </summary>
+    public QueryAvailability Availability =>
+        Volatile.Read(ref _coldClosed) != 0 ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted      ? QueryAvailability.Loading
+      :                                      QueryAvailability.Available;
+
+    /// <summary>
+    /// Test seam: an engine constructed while this holds a task starts its cold scan only once that
+    /// task completes — the only way to hold <see cref="QueryAvailability.Loading"/> open. An
+    /// <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into the flush
+    /// loop, so it reaches only the engines the setting test constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Task?> HoldColdLoadForTest = new();
 
     private readonly string                        _dataDir;
     private readonly ILogger<MetricStorageEngine>  _logger;
@@ -1144,6 +1174,9 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
 
+    /// <summary>Test hook: one rollup pass, now — what the rollup loop runs on its timer.</summary>
+    internal Task PerformRollupForTest() => PerformRollupAsync(CancellationToken.None);
+
     /// <summary>
     /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
     /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
@@ -1306,8 +1339,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         meta.Kind = item.Kind;
         if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
-        foreach (var (k, v) in item.Labels)
+        ReadOnlySpan<string> kv = item.Labels.Interleaved;
+        for (int i = 0; i < kv.Length; i += 2)
         {
+            if (!IsLastOfItsRun(kv, i)) continue;
+            string k = kv[i], v = kv[i + 1];
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
             // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
             // table, and the cap only needs checking for a value that is actually new.
@@ -1319,6 +1355,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         Interlocked.Increment(ref _metaRegistrations);
         return meta;
     }
+
+    /// <summary>
+    /// Whether pair <paramref name="i"/> of canonically sorted pairs is the one the catalog records
+    /// for its key: always, unless the key repeats — a set stored before ingest collapsed repeated
+    /// keys (#92) — and then only the LAST of its run, the ordinal-greatest value, which is the value
+    /// the answers write and a filter matches (<see cref="MetricReader.MatchesLabels"/>). Recording
+    /// the others offered, in <c>/labels/{key}/values</c>, a value no filter ever selects.
+    /// </summary>
+    private static bool IsLastOfItsRun(ReadOnlySpan<string> kv, int i) =>
+        i + 2 >= kv.Length || !string.Equals(kv[i], kv[i + 2]);
 
     // ── IMetricCatalog ────────────────────────────────────────────────────────
 
@@ -1606,6 +1652,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     {
         var ct = _cts.Token;
 
+        // Test seam (#95): hold the cold scan, so a test can see this engine Loading. Null in production.
+        if (HoldColdLoadForTest.Value is { } hold)
+        {
+            try { await hold.WaitAsync(ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* disposed while held: load and go on to the final flush */ }
+        }
+
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
         catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
@@ -1625,6 +1678,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             // logs its own failures; this is only here so that the loop outlives them.
             try { await FlushIfDueAsync(); }
             catch (Exception ex) { _logger.LogError(ex, "Periodic metric flush failed; the loop continues"); }
+
+            // The label pool's reset bridge ends on its interval even when churn has stopped and no
+            // new label arrives to end it (see MetricLabelInterner.EndBridgeIfDue): a volatile read
+            // per tick while there is no bridge.
+            MetricLabelInterner.Shared.EndBridgeIfDue();
         }
         // Final flush on shutdown — unconditional, so a clean stop leaves nothing to replay.
         try { await FlushHotTierAsync(); }
@@ -2787,15 +2845,33 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         }
     }
 
-    /// <summary>One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.</summary>
+    /// <summary>
+    /// One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.
+    ///
+    /// <para><b>A NaN or ±Infinity value is no measurement here either</b> (#92), as in every reducer
+    /// of <c>MetricAggregator</c>: a gauge averages its FINITE values, and a counter or a histogram
+    /// takes its latest point with a finite value (a cumulative snapshot, so an earlier one of the
+    /// same bucket loses nothing — the next step's delta carries the rest). A bucket with no finite
+    /// value answers NaN — null on the wire, a gap — as its latest point did. Folded in, one NaN made
+    /// the gauge's whole bucket NaN and a counter bucket ending on one NaN, in every stepped read
+    /// (the Metrics page always sends a step: one bad sample blanked ~7 minutes of a 24-hour chart)
+    /// and in the 5-minute and 1-hour rollups — which then delete the raw file, so the bucket's
+    /// finite samples were gone for good. On finite buckets every value is what it was, to the bit.</para>
+    /// </summary>
     private static MetricDataPoint Reduce(ReadOnlySpan<MetricDataPoint> bucket, long key, bool takeLast)
     {
         if (takeLast)
         {
-            int best = 0;
-            for (int i = 1; i < bucket.Length; i++)
-                if (bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano) best = i;
-            ref readonly var last = ref bucket[best];
+            // The latest point with a finite value (the later of equal timestamps, as before); the
+            // latest point outright when none has one.
+            int best = -1, latest = 0;
+            for (int i = 0; i < bucket.Length; i++)
+            {
+                if (i > 0 && bucket[i].TimestampUnixNano >= bucket[latest].TimestampUnixNano) latest = i;
+                if (double.IsFinite(bucket[i].Value)
+                    && (best < 0 || bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano)) best = i;
+            }
+            ref readonly var last = ref bucket[best >= 0 ? best : latest];
             return new MetricDataPoint
             {
                 TimestampUnixNano = key,
@@ -2806,19 +2882,21 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             };
         }
 
-        double value = bucket[0].Value;           // Average's seed: the first element
-        long   count = 0;                         // Sum's seed: zero
-        double sum   = 0.0;
+        double value  = double.NaN;               // Average's seed: the first FINITE element
+        int    finite = 0;
+        long   count  = 0;                        // Sum's seed: zero
+        double sum    = 0.0;
         for (int i = 0; i < bucket.Length; i++)
         {
-            if (i > 0) value += bucket[i].Value;
+            double v = bucket[i].Value;
+            if (double.IsFinite(v)) { value = finite == 0 ? v : value + v; finite++; }
             count = checked(count + bucket[i].Count);
             sum  += bucket[i].Sum;
         }
         return new MetricDataPoint
         {
             TimestampUnixNano = key,
-            Value             = value / bucket.Length,
+            Value             = finite == 0 ? double.NaN : value / finite,   // no finite value: NaN (null)
             Count             = count,
             Sum               = sum,
         };
@@ -2915,10 +2993,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
                     long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
                     if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
-                    foreach (var (k, v) in s.Labels)
+                    ReadOnlySpan<string> kv = s.Labels.Interleaved;
+                    for (int i = 0; i < kv.Length; i += 2)
                     {
-                        var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
+                        if (!IsLastOfItsRun(kv, i)) continue;   // a stored repeated key: see IsLastOfItsRun
+                        var values = meta.LabelValues.GetOrAdd(kv[i], static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(kv[i + 1], 0);
                     }
                     meta.AddSeries(s.Labels.GetHashCode());
                     seeded++;

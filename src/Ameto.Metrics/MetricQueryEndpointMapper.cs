@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using System.Globalization;
+using System.Text.Json.Serialization;
 using Ameto.Core;
 
 namespace Ameto.Metrics;
@@ -61,6 +62,7 @@ public static class MetricQueryEndpointMapper
                 return Results.BadRequest("'metric' is required");
 
             var series = await agg.QueryAsync(ToRequest(dto), ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             return MetricSeriesJson.Array(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
@@ -81,6 +83,7 @@ public static class MetricQueryEndpointMapper
                 Name  = dto.Name,
             };
             var series = await agg.EvalExprAsync(req, ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             return MetricSeriesJson.Single(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
@@ -93,6 +96,7 @@ public static class MetricQueryEndpointMapper
             var filters = ParseFilters(ctx.Request.Query["filters"]);
 
             var hm      = await agg.HeatmapAsync(name, from, to, step, filters, ctx.RequestAborted);
+            if (MetricStoreGate.IsClosed(agg)) return MetricStoreGate.Closed;
             var columns = new HeatmapColumnDto[hm.Columns.Length];
             for (int i = 0; i < columns.Length; i++)
                 columns[i] = new HeatmapColumnDto { Ts = hm.Columns[i].Ts, Counts = hm.Columns[i].Counts };
@@ -132,6 +136,7 @@ public static class MetricQueryEndpointMapper
             var from = ParseDate(ctx.Request.Query["from"]);
             var to   = ParseDate(ctx.Request.Query["to"]);
             var step = ParseStep(ctx.Request.Query["step"]);
+            if (MetricStoreGate.IsClosed(query)) return MetricStoreGate.Closed;   // streamed: asked before it starts
 
             // Each series is written as storage produces it; none is held once written. The answer
             // carries ts / value / count / sum only, so the storage need build no bucket arrays.
@@ -156,13 +161,16 @@ public static class MetricQueryEndpointMapper
 
     /// <summary>
     /// A label set as the DTO's dictionary, in the set's order — what <c>Pairs.ToDictionary</c>
-    /// built, without the pair view and the LINQ iterator. <see cref="Dictionary{TKey, TValue}.Add"/>
-    /// refuses a repeated or null key exactly as it did inside ToDictionary.
+    /// built, without the pair view and the LINQ iterator. A repeated key keeps the last value of its
+    /// run and a null key is skipped, as <see cref="MetricSeriesJson.WriteLabels"/> writes them: a set
+    /// stored before ingest collapsed repeated keys (#92) must not fail the answer — ToDictionary
+    /// threw on it, a 500 for every exemplar of the metric.
     /// </summary>
     private static Dictionary<string, string> LabelDictionary(LabelSet labels)
     {
         var dict = new Dictionary<string, string>(labels.Count);
-        for (int i = 0; i < labels.Count; i++) dict.Add(labels.KeyAt(i), labels.ValueAt(i));
+        for (int i = 0; i < labels.Count; i++)
+            if (labels.KeyAt(i) is { } key) dict[key] = labels.ValueAt(i);
         return dict;
     }
 
@@ -255,6 +263,8 @@ public sealed class MetricSeriesDto
 public sealed class ExemplarDto
 {
     public long                       Ts      { get; init; }
+    /// <summary><c>null</c> on the wire when NaN or ±Infinity (#92) — see <see cref="NonFiniteAsNullConverter"/>.</summary>
+    [JsonConverter(typeof(NonFiniteAsNullConverter))]
     public double                     Value   { get; init; }
     public string                     TraceId { get; init; } = string.Empty;
     public string                     SpanId  { get; init; } = string.Empty;
@@ -273,6 +283,8 @@ public sealed class MetricPointDto
 /// <summary>Histogram heatmap payload.</summary>
 public sealed class HeatmapDto
 {
+    /// <summary>A non-finite bound (an exporter's <c>+Inf</c>) is <c>null</c> on the wire (#92).</summary>
+    [JsonConverter(typeof(NonFiniteAsNullArrayConverter))]
     public double[]            Bounds  { get; init; } = [];
     public string              Unit    { get; init; } = string.Empty;
     public HeatmapColumnDto[]  Columns { get; init; } = [];
@@ -281,5 +293,7 @@ public sealed class HeatmapDto
 public sealed class HeatmapColumnDto
 {
     public long     Ts     { get; init; }
+    /// <summary>Deltas of integer counts, so finite; written like <see cref="HeatmapDto.Bounds"/> all the same.</summary>
+    [JsonConverter(typeof(NonFiniteAsNullArrayConverter))]
     public double[] Counts { get; init; } = [];
 }

@@ -175,6 +175,77 @@ public sealed class StringInternPool
         }
     }
 
+    /// <summary><c>carriedFrom</c> of <see cref="InternOrCarry(ReadOnlySpan{byte}, out string, StringInternPool, out int)"/>: the text was already here.</summary>
+    public const int FoundHere = -1;
+
+    /// <summary><c>carriedFrom</c> of <see cref="InternOrCarry(ReadOnlySpan{byte}, out string, StringInternPool, out int)"/>: the text was in neither pool.</summary>
+    public const int FoundNowhere = -2;
+
+    /// <summary>
+    /// <see cref="Intern(ReadOnlySpan{byte}, out string)"/> for a pool that REPLACED <paramref name="carryFrom"/>
+    /// (the metric label pool's reset): on a miss here, <paramref name="carryFrom"/>'s instance of the text —
+    /// when it holds one — is claimed instead of a new string, so a caller still holding that instance keeps
+    /// matching it by reference. <paramref name="carriedFrom"/> is the text's index in
+    /// <paramref name="carryFrom"/> when it was carried, else <see cref="FoundHere"/> or
+    /// <see cref="FoundNowhere"/>.
+    ///
+    /// <para>A copy of <see cref="Intern(ReadOnlySpan{byte}, out string)"/>'s body, not a layer over it: the
+    /// hit — the path every call takes but the first — must cost what that one costs, and that one is the
+    /// log ingest path's, which must not gain a parameter or a call to pay for this.</para>
+    /// </summary>
+    public int InternOrCarry(ReadOnlySpan<byte> utf8, out string canonical, StringInternPool carryFrom, out int carriedFrom)
+    {
+        carriedFrom = FoundHere;
+        if (utf8.IsEmpty) { canonical = string.Empty; return -1; }
+
+        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
+        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
+        Span<char> chars = rented ?? stackalloc char[charCount];
+        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        var key = chars[..charCount];
+        try
+        {
+            var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+            if (lookup.TryGetValue(key, out string? existing, out int idx))
+            {
+                canonical = existing;
+                return idx;
+            }
+
+            if (carryFrom.TryGet(key, out string? carried, out int oldIdx))
+            {
+                carriedFrom = oldIdx;
+                return Claim(carried, out canonical);
+            }
+            carriedFrom = FoundNowhere;
+            return Claim(new string(key), out canonical);
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>The string overload of <see cref="InternOrCarry(ReadOnlySpan{byte}, out string, StringInternPool, out int)"/>.</summary>
+    public int InternOrCarry(string template, out string canonical, StringInternPool carryFrom, out int carriedFrom)
+    {
+        carriedFrom = FoundHere;
+        var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(template.AsSpan(), out string? existing, out int idx))
+        {
+            canonical = existing;
+            return idx;
+        }
+
+        if (carryFrom.TryGet(template.AsSpan(), out string? carried, out int oldIdx))
+        {
+            carriedFrom = oldIdx;
+            return Claim(carried, out canonical);
+        }
+        carriedFrom = FoundNowhere;
+        return Claim(template, out canonical);
+    }
+
     /// <summary>
     /// String overload of <see cref="Intern(ReadOnlySpan{byte}, out string)"/>: interns
     /// <paramref name="template"/> and hands back the pool's own instance, so a caller that

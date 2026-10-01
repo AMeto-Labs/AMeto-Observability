@@ -39,6 +39,50 @@ internal partial class MetricJson : JsonSerializerContext
 }
 
 /// <summary>
+/// A double the way the serializer writes one — <see cref="Utf8JsonWriter.WriteNumberValue(double)"/>,
+/// the same bytes — except that NaN and ±Infinity, which JSON has no number for and the serializer
+/// throws on, are written as <c>null</c> (#92). On the response DTOs' doubles only (exemplar value,
+/// heatmap bounds and counts): one non-finite sample must not fail the whole answer. Reads accept a
+/// number, or <c>null</c> as NaN; nothing reads these DTOs.
+/// </summary>
+internal sealed class NonFiniteAsNullConverter : JsonConverter<double>
+{
+    public override double Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        reader.TokenType == JsonTokenType.Null ? double.NaN : reader.GetDouble();
+
+    public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options)
+    {
+        if (double.IsFinite(value)) writer.WriteNumberValue(value);
+        else                        writer.WriteNullValue();
+    }
+}
+
+/// <summary><see cref="NonFiniteAsNullConverter"/> for a <c>double[]</c>, element by element.</summary>
+internal sealed class NonFiniteAsNullArrayConverter : JsonConverter<double[]>
+{
+    public override double[]? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null) return null;
+        if (reader.TokenType != JsonTokenType.StartArray) throw new JsonException("expected an array of numbers");
+        var values = new List<double>();
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            values.Add(reader.TokenType == JsonTokenType.Null ? double.NaN : reader.GetDouble());
+        return values.ToArray();
+    }
+
+    public override void Write(Utf8JsonWriter writer, double[] value, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray();
+        foreach (double d in value)
+        {
+            if (double.IsFinite(d)) writer.WriteNumberValue(d);
+            else                    writer.WriteNullValue();
+        }
+        writer.WriteEndArray();
+    }
+}
+
+/// <summary>
 /// The series answers — <c>GET /api/metrics/{name}</c>, <c>POST /api/metrics/query</c>,
 /// <c>POST /api/metrics/expr</c> — written straight from <see cref="MetricSeries"/> with a
 /// <see cref="Utf8JsonWriter"/> (issue #83 WP7, M#9).
@@ -53,25 +97,34 @@ internal partial class MetricJson : JsonSerializerContext
 /// set's order, keys written as-is (no naming policy touched dictionary keys); the kind as its enum
 /// name, or its number when it has none (<c>Enum.ToString</c>); numbers through the same writer
 /// calls the serializer makes, so 0.1, 1E+300, -0 and long.MaxValue read the same; the relaxed
-/// encoder, as <see cref="MetricJson"/>. And the same FAILURES: a non-finite value throws from the
-/// writer as it did from the serializer, and a label set with a repeated key throws as the
-/// <c>ToDictionary</c> that built the DTO did (<see cref="ArgumentException"/>; a null key,
-/// <see cref="ArgumentNullException"/>). <c>MetricResponseShapeTests</c> pins all of it.</para>
+/// encoder, as <see cref="MetricJson"/>. <c>MetricResponseShapeTests</c> pins all of it.</para>
+///
+/// <para><b>A NaN or an infinity is written as <c>null</c></b> (<c>value</c> and <c>sum</c>; <c>ts</c>
+/// and <c>count</c> are integers) — per point, so the rest of the series and every other series of
+/// the answer are written as ever (#92). JSON has no number for them, and the serializer used to
+/// throw: one exporter dividing by zero, an empty histogram's mean, a counter reset some SDKs
+/// report as NaN — and the whole answer was a 500, the whole panel empty, or, past the first flush
+/// of the streamed answer, a dropped connection. <c>null</c> rather than the string <c>"NaN"</c>:
+/// the Angular client reads these fields as numbers, and <c>null</c> is JSON's "no value" — the
+/// same answer the exemplar and heatmap DTOs give through <see cref="NonFiniteAsNullConverter"/>.
+/// A finite value's bytes are what they were.</para>
+///
+/// <para><b>A repeated label key is written once — the last of its run, which is its ordinal-greatest
+/// value — and never fails the answer</b> (#92). It used to throw, as the <c>ToDictionary</c> that
+/// built the DTO did: one such series failed a whole panel with a 500, or — past the first flush of
+/// the streamed raw answer — dropped the connection. Ingest no longer produces such a set (the OTLP
+/// label builder lets the last value SENT win), so what is left is a set stored before that fix, or
+/// one a caller built by hand; neither may take the answer down with it. The pairs are sorted by
+/// key, then value, so the value written is the one a browser's <c>JSON.parse</c> would have kept
+/// had the key gone out twice — the greatest, not the last sent, whose order was never stored (a
+/// point <c>service.name=api</c> under a resource <c>service.name=gateway</c> is answered as
+/// <c>gateway</c>). A null key (no reader produces one) is skipped for the same reason.</para>
 ///
 /// <para><b>When bytes leave.</b> Output collects in the response pipe and is flushed to the network
 /// once more than <see cref="FlushThresholdBytes"/> have accumulated — the serializer's own habit —
-/// so an answer that fails before then fails as a clean 500 with nothing sent, exactly as before.
-/// A failure after a flush aborts the response mid-body, which is what a non-finite value past the
-/// serializer's flush threshold always did; what is new is only that a series is written before
-/// the next one is read.</para>
-///
-/// <para><b>A label set that cannot be written fails before any of the series is written.</b> The
-/// old endpoints built every DTO before the first byte, so a repeated label key failed the request
-/// as a clean 500 however large the answer. The list answers keep exactly that: they are checked
-/// whole before the first byte. The streamed raw answer cannot check a series storage has not
-/// produced yet: it checks each one before that series' first byte, which is still a clean 500
-/// while nothing has been flushed, and aborts the response after — the cost of not holding the
-/// whole answer, and the same abort a non-finite value past a flush always caused.</para>
+/// so an answer that fails before then (storage throwing, say) fails as a clean 500 with nothing
+/// sent, exactly as before. A failure after a flush aborts the response mid-body; no series can
+/// cause one any more — only the storage behind it.</para>
 /// </summary>
 internal static class MetricSeriesJson
 {
@@ -108,7 +161,6 @@ internal static class MetricSeriesJson
     /// <summary>One series, as the DTO serialized it.</summary>
     public static void Write(Utf8JsonWriter w, MetricSeries s)
     {
-        ThrowIfUnwritable(s);                  // before the series' first byte, never part-way through it
         w.WriteStartObject();
         w.WriteString(NameProp, s.Name);
         w.WriteString(KindProp, KindName(s.Kind));
@@ -116,8 +168,7 @@ internal static class MetricSeriesJson
 
         w.WritePropertyName(LabelsProp);
         w.WriteStartObject();
-        ReadOnlySpan<string> kv = s.Labels.Interleaved;
-        for (int i = 0; i < kv.Length; i += 2) w.WriteString(kv[i], kv[i + 1]);
+        WriteLabels(w, s.Labels.Interleaved);
         w.WriteEndObject();
 
         w.WritePropertyName(PointsProp);
@@ -126,13 +177,11 @@ internal static class MetricSeriesJson
         for (int i = 0; i < points.Count; i++)
         {
             var p = points[i];
-            ThrowIfNotFinite(p.Value);
-            ThrowIfNotFinite(p.Sum);
             w.WriteStartObject();
-            w.WriteNumber(TsProp,    p.TimestampUnixNano);
-            w.WriteNumber(ValueProp, p.Value);
+            w.WriteNumber(TsProp, p.TimestampUnixNano);
+            WriteNumberOrNull(w, ValueProp, p.Value);
             w.WriteNumber(CountProp, p.Count);
-            w.WriteNumber(SumProp,   p.Sum);
+            WriteNumberOrNull(w, SumProp, p.Sum);
             w.WriteEndObject();
         }
         w.WriteEndArray();
@@ -140,36 +189,33 @@ internal static class MetricSeriesJson
     }
 
     /// <summary>
-    /// What <c>ToDictionary</c> refused when the old endpoints built a series' DTO: a null label key
-    /// (<see cref="ArgumentNullException"/>) and a repeated one (<see cref="ArgumentException"/>) —
-    /// the pairs are sorted by key, so a repeat is adjacent. Checked BEFORE anything of the series
-    /// is written: the old endpoints built every DTO before the first byte, so a label set they
-    /// could not serialize failed the request as a clean 500. A non-finite number is NOT checked
-    /// here — the serializer met that while writing, and <see cref="ThrowIfNotFinite"/> keeps it
-    /// where it was.
+    /// A finite double as the number the serializer wrote; NaN or ±Infinity — which JSON has no
+    /// number for, and which the writer refuses with an exception — as <c>null</c>. See the class
+    /// remarks.
     /// </summary>
-    internal static void ThrowIfUnwritable(MetricSeries s)
+    private static void WriteNumberOrNull(Utf8JsonWriter w, JsonEncodedText property, double value)
     {
-        ReadOnlySpan<string> kv = s.Labels.Interleaved;
-        for (int i = 0; i < kv.Length; i += 2)
-        {
-            if (kv[i] is null) throw new ArgumentNullException("key");
-            if (i > 0 && string.Equals(kv[i], kv[i - 2]))
-                throw new ArgumentException($"An item with the same key has already been added. Key: {kv[i]}");
-        }
+        if (double.IsFinite(value)) w.WriteNumber(property, value);
+        else                        w.WriteNull(property);
     }
 
     /// <summary>
-    /// The check the serializer's writer made before it wrote a double. <see cref="WriterOptions"/>
-    /// skips the writer's structural validation (the shape here is fixed), which is also where a
-    /// non-finite number would have been refused — so it is made here, with the same exception.
+    /// The label pairs as object members, each key ONCE: the pairs are sorted by key, then value, so
+    /// a repeated key is a run of adjacent pairs and only the last of the run — the ordinal-greatest
+    /// value — is written. A null key
+    /// is skipped. Neither can come from ingest (see the class remarks); this is the defence that
+    /// keeps a set stored before that fix from failing the answer. Valid sets are written pair for
+    /// pair, as before.
     /// </summary>
-    private static void ThrowIfNotFinite(double value)
+    internal static void WriteLabels(Utf8JsonWriter w, ReadOnlySpan<string> kv)
     {
-        if (!double.IsFinite(value))
-            throw new ArgumentException(
-                $".NET number values such as positive and negative infinity cannot be written as valid JSON. " +
-                $"To make it work when using 'JsonSerializer', consider specifying 'JsonNumberHandling.AllowNamedFloatingPointLiterals'.");
+        for (int i = 0; i < kv.Length; i += 2)
+        {
+            string key = kv[i];
+            if (key is null) continue;
+            if (i + 2 < kv.Length && string.Equals(key, kv[i + 2])) continue;   // not the last of its run
+            w.WriteString(key, kv[i + 1]);
+        }
     }
 
     /// <summary><c>MetricKind.ToString()</c>, without the allocation for the three named kinds.</summary>
@@ -221,10 +267,6 @@ internal static class MetricSeriesJson
     {
         public async Task ExecuteAsync(HttpContext ctx)
         {
-            // The whole answer is in hand: check all of it before the first byte, so a series that
-            // cannot be written fails the request cleanly wherever it sits, as building every DTO
-            // first did.
-            for (int i = 0; i < series.Count; i++) ThrowIfUnwritable(series[i]);
             Begin(ctx);
             var ct = ctx.RequestAborted;
             await using var w = new Utf8JsonWriter(ctx.Response.BodyWriter, WriterOptions);
