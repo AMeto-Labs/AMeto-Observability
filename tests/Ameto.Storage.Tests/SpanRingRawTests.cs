@@ -673,6 +673,85 @@ public sealed class SpanRingRawTests : IDisposable
     }
 
     /// <summary>
+    /// …AND ONE TAKEN AGAIN BEFORE THE DECISION, WITH A HIGH CHUNK FREED MEANWHILE, IS NOT A REFUSAL
+    /// EITHER (review F4). Re-reading the low list's index once narrowed the false refusal and did not
+    /// close it: A finds the low list empty; low chunk L is freed; A finds the high list empty; high
+    /// chunk H is freed and producer C takes L; A re-reads the low list — empty — and refused, with H
+    /// free and no instant at which both lists were empty. The decision now compares the low head's
+    /// VERSIONED value with the one read before the look, and L's round trip moved it.
+    ///
+    /// <para>At the seams: the arena is filled and drained unreleased, as above; between A's two
+    /// looks the seam frees low chunk 5; after both were found empty it frees high chunk 20 and runs
+    /// producer C to completion on another thread (C pops the low list first, so it takes chunk 5).
+    /// Reverted (one re-read of the low index): A's span is refused and <c>RefusedNoArena</c> moves
+    /// to 2.</para>
+    /// </summary>
+    [Fact]
+    public void A_low_chunk_freed_and_taken_again_while_a_high_one_frees_is_not_a_refusal()
+    {
+        using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024);
+        var headers = new SpanHeader[1_024];
+        var apart   = new byte[]?[1_024];
+
+        int filled = 0;
+        while (true)
+        {
+            var h = Fields(filled);
+            if (!ring.TryEnqueueRaw(in h, "op"u8, -1, "svc"u8, Stamp(filled))) break;
+            filled++;
+            Assert.True(filled < 1_000, "the arena never filled");
+        }
+        ring.EndBatch();
+        Assert.Equal(1, ring.RefusedNoArena);                             // both free lists are empty now
+        int n = ring.TryDequeueMany(headers, apart);                      // drained, still unreleased
+        Assert.Equal(filled, n);
+        int low  = Array.FindIndex(headers, 0, n, static h => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes == 5);
+        int high = Array.FindIndex(headers, 0, n, static h => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes == 20);
+        Assert.True(low >= 0 && high >= 0, "no span in low chunk 5 or high chunk 20");
+        Assert.True(20 >= SpanRingBuffer.LowWaterChunks && 5 < SpanRingBuffer.LowWaterChunks);
+
+        int between = 0, decided = 0;
+        bool cTaken = false;
+        int  cChunk = -1;
+        ring._betweenListLooksForTest = () =>
+        {
+            if (Interlocked.Increment(ref between) != 1) return;
+            ring.Release(headers.AsSpan(low, 1));                         // L freed after A's low look
+        };
+        ring._afterListsFoundEmptyForTest = () =>
+        {
+            if (Interlocked.Increment(ref decided) != 1) return;
+            ring.Release(headers.AsSpan(high, 1));                        // H freed…
+            Task.Run(() =>                                                // …and producer C takes L
+            {
+                var c = Fields(6_000);
+                cTaken = ring.TryEnqueueRaw(in c, "op"u8, -1, "svc"u8, Stamp(6_000));
+                ring.EndBatch();
+            }).Wait(HangGuard);
+        };
+
+        var span = Fields(5_000);
+        bool taken = ring.TryEnqueueRaw(in span, "op"u8, -1, "svc"u8, Stamp(5_000));
+        ring.EndBatch();
+        ring._betweenListLooksForTest     = null;
+        ring._afterListsFoundEmptyForTest = null;
+
+        int m = ring.TryDequeueMany(headers.AsSpan(n), apart.AsSpan(n));
+        for (int i = n; i < n + m; i++)
+            if (headers[i].TraceId.Equals(Fields(6_000).TraceId)) cChunk = headers[i].PayloadArenaOffset / SpanRingBuffer.ChunkBytes;
+
+        _out.WriteLine($"{filled} chunks filled; looks between {between}, decisions {decided}; C took chunk {cChunk}; "
+                     + $"A taken: {taken}; refused for want of arena: {ring.RefusedNoArena}");
+        Assert.True(cTaken, "producer C was refused");
+        Assert.Equal(5, cChunk);                                          // C did take L
+        Assert.True(taken, "A's span was refused with high chunk 20 free");
+        Assert.Equal(1, ring.RefusedNoArena);                             // only the fixture's own refusal
+        Assert.Equal(2, m);
+        for (int i = 0; i < n + m; i++)
+            if (i != low && i != high) ring.Release(headers.AsSpan(i, 1));
+    }
+
+    /// <summary>
     /// A CHUNK IS REUSED ONLY WHEN EVERY SPAN IN IT IS DRAINED, AND THEN FIRST. Three spans in one chunk,
     /// one drained: a new batch must NOT be packed into that chunk. All drained: the next batch gets it
     /// back (LIFO), so a drainer that keeps up works in one chunk forever — the arena's residency is
