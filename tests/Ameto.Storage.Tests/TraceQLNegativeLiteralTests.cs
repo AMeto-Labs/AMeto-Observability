@@ -66,6 +66,8 @@ public sealed class TraceQLNegativeLiteralTests
     [InlineData("{ duration > -1ms }")]
     [InlineData("{ duration < -1s }")]
     [InlineData("{ duration > -5 }")]          // the nanosecond spelling of the same thing
+    [InlineData("{ duration > -0.5ns }")]      // under a nanosecond: was truncated to 0 before the sign check (review F6)
+    [InlineData("{ duration >= -0.0001us }")]  // the same, spelled in microseconds
     [InlineData("{ .x = - 3 }")]               // a sign that is not attached to a number
     [InlineData("{ .x = -abc }")]
     [InlineData("{ .x = 1.2.3 }")]             // was the number 0
@@ -76,6 +78,7 @@ public sealed class TraceQLNegativeLiteralTests
     [Theory]
     [InlineData("{ duration > 1ms }")]
     [InlineData("{ duration > 0 }")]
+    [InlineData("{ duration > 0.5ns }")]       // a positive fraction of a nanosecond is still a duration
     [InlineData("{ .route-name = \"a-b\" }")]  // '-' inside a key and inside a string is not a sign
     [InlineData("{ .x = 1e }")]                // a bare `e` is still an identifier — and an error, as before
     public void What_parsed_before_still_parses_the_same(string query)

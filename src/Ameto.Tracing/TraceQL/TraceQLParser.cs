@@ -215,7 +215,7 @@ public static class TraceQLParser
             {
                 TokenKind.String   => TraceQLValue.FromString(t.Text),
                 TokenKind.Number   => TraceQLValue.FromNumber(t.Number),
-                TokenKind.Duration => TraceQLValue.FromDuration((long)t.Number),
+                TokenKind.Duration => TraceQLValue.FromDuration(t.Number),
                 TokenKind.Ident    => TraceQLValue.FromIdent(t.Text),
                 _ => throw new TraceQLException($"Expected scalar value, got {t.Kind}('{t.Text}')"),
             };

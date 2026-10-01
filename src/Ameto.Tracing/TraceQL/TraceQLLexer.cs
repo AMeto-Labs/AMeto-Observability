@@ -9,7 +9,7 @@ public enum TokenKind
     Ident,    // service / duration / status / name / kind / error / ok / unset / ...
     String,   // "..." or `...`
     Number,   // 123, 1.5, -3, -1e3
-    Duration, // 1s / 500ms / 1.5m  — Raw holds nanoseconds as long
+    Duration, // 1s / 500ms / 1.5m  — Number holds the nanoseconds, untruncated (-0.5ns keeps its sign)
     Eof,
 }
 
@@ -180,35 +180,41 @@ public static class TraceQLLexer
 
         // Check for duration suffix. A bool, not "nanos >= 0": a negative duration is still a
         // duration (an attribute may be compared with one; the duration intrinsic refuses it).
-        if (TryParseDurationSuffix(src, ref pos, num, out long nanos))
+        if (TryParseDurationSuffix(src, ref pos, num, out double nanos))
             return new Token(TokenKind.Duration, src[start..pos].ToString(), nanos);
 
         return new Token(TokenKind.Number, numText.ToString(), num);
     }
 
-    private static bool TryParseDurationSuffix(ReadOnlySpan<char> src, ref int pos, double num, out long nanos)
+    /// <summary>
+    /// The literal's nanoseconds, AS A DOUBLE — not truncated here (review F6). <c>(long)</c> cut
+    /// <c>-0.5ns</c> to 0 before the parser could see the sign, so <c>duration &gt; -0.5ns</c> was
+    /// accepted as <c>duration &gt; 0</c> (dropping the zero-length spans) while the bare <c>-0.5</c>
+    /// was refused. The <c>duration</c> intrinsic truncates after its sign check.
+    /// </summary>
+    private static bool TryParseDurationSuffix(ReadOnlySpan<char> src, ref int pos, double num, out double nanos)
     {
         nanos = 0;
         if (pos >= src.Length) return false;
 
         // ms
         if (pos + 1 < src.Length && src[pos] == 'm' && src[pos + 1] == 's')
-        { pos += 2; nanos = (long)(num * 1_000_000); return true; }
+        { pos += 2; nanos = num * 1_000_000; return true; }
         // us
         if (pos + 1 < src.Length && src[pos] == 'u' && src[pos + 1] == 's')
-        { pos += 2; nanos = (long)(num * 1_000); return true; }
+        { pos += 2; nanos = num * 1_000; return true; }
         // ns
         if (pos + 1 < src.Length && src[pos] == 'n' && src[pos + 1] == 's')
-        { pos += 2; nanos = (long)num; return true; }
+        { pos += 2; nanos = num; return true; }
         // s  (but not followed by a letter — avoids matching "service")
         if (src[pos] == 's' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; nanos = (long)(num * 1_000_000_000L); return true; }
+        { pos += 1; nanos = num * 1_000_000_000L; return true; }
         // m  (minutes)
         if (src[pos] == 'm' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; nanos = (long)(num * 60_000_000_000L); return true; }
+        { pos += 1; nanos = num * 60_000_000_000L; return true; }
         // h
         if (src[pos] == 'h' && (pos + 1 >= src.Length || !char.IsLetter(src[pos + 1])))
-        { pos += 1; nanos = (long)(num * 3_600_000_000_000L); return true; }
+        { pos += 1; nanos = num * 3_600_000_000_000L; return true; }
 
         return false;
     }
