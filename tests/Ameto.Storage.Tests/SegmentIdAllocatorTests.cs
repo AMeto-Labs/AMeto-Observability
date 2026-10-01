@@ -26,11 +26,26 @@ public sealed class SegmentIdAllocatorTests : IAsyncLifetime
 
     private string SegDir => Path.Combine(_dir, "segments");
 
-    public Task InitializeAsync()
+    /// <summary>
+    /// The engine's catalog scan is a background task its constructor starts, and the facts here
+    /// write peer segments STRAIGHT INTO the segments directory it lists — through a
+    /// <see cref="SegmentWriter"/> that holds the file open while it writes. A scan that lists the
+    /// directory in that window (the task started late: two cores, the full suite) fails to open
+    /// the half-written file, quarantines it as <c>.corrupt</c> once the writer lets go, and the
+    /// import that follows finds no file: <see cref="SegmentImportOutcome.Unreadable"/>, the floor
+    /// never raised, and <c>An_import_moves_the_allocator_forward_and_never_backward</c> failed
+    /// with "live WAL block 7 did not clear the imported id 1001" (#94) — the exact message a
+    /// scan made to fail on that file through <c>_beforeScanOpensSegment</c> reproduces, every run.
+    ///
+    /// <para>Awaited here, as <c>SegmentCatalogKeyTests</c> does for the same reason: "no scan is in
+    /// flight" becomes a fact of the fixture rather than an assumption each fact inherits. Nothing
+    /// else lists the directory while these facts run.</para>
+    /// </summary>
+    public async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
         _engine = NewEngine();
-        return Task.CompletedTask;
+        await _engine.CatalogLoaded;
     }
 
     public async Task DisposeAsync()

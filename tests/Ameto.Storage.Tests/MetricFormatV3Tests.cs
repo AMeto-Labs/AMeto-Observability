@@ -206,6 +206,145 @@ public sealed class MetricFormatV3Tests : IDisposable
             Assert.Equal(expected[s.Labels], s.Points.Count);
     }
 
+    /// <summary>
+    /// The grouping a flush depends on, which the byte goldens cannot see — they write one metric
+    /// per call. Several metrics interleaved in the input come out one file per name (per 512
+    /// series), the names in the order they were first met, each file's series in input order —
+    /// what <c>GroupBy</c> gave before the writer grouped by a counting sort. And a series whose
+    /// points are out of order is written sorted, its file's range taken from the sorted ends.
+    /// </summary>
+    [Fact]
+    public void Write_groups_interleaved_metrics_by_first_seen_name_keeping_input_order()
+    {
+        const long T = 1_784_800_000_000_000_000L, Sec = 1_000_000_000L;
+        string[] input = ["b", "a", "b", "c", "a", "b", "c"];
+        var items = new List<(SeriesKey, HotSeries)>();
+        for (int i = 0; i < input.Length; i++)
+        {
+            var labels = new LabelSet(new Dictionary<string, string> { ["i"] = i.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+            // Series 4 ("a") arrives out of order: 30 s, 10 s, 20 s.
+            List<MetricDataPoint> pts = i == 4
+                ? [new() { TimestampUnixNano = T + 30 * Sec, Value = 3 }, new() { TimestampUnixNano = T + 10 * Sec, Value = 1 }, new() { TimestampUnixNano = T + 20 * Sec, Value = 2 }]
+                : [new() { TimestampUnixNano = T + (i + 1) * Sec, Value = i }];
+            items.Add((new SeriesKey("m." + input[i], MetricKind.Gauge, "1", labels), new HotSeries(pts)));
+        }
+
+        var infos = MetricWriter.Write(_dir, items, MetricGranularity.Raw);
+
+        Assert.Equal(["m.b", "m.a", "m.c"], infos.Select(f => f.MetricName));
+        string[][] expected = [["0", "2", "5"], ["1", "4"], ["3", "6"]];
+        for (int f = 0; f < infos.Count; f++)
+        {
+            var series = MetricReader.ReadAllSync(infos[f].FilePath).ToList();
+            Assert.Equal(expected[f], series.Select(s => s.Labels.ValueAt(0)));
+            Assert.Equal(infos[f].MetricName, MetricReader.ReadSegmentInfo(infos[f].FilePath).MetricName);
+        }
+
+        var a4 = MetricReader.ReadAllSync(infos[1].FilePath).Single(s => s.Labels.ValueAt(0) == "4");
+        Assert.Equal([1d, 2d, 3d], a4.Points.Select(p => p.Value));
+        Assert.Equal(T + 2 * Sec,  infos[1].MinNano);    // series 1's only point
+        Assert.Equal(T + 30 * Sec, infos[1].MaxNano);    // series 4's last point once sorted
+        Assert.Equal(new FileInfo(infos[1].FilePath).Length, infos[1].SizeBytes);
+    }
+
+    /// <summary>
+    /// A METRIC NAME TOO LONG FOR A FILE NAME (#106 review, P1). The whole sanitized name went into
+    /// the file name, so a name past ~186 characters — OpenTelemetry allows 255; on Linux, where the
+    /// limit is 255 BYTES, a Cyrillic one past ~90 — made <c>File.Create</c> throw, retracted the whole
+    /// flush, deleted the other metrics' files of it, and failed every flush after it the same way.
+    /// Here one flush carries a 200-character ASCII name, a 150-character Cyrillic one and an ordinary
+    /// one: all three land, each file name fits 255 bytes, and each reads back under its full name.
+    /// </summary>
+    [Fact]
+    public async Task Metric_names_too_long_for_a_file_name_still_flush_and_read_back()
+    {
+        string ascii    = "otel." + new string('a', 195);       // 200 characters
+        string cyrillic = new string('\u0436', 150);            // 150 characters, 300 UTF-8 bytes
+        string ordinary = "beside.them";
+        long   ts       = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        await using (var engine = new MetricStorageEngine(_dir,
+                         Microsoft.Extensions.Logging.Abstractions.NullLogger<MetricStorageEngine>.Instance))
+        {
+            MetricIngestItem Item(string name) => new()
+            {
+                Name = name, Kind = MetricKind.Gauge, Unit = "1", TimestampUnixNano = ts, ScalarValue = 42,
+                Labels = new LabelSet(new Dictionary<string, string> { ["service.name"] = "T" }),
+            };
+            engine.Ingest([Item(ascii), Item(cyrillic), Item(ordinary)]);
+        }   // the final flush: one flush, all three metrics
+
+        var files = Directory.GetFiles(_dir, "*.mts");
+        Assert.Equal(3, files.Length);
+        foreach (string name in new[] { ascii, cyrillic, ordinary })
+        {
+            string file = Assert.Single(files, f => MetricReader.ReadSegmentInfo(f).MetricName == name);
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(Path.GetFileName(file) + MetricWriter.TempSuffix) <= 255,
+                $"{Path.GetFileName(file)} is longer than a file name may be on ext4");
+            var series = Assert.Single(MetricReader.ReadAllSync(file));
+            Assert.Equal(name, series.Name);
+            Assert.Equal(42, Assert.Single(series.Points).Value);
+        }
+        Assert.Single(files, f => Path.GetFileName(f).StartsWith("metrics-beside_them-", StringComparison.Ordinal));   // a short name is as it was
+    }
+
+    /// <summary>
+    /// The cap keeps names apart: two long names that share far more than the kept prefix differ in
+    /// the hash of the whole name, and a name of three-byte letters is cut by bytes, not characters.
+    /// </summary>
+    [Fact]
+    public void Long_names_that_share_a_prefix_get_different_file_names_within_the_byte_budget()
+    {
+        string a = new string('m', 80) + ".alpha", b = new string('m', 80) + ".beta", cjk = new string('\u4E2D', 100);
+        foreach (string name in new[] { a, b, cjk })
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(MetricWriter.FileNamePart(name)) <= MetricWriter.MaxNamePartBytes, name);
+        Assert.NotEqual(MetricWriter.FileNamePart(a), MetricWriter.FileNamePart(b));
+        Assert.Equal(MetricWriter.FileNamePart(a), MetricWriter.FileNamePart(a));                 // stable
+        Assert.Equal("http_server_duration", MetricWriter.FileNamePart("http.server.duration"));  // short: unchanged
+
+        const long T = 1_784_800_000_000_000_000L;
+        var items = new List<(SeriesKey, HotSeries)>();
+        foreach (string name in new[] { a, b })
+            items.Add((new SeriesKey(name, MetricKind.Gauge, "1", new LabelSet(new Dictionary<string, string> { ["k"] = "v" })),
+                       new HotSeries([new MetricDataPoint { TimestampUnixNano = T, Value = 1 }])));
+        var infos = MetricWriter.Write(_dir, items, MetricGranularity.Raw);
+        Assert.Equal([a, b], infos.Select(i => MetricReader.ReadSegmentInfo(i.FilePath).MetricName));
+    }
+
+    /// <summary>
+    /// <c>PointsForWrite</c> reads a series' list without its lock, which is sound only for a series
+    /// nothing appends to (#106 review, F3): a drain's snapshot or a list-built batch, never a live
+    /// series from the hot tier. A Debug build asserts it; here the assertion is turned into an
+    /// exception for the duration of the call. Debug only — the assertion compiles away in Release.
+    /// </summary>
+#if DEBUG
+    [Fact]
+#else
+    [Fact(Skip = "Debug.Assert compiles away in Release.")]
+#endif
+    public void Reading_a_live_series_for_the_writer_asserts_in_Debug()
+    {
+        var live     = new HotSeries(new LabelSet(new Dictionary<string, string> { ["k"] = "v" }));
+        var snapshot = new HotSeries([new MetricDataPoint { TimestampUnixNano = 1, Value = 1 }]);
+
+        var listener = new ThrowingListener();
+        System.Diagnostics.Trace.Listeners.Insert(0, listener);   // Debug.Assert reports through these
+        try
+        {
+            Assert.Equal(1, snapshot.PointsForWrite().Length);
+            var ex = Assert.Throws<InvalidOperationException>(() => { _ = live.PointsForWrite().Length; });
+            Assert.Contains("live series", ex.Message);
+        }
+        finally { System.Diagnostics.Trace.Listeners.Remove(listener); }
+    }
+
+    private sealed class ThrowingListener : System.Diagnostics.TraceListener
+    {
+        public override void Fail(string? message, string? detailMessage) => throw new InvalidOperationException(message);
+        public override void Write(string? message) { }
+        public override void WriteLine(string? message) { }
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {

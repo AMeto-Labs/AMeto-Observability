@@ -206,14 +206,108 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         // reader's live set.
         Assert.Equal(TraceLookupSegmentFixture.Blocks,
                      (await ReadTrace(TraceLookupSegmentFixture.Wide)).Count);
+        Assert.Single(await ReadTrace(TraceLookupSegmentFixture.Needle));
 
-        // The yardstick, measured on this machine and this fixture rather than asserted from a
-        // constant: what holding every span of the file costs, which is what the reader this
-        // replaced retained for the whole of a trace lookup.
+        // THE YARDSTICK, IN THE DEFECT'S OWN FORM (#89). The defect this guards against is a walk
+        // that materialises a block's spans and selects from them, so "one block" is measured as
+        // exactly that: one block's spans, decoded by the reader, held in a list. It used to be the
+        // whole file's cost divided down (per span x BlockSize) — a number that was right for the
+        // record shape it was tuned on and stopped being right when the shape changed.
         long materialised = LiveBytesHoldingTheWholeFile();
-        long perSpan      = materialised / TraceLookupSegmentFixture.Spans;
-        long oneBlock     = perSpan * TraceLookupSegmentFixture.BlockSize;
+        long oneBlock     = LiveBytesHoldingOneBlock();
 
+        // THE FLOOR, MEASURED, NOT ASSUMED (#89). Every trace read goes through pooled buffers — the
+        // trace index's two (2 MB and 512 KB buckets for this file) and the block's — and whether
+        // they count against the baseline depends on the POOL, not on the reader. Measured on the box
+        // #89 was reported from, at 86 % memory load: the one-span read leaves 2.52 MB live when it
+        // has finished, those buffers back in ArrayPool.Shared, and one more full collection takes it
+        // to zero — so the collection before each baseline empties the pool and every read rents
+        // afresh. A machine with memory to spare keeps them pooled and they fall inside the baseline
+        // instead: the likeliest reason this fact was red there and green in CI with the same tree.
+        // The needle read goes through the same buffers and holds one span: its peak is that floor,
+        // in this process, in this pool state.
+        //
+        // MEASURED ON BOTH SIDES OF THE WIDE READ, because that state can change under it: a machine
+        // near the pressure line (the #89 box runs at 86 % load) can cross it between the needle read
+        // and the wide one, and the buffers — about a block's worth — then count in one reading and not
+        // in the other, moving peak - floor by a block either way: a false red, or a false green over
+        // the very defect below. Two floors a quarter block apart or less mean the state held, and the
+        // lower is subtracted (the stricter). Otherwise the whole measurement is taken once more, and a
+        // second disagreement is reported as INCONCLUSIVE — a failure that says it is about the pool,
+        // never a verdict on the reader either way.
+        long floor = 0, floorAfter = 0, peak = 0;
+        int  floorSamples = 0, samples = 0;
+        bool settled = false;
+        for (int attempt = 1; attempt <= 2 && !settled; attempt++)
+        {
+            (floor, floorSamples) = await PeakOfTraceRead(TraceLookupSegmentFixture.Needle);
+            (peak,  samples)      = await PeakOfTraceRead(TraceLookupSegmentFixture.Wide);
+            (floorAfter, _)       = await PeakOfTraceRead(TraceLookupSegmentFixture.Needle);
+            settled = Math.Abs(floorAfter - floor) <= oneBlock / 4;
+            _out.WriteLine($"attempt {attempt}: floor {floor / 1048576.0:N2} MB before the wide read, "
+                         + $"{floorAfter / 1048576.0:N2} MB after{(settled ? "" : " — the pool's state moved")}");
+        }
+        Assert.True(settled,
+            $"INCONCLUSIVE — not a verdict on the trace reader: twice, the one-span read's floor moved from "
+          + $"{floor / 1048576.0:N2} MB to {floorAfter / 1048576.0:N2} MB across the wide read, more than a "
+          + $"quarter block ({oneBlock / 4 / 1048576.0:N2} MB). The pooled buffers every read goes through counted "
+          + "in one reading and not the other (memory pressure crossing ArrayPool's trim line), so the wide "
+          + "read's peak above the floor could be off by a block either way. Re-run on a machine that is not "
+          + "at the edge of its memory.");
+        floor = Math.Min(floor, floorAfter);
+
+        _out.WriteLine($"segment       = {TraceLookupSegmentFixture.Spans:N0} spans, "
+                     + $"{TraceLookupSegmentFixture.Blocks} blocks, "
+                     + $"{new FileInfo(_fx.SegmentPath).Length / 1048576.0:N1} MB on disk");
+        _out.WriteLine($"one block     = {oneBlock / 1048576.0,8:N2} MB   <- {TraceLookupSegmentFixture.BlockSize:N0} decoded spans held, "
+                     + $"{oneBlock / TraceLookupSegmentFixture.BlockSize:N0} B each");
+        _out.WriteLine($"whole file    = {materialised / 1048576.0,8:N2} MB   <- peak of the materialising reader");
+        _out.WriteLine($"floor         = {floor / 1048576.0,8:N2} MB   <- peak of the one-span read, over {floorSamples} decoded block(s)");
+        _out.WriteLine($"trace read    = {peak / 1048576.0,8:N2} MB   <- peak of the wide read, over {samples} decoded block(s)");
+        _out.WriteLine($"above floor   = {(peak - floor) / 1048576.0,8:N2} MB = {(double)(peak - floor) / oneBlock:N2} blocks");
+
+        // A reader that materialises the file never enters the block walk, so it would sail
+        // through every threshold below on a peak of zero. The sample count is what stops that.
+        Assert.True(samples >= TraceLookupSegmentFixture.Blocks,
+            $"the walk decoded {samples} block(s) for a trace with one span in each of "
+          + $"{TraceLookupSegmentFixture.Blocks} — the trace read is not walking blocks at all");
+        Assert.True(floorSamples >= 1, "the one-span read decoded no block at all");
+
+        // The floor read must not be able to hide the defect it is subtracted from: under it, the
+        // needle read materialises ITS block too — the file's last, which holds only the remainder.
+        int lastBlockSpans = TraceLookupSegmentFixture.Spans % TraceLookupSegmentFixture.BlockSize;   // not const: a guard, not a proof
+        Assert.True(lastBlockSpans is > 0 and <= TraceLookupSegmentFixture.BlockSize / 4,
+            $"the needle's block holds {lastBlockSpans} spans: the floor read would carry most of the defect it measures against");
+
+        // THE SHAPE ASSERTION, in this fixture's own bytes: what the wide read holds ABOVE the floor
+        // stays under half of what one block's decoded spans cost. Measured on that box, Debug, 10
+        // runs each pinned to two cores, after WP2 (#84) made a span record an attribute blob rather
+        // than a dictionary: one block is 2.38-2.56 MB (608-654 B a span; the whole file 31.6 MB, 663 B
+        // a span — the old yardstick divided THAT down, 2.59 MB, against 6.84 MB before WP2); the
+        // honest walk peaks at 2.69 MB over a 2.58 MB floor, 0.05-0.06 blocks above it; the defect —
+        // the walk materialising each block and selecting from it — peaks at 5.06-5.20 MB over a
+        // 3.07-3.16 MB floor (the needle's own block is 848 spans, a fifth of one), 0.83-0.86 blocks
+        // above it. On the same box at 74 % load the pool kept its buffers: a 0.06 MB floor, the honest
+        // walk 0.00 blocks above it, the defect 0.80 (a 0.55 MB floor). Half a block sits between the
+        // two with room on both sides in both states, and the floor makes
+        // the pool's state cancel out of the comparison instead of deciding it.
+        Assert.True(peak - floor < oneBlock / 2,
+            $"the wide trace read held {(peak - floor) / 1048576.0:N2} MB above the one-span read's "
+          + $"{floor / 1048576.0:N2} MB = {(double)(peak - floor) / oneBlock:N2} blocks of decoded spans "
+          + $"({oneBlock / 1048576.0:N2} MB a block) — a trace read is holding a block's worth of decoded "
+          + "spans, not just the block");
+
+        Assert.True(peak < materialised / 4,
+            $"peak retention was {peak * 100.0 / materialised:N1}% of the whole file");
+    }
+
+    /// <summary>
+    /// The largest live set the trace walk reaches for <paramref name="id"/>, sampled once per
+    /// decoded block through <see cref="SpanReader._afterTraceBlockForTest"/>, against a baseline
+    /// taken after a compacting collection — and how many blocks it decoded.
+    /// </summary>
+    private async Task<(long Peak, int Samples)> PeakOfTraceRead(TraceId id)
+    {
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         long baseline = GC.GetTotalMemory(forceFullCollection: true);
 
@@ -227,51 +321,11 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         };
 
         List<SpanRecord> spans;
-        try     { spans = await ReadTrace(TraceLookupSegmentFixture.Wide); }
+        try     { spans = await ReadTrace(id); }
         finally { SpanReader._afterTraceBlockForTest = null; }
 
-        _out.WriteLine($"segment       = {TraceLookupSegmentFixture.Spans:N0} spans, "
-                     + $"{TraceLookupSegmentFixture.Blocks} blocks, "
-                     + $"{new FileInfo(_fx.SegmentPath).Length / 1048576.0:N1} MB on disk");
-        _out.WriteLine($"per span      = {perSpan:N0} B");
-        _out.WriteLine($"one block     = {oneBlock / 1048576.0,8:N2} MB");
-        _out.WriteLine($"whole file    = {materialised / 1048576.0,8:N2} MB   <- peak of the materialising reader");
-        _out.WriteLine($"trace read    = {peak / 1048576.0,8:N2} MB   <- peak of this one, over {samples} decoded block(s)");
-
-        Assert.Equal(TraceLookupSegmentFixture.Blocks, spans.Count);
-
-        // A reader that materialises the file never enters the block walk, so it would sail
-        // through every threshold below on a peak of zero. The sample count is what stops that.
-        Assert.True(samples >= TraceLookupSegmentFixture.Blocks,
-            $"the walk decoded {samples} block(s) for a trace with one span in each of "
-          + $"{TraceLookupSegmentFixture.Blocks} — the trace read is not walking blocks at all");
-
-        // THE SHAPE ASSERTION, in this fixture's own bytes: under what ONE BLOCK of decoded spans
-        // costs, not "under N megabytes". A reader that materialises the file peaks at
-        // Spans/BlockSize = 12.2 blocks and fails here.
-        //
-        // The multiplier was 3 and that was too loose to do its job. The walk legitimately holds
-        // the block's raw bytes, which are far cheaper than the same block's SpanRecords — measured
-        // here at 2.69 MB against a 6.84 MB block, so 0.39 blocks — while the defect this guards
-        // against, materialising the block's spans and selecting from them, adds a whole block and
-        // lands at about 1.4. A budget of three blocks passed both, which is how the earlier
-        // version of this test stayed green under exactly that mutation. One block sits between
-        // them with room on either side: two and a half times the honest peak, and well under the
-        // defect's.
-        // HALF A BLOCK, and the halving is what the two measurements demand rather than taste.
-        // A budget of one whole block sat ABOVE the defect it exists to catch — measured, the
-        // honest walk peaks at 2.69 MB and materialising the block peaks at 6.71 MB against a
-        // 6.84 MB block, so the test only went red by about one percent, and the block figure
-        // itself drifts a few percent with pool warmth and xUnit ordering. Half a block sits at
-        // 3.4 MB: a quarter above the honest peak and half of the defect, so neither drift can
-        // decide the outcome.
-        Assert.True(peak < oneBlock / 2,
-            $"peak retention was {peak / 1048576.0:N2} MB = {(double)peak / oneBlock:N2} blocks "
-          + $"({peak * 100.0 / materialised:N1}% of the whole file) — a trace read is holding "
-          + "a whole block's worth of decoded spans, not just the block");
-
-        Assert.True(peak < materialised / 4,
-            $"peak retention was {peak * 100.0 / materialised:N1}% of the whole file");
+        Assert.Equal(id.Equals(TraceLookupSegmentFixture.Wide) ? TraceLookupSegmentFixture.Blocks : 1, spans.Count);
+        return (peak, samples);
     }
 
     [Fact]
@@ -466,6 +520,34 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         long live     = GC.GetTotalMemory(forceFullCollection: true) - baseline;
         GC.KeepAlive(held);
         return live;
+    }
+
+    /// <summary>
+    /// What holding ONE block's decoded spans costs — the form of the defect the peak test guards
+    /// against: the reader's records for the file's first block, in a list of their own, with the
+    /// rest of the file dropped (#89).
+    /// </summary>
+    private long LiveBytesHoldingOneBlock()
+    {
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        long baseline = GC.GetTotalMemory(forceFullCollection: true);
+        var  held     = OneBlockOfSpans(_fx.SegmentPath);
+        long live     = GC.GetTotalMemory(forceFullCollection: true) - baseline;
+        GC.KeepAlive(held);
+        return live;
+    }
+
+    /// <summary>
+    /// A frame of its own, so the whole-file list is dead by the time the block is measured: an
+    /// unoptimised frame keeps every local alive to its end, and this probe only runs unoptimised.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static List<SpanRecord> OneBlockOfSpans(string path)
+    {
+        var all   = SpanReader.ReadAll(path);
+        var block = new List<SpanRecord>(TraceLookupSegmentFixture.BlockSize);
+        for (int i = 0; i < TraceLookupSegmentFixture.BlockSize; i++) block.Add(all[i]);
+        return block;
     }
 }
 

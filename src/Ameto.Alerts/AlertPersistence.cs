@@ -210,8 +210,12 @@ public sealed class AlertPersistence
 
     // ── Per-rule state (cooldown / state continuity across restart) ─────────────
 
+    /// <param name="evaluatedAt">
+    /// When the rule was last evaluated — what a Pending rule's <c>For</c> credit is measured up to
+    /// across a restart (#94). Null when unknown; a row written before the column existed reads as null.
+    /// </param>
     public void SaveState(string ruleId, AlertState state, double lastValue,
-        DateTimeOffset? pendingSince, DateTimeOffset? lastFired)
+        DateTimeOffset? pendingSince, DateTimeOffset? lastFired, DateTimeOffset? evaluatedAt = null)
     {
         lock (_lock)
         try
@@ -219,35 +223,38 @@ public sealed class AlertPersistence
             using var conn = Open();
             using var cmd  = conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO alert_state (rule_id, state, last_value, pending_ticks, fired_ticks)
-                VALUES (@id, @state, @val, @pend, @fired)
+                INSERT INTO alert_state (rule_id, state, last_value, pending_ticks, fired_ticks, evaluated_ticks)
+                VALUES (@id, @state, @val, @pend, @fired, @eval)
                 ON CONFLICT(rule_id) DO UPDATE SET state=excluded.state, last_value=excluded.last_value,
-                    pending_ticks=excluded.pending_ticks, fired_ticks=excluded.fired_ticks
+                    pending_ticks=excluded.pending_ticks, fired_ticks=excluded.fired_ticks,
+                    evaluated_ticks=excluded.evaluated_ticks
                 """;
             cmd.Parameters.AddWithValue("@id",    ruleId);
             cmd.Parameters.AddWithValue("@state", (int)state);
             cmd.Parameters.AddWithValue("@val",   lastValue);
             cmd.Parameters.AddWithValue("@pend",  (object?)pendingSince?.UtcTicks ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@fired", (object?)lastFired?.UtcTicks ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@eval",  (object?)evaluatedAt?.UtcTicks ?? DBNull.Value);
             cmd.ExecuteNonQuery();
         }
         catch (Exception ex) { _logger.LogError(ex, "Failed to persist alert state"); }
     }
 
-    public IReadOnlyList<(string RuleId, AlertState State, double LastValue, DateTimeOffset? Pending, DateTimeOffset? Fired)> LoadStates()
+    public IReadOnlyList<(string RuleId, AlertState State, double LastValue, DateTimeOffset? Pending, DateTimeOffset? Fired, DateTimeOffset? Evaluated)> LoadStates()
     {
-        var list = new List<(string, AlertState, double, DateTimeOffset?, DateTimeOffset?)>();
+        var list = new List<(string, AlertState, double, DateTimeOffset?, DateTimeOffset?, DateTimeOffset?)>();
         try
         {
             using var conn = Open();
             using var cmd  = conn.CreateCommand();
-            cmd.CommandText = "SELECT rule_id, state, last_value, pending_ticks, fired_ticks FROM alert_state";
+            cmd.CommandText = "SELECT rule_id, state, last_value, pending_ticks, fired_ticks, evaluated_ticks FROM alert_state";
             using var r = cmd.ExecuteReader();
             while (r.Read())
                 list.Add((
                     r.GetString(0), (AlertState)r.GetInt32(1), r.GetDouble(2),
                     r.IsDBNull(3) ? null : new DateTimeOffset(r.GetInt64(3), TimeSpan.Zero),
-                    r.IsDBNull(4) ? null : new DateTimeOffset(r.GetInt64(4), TimeSpan.Zero)));
+                    r.IsDBNull(4) ? null : new DateTimeOffset(r.GetInt64(4), TimeSpan.Zero),
+                    r.IsDBNull(5) ? null : new DateTimeOffset(r.GetInt64(5), TimeSpan.Zero)));
         }
         catch (Exception ex) { _logger.LogError(ex, "Failed to load alert states"); }
         return list;
@@ -271,13 +278,29 @@ public sealed class AlertPersistence
                 until_ticks INTEGER NOT NULL, created_ticks INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS alert_state (
                 rule_id TEXT PRIMARY KEY, state INTEGER NOT NULL, last_value REAL NOT NULL,
-                pending_ticks INTEGER, fired_ticks INTEGER);
+                pending_ticks INTEGER, fired_ticks INTEGER, evaluated_ticks INTEGER);
             CREATE TABLE IF NOT EXISTS maintenance_windows (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL,
                 days_of_week INTEGER NOT NULL, start_minute INTEGER NOT NULL,
                 duration_minutes INTEGER NOT NULL, max_severity INTEGER);
             """;
         cmd.ExecuteNonQuery();
+
+        // Columns added after a table was first created — idempotent, as AuthDatabase.MigrateSchema
+        // does it: the ALTER fails on a database that already has the column, and that is the only
+        // failure it can have here. CREATE TABLE above already carries it for a new database.
+        //
+        // evaluated_ticks (#94): when a rule was last evaluated, so a Pending rule's For credit
+        // survives a restart — the downtime is excluded, what was seen before it is kept. Nullable:
+        // a row written before the column existed reads as "unknown", and the clock restarts.
+        try
+        {
+            using var alter = conn.CreateCommand();
+            alter.CommandText = "ALTER TABLE alert_state ADD COLUMN evaluated_ticks INTEGER";
+            alter.ExecuteNonQuery();
+        }
+        catch (SqliteException) { /* column already exists */ }
+
         PruneHistory();
     }
 
