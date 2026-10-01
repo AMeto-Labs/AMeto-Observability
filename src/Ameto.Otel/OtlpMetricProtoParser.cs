@@ -32,31 +32,16 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpMetricProtoParser
 {
-    /// <summary>A resolved string and its interner id (see <see cref="MetricLabelInterner.Intern(ReadOnlySpan{byte}, out string)"/>).</summary>
-    private readonly record struct Interned(string Text, int Id);
-
     /// <summary>Per-call scratch state — keeps the recursive readers to two parameters.</summary>
     private sealed class ParseState
     {
-        public readonly MetricLabelInterner Interner;
         public readonly List<MetricIngestItem> Result = [];
 
         /// <summary>
-        /// One point's labels, interleaved k0, v0, k1, v1, …, with each string's interner id beside
-        /// it — refilled per data point and handed to <see cref="MetricLabelInterner.GetLabelSet"/>,
-        /// which sorts both in place and copies only on a miss.
+        /// The point's labels and the resource's — the builder the JSON mapper uses too, so the rule
+        /// that decides a series' identity is written once for both encodings.
         /// </summary>
-        public string[] Kv  = new string[32];
-        public int[]    Ids = new int[32];
-        public int      Used;
-
-        public readonly Interned ServiceNameKey;
-        public Interned? ServiceName;
-
-        /// <summary>The resource's labels, interleaved like <see cref="Kv"/>; <see cref="ResUsed"/> strings.</summary>
-        public string[] ResKv  = new string[16];
-        public int[]    ResIds = new int[16];
-        public int      ResUsed;
+        public readonly MetricLabelSetBuilder Labels;
 
         /// <summary>Histogram scratch, so a point's arrays are allocated once at their exact size.</summary>
         public readonly List<long>   Counts = new(32);
@@ -70,40 +55,9 @@ public static class OtlpMetricProtoParser
         /// </summary>
         public double[]? LastBounds;
 
-        public ParseState(MetricLabelInterner interner)
-        {
-            Interner       = interner;
-            int id         = interner.Intern("service.name", out string key);
-            ServiceNameKey = new Interned(key, id);
-        }
+        public ParseState(MetricLabelInterner interner) => Labels = new MetricLabelSetBuilder(interner);
 
-        public void Add(Interned key, Interned value)
-        {
-            if (Used + 2 > Kv.Length)
-            {
-                Array.Resize(ref Kv,  Kv.Length * 2);
-                Array.Resize(ref Ids, Ids.Length * 2);
-            }
-            Kv[Used] = key.Text;   Ids[Used] = key.Id;   Used++;
-            Kv[Used] = value.Text; Ids[Used] = value.Id; Used++;
-        }
-
-        public void AddResource(Interned key, Interned value)
-        {
-            if (ResUsed + 2 > ResKv.Length)
-            {
-                Array.Resize(ref ResKv,  ResKv.Length * 2);
-                Array.Resize(ref ResIds, ResIds.Length * 2);
-            }
-            ResKv[ResUsed] = key.Text;   ResIds[ResUsed] = key.Id;   ResUsed++;
-            ResKv[ResUsed] = value.Text; ResIds[ResUsed] = value.Id; ResUsed++;
-        }
-
-        public Interned Intern(ReadOnlySpan<byte> utf8)
-        {
-            int id = Interner.Intern(utf8, out string s);
-            return new Interned(s, id);
-        }
+        public InternedText Intern(ReadOnlySpan<byte> utf8) => Labels.Intern(utf8);
     }
 
     public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload) =>
@@ -131,8 +85,7 @@ public static class OtlpMetricProtoParser
     {
         // Resource first: the wire format does not guarantee field order, and the service
         // name / resource labels are stamped onto every point below.
-        st.ServiceName = null;
-        st.ResUsed     = 0;
+        st.Labels.BeginResource();
 
         var pass1 = new ProtoReader(bytes);
         uint tag;
@@ -169,7 +122,8 @@ public static class OtlpMetricProtoParser
 
             if (keyUtf8.SequenceEqual("service.name"u8))
             {
-                if (value.IsString) st.ServiceName = st.Intern(value.Utf8);      // mapper parity: string only
+                // Mapper parity: a string only, and the first one (see SetServiceName).
+                if (value.IsString && !st.Labels.HasServiceName) st.Labels.SetServiceName(st.Intern(value.Utf8));
                 continue;
             }
             if (keyUtf8.SequenceEqual("service.instance.id"u8)) continue;
@@ -177,7 +131,7 @@ public static class OtlpMetricProtoParser
                 keyUtf8.StartsWith("telemetry.distro."u8)) continue;
 
             if (value.TryFormat(st, out var sv))
-                st.AddResource(st.Intern(keyUtf8), sv);
+                st.Labels.AddResourceLabel(st.Intern(keyUtf8), sv);
         }
     }
 
@@ -412,16 +366,15 @@ public static class OtlpMetricProtoParser
     }
 
     /// <summary>
-    /// Builds the point's label set: service name, the point's own attributes, then any
-    /// resource label not already present (point attributes win on key collision).
-    /// Re-walks the data point for just the attribute fields — a second pass over a span
-    /// already in L1 is cheaper than buffering attributes during the first.
+    /// Builds the point's label set through the shared <see cref="MetricLabelSetBuilder"/>: service
+    /// name, the point's own attributes, then any resource label not already present. Re-walks the
+    /// data point for just the attribute fields — a second pass over a span already in L1 is cheaper
+    /// than buffering attributes during the first.
     /// </summary>
     private static LabelSet BuildLabels(ReadOnlySpan<byte> dp, int attrField, ParseState st)
     {
-        st.Used = 0;
-        if (st.ServiceName is { } service)
-            st.Add(st.ServiceNameKey, service);
+        var labels = st.Labels;
+        labels.BeginPoint();
 
         uint attrTag = ((uint)attrField << 3) | 2;
         var r = new ProtoReader(dp);
@@ -430,23 +383,10 @@ public static class OtlpMetricProtoParser
         {
             if (tag != attrTag) { r.SkipField(tag); continue; }
             if (!TryReadKeyValue(r.ReadLengthDelimited(), out var keyUtf8, out var value)) continue;
-            if (value.TryFormat(st, out var sv)) st.Add(st.Intern(keyUtf8), sv);
+            if (value.TryFormat(st, out var sv)) labels.Add(st.Intern(keyUtf8), sv);
         }
 
-        var res = st.ResKv;
-        for (int i = 0; i < st.ResUsed; i += 2)
-        {
-            // Against everything added so far, resource labels included: a resource that repeats
-            // a key keeps its first value, as the pair-list shape always did.
-            bool exists = false;
-            for (int j = 0; j < st.Used; j += 2)
-                if (st.Kv[j] == res[i]) { exists = true; break; }
-            if (!exists) st.Add(new Interned(res[i], st.ResIds[i]), new Interned(res[i + 1], st.ResIds[i + 1]));
-        }
-
-        return st.Used == 0
-            ? LabelSet.Empty
-            : st.Interner.GetLabelSet(st.Kv.AsSpan(0, st.Used), st.Ids.AsSpan(0, st.Used));
+        return labels.Build();
     }
 
     // ── KeyValue / AnyValue ───────────────────────────────────────────────────
@@ -482,7 +422,7 @@ public static class OtlpMetricProtoParser
         /// invariant culture writes exactly the characters <c>ToString(InvariantCulture)</c>
         /// returns.
         /// </summary>
-        public bool TryFormat(ParseState st, out Interned text)
+        public bool TryFormat(ParseState st, out InternedText text)
         {
             Span<byte> buf = stackalloc byte[32];   // long ≤ 20, shortest round-trip double ≤ 24
             int n;
@@ -509,8 +449,8 @@ public static class OtlpMetricProtoParser
 
             // A number whose invariant text outgrows the buffer — not reachable for long or
             // double, kept so a wrong size can only cost an allocation.
-            text = new Interned(Which == 3 ? Int.ToString(CultureInfo.InvariantCulture)
-                                           : Double.ToString(CultureInfo.InvariantCulture), -1);
+            text = new InternedText(Which == 3 ? Int.ToString(CultureInfo.InvariantCulture)
+                                               : Double.ToString(CultureInfo.InvariantCulture), -1);
             return true;
         }
     }

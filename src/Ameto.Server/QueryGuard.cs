@@ -45,6 +45,7 @@ internal sealed class QueryGuard
     /// </summary>
     public async ValueTask<Lease?> TryEnterAsync(CancellationToken ct)
     {
+        _onEnteringForTest?.Invoke();
         if (_slots is null) return new Lease(null);
         return await _slots.WaitAsync(QueueWait, ct).ConfigureAwait(false) ? new Lease(_slots) : null;
     }
@@ -56,6 +57,12 @@ internal sealed class QueryGuard
     /// </summary>
     public QueryDeadline StartDeadline(CancellationToken requestAborted)
         => new(requestAborted, Timeout);
+
+    /// <summary>
+    /// Test seam: called by every <see cref="TryEnterAsync"/> before it waits for a slot — the
+    /// instant a request is past everything it checked before queueing. Null in production.
+    /// </summary>
+    internal Action? _onEnteringForTest;
 
     internal readonly struct Lease(SemaphoreSlim? slots) : IDisposable
     {

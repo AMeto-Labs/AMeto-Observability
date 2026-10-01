@@ -82,8 +82,13 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
                      "metricsExemplarMetricsRefused", "tracesRingBytesInFlight",
                      "tracesRingRefusedForBytes", "tracesRingRefusedNoSlot", "tracesRingRefusedNoArena",
                      "tracesUnpooledSpanNames", "tracesUnpooledServiceNames", "tracesInternPoolSaturations",
+                     "metricsLabelPoolStrings", "metricsLabelPoolSaturations", "metricsLabelPoolResets",
                  })
             Assert.True(Long(json, counter) >= 0, counter);
+
+        // The metric label pool (#88): the process-wide one the OTLP parsers intern into.
+        Assert.Equal(MetricLabelInterner.DefaultMaxStrings, json.GetProperty("metricsLabelPoolMaxStrings").GetInt32());
+        Assert.True(Long(json, "metricsLabelPoolStrings") <= MetricLabelInterner.DefaultMaxStrings);
 
         // Additive: the fields the client reads are all still there.
         foreach (string existing in new[] { "diskFreeBytes", "processWorkingSetBytes", "segmentCount",

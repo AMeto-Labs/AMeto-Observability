@@ -55,8 +55,8 @@ public sealed class TraceDetailAllocProbe : IDisposable
     private static readonly TraceId Trace = new(0x5DE7A11000000001UL, 0x0000000000002000UL);
 
     /// <summary>
-    /// A four-way tree, so the flame graph has real structure (seven levels) and stays well under
-    /// the depth at which today's serialiser refuses it.
+    /// A four-way tree, so the flame graph has real structure (seven levels) — within the 32 levels
+    /// the old serialiser admitted, so the before and after figures below measure the same answer.
     /// </summary>
     private static void WriteTrace(TraceStorageEngine engine) => WriteTrace(engine, Trace);
 
@@ -210,11 +210,14 @@ public sealed class TraceDetailAllocProbe : IDisposable
 
         // THE GATE ON THE FLAME GRAPH. Before TS#11: 495-519 B per span of its own (991 120-1 039 120
         // B per request) — two dictionaries, a List per span, LINQ per node, an id string and two
-        // boxed enums. What must stay is what the response is made of: a FlamegraphNode (80 B), its
-        // id string (56 B), children arrays and the span list the builder reads — 168 B per span.
-        Assert.True(flameOwn < Spans * 256,
-            $"GET .../flamegraph allocated {flameOwn:N0} B of its own for {Spans:N0} spans — the builder "
-            + "is indexing the trace through dictionaries and per-span lists again");
+        // boxed enums. After TS#11, 168 B per span (336 208 B): a FlamegraphNode (80 B), its id
+        // string (56 B) and a children array per parent, handed to the reflection serialiser. Since
+        // #91 the tree is written straight from the pooled index (TraceFlamegraphJson) and all that
+        // is left is the span list the handler collects and one writer — 17 B per span (34 312 B).
+        // The gate is 32 B per span: above that, below any per-node object coming back.
+        Assert.True(flameOwn < Spans * 32,
+            $"GET .../flamegraph allocated {flameOwn:N0} B of its own for {Spans:N0} spans — the tree "
+            + "is being built from per-node objects (a node, an id string, a children array) again");
 
         // THE GATE ON THE COMPARE VIEW. Before it moved onto the detail's writer: 978 B per span of
         // its own, over both traces (3 914 248 B for this trace compared with itself) — the DTO

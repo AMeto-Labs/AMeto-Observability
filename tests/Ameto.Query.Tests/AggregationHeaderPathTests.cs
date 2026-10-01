@@ -323,50 +323,32 @@ public sealed class AggregationHeaderPathTests : IDisposable
     }
 
     /// <summary>
-    /// …BUT NOT WHEN THE SNAPSHOT ALREADY LISTS THE MERGE'S OUTPUT. The merge publishes its output
-    /// and then deletes its sources, so a scan whose snapshot falls between the two lists the
-    /// output and a source not yet deleted. It reads that source's events in the output; the
-    /// source's own failed open lost nothing, so the count is exact and must say so.
+    /// …AND A COUNT TAKEN AT THE MERGE'S SWAP IS EXACT AND COMPLETE (#85). The merge used to
+    /// publish its output and then delete its sources, and a count whose snapshot fell between
+    /// the two read the batch twice — over 400 here, reported as complete. The output now goes in
+    /// and the sources come out as one catalog generation; counted from inside the window after
+    /// that swap and before any source file is unlinked, the answer is 400, not partial.
     ///
-    /// <para>The scan starts once the merge has removed its first source's entry, and every
-    /// worker waits for the merge to finish before it opens anything.</para>
+    /// <para>This replaces a test of the state the old order produced — a snapshot listing the
+    /// output and one source still to be deleted — which can no longer arise.</para>
     /// </summary>
     [Fact]
-    public async Task A_merge_whose_output_the_header_snapshot_lists_leaves_the_count_complete()
+    public async Task A_count_taken_at_the_merge_swap_is_exact_and_complete()
     {
         Assert.True(AggregationParser.TryParse("select count(*)", out var total));
         await _engine.FlushHotTierAsync();
 
-        using var firstRemoved = new ManualResetEventSlim();
-        using var scanning     = new ManualResetEventSlim();
-        using var mergeDone    = new ManualResetEventSlim();
-        int removals = 0;
-        _engine._afterSegmentEntryRemoved = () =>
-        {
-            if (Interlocked.Increment(ref removals) != 1) return;
-            firstRemoved.Set();
-            Assert.True(scanning.Wait(TimeSpan.FromSeconds(30)), "the scan never reached a segment");
-        };
-        var merge = Task.Run(async () =>
-        {
-            try     { return await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
-            finally { mergeDone.Set(); }
-        });
-        Assert.True(firstRemoved.Wait(TimeSpan.FromSeconds(30)), "the merge never removed a source");
+        AggregationResult? raced = null;
+        _engine._afterMergeSwap = () =>
+            // Kept, not asserted: a throw here is the merge's, and ends it.
+            raced = _withHeader.ExecuteAsync(total!, From, To).GetAwaiter().GetResult();
+        bool merged;
+        try     { merged = await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+        finally { _engine._afterMergeSwap = null; }
 
-        _engine._beforeHeaderSegmentOpen = _ =>
-        {
-            scanning.Set();
-            mergeDone.Wait(TimeSpan.FromSeconds(30));
-        };
-        AggregationResult raced;
-        try     { raced = await _withHeader.ExecuteAsync(total!, From, To); }
-        finally { _engine._beforeHeaderSegmentOpen = null; _engine._afterSegmentEntryRemoved = null; }
-
-        Assert.True(await merge, "setup: the merge pass merged nothing — the test proves nothing");
-        Assert.Equal(2, removals);   // one pair: the second source was deleted under the scan
-
-        Assert.False(raced.Partial, $"an exact count was reported as partial: {raced.PartialReason}");
+        Assert.True(merged, "setup: the merge pass merged nothing — the test proves nothing");
+        Assert.NotNull(raced);
+        Assert.False(raced!.Partial, $"an exact count was reported as partial: {raced.PartialReason}");
         Assert.Equal(400d, Assert.Single(raced.Rows).Values[0]);
     }
 

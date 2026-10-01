@@ -231,7 +231,8 @@
 
 .preview-bar { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
 .pv-result { font-size: 12px; color: var(--text-secondary); b { color: var(--text-primary); font-family: var(--font-ui); }
-  &.fires { color: var(--error); } }
+  &.fires { color: var(--error); }
+  &.unavailable { color: var(--error); } }
 
 .ch-hdr { display: flex; align-items: center; justify-content: space-between;
   span { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; } }

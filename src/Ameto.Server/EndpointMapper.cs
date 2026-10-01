@@ -55,6 +55,7 @@ public static class EndpointMapper
         app.MapGet("/api/events", async (
             HttpContext           ctx,
             IQueryExecutor        executor,
+            StorageEngine         storage,
             QueryGuard            guard,
             ILoggerFactory        loggerFactory,
             string?               filter   = null,
@@ -98,6 +99,10 @@ public static class EndpointMapper
                 Levels              = levelSet,
             };
 
+            // A closed log store (#95), refused before the stream opens: once it has, the only
+            // answer left is a stream that dies.
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
             QueryGuard.Lease? lease;
             try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
             catch (OperationCanceledException) { return Results.Empty; }   // client left the queue
@@ -106,6 +111,10 @@ public static class EndpointMapper
 
             using (lease)
             {
+                // AND AFTER THE QUEUE: a search that waited for its slot while the store closed
+                // would otherwise open a 200 stream and fail inside it.
+                if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
                 ctx.Response.ContentType = "text/event-stream";
                 ctx.Response.Headers.CacheControl = "no-cache";
                 ctx.Response.Headers.Connection   = "keep-alive";
@@ -143,6 +152,10 @@ public static class EndpointMapper
                     await TimedOutAsync(sse, guard, ctx);
                 }
                 catch (OperationCanceledException) { /* client disconnected */ }
+                catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage))
+                {
+                    await SafeErrorAsync(sse, LogStoreGate.ClosedMessage, ctx);   // the store closed under the scan
+                }
                 catch (Exception ex)
                 {
                     loggerFactory.CreateLogger(QueryLogCategory)
@@ -200,6 +213,7 @@ public static class EndpointMapper
 
             using (lease)
             {
+                if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;   // #95, after the queue
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
                 try
                 {
@@ -225,6 +239,7 @@ public static class EndpointMapper
                 }
                 catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
                 catch (OperationCanceledException) { return Results.Empty; }   // client left
+                catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
                 catch (Exception ex)
                 {
                     loggerFactory.CreateLogger(QueryLogCategory).LogError(ex, "Aggregation failed");
@@ -255,7 +270,7 @@ public static class EndpointMapper
 
         // ── Distinct property names: GET /api/events/props ───────────────────
         // Returns sorted unique property keys from the last 24 h (up to 5 000 events sampled).
-        app.MapGet("/api/events/props", async (HttpContext ctx, IQueryExecutor executor, QueryGuard guard) =>
+        app.MapGet("/api/events/props", async (HttpContext ctx, IQueryExecutor executor, StorageEngine storage, QueryGuard guard) =>
         {
             var request = new QueryRequest
             {
@@ -273,6 +288,7 @@ public static class EndpointMapper
 
             using (lease)
             {
+                if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;   // #95, after the queue
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
                 var props = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
                 try
@@ -284,6 +300,7 @@ public static class EndpointMapper
                             props.Add(key);
                     }
                 }
+                catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
                 catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
                 // The unfiltered partner the other guarded endpoints all have. A closed tab
                 // cancels the linked token while TimedOut stays FALSE — it is a disconnect, not
@@ -298,7 +315,7 @@ public static class EndpointMapper
         // ── Distinct services: GET /api/events/services ───────────────────────
         // Returns sorted unique values of ApplicationContext / service.name properties
         // from the last 7 days (up to 10 000 events sampled) — fast index-friendly scan.
-        app.MapGet("/api/events/services", async (HttpContext ctx, IQueryExecutor executor, QueryGuard guard,
+        app.MapGet("/api/events/services", async (HttpContext ctx, IQueryExecutor executor, StorageEngine storage, QueryGuard guard,
             int days = 7) =>
         {
             var request = new QueryRequest
@@ -315,6 +332,7 @@ public static class EndpointMapper
 
             using (lease)
             {
+                if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;   // #95, after the queue
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
                 var services = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
                 try
@@ -329,6 +347,7 @@ public static class EndpointMapper
                             services.Add(svc);
                     }
                 }
+                catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
                 catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
                 // The unfiltered partner the other guarded endpoints all have. A closed tab
                 // cancels the linked token while TimedOut stays FALSE — it is a disconnect, not
@@ -394,13 +413,26 @@ public static class EndpointMapper
 
             var svcFilter = string.IsNullOrEmpty(service) ? null : service;
 
+            // A closed log store (#95) — asked BEFORE the cache, so a closed store is refused rather
+            // than served the last answer it gave while open for as long as that stays cached.
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
             // Cache keyed on the bucket grid so drifting "now" bounds still hit within a TTL.
             var cacheKey = new CountsCacheKey(minB, maxB, bucketSeconds, svcFilter);
             if (cache.TryGet(cacheKey, out var cached))
                 return Results.Json(cached, EventCountsJsonContext.Default.EventCountsResponse);
 
-            var result = await storage.AggregateLogVolumeAsync(
-                fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+            // AND AFTER THE READ, before anything is cached: a store that closed during it either
+            // threw (its snapshot refuses once the teardown has collected its tiers) or answered
+            // from a teardown in progress. Neither is a count to serve, or to keep serving.
+            LogVolumeCounts result;
+            try
+            {
+                result = await storage.AggregateLogVolumeAsync(
+                    fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+            }
+            catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             var buckets = new long[nBuckets];
             for (int i = 0; i < nBuckets; i++)
@@ -456,6 +488,7 @@ public static class EndpointMapper
         app.MapGet("/api/events/live", async (
             HttpContext     ctx,
             IQueryExecutor  executor,
+            StorageEngine   storage,
             QueryGuard      guard,
             LiveEventSignal signal,
             ServerOptions   options,
@@ -471,6 +504,9 @@ public static class EndpointMapper
                 return Results.BadRequest(new { error = windowError });
             if (!TryCompileFilter(filter, out string? filterError))
                 return Results.BadRequest(new { error = filterError });
+
+            // A closed log store (#95), refused while there is still a status line to refuse on.
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers.CacheControl = "no-cache";
@@ -586,6 +622,13 @@ public static class EndpointMapper
                     refusedInARow = 0;
                     using (lease)
                     {
+                        // The store closed under an open tail (#95): say so and end, rather than
+                        // poll a closed store into an ObjectDisposedException and a "failed" frame.
+                        if (LogStoreGate.IsClosed(storage))
+                        {
+                            await SafeErrorAsync(sse, LogStoreGate.ClosedMessage, ctx);
+                            break;
+                        }
                         // Bounded like any other search: an unfiltered forward poll over
                         // a wide window is a full-catalog scan, and without a budget it
                         // would hold the slot it took for as long as that takes. A source
@@ -679,6 +722,10 @@ public static class EndpointMapper
                 }
             }
             catch (OperationCanceledException) { /* client disconnected */ }
+            catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage))
+            {
+                await SafeErrorAsync(sse, LogStoreGate.ClosedMessage, ctx);   // the store closed inside a poll
+            }
             catch (Exception ex)
             {
                 loggerFactory.CreateLogger(QueryLogCategory)
@@ -694,6 +741,7 @@ public static class EndpointMapper
         app.MapGet("/api/spans/{spanId}/logs", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            StorageEngine  storage,
             QueryGuard     guard,
             string         spanId,
             string?        from  = null,
@@ -728,7 +776,7 @@ public static class EndpointMapper
 
             // Guarded and bounded: from/to are optional here, so this is routinely an
             // unbounded-window scan — the shape the budget exists for.
-            await WriteGuardedListAsync(ctx, executor, guard, request);
+            await WriteGuardedListAsync(ctx, executor, storage, guard, request);
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Trace logs: GET /api/traces/{traceId}/logs ────────────────────────
@@ -740,6 +788,7 @@ public static class EndpointMapper
         app.MapGet("/api/traces/{traceId}/logs", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            StorageEngine  storage,
             QueryGuard     guard,
             string         traceId,
             string?        from  = null,
@@ -772,7 +821,7 @@ public static class EndpointMapper
                 Direction = QueryDirection.Forward,
             };
 
-            await WriteGuardedListAsync(ctx, executor, guard, request);
+            await WriteGuardedListAsync(ctx, executor, storage, guard, request);
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
     }
 
@@ -782,7 +831,7 @@ public static class EndpointMapper
     /// cannot admit to being partial the way a stream can, so it does not pretend.
     /// </summary>
     private static async Task WriteGuardedListAsync(
-        HttpContext ctx, IQueryExecutor executor, QueryGuard guard, QueryRequest request)
+        HttpContext ctx, IQueryExecutor executor, IQueryAvailability store, QueryGuard guard, QueryRequest request)
     {
         QueryGuard.Lease? lease;
         try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
@@ -798,12 +847,21 @@ public static class EndpointMapper
 
         using (lease)
         {
+            // A closed log store (#95), asked after the queue so a request that waited out the
+            // close is refused too.
+            if (LogStoreGate.IsClosed(store)) { await LogStoreGate.Closed.ExecuteAsync(ctx); return; }
+
             using var deadline = guard.StartDeadline(ctx.RequestAborted);
             var results = new List<LogEvent>();
             try
             {
                 await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
                     results.Add(ev);
+            }
+            catch (ObjectDisposedException) when (LogStoreGate.IsClosed(store))
+            {
+                await LogStoreGate.Closed.ExecuteAsync(ctx);
+                return;
             }
             catch (OperationCanceledException) when (deadline.TimedOut) { }
             catch (OperationCanceledException) { return; }   // client disconnected

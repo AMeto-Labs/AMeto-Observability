@@ -453,9 +453,19 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         }
 
         if (used == 0) return null;                          // nothing usable → scan
-        if (used < lists!.Length) Array.Resize(ref lists, used);
+        return IntersectLists(lists!, used);
+    }
 
-        // Intersect ascending arrays, smallest first (merge against the running result).
+    /// <summary>
+    /// The tail of <see cref="LookupIntersect"/>, shared with <see cref="SegmentIndexReader"/>:
+    /// intersects the first <paramref name="used"/> ascending posting lists, smallest first
+    /// (merging against the running result), into a fresh array. The lists themselves are never
+    /// written — a reader's memo hands out the arrays it keeps.
+    /// </summary>
+    internal static uint[] IntersectLists(int[][] lists, int used)
+    {
+        if (used < lists.Length) Array.Resize(ref lists, used);
+
         Array.Sort(lists, static (a, b) => a.Length - b.Length);
         int[] acc = lists[0];
         for (int i = 1; i < lists.Length && acc.Length > 0; i++)
@@ -530,14 +540,9 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         // The flat spelling, when the encoded path could also be one dotted key name.
         // Written into stack scratch and probed through the span alternate lookup: a string
         // per predicate per segment would be pure garbage for a bucket that usually is absent.
-        if (property.Length <= MaxFlatKeyChars &&
-            property.IndexOf(ClefFields.PropertyPathSeparator) >= 0 &&
-            property.IndexOf(PathIndexMarker) < 0)
+        Span<char> flat = stackalloc char[MaxFlatKeyChars];
+        if (TryFlatSpelling(property, flat))
         {
-            Span<char> flat = stackalloc char[MaxFlatKeyChars];
-            for (int i = 0; i < property.Length; i++)
-                flat[i] = property[i] == ClefFields.PropertyPathSeparator ? '.' : property[i];
-
             if (_postings.GetAlternateLookup<ReadOnlySpan<char>>()
                          .TryGetValue(flat[..property.Length], out var flatValues))
             {
@@ -552,11 +557,30 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     /// <summary>Longest path given a flat alternate — matches
     /// <c>FilterEvaluator.MaxFlatKeyChars</c>, which decides the same thing on the scan side.</summary>
-    private const int MaxFlatKeyChars = 512;
+    internal const int MaxFlatKeyChars = 512;
 
     /// <summary>U+0002, the subscript marker <c>PropertyPath</c> writes for <c>Foo[0]</c>. A
     /// path carrying one is not a flat key name, so it gets no dotted alternate.</summary>
     private const char PathIndexMarker = (char)2;
+
+    /// <summary>
+    /// Writes the dotted spelling of an encoded path into the first <c>property.Length</c> chars
+    /// of <paramref name="flat"/> (at least <see cref="MaxFlatKeyChars"/> long) and returns true,
+    /// or returns false when the path has no such spelling. The one rule for both readers of a
+    /// section — this class's decoded dictionaries and <see cref="SegmentIndexReader"/>'s packed
+    /// catalog — so they cannot come to disagree about which bucket a filter key may also name.
+    /// </summary>
+    internal static bool TryFlatSpelling(string property, Span<char> flat)
+    {
+        if (property.Length > MaxFlatKeyChars ||
+            property.IndexOf(ClefFields.PropertyPathSeparator) < 0 ||
+            property.IndexOf(PathIndexMarker) >= 0)
+            return false;
+
+        for (int i = 0; i < property.Length; i++)
+            flat[i] = property[i] == ClefFields.PropertyPathSeparator ? '.' : property[i];
+        return true;
+    }
 
     // ── Value identity: the index is typed, the scan is coercing ───────────────
 
@@ -585,7 +609,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     }
 
     /// <summary>Unions two ascending, distinct int arrays into a new ascending array.</summary>
-    private static int[] UnionAscending(int[] a, int[] b)
+    internal static int[] UnionAscending(int[] a, int[] b)
     {
         var outp = new int[a.Length + b.Length];
         int i = 0, j = 0, k = 0;
@@ -602,7 +626,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     }
 
     /// <summary>Intersects two ascending, distinct int arrays into a new ascending array.</summary>
-    private static int[] IntersectSorted(int[] a, int[] b)
+    internal static int[] IntersectSorted(int[] a, int[] b)
     {
         var outp = new int[Math.Min(a.Length, b.Length)];
         int i = 0, j = 0, k = 0;
@@ -616,7 +640,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return k == outp.Length ? outp : outp[..k];
     }
 
-    private static uint[] ToUInt(int[] offsets)
+    internal static uint[] ToUInt(int[] offsets)
     {
         var r = new uint[offsets.Length];
         for (int i = 0; i < offsets.Length; i++) r[i] = (uint)offsets[i];
@@ -862,9 +886,177 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return idx;
     }
 
+    // ── Query side, lazily: the packed section read where it lies ─────────────
+    //
+    // Deserialise above turns a whole section into dictionaries: a string per value and an
+    // int[] per posting list, for every property, to answer a query that names one of them —
+    // for an Information group of the #80 stand, all 11.7 MB of its section, every query.
+    // SegmentIndexReader answers from the packed bytes instead: a catalog of where each
+    // property's entries lie (one walk over the length prefixes, a few KB per group), then a
+    // scan of that one property's entries for the bucket asked for, decoding only the posting
+    // lists that match. Deserialise stays as the reference the reader's parity tests compare
+    // against, and for the tests that read a section directly.
+
+    /// <summary>One run of a property's value entries: where the first starts, and how many.</summary>
+    internal readonly record struct PropertyRun(int Offset, int ValueCount);
+
+    /// <summary>
+    /// A property of a packed section. <see cref="Name"/> is decoded the way
+    /// <see cref="Deserialise"/> decodes it (UTF-8 with replacement), and <see cref="Runs"/>
+    /// holds every entry filed under a name that decodes to it, in section order. Two runs happen
+    /// only when two DIFFERENT byte strings decode alike (invalid UTF-8), which Deserialise merges
+    /// into one dictionary; keeping both runs and unioning at lookup time is that merge, deferred.
+    /// </summary>
+    internal sealed class PackedProperty(string name, PropertyRun run)
+    {
+        public readonly string        Name = name;
+        public          PropertyRun[] Runs = [run];
+    }
+
+    /// <summary>
+    /// Where each property of a packed section lies. Built once per group and kept by the
+    /// reader's memo; property names are ordinal, as in <see cref="Deserialise"/>.
+    /// </summary>
+    internal sealed class PackedCatalog
+    {
+        /// <summary>A group with no inverted section: every property is unknown, which is what
+        /// an empty <see cref="Deserialise"/> answers too.</summary>
+        public static readonly PackedCatalog Empty = new(codec: true, new Dictionary<string, PackedProperty>(StringComparer.Ordinal), 0);
+
+        public readonly bool                                  Codec;
+        public readonly Dictionary<string, PackedProperty>    Properties;
+        public readonly long                                  RetainedBytes;
+
+        /// <summary>Lookup by a span, for the flat spelling written into stack scratch.</summary>
+        public readonly Dictionary<string, PackedProperty>.AlternateLookup<ReadOnlySpan<char>> BySpan;
+
+        public PackedCatalog(bool codec, Dictionary<string, PackedProperty> properties, long retainedBytes)
+        {
+            Codec         = codec;
+            Properties    = properties;
+            RetainedBytes = retainedBytes;
+            BySpan        = properties.GetAlternateLookup<ReadOnlySpan<char>>();
+        }
+    }
+
+    /// <summary>
+    /// Walks a packed section's length prefixes once and returns where every property's value
+    /// entries lie. Nothing but the property names is decoded, and those are the only strings
+    /// allocated. A section that overruns itself throws, as <see cref="Deserialise"/> does, so a
+    /// corrupt section still sends the caller down its fall-back-to-scan path.
+    /// </summary>
+    internal static PackedCatalog ReadCatalog(ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty) return PackedCatalog.Empty;
+
+        int  pos       = 0;
+        uint first     = BinaryPrimitives.ReadUInt32LittleEndian(data); pos += 4;
+        bool codec     = first == CodecMagic;
+        uint propCount = codec ? BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]) : first;
+        if (codec) pos += 4;
+
+        var  props = new Dictionary<string, PackedProperty>((int)Math.Min(propCount, 4096u), StringComparer.Ordinal);
+        long bytes = CatalogShellBytes;
+        for (uint p = 0; p < propCount; p++)
+        {
+            int    nameLen = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]); pos += 2;
+            string name    = System.Text.Encoding.UTF8.GetString(data.Slice(pos, nameLen)); pos += nameLen;
+            uint   count   = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
+            if (count > int.MaxValue) ThrowOverrun(pos, data.Length);
+
+            var run = new PropertyRun(pos, (int)count);
+            for (uint v = 0; v < count; v++)
+            {
+                int valLen = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]);
+                pos += 2 + valLen;
+                uint bmLen = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]);
+                pos += 4;
+                if ((ulong)pos + bmLen > (ulong)data.Length) ThrowOverrun(pos, data.Length);
+                pos += (int)bmLen;
+            }
+
+            if (props.TryGetValue(name, out var same))
+            {
+                same.Runs = [.. same.Runs, run];
+                bytes += RunBytes;
+            }
+            else
+            {
+                props.Add(name, new PackedProperty(name, run));
+                bytes += PropertyBytes + 2L * name.Length;
+            }
+        }
+        return new PackedCatalog(codec, props, bytes);
+    }
+
+    /// <summary>
+    /// The union of the posting lists of every entry in <paramref name="runs"/> whose value decodes
+    /// to text equal to <paramref name="form"/> OrdinalIgnoreCase, in section order — exactly the
+    /// bucket <see cref="Deserialise"/>'s case-insensitive dictionary holds under that key. Null
+    /// when no entry does.
+    ///
+    /// <para>Cheap for the entries it rejects: OrdinalIgnoreCase requires equal UTF-16 lengths,
+    /// and a value of B bytes decodes to between B/3 and B chars (a replaced invalid sequence
+    /// included), so a value outside [form, 3 × form] bytes is skipped unread. An ASCII value
+    /// against an ASCII form compares its bytes directly, which for ASCII IS OrdinalIgnoreCase;
+    /// everything else is decoded and compared exactly as the dictionary would.</para>
+    /// </summary>
+    internal static int[]? ScanBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form)
+    {
+        int  minLen    = form.Length;
+        long maxLen    = 3L * form.Length;
+        bool formAscii = System.Text.Ascii.IsValid(form);
+
+        char[]?    rented  = maxLen >= 256 ? ArrayPool<char>.Shared.Rent((int)maxLen + 1) : null;
+        Span<char> scratch = rented ?? stackalloc char[256];
+        try
+        {
+            int[]? acc = null;
+            for (int r = 0; r < runs.Length; r++)
+            {
+                int pos = runs[r].Offset;
+                for (int v = 0; v < runs[r].ValueCount; v++)
+                {
+                    int valLen = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]); pos += 2;
+                    var value  = data.Slice(pos, valLen);                              pos += valLen;
+                    int bmLen  = (int)BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
+                    var bm     = data.Slice(pos, bmLen);                               pos += bmLen;
+
+                    if (valLen < minLen || valLen > maxLen) continue;
+                    if (!ValueEquals(value, form, formAscii, scratch)) continue;
+
+                    var decoded = codec ? DecodeCodec(bm) : DecodeRoaring(bm);
+                    acc = acc is null ? decoded : UnionAscending(acc, decoded);
+                }
+            }
+            return acc;
+        }
+        finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
+    }
+
+    /// <summary><c>Encoding.UTF8.GetString(utf8)</c> equals <paramref name="form"/>
+    /// OrdinalIgnoreCase, without the string.</summary>
+    private static bool ValueEquals(ReadOnlySpan<byte> utf8, string form, bool formAscii, Span<char> scratch)
+    {
+        if (formAscii && System.Text.Ascii.IsValid(utf8))
+            return System.Text.Ascii.EqualsIgnoreCase(utf8, form);
+
+        int chars = System.Text.Encoding.UTF8.GetChars(utf8, scratch);
+        return scratch[..chars].Equals(form, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void ThrowOverrun(int pos, int length) =>
+        throw new InvalidDataException($"Inverted section overruns itself at byte {pos} of {length}");
+
+    // What the catalog keeps alive, at the CLR's usual 64-bit costs: the dictionary shell, and per
+    // property an entry, the PackedProperty, its name and a one-element run array.
+    private const long CatalogShellBytes = 160;
+    private const long RunBytes          = 8;
+    private const long PropertyBytes     = 48 + 32 + 22 + 32;
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static int[] DecodeCodec(ReadOnlySpan<byte> bytes)
+    internal static int[] DecodeCodec(ReadOnlySpan<byte> bytes)
     {
         int count = SegmentBitmapCodec.Count(bytes);
         if (count == 0) return Array.Empty<int>();
@@ -873,7 +1065,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return arr;
     }
 
-    private static int[] DecodeRoaring(ReadOnlySpan<byte> bytes)
+    internal static int[] DecodeRoaring(ReadOnlySpan<byte> bytes)
     {
         using var ms = new MemoryStream(bytes.ToArray());
         var bm = RoaringBitmap.Deserialize(ms);

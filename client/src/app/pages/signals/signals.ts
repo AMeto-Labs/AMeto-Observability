@@ -6,11 +6,21 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
+import { unavailableMessage } from '../../shared/utils/unavailable';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
   AlertSilence, AlertChannel, AlertSource, AlertSeverity, AlertComparator,
   TraceMetricKind, AlertPreviewResult, MaintenanceWindow,
 } from '../../core/models/alert.model';
+
+/**
+ * The preview's verdict. A `null` value means the window holds no finite value (every point NaN or
+ * infinite, #92): the server evaluates nothing and leaves the rule's state alone, so the preview
+ * claims no verdict either — "ok" there read as "this rule would resolve".
+ */
+export function previewVerdict(p: AlertPreviewResult): string {
+  return p.value == null ? 'no data' : p.wouldFire ? 'WOULD FIRE' : 'ok';
+}
 
 interface MaintDraft { name: string; days: boolean[]; startTime: string; durationMinutes: number; maxSeverity: string; }
 
@@ -83,6 +93,9 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   editing  = signal<RuleDraft | null>(null);
   preview  = signal<AlertPreviewResult | null>(null);
   previewing = signal(false);
+  protected readonly previewVerdict = previewVerdict;
+  /** The server's sentence when the preview was refused with 503. */
+  previewError = signal<string | null>(null);
   testStatus = signal<string>('');
 
   readonly sources: AlertSource[] = ['Log', 'Metric', 'Trace'];
@@ -231,9 +244,9 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   ruleName(id: string): string { return this.rules().find(r => r.id === id)?.name ?? id; }
 
   // ── Editor ──────────────────────────────────────────────────────────────────
-  newRule() { this.editing.set(this.blankDraft()); this.preview.set(null); this.testStatus.set(''); }
-  edit(r: AlertRule) { this.editing.set(this.fromRule(r)); this.preview.set(null); this.testStatus.set(''); }
-  cancel() { this.editing.set(null); this.preview.set(null); this.testStatus.set(''); }
+  newRule() { this.editing.set(this.blankDraft()); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
+  edit(r: AlertRule) { this.editing.set(this.fromRule(r)); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
+  cancel() { this.editing.set(null); this.preview.set(null); this.previewError.set(null); this.testStatus.set(''); }
 
   addChannel(type: ChannelType) {
     const d = this.editing(); if (!d) return;
@@ -249,9 +262,17 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
   runPreview() {
     const d = this.editing(); if (!d) return;
     this.previewing.set(true);
+    this.previewError.set(null);
     this.api.previewAlert(this.toRequest(d)).subscribe({
       next: p => { this.preview.set(p); this.previewing.set(false); this.cdr.markForCheck(); },
-      error: () => { this.previewing.set(false); this.cdr.markForCheck(); },
+      // A 503 is the rule's store saying it cannot answer (#95: shut down, or still loading) —
+      // shown, in place of a stale result, rather than dropped.
+      error: err => {
+        const message = unavailableMessage(err);
+        if (message) { this.preview.set(null); this.previewError.set(message); }
+        this.previewing.set(false);
+        this.cdr.markForCheck();
+      },
     });
   }
 
@@ -373,7 +394,7 @@ export class SignalsPageComponent implements OnInit, OnDestroy {
     if (s % 60 === 0 && s >= 60) return s / 60 + 'm';
     return s + 's';
   }
-  fmtNum(v: number): string { return v == null ? '—' : (v === Math.floor(v) ? String(v) : v.toFixed(2)); }
+  fmtNum(v: number | null): string { return v == null ? '—' : (v === Math.floor(v) ? String(v) : v.toFixed(2)); }
   fmtTime(iso: string): string { return iso ? format(new Date(iso), 'dd/MM HH:mm:ss') : '—'; }
   fmtAgo(iso?: string): string {
     if (!iso) return '—';
