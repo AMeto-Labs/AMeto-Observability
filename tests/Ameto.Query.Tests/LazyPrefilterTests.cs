@@ -68,6 +68,19 @@ public sealed class LazyPrefilterTests : IAsyncLifetime
         return (SegmentReader.Opens - opens, SegmentReader.Closes - closes, rows);
     }
 
+    /// <summary>
+    /// <see cref="CountAsync"/> for a consumer that reads the enumerator to its END — the list
+    /// endpoint and the SSE writer do — rather than breaking off at the count itself.
+    /// </summary>
+    private async Task<(long Opens, long Closes, List<LogEvent> Rows)> DrainAsync(string filter, int count)
+    {
+        long opens = SegmentReader.Opens, closes = SegmentReader.Closes;
+        var rows = new List<LogEvent>();
+        await foreach (var ev in _query.ExecuteAsync(new QueryRequest { Filter = filter, Count = count }))
+            rows.Add(ev);
+        return (SegmentReader.Opens - opens, SegmentReader.Closes - closes, rows);
+    }
+
     /// <summary>Every event in the requested order, kept where <paramref name="property"/> reads <paramref name="value"/>.</summary>
     private async Task<List<LogEvent>> OracleAsync(string property, string value, bool forward)
     {
@@ -165,6 +178,64 @@ public sealed class LazyPrefilterTests : IAsyncLifetime
                 Assert.Equal(opens, closes);
             }
         }
+    }
+
+    /// <summary>
+    /// A CONSUMER THAT READS TO THE END PAYS WHAT ONE THAT STOPS AT THE LIMIT PAYS (#114, F2). The
+    /// executor tested the limit only when the NEXT row arrived, so draining the enumerator made the
+    /// merge produce row count+1 first — and at a prefilter batch edge that one row costs the whole
+    /// next batch, doubled. Red before the fix with P = 8: a page of 44 opened 24 segments read to
+    /// the end, 8 stopped at the limit.
+    ///
+    /// <para>Where the edges fall depends on the machine — the first batch is
+    /// <see cref="QueryExecutor.PrefilterParallelism"/> segments — so the test finds them instead of
+    /// naming one: every page size up to 80 is read both ways, and the sizes at which one more row
+    /// costs another batch must be among them, or nothing here could have shown the extra row.</para>
+    /// </summary>
+    [Fact]
+    public async Task ReadingToTheEndOpensNoMoreThanStoppingAtTheLimit()
+    {
+        const string Filter  = "Customer = 'cust-1'";
+        const int    MaxPage = 80;
+
+        var stopped = new long[MaxPage + 2];
+        for (int count = 1; count <= MaxPage + 1; count++)
+            stopped[count] = (await CountAsync(Filter, count)).Opens;
+
+        var edges = new List<int>();
+        for (int count = 1; count <= MaxPage; count++)
+        {
+            if (stopped[count + 1] > stopped[count]) edges.Add(count);
+
+            var (opens, closes, rows) = await DrainAsync(Filter, count);
+            Assert.Equal(count, rows.Count);
+            Assert.True(opens == stopped[count],
+                $"a page of {count} read to the end opened {opens} segments; stopped at the limit it opens {stopped[count]}");
+            Assert.Equal(opens, closes);
+        }
+
+        _out.WriteLine($"P = {QueryExecutor.PrefilterParallelism}: one more row costs another prefilter batch after a page of {string.Join(", ", edges)}");
+        Assert.NotEmpty(edges);
+    }
+
+    /// <summary>
+    /// A page of nothing asks for nothing: no row, no pin, no open. Red without the guard both
+    /// ways round: with the limit checked before each row (b6df5e9) a count of 0 returned nothing
+    /// but planned the window and opened the first prefilter batch for it — 8 opens here; with the
+    /// check after each row alone, it returned a row.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task APageOfNothingOpensNothing(int count)
+    {
+        long pins = QueryExecutor.Pins;
+        var (opens, closes, rows) = await DrainAsync("Customer = 'cust-1'", count);
+
+        Assert.Empty(rows);
+        Assert.Equal(0, opens);
+        Assert.Equal(0, closes);
+        Assert.Equal(0, QueryExecutor.Pins - pins);
     }
 
     /// <summary>

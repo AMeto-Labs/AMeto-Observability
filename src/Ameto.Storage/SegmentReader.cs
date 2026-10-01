@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.IO.MemoryMappedFiles;
 using System.Text;
 using K4os.Compression.LZ4;
+using Microsoft.Win32.SafeHandles;
 using Ameto.Core;
 using Ameto.Core.Serialization;
 
@@ -90,22 +91,71 @@ public sealed class SegmentReader : ISegmentReader
         if (!fi.Exists) throw new FileNotFoundException("Segment file not found", filePath);
 
         long fileSize = fi.Length;
-        // A file too short to hold even a footer is not a segment in any version this reader
-        // knows -- it is the torn write a power cut leaves behind. Named as corruption
-        // (InvalidDataException) so callers that quarantine on it can tell bytes from
-        // circumstance: without this guard a zero-byte file failed the MAPPING below with
-        // ArgumentException and a sub-footer file failed the footer read with
-        // ArgumentOutOfRangeException, neither of which names the file as the problem -- and
-        // the more torn the file, the more certainly it dodged the quarantine.
+        ThrowIfShorterThanFooter(filePath, fileSize);
+        var mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+        return Map(mmf, filePath, fileSize, computeUncompressedBytes, fi.LastWriteTimeUtc.Ticks);
+    }
+
+    /// <summary>
+    /// Opens a segment through a handle the caller ALREADY HOLDS on its file, instead of opening the
+    /// path again: the mapping is made from <paramref name="handle"/>, and the size and write time
+    /// come from it too, so nothing here resolves <paramref name="filePath"/>, which only names the
+    /// file in the reader's <see cref="Info"/> and in its exceptions.
+    ///
+    /// <para>For the pin a query takes on every segment of its window when it snapshots the catalog
+    /// (#114). The query opens its segments lazily, a batch at a time as the merge front reaches
+    /// them, and a merge can commit in between: by then the catalog has swapped the sources out
+    /// and unlinked them, and opening one BY PATH finds nothing — the query skipped it and lost its
+    /// rows, while the merge output that holds them was not in the query's snapshot either. A
+    /// handle taken at snapshot time keeps the file: on Linux the inode outlives the unlink, on
+    /// Windows the unlink fails and is parked until the handle goes (see the share mode the query
+    /// pins with).</para>
+    ///
+    /// <para>THE HANDLE STAYS THE CALLER'S. The mapping is created with <c>leaveOpen</c>, so
+    /// <see cref="Dispose"/> releases the view and the mapping and never the handle; the caller
+    /// closes it after every reader made from it, which is the order a mapping needs anyway.</para>
+    /// </summary>
+    public static SegmentReader Open(SafeFileHandle handle, string filePath, bool computeUncompressedBytes = false)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+
+        long fileSize = RandomAccess.GetLength(handle);
+        ThrowIfShorterThanFooter(filePath, fileSize);
+        long lastWriteTicks = File.GetLastWriteTimeUtc(handle).Ticks;
+        var mmf = MemoryMappedFile.CreateFromFile(
+            handle, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
+        return Map(mmf, filePath, fileSize, computeUncompressedBytes, lastWriteTicks);
+    }
+
+    /// <summary>
+    /// A file too short to hold even a footer is not a segment in any version this reader
+    /// knows -- it is the torn write a power cut leaves behind. Named as corruption
+    /// (InvalidDataException) so callers that quarantine on it can tell bytes from
+    /// circumstance: without this guard a zero-byte file failed the MAPPING with
+    /// ArgumentException and a sub-footer file failed the footer read with
+    /// ArgumentOutOfRangeException, neither of which names the file as the problem -- and
+    /// the more torn the file, the more certainly it dodged the quarantine.
+    /// </summary>
+    private static void ThrowIfShorterThanFooter(string filePath, long fileSize)
+    {
         if (fileSize < 44)   // the footer is 44 bytes in every supported version
             throw new InvalidDataException(
                 $"Segment file {filePath} is {fileSize} bytes -- too short to hold a segment footer; a torn or empty file.");
-        var  mmf      = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+    }
+
+    /// <summary>
+    /// What both <c>Open</c> overloads do once they have a mapping, wherever it came from: the
+    /// view over the whole file, the parse, the count. Owns <paramref name="mmf"/> from here on:
+    /// a failure disposes it before rethrowing.
+    /// </summary>
+    private static SegmentReader Map(
+        MemoryMappedFile mmf, string filePath, long fileSize, bool computeUncompressedBytes, long lastWriteTicks)
+    {
         MemoryMappedViewAccessor? view = null;
         try
         {
             view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes, fi.LastWriteTimeUtc.Ticks);
+            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes, lastWriteTicks);
             Interlocked.Increment(ref Opens);
             return reader;
         }
