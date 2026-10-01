@@ -312,10 +312,13 @@ export class FlamegraphComponent implements OnChanges {
     return r ? layoutFlamegraph(r) : [];
   });
 
-  /** Nodes whose subtree the server did not send (see {@link FlamegraphNode.truncated}). */
+  /**
+   * Cut nodes in VIEW (see {@link FlamegraphNode.truncated}) — over the bars drawn, not the whole
+   * tree, so a zoom into a subtree with no cut node says nothing is missing from it (#106 review).
+   */
   cutCount = computed(() => {
     let n = 0;
-    for (const node of this.flatNodes()) if (node.truncated) n++;
+    for (const node of this.visibleNodes()) if (node.truncated) n++;
     return n;
   });
 

@@ -175,6 +175,28 @@ describe('flame graph cut node', () => {
     expect(el.querySelector('.fg-tt-cut')?.textContent).toContain(CUT_NOTE);
   });
 
+  it('counts the cut nodes in view: zoomed into a subtree without one, it says nothing is missing', async () => {
+    const cut  = node(6, [], { name: 'deepest-sent', truncated: true });
+    const tree = node(10, [node(7, [cut], { name: 'with-cut' }), node(2, [], { name: 'without-cut' })]);
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    const bar = (name: string) =>
+      Array.from(el.querySelectorAll<HTMLElement>('.fg-bar')).find(b => b.title.startsWith(name + ' '))!;
+
+    bar('without-cut').click();   // zoom into the subtree with no cut node
+    fixture.detectChanges();
+    expect(el.querySelectorAll('.fg-bar').length).toBe(1);
+    expect(el.querySelector('.fg-cut-note')).toBeNull();
+    expect(el.querySelector('.fg-legend')?.textContent).not.toContain('Cut');
+
+    (el.querySelector('.fg-btn') as HTMLElement).click();   // reset
+    fixture.detectChanges();
+    bar('with-cut').click();      // and into the one that holds it
+    fixture.detectChanges();
+    expect(el.querySelectorAll('.fg-bar').length).toBe(2);
+    expect(el.querySelector('.fg-cut-note')?.textContent).toContain('1 branch cut');
+  });
+
   it('says nothing when no node was cut', async () => {
     const fixture = await render(node(10, [node(4), node(5, [node(1)])]));
     const el: HTMLElement = fixture.nativeElement;
