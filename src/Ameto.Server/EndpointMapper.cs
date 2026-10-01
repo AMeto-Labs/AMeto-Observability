@@ -169,7 +169,7 @@ public static class EndpointMapper
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Aggregation: GET /api/events/aggregate ────────────────────────────
-        // `select count(*) where @l = 'Error' group by ['service.name'] limit 20`.
+        // `select count(*) where @l = 'Error' group by @service limit 20`.
         //
         // A separate endpoint because the answer is a different SHAPE: a table with its own
         // columns, not a stream of events, so it cannot arrive on the SSE channel the search
@@ -313,8 +313,9 @@ public static class EndpointMapper
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Distinct services: GET /api/events/services ───────────────────────
-        // Returns sorted unique values of ApplicationContext / service.name properties
-        // from the last 7 days (up to 10 000 events sampled) — fast index-friendly scan.
+        // Returns sorted unique values of the events' @service (or, failing that, their
+        // ApplicationContext property) from the last 7 days (up to 10 000 events sampled) —
+        // fast index-friendly scan.
         app.MapGet("/api/events/services", async (HttpContext ctx, IQueryExecutor executor, StorageEngine storage, QueryGuard guard,
             int days = 7) =>
         {
@@ -339,7 +340,7 @@ public static class EndpointMapper
                 {
                     await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
                     {
-                        // Prefer service.name (OTLP), fall back to ApplicationContext (Serilog)
+                        // Prefer the @service header, fall back to ApplicationContext (Serilog)
                         var svc = ev.ServiceName
                             ?? (ev.Properties?.TryGetValue("ApplicationContext", out var v) == true
                                 ? v?.ToString() : null);

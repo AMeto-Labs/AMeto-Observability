@@ -33,7 +33,7 @@ public sealed class GroupKeySpec(string property, string alias)
 
 /// <summary>
 /// A query that answers with a TABLE rather than a list of events:
-/// <c>select count(*) where @l = 'Error' group by ['service.name'] limit 20</c>.
+/// <c>select count(*) where @l = 'Error' group by @service limit 20</c>.
 ///
 /// <para>The <c>where</c> clause is kept as its original text rather than a parsed tree, so the
 /// scan it drives is the ordinary one — same compilation, same index hints, same level pruning,

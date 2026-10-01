@@ -75,13 +75,13 @@ public static class AggregationParser
     public static AggregationQuery Parse(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
-            throw new FormatException("Expected an aggregation, for example: select count(*) group by ['service.name'].");
+            throw new FormatException("Expected an aggregation, for example: select count(*) group by @service.");
 
         var tokens = new Lexer(text).Tokenise();
         if (tokens.Count == 0 || !IsWord(tokens[0], "select"))
             throw new FormatException(
                 "Not an aggregation — it has to start with 'select', for example: " +
-                "select count(*) group by ['service.name'].");
+                "select count(*) group by @service.");
 
         return new Parser(tokens, text).Parse();
     }
