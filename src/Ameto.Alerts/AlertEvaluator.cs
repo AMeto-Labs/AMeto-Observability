@@ -94,11 +94,13 @@ public sealed class AlertEvaluator : IAsyncDisposable
         foreach (var m in _persist.LoadMaintenance())
             _maintenance[m.Id] = m;
 
-        foreach (var (ruleId, state, lastValue, pending, fired) in _persist.LoadStates())
+        foreach (var (ruleId, state, lastValue, pending, fired, evaluated) in _persist.LoadStates())
             _states[ruleId] = new MutableState
             {
                 State = state, LastValue = lastValue, PendingSince = pending,
                 LastFiredAt = fired, Notified = state == AlertState.Firing,
+                // When it was last evaluated, so a Pending rule's For credit survives the restart (#94).
+                EvaluatedAt = evaluated ?? default, PersistedEvaluatedAt = evaluated,
             };
 
         var hist = _persist.LoadHistory(HistoryCapacity);
@@ -373,27 +375,51 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// WAS the previous cycle. The comparison is to the previous cycle's time, not to a fixed
     /// interval, so a slow cycle costs no rule its credit.</para>
     ///
-    /// <para><b>Across a restart</b>, the same rule, and it restarts the clock: a Pending state restored
-    /// from disk carries its <c>PendingSince</c> but not when it was last evaluated (nothing persists
-    /// that per tick), so nothing after <c>PendingSince</c> is known to have been seen. Before this, a
-    /// rule Pending for a minute before a ten-minute restart fired on the first tick after it; now it
-    /// waits out <c>For</c> again from the first tick that sees the breach — later by at most
-    /// <c>For</c>, never earlier.</para>
+    /// <para><b>Across a restart, the same rule.</b> A Pending state is persisted with the time the rule
+    /// was last evaluated (<c>alert_state.evaluated_ticks</c>, written on every Pending tick — see
+    /// <see cref="PersistEvaluationIfDue"/>), and restored with it, so a restart is a run of skipped
+    /// ticks like any other: the downtime adds nothing, the credit seen before it is kept, and the
+    /// first tick after it that sees the breach resumes the count. Resetting instead — the rule
+    /// between 1d8d777 and this — meant a server restarting more often than <c>For</c> never fired a
+    /// Pending rule at all (#106 review F1); counting the downtime, as main did before #94, fired a
+    /// rule pending a minute before a ten-minute restart on the first tick after it.</para>
+    ///
+    /// <para>When the last evaluation is NOT known — a row written before the column existed, or one an
+    /// older build rewrote without it, which then reads as older than <c>PendingSince</c> — nothing
+    /// after <c>PendingSince</c> is known to have been seen, and the clock restarts at this tick:
+    /// later by at most <c>For</c>, never earlier.</para>
     /// </summary>
     private DateTimeOffset HeldPastUnobservedTicks(DateTimeOffset since, DateTimeOffset lastEvaluated, DateTimeOffset now)
     {
-        // Restored from disk: nothing after `since` is known to have been seen, so the clock restarts
-        // at THIS tick — not at the previous cycle, which in this process may itself have skipped the
-        // rule (a store still loading, a failed read) and would credit an interval nobody saw.
-        if (lastEvaluated == default) return now;
-        DateTimeOffset previousTick = _previousCycleAt ?? now;
+        if (lastEvaluated == default || lastEvaluated < since) return now;
+        DateTimeOffset previousTick = _previousCycleAt ?? now;   // none yet in this process: this one
         return previousTick > lastEvaluated ? since + (previousTick - lastEvaluated) : since;
+    }
+
+    /// <summary>
+    /// The least time between two writes of a Pending rule's evaluation time (<see cref="PersistEvaluationIfDue"/>):
+    /// ticks are fifteen seconds apart, so in practice this is one write per Pending rule per tick, and
+    /// only a cycle driven twice within a second (a test, a manual re-run) is coalesced.
+    /// </summary>
+    private static readonly TimeSpan EvaluationPersistInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Writes a Pending rule's state with its evaluation time when the last write of it is at least
+    /// <see cref="EvaluationPersistInterval"/> old — what a restart restores its <c>For</c> credit from
+    /// (see <see cref="HeldPastUnobservedTicks"/>). Only Pending rules: an Ok or Firing rule's
+    /// evaluation time changes nothing a restart decides, and a state change is written anyway.
+    /// </summary>
+    private void PersistEvaluationIfDue(string ruleId, MutableState st, DateTimeOffset now)
+    {
+        if (st.State != AlertState.Pending) return;
+        if (st.PersistedEvaluatedAt is { } last && now - last < EvaluationPersistInterval && now >= last) return;
+        PersistState(ruleId, st);
     }
 
     private void Transition(AlertRule rule, double value, DateTimeOffset now)
     {
         var st = _states.GetOrAdd(rule.Id, _ => new MutableState());
-        var lastEvaluated = st.EvaluatedAt;   // before this tick; default: never, in this process
+        var lastEvaluated = st.EvaluatedAt;   // before this tick; default: never (or not known, restored from an older row)
         st.LastValue   = value;
         st.EvaluatedAt = now;
         var prevState  = st.State;
@@ -470,10 +496,15 @@ public sealed class AlertEvaluator : IAsyncDisposable
         if (st.State != AlertState.Firing) { st.Notified = false; st.FiringSince = null; st.Escalated = false; }
 
         if (st.State != prevState) PersistState(rule.Id, st);
+        else                       PersistEvaluationIfDue(rule.Id, st, now);   // the For credit a restart restores (#94)
     }
 
-    private void PersistState(string ruleId, MutableState st) =>
-        _persist.SaveState(ruleId, st.State, st.LastValue, st.PendingSince, st.LastFiredAt);
+    private void PersistState(string ruleId, MutableState st)
+    {
+        DateTimeOffset? evaluated = st.EvaluatedAt == default ? null : st.EvaluatedAt;
+        _persist.SaveState(ruleId, st.State, st.LastValue, st.PendingSince, st.LastFiredAt, evaluated);
+        st.PersistedEvaluatedAt = evaluated;
+    }
 
     private void Dispatch(AlertRule rule, AlertState state, double value, DateTimeOffset now, bool escalation = false)
     {
@@ -954,6 +985,8 @@ public sealed class AlertEvaluator : IAsyncDisposable
         public DateTimeOffset? PendingSince;
         public DateTimeOffset? LastFiredAt;
         public DateTimeOffset  EvaluatedAt;
+        /// <summary>The evaluation time last written to <c>alert_state</c>; see <c>PersistEvaluationIfDue</c>.</summary>
+        public DateTimeOffset? PersistedEvaluatedAt;
         public bool            Notified;
         public DateTimeOffset? AckedAt;
         public string?         AckedBy;

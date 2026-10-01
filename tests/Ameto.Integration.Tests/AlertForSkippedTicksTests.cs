@@ -124,46 +124,76 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// The same rule across a restart, where it RESTARTS the clock: the state comes back from disk
-    /// with its PendingSince and without the time it was last evaluated, so nothing after PendingSince
-    /// is known to have been seen. Before, a rule Pending when the process stopped fired on the first
-    /// tick after a ten-minute restart; now it waits out For from that tick.
+    /// A restart is a run of skipped ticks (#94, #106 review F1): the state comes back from disk WITH
+    /// the time the rule was last evaluated, so the downtime adds nothing and the 30 s seen before it
+    /// are kept. Ten minutes later the first tick resumes at 30 s, the next makes 45, the one after
+    /// fires. Before #94 the downtime counted and the first tick fired; between 1d8d777 and this the
+    /// credit was thrown away and the count started over.
     /// </summary>
     [Fact]
-    public async Task A_restart_does_not_count_toward_For_either()
+    public async Task A_restart_keeps_the_credit_seen_before_it_and_does_not_count_the_downtime()
     {
         await using (var before = NewEvaluator())
         {
-            await before.EvaluateOnceAsync(At(0));
+            for (int t = 0; t <= 2; t++) await before.EvaluateOnceAsync(At(t));
             Assert.Equal(AlertState.Pending, StateOf(before).State);
         }
 
         await using var after = NewEvaluator();
         Assert.Equal(AlertState.Pending, StateOf(after).State);   // restored from disk
         Assert.Equal(At(0), StateOf(after).PendingSince);
+        Assert.Equal(At(2), StateOf(after).EvaluatedAt);         // and when it was last seen
 
         await after.EvaluateOnceAsync(At(40));   // ten minutes later
         Assert.Equal(AlertState.Pending, StateOf(after).State);
-        Assert.Equal(At(40), StateOf(after).PendingSince);
+        Assert.Equal(At(0) + (At(40) - At(2)), StateOf(after).PendingSince);   // 30 s held, the downtime skipped
 
-        for (int t = 41; t <= 43; t++) await after.EvaluateOnceAsync(At(t));
+        await after.EvaluateOnceAsync(At(41));
         Assert.Equal(AlertState.Pending, StateOf(after).State);   // 45 s seen
-        await after.EvaluateOnceAsync(At(44));
+        await after.EvaluateOnceAsync(At(42));
         Assert.Equal(AlertState.Firing, StateOf(after).State);    // 60 s seen
     }
 
     /// <summary>
-    /// The restart again, with the first tick after it SKIPPING the rule — a store still loading, a
-    /// read that failed. The clock restarts at the first tick that sees the breach, not at the cycle
-    /// before it: counting from the skipped tick credited 15 s nobody saw.
+    /// THE REVIEW'S SCENARIO (#106 F1): For 60 s, the breach seen on every tick, the server restarting
+    /// every 45 s — three ticks a life. The second life's third tick has seen 60 s, and fires. While a
+    /// restart reset the clock, every life started over at 0 and the rule was still Pending after ten
+    /// lives; on main before #94 it fired on the second life's first tick, the downtime counted.
     /// </summary>
     [Fact]
-    public async Task After_a_restart_the_clock_starts_at_the_first_tick_that_sees_the_breach()
+    public async Task A_server_restarting_more_often_than_For_still_fires()
     {
-        await using (var before = NewEvaluator())
-            await before.EvaluateOnceAsync(At(0));
+        int tick = 0;
+        for (int life = 1; life <= 4; life++)
+        {
+            await using var evaluator = NewEvaluator();
+            for (int t = 0; t < 3; t++, tick++)
+            {
+                await evaluator.EvaluateOnceAsync(At(tick));
+                if (StateOf(evaluator).State == AlertState.Firing)
+                {
+                    Assert.Equal((2, 2), (life, t));   // the second life's last tick: 30 s + 30 s seen
+                    return;
+                }
+            }
+        }
+        Assert.Fail("a rule whose breach was seen on every tick never fired across four restarts");
+    }
+
+    /// <summary>
+    /// A state row WITHOUT an evaluation time — written before the column existed — says nothing about
+    /// what was seen after PendingSince, so the clock restarts at the first tick that sees the breach;
+    /// and when the first tick after the restart SKIPS the rule (a store still loading, a failed
+    /// read), not at that skipped tick: counting from it would credit 15 s nobody saw.
+    /// </summary>
+    [Fact]
+    public async Task A_state_from_before_the_evaluation_column_restarts_the_clock_at_the_first_tick_that_sees_the_breach()
+    {
+        new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance)
+            .SaveState("spans", AlertState.Pending, 20, pendingSince: At(0), lastFired: null);   // no evaluation time
 
         await using var after = NewEvaluator();
+        Assert.Equal(AlertState.Pending, StateOf(after).State);
         _traces.Failing = true;
         await after.EvaluateOnceAsync(At(40));   // the first tick after the restart: skipped
         _traces.Failing = false;
@@ -173,9 +203,40 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
         Assert.Equal(At(41), StateOf(after).PendingSince);
 
         for (int t = 42; t <= 44; t++) await after.EvaluateOnceAsync(At(t));
-        Assert.Equal(AlertState.Pending, StateOf(after).State);   // 45 s seen: was Firing, on 60 s counted from tick 40
+        Assert.Equal(AlertState.Pending, StateOf(after).State);   // 45 s seen
         await after.EvaluateOnceAsync(At(45));
         Assert.Equal(AlertState.Firing, StateOf(after).State);    // 60 s seen
+    }
+
+    /// <summary>
+    /// The migration: an <c>alert_state</c> table created before <c>evaluated_ticks</c> existed gains the
+    /// column in place when the persistence opens, its rows read back with no evaluation time, and a
+    /// write then carries one. Opening it again changes nothing.
+    /// </summary>
+    [Fact]
+    public void An_alert_state_table_from_before_the_column_is_migrated_in_place()
+    {
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={Path.Combine(_dir, "Ameto.db")};Pooling=False"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE alert_state (
+                    rule_id TEXT PRIMARY KEY, state INTEGER NOT NULL, last_value REAL NOT NULL,
+                    pending_ticks INTEGER, fired_ticks INTEGER);
+                INSERT INTO alert_state VALUES ('old', 1, 7, 638000000000000000, NULL);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
+        var persist = new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance);
+        var old = Assert.Single(persist.LoadStates());
+        Assert.Equal(("old", AlertState.Pending, (DateTimeOffset?)null), (old.RuleId, old.State, old.Evaluated));
+
+        persist.SaveState("old", AlertState.Pending, 7, old.Pending, null, evaluatedAt: At(3));
+        var again = Assert.Single(new AlertPersistence(_dir, NullLogger<AlertPersistence>.Instance).LoadStates());
+        Assert.Equal(At(3), again.Evaluated);
+        Assert.Equal(old.Pending, again.Pending);
     }
 
     /// <summary>A trace store answering 20 spans, or failing the read while <see cref="Failing"/> is set.</summary>
