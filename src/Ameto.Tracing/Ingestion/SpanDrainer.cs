@@ -278,13 +278,14 @@ internal sealed class SpanDrainer : IAsyncDisposable
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                // THE FINAL DRAIN IS THE ONE WRITE THE LOOP DOES NOT GUARD: a batch that throws in the
-                // main loop is logged and the loop goes on, but a throw out of the "drain remaining
-                // items" pass ends the task. Letting it out of here skipped the flush below — the
-                // spans that drain had already put in the tier were then left to the engine's own
-                // teardown, which the host timeout may cut short — and threw out of a disposal the
-                // host runs on two chains at once. Logged, then the tier is flushed all the same.
-                _logger.LogError(ex, "SpanDrainer: the final drain at shutdown failed; flushing what reached the hot tier");
+                // A DRAIN TASK THAT ENDED IN A FAULT. Both drains now catch per batch, so a write
+                // that throws no longer gets here; what still can is a fault outside them — the park
+                // throwing something other than a cancellation, a logger that throws. Letting it out
+                // of here skipped the flush below — the spans already in the tier were then left to
+                // the engine's own teardown, which the host timeout may cut short — and threw out of
+                // a disposal the host runs on two chains at once. Logged, then the tier is flushed
+                // all the same.
+                _logger.LogError(ex, "SpanDrainer: the drain loop ended in a fault; flushing what reached the hot tier");
             }
 
             // Final flush so spans drained from the ring buffer at shutdown reach disk

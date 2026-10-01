@@ -160,23 +160,22 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
     }
 
     /// <summary>
-    /// A FINAL DRAIN THAT THROWS STILL ENDS IN THE DRAINER'S OWN FLUSH (#94). The main loop logs a
-    /// batch that throws and goes on; the "drain remaining items" pass after it does not, so its
-    /// throw ends the drain task, and <c>DisposeAsync</c> caught only
-    /// <c>OperationCanceledException</c> around the join: the exception left the disposal and the
-    /// <c>FlushHotTier</c> after it never ran.
+    /// A DRAIN LOOP THAT ENDS IN A FAULT STILL ENDS IN THE DRAINER'S OWN FLUSH (#94, review F3).
+    /// <c>DisposeAsync</c> caught only <c>OperationCanceledException</c> around the join: any other
+    /// exception out of the drain task left the disposal, and the <c>FlushHotTier</c> after it never
+    /// ran. bd43e15 met it through a final drain that threw; both drains now catch per batch (the
+    /// next fact), so what can still fault the task is a throw outside them.
     ///
-    /// <para>At the seams: the park seam publishes one span and cancels the loop, so the only write
-    /// in the test is the final drain's; the engine's after-hold seam throws from inside that write,
-    /// after the span is in the hot tier — the shape of any failure past the tier insert.</para>
+    /// <para>At the seams: the first park publishes one span and returns, so the loop writes it into
+    /// the hot tier; the second park — the loop is idle again — throws an
+    /// <see cref="InvalidOperationException"/>, which no catch in the loop takes, and the task
+    /// faults. The span is then in the tier and nowhere else.</para>
     ///
-    /// <para>Reverted (only the cancellation caught): <c>DisposeAsync</c> throws the seam's
-    /// exception, and the span is still in the hot tier with no cold segment. Since the final drain
-    /// catches per batch (the next fact), the throw no longer reaches the join here; the join's own
-    /// catch stays for anything else that ends the drain task.</para>
+    /// <para>Reverted (only the cancellation caught at the join): <c>DisposeAsync</c> throws the
+    /// seam's exception, and the span is still in the hot tier with no cold segment.</para>
     /// </summary>
     [Fact]
-    public async Task A_final_drain_that_throws_is_logged_and_the_tier_is_still_flushed()
+    public async Task A_drain_loop_that_faults_is_logged_and_the_tier_is_still_flushed()
     {
         var pools = new SpanStringPools();
         using var ring   = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024, pools);
@@ -184,40 +183,38 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
         var trace  = new TraceId(0xD2A3, 11);
         var logger = new CapturingLogger();
 
-        int throws = 0;
-        engine._afterWriteHoldForTest = _ =>
-        {
-            // Only the final drain writes here; its span is in the tier by now.
-            if (Interlocked.Increment(ref throws) == 1)
-                throw new InvalidOperationException("final-drain fault (test seam)");
-        };
-
         int parks = 0;
-        var cancelledWhileParking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var faulted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // `await using` after the ring and the engine, as above: the loop is joined before the ring is freed.
         await using var drainer = new SpanDrainer(ring, engine, logger, startLoop: true,
-            beforeParkForTest: cts =>
+            beforeParkForTest: _ =>
             {
-                if (Interlocked.Increment(ref parks) != 1) return;
-                var h = new SpanHeader
+                int park = Interlocked.Increment(ref parks);
+                if (park == 1)
                 {
-                    TraceId           = trace,
-                    SpanId            = new SpanId(1),
-                    StartTimeUnixNano = 1_785_000_000_000_000_000L,
-                    DurationNanos     = 1_000,
-                    Kind              = SpanKind.Server,
-                };
-                Assert.True(ring.TryEnqueueRaw(in h, "GET /faulted"u8, -1, "gateway"u8, []));
-                ring.EndBatch();
-                cts.Cancel();
-                cancelledWhileParking.TrySetResult();
+                    var h = new SpanHeader
+                    {
+                        TraceId           = trace,
+                        SpanId            = new SpanId(1),
+                        StartTimeUnixNano = 1_785_000_000_000_000_000L,
+                        DurationNanos     = 1_000,
+                        Kind              = SpanKind.Server,
+                    };
+                    Assert.True(ring.TryEnqueueRaw(in h, "GET /faulted"u8, -1, "gateway"u8, []));
+                    ring.EndBatch();
+                    return;                                       // the loop drains it into the tier
+                }
+                if (park != 2) return;
+                faulted.TrySetResult();
+                throw new InvalidOperationException("park fault (test seam)");
             });
 
-        await cancelledWhileParking.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await faulted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.True(engine.HotBytesForTest > 0, "the span did not reach the hot tier before the fault");
         var disposal = await Record.ExceptionAsync(() => drainer.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
 
         Assert.Null(disposal);                                   // the fault stayed inside the disposal
-        Assert.Equal(1, Volatile.Read(ref throws));              // and it did happen, in the final drain
+        Assert.Equal(2, Volatile.Read(ref parks));               // the loop parked twice, and the second one faulted it
         Assert.Equal(0, engine.HotBytesForTest);                 // the drainer's own flush ran
         Assert.Equal(1, engine.ColdSegmentCountForTest);
         Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error
