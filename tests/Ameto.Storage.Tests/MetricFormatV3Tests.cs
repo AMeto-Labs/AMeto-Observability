@@ -311,6 +311,40 @@ public sealed class MetricFormatV3Tests : IDisposable
         Assert.Equal([a, b], infos.Select(i => MetricReader.ReadSegmentInfo(i.FilePath).MetricName));
     }
 
+    /// <summary>
+    /// <c>PointsForWrite</c> reads a series' list without its lock, which is sound only for a series
+    /// nothing appends to (#106 review, F3): a drain's snapshot or a list-built batch, never a live
+    /// series from the hot tier. A Debug build asserts it; here the assertion is turned into an
+    /// exception for the duration of the call. Debug only — the assertion compiles away in Release.
+    /// </summary>
+#if DEBUG
+    [Fact]
+#else
+    [Fact(Skip = "Debug.Assert compiles away in Release.")]
+#endif
+    public void Reading_a_live_series_for_the_writer_asserts_in_Debug()
+    {
+        var live     = new HotSeries(new LabelSet(new Dictionary<string, string> { ["k"] = "v" }));
+        var snapshot = new HotSeries([new MetricDataPoint { TimestampUnixNano = 1, Value = 1 }]);
+
+        var listener = new ThrowingListener();
+        System.Diagnostics.Trace.Listeners.Insert(0, listener);   // Debug.Assert reports through these
+        try
+        {
+            Assert.Equal(1, snapshot.PointsForWrite().Length);
+            var ex = Assert.Throws<InvalidOperationException>(() => { _ = live.PointsForWrite().Length; });
+            Assert.Contains("live series", ex.Message);
+        }
+        finally { System.Diagnostics.Trace.Listeners.Remove(listener); }
+    }
+
+    private sealed class ThrowingListener : System.Diagnostics.TraceListener
+    {
+        public override void Fail(string? message, string? detailMessage) => throw new InvalidOperationException(message);
+        public override void Write(string? message) { }
+        public override void WriteLine(string? message) { }
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {

@@ -3386,6 +3386,7 @@ internal sealed class HotSeries
     {
         _points = points;
         Bounds  = bounds;
+        _snapshot = true;   // a list somebody else built: nothing appends to it
 
         ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points);
         for (int i = 1; i < all.Length; i++)
@@ -3397,6 +3398,7 @@ internal sealed class HotSeries
         _points     = points;
         Bounds      = bounds;
         _outOfOrder = outOfOrder;
+        _snapshot   = true;
     }
 
     /// <summary>
@@ -3456,6 +3458,13 @@ internal sealed class HotSeries
     /// empty list. Read and written under <see cref="_lock"/>.
     /// </summary>
     private bool _outOfOrder;
+
+    /// <summary>
+    /// Built over a list somebody handed over — the drain's (<see cref="FromDrain"/>), a rewrite's
+    /// batch, a test's — and never published into <c>_hot</c>, so nothing appends to it: the one kind
+    /// of series <see cref="PointsForWrite"/> may read without its lock. False for a live series.
+    /// </summary>
+    private readonly bool _snapshot;
 
     public void Append(MetricDataPoint p, double[]? bounds, long nowUtcTicks)
     {
@@ -3545,6 +3554,10 @@ internal sealed class HotSeries
     /// </summary>
     internal ReadOnlySpan<MetricDataPoint> PointsForWrite()
     {
+        // The rule above, checked where it can be (#106 review, F3): a live series' list grows
+        // under the span — torn points written with no error.
+        System.Diagnostics.Debug.Assert(_snapshot,
+            "PointsForWrite on a live series: its list can grow under the span the writer reads");
         lock (_lock)
         {
             ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_points);
