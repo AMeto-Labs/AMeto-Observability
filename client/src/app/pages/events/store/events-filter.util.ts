@@ -13,13 +13,71 @@ export const PREFIX_RE = /[@A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/
 const LEVEL_CLAUSE_RE =
   /@l\s+not\s+in\s*\[[^\]]*\]|@l\s+in\s*\[[^\]]*\]|@l\s*(?:<>|!=|=)\s*'[^']*'/gi;
 
+// ── The services picker's clause ────────────────────────────────────────────
+//
+// The picker owns ONE clause: a top-level AND conjunct `@service = '…'` / `@service in […]` —
+// or the `['service.name']` spelling it wrote before, which saved searches, history and shared
+// URLs still carry. Only such a conjunct is a SELECTION: it constrains every row. The same text
+// under a `not`, or beside a top-level `or`, does not, and reading it as one hid rows the server
+// had rightly returned. The field names are matched ORDINALLY, as the server matches its aliases
+// (`@SERVICE` is a user property there); the `in` keyword, like every keyword, in any case.
+
+/** `@service = 'x'` — either spelling of the field; group 1 is the service. */
+const SERVICE_EQ_CLAUSE = /^(?:@service|\['service\.name'\])\s*=\s*'([^']+)'$/;
+
+/** `@service in ['a', 'b']` — either spelling; group 1 is the list body. */
+const SERVICE_IN_CLAUSE = /^(?:@service|\['service\.name'\])\s+[Ii][Nn]\s*\[([^\]]+)\]$/;
+
+/** The quoted items of an `in […]` list body. */
+const QUOTED_ITEM = /'([^']+)'/g;
+
+/** The picker's oldest clause, `(service.name = 'x' or ApplicationContext = 'x')`: replaced, never read. */
+const LEGACY_SERVICE_OR_CLAUSE =
+  /^\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)$/;
+
+/** A top-level connective at the scan position: whitespace, `and`/`or`, whitespace. */
+const CONNECTIVE_AT = /^\s+(and|or)\s+/i;
+
 /**
- * Matches the service clause for splicing: the `@service = …` / `@service in […]` this page
- * writes, and the forms it wrote before — `['service.name'] = …` / `in […]` and the older
- * OR-form — which saved searches, history and shared URLs still carry.
+ * The top-level AND conjuncts of `expr` — split outside quotes, brackets and parentheses — or
+ * null when `expr` has a top-level `or`, where no single conjunct constrains every row.
  */
-const SERVICE_CLAUSE_RE =
-  /@service\s*=\s*'[^']*'|@service\s+in\s*\[[^\]]*\]|\['service\.name'\]\s*=\s*'[^']*'|\['service\.name'\]\s*in\s*\[[^\]]*\]|\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)/g;
+function topLevelConjuncts(expr: string): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let start = 0;
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i];
+    if (quoted) {
+      if (c === '\\') i++;                                   // \' escapes a quote
+      else if (c === "'") {
+        if (expr[i + 1] === "'") i++;                        // '' is a quote too
+        else quoted = false;
+      }
+      continue;
+    }
+    if (c === "'") { quoted = true; continue; }
+    if (c === '(' || c === '[') { depth++; continue; }
+    if (c === ')' || c === ']') { depth--; continue; }
+    if (depth !== 0 || !/\s/.test(c)) continue;
+    const m = CONNECTIVE_AT.exec(expr.slice(i));
+    if (!m) continue;
+    if (m[1].toLowerCase() === 'or') return null;
+    parts.push(expr.slice(start, i).trim());
+    i += m[0].length - 1;
+    start = i + 1;
+  }
+  parts.push(expr.slice(start).trim());
+  return parts.filter(p => p.length > 0);
+}
+
+/** True for a conjunct the picker writes, or wrote in an earlier spelling. */
+function isServiceClause(conjunct: string): boolean {
+  return SERVICE_EQ_CLAUSE.test(conjunct)
+      || SERVICE_IN_CLAUSE.test(conjunct)
+      || LEGACY_SERVICE_OR_CLAUSE.test(conjunct);
+}
 
 /** Milliseconds between .NET DateTime min (0001-01-01 UTC) and Unix epoch (1970-01-01 UTC). */
 const DOTNET_TICKS_UNIX_EPOCH_MS = 62_135_596_800_000;
@@ -157,19 +215,18 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
   return ALL_LEVELS();
 }
 
-/** The service field as the picker's clauses spell it: `@service`, or the older `['service.name']`. */
-const SERVICE_FIELD = String.raw`(?:@service|\['service\.name'\])`;
-
-/** Selected service names in a filter expression (either spelling of the service clause). */
+/**
+ * The services the filter SELECTS: those named by the picker's clause when it is a top-level AND
+ * conjunct (either spelling). Empty — "all services" — when there is none, including when the
+ * clause sits under a `not` or beside a top-level `or`, where it selects nothing.
+ */
 export function parseServicesFromFilter(expr: string): Set<string> {
-  const inMatch = expr.match(new RegExp(String.raw`${SERVICE_FIELD}\s+in\s*\[([^\]]+)\]`, 'i'));
-  if (inMatch) {
-    const svcs = new Set<string>();
-    for (const m of inMatch[1].matchAll(/'([^']+)'/g)) svcs.add(m[1]);
-    return svcs;
+  for (const conjunct of topLevelConjuncts(expr) ?? []) {
+    const inMatch = SERVICE_IN_CLAUSE.exec(conjunct);
+    if (inMatch) return new Set([...inMatch[1].matchAll(QUOTED_ITEM)].map(m => m[1]));
+    const eqMatch = SERVICE_EQ_CLAUSE.exec(conjunct);
+    if (eqMatch) return new Set([eqMatch[1]]);
   }
-  const eqMatch = expr.match(new RegExp(String.raw`${SERVICE_FIELD}\s*=\s*'([^']+)'`, 'i'));
-  if (eqMatch) return new Set([eqMatch[1]]);
   return new Set<string>();
 }
 
@@ -190,14 +247,19 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 }
 
 /**
- * Rewrites the service clause of `expr` as `@service = …` / `@service in […]` — the built-in
- * field's own name, which the server answers from the event header and its index. A clause in
- * the older `['service.name']` spelling is replaced, not duplicated. Placed after any `@l`
- * clause, before the rest of the user's expression.
+ * Rewrites the picker's service clause of `expr` as `@service = …` / `@service in […]` — the
+ * built-in field's own name, which the server answers from the event header and its index. Only
+ * the picker's own clause (a top-level AND conjunct, in either spelling) is replaced — never
+ * duplicated — and a service test the user wrote under a `not` or inside an `or` is left as
+ * written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
+ * all of it. Placed after any `@l` clause, before the rest of the user's expression.
  */
 export function setServicesClause(expr: string, svcs: Set<string>): string {
-  const stripped = stripFilterClause(expr, SERVICE_CLAUSE_RE);
-  if (svcs.size === 0) return stripped;
+  const conjuncts = topLevelConjuncts(expr);
+  const stripped = conjuncts
+    ? conjuncts.filter(c => !isServiceClause(c)).join(' and ')
+    : `(${expr.trim()})`;
+  if (svcs.size === 0) return conjuncts ? stripped : expr.trim();
   const clause = svcs.size === 1
     ? `@service = '${[...svcs][0]}'`
     : `@service in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;

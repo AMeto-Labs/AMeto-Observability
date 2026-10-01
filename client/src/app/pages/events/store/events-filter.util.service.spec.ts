@@ -37,6 +37,29 @@ describe('the service clause the events page writes', () => {
     expect(setServicesClause("@service in ['a', 'b'] and Region = 'eu'", new Set())).toBe("Region = 'eu'");
     expect(setServicesClause("['service.name'] = 'a'", new Set())).toBe('');
   });
+
+  it('leaves a negated service test as the user wrote it', () => {
+    expect(setServicesClause("not @service = 'x' and Region = 'eu'", new Set(['a'])))
+      .toBe("@service = 'a' and not @service = 'x' and Region = 'eu'");
+    expect(setServicesClause("not @service = 'x'", new Set())).toBe("not @service = 'x'");
+  });
+
+  it('ANDs the selection with a whole top-level or, instead of tearing a branch out of it', () => {
+    expect(setServicesClause("@service = 'a' or @l = 'Fatal'", new Set(['b'])))
+      .toBe("@service = 'b' and (@service = 'a' or @l = 'Fatal')");
+    expect(setServicesClause("@service = 'a' or @l = 'Fatal'", new Set())).toBe("@service = 'a' or @l = 'Fatal'");
+  });
+
+  it('does not split at an and inside quotes, brackets or parentheses', () => {
+    expect(setServicesClause("Msg = 'x and y' and @service = 'a'", new Set(['b'])))
+      .toBe("@service = 'b' and Msg = 'x and y'");
+    expect(setServicesClause("(A = 1 and B = 2) and @service = 'a'", new Set()))
+      .toBe('(A = 1 and B = 2)');
+  });
+
+  it('matches the field ordinally, as the server does: @SERVICE is a user property', () => {
+    expect(setServicesClause("@SERVICE = 'x'", new Set(['a']))).toBe("@service = 'a' and @SERVICE = 'x'");
+  });
 });
 
 describe('reading the selected services back out of a filter', () => {
@@ -53,6 +76,21 @@ describe('reading the selected services back out of a filter', () => {
   it('does not read an exclusion as a selection', () => {
     expect(parseServicesFromFilter("@service <> 'api'").size).toBe(0);
     expect(parseServicesFromFilter("@service != 'api'").size).toBe(0);
+    expect(parseServicesFromFilter("not @service = 'api'").size).toBe(0);
+  });
+
+  it('reads nothing as a selection beside a top-level or', () => {
+    expect(parseServicesFromFilter("@service = 'a' or @l = 'Fatal'").size).toBe(0);
+    expect(parseServicesFromFilter("@l = 'Fatal' or @service in ['a', 'b']").size).toBe(0);
+  });
+
+  it('reads a selection inside an and that nests an or', () => {
+    expect([...parseServicesFromFilter("(@l = 'Error' or @l = 'Fatal') and @service = 'a'")]).toEqual(['a']);
+  });
+
+  it('matches the field ordinally and the in keyword in any case', () => {
+    expect(parseServicesFromFilter("@SERVICE = 'x'").size).toBe(0);
+    expect([...parseServicesFromFilter("@service IN ['a']")]).toEqual(['a']);
   });
 
   it('round-trips what it writes', () => {

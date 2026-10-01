@@ -26,6 +26,9 @@ const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
  */
 const EMPTY_IDS: ReadonlySet<string> = new Set<string>();
 
+/** "No client-side service narrowing" — see displayedEvents. Never mutated. */
+const EMPTY_SERVICES: ReadonlySet<string> = new Set<string>();
+
 /**
  * Floor under the live buffer. The server hands over LiveTail.PageSize (500) events per poll,
  * and up to eight times that while a tail is catching up. `pageSize * 4` is 200 at the default
@@ -192,11 +195,20 @@ export const EventsStore = signalStore(
      */
     const isAggregation = computed(() => isAggregationQuery(store.filter()));
 
-    /** Events list — optionally narrowed client-side by service and quick-search. */
+    /**
+     * Events list — narrowed client-side by quick-search, and by the service selection only while
+     * the draft in the box differs from the APPLIED filter. Once applied, the server has already
+     * answered the service clause — case-insensitively, under every spelling, inside `not` and
+     * `or` — and the rows it returned are the answer; filtering them again here could only hide
+     * some. For a draft, the selection is a preview: matched case-insensitively, as the server will.
+     */
     const displayedEvents = computed(() => {
       let evs = store.events();
-      const svcs = selectedServices();
-      if (svcs.size > 0) evs = evs.filter(e => svcs.has(eventService(e) ?? ''));
+      const svcs = store.filterInput() === store.filter() ? EMPTY_SERVICES : selectedServices();
+      if (svcs.size > 0) {
+        const wanted = new Set([...svcs].map(s => s.toLowerCase()));
+        evs = evs.filter(e => wanted.has((eventService(e) ?? '').toLowerCase()));
+      }
       const q = store.quickSearch().trim().toLowerCase();
       if (q) evs = evs.filter(e => (e['@mt'] ?? '').toLowerCase().includes(q));
       return evs;
