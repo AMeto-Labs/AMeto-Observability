@@ -190,6 +190,9 @@ public sealed class QueryWindowPinTests : IAsyncLifetime
     public async Task AMergeUnderARunningQueryParksItsSourcesWithoutAWarningStorm()
     {
         var sources = SegmentPaths();
+        // Only what the scenario logs: the fixture's own start-up is not what this is about, and a
+        // host that warns about something there must not fail it for the wrong reason.
+        int setupWarnings = Warnings(_engineLog).Count;
 
         var it = _query.ExecuteAsync(Request(null, int.MaxValue, forward: false)).GetAsyncEnumerator();
         int rows;
@@ -215,8 +218,9 @@ public sealed class QueryWindowPinTests : IAsyncLifetime
         foreach (var path in sources) Assert.False(File.Exists(path), $"source {Path.GetFileName(path)} outlived the query");
         Assert.Empty(Directory.EnumerateFiles(Path.Combine(_dir, "segments"), "*.mergemanifest"));
 
-        _out.WriteLine($"storage warnings: {Warnings(_engineLog).Count}");
-        Assert.Empty(Warnings(_engineLog));
+        var storageWarnings = Warnings(_engineLog).Skip(setupWarnings).ToList();
+        _out.WriteLine($"storage warnings: {storageWarnings.Count}");
+        Assert.Empty(storageWarnings);
         Assert.Empty(Warnings(_queryLog));
     }
 
