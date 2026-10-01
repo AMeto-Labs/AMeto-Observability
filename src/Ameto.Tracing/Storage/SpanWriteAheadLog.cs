@@ -97,7 +97,9 @@ namespace Ameto.Tracing.Storage;
 /// keeps only entries stamped with the generation the header now carries. Only a crash
 /// landing between the segment write and the moment the commit starts to move the surviving tail
 /// can duplicate spans: from the first byte the move overwrites, the flushed generation is gone
-/// from the log whether or not the commit lives to stamp the header.</para>
+/// from the log whether or not the commit lives to stamp the header. A commit that keeps a short
+/// flushed prefix in place moves nothing (<see cref="PrefixStaysLocked"/>), so for it the window
+/// runs to the stamp itself.</para>
 ///
 /// <para>The generation is assigned by this class under its own write lock, which is what
 /// makes the test sound. An earlier design compared each entry's span START TIME against the
