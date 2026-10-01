@@ -39,7 +39,8 @@ public sealed class SpanWalV2Tests : IDisposable
 
     private string WalPath => Path.Combine(_dir, "spans.wal");
 
-    private const int  FileHeader   = 32;
+    private const int  FileHeader   = 64;   // v3: v2's 32 bytes + the relocation record (#103)
+    private const int  FileHeaderV1 = 32;   // v1 and v2
     private const int  V1EntryHead  = 64;
     private const int  V2EntryHead  = 68;   // 64 checksummed bytes + the CRC
     private const long BaseNano     = 1_784_800_000_000_000_000L;
@@ -181,7 +182,7 @@ public sealed class SpanWalV2Tests : IDisposable
     private void WriteV1Log(uint headerGeneration, params (SpanIngestItem Span, uint Generation)[] entries)
     {
         using var ms = new MemoryStream();
-        ms.Write(new byte[FileHeader]);
+        ms.Write(new byte[FileHeaderV1]);
         foreach (var (s, gen) in entries)
         {
             byte[] name = Encoding.UTF8.GetBytes(s.Name);
@@ -231,7 +232,7 @@ public sealed class SpanWalV2Tests : IDisposable
         List<SpanIngestItem> first;
         using (var wal = SpanWriteAheadLog.Open(WalPath))
         {
-            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
             Assert.Equal(7u, wal.HeaderForTest.Generation);
             first = wal.ReadAll();
             wal.Append(Item(5));
@@ -290,7 +291,7 @@ public sealed class SpanWalV2Tests : IDisposable
         Directory.Delete(WalPath + SpanWriteAheadLog.UpgradeSuffix);
         using (var wal = SpanWriteAheadLog.Open(WalPath))
         {
-            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
             Assert.Equal(2, wal.ReadAll().Count);
         }
     }
@@ -354,7 +355,7 @@ public sealed class SpanWalV2Tests : IDisposable
         // The next start, with the scanner gone: upgraded, and the span appended as v1 came along.
         using (var wal = SpanWriteAheadLog.Open(WalPath))
         {
-            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
             Assert.Equal([101UL, 102UL, 103UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
         }
     }
@@ -381,7 +382,7 @@ public sealed class SpanWalV2Tests : IDisposable
 
         using (var wal = SpanWriteAheadLog.Open(WalPath, 8 * 1024 * 1024, 1 << 20, log, io))
         {
-            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
             Assert.Equal([101UL, 102UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
         }
 
@@ -409,7 +410,7 @@ public sealed class SpanWalV2Tests : IDisposable
         File.WriteAllBytes(WalPath + SpanWriteAheadLog.UpgradeSuffix, [1, 2, 3]);
         using (var wal = SpanWriteAheadLog.Open(WalPath))
         {
-            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
             Assert.Equal([104UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
         }
         Assert.False(File.Exists(WalPath + SpanWriteAheadLog.UpgradeSuffix));

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -20,31 +21,54 @@ namespace Ameto.Tracing.Storage;
 /// to this log is a single span copy into an mmap page, so the segment write is now free
 /// to wait until a batch is actually worth a file.</para>
 ///
-/// Format (v2):
+/// Format (v3):
 /// <code>
-///   [File Header — 32 bytes]
+///   [File Header — 64 bytes; v1's and v2's were the first 32 of them]
 ///     0   Magic              uint32  "RDSW"
-///     4   Version            uint16  2   (1 is still READ: see <see cref="Open(string, long)"/>)
+///     4   Version            uint16  3   (2 and 1 are still READ: see <see cref="Open(string, long, ILogger)"/>)
 ///     6   _pad               uint16
 ///     8   WriteOffset        int64   next byte to write (absolute, includes this header)
 ///    16   Generation         uint32  flush generation, see the crash-recovery note below
 ///    20   _reserved          uint32 + int64
+///    32   MoveFrom           int64   the relocation record: see <see cref="RelocateLocked"/>
+///    40   MoveLength         int64   0 = no relocation in flight
+///    48   MoveDone           int64
+///    56   Crc                uint32  CRC32C over bytes [0, 8) and [16, 56): all but the claim
+///    60   PendingCrc         uint32  the same, of the state a store in progress is writing
 ///
-///   [Entry 0 …]
+///   [Entry 0 …]  — unchanged since v2
 ///     [Entry Header — 64 bytes, Pack = 1, carries the generation it was written under]
 ///     [Crc               — uint32, CRC32C over the 64 header bytes + name + service + attrs]
 ///     [Name UTF-8][ServiceName UTF-8][Attributes msgpack]
 /// </code>
 ///
-/// <para><b>v2 is v1 plus a checksum per entry, and nothing else.</b> v1 had none anywhere: the
-/// bounds check could only say that the declared lengths FIT, so a torn append — pages of an
-/// mmap reaching the disk in whatever order the OS picks — replayed as a span with garbage name,
-/// service and attribute bytes straight into the hot tier. That is the shape the metrics WAL was
-/// poisoned by on the stand, on the third signal. The CRC is stored after the header and written
-/// LAST, over the bytes as they sit in the map, and <see cref="ReadAll"/> stops at the first
-/// entry that does not verify — exactly the rule the logs WAL (v4) follows. A stride that
-/// desynchronises inside a half-relocated front (see <see cref="CommitFlush"/>) now ends the
-/// replay cleanly instead of manufacturing spans.</para>
+/// <para><b>v2 was v1 plus a checksum per entry.</b> v1 had none anywhere: the bounds check could
+/// only say that the declared lengths FIT, so a torn append — pages of an mmap reaching the disk in
+/// whatever order the OS picks — replayed as a span with garbage name, service and attribute bytes
+/// straight into the hot tier. That is the shape the metrics WAL was poisoned by on the stand, on
+/// the third signal. The CRC is stored after the header and written LAST, over the bytes as they
+/// sit in the map, and <see cref="ReadAll"/> stops at the first entry that does not verify —
+/// exactly the rule the logs WAL (v4) follows.</para>
+///
+/// <para><b>v3 is v2 with a header long enough to record a commit's relocation in flight (#103).</b>
+/// <see cref="CommitFlush"/> moves the spans appended during a flush to the front of the log. v2 did
+/// it with one <c>Buffer.MemoryCopy</c>, and a process killed inside that copy left the copies of
+/// the tail up to the copy front, one entry torn by the front, and the untouched originals behind
+/// it — under the old header, whose claim still covered all of it. The replay read the copies,
+/// stopped at the torn entry (v2's checksum made that certain), and truncated the log there: the
+/// originals behind the front — spans acknowledged to the exporter and in no segment — were never
+/// replayed again and were overwritten by the next appends. The move is now recorded in the header
+/// before its first byte, made in chunks that a redo can repeat exactly, and finished by the next
+/// open before anything is replayed (<see cref="RelocateLocked"/>,
+/// <see cref="FinishRelocationLocked"/>). The entries did not change: an upgraded v2 log is its
+/// entries, byte for byte, behind a longer header.</para>
+///
+/// <para><b>The v3 header carries its own checksum.</b> One field of it can hide every entry without
+/// any entry being wrong: a rotted or copied <see cref="WalFileHeader.Generation"/> that is neither
+/// the entries' generation nor its predecessor makes the replay skip them all, silently — and a
+/// rotted record would move bytes. A header that does not verify has its generation rebuilt from
+/// the entries, which carry checksums of their own, and its record is acted on only in a state a
+/// commit can leave (<see cref="SealHeaderLocked"/>, <see cref="FinishRelocationLocked"/>).</para>
 ///
 /// <para><b>Names and services longer than 65 535 bytes are logged EMPTY.</b> v2 kept v1's 16-bit
 /// <c>NameLength</c> and <c>ServiceLength</c>, and an append clamps such a field out of the log
@@ -55,18 +79,27 @@ namespace Ameto.Tracing.Storage;
 /// <para><b>Durability, stated because it is a choice.</b> Appends are not fsynced — not per
 /// span and not on a timer. There is NO PERIODIC FSYNC BETWEEN SEGMENT FLUSHES: the two
 /// flushes in <see cref="CommitFlush"/> are the only points at which this log is forced to
-/// the platter. The mapping survives the death of this PROCESS (the page cache is the file's
-/// and outlives it); the death of the MACHINE loses whatever the OS had not yet written back,
-/// which can be every span since the last segment flush. The per-entry checksum is what keeps
-/// that loss a clean cut rather than a replay of garbage. (The logs WAL made the other choice,
-/// a timer msync; the trade here was made for the drainer's throughput, and it is this note that
-/// makes it a decision rather than an accident.)</para>
+/// the platter (and the one an open makes after finishing an interrupted relocation). The mapping
+/// survives the death of this PROCESS (the page cache is the file's and outlives it), and since v3
+/// so does a commit killed in the middle of its move: the next open finishes it. The death of the
+/// MACHINE loses whatever the OS had not yet written back, which can be every span since the last
+/// segment flush. The per-entry checksum is what keeps that loss a clean cut rather than a replay of
+/// garbage. What nothing here makes durable is a commit's move across a POWER LOSS: the moved spans
+/// and the header that records the move sit on different pages, and the commit's barrier comes
+/// after the whole move, so the disk can keep a later chunk of it and lose an earlier one — the
+/// spans that arrived during that flush are then lost, as they were before v3. (The logs WAL made
+/// the other choice, a timer msync; the trade here was made for the drainer's throughput, and it is
+/// this note that makes it a decision rather than an accident.)</para>
 ///
 /// <para><b>Crash recovery.</b> A flush writes the segment first and resets the log second,
 /// so a crash between the two would replay spans that are already cold. The flush therefore
 /// bumps <see cref="WalFileHeader.Generation"/> BEFORE zeroing the write offset, and recovery
 /// keeps only entries stamped with the generation the header now carries. Only a crash
-/// landing between the segment write and the generation bump can duplicate spans.</para>
+/// landing between the segment write and the moment the commit starts to move the surviving tail
+/// can duplicate spans: from the first byte the move overwrites, the flushed generation is gone
+/// from the log whether or not the commit lives to stamp the header. A commit that keeps a short
+/// flushed prefix in place moves nothing (<see cref="PrefixStaysLocked"/>), so for it the window
+/// runs to the stamp itself.</para>
 ///
 /// <para>The generation is assigned by this class under its own write lock, which is what
 /// makes the test sound. An earlier design compared each entry's span START TIME against the
@@ -93,17 +126,23 @@ namespace Ameto.Tracing.Storage;
 internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 {
     private const uint   MagicNumber     = 0x52_44_53_57; // "RDSW"
-    private const ushort WalVersion      = 2;
+    private const ushort WalVersion      = 3;
+    private const ushort WalVersionV2    = 2;
     private const ushort WalVersionV1    = 1;
-    private const int    FileHeaderSize  = 32;
+
+    /// <summary>A v3 file header: v2's 32 bytes, then the relocation record and the header's checksums. See <see cref="WalFileHeader"/>.</summary>
+    private const int    FileHeaderSize       = 64;
+
+    /// <summary>A v1 or v2 file header. Its data starts right after it, so such a log's offsets are 32 lower.</summary>
+    private const int    FileHeaderSizeLegacy = 32;
 
     /// <summary>The 64 bytes of <see cref="SpanWalEntryHeader"/> — every field the checksum covers. All of a v1 entry header.</summary>
     private const int    ChecksummedHeaderBytes = 64;
 
-    /// <summary>A v2 entry header: the checksummed 64 bytes, then the CRC32C over them and the payload.</summary>
+    /// <summary>A v2 (and v3) entry header: the checksummed 64 bytes, then the CRC32C over them and the payload.</summary>
     private const int    EntryHeaderSize   = ChecksummedHeaderBytes + sizeof(uint);
 
-    /// <summary>A v1 entry header: no checksum. Read only, and only to upgrade the file it is in.</summary>
+    /// <summary>A v1 entry header: no checksum. Read, and appended only by a log whose upgrade could not commit.</summary>
     private const int    EntryHeaderSizeV1 = ChecksummedHeaderBytes;
 
     /// <summary>8 MB holds ~12k eight-attribute spans; the log is reset on every flush, so it grows only under a burst.</summary>
@@ -112,9 +151,24 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <summary>First generation of a fresh log. 0 is reserved for "never written".</summary>
     private const uint FirstGeneration = 1;
 
-    /// <summary>Where a v1 log is rewritten as v2 before it replaces the original. See <see cref="Open(string, long)"/>.</summary>
+    /// <summary>Where a v1 or v2 log is rewritten as v3 before it replaces the original. See <see cref="Open(string, long, ILogger)"/>.</summary>
     internal const string UpgradeSuffix = ".upgrade.tmp";
 
+    /// <summary>
+    /// The file header. The first 32 bytes are v1's and v2's, byte for byte; the rest exists in v3
+    /// only, and a log that is v1 or v2 on disk never reads or writes past its 32 (see
+    /// <see cref="_headerSize"/>).
+    ///
+    /// <para><b>The relocation record</b> (<see cref="MoveFrom"/>, <see cref="MoveLength"/>,
+    /// <see cref="MoveDone"/>) is what makes a commit's move of the surviving tail safe against the
+    /// process dying in the middle of it. See <see cref="RelocateLocked"/>.</para>
+    ///
+    /// <para><b><see cref="Crc"/></b> covers everything but <see cref="WriteOffset"/>: the identity,
+    /// the generation and the record, which change a few times per flush, and not the claim, which
+    /// every append moves and which the replay checks against the data anyway (it stops at the
+    /// first entry that does not verify, and truncates the claim to there). See
+    /// <see cref="SealHeaderLocked"/>.</para>
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
     {
@@ -125,6 +179,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         public uint   Generation;
         private uint  _reserved0;
         private long  _reserved1;
+        // ── v3 only ──
+        public long   MoveFrom;          // logical offset the surviving tail is moved from: the flush boundary
+        public long   MoveLength;        // its length; 0 = no relocation in flight
+        public long   MoveDone;          // bytes of it already moved, always a chunk boundary
+        public uint   Crc;               // CRC32C over bytes [0, 8) and [16, 56): see SealHeaderLocked
+        public uint   PendingCrc;        // the same, of the header as the store in progress leaves it
     }
 
     /// <summary>
@@ -151,8 +211,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         public uint   Generation;             // 0 = unwritten; see the class remarks
     }
 
-    private readonly string _filePath;
-    private readonly Lock   _writeLock = new();
+    private readonly string   _filePath;
+    private readonly ILogger? _logger;
+    private readonly Lock     _writeLock = new();
 
     /// <summary>
     /// The most one growth adds. Doubling up to it, a step of it after — see <see cref="NextCapacity"/>.
@@ -171,13 +232,26 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     private long                      _writeOffset;        // logical, excludes the file header
     private uint                      _generation;
 
-    /// <summary>Set by <see cref="OpenOrCreate"/> when the file on disk is a v1 log; <see cref="Open(string, long)"/> upgrades it.</summary>
-    private bool _legacyV1;
+    /// <summary>
+    /// 0 for a v3 log. 1 or 2 when the file on disk is a log of that version: set by
+    /// <see cref="OpenOrCreate"/> before the mapping is sized, and never again. <see cref="Open(string, long, ILogger)"/>
+    /// upgrades such a log; it stays in its own layout for the life of the process only when that
+    /// upgrade cannot commit — appends in its stride, commits with the single copy it always made,
+    /// no relocation record, because it has no room for one.
+    /// </summary>
+    private ushort _legacyVersion;
+
+    /// <summary>
+    /// Where the data starts: <see cref="FileHeaderSize"/>, or <see cref="FileHeaderSizeLegacy"/> for a
+    /// log that is v1 or v2 on disk. Every offset into the mapping and every file size goes through
+    /// it. Set by <see cref="OpenOrCreate"/> before the mapping is sized, and never again.
+    /// </summary>
+    private int _headerSize = FileHeaderSize;
 
     /// <summary>
     /// The entry stride this log reads and appends: <see cref="EntryHeaderSize"/> with a checksum
-    /// (v2), or — only for a v1 log whose upgrade could not be committed, see
-    /// <see cref="StayV1"/> — <see cref="EntryHeaderSizeV1"/> without one.
+    /// (v2, v3), or — only for a log that is v1 on disk, see <see cref="_legacyVersion"/> —
+    /// <see cref="EntryHeaderSizeV1"/> without one.
     /// </summary>
     private int  _entryHeaderSize = EntryHeaderSize;
     private bool _checksummed     = true;
@@ -194,36 +268,53 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <summary>Bytes currently held by the log. Diagnostics only.</summary>
     public long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
-    private SpanWriteAheadLog(string filePath, long growthStepCap)
+    private SpanWriteAheadLog(string filePath, long growthStepCap, ILogger? logger)
     {
         _filePath      = filePath;
         _growthStepCap = Math.Max(4096, growthStepCap);
+        _logger        = logger;
+        // Armed before OpenOrCreate, which is where a relocation interrupted by the previous
+        // process is finished: the only way a test reaches that relocation and its stores.
+        OnRelocationStepForTest = t_relocationStepForNextOpenForTest;
+        OnPendingStoredForTest  = t_pendingStoredForNextOpenForTest;
     }
 
     /// <summary>
-    /// Opens the log, creating it if absent. Growth is bounded by the traces hot-tier budget
-    /// (<see cref="MemoryBudgets.TraceHotTierCapBytes"/>) — see <see cref="NextCapacity"/>.
+    /// Opens the log, creating it if absent, and finishes a commit's relocation that the previous
+    /// process did not live to finish (<see cref="FinishRelocationLocked"/>). Growth is bounded by
+    /// the traces hot-tier budget (<see cref="MemoryBudgets.TraceHotTierCapBytes"/>) — see
+    /// <see cref="NextCapacity"/>.
     ///
-    /// <para><b>A v1 LOG IS UPGRADED, NOT DISCARDED.</b> The release before this one wrote v1, and
-    /// until now an unknown version was treated as a foreign file and re-initialised — which, for
-    /// the v1 log a restart after this upgrade finds, would have silently dropped every span the
-    /// previous process acknowledged and never flushed. So a v1 file is read with the v1 stride,
-    /// rewritten entry for entry as v2 into <c>spans.wal.upgrade.tmp</c> (each entry's bytes
-    /// verbatim, now with its checksum), fsynced, and moved over the original. The move is the
-    /// commit point: a crash before it leaves the v1 file untouched and the next start upgrades it
-    /// again; a crash after it leaves a complete v2 file.</para>
+    /// <para><b>A v1 OR v2 LOG IS UPGRADED, NOT DISCARDED.</b> Earlier releases wrote v1 and then v2,
+    /// and an unknown version is treated as a foreign file and re-initialised — which, for the log a
+    /// restart after this upgrade finds, would silently drop every span the previous process
+    /// acknowledged and never flushed. So such a file is opened in its own layout (v1: 64-byte
+    /// entries without a checksum; v2: v3's entries; both behind a 32-byte header), rewritten as v3
+    /// into <c>spans.wal.upgrade.tmp</c> — each entry's bytes verbatim, a v1 entry now with its
+    /// checksum, a v2 entry with the one it has — fsynced, and moved over the original — durably: a
+    /// write-through move on Windows, a directory fsync after the rename elsewhere
+    /// (<see cref="DurableFile"/>), because an atomic rename the disk has not committed can come
+    /// undone in a power loss and bring the old log back under the name, with the generation it had
+    /// at the upgrade, and every span logged to the new file since would be gone. The move is
+    /// the commit point: a crash before it leaves the old file untouched and the next start upgrades
+    /// it again; a crash after it leaves a complete v3 file. The upgrade copies what the old release
+    /// would have replayed, and only that: a v2 log is copied up to the first entry that does not
+    /// verify. It cannot repair what a stop under the old release already cost — a v2 log killed
+    /// inside the very move this version records has no record of it, and its spans behind the
+    /// copy front are lost to the upgrade exactly as they were to the old replay.</para>
     ///
     /// <para><b>AN UPGRADE THAT CANNOT COMPLETE DOES NOT STOP THE SERVER.</b> This runs in the trace
     /// engine's constructor, where a throw fails the host — once, on every existing install, at the
     /// first start after the upgrade. The rename is retried briefly (an antivirus scanner holding the
     /// fresh copy open is the sharing violation seen on Windows); if the copy cannot be written (a
-    /// full disk) or the rename still fails, the log is opened AS v1, in place, untouched: every span
-    /// it holds replays, new spans are appended in the v1 layout, the error is logged, and the
-    /// upgrade is tried again at the next start. That is exactly the log the previous release ran
-    /// with — no checksum — for one more process lifetime; the alternatives were refusing to start,
-    /// or re-initialising a file whose spans exist nowhere else.</para>
+    /// full disk) or the rename still fails, the log is opened in its own version, in place,
+    /// untouched: every span it holds replays, new spans are appended in its layout, the error is
+    /// logged, and the upgrade is tried again at the next start. That is exactly the log the
+    /// previous release ran with — no relocation record, and for v1 no checksum — for one more
+    /// process lifetime; the alternatives were refusing to start, or re-initialising a file whose
+    /// spans exist nowhere else.</para>
     ///
-    /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
+    /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v3 treats a v3 log as a
     /// foreign file (any version but its own) and re-initialises it in place. That costs nothing
     /// only after a CLEAN stop whose final flush FINISHED — one that logged neither of
     /// <c>TraceStorageEngine.DisposeCoreAsync</c>'s Errors, "The final span flush did not finish
@@ -243,20 +334,18 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         io ??= UpgradeIo.Default;
         string tmp = filePath + UpgradeSuffix;
 
-        var wal = new SpanWriteAheadLog(filePath, growthStepCap);
-        try { wal.OpenOrCreate(initialCapacity); }
-        catch { wal.Dispose(); throw; }
-
-        if (!wal._legacyV1)
+        var wal = OpenInstance(filePath, initialCapacity, growthStepCap, logger);
+        if (wal._legacyVersion == 0)
         {
             // A STALE COPY from an upgrade that died before its rename. Never the only copy of
-            // anything: until the rename the v1 log is authoritative, and the rename is atomic. A v1
-            // log re-truncates it below; beside a v2 log it is 8 MB+ of garbage nobody would remove.
+            // anything: until the rename the old log is authoritative, and the rename is atomic. An
+            // old log re-truncates it below; beside a v3 log it is 8 MB+ of garbage nobody would remove.
             DeleteQuietly(tmp);
             return wal;
         }
 
-        long capacity;
+        ushort legacy = wal._legacyVersion;
+        long   capacity;
         try
         {
             capacity = wal.WriteUpgradedCopy(tmp);
@@ -265,10 +354,10 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         {
             DeleteQuietly(tmp);
             logger?.LogError(ex,
-                "The span WAL at {Path} is a v1 log and its v2 copy could not be written; it stays v1 "
-              + "(no per-entry checksum) for this run, every span in it replays, and the upgrade is "
-              + "retried at the next start", filePath);
-            return wal.StayV1();
+                "The span WAL at {Path} is a v{Version} log and its v3 copy could not be written; it stays "
+              + "v{Version} (no relocation record) for this run, every span in it replays, and the upgrade is "
+              + "retried at the next start", filePath, legacy, legacy);
+            return wal;                                  // already open, in its own layout
         }
         wal.Dispose();                                   // the mapping has to go before the file can
 
@@ -277,21 +366,34 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         {
             DeleteQuietly(tmp);
             logger?.LogError(moveFailure,
-                "The span WAL at {Path} could not be replaced by its v2 copy after {Attempts} attempts; "
-              + "it stays v1 (no per-entry checksum) for this run, every span in it replays, and the "
-              + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
+                "The span WAL at {Path} could not be replaced by its v3 copy after {Attempts} attempts; it "
+              + "stays v{Version} (no relocation record) for this run, every span in it replays, and the "
+              + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1, legacy);
 
-            // Whatever is at the path now — the rename is atomic, so it is the v1 log as it was.
-            var legacy = new SpanWriteAheadLog(filePath, growthStepCap);
-            try { legacy.OpenOrCreate(initialCapacity); }
-            catch { legacy.Dispose(); throw; }
-            return legacy._legacyV1 ? legacy.StayV1() : legacy;
+            // Whatever is at the path now — the rename is atomic, so it is the old log as it was,
+            // which opens in its own layout by itself.
+            return OpenInstance(filePath, initialCapacity, growthStepCap, logger);
         }
 
-        var upgraded = new SpanWriteAheadLog(filePath, growthStepCap);
-        try { upgraded.OpenOrCreate(capacity); }
-        catch { upgraded.Dispose(); throw; }
-        return upgraded;
+        // The rename is atomic, not yet durable: until the directory entry reaches the disk a power
+        // loss can bring the old inode back under the name. Windows' move is write-through
+        // (DurableFile.Replace); a POSIX rename is made durable by fsync on the directory, which is
+        // this. It cannot throw: the log is upgraded, and failing the start over it would be worse
+        // than the window the Warning names.
+        if (!DurableFile.SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(filePath))!))
+            logger?.LogWarning(
+                "The span WAL at {Path} was upgraded, but its directory could not be synced: until the file "
+              + "system commits the rename on its own, a power loss can bring the v{Version} log back.", filePath, legacy);
+
+        return OpenInstance(filePath, capacity, growthStepCap, logger);
+    }
+
+    private static SpanWriteAheadLog OpenInstance(string filePath, long initialCapacity, long growthStepCap, ILogger? logger)
+    {
+        var wal = new SpanWriteAheadLog(filePath, growthStepCap, logger);
+        try { wal.OpenOrCreate(initialCapacity); }
+        catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
+        return wal;
     }
 
     /// <summary>
@@ -329,87 +431,133 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     }
 
     /// <summary>
-    /// Keeps this v1 log as v1 for the life of the process: reads and appends use the v1 stride, no
-    /// checksum is written or checked. Everything else — generations, the two-phase flush, the
-    /// terminator — is byte-for-byte the same in both versions, which is what makes this safe.
-    /// </summary>
-    private SpanWriteAheadLog StayV1()
-    {
-        _entryHeaderSize = EntryHeaderSizeV1;
-        _checksummed     = false;
-        return this;
-    }
-
-    /// <summary>
     /// The upgrade's rename and the pause between its attempts, as a seam: a test fails the rename
-    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>.
+    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>,
+    /// whose move is <see cref="DurableFile.Replace"/> — the metric WAL's durable rename (44797aa,
+    /// bedba1b), shared. It was a plain <c>File.Move</c>: atomic, and not durable.
     /// </summary>
     internal sealed class UpgradeIo
     {
         public static readonly UpgradeIo Default = new();
 
-        public Action<string, string> Move { get; init; } = static (from, to) => File.Move(from, to, overwrite: true);
+        public Action<string, string> Move { get; init; } = DurableFile.Replace;
         public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
+    }
+
+    /// <summary>The format version of the file behind <paramref name="file"/>, or 0 when it is not a span WAL at all.</summary>
+    private static ushort VersionOnDisk(FileStream file)
+    {
+        Span<byte> head = stackalloc byte[6];
+        file.Position = 0;
+        int read = file.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+        file.Position = 0;
+        if (read < head.Length || BinaryPrimitives.ReadUInt32LittleEndian(head) != MagicNumber) return 0;
+        return BinaryPrimitives.ReadUInt16LittleEndian(head[4..]);
     }
 
     private void OpenOrCreate(long initialCapacity)
     {
-        bool exists   = File.Exists(_filePath);
-        long fileSize = FileHeaderSize + initialCapacity;
-
+        bool exists = File.Exists(_filePath);
         _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+
+        // The version decides the header's size, and the header's size decides where the data starts
+        // — so it is read off the handle before the mapping is sized.
+        ushort onDisk = exists ? VersionOnDisk(_fileStream) : (ushort)0;
+        bool   known  = onDisk is WalVersion or WalVersionV2 or WalVersionV1;
+        if (onDisk is WalVersionV2 or WalVersionV1)
+        {
+            // Left in its own layout, and read with it. Open upgrades it once it is open (see there).
+            _legacyVersion = onDisk;
+            _headerSize    = FileHeaderSizeLegacy;
+            if (onDisk == WalVersionV1)
+            {
+                _entryHeaderSize = EntryHeaderSizeV1;
+                _checksummed     = false;
+            }
+        }
+
+        long fileSize = _headerSize + initialCapacity;
         if (_fileStream.Length < fileSize) _fileStream.SetLength(fileSize);
         else                               fileSize = _fileStream.Length;   // reopen an already-grown log at its size
 
-        _capacity = fileSize - FileHeaderSize;
+        _capacity = fileSize - _headerSize;
         Map(fileSize);
 
         ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-        bool known = exists && hdr.Magic == MagicNumber && (hdr.Version == WalVersion || hdr.Version == WalVersionV1);
         if (!known)
         {
-            // New, foreign or future-versioned file — reinitialise in place. Anything
+            // New, foreign or future-versioned file — reinitialise in place, as v3. Anything
             // already there cannot be replayed under a layout we do not know.
+            new Span<byte>(_ptr, FileHeaderSize).Clear();
             hdr.Magic       = MagicNumber;
             hdr.Version     = WalVersion;
             hdr.WriteOffset = FileHeaderSize;
             hdr.Generation  = FirstGeneration;
             _writeOffset    = 0;
             _generation     = FirstGeneration;
+            SealHeaderLocked();
+            return;
         }
-        else
-        {
-            _writeOffset = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
-            _generation  = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
-            if (_writeOffset > _capacity) _writeOffset = _capacity;  // truncated file — replay what is mapped
-            _legacyV1 = hdr.Version == WalVersionV1;                 // left untouched: Open upgrades it
-        }
+
+        _writeOffset = Math.Max(0, hdr.WriteOffset - _headerSize);
+        _generation  = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
+        if (_writeOffset > _capacity) _writeOffset = _capacity;  // truncated file — replay what is mapped
+        if (_legacyVersion != 0) return;                         // left untouched: Open upgrades it
+
+        // Decided before anything below stores into the header. A v1 or v2 header has no checksum.
+        bool verifies = HeaderVerifies(in hdr);
+
+        // A header that verifies only by its PENDING checksum — the previous process stopped between
+        // a field and its seal — is sealed before anything else is stored: the next covered store
+        // overwrites PendingCrc first, and a second stop before that store's field would leave a
+        // header matching neither slot, a false "does not verify" (the metric WAL's 6327634).
+        if (verifies) SealHeaderLocked();
+
+        // Nothing below may make a header that did NOT verify verify again before its generation is
+        // rebuilt: an open killed during the finish would otherwise leave the rotted generation
+        // sealed, and the next open would skip the rebuild (c4fadf7). Released, and the header
+        // sealed once, at the end of the open.
+        _sealsHeld = !verifies;
+
+        // A commit's move of the surviving tail that the process did not live to finish is
+        // finished here, before anything walks the data. See RelocateLocked.
+        FinishRelocationLocked(ref hdr, trusted: verifies);
+
+        // A header whose generation does not verify gets it back from the entries. See there.
+        if (!verifies) RebuildGenerationLocked(ref hdr);
+
+        _sealsHeld = false;
+        SealHeaderLocked();
     }
 
     /// <summary>
-    /// Rewrites this (v1) log as v2 at <paramref name="tmpPath"/> and fsyncs it. Every entry the
-    /// v1 walk reaches is copied — header bytes and payload verbatim, the checksum computed over
-    /// them — so the upgraded log replays exactly what the v1 log would have, under the same
-    /// generation rule. Returns the logical capacity the copy was sized to.
+    /// Rewrites this v1 or v2 log as v3 at <paramref name="tmpPath"/> and fsyncs it. Every entry the
+    /// old replay would reach is copied — header bytes and payload verbatim; a v1 entry gets the
+    /// checksum computed over them, a v2 entry keeps the one it has (and was verified by) — so the
+    /// upgraded log replays exactly what the old log would have, under the same generation rule.
+    /// Returns the logical capacity the copy was sized to.
     /// </summary>
     private long WriteUpgradedCopy(string tmpPath)
     {
         lock (_writeLock)
         {
-            using var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+            using var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                                          bufferSize: 64 * 1024);
             Span<byte> fileHeader = stackalloc byte[FileHeaderSize];
             fileHeader.Clear();
             fs.Write(fileHeader);                        // placeholder; the real one goes in last
 
             Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
             long pos = 0, written = 0, total;
-            while ((total = EntryAt(pos, _writeOffset, EntryHeaderSizeV1, checksummed: false)) > 0)
+            while ((total = EntryAt(pos, _writeOffset, _entryHeaderSize, _checksummed)) > 0)
             {
-                byte* src     = _ptr + FileHeaderSize + pos;
+                byte* src     = _ptr + _headerSize + pos;
                 var   header  = new ReadOnlySpan<byte>(src, ChecksummedHeaderBytes);
-                var   payload = new ReadOnlySpan<byte>(src + EntryHeaderSizeV1, (int)(total - EntryHeaderSizeV1));
-                uint  crc     = Crc32c.Append(Crc32c.Append(0, header), payload);
-                MemoryMarshal.Write(crcBytes, in crc);
+                var   payload = new ReadOnlySpan<byte>(src + _entryHeaderSize, (int)(total - _entryHeaderSize));
+                uint  crc     = _checksummed
+                    ? Unsafe.ReadUnaligned<uint>(src + ChecksummedHeaderBytes)   // v2: its own, verified by EntryAt
+                    : Crc32c.Append(Crc32c.Append(0, header), payload);           // v1: computed now
+                BinaryPrimitives.WriteUInt32LittleEndian(crcBytes, crc);
 
                 fs.Write(header);
                 fs.Write(crcBytes);
@@ -428,6 +576,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                 WriteOffset = FileHeaderSize + written,
                 Generation  = _generation,
             };
+            hdr.Crc = hdr.PendingCrc = HeaderChecksum(in hdr);
             MemoryMarshal.Write(fileHeader, in hdr);
             fs.Position = 0;
             fs.Write(fileHeader);
@@ -559,12 +708,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         if (nameUtf8.Length    > ushort.MaxValue) nameUtf8    = default;
         if (serviceUtf8.Length > ushort.MaxValue) serviceUtf8 = default;
 
-        int  headerSize = _entryHeaderSize;              // v2, unless the upgrade could not commit
+        int  headerSize = _entryHeaderSize;              // v2/v3, unless the log is v1 on disk
         int  payload    = nameUtf8.Length + serviceUtf8.Length + attrs.Length;
         long entrySize  = (long)headerSize + payload;
         EnsureCapacityLocked(_writeOffset + entrySize);
 
-        byte* dest = _ptr + FileHeaderSize + _writeOffset;
+        byte* dest = _ptr + _headerSize + _writeOffset;
 
         ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(dest);
         // TraceId sits at offset 0 of the entry, so the entry pointer addresses it
@@ -599,7 +748,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         }
 
         _writeOffset += entrySize;
-        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + _writeOffset;
     }
 
     // ── Two-phase flush (Begin / Commit / Abandon) ───────────────────────────
@@ -649,6 +798,21 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// during the flush move to the front, and the header commits the new generation.
     /// Call only after the segment carrying the flushed spans is DURABLE on disk.
     ///
+    /// <para><b>The order, and what a process killed at each point leaves (#103).</b> The move of the
+    /// surviving tail is recorded in the header before its first byte (<see cref="RelocateLocked"/>)
+    /// and made in chunks, each recorded as it completes; then the new end is stored, the record
+    /// cleared, and the generation-0 terminator planted; then the barrier; then the stamp. Killed
+    /// before the record: nothing has moved, and the old header replays both generations — the
+    /// flushed one as duplicates of a segment already durable, the one window this protocol keeps.
+    /// Killed anywhere from the record to the clear: the next open redoes the chunk the record names
+    /// and every one after it, stores the end and clears the record (<see cref="FinishRelocationLocked"/>)
+    /// — the surviving tail replays once, the flushed generation not at all. Killed after the clear:
+    /// the header's claim is the relocated end, the terminator or the claim stops the walk there,
+    /// and the old generation in the header still accepts the tail's. A flushed prefix far shorter
+    /// than its tail, provably dead under the stamp, stays where it is and nothing moves
+    /// (<see cref="PrefixStaysLocked"/>): killed before the stamp, both generations replay, as before
+    /// a record; after it, the tail alone.</para>
+    ///
     /// <para><b>What it forces to disk, and where.</b> It used to hand FlushViewOfFile the WHOLE
     /// view, twice, for a commit whose own dirty bytes are the relocated tail and one header page.
     /// Both barriers are now RANGES: the relocated tail with its terminator (which begins at offset
@@ -684,20 +848,60 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                 return;
             }
 
-            long boundary = _flushBoundary;
+            // A replay that truncated the log below the boundary (ReadAll during a flush; the engine
+            // never does it) leaves nothing after it: everything still in the log was flushed.
+            long boundary = Math.Min(_flushBoundary, _writeOffset);
             long tail     = _writeOffset - boundary;     // appended while the segment was written
-            if (tail > 0 && boundary > 0)
-                Buffer.MemoryCopy(_ptr + FileHeaderSize + boundary,
-                                  _ptr + FileHeaderSize, _capacity, tail);
+            ref var hdr   = ref Unsafe.AsRef<WalFileHeader>(_ptr);
 
-            // The move does not erase its source, and a crash between the stores below
-            // would leave the old offset covering both the relocated tail and the stale
-            // originals. A generation-0 marker at the new end stops any replay exactly
-            // where the data now ends — the same trick the metric WAL's Compact uses.
-            // It is not optional: without room for it the commit has no terminator, so
-            // rather than proceed unterminated the log grows to make room.
-            EnsureCapacityLocked(tail + EntryHeaderSize);
-            Unsafe.AsRef<SpanWalEntryHeader>(_ptr + FileHeaderSize + tail).Generation = 0;
+            // A dead prefix far shorter than the tail behind it stays where it is, and so does the
+            // tail: nothing moves, the stamp alone kills the prefix. See PrefixStaysLocked.
+            bool keeps = tail > 0 && boundary > 0 && PrefixStaysLocked(boundary, tail);
+            long end   = keeps ? boundary + tail : tail;
+
+            if (tail > 0 && boundary > 0 && !keeps)
+            {
+                if (_legacyVersion != 0)
+                {
+                    // A v1 or v2 log kept in its own layout has no room for the record: it moves the
+                    // tail in the one copy it always made, and keeps the #103 window for this run.
+                    Buffer.MemoryCopy(_ptr + _headerSize + boundary, _ptr + _headerSize, _capacity, tail);
+                }
+                else
+                {
+                    // The claim the record is checked against (FinishRelocationLocked): every append
+                    // stored it, so this restates it rather than changes it.
+                    Volatile.Write(ref hdr.WriteOffset, _headerSize + boundary + tail);
+                    RelocateLocked(ref hdr, boundary, tail, done: 0);
+                    Volatile.Write(ref hdr.WriteOffset, _headerSize + tail);
+                    OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, tail);
+                    ClearRelocationLocked(ref hdr);
+                    OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, tail);
+                }
+            }
+
+            // From here the log ends where the relocated tail does (or, kept in place, where it
+            // always did) — in memory and in the header's claim, before the barrier. A barrier that
+            // fails below therefore leaves the next append landing over the terminator rather than
+            // past it: the version of this path before v2 left the write offset where it was, beyond
+            // the generation-0 marker, so every span appended after a failed barrier landed where
+            // the next replay stops short of — acknowledged, queryable, and gone at the next restart.
+            // The flushed generation's spans are not in the log any more, which is fine: their
+            // segment was published before this commit ran.
+            _writeOffset    = end;
+            hdr.WriteOffset = _headerSize + end;
+
+            // The move does not erase its source, and the old header's generation still accepts the
+            // relocated tail's: a generation-0 marker at the new end stops any walk exactly where
+            // the data now ends, whatever claim a power loss leaves in the header page — the same
+            // trick the metric WAL's Compact uses. Planted AFTER the record is cleared, never before:
+            // when the tail is exactly as long as the flushed prefix, the marker's slot is the first
+            // source entry, which a finish at open would still read. It always fits after a move
+            // (the tail is shorter than the log by at least the flushed prefix, and that prefix
+            // holds at least one entry); with nothing flushed before it there was no move, and no
+            // room for it means only that the log is full, where the claim alone ends the walk. A
+            // kept tail moved nothing, so there is no source behind it to stop a walk short of.
+            if (!keeps) PlantEndMarkerLocked(end);
 
             // ── PERSISTENCE BARRIER. The relocation and the header live on different
             //    pages, and dirty mmap pages reach the platter in whatever order the OS
@@ -707,52 +911,43 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             //    durable originals of the during-flush tail sat beyond the committed
             //    offset, unreachable. Every span appended during the build — tens of
             //    thousands at load — would be lost. Flushed here, a crash before the
-            //    header lands leaves the OLD header {flushed gen, old offset} over a front
-            //    that now holds the relocated tail followed by the generation-0 marker:
-            //    replay reads the tail and stops at the marker. Nothing lost, nothing
-            //    duplicated.
+            //    header lands leaves the OLD generation over a front that now holds the
+            //    relocated tail followed by the generation-0 marker: replay reads the tail
+            //    and stops at the marker. Nothing lost, nothing duplicated.
             //
             //    THE RANGE IS [0, relocated tail + terminator), page-aligned outwards. It
             //    starts at the file's first byte, so the header page is in it; the tail is
             //    all the commit dirtied besides the header. Nothing past it is claimed by
-            //    anything this commit writes.
+            //    anything this commit writes. A kept tail takes its dead prefix with it: the
+            //    replay walks through that prefix to reach the tail, and a page of it torn by a
+            //    power loss would end the replay in front of every span the commit kept.
             try
             {
-                FlushRangeLocked(0, FileHeaderSize + tail + EntryHeaderSize);
+                FlushRangeLocked(0, _headerSize + end + EntryHeaderSize);
                 FlushHandle(_fileStream!);
             }
             catch (Exception ex)
             {
-                // The barrier failed, so the header must NOT claim data we could not
-                // persist: it keeps the flushed generation, and the retry's Begin reuses the
-                // already-bumped append generation (_generationBumped stays set), so the window
-                // never widens.
-                //
-                // THE RELOCATION ITSELF IS DONE, in memory, and the log now continues from its
-                // end. The version of this path before v2 left the write offset where it was —
-                // past the generation-0 marker just written at the end of the relocated tail —
-                // so every span appended after a failed barrier landed beyond a terminator that
-                // the next replay stops at: acknowledged, queryable, and gone at the next
-                // restart. Pointing the offset at the relocated end puts the next append over
-                // that marker instead. The flushed generation's spans are not in the log any
-                // more, which is fine: their segment was published before this commit ran.
-                _writeOffset = tail;
-                Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + tail;
+                // The barrier failed, so the header must NOT claim the new generation: it keeps
+                // the flushed one, and the retry's Begin reuses the already-bumped append
+                // generation (_generationBumped stays set), so the window never widens. The
+                // relocation itself is done and recorded as done (the record is clear), and the
+                // log already continues from its end (above).
                 _flushOpen     = false;
                 _flushBoundary = 0;
                 throw new IOException(
                     "span WAL commit barrier failed; the log keeps the flushed generation in its header", ex);
             }
 
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.Generation  = _generation;               // must land before the offset store
-            hdr.WriteOffset = FileHeaderSize + tail;
+            // THE STAMP, between two checksums like every covered store (StoreCovered): a process
+            // killed inside it leaves a header that verifies, as the generation was before it or
+            // as it is after, never one that reads as rot.
+            StoreCovered(HeaderField.Generation, _generation);
 
             // Only now is the cycle over: every step that can throw is behind us, so the
             // in-memory generation and the header can no longer drift apart (a Begin that
             // bumped a second time would stamp appends the header's acceptance window does
             // not cover, and ReadAll would drop them).
-            _writeOffset      = tail;
             _flushBoundary    = 0;
             _flushOpen        = false;
             _generationBumped = false;
@@ -760,14 +955,8 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             // Commit the header itself, so the dead generation cannot come back after a
             // power loss and be replayed into duplicates of a segment already on disk. The
             // page goes to the filesystem here, under the lock; the drive flush below.
-            FlushRangeLocked(0, FileHeaderSize);
+            FlushRangeLocked(0, _headerSize);
             handle = _fileStream;
-
-            // RESIDUAL WINDOW, now bounded by the checksum: a crash INSIDE the first flush can
-            // leave the front half-relocated — some pages the new tail, some still the old
-            // generation — under the old header, where a stride can desync mid-region. In v1
-            // that replayed garbage; in v2 the first entry that does not verify ends the
-            // replay. What it can still cost is the relocated entries past the torn page.
         }
 
         // ── OFF THE LOCK: the header page's drive flush. A failure here leaves consistent state
@@ -795,6 +984,413 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         }
     }
 
+    // ── The relocation record (v3) ───────────────────────────────────────────
+
+    /// <summary>The points of a relocation <see cref="OnRelocationStepForTest"/> fires at, in order.</summary>
+    internal enum RelocationStep : byte
+    {
+        /// <summary>The record is armed and sealed; no byte has moved.</summary>
+        Armed,
+        /// <summary>A chunk is moved and its <see cref="WalFileHeader.MoveDone"/> sealed.</summary>
+        Chunk,
+        /// <summary>The new end is stored; the record is still armed.</summary>
+        EndStored,
+        /// <summary>The record is cleared and sealed; the end marker is not planted yet.</summary>
+        Cleared,
+    }
+
+    /// <summary>
+    /// Test seam fired at every <see cref="RelocationStep"/> of a relocation — a commit's, or the one
+    /// the open finishes — with the bytes moved so far. What the file holds at that instant is what
+    /// a process killed there leaves. The states BETWEEN a covered store and its checksum are
+    /// <see cref="OnCoveredStoreForTest"/>'s and <see cref="OnPendingStoredForTest"/>'s. Null in
+    /// production.
+    /// </summary>
+    internal Action<RelocationStep, long>? OnRelocationStepForTest;
+
+    /// <summary>
+    /// Test seam: <see cref="OnRelocationStepForTest"/> for the logs this THREAD opens next — the only
+    /// way to reach a relocation the open itself finishes. Thread-static so that no other test's open
+    /// sees it. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<RelocationStep, long>? t_relocationStepForNextOpenForTest;
+
+    /// <summary>A commit moves its tail only when the flushed prefix is at least 1/n of it — at most n chunks; see <see cref="PrefixStaysLocked"/>.</summary>
+    private const long MinPrefixToMoveTail = 8;
+
+    /// <summary>
+    /// Whether this commit leaves the flushed prefix <c>[0, boundary)</c> where it is, and with it the
+    /// tail behind it, instead of moving the tail to the front. Caller holds the lock.
+    ///
+    /// <para><b>Why a prefix may stay.</b> The move goes in chunks no longer than the prefix, each
+    /// with a covered header store, under the append lock: a one-entry prefix before an 8 MiB tail
+    /// of minimal spans is 120 000 of them — measured 10-12.5 ms of commit against 3.3 ms for the
+    /// same tail moved in one chunk, where this box's drive flush is 2 ms. Left in place, the prefix
+    /// is dead weight the replay skips, and the next commit reclaims it with everything else — its
+    /// own prefix is then at least this whole tail, so the move it makes is a few chunks at most.
+    /// The metric WAL's rule (61c1f02, d5f7411): the tail moves only when the prefix is at least an
+    /// eighth of it, compared multiplied, so at most eight chunks.</para>
+    ///
+    /// <para><b>Why the span WAL has to check what the metric WAL could assume.</b> There a prefix is
+    /// dead by construction: it is at or below the watermark, and the watermark is what the replay
+    /// filters on. Here the replay accepts a WINDOW — the header's generation and its successor —
+    /// and the prefix is not always outside the window the stamp opens. After an abandoned flush,
+    /// the retry's Begin reuses the bumped generation, so the spans appended between the two Begins
+    /// sit in the retry's prefix with the very generation this commit stamps; after a restart that
+    /// followed a crash mid-flush, the prefix holds the successor's entries from before the crash
+    /// behind appends of the header's own. Left in place, either would replay beside the segment
+    /// that holds it — on every restart until a later commit moved past it. So a prefix stays only
+    /// if the walk over it proves what the replay will do with it under the new header: no entry
+    /// of the stamp's generation or its successor. And only if every entry of it verifies: a kept
+    /// prefix sits IN FRONT of the tail, and the replay stops at the first entry that does not
+    /// verify — a torn one there would cut off every span this commit kept. A walk that does not
+    /// end exactly on the boundary proves neither, and the tail moves.</para>
+    ///
+    /// <para>The walk reads the prefix once, with checksums: at most an eighth of the tail, which
+    /// this commit has just been spared moving. v1 and v2 logs kept in their own layout move as they
+    /// always did.</para>
+    /// </summary>
+    private bool PrefixStaysLocked(long boundary, long tail)
+    {
+        if (_legacyVersion != 0 || boundary * MinPrefixToMoveTail >= tail) return false;
+
+        uint stamp = _generation, successor = Next(stamp);
+        long pos = 0, total;
+        while (pos < boundary && (total = EntryAt(pos, boundary, _entryHeaderSize, _checksummed)) > 0)
+        {
+            uint g = Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + pos).Generation;
+            if (g == stamp || g == successor) return false;
+            pos += total;
+        }
+        return pos == boundary;
+    }
+
+    /// <summary>
+    /// Moves the surviving tail <c>[from, from + length)</c> to the front, FROM <paramref name="done"/>
+    /// on, recording its progress in the header so that a process that dies anywhere inside can be
+    /// finished at the next open (<see cref="FinishRelocationLocked"/>). v3 only; caller holds the
+    /// lock (or is the open).
+    ///
+    /// <para><b>Why v2's single <c>Buffer.MemoryCopy</c> was not enough once entries carry
+    /// checksums (#103).</b> A process killed in the middle of the copy left the old header over a
+    /// front half overwritten: the copies verify, the entry straddling the copy front does not, and
+    /// the replay stopped there and truncated the log. The tail entries not yet copied still sat
+    /// intact further on — acknowledged spans in no segment — and nothing would ever read them
+    /// again. v1 walked on past the front off garbage lengths and replayed them, with duplicates;
+    /// v2 made the loss certain. This is the metric WAL's protocol (a057ca6), the same bug in its
+    /// Compact.</para>
+    ///
+    /// <para><b>Chunks no longer than <paramref name="from"/>,</b> so that no chunk's destination
+    /// overlaps its own source: a chunk at <c>d</c> writes <c>[d, d + c)</c> and reads
+    /// <c>[from + d, from + d + c)</c>, and <c>c ≤ from</c>. The earlier chunks wrote only below
+    /// <c>d</c>, so a chunk's source is intact until that chunk is done — which is what makes
+    /// redoing the chunk <see cref="WalFileHeader.MoveDone"/> names exact, however far into it the
+    /// process got. When the tail fits in the flushed prefix (the usual case: spans arriving during
+    /// a build are fewer than the snapshot it writes) this is ONE chunk, the old single copy; a tail
+    /// longer than the prefix takes <c>length / from</c> of them, one header store each.</para>
+    ///
+    /// <para><b>Order.</b> <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// first, then <see cref="WalFileHeader.MoveLength"/>, which arms the record; then each chunk,
+    /// then its <see cref="WalFileHeader.MoveDone"/>. The caller stores the new end and only then
+    /// clears the record. Program order is what a killed process leaves behind; across a power loss
+    /// the header page and the data pages still reach the disk in any order, the residual the class
+    /// remarks name.</para>
+    ///
+    /// <para><b>Program order is pinned, not assumed.</b> Every store of the record is a
+    /// <see cref="Volatile.Write(ref long, long)"/> (the covered ones inside
+    /// <see cref="StoreCovered"/>): a release, so neither the compiler nor the CPU can let a store the
+    /// protocol puts BEFORE it — the record's other fields, a chunk's bytes, a pending checksum —
+    /// land after it. A plain store sequence is what the JIT is free to reorder, and a reordered
+    /// arming (<c>MoveLength</c> before <c>MoveFrom</c>) is a record a killed process leaves naming
+    /// a move that is not the one in flight.</para>
+    /// </summary>
+    private void RelocateLocked(ref WalFileHeader hdr, long from, long length, long done)
+    {
+        byte* data = _ptr + _headerSize;
+        if (done == 0)
+        {
+            // MoveFrom and MoveDone count only while MoveLength is set (see HeaderChecksum), so
+            // they are written plainly here and the one covered change is the arming.
+            Volatile.Write(ref hdr.MoveFrom, from);
+            Volatile.Write(ref hdr.MoveDone, 0);
+            StoreCovered(HeaderField.MoveLength, (ulong)length);       // armed
+            OnRelocationStepForTest?.Invoke(RelocationStep.Armed, 0);
+        }
+
+        while (done < length)
+        {
+            long chunk = Math.Min(from, length - done);
+            Buffer.MemoryCopy(data + from + done, data + done, chunk, chunk);
+            done += chunk;
+            StoreCovered(HeaderField.MoveDone, (ulong)done);
+            OnRelocationStepForTest?.Invoke(RelocationStep.Chunk, done);
+        }
+    }
+
+    /// <summary>Disarms the relocation record: MoveLength first, a covered store; MoveFrom and MoveDone stop counting with it.</summary>
+    private void ClearRelocationLocked(ref WalFileHeader hdr)
+    {
+        StoreCovered(HeaderField.MoveLength, 0);
+        Volatile.Write(ref hdr.MoveFrom, 0);
+        Volatile.Write(ref hdr.MoveDone, 0);
+    }
+
+    /// <summary>
+    /// Finishes a relocation the previous process was killed inside (<see cref="RelocateLocked"/>):
+    /// redoes the chunk the header's <see cref="WalFileHeader.MoveDone"/> names and every one after
+    /// it, stores the end the commit would have stored, clears the record and plants the marker —
+    /// the state the commit had reached just before its barrier — and then makes that state durable
+    /// with the barrier the commit did not live to issue. Runs at open, before any walk. A record
+    /// whose numbers cannot describe a move inside this file is not acted on — moving bytes by it
+    /// could only destroy data — and is cleared with an Error; the walk that follows then decides
+    /// where the data ends, as it did before the record existed.
+    ///
+    /// <para>The generation is left as the header has it — the flushed one, which the commit had
+    /// not stamped over yet. It accepts the relocated tail's generation as its successor, so the
+    /// replay is the same as after a stamp, and the flushed generation's entries are gone from the
+    /// log either way: overwritten by the move, or past its end.</para>
+    ///
+    /// <para><b>A record in a header that did not verify</b> (<paramref name="trusted"/> false) has
+    /// to prove it describes the move a commit made, not merely one that would fit: the claim must
+    /// be where that commit left it, with the progress that goes with it — the old end,
+    /// <c>from + length</c>, with <c>done</c> a chunk boundary (a multiple of <c>from</c>, or all of
+    /// it): the move in flight; or the new end, <c>length</c>, with <c>done == length</c>: the move
+    /// finished and its end stored, only the clear missing. A new end with less done is no state a
+    /// commit leaves, and redoing from there would read source bytes the later chunks have already
+    /// overwritten (the metric WAL's 83f849f). Rot that passes, in two fields no store ties
+    /// together, is not a case worth moving bytes for.</para>
+    /// </summary>
+    private void FinishRelocationLocked(ref WalFileHeader hdr, bool trusted)
+    {
+        long from = hdr.MoveFrom, length = hdr.MoveLength, done = hdr.MoveDone;
+        if (length == 0) return;                         // nothing in flight: the normal case
+
+        bool fits    = from > 0 && length > 0 && done >= 0 && done <= length && from <= _capacity - length;
+        bool matches = fits
+                    && ((_writeOffset == from + length && (done % from == 0 || done == length))
+                     || (_writeOffset == length && done == length));
+        if (!fits || (!trusted && !matches))
+        {
+            _logger?.LogError(
+                "Span WAL at {Path} records a relocation it cannot vouch for (from {From}, length {Length}, done {Done}, " +
+                "claim {Claim}, capacity {Capacity}, header verifies: {Verifies}); ignoring it — the walk decides where " +
+                "the data ends.", _filePath, from, length, done, _writeOffset, _capacity, trusted);
+            ClearRelocationLocked(ref hdr);
+            return;
+        }
+
+        _logger?.LogWarning(
+            "Span WAL at {Path}: finishing the relocation of {Length} byte(s) of spans appended during a flush, " +
+            "which a stop interrupted after {Done} byte(s).", _filePath, length, done);
+
+        RelocateLocked(ref hdr, from, length, done);
+        _writeOffset = length;
+        Volatile.Write(ref hdr.WriteOffset, _headerSize + length);
+        OnRelocationStepForTest?.Invoke(RelocationStep.EndStored, length);
+        ClearRelocationLocked(ref hdr);
+        OnRelocationStepForTest?.Invoke(RelocationStep.Cleared, length);
+        PlantEndMarkerLocked(length);
+
+        // THE COMMIT'S BARRIER, which the stopped process never reached. Without it the finished move
+        // lives in the page cache only, and a power loss before the OS writes it back mixes what the
+        // killed process moved, what this open redid and what neither did — the residual a commit
+        // closes with this same range before anything else may append. A failure is reported, not
+        // thrown: the open must not fail the start, and the log is exactly as correct for this run.
+        try
+        {
+            FlushRangeLocked(0, _headerSize + length + EntryHeaderSize);
+            FlushHandle(_fileStream!);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex,
+                "Span WAL at {Path}: the relocation finished at open could not be forced to disk; it is in the " +
+                "page cache, and a power loss before the OS writes it back can still cost the spans it moved.",
+                _filePath);
+        }
+    }
+
+    /// <summary>
+    /// Plants the generation-0 end marker at logical offset <paramref name="at"/> when the slot fits
+    /// in the mapping — only the entry header's generation field is written. Caller holds the lock.
+    /// </summary>
+    private void PlantEndMarkerLocked(long at)
+    {
+        if (at + ChecksummedHeaderBytes <= _capacity)
+            Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + at).Generation = 0;
+    }
+
+    // ── The header's own checksum (v3) ───────────────────────────────────────
+
+    /// <summary>
+    /// The header checksum: CRC32C over bytes [0, 8) and [16, 56) of the header — everything but the
+    /// claim — with <see cref="WalFileHeader.MoveFrom"/> and <see cref="WalFileHeader.MoveDone"/>
+    /// read as 0 while <see cref="WalFileHeader.MoveLength"/> is 0. That last rule is what makes
+    /// every covered change ONE field: arming writes the other two first, invisibly, and disarming
+    /// clears MoveLength first, after which they are invisible again (see <see cref="StoreCovered"/>).
+    /// The metric WAL's header checksum, field for field (29718e4).
+    /// </summary>
+    private static uint HeaderChecksum(in WalFileHeader header)
+    {
+        WalFileHeader h = header;
+        if (h.MoveLength == 0) { h.MoveFrom = 0; h.MoveDone = 0; }
+        var bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<WalFileHeader>(in h));
+        return Crc32c.Append(Crc32c.Append(0, bytes[..8]), bytes[16..56]);
+    }
+
+    /// <summary>The header verifies: as it is (<see cref="WalFileHeader.Crc"/>) or as the store in flight when the process stopped was leaving it (<see cref="WalFileHeader.PendingCrc"/>).</summary>
+    private static bool HeaderVerifies(in WalFileHeader header)
+    {
+        uint crc = HeaderChecksum(in header);
+        return header.Crc == crc || header.PendingCrc == crc;
+    }
+
+    /// <summary>The covered header fields that change after the header is first written. See <see cref="StoreCovered"/>.</summary>
+    private enum HeaderField : byte { Generation, MoveLength, MoveDone }
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after the field is stored and BEFORE the checksum
+    /// that vouches for it — the state a process killed between the two leaves. Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnCoveredStoreForTest;
+
+    /// <summary>
+    /// Test seam fired by <see cref="StoreCovered"/> after <see cref="WalFileHeader.PendingCrc"/> is
+    /// stored and BEFORE the field — the other state a process killed inside the store leaves.
+    /// Null in production.
+    /// </summary>
+    internal Action<string, ulong>? OnPendingStoredForTest;
+
+    /// <summary>Test seam: <see cref="OnPendingStoredForTest"/> for the logs this THREAD opens next. Null in production.</summary>
+    [ThreadStatic] internal static Action<string, ulong>? t_pendingStoredForNextOpenForTest;
+
+    /// <summary>
+    /// THE ONE WAY A COVERED HEADER FIELD CHANGES once the header exists: the checksum of the header
+    /// AS IT WILL BE goes into <see cref="WalFileHeader.PendingCrc"/>, then the field, then the same
+    /// value into <see cref="WalFileHeader.Crc"/>. A process killed anywhere in that sequence leaves
+    /// a header that verifies — before the field, by <c>Crc</c>; after it, by <c>PendingCrc</c> — so
+    /// a stop is never mistaken for rot (the metric WAL's 1599bf4: its first version stored the
+    /// field and then sealed, and a kill in between made the header fail and the rebuild drop a
+    /// watermark that was right). Each of the three is a release store, so the order is the one
+    /// written here and not the JIT's. v1 and v2 headers have no checksum; a held header (the open
+    /// rebuilding one that did not verify) is sealed once, at the end of that open.
+    /// </summary>
+    private void StoreCovered(HeaderField field, ulong value)
+    {
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        if (_legacyVersion != 0 || _sealsHeld)
+        {
+            Set(ref h, field, value);
+            return;
+        }
+
+        WalFileHeader next = h;
+        Set(ref next, field, value);
+        Volatile.Write(ref h.PendingCrc, HeaderChecksum(in next));
+        OnPendingStoredForTest?.Invoke(field.ToString(), value);
+        Set(ref h, field, value);
+        OnCoveredStoreForTest?.Invoke(field.ToString(), value);
+        Volatile.Write(ref h.Crc, h.PendingCrc);
+
+        static void Set(ref WalFileHeader h, HeaderField field, ulong value)
+        {
+            switch (field)
+            {
+                case HeaderField.Generation: Volatile.Write(ref h.Generation, (uint)value); break;
+                case HeaderField.MoveLength: Volatile.Write(ref h.MoveLength, (long)value); break;
+                case HeaderField.MoveDone:   Volatile.Write(ref h.MoveDone,   (long)value); break;
+            }
+        }
+    }
+
+    /// <summary>Set by the open while it rewrites a header that did not verify; see <see cref="OpenOrCreate"/>.</summary>
+    private bool _sealsHeld;
+
+    /// <summary>
+    /// Stores the header's checksum, both slots, over the header as it stands — after the open has
+    /// written it whole (a fresh header, a rebuilt one, or one that verified only by its pending
+    /// checksum); a single covered field changes through <see cref="StoreCovered"/> instead. v3 only.
+    /// Caller holds the lock, or is the open.
+    ///
+    /// <para><b>Why a checksum on a header the entries already vouch for.</b> One field of it can hide
+    /// every entry without any entry being wrong: the replay accepts the header's generation and its
+    /// successor, so a rotted <see cref="WalFileHeader.Generation"/> two or more away from the
+    /// entries' makes it skip them all — acknowledged spans dropped by four bytes of header,
+    /// silently (#103's second half). And a rotted relocation record would move bytes at the next
+    /// open. A header that does not verify has its generation rebuilt from the entries instead
+    /// (<see cref="RebuildGenerationLocked"/>), and its record is trusted only in a state a commit
+    /// leaves (<see cref="FinishRelocationLocked"/>).</para>
+    ///
+    /// <para><b>Why not the claim.</b> <see cref="WalFileHeader.WriteOffset"/> moves on every append,
+    /// and sealing it would put a hash on the append path for a field the replay already checks
+    /// against the data: the walk stops at the first entry that does not verify, wherever the claim
+    /// says the log ends.</para>
+    ///
+    /// <para><b>No ordinary stop leaves a header that does not verify.</b> Every covered change after
+    /// the first write is one field through <see cref="StoreCovered"/>, whose two checksum slots
+    /// vouch for the header before and after it; what remains is rot, a copied or restored file,
+    /// and a process killed while the OPEN was rewriting a header it had already found not to
+    /// verify — which the next open rebuilds again.</para>
+    /// </summary>
+    private void SealHeaderLocked()
+    {
+        if (_legacyVersion != 0 || _sealsHeld) return;
+        ref var h = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        h.PendingCrc = h.Crc = HeaderChecksum(in h);
+    }
+
+    /// <summary>
+    /// The generation of a header that does not verify (<see cref="SealHeaderLocked"/>), taken back
+    /// from the entries — which carry their own checksums, and so are the better witness. The walk
+    /// over the claimed range verifies every entry and finds the NEWEST generation among them; the
+    /// header gets its predecessor, so the replay accepts the newest and the one before it. That
+    /// covers every live entry: the live generations are the header's and its successor, and the
+    /// newest entry carries one of the two. If it carries the header's (no flush was in flight), the
+    /// generation before it is accepted too — a committed generation still in the file, at most,
+    /// which replays beside its segment: duplicates, never loss. With no entry at all the
+    /// generation starts over.
+    ///
+    /// <para>NEWEST, NOT LAST. A restart after a crash mid-flush appends under the header's
+    /// generation BEHIND entries of its successor, so the last entry can be the older of the two;
+    /// taken as the newest, it would have rebuilt a window that drops the successor's entries. The
+    /// order is the generation cycle's (<see cref="IsAfter"/>), not the number's, so a wrap past
+    /// <see cref="uint.MaxValue"/> does not read as the oldest.</para>
+    ///
+    /// <para>An Error says it happened; the open seals the result.</para>
+    /// </summary>
+    private void RebuildGenerationLocked(ref WalFileHeader hdr)
+    {
+        uint rotted = hdr.Generation, newest = 0;
+        for (long pos = 0, total; (total = EntryAt(pos, _writeOffset, _entryHeaderSize, _checksummed)) > 0; pos += total)
+        {
+            uint g = Unsafe.AsRef<SpanWalEntryHeader>(_ptr + _headerSize + pos).Generation;
+            if (newest == 0 || IsAfter(g, newest)) newest = g;
+        }
+
+        _generation    = newest == 0 ? FirstGeneration : Prev(newest);
+        hdr.Generation = _generation;
+
+        _logger?.LogError(
+            "Span WAL at {Path}: the header does not verify (generation {Generation}); its generation was rebuilt " +
+            "from the entries: {NewGeneration}, whose spans and its successor's replay.",
+            _filePath, rotted, _generation);
+    }
+
+    private static uint Prev(uint g) => g == FirstGeneration ? uint.MaxValue : g - 1;
+
+    /// <summary>
+    /// <paramref name="a"/> comes after <paramref name="b"/> on the generation cycle — 1, 2, …,
+    /// <see cref="uint.MaxValue"/>, 1, … (0 is never a generation), uint.MaxValue values long — by
+    /// less than half of it. The generations a log holds at once are a handful of neighbours, so
+    /// "less than half the cycle ahead" is "newer".
+    /// </summary>
+    private static bool IsAfter(uint a, uint b)
+    {
+        uint x = a - 1, y = b - 1;                       // positions on the cycle, 0-based
+        uint d = x >= y ? x - y : x - y - 1;             // (x - y) mod uint.MaxValue: the wrap added 2^32, the cycle is 2^32 - 1
+        return d != 0 && d < 0x8000_0000u;
+    }
+
     // ── Reset ────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -814,10 +1410,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             _flushOpen        = false;
             _flushBoundary    = 0;
 
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.Generation  = _generation;                // must land before the offset
-            hdr.WriteOffset = FileHeaderSize;
-            _writeOffset    = 0;
+            StoreCovered(HeaderField.Generation, _generation);   // must land before the offset
+            Volatile.Write(ref Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset, _headerSize);
+            _writeOffset = 0;
         }
     }
 
@@ -842,7 +1437,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 
             while ((total = EntryAt(pos, end, _entryHeaderSize, _checksummed)) > 0)
             {
-                byte* src = _ptr + FileHeaderSize + pos;
+                byte* src = _ptr + _headerSize + pos;
                 ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(src);
 
                 // TWO generations are live, not one: the HEADER's (committed — or, after
@@ -888,20 +1483,19 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             }
 
             // THE WALK, NOT THE HEADER, IS WHERE THE LOG ENDS. The header's offset can be
-            // stale by design: a crash after a commit relocated the tail but before its
-            // header store leaves an offset covering the region the relocation shortened.
-            // Replay handles that correctly — it stops at the generation-0 terminator — but
-            // Append starts from _writeOffset, so adopting the stale value would place every
-            // new entry PAST that terminator, where the NEXT recovery stops before reaching
-            // it: everything ingested since this restart, silently dropped, with no segment
-            // carrying it. Truncating here is what makes the first append after a recovery
-            // land where the data actually ends. The same holds for an entry that fails its
-            // checksum: the next append overwrites it, rather than leaving it in front of
-            // everything written after it.
+            // stale: a power loss can keep an older header page over newer data pages, so the
+            // claim may still cover the region a commit's relocation shortened. Replay handles
+            // that correctly — it stops at the generation-0 terminator — but Append starts from
+            // _writeOffset, so adopting the stale value would place every new entry PAST that
+            // terminator, where the NEXT recovery stops before reaching it: everything ingested
+            // since this restart, silently dropped, with no segment carrying it. Truncating here
+            // is what makes the first append after a recovery land where the data actually ends.
+            // The same holds for an entry that fails its checksum: the next append overwrites it,
+            // rather than leaving it in front of everything written after it.
             if (pos < _writeOffset)
             {
                 _writeOffset = pos;
-                Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + pos;
+                Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = _headerSize + pos;
             }
         }
 
@@ -911,15 +1505,15 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <summary>
     /// The entry at logical offset <paramref name="pos"/>: its total length, or 0 where the log
     /// ends — too short for a header, never written (generation 0), longer than what is left, or
-    /// (<paramref name="checksummed"/>, v2) not matching its CRC. Bounds are checked before the
-    /// checksum reads anything, so a garbage length cannot walk it off the mapping. Caller holds
+    /// (<paramref name="checksummed"/>, v2 and v3) not matching its CRC. Bounds are checked before
+    /// the checksum reads anything, so a garbage length cannot walk it off the mapping. Caller holds
     /// the lock.
     /// </summary>
     private long EntryAt(long pos, long end, int headerSize, bool checksummed)
     {
         if (pos + headerSize > end) return 0;
 
-        byte* src = _ptr + FileHeaderSize + pos;
+        byte* src = _ptr + _headerSize + pos;
         ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(src);
 
         // Generation 0 is never written by an append, so it marks the end of real
@@ -980,8 +1574,8 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// </summary>
     private void Grow(long newCapacity)
     {
-        long oldFileSize = FileHeaderSize + _capacity;
-        long newFileSize = FileHeaderSize + newCapacity;
+        long oldFileSize = _headerSize + _capacity;
+        long newFileSize = _headerSize + newCapacity;
 
         Unmap();
         try
@@ -1037,7 +1631,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         if (_ptr is null) return false;
 
         long pageSize  = Environment.SystemPageSize;
-        long fileSize  = FileHeaderSize + _capacity;
+        long fileSize  = _headerSize + _capacity;
         long alignedTo = Math.Min(fileSize, (to + pageSize - 1) / pageSize * pageSize);
 
         // The header page, unless the range already starts inside it.
