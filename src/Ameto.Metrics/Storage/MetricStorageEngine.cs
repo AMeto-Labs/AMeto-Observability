@@ -3021,6 +3021,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// (<see cref="MetricReader.ReadIdentities"/>). <c>MetricCatalogSeedTests</c> holds the catalog
     /// to the one the full decode builds. The one difference is a file torn inside its points: the
     /// full decode stopped at the torn series, this reads the identities past it.</para>
+    ///
+    /// <para><b>What it trusts</b> (#106 review, F5): the header's <c>MaxNano</c>, for every series of the
+    /// file, where it used to read each series' own last point. A v3 file carries no checksum, so a
+    /// damaged header now moves <see cref="MetricMeta.LastSeenMs"/> where the points would not have —
+    /// display only (the catalog's "last seen"), and the same field queries and retention already
+    /// trust for the file's range.</para>
     /// </summary>
     private void SeedCatalogFromCold(List<MetricSegmentInfo> segments)
     {
