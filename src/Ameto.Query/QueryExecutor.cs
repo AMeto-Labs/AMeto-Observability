@@ -75,6 +75,12 @@ public sealed class QueryExecutor : IQueryExecutor
         int limit  = request.Count;
         int count  = 0;
 
+        // A page of nothing asks for nothing: no snapshot, no pins, no prefilter. The loop below
+        // checks its limit AFTER each row now, so without this a count of 0 would get a row; and
+        // when the check ran before each row, the same request planned the window and primed a
+        // prefilter batch (8 opens over the 40-segment fixture) for a first row it then dropped.
+        if (limit <= 0) yield break;
+
         bool forward  = request.Direction == QueryDirection.Forward;
         var  from     = request.FromUtc;
         var  to       = request.ToUtc;
@@ -207,9 +213,14 @@ public sealed class QueryExecutor : IQueryExecutor
 
             await foreach (var ev in MergeSourcesAsync(hotStream, window, pins, filter, levels, from, to, afterTs, afterId, forward, pace, ct))
             {
-                if (ct.IsCancellationRequested || count >= limit) yield break;
+                if (ct.IsCancellationRequested) yield break;
                 yield return ev;
-                count++;
+                // Stop AT the limit, not when the row after it arrives. Checked before each row,
+                // the limit made a consumer that reads the stream to its end — the list endpoint,
+                // the SSE writer — wait while the merge produced row limit+1, only to drop it, and
+                // at a prefilter batch edge that one row costs the whole next batch, doubled: 24
+                // segments opened instead of 8 for a page of 44 over the 40-segment fixture (#114).
+                if (++count >= limit) yield break;
             }
         }
         finally
