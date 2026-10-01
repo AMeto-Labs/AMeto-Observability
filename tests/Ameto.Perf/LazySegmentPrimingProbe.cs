@@ -66,6 +66,10 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
     /// read its blocks — and the second mapping is the one lazy priming was supposed to have
     /// avoided. The prefilter's reader is handed to the scan now.
     ///
+    /// <para>And a PAGE maps only what its prefilter got to. The prefilter used to run over the
+    /// whole window before the first row, so a page of 5 mapped all 40; it runs in priming order
+    /// now, a batch at a time, and this page is served before the first batch runs out.</para>
+    ///
     /// <para>Reported per query and per SURVIVING segment; the count is what the assertion is
     /// about, so unlike the allocation ratio above it is exact.</para>
     /// </summary>
@@ -91,14 +95,15 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
         _out.WriteLine($"page of 5 : {pageOpens} opens");
         _out.WriteLine($"full read : {fullOpens} opens");
 
-        // The prefilter maps every segment once; the scan borrows. Nothing is mapped twice,
-        // however much of the catalog the query ends up draining.
+        // The prefilter maps every segment it checks once; the scan borrows. Nothing is mapped
+        // twice, however much of the catalog the query ends up draining — and a page maps only
+        // the first prefilter batch, not the window.
         Assert.Equal(Segments, fullOpens);
-        Assert.Equal(Segments, pageOpens);
+        Assert.InRange(pageOpens, 1, QueryExecutor.PrefilterParallelism);
 
         // …AND EVERY ONE OF THEM IS CLOSED. This is the half a single-segment test cannot
-        // reach: a page of 5 primes one or two of the 40, so ~38 readers were opened by the
-        // prefilter, handed to a scan that never ran, and have no iterator to close them —
+        // reach: a page of 5 primes one or two of the segments its prefilter batch opened, so
+        // the rest were handed to a scan that never ran, and have no iterator to close them —
         // only the merge's finally does. On Windows a mapping keeps the file undeletable, and
         // retention and the merge delete segments while queries run, so an escaped reader here
         // is not a leak that shows up as memory, it is a file that never goes away.
@@ -113,7 +118,7 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
         long opened = SegmentReader.Opens - o0, closed = SegmentReader.Closes - c0;
 
         _out.WriteLine($"page of 5 : {opened} opened, {closed} closed");
-        Assert.Equal(Segments, opened);
+        Assert.Equal(pageOpens, opened);
         Assert.Equal(opened, closed);
 
         // Belt and braces, and the operation the merge's source cleanup actually needs.
