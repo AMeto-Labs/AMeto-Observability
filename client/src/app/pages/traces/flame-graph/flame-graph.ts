@@ -344,7 +344,7 @@ export class FlamegraphComponent implements OnChanges {
    */
   private readonly zoom = computed(() => {
     const f = this.focused();
-    return f ? { x: f._x!, w: f._w!, depth: f._depth! } : { x: 0, w: 1, depth: 0 };
+    return { x: f?._x ?? 0, w: f?._w ?? 1, depth: f?._depth ?? 0 };
   });
 
   ngOnChanges(ch: SimpleChanges) {
