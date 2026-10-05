@@ -16,17 +16,29 @@ const LEVEL_CLAUSE_RE =
 // ── The services picker's clause ────────────────────────────────────────────
 //
 // The picker owns ONE clause: a top-level AND conjunct `@service = '…'` / `@service in […]` —
-// or the `['service.name']` spelling it wrote before, which saved searches, history and shared
-// URLs still carry. Only such a conjunct is a SELECTION: it constrains every row. The same text
-// under a `not`, or beside a top-level `or`, does not, and reading it as one hid rows the server
-// had rightly returned. The field names are matched ORDINALLY, as the server matches its aliases
-// (`@SERVICE` is a user property there); the `in` keyword, like every keyword, in any case.
+// under any name the server answers for the field. Only such a conjunct is a SELECTION: it
+// constrains every row. The same text under a `not`, or beside a top-level `or`, does not, and
+// reading it as one hid rows the server had rightly returned. The field names are matched
+// ORDINALLY, as the server matches its aliases (`@SERVICE` is a user property there); the `in`
+// keyword, like every keyword, in any case.
 
-/** `@service = 'x'` — either spelling of the field; group 1 is the service. */
-const SERVICE_EQ_CLAUSE = /^(?:@service|\['service\.name'\])\s*=\s*'([^']+)'$/;
+/**
+ * The field under each name the server resolves to it (BuiltinFields, the ServiceName row), as
+ * people write them: `@service`; `ServiceName`; `service.name`, which the parser splits into the
+ * path the table lists; and `['service.name']`, the spelling the picker wrote before `@service`,
+ * which saved searches, history and shared URLs still carry. Knowing only the first and the last,
+ * the picker kept a `ServiceName = 'old'` conjunct as the user's own text and ANDed its pick in
+ * front of it: two service clauses that contradict, and an empty page. The clauses below are
+ * anchored, so a longer name that merely starts like one of these — `service.namespace`,
+ * `ServiceNameX` — is a property, as it is to the server.
+ */
+const SERVICE_FIELD = String.raw`(?:@service|ServiceName|service\.name|\['service\.name'\])`;
 
-/** `@service in ['a', 'b']` — either spelling; group 1 is the list body. */
-const SERVICE_IN_CLAUSE = /^(?:@service|\['service\.name'\])\s+[Ii][Nn]\s*\[([^\]]+)\]$/;
+/** `@service = 'x'` — any spelling of the field; group 1 is the service. */
+const SERVICE_EQ_CLAUSE = new RegExp(String.raw`^${SERVICE_FIELD}\s*=\s*'([^']+)'$`);
+
+/** `@service in ['a', 'b']` — any spelling; group 1 is the list body. */
+const SERVICE_IN_CLAUSE = new RegExp(String.raw`^${SERVICE_FIELD}\s+[Ii][Nn]\s*\[([^\]]+)\]$`);
 
 /** The quoted items of an `in […]` list body. */
 const QUOTED_ITEM = /'([^']+)'/g;
@@ -72,7 +84,10 @@ function topLevelConjuncts(expr: string): string[] | null {
   return parts.filter(p => p.length > 0);
 }
 
-/** True for a conjunct the picker writes, or wrote in an earlier spelling. */
+/**
+ * True for a conjunct that selects services, under any name of the field, or for the picker's
+ * oldest clause.
+ */
 function isServiceClause(conjunct: string): boolean {
   return SERVICE_EQ_CLAUSE.test(conjunct)
       || SERVICE_IN_CLAUSE.test(conjunct)
@@ -217,7 +232,7 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
 
 /**
  * The services the filter SELECTS: those named by the picker's clause when it is a top-level AND
- * conjunct (either spelling). Empty — "all services" — when there is none, including when the
+ * conjunct (any spelling of the field). Empty — "all services" — when there is none, including when the
  * clause sits under a `not` or beside a top-level `or`, where it selects nothing.
  */
 export function parseServicesFromFilter(expr: string): Set<string> {
@@ -249,7 +264,7 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 /**
  * Rewrites the picker's service clause of `expr` as `@service = …` / `@service in […]` — the
  * built-in field's own name, which the server answers from the event header and its index. Only
- * the picker's own clause (a top-level AND conjunct, in either spelling) is replaced — never
+ * the picker's own clause (a top-level AND conjunct, in any spelling of the field) is replaced — never
  * duplicated — and a service test the user wrote under a `not` or inside an `or` is left as
  * written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
  * all of it. Placed after any `@l` clause, before the rest of the user's expression.

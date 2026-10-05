@@ -99,6 +99,54 @@ describe('reading the selected services back out of a filter', () => {
   });
 });
 
+/**
+ * The server answers the field under four names — BuiltinFields' ServiceName row, matched
+ * ordinally: `@service`, `ServiceName`, the bare dotted `service.name` and the bracketed
+ * `['service.name']`. The picker knew the first and the last only, so a filter in either of the
+ * other two — `ServiceName = 'x'` was the documented example until #113 — kept its clause as the
+ * user's text, and a pick ANDed `@service = 'new'` in front of it: two service clauses that
+ * contradict each other, and an empty page.
+ */
+describe('the service clause under every name the server answers for it', () => {
+  const SPELLINGS = ['@service', 'ServiceName', 'service.name', "['service.name']"];
+
+  it('reads each spelling as the selection', () => {
+    for (const f of SPELLINGS) {
+      expect([...parseServicesFromFilter(`${f} = 'api'`)], f).toEqual(['api']);
+      expect([...parseServicesFromFilter(`@l = 'Error' and ${f} in ['a', 'b']`)], f).toEqual(['a', 'b']);
+    }
+  });
+
+  it('replaces each spelling with the pick, and clears it when nothing is picked', () => {
+    for (const f of SPELLINGS) {
+      expect(setServicesClause(`${f} = 'old' and Region = 'eu'`, new Set(['new'])), f)
+        .toBe("@service = 'new' and Region = 'eu'");
+      expect(setServicesClause(`@l = 'Error' and ${f} in ['a', 'b']`, new Set()), f).toBe("@l = 'Error'");
+    }
+  });
+
+  it("turns a saved ServiceName = 'old' and a pick into one clause, not two that contradict", () => {
+    const saved = "ServiceName = 'old' and Region = 'eu'";
+    const opened = parseServicesFromFilter(saved);          // what the picker opens with
+    expect([...opened]).toEqual(['old']);
+    expect(setServicesClause(saved, new Set([...opened, 'new'])))
+      .toBe("@service in ['old', 'new'] and Region = 'eu'");
+    expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
+  });
+
+  it('leaves alone what only looks like the field: other properties, other cases, other tests', () => {
+    for (const other of [
+      "service.namespace = 'x'", "['service.namespace'] = 'x'", "service.name.id = 'x'",
+      "@service.name = 'x'", "ServiceNameX = 'x'", "MyServiceName = 'x'",
+      "servicename = 'x'", "SERVICENAME = 'x'", "Service.Name = 'x'", "['Service.Name'] = 'x'",
+      "ServiceName <> 'x'", "service.name like 'x%'", "not ServiceName = 'x'",
+    ]) {
+      expect(parseServicesFromFilter(other).size, other).toBe(0);
+      expect(setServicesClause(other, new Set(['a'])), other).toBe(`@service = 'a' and ${other}`);
+    }
+  });
+});
+
 describe('eventService', () => {
   const base: EventDto = { '@t': '2026-10-01T09:00:00.0000000Z', '@mt': 'x', '@l': 'Information', id: '1' };
 
