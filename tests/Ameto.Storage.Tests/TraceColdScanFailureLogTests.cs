@@ -65,19 +65,7 @@ public sealed class TraceColdScanFailureLogTests : IDisposable
     [Fact]
     public void A_segment_held_open_through_the_retries_is_kept_and_leaves_the_store_degraded_until_a_restart()
     {
-        string trc;
-        using (var writer = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance))
-        {
-            writer.LoadColdSegments();
-            writer.WriteSpan(new SpanIngestItem
-            {
-                TraceId = new TraceId(0, 1), SpanId = new SpanId(1), ParentSpanId = default,
-                StartTimeUnixNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L, DurationNanos = 1_000_000L,
-                Name = "GET /orders", ServiceName = "billing", Kind = SpanKind.Server, Status = SpanStatusCode.Ok,
-            });
-            writer.FlushHotTier();
-            trc = Assert.Single(Directory.GetFiles(_dir, "*.trc"));
-        }
+        string trc = WriteOneSegment();
 
         var logger = new CapturingLogger();
         using (new FileStream(trc, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
@@ -97,6 +85,80 @@ public sealed class TraceColdScanFailureLogTests : IDisposable
         restarted.LoadColdSegments();
         Assert.Equal(1, restarted.ColdSegmentCountForTest);
         Assert.Equal(QueryAvailability.Available, restarted.Availability);
+    }
+
+    /// <summary>
+    /// BUSY, THEN GONE, IS A HANDOVER (#119 review). On Windows the compactor's delete-pending source
+    /// refuses the scan's first open with access denied, and is gone by the retry: the merge that
+    /// holds its spans was published. The retry used to swallow that FileNotFoundException and answer
+    /// "still unreadable", so the store went Degraded — every trace alert rule skipped until a
+    /// restart — over a handover that lost nothing. The last failure decides now: one retry, then
+    /// skipped as vanished; the store is Available and nothing is short.
+    /// </summary>
+    [Fact]
+    public void A_segment_busy_and_then_gone_is_a_handover_not_a_degraded_store()
+    {
+        string trc   = WriteOneSegment();
+        var logger   = new CapturingLogger();
+        using var e  = new TraceStorageEngine(_dir, logger);
+        int attempts = 0;
+        e._readColdSegmentInfoForTest = path =>
+        {
+            if (++attempts == 1) throw new UnauthorizedAccessException($"Access to the path '{path}' is denied.");
+            throw new FileNotFoundException("gone", path);
+        };
+
+        e.LoadColdSegments();
+
+        Assert.Equal(2, attempts);                                       // one retry: gone is not retried again
+        Assert.Equal(QueryAvailability.Available, e.Availability);
+        Assert.False(e.ColdTierIncompleteForTest);
+        Assert.DoesNotContain(logger.Entries, static x => x.Level == LogLevel.Error);
+        Assert.True(File.Exists(trc));                                   // the seam's "gone": nothing deleted it
+    }
+
+    /// <summary>
+    /// BUSY, THEN DAMAGED, IS DAMAGE (#119 review). A segment held on its first open whose bytes the
+    /// reader refuses once it can open it takes the damage path — here, a readable header: deleted,
+    /// with its window recorded as unreadable — and does not leave the store Degraded, which no
+    /// restart would end.
+    /// </summary>
+    [Fact]
+    public void A_segment_busy_and_then_damaged_takes_the_damage_path_not_the_degraded_one()
+    {
+        string trc = WriteOneSegment();
+        using (var fs = new FileStream(trc, FileMode.Open, FileAccess.Write))
+        {
+            fs.Seek(-4, SeekOrigin.End);
+            fs.Write([0xDE, 0xAD, 0xBE, 0xEF]);   // the footer magic, which a v1 file also fails on; header intact
+        }
+
+        var logger   = new CapturingLogger();
+        using var e  = new TraceStorageEngine(_dir, logger);
+        int attempts = 0;
+        e._readColdSegmentInfoForTest = path => ++attempts == 1 ? throw new IOException("busy") : SpanReader.ReadSegmentInfo(path);
+
+        e.LoadColdSegments();
+
+        Assert.Equal(2, attempts);
+        Assert.False(File.Exists(trc), "a segment whose bytes the reader refused was kept as merely unreachable");
+        Assert.Equal(1, e.VanishedRegionCountForTest);                   // the damage path's record of the window
+        Assert.Equal(QueryAvailability.Available, e.Availability);
+    }
+
+    /// <summary>One segment of one span, written and flushed by an engine that is then closed; its path.</summary>
+    private string WriteOneSegment()
+    {
+        using var writer = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        writer.LoadColdSegments();
+        writer.WriteSpan(new SpanIngestItem
+        {
+            TraceId = new TraceId(0, 1), SpanId = new SpanId(1), ParentSpanId = default,
+            StartTimeUnixNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L, DurationNanos = 1_000_000L,
+            Name = "GET /orders", ServiceName = "billing", Kind = SpanKind.Server, Status = SpanStatusCode.Ok,
+        });
+        writer.FlushHotTier();
+        return Assert.Single(Directory.GetFiles(_dir, "*.trc"));
     }
 
     private sealed class CapturingLogger : ILogger<TraceStorageEngine>
