@@ -231,6 +231,39 @@ public sealed class MetricColdScanFaultTests : IDisposable
         Assert.Single(log.Snapshot(), e => e.Level == MsLogLevel.Warning && e.Message.Contains("was gone"));
     }
 
+    /// <summary>
+    /// THE LAST ATTEMPT IS THE VERDICT. A file another process was deleting — on Windows a
+    /// delete-pending file refuses an open with access denied — is unreachable on the first attempt
+    /// and gone on the second: it ends as Gone, after one pause, and the store is not Degraded over a
+    /// file that no longer exists.
+    /// </summary>
+    [Fact]
+    public async Task A_file_unreachable_and_then_gone_ends_as_gone_not_as_a_degraded_store()
+    {
+        var files  = await WriteSegmentsAsync("deleting.metric");
+        string deleting = files["deleting.metric"];
+
+        int attempts = 0;
+        var log   = new Entries();
+        var waits = new List<TimeSpan>();
+        var io = new MetricStorageEngine.ColdScanIo
+        {
+            ReadSegmentInfo = path =>
+            {
+                if (++attempts == 1) throw new UnauthorizedAccessException($"Access to the path '{path}' is denied.");
+                throw new FileNotFoundException("gone", path);
+            },
+            Wait = waits.Add,
+        };
+        await using var engine = await StartAsync(log, io);
+
+        Assert.Equal(2, attempts);
+        Assert.Equal(Delays[..1], waits);
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+        Assert.DoesNotContain(log.Snapshot(), e => e.Level >= MsLogLevel.Error);
+        Assert.True(File.Exists(deleting));   // the seam's "gone" — nothing deleted it
+    }
+
     // ── About the bytes: deleted, as before ───────────────────────────────────────────────────
 
     /// <summary>
