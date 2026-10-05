@@ -4330,7 +4330,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private void ReplayOrphanedWal(string walFile)
     {
         string poolPath   = walFile + ".pool";
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
+        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version);
+
+        // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
+        // here. Cleaning it up as the branch below does with what it cannot read is what every
+        // release before log WAL v5 does to a v5 log, and it throws away every acknowledged event
+        // the log holds. Left in place, the release that wrote it replays it when it starts again.
+        // Its block is reserved all the same, so nothing written meanwhile takes the ids that
+        // replay will write into; and this runs again at every start for as long as it stays.
+        if (version > WriteAheadLog.FormatVersion)
+        {
+            ReserveWalBlock(segId);
+            _logger.LogError(
+                "WAL {File} is format v{Version}, newer than this release reads (v{Current}): left in place, not " +
+                "replayed. Its events come back when the release that wrote it starts again; delete the file and " +
+                "its .pool only to give them up.",
+                walFile, version, WriteAheadLog.FormatVersion);
+            return;
+        }
 
         // Empty or corrupt WAL — clean up
         if (segId == 0 || entries.Count == 0)

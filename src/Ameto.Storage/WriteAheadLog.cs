@@ -831,8 +831,20 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         return dict;
     }
 
-    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath)
+    /// <summary>The format this build writes, and the newest it reads (see WalVersion).</summary>
+    public const ushort FormatVersion = WalVersion;
+
+    public static (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath) =>
+        ReadForRecovery(walPath, out _);
+
+    /// <param name="version">
+    /// The format the file's header claims, or 0 when the file is not one of these logs. A version
+    /// above <see cref="FormatVersion"/> comes back with no entries: a later release wrote the file,
+    /// and only it can read it.
+    /// </param>
+    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath, out ushort version)
     {
+        version = 0;
         if (!File.Exists(walPath)) return (0, []);
         long fileSize = new FileInfo(walPath).Length;
         if (fileSize < FileHeaderSize) return (0, []);
@@ -845,6 +857,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
             if (fh.Magic != MagicNumber) return (0, []);
+            version = fh.Version;
             // v5 = current. v4 = the releases before it: checksummed, no service. v3: replayable,
             // no per-entry validation possible. Anything else is unreplayable by construction.
             EntryLayout layout;
