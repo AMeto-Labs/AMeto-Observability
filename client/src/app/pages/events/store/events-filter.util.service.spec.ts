@@ -59,6 +59,13 @@ describe('the service clause the events page writes', () => {
   it('matches the field ordinally, as the server does: @SERVICE is a user property', () => {
     expect(setServicesClause("@SERVICE = 'x'", new Set(['a']))).toBe("@service = 'a' and @SERVICE = 'x'");
   });
+
+  it('writes a quote or a backslash in a service name escaped, so the server reads the name', () => {
+    // The lexer ends a string at a lone quote and drops a backslash before the next character.
+    expect(setServicesClause('', new Set(["O'Brien"]))).toBe("@service = 'O''Brien'");
+    expect(setServicesClause('', new Set(['DOMAIN\\svc', "it's"])))
+      .toBe("@service in ['DOMAIN\\\\svc', 'it''s']");
+  });
 });
 
 describe('reading the selected services back out of a filter', () => {

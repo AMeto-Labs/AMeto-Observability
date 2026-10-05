@@ -262,6 +262,16 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 }
 
 /**
+ * `s` as a string literal the server's lexer reads back as `s`. It ends a string at a lone quote
+ * and takes a backslash as an escape of the character after it, so `'O'Brien'` was the name `O`
+ * followed by text it could not use, and `'DOMAIN\svc'` the name `DOMAINsvc`. The quote is
+ * doubled, as `jvLiteral` writes it; the backslash is escaped.
+ */
+function quoted(s: string): string {
+  return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+}
+
+/**
  * Rewrites the picker's service clause of `expr` as `@service = …` / `@service in […]` — the
  * built-in field's own name, which the server answers from the event header and its index. Only
  * the picker's own clause (a top-level AND conjunct, in any spelling of the field) is replaced —
@@ -276,8 +286,8 @@ export function setServicesClause(expr: string, svcs: Set<string>): string {
     : `(${expr.trim()})`;
   if (svcs.size === 0) return conjuncts ? stripped : expr.trim();
   const clause = svcs.size === 1
-    ? `@service = '${[...svcs][0]}'`
-    : `@service in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
+    ? `@service = ${quoted([...svcs][0])}`
+    : `@service in [${[...svcs].map(quoted).join(', ')}]`;
   const lvlMatch = stripped.match(/^(@l\s+(?:not\s+in|in)\s*\[[^\]]+\]|@l\s*(?:<>|!=|=)\s*'[^']*')(\s+and\s+|$)/i);
   if (lvlMatch) {
     const rest = stripped.slice(lvlMatch[0].length).trim();
