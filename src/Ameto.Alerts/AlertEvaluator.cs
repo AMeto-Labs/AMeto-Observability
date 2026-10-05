@@ -681,8 +681,8 @@ public sealed class AlertEvaluator : IAsyncDisposable
             string? rule = Volatile.Read(ref _unavailableLastRule[i]);
             if (why == QueryAvailability.Degraded)
                 _logger.LogWarning(
-                    "Alert rule {Rule} was not evaluated: the {Source} store is {Availability} — it could not "
-                  + "load everything on disk at startup and stays partial until a restart — so its answer "
+                    "Alert rule {Rule} was not evaluated: the {Source} store is {Availability} (it could not "
+                  + "load everything on disk at startup, and stays partial until a restart), so its answer "
                   + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
                   + "since the last such line. Rules keep their state and nothing is sent; set "
                   + "Ameto:Alerts:EvaluateOnDegradedStore to evaluate them on what the store has instead. "
@@ -1066,7 +1066,10 @@ public sealed class AlertEvaluator : IAsyncDisposable
 /// </summary>
 public readonly record struct AlertValue(double Value, QueryAvailability Availability)
 {
-    /// <summary>True when <see cref="Value"/> is the store's whole, true answer.</summary>
+    /// <summary>
+    /// True when <see cref="Value"/> may be acted on: the store's whole, true answer — or a Degraded
+    /// store's partial one, when <see cref="AlertEvaluatorOptions.EvaluateOnDegradedStore"/> asks for it.
+    /// </summary>
     public bool IsAvailable => Availability == QueryAvailability.Available;
 
     internal static AlertValue Of(double value) => new(value, QueryAvailability.Available);

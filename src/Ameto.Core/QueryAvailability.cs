@@ -43,8 +43,8 @@ public enum QueryAvailability : byte
     /// dropped (#108). A read answers from what it has, a PART as while <see cref="Loading"/> —
     /// and unlike Loading the part will not grow, because nothing scans again before a restart.
     ///
-    /// <para>A file whose BYTES are bad is not this: one deleted or set aside as unreadable, with
-    /// an Error of its own, is the store's data from then on, not a load left unfinished.</para>
+    /// <para>A file whose BYTES are bad is not this: one deleted or set aside as unreadable, with a
+    /// log line of its own, is the store's data from then on, not a load left unfinished.</para>
     /// </summary>
     Degraded = 3,
 }
