@@ -43,6 +43,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     private readonly TimeProvider _time;
 
+    /// <summary><see cref="AlertEvaluatorOptions.EvaluateOnDegradedStore"/>: whether a Degraded store's answers are acted on.</summary>
+    private readonly bool _evaluateOnDegraded;
+
     private readonly ConcurrentDictionary<string, MutableState> _states = new();
     private readonly ConcurrentDictionary<string, AlertSilence> _silences = new();
     private readonly ConcurrentDictionary<string, MaintenanceWindow> _maintenance = new();
@@ -75,12 +78,13 @@ public sealed class AlertEvaluator : IAsyncDisposable
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
         IQueryExecutor logQuery, StorageEngine storage,
         IMetricAggregator metrics, ITraceStatsProvider traceStats,
-        ILogger<AlertEvaluator> logger, TimeProvider? time = null)
+        ILogger<AlertEvaluator> logger, TimeProvider? time = null, AlertEvaluatorOptions? options = null)
     {
         _store = store; _dispatcher = dispatcher; _persist = persist;
         _logQuery = logQuery; _storage = storage; _metrics = metrics; _traceStats = traceStats;
         _logger = logger;
         _time   = time ?? TimeProvider.System;
+        _evaluateOnDegraded = options?.EvaluateOnDegradedStore ?? false;
         LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
     }
@@ -308,9 +312,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
                 // THE SAME CASE WITHOUT A HOST STOP (#95). The flag above covers an engine closed by
                 // the host's own shutdown; this covers every other way a store can stop answering
-                // truly — closed by something else, or still loading its cold tier — because the
-                // store says so itself. Nothing about the rule changes: not its state, not its last
-                // value, not its evaluation time. A skipped tick is a tick that did not happen.
+                // truly — closed by something else, still loading its cold tier, or degraded: done
+                // loading without having reached everything on disk (#94) — because the store says
+                // so itself. Nothing about the rule changes: not its state, not its last value, not
+                // its evaluation time. A skipped tick is a tick that did not happen, so it adds
+                // nothing to a Pending rule's For either (see HeldPastUnobservedTicks).
                 if (!value.IsAvailable)
                 {
                     WarnUnavailable(rule, value.Availability);
@@ -365,7 +371,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// A Pending rule's <see cref="MutableState.PendingSince"/>, moved forward past the ticks that did not
     /// evaluate it (#94). <c>For</c> is how long the condition has been SEEN to hold, and a tick that
     /// skipped the rule saw nothing: its evaluation threw, its value was not a number, its store was
-    /// loading or closed (the skips #92 and #95 add), or the process was not running. Counted as
+    /// loading, degraded or closed (the skips #92, #95 and #94 add), or the process was not running. Counted as
     /// time held, those ticks let a rule that went Pending just before a long outage fire on the
     /// first tick after it, on one observation.
     ///
@@ -557,17 +563,21 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     /// <summary>
     /// The rule's value — or, when the store behind it could not answer truly, which way it could
-    /// not (#95). A store that has closed answers EMPTY and one still loading answers a PART, and
-    /// either, taken as a number, is a 0 (or a low count) that resolves every firing "&gt;" rule and
-    /// fires every "&lt;" one. The store is asked instead of the answer being guessed at.
+    /// not (#95). A store that has closed answers EMPTY, and one still loading — or degraded, done
+    /// loading without having reached everything on disk (#94) — answers a PART; either, taken as a
+    /// number, is a 0 (or a low count) that resolves every firing "&gt;" rule and fires every "&lt;"
+    /// one. The store is asked instead of the answer being guessed at. A degraded store's answer is
+    /// acted on only when <see cref="AlertEvaluatorOptions.EvaluateOnDegradedStore"/> says so.
     ///
     /// <para><b>Asked twice, around the read, and each question catches one state.</b> Availability
-    /// only moves forward — Loading → Available → Closed — so:</para>
+    /// only moves forward — Loading → Available or Degraded → Closed, and a store is Degraded from the
+    /// end of its load or never — so:</para>
     /// <list type="bullet">
-    /// <item>BEFORE the read catches <see cref="QueryAvailability.Loading"/>. A read that ran while the
-    /// store loaded began while it loaded, so this question, asked earlier still, saw it too. Asked
-    /// only AFTER, it would miss a load that finished during the read — the read's snapshot of the
-    /// cold tier was taken before it.</item>
+    /// <item>BEFORE the read catches <see cref="QueryAvailability.Loading"/> and
+    /// <see cref="QueryAvailability.Degraded"/>. A read that ran while the store was partial began
+    /// while it was, so this question, asked earlier still, saw it too. Asked only AFTER, it would
+    /// miss a load that finished during the read — the read's snapshot of the cold tier was taken
+    /// before it.</item>
     /// <item>AFTER the read catches <see cref="QueryAvailability.Closed"/>. A read that met a closed
     /// door is followed by this question, which sees the same door. Asked only BEFORE, it misses the
     /// tick that began open and read after the close — the race #84 closed for the host stop.</item>
@@ -595,7 +605,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
         };
 
         var before = store?.Availability ?? QueryAvailability.Available;
-        if (before != QueryAvailability.Available) return AlertValue.Unavailable(before);
+        if (!CanActOn(before)) return AlertValue.Unavailable(before);
 
         var from = now - rule.Window;
         double value;
@@ -614,20 +624,29 @@ public sealed class AlertEvaluator : IAsyncDisposable
         }
 
         var after = store?.Availability ?? QueryAvailability.Available;
-        if (after != QueryAvailability.Available) return AlertValue.Unavailable(after);
+        if (!CanActOn(after)) return AlertValue.Unavailable(after);
 
         return AlertValue.Of(value);
     }
 
     /// <summary>
+    /// Whether a store's answer may be acted on in <paramref name="availability"/>: an Available
+    /// store's always, a Degraded one's only when the operator has chosen rules over its partial data
+    /// to rules that wait for a restart (<see cref="AlertEvaluatorOptions.EvaluateOnDegradedStore"/>).
+    /// </summary>
+    private bool CanActOn(QueryAvailability availability) =>
+        availability == QueryAvailability.Available
+        || (availability == QueryAvailability.Degraded && _evaluateOnDegraded);
+
+    /// <summary>
     /// Records that a rule was left as it was because its store cannot answer. Nothing is logged
-    /// here: the tick's skips are counted per (source, Loading or Closed) and said once, by
+    /// here: the tick's skips are counted per (source, Loading, Degraded or Closed) and said once, by
     /// <see cref="FlushUnavailableWarnings"/> after the tick's last rule — so a line counts the
     /// whole tick, not the first rule of it.
     /// </summary>
     private void WarnUnavailable(AlertRule rule, QueryAvailability why)
     {
-        int i = ((int)rule.Source % SourceCount) * 2 + (why == QueryAvailability.Closed ? 1 : 0);
+        int i = ((int)rule.Source % SourceCount) * StatesPerSource + SlotOf(why);
         Interlocked.Increment(ref _unavailableSkipped[i]);
         Volatile.Write(ref _unavailableLastRule[i], rule.Id);
     }
@@ -636,10 +655,14 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// Says, once a tick and at most once a minute per SOURCE AND STATE, that rules are being left
     /// as they were because their store cannot answer. Not per rule: a closed store skips every
     /// rule that reads it, on every tick, and a line per rule per tick would bury the log for as
-    /// long as the store stays down. Loading and Closed have a slot each, so a store that finishes
-    /// loading and then closes within the minute is still reported closed at once; and each line
-    /// counts every evaluation its slot skipped since its last line — the ticks it was held back
-    /// included — so the rules it does not name are accounted for.
+    /// long as the store stays down. Loading, Degraded and Closed have a slot each, so a store that
+    /// finishes loading and then closes within the minute is still reported closed at once — and a
+    /// store whose load ends Degraded is reported Degraded at once, not a minute after its Loading
+    /// line; and each line counts every evaluation its slot skipped since its last line — the ticks
+    /// it was held back included — so the rules it does not name are accounted for.
+    ///
+    /// <para>A Degraded line says what Loading's need not: that it will not end by itself, and the
+    /// setting that evaluates the rules anyway.</para>
     /// </summary>
     private void FlushUnavailableWarnings()
     {
@@ -653,14 +676,25 @@ public sealed class AlertEvaluator : IAsyncDisposable
             if (Interlocked.CompareExchange(ref _unavailableWarnedAt[i], now, last) != last) continue;
 
             int skipped = Interlocked.Exchange(ref _unavailableSkipped[i], 0);
-            var why     = i % 2 == 1 ? QueryAvailability.Closed : QueryAvailability.Loading;
-            _logger.LogWarning(
-                "Alert rule {Rule} was not evaluated: the {Source} store is {Availability}, so its answer "
-              + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
-              + "since the last such line. Rules keep their state and nothing is sent. Said at most once "
-              + "a minute per source and state",
-                Volatile.Read(ref _unavailableLastRule[i]), (AlertSource)(i / 2), why,
-                why == QueryAvailability.Loading ? "partial" : "empty", skipped);
+            var why     = StateOfSlot(i % StatesPerSource);
+            var source  = (AlertSource)(i / StatesPerSource);
+            string? rule = Volatile.Read(ref _unavailableLastRule[i]);
+            if (why == QueryAvailability.Degraded)
+                _logger.LogWarning(
+                    "Alert rule {Rule} was not evaluated: the {Source} store is {Availability} — it could not "
+                  + "load everything on disk at startup and stays partial until a restart — so its answer "
+                  + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
+                  + "since the last such line. Rules keep their state and nothing is sent; set "
+                  + "Ameto:Alerts:EvaluateOnDegradedStore to evaluate them on what the store has instead. "
+                  + "Said at most once a minute per source and state",
+                    rule, source, why, "partial", skipped);
+            else
+                _logger.LogWarning(
+                    "Alert rule {Rule} was not evaluated: the {Source} store is {Availability}, so its answer "
+                  + "would be {Answer}, not a value — {Skipped} rule evaluation(s) skipped for this reason "
+                  + "since the last such line. Rules keep their state and nothing is sent. Said at most once "
+                  + "a minute per source and state",
+                    rule, source, why, why == QueryAvailability.Loading ? "partial" : "empty", skipped);
         }
     }
 
@@ -669,17 +703,34 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// <summary>The <see cref="AlertSource"/> values: Log, Metric, Trace.</summary>
     private const int SourceCount = 3;
 
+    /// <summary>The states a rule is skipped for, a warning slot each per source: Loading, Degraded, Closed.</summary>
+    private const int StatesPerSource = 3;
+
+    private static int SlotOf(QueryAvailability why) => why switch
+    {
+        QueryAvailability.Loading  => 0,
+        QueryAvailability.Degraded => 1,
+        _                          => 2,   // Closed
+    };
+
+    private static QueryAvailability StateOfSlot(int slot) => slot switch
+    {
+        0 => QueryAvailability.Loading,
+        1 => QueryAvailability.Degraded,
+        _ => QueryAvailability.Closed,
+    };
+
     /// <summary>
     /// Last <see cref="_time"/> timestamp a warning was logged, per (<see cref="AlertSource"/>,
-    /// Loading or Closed) — index <c>source * 2 + (closed ? 1 : 0)</c>; 0 = never.
+    /// state) — index <c>source * StatesPerSource + SlotOf(state)</c>; 0 = never.
     /// </summary>
-    private readonly long[] _unavailableWarnedAt = new long[SourceCount * 2];
+    private readonly long[] _unavailableWarnedAt = new long[SourceCount * StatesPerSource];
 
     /// <summary>Evaluations skipped per slot of <see cref="_unavailableWarnedAt"/> since its last line.</summary>
-    private readonly int[] _unavailableSkipped = new int[SourceCount * 2];
+    private readonly int[] _unavailableSkipped = new int[SourceCount * StatesPerSource];
 
     /// <summary>The most recent rule skipped per slot — the one a line names.</summary>
-    private readonly string?[] _unavailableLastRule = new string?[SourceCount * 2];
+    private readonly string?[] _unavailableLastRule = new string?[SourceCount * StatesPerSource];
     /// <summary>
     /// Safety bound for the scanning fallback. It replaces a hard 10 000 that was NOT a
     /// safety bound but a silent ceiling: a rule counting more than that reported exactly

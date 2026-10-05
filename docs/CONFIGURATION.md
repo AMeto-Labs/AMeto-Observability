@@ -259,6 +259,25 @@ Like the metrics options, every memory ceiling is a quantity of **bytes** derive
 
 ---
 
+## Alert options (`Ameto:Alerts`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `Enabled` | bool | `true` | Runs the alert evaluator and the `/api/alerts` endpoints. It needs metrics and tracing as well: with `Ameto:Metrics:Enabled` or `Ameto:Tracing:Enabled` off, alerts are switched off too. |
+| `EvaluateOnDegradedStore` | bool | `false` | Evaluate rules over a **degraded** store on the partial data it has, instead of skipping them until a restart — see below. |
+
+**A rule is evaluated only over a store that can answer for everything it holds.** On every tick (15 s) the evaluator asks the store the rule reads — logs, metrics or traces — whether its answer would be whole, and when it would not, leaves the rule exactly as it was (state, last value, evaluation time) and sends nothing:
+
+* **loading** — the first seconds or minutes after a start, while the store reads what it holds on disk. Ends by itself.
+* **degraded** — that startup read ended without reaching everything on disk: it failed as a whole (the data directory could not be listed), or — metrics and traces — it left behind a file it could not read, after a few retries, for a reason other than the file's own bytes: held open by another process (an antivirus, a backup agent), a network share that dropped, too many open files. Such a file is kept on disk, never deleted, and is read at the next start. The store logs an Error at startup saying what it left behind, and stays degraded **until a restart**. A file whose bytes are damaged is not this: it is deleted or set aside with an Error of its own (the log store sets aside, as `.seg.corrupt`, any segment its startup read fails on), and it does not make the store degraded.
+* **closed** — the store has shut down.
+
+A skipped tick does not count toward a rule's `For`. The evaluator logs one Warning per store and state at most once a minute, counting the evaluations it skipped since the last one (`Alert rule … was not evaluated: the Metric store is Degraded …`), and `POST /api/alerts/preview` answers such a rule with `503` — carrying `Retry-After` only while the store is loading.
+
+Evaluating on a degraded store reads the window it failed to load as a quiet one: a `<` rule can fire, and a `>` rule can resolve, on data that exists but was not loaded. That is why it is off by default. Set `EvaluateOnDegradedStore: true` when rules that can misfire suit you better than rules that stay silent until the restart; the store's startup Error is then the only word about it. A loading or closed store is skipped either way.
+
+---
+
 ## Resource attributes (env, deployment id, …)
 
 Attach shared attributes to everything a service sends by setting OTLP **resource attributes** on the sender — one env var, no code:
@@ -456,6 +475,10 @@ Ameto:
     IndexBackfill: "Idle"         # Off | Idle | Eager
     SegmentFormatV4: false        # one-way door — see the Traces section
     IndexEnabled: true
+
+  Alerts:
+    Enabled: true                 # needs Metrics and Tracing enabled as well
+    EvaluateOnDegradedStore: false   # true = evaluate rules on a degraded store's partial data
 
   Retention:
     VerboseDays: 90

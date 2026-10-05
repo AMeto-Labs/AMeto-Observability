@@ -589,6 +589,8 @@ Three privilege tiers:
 
 Rule writes are admin-only because a rule owns its channels, and a channel holds a credential and names the host the server dials on dispatch.
 
+**A rule over a store that cannot answer for everything it holds is not evaluated** — while that store is still loading after a start, while it is **degraded** (its startup read left data on disk unread; this lasts until a restart), and once it has closed. The rule keeps its state and nothing is sent; see [Alert options](CONFIGURATION.md#alert-options-ametoalerts). `POST …/preview` answers such a rule with `503` and an `error` sentence, with `Retry-After: 5` only while the store is loading. With `Ameto:Alerts:EvaluateOnDegradedStore: true`, rules over a degraded store are evaluated, and previewed, on the data it has.
+
 **Secrets in channels.** Every response redacts channel secrets to `********`. Sending that sentinel back on an upsert means "unchanged" and the stored value is merged in — but only while the channel's destination is unchanged too (webhook URL, SMTP host/port, Telegram chat id, or the whole HTTP-flow step list). Moving the destination while leaving a secret masked returns `400`; re-send the secret to point a channel somewhere new.
 
 ---
