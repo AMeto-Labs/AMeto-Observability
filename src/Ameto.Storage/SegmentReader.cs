@@ -204,9 +204,14 @@ public sealed class SegmentReader : ISegmentReader
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         int blockCount = ReadInt32At(_blockIndexOffset);
+        int stride     = version >= 5 ? 20 : 16;
+        // A count the file cannot hold is a claim about the BYTES, and is named as one (#119
+        // review): unchecked, a torn count failed the allocation below with OutOfMemoryException —
+        // a word about the machine, not the file — and the catalog scan, which sets a segment aside
+        // only for bytes it refuses, would have kept it as unreachable at every start instead.
+        FileBounds.RequireCountFits(blockCount, fileSize - _blockIndexOffset - 4, stride, "Block index", filePath);
         _blocks        = new (long, long)[blockCount];
         _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
-        int stride = version >= 5 ? 20 : 16;
 
         // Pull the whole block index in ONE mapped read and parse it from the span. The
         // per-entry shape cost three MemoryMappedViewAccessor calls per block, so opening a
@@ -293,6 +298,8 @@ public sealed class SegmentReader : ISegmentReader
 
         int count = ReadInt32At(directoryOffset);
         if (count <= 0) return [];
+        // The same rule as the block index's count: what the file cannot hold is torn bytes.
+        FileBounds.RequireCountFits(count, _fileSize - directoryOffset - 4, GroupEntrySize, "Group directory", filePath);
 
         var groups = new SegmentIndexGroup[count];
         int bytes  = count * GroupEntrySize;

@@ -9,8 +9,23 @@ namespace Ameto.Storage;
 internal static partial class StorageEngineLog
 {
     /// <summary>
+    /// A segment the catalog scan could not open, through its retries, for a reason that is not its
+    /// bytes (#119 review): left under its name — not set aside as <c>.seg.corrupt</c> — out of this
+    /// run's catalog, and the store <see cref="Ameto.Core.QueryAvailability.Degraded"/> until the
+    /// restart that reads it. One Error per such segment, naming it.
+    /// </summary>
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Segment {File} could not be read by the catalog scan, through its retries, for a reason that is not "
+                + "its contents: it is left where it is — not set aside as .corrupt — and is read at the next start. Until "
+                + "then its events are not served: the log store reports itself Degraded, and log ALERT RULES are not "
+                + "evaluated on the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). Restart once "
+                + "whatever holds the file has let go of it")]
+    internal static partial void CatalogSegmentUnreachable(ILogger logger, Exception exception, string file);
+
+    /// <summary>
     /// The catalog scan failed AS A WHOLE (#94): the directory could not be listed, or the recovery of
-    /// interrupted merges threw — a file that fails on its own is quarantined inside the scan. The
+    /// interrupted merges threw — a file that fails on its own is handled inside the scan (set aside
+    /// for its bytes, otherwise left unread with an Error of its own, see above). The
     /// segments on disk are then not in the catalog, nothing scans again before a restart, and every
     /// reader answers from the hot tier and what has been flushed since. The boot scan's task faults,
     /// which is what makes the store report itself <see cref="Ameto.Core.QueryAvailability.Degraded"/>

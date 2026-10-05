@@ -552,21 +552,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     ///
     /// <para><see cref="QueryAvailability.Degraded"/> instead of Available after such a scan (#94):
     /// the task that did not complete successfully IS the record that the catalog is short, and it
-    /// is final — nothing scans again before a restart. A segment the scan cannot read on its own
-    /// is quarantined inside a scan that succeeds, and does not make the store degraded.</para>
+    /// is final — nothing scans again before a restart. Degraded as well after a scan that left a
+    /// segment unread for a reason that is not its bytes (<see cref="_catalogScanShort"/>). A segment
+    /// set aside FOR its bytes (<c>.seg.corrupt</c>) does not make the store degraded: that is what
+    /// the disk holds, not a load left unfinished.</para>
     ///
     /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
     /// step of the teardown after its final flush. Conservative by a few steps — reads stay whole
     /// until <see cref="_snapshotsClosed"/>, after which <see cref="SnapshotTiers"/> THROWS rather
     /// than answering — but past it nothing a caller acts on is worth reading.</para>
     ///
-    /// <para>Three volatile reads at most (the task's state is one), no lock, no allocation.</para>
+    /// <para>Four volatile reads at most (the task's state is two), no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
         Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
       : !_catalogLoad.IsCompleted             ? QueryAvailability.Loading
-      : !_catalogLoad.IsCompletedSuccessfully ? QueryAvailability.Degraded
+      : !_catalogLoad.IsCompletedSuccessfully
+        || Volatile.Read(ref _catalogScanShort) != 0 ? QueryAvailability.Degraded
       :                                         QueryAvailability.Available;
+
+    /// <summary>
+    /// 1 once the boot catalog scan has left a segment on disk unregistered for a reason that is not
+    /// its bytes — held open by another process, on a share that dropped, a process out of handles —
+    /// after its retries (#108's rule, here per the #119 review). Written by the scan, so before its
+    /// task completes (a release the <c>IsCompleted</c> read above acquires), and never cleared: the
+    /// next start reads the file. See <see cref="LoadSegmentCatalogCore"/>.
+    /// </summary>
+    private int _catalogScanShort;
 
     /// <summary>
     /// Test seam: an engine constructed while this holds a task starts its catalog scan only once
@@ -1925,9 +1937,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     /// <summary>
     /// Test hook: called by <see cref="LoadSegmentCatalog"/> with a listed file's path just before
-    /// it opens the file: the window in which a delete can remove the file under the scan before
-    /// the scan has read it. It runs inside the scan's per-file try, so a throw from it is handled
-    /// as an unreadable file.
+    /// each attempt to open the file: the window in which a delete can remove the file under the
+    /// scan before the scan has read it. It runs inside the scan's open, so a throw from it is
+    /// handled as that attempt's failure — classified, and retried when it says nothing about the
+    /// bytes (see <see cref="ReadCatalogSegmentInfo"/>).
     /// </summary>
     internal Action<string>? _beforeScanOpensSegment;
 
@@ -4143,18 +4156,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // and an error at every start, which is how an operator finds out at all.
         var files = Directory.GetFiles(_segDir, "*.seg");
         Array.Sort(files, StringComparer.Ordinal);
+        long retryTicksLeft = CatalogReadRetryBudget.Ticks;
         foreach (var file in files)
         {
             try
             {
-                _beforeScanOpensSegment?.Invoke(file);
-
                 // Closed before the gate: nothing below reads the file, and on Windows a mapping
                 // held while waiting for the gate is what made a delete of this very file fail
-                // its unlink and park.
-                SegmentInfo info;
-                using (var reader = SegmentReader.Open(file, computeUncompressedBytes: true))
-                    info = reader.Info;
+                // its unlink and park. Retried there if the failure may clear by itself (#119).
+                SegmentInfo info = ReadCatalogSegmentInfo(file, ref retryTicksLeft);
                 var key = SegmentKey.Of(info);
 
                 _beforeScanRegistersSegment?.Invoke(file);
@@ -4247,6 +4257,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 lock (_scanDeleteGate) skip = ScanSkipUnderGate(file);
                 if (LogScanSkip(skip, file, ex)) continue;
 
+                // NOT ABOUT THE BYTES: LEFT WHERE IT IS (#119 review — #108's rule for metrics and
+                // traces). This branch set aside whatever the open threw: a segment an antivirus or
+                // a backup agent held for a moment, one on a share that blinked, one a process out
+                // of handles could not open — every byte of it good, renamed .seg.corrupt and served
+                // by nobody until an operator renamed it back. ReadCatalogSegmentInfo has retried
+                // such a failure; one that outlasted the retries is the LAST attempt's, and it leaves
+                // the file under its name, out of this run's catalog, for the next start to read:
+                // the store is Degraded until then, its alert rules not evaluated on the part it
+                // holds. That includes a file gone with no delete of ours recorded — skipped quietly
+                // it would be the case the comment above refuses: a probe a failing mount answers
+                // "not there" for a live segment. Quarantine stays for what the BYTES say
+                // (FileBounds.DescribesContent): a torn frame, a file too short for a footer, a torn
+                // merge output (#98) — the reader names every one of those as content.
+                if (!FileBounds.DescribesContent(ex))
+                {
+                    Volatile.Write(ref _catalogScanShort, 1);   // before the scan's task completes
+                    StorageEngineLog.CatalogSegmentUnreachable(_logger, ex, file);
+                    continue;
+                }
+
                 // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
                 // header or footer that nothing could ever parse; the reader now also throws on
                 // one torn block FRAME -- four bad bytes in a file whose every other block is
@@ -4265,6 +4295,70 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>
+    /// The pauses between the catalog scan's attempts at a segment it could not open for a reason
+    /// that is not its bytes: six attempts over ~0.8 s — the metric WAL upgrade's schedule (#105),
+    /// which the metric and trace cold scans also follow (#108, #119 review).
+    /// </summary>
+    private static readonly TimeSpan[] CatalogReadRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>
+    /// What one scan may spend waiting on such segments, IN ALL — the other scans' figure: forty
+    /// files a backup agent holds must not keep every log alert in Loading for half a minute. Past
+    /// it, a segment that cannot be opened gets one attempt.
+    /// </summary>
+    private static readonly TimeSpan CatalogReadRetryBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Test seam: the pause between the catalog scan's attempts at a segment, in place of
+    /// <see cref="Thread.Sleep(TimeSpan)"/>. Set it on an engine built with its boot scan held. Null
+    /// in production.
+    /// </summary>
+    internal Action<TimeSpan>? _catalogScanWaitForTest;
+
+    /// <summary>
+    /// One listed segment's info, the reader closed again — or the failure of the LAST attempt,
+    /// rethrown for the scan's catch to classify (#119 review). A failure that may clear by itself
+    /// is retried after each of <see cref="CatalogReadRetryDelays"/> while
+    /// <paramref name="retryTicksLeft"/> lasts: one that says nothing about the bytes
+    /// (<see cref="FileBounds.DescribesContent"/>), for a file no delete has let go. Content is not
+    /// retried — the same bytes fail the same way — and a file parked for deletion, or deleted
+    /// while the scan runs, is the delete's (see <see cref="ScanSkipUnderGate"/>), whatever a wait
+    /// would show. No lock is held across a pause.
+    /// </summary>
+    private SegmentInfo ReadCatalogSegmentInfo(string file, ref long retryTicksLeft)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            Exception fault;
+            try
+            {
+                _beforeScanOpensSegment?.Invoke(file);
+                using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
+                if (attempt > 1)
+                    _logger.LogWarning("Segment {File} could not be read at first and was read on attempt {Attempt}",
+                                       file, attempt);
+                return reader.Info;
+            }
+            catch (Exception ex) { fault = ex; }
+
+            bool letGo;
+            lock (_scanDeleteGate) letGo = ScanSkipUnderGate(file) != ScanSkip.None;
+            if (letGo || FileBounds.DescribesContent(fault)
+                || attempt > CatalogReadRetryDelays.Length || retryTicksLeft <= 0)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(fault);
+
+            long wait = Math.Min(CatalogReadRetryDelays[attempt - 1].Ticks, retryTicksLeft);
+            retryTicksLeft -= wait;
+            if (_catalogScanWaitForTest is { } pause) pause(TimeSpan.FromTicks(wait));
+            else                                      Thread.Sleep(TimeSpan.FromTicks(wait));
+        }
     }
 
     /// <summary>Why the catalog scan leaves a file alone, if it does.</summary>
