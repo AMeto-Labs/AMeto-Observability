@@ -250,6 +250,39 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     }
 
     /// <summary>
+    /// A client of a host that has ANSWERED A REQUEST — for a test that starts a budget once it has
+    /// one, so the budget times the test's own request and not the host (#115).
+    ///
+    /// <para><see cref="WebApplicationFactory{TEntryPoint}.CreateClient()"/> starts the host on a
+    /// class's first call, but the host keeps work back for its first request: routing builds its
+    /// table, with a request delegate for every endpoint, and the middleware chain runs for the first
+    /// time. Measured on the development PC (Debug, each fact alone in its process): a live tail's
+    /// headers took 150-1 060 ms as a fresh host's first request and 40-50 ms after one
+    /// <c>/health</c>; on one pinned core, 660-780 ms against 100-170 ms. A 3 s budget started before
+    /// that request ran out on a loaded two-core runner, and the tail answered 499 to a test that only
+    /// asked whether it opens.</para>
+    ///
+    /// <para><c>/health</c> because it runs the whole pipeline — routing, authentication — and no
+    /// engine, and it answers at the root under any base path. No budget of its own beyond the
+    /// client's default timeout: how long a host takes to come up is not what any test here asserts.</para>
+    /// </summary>
+    public async Task<HttpClient> CreateReadyClientAsync()
+    {
+        var client = CreateClient();
+        try
+        {
+            using var health = await client.GetAsync("/health");
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+            return client;
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Seeds <see cref="TestApiKey"/> into the DB-backed auth store once, then
     /// refreshes the in-memory cache so the ingest endpoint accepts it.
     /// </summary>

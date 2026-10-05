@@ -1049,6 +1049,19 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
 
 public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
 {
+    /// <summary>
+    /// What the tail's HEADERS may take: a hang guard, not a timing bound — neither fact is about how
+    /// fast a tail opens, so a correct host on a loaded runner must not fail them (#115). The 3 s these
+    /// facts used to give the whole request also covered the class's first request, which builds the
+    /// host's routes; on a loaded two-core runner that ran out and the tail answered 499. Started once
+    /// the host has answered a request (<see cref="AmetoWebAppFactory.CreateReadyClientAsync"/>), so it
+    /// covers the tail's own request alone.
+    /// </summary>
+    private static readonly TimeSpan HeadersHangGuard = TimeSpan.FromSeconds(30);
+
+    /// <summary>How long the first line is waited for, from the headers on. A quiet stream is accepted.</summary>
+    private static readonly TimeSpan FirstLineBudget = TimeSpan.FromSeconds(3);
+
     private readonly AmetoWebAppFactory _factory;
 
     public LiveTailTests(AmetoWebAppFactory factory) => _factory = factory;
@@ -1057,8 +1070,8 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
     public async Task LiveTail_Connect_ReceivesKeepaliveOrData()
     {
         // ResponseHeadersRead lets us read the SSE stream incrementally.
-        using var client = _factory.CreateClient();
-        using var cts    = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var client = await _factory.CreateReadyClientAsync();
+        using var cts    = new CancellationTokenSource(HeadersHangGuard);
 
         using var request = new HttpRequestMessage(HttpMethod.Get, "/api/events/live");
         using var resp    = await client.SendAsync(
@@ -1070,6 +1083,8 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
         await using var stream = await resp.Content.ReadAsStreamAsync(cts.Token);
         using var reader = new System.IO.StreamReader(stream);
 
+        // The short budget is the stream read's alone: it starts with the headers in hand.
+        cts.CancelAfter(FirstLineBudget);
         string? firstLine = null;
         try { firstLine = await reader.ReadLineAsync(cts.Token); }
         catch (OperationCanceledException) { /* timeout acceptable */ }
@@ -1084,8 +1099,8 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task LiveTail_WithLevelFilter_Returns200()
     {
-        using var client = _factory.CreateClient();
-        using var cts    = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var client = await _factory.CreateReadyClientAsync();
+        using var cts    = new CancellationTokenSource(HeadersHangGuard);
 
         using var request = new HttpRequestMessage(
             HttpMethod.Get, "/api/events/live?filter=" + Uri.EscapeDataString("@l = 'Error'"));
