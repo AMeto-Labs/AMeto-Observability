@@ -1667,9 +1667,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // held any row. The hook still gets the attached text; the WAL never stores it.
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
+        // The service is logged the way the header holds it, by pool index, and its text goes into
+        // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
+        // flush resolves it, so a replayed event carries the service the flushed one would have.
+        string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception);
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception,
+                          h.ServiceNamePoolIndex, svcStr);
             _walFaulted = false;
         }
         catch (ObjectDisposedException)
