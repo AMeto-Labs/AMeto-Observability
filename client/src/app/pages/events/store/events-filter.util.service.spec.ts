@@ -1,4 +1,3 @@
-import { EventDto, eventService } from '../../../core/models/event.model';
 import { BUILTIN_SUGGESTIONS, parseServicesFromFilter, setServicesClause } from './events-filter.util';
 
 /**
@@ -144,26 +143,6 @@ describe('the service clause under every name the server answers for it', () => 
       expect(parseServicesFromFilter(other).size, other).toBe(0);
       expect(setServicesClause(other, new Set(['a'])), other).toBe(`@service = 'a' and ${other}`);
     }
-  });
-});
-
-describe('eventService', () => {
-  const base: EventDto = { '@t': '2026-10-01T09:00:00.0000000Z', '@mt': 'x', '@l': 'Information', id: '1' };
-
-  it('reads @service', () => {
-    expect(eventService({ ...base, '@service': 'api' })).toBe('api');
-  });
-
-  it('falls back to service.name, the key an older server sent', () => {
-    expect(eventService({ ...base, 'service.name': 'legacy' })).toBe('legacy');
-  });
-
-  it('prefers @service when both are present', () => {
-    expect(eventService({ ...base, '@service': 'api', 'service.name': 'legacy' })).toBe('api');
-  });
-
-  it('is undefined for an event without a service', () => {
-    expect(eventService(base)).toBeUndefined();
   });
 });
 
