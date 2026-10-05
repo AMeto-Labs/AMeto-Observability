@@ -135,6 +135,12 @@ describe('the service clause under every name the server answers for it', () => 
     expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
   });
 
+  it('repairs, at the next pick, a contradiction the old picker already saved', () => {
+    const saved = "@service = 'new' and ServiceName = 'old' and Region = 'eu'";
+    expect([...parseServicesFromFilter(saved)]).toEqual(['new']);   // it opens with the first
+    expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
+  });
+
   it('leaves alone what only looks like the field: other properties, other cases, other tests', () => {
     for (const other of [
       "service.namespace = 'x'", "['service.namespace'] = 'x'", "service.name.id = 'x'",
