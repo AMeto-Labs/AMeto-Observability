@@ -130,7 +130,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
                  [title]="barTitle(node)"
                  [style.left.%]="barLeft(node)"
                  [style.width.%]="barWidth(node)"
-                 [style.top.px]="node._depth! * ROW_H"
+                 [style.top.px]="barTop(node)"
                  [style.height.px]="ROW_H - 2"
                  [style.background]="barColor(node)"
                  [class.fg-bar--error]="node.status === 'Error'"
@@ -322,20 +322,29 @@ export class FlamegraphComponent implements OnChanges {
     return n;
   });
 
-  /** When a node is focused, show only its subtree re-scaled to full width. */
+  /**
+   * The bars to draw: every node, or with one focused, its subtree — the tree's OWN nodes either
+   * way, placed in the zoom by {@link barLeft}, {@link barWidth} and {@link barTop}. It used to
+   * return re-scaled copies, and a bar clicked inside a zoomed view handed {@link focusNode} its
+   * copy, whose `_x` / `_w` / `_depth` were already relative to that zoom: applied to the full
+   * layout, they put the next zoom's bars at the wrong offset or off the canvas (#94). A bar now
+   * IS its node, so a click can only focus a node of the tree.
+   */
   visibleNodes = computed(() => {
     const all = this.flatNodes();
     const f   = this.focused();
     if (!f) return all;
-
     const ids = subtreeIds(f);
+    return all.filter(n => ids.has(n.spanId));
+  });
 
-    // re-scale: f._x..f._x+f._w → 0..1
-    const ox = f._x ?? 0, ow = f._w ?? 1;
-    const od = f._depth ?? 0;
-    return all
-      .filter(n => ids.has(n.spanId))
-      .map(n => ({ ...n, _x: (n._x! - ox) / ow, _w: n._w! / ow, _depth: n._depth! - od }));
+  /**
+   * The stretch of the full layout the canvas shows: the focused node's — so it fills the width
+   * and sits on the top row — or, unzoomed, all of it.
+   */
+  private readonly zoom = computed(() => {
+    const f = this.focused();
+    return f ? { x: f._x!, w: f._w!, depth: f._depth! } : { x: 0, w: 1, depth: 0 };
   });
 
   ngOnChanges(ch: SimpleChanges) {
@@ -375,10 +384,20 @@ export class FlamegraphComponent implements OnChanges {
 
   resetFocus() { this.focused.set(null); }
 
-  // ── Bar geometry ──────────────────────────────────────────────────────────
+  // ── Bar geometry: a node's place in the full layout, seen through the zoom ──
 
-  barLeft(n: FlamegraphNode): number  { return (n._x ?? 0) * 100; }
-  barWidth(n: FlamegraphNode): number { return Math.max(0.05, (n._w ?? 0) * 100); }
+  barLeft(n: FlamegraphNode): number {
+    const z = this.zoom();
+    return ((n._x ?? 0) - z.x) / z.w * 100;
+  }
+
+  barWidth(n: FlamegraphNode): number {
+    return Math.max(0.05, (n._w ?? 0) / this.zoom().w * 100);
+  }
+
+  barTop(n: FlamegraphNode): number {
+    return ((n._depth ?? 0) - this.zoom().depth) * this.ROW_H;
+  }
 
   barTitle(n: FlamegraphNode): string {
     const t = n.name + ' · ' + this.fmtMs(n.totalMs);
