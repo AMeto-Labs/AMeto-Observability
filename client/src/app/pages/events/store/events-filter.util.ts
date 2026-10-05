@@ -22,26 +22,154 @@ const LEVEL_CLAUSE_RE =
 // ORDINALLY, as the server matches its aliases (`@SERVICE` is a user property there); the `in`
 // keyword, like every keyword, in any case.
 
+/** PropertyPath.Separator: what the server's parser joins a property path's segments with. */
+const PATH_SEP = '\u0001';
+
 /**
- * The field under each name the server resolves to it (BuiltinFields, the ServiceName row), as
- * people write them: `@service`; `ServiceName`; `service.name`, which the parser splits into the
- * path the table lists; and `['service.name']`, the spelling the picker wrote before `@service`,
- * which saved searches, history and shared URLs still carry. Knowing only the first and the last,
- * the picker kept a `ServiceName = 'old'` conjunct as the user's own text and ANDed its pick in
- * front of it: two service clauses that contradict, and an empty page. The clauses below are
- * anchored, so a longer name that merely starts like one of these — `service.namespace`,
- * `ServiceNameX` — is a property, as it is to the server.
+ * The KEYS the server resolves to the field (BuiltinFields, the ServiceName row): `@service`;
+ * `ServiceName`; `service.name` as one key, which only a bracket writes (`['service.name']`, the
+ * spelling the picker wrote before `@service` — saved searches, history and shared URLs still
+ * carry it); and the path `service`/`name`, which bare `service.name` becomes, and
+ * `service['name']`, `['service'].name` and `['service']['name']` too.
+ *
+ * The picker used to match SPELLINGS, with a regex, and every spelling it missed kept its clause
+ * as the user's own text while a pick ANDed `@service = 'new'` in front of it: two service
+ * clauses that contradict, and an empty page. So a conjunct is now read the way the server reads
+ * it ({@link lex}, {@link readPath}) and the KEY that comes out is what is compared — ordinally,
+ * as the server compares it, so `service.namespace`, `servicename` and `service['name']['x']`
+ * stay properties here as they are there.
  */
-const SERVICE_FIELD = String.raw`(?:@service|ServiceName|service\.name|\['service\.name'\])`;
+const SERVICE_KEYS: ReadonlySet<string> =
+  new Set(['@service', 'ServiceName', 'service.name', `service${PATH_SEP}name`]);
 
-/** `@service = 'x'` — any spelling of the field; group 1 is the service. */
-const SERVICE_EQ_CLAUSE = new RegExp(String.raw`^${SERVICE_FIELD}\s*=\s*'([^']+)'$`);
+/** A token of the server's filter lexer, as far as the picker's clause needs one. */
+interface Token {
+  kind: 'ident' | 'string' | 'number' | 'punct' | 'op';
+  /** An identifier as written; a string's value, its escapes undone; otherwise the symbol. */
+  text: string;
+}
 
-/** `@service in ['a', 'b']` — any spelling; group 1 is the list body. */
-const SERVICE_IN_CLAUSE = new RegExp(String.raw`^${SERVICE_FIELD}\s+[Ii][Nn]\s*\[([^\]]+)\]$`);
+/** `char.IsLetter` / `char.IsDigit`, the lexer's tests — one UTF-16 unit at a time, as there. */
+const isLetter = (ch: string) => /\p{L}/u.test(ch);
+const isDigit = (ch: string | undefined) => ch !== undefined && /\p{Nd}/u.test(ch);
+const isIdentPart = (ch: string) =>
+  ch === '@' || ch === '_' || ch === '.' || isLetter(ch) || isDigit(ch);
 
-/** The quoted items of an `in […]` list body. */
-const QUOTED_ITEM = /'([^']+)'/g;
+const isPunct = (t: Token | undefined, ch: string) => t?.kind === 'punct' && t.text === ch;
+
+/**
+ * `src` in the server lexer's tokens (Lexer.Tokenise), rule for rule: whitespace separates
+ * tokens; `'…'` is a string in which `\x` is x and `''` is a quote; `( ) [ ] ,` stand alone; a
+ * `.` not before a digit is a dot; `= != <> < <= > >=` are operators; a number starts with `-`,
+ * a digit or `.digit`; an identifier starts with `@`, `_` or a letter and runs on through those,
+ * digits AND DOTS; any other character is skipped, as the lexer skips it.
+ *
+ * One departure: a string still open at the end — which the lexer reads to the end — makes this
+ * null. That is a draft being typed (`@service = 'pay`), and the picker reads nothing from it.
+ */
+function lex(src: string): Token[] | null {
+  const out: Token[] = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const two = src.slice(i, i + 2);
+    if (/\s/.test(c)) {
+      i++;
+    } else if (c === "'") {
+      let text = '';
+      for (i++; ; ) {
+        if (i >= src.length) return null;
+        if (src[i] === '\\' && i + 1 < src.length) { text += src[i + 1]; i += 2; }
+        else if (src[i] === "'" && src[i + 1] === "'") { text += "'"; i += 2; }
+        else if (src[i] === "'") { i++; break; }
+        else { text += src[i]; i++; }
+      }
+      out.push({ kind: 'string', text });
+    } else if ('()[],'.includes(c) || (c === '.' && !isDigit(src[i + 1]))) {
+      out.push({ kind: 'punct', text: c });
+      i++;
+    } else if (two === '!=' || two === '<=' || two === '<>' || two === '>=') {
+      out.push({ kind: 'op', text: two });
+      i += 2;
+    } else if (c === '=' || c === '<' || c === '>') {
+      out.push({ kind: 'op', text: c });
+      i++;
+    } else if (c === '-' || c === '.' || isDigit(c)) {        // a `.` here has a digit after it
+      let j = c === '-' ? i + 1 : i;
+      while (j < src.length && (src[j] === '.' || isDigit(src[j]))) j++;
+      out.push({ kind: 'number', text: src.slice(i, j) });
+      i = j;
+    } else if (c === '@' || c === '_' || isLetter(c)) {
+      let j = i + 1;
+      while (j < src.length && isIdentPart(src[j])) j++;
+      out.push({ kind: 'ident', text: src.slice(i, j) });
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+
+/**
+ * The key the server's parser makes of the property path starting at `t[p]`
+ * (FilterParser.ReadPropertyPath) — an identifier split at its dots, a bracketed string kept whole
+ * as one segment, then any run of `.identifier` and `['segment']`, all joined with U+0001 — and
+ * the position after it; null when no path starts there. A bracketed number, an array index, is
+ * not read: no key of the field has one, so a clause holding one is not the picker's.
+ */
+function readPath(t: readonly Token[], p: number): { key: string; end: number } | null {
+  const bracketed = (k: number): string | null =>
+    isPunct(t[k], '[') && t[k + 1]?.kind === 'string' && isPunct(t[k + 2], ']')
+      ? t[k + 1].text
+      : null;
+
+  const segs: string[] = [];
+  const first = bracketed(p);
+  if (first !== null) { segs.push(first); p += 3; }
+  else if (t[p]?.kind === 'ident') { segs.push(...t[p].text.split('.')); p++; }
+  else return null;
+
+  for (;;) {
+    const seg = bracketed(p);
+    if (seg !== null) {
+      segs.push(seg);
+      p += 3;
+    } else if (isPunct(t[p], '.') && t[p + 1]?.kind === 'ident') {
+      segs.push(...t[p + 1].text.split('.'));
+      p += 2;
+    } else {
+      return { key: segs.join(PATH_SEP), end: p };
+    }
+  }
+}
+
+/**
+ * The services a conjunct SELECTS — `field = 'x'` or `field in ['x', …]`, `field` being any
+ * spelling the server resolves to the built-in service — or null for anything else: an exclusion
+ * (`<>`, `not in`), another property, a comparison with something that is not a name, a list
+ * holding one, or text after the clause. A name is never empty.
+ */
+function serviceSelection(conjunct: string): string[] | null {
+  const t = lex(conjunct);
+  const path = t && readPath(t, 0);
+  if (!t || !path || !SERVICE_KEYS.has(path.key)) return null;
+
+  const isName = (k: number) => t[k]?.kind === 'string' && t[k].text.length > 0;
+  let p = path.end;
+  if (t[p]?.kind === 'op' && t[p].text === '=')
+    return isName(p + 1) && p + 2 === t.length ? [t[p + 1].text] : null;
+
+  if (t[p]?.kind !== 'ident' || t[p].text.toLowerCase() !== 'in' || !isPunct(t[p + 1], '['))
+    return null;
+  const names: string[] = [];
+  for (p += 2; isName(p); ) {
+    names.push(t[p++].text);
+    if (!isPunct(t[p], ',')) break;
+    p++;                                                      // the parser takes a trailing comma
+  }
+  return names.length > 0 && isPunct(t[p], ']') && p + 1 === t.length ? names : null;
+}
 
 /** The picker's oldest clause, `(service.name = 'x' or ApplicationContext = 'x')`: replaced, never read. */
 const LEGACY_SERVICE_OR_CLAUSE =
@@ -89,9 +217,7 @@ function topLevelConjuncts(expr: string): string[] | null {
  * oldest clause.
  */
 function isServiceClause(conjunct: string): boolean {
-  return SERVICE_EQ_CLAUSE.test(conjunct)
-      || SERVICE_IN_CLAUSE.test(conjunct)
-      || LEGACY_SERVICE_OR_CLAUSE.test(conjunct);
+  return serviceSelection(conjunct) !== null || LEGACY_SERVICE_OR_CLAUSE.test(conjunct);
 }
 
 /** Milliseconds between .NET DateTime min (0001-01-01 UTC) and Unix epoch (1970-01-01 UTC). */
@@ -237,10 +363,8 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
  */
 export function parseServicesFromFilter(expr: string): Set<string> {
   for (const conjunct of topLevelConjuncts(expr) ?? []) {
-    const inMatch = SERVICE_IN_CLAUSE.exec(conjunct);
-    if (inMatch) return new Set([...inMatch[1].matchAll(QUOTED_ITEM)].map(m => m[1]));
-    const eqMatch = SERVICE_EQ_CLAUSE.exec(conjunct);
-    if (eqMatch) return new Set([eqMatch[1]]);
+    const names = serviceSelection(conjunct);
+    if (names) return new Set(names);
   }
   return new Set<string>();
 }
