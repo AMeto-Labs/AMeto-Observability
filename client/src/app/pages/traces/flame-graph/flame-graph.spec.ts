@@ -321,6 +321,19 @@ describe('flame graph zoom', () => {
     expect(el.querySelector('.fg-tt-cut')).toBeNull();
   });
 
+  it('does not zoom into a bar of zero width: a span the server rounded to 0 ms has nothing to stretch', async () => {
+    const tree = node(16, [node(0, [], { name: 'z' }), node(16, [], { name: 'a' })], { name: 'root' });
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    const whole = geometry(el);
+    expect(whole['z']).toEqual([0, 0.05, 24]);    // drawn as the minimum sliver, so it can be clicked
+
+    bar(el, 'z').click();
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(whole);
+    expect(el.querySelector('.fg-btn')).toBeNull();
+  });
+
   it('draws, after any chain of zooms, the clicked node\'s subtree as that subtree\'s own flame graph', async () => {
     const tree = randomTree(11, 400);
     const flat = layoutFlamegraph(tree);

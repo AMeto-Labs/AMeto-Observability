@@ -374,10 +374,16 @@ export class FlamegraphComponent implements OnChanges {
     });
   }
 
+  /**
+   * Zooms into `node`, or back out when it is the focused one. A node of no width — a span the
+   * server rounded to 0 ms, drawn as the minimum sliver — has nothing to stretch: zooming into it
+   * divided by zero, and every bar in view got a NaN place, which the browser ignores, so the bars
+   * kept their pre-zoom places on the shifted rows. Such a click leaves the view as it is.
+   */
   focusNode(node: FlamegraphNode) {
     if (this.focused()?.spanId === node.spanId) {
       this.focused.set(null);
-    } else {
+    } else if ((node._w ?? 0) > 0) {
       this.focused.set(node);
     }
   }
