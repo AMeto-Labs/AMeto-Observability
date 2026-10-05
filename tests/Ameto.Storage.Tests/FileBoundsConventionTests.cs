@@ -53,6 +53,8 @@ public sealed class FileBoundsConventionTests
         ["SpanWriteScratch.cs"] = "the segment WRITER's scratch arrays: every size is a batch's own span count or a body "
                                 + "sized from in-memory counts; it reads no file",
         ["MetricWriter.cs"] = "writes files rather than reading them",
+        ["SpanStartIndex.cs"] = "the hot tier's in-memory start index: sized from a tier list's own span count or a "
+                              + "constant, and doubled from its own length; it reads no file",
     };
 
     /// <summary>

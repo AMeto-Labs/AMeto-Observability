@@ -23,6 +23,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private          List<SpanRecord>                          _hotSpans  = new();
     private readonly Dictionary<TraceId, List<int>>            _traceIdx  = new();
     private readonly ReaderWriterLockSlim                      _lock      = new();
+    // The start-time bounds of _hotSpans, block by block (#94) — replaced wherever _hotSpans is,
+    // and travelling with it into _flushingStarts. See SpanStartIndex. Under _lock.
+    private          SpanStartIndex                            _hotStarts;
+    private          SpanStartIndex?                           _flushingStarts;
 
     // ── In-flight flush ──────────────────────────────────────────────────────
     // The segment build (sort + LZ4-HC + four indexes + three sidecars) used to run
@@ -783,6 +787,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                                 bool writeSegmentFormatV4, bool indexEnabled,
                                 TracesOptions? options, SpanStringPools? pools)
     {
+        _hotStarts = new SpanStartIndex(_hotSpans);
         _pools = pools ?? new SpanStringPools();
         options ??= new TracesOptions();
         var budgets = MemoryBudgets.Current();
@@ -1350,6 +1355,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         };
 
         int offset = _hotSpans.Count;
+        _hotStarts.Append(h.StartTimeUnixNano);   // first: see SpanStartIndex.Append for the order
         _hotSpans.Add(record);
         _hotBytes += HotSpanBytes(attributes.Length)
                    + (namePooled    ? 0 : SpanStringPools.UnpooledStringBytes(name))
@@ -2563,25 +2569,30 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     private List<SpanRecord> TakeSnapshotLocked()
     {
-        var nextTier  = new List<SpanRecord>();
-        var nextNames = _pools.CreateNamePool();
+        var nextTier   = new List<SpanRecord>();
+        var nextStarts = new SpanStartIndex(nextTier);
+        var nextNames  = _pools.CreateNamePool();
 
         // The log opens its window only now, and first of the two: if BeginFlush throws, the tier
         // must still be where it was — detaching first would strand the snapshot with no flush to
         // carry it and no caller holding a reference.
         _wal.BeginFlush();
-        return DetachTierLocked(nextTier, nextNames);
+        return DetachTierLocked(nextTier, nextStarts, nextNames);
     }
 
     /// <summary>
     /// The detach itself, once the log's window is open: stores and a <c>Clear</c>, nothing that
-    /// allocates or throws. <paramref name="nextTier"/> and <paramref name="nextNames"/> were built
-    /// by the caller before the window opened. Under _lock(write).
+    /// allocates or throws. <paramref name="nextTier"/>, its <paramref name="nextStarts"/> and
+    /// <paramref name="nextNames"/> were built by the caller before the window opened. The snapshot
+    /// takes its start index with it. Under _lock(write).
     /// </summary>
-    private List<SpanRecord> DetachTierLocked(List<SpanRecord> nextTier, Ameto.Core.StringInternPool nextNames)
+    private List<SpanRecord> DetachTierLocked(
+        List<SpanRecord> nextTier, SpanStartIndex nextStarts, Ameto.Core.StringInternPool nextNames)
     {
         var snapshot = _hotSpans;
-        _hotSpans = nextTier;
+        _flushingStarts = _hotStarts;
+        _hotSpans  = nextTier;
+        _hotStarts = nextStarts;
         _traceIdx.Clear();
         _hotSince = null;
         _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
@@ -2633,10 +2644,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         bool started = false;
         try
         {
-            var snapshot  = _hotSpans;
-            var nextTier  = new List<SpanRecord>();
-            var nextNames = _pools.CreateNamePool();
-            var flush     = new Task(() =>
+            var snapshot   = _hotSpans;
+            var nextTier   = new List<SpanRecord>();
+            var nextStarts = new SpanStartIndex(nextTier);
+            var nextNames  = _pools.CreateNamePool();
+            var flush      = new Task(() =>
             {
                 try     { CompleteFlush(snapshot); }
                 finally { EndHeavyPhase(); }
@@ -2655,7 +2667,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             }
             started = true;                                     // the slot is the task's to release now
 
-            DetachTierLocked(nextTier, nextNames);
+            DetachTierLocked(nextTier, nextStarts, nextNames);
             _flushTask = flush;
         }
         finally
@@ -2782,8 +2794,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     _wal.AbandonFlush();          // flag-only, no I/O — fine under the lock
                     RestoreSnapshotLocked(snapshot);
                 }
-                _flushingSpans = null;            // the segment (or the restored tier) now carries them
-                _flushingBytes = 0;
+                _flushingSpans  = null;           // the segment (or the restored tier) now carries them
+                _flushingStarts = null;
+                _flushingBytes  = 0;
                 _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
@@ -2873,14 +2886,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// rebuilds the trace index over the combined list. Under _lock(write). A NEW list —
     /// never the snapshot itself: readers may still be iterating it through the
     /// <see cref="_flushingSpans"/> reference they took lock-free, and mutating a list
-    /// under a live enumerator faults them.
+    /// under a live enumerator faults them. Its start index is a new one too, built before
+    /// anything is swapped, for the same readers.
     /// </summary>
     private void RestoreSnapshotLocked(List<SpanRecord> snapshot)
     {
         var combined = new List<SpanRecord>(snapshot.Count + _hotSpans.Count);
         combined.AddRange(snapshot);
         combined.AddRange(_hotSpans);
-        _hotSpans = combined;
+        var starts = SpanStartIndex.Build(combined);
+        _hotSpans  = combined;
+        _hotStarts = starts;
         _hotBytes += _flushingBytes;      // the snapshot's bytes come back with its spans
         _unflushedGeneration++;
 
@@ -4132,17 +4148,54 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// mutated — the segment writer sorts a copy (<c>SpanWriter.Write</c>), which readers already
     /// rely on when they take <see cref="_flushingSpans"/> lock-free. A <c>SpanRecord</c> is
     /// init-only. So the elements a run covers cannot change while it is walked.</para>
+    ///
+    /// <para><b>BOTH RUNS, ALWAYS.</b> Every reader of the unflushed spans reads the snapshot as well
+    /// as the live tier. Once the segment build moved off the lock, the detached snapshot — up to
+    /// <see cref="HotFlushThreshold"/> spans — belonged to neither tier for the build's whole
+    /// duration, so the trace list, per-service stats, volume sparkline and service graph each
+    /// carried a rolling hole just behind the live edge; at load, where flushes run back to back,
+    /// that hole was close to permanent. Tier order is the snapshot, then the live tier: the
+    /// snapshot left the tier before anything now in it arrived.</para>
+    ///
+    /// <para><b>EACH RUN WITH ITS START INDEX</b> (#94), captured in the same hold and safe to read
+    /// after it for the reason <see cref="SpanStartIndex"/> gives. A run whose index is not the one
+    /// built for its list, or does not count exactly its spans, is captured UNINDEXED and walked
+    /// whole — the pairing is maintained at four sites by hand, and a slip at one of them must cost
+    /// speed, never rows. <see cref="UnindexedCapturesForTest"/> counts it happening.</para>
     /// </summary>
-    private readonly ref struct UnflushedRuns(ReadOnlySpan<SpanRecord> flushing, ReadOnlySpan<SpanRecord> hot)
+    private readonly ref struct UnflushedRuns(
+        ReadOnlySpan<SpanRecord> flushing, SpanStartView flushingStarts,
+        ReadOnlySpan<SpanRecord> hot,      SpanStartView hotStarts)
     {
-        public readonly ReadOnlySpan<SpanRecord> Flushing = flushing;
-        public readonly ReadOnlySpan<SpanRecord> Hot      = hot;
+        public readonly ReadOnlySpan<SpanRecord> Flushing       = flushing;
+        public readonly SpanStartView            FlushingStarts = flushingStarts;
+        public readonly ReadOnlySpan<SpanRecord> Hot            = hot;
+        public readonly SpanStartView            HotStarts      = hotStarts;
     }
 
     /// <summary>See <see cref="UnflushedRuns"/>. Caller holds the read lock.</summary>
-    private UnflushedRuns UnflushedRunsLocked() => new(
-        _flushingSpans is { } flushing ? CollectionsMarshal.AsSpan(flushing) : default,
-        CollectionsMarshal.AsSpan(_hotSpans));
+    private UnflushedRuns UnflushedRunsLocked()
+    {
+        var flushing = _flushingSpans;
+        return new(
+            flushing is not null ? CollectionsMarshal.AsSpan(flushing) : default, StartViewLocked(_flushingStarts, flushing),
+            CollectionsMarshal.AsSpan(_hotSpans),                                StartViewLocked(_hotStarts, _hotSpans));
+    }
+
+    /// <summary>The start view of <paramref name="list"/>, or an unindexed one when the index is not provably its own.</summary>
+    private SpanStartView StartViewLocked(SpanStartIndex? index, List<SpanRecord>? list)
+    {
+        if (list is null) return default;
+        if (index is not null && ReferenceEquals(index.Owner, list) && index.Count == list.Count)
+            return index.View(list.Count);
+        Interlocked.Increment(ref _unindexedCaptures);
+        return default;
+    }
+
+    private long _unindexedCaptures;
+
+    /// <summary>Test hook: runs captured without a start index they could prove was theirs. Zero in a healthy engine.</summary>
+    internal long UnindexedCapturesForTest => Interlocked.Read(ref _unindexedCaptures);
 
     /// <summary>
     /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:

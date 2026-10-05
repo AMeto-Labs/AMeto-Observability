@@ -45,8 +45,13 @@ public sealed class TraceHotTierWindowTests : IDisposable
     private static readonly TimeSpan HangGuard  = TimeSpan.FromSeconds(30);
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-hotwin-" + Guid.NewGuid().ToString("N"));
+    private readonly Xunit.Abstractions.ITestOutputHelper _out;
 
-    public TraceHotTierWindowTests() => Directory.CreateDirectory(_dir);
+    public TraceHotTierWindowTests(Xunit.Abstractions.ITestOutputHelper output)
+    {
+        _out = output;
+        Directory.CreateDirectory(_dir);
+    }
 
     public void Dispose()
     {
@@ -243,6 +248,25 @@ public sealed class TraceHotTierWindowTests : IDisposable
         Assert.True(crossed >= ListFilters.Length / 2, $"only {crossed} of {ListFilters.Length} streams crossed the flush");
     }
 
+    /// <summary>
+    /// A tier rebuilt from the write-ahead log after a crash goes through the same insert as live
+    /// ingest, so it is indexed the same way — and pages over it are the model's pages.
+    /// </summary>
+    [Fact]
+    public async Task Pages_over_a_tier_replayed_from_the_log_match_the_oracles()
+    {
+        var corpus = Corpus(10, traces: 420);
+        var crashed = SpanWriteAheadLog.Open(Path.Combine(_dir, "spans.wal"));
+        foreach (var item in corpus) crashed.Append(item);
+        crashed.Dispose();
+
+        using var engine = NewEngine();
+        Assert.Equal(corpus.Count, engine.HotSpansForTest.Count);
+
+        await AssertListPagesAsync(engine, flushing: [], "replayed");
+        AssertQlPages(engine, flushing: [], "replayed");
+    }
+
     // ── The trace list against its model ───────────────────────────────────────
 
     private async Task AssertListPagesAsync(TraceStorageEngine engine, List<SpanRecord> flushing, string state)
@@ -270,6 +294,10 @@ public sealed class TraceHotTierWindowTests : IDisposable
 
         // Not vacuous: the small limits page the window many times over, and the pages carry rows.
         Assert.True(pages >= 40 && rows >= 1_000, $"{state}: only {pages} pages and {rows} rows were compared");
+
+        // And every run those pages read was read through its own start index — the pairing the
+        // engine maintains by hand at every swap held in every state these tests build.
+        Assert.Equal(0, engine.UnindexedCapturesForTest);
     }
 
     private static Task<TraceListPage> List(TraceStorageEngine engine, ListFilter f, DateTimeOffset pageTo) =>
@@ -519,6 +547,7 @@ public sealed class TraceHotTierWindowTests : IDisposable
         // Not vacuous: pages that turned matches away (the floor's whole subject) and pages that did not.
         Assert.True(pages >= 30 && evictions >= 10 && evictions < pages,
             $"{state}: {pages} pages compared, {evictions} of them evicting");
+        Assert.Equal(0, engine.UnindexedCapturesForTest);
     }
 
     /// <summary>
