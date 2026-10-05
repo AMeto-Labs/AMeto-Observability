@@ -189,8 +189,10 @@ public sealed class TraceQlSharedWalkProbe : IClassFixture<ColdSpanSegmentFixtur
         Assert.Equal(selectedAlone, selectedShared);
 
         // A GC landing inside a window adds this thread's unused allocation context to the reading
-        // and can only add, so the smallest of the rounds is the clean one.
-        Assert.True(sharedBytes < 1,
+        // and can only add, so the smallest of the rounds is the clean one. The bound is 8 B and not
+        // 1 because that context is up to 8 KB — 4 B a span over Debug's 2 000 — while anything the
+        // walk allocated per span would be an object, 24 B at the least.
+        Assert.True(sharedBytes < 8,
             $"{tier} {label}: the shared post-filter allocated {sharedBytes:N1} B per span — it allocates nothing per span");
 
         // ── The whole page, both ways.
