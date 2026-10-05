@@ -3789,13 +3789,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// File.Delete it got otherwise, outside the gate, recorded nothing, so a scan already running
     /// could register a source this sweep had just deleted (#98).</para>
     ///
-    /// <para>A listed file still PARKED is not this sweep's to touch: it has an owner, the retry it
-    /// was parked for, which deletes it once nothing holds it, under <c>_importLock</c> and against
-    /// the catalog, and says so at Warning once its window is spent. Tried here as well it failed
-    /// again on every pass, at Warning per source: a query pins every segment of its window for its
-    /// whole run (#114), so a merge under a long query leaves every source it reached parked on
-    /// Windows, and each 15 s pass logged up to <see cref="MergeMaxSources"/> Warnings for deletes
-    /// already being retried. Left to the park, the manifest waits a pass longer.</para>
+    /// <para>Two kinds of listed file are not this sweep's to touch. One still PARKED has an owner:
+    /// the retry it was parked for, which deletes it once nothing holds it, under
+    /// <c>_importLock</c> and against the catalog, and says so at Warning once its window is spent.
+    /// Tried here as well it failed again on every pass, at Warning per source: a query pins every
+    /// segment of its window for its whole run (#114), so a merge under a long query leaves every
+    /// source it reached parked on Windows, and each 15 s pass logged up to
+    /// <see cref="MergeMaxSources"/> Warnings for deletes already being retried. Left to the park,
+    /// the manifest waits a pass longer. One the catalog NAMES is in service again: a peer pushed
+    /// the replica to the path its merged-away copy had. It is neither unlinked — which left its
+    /// entry naming a file that was gone — nor waited for: the rule a parked delete follows when the
+    /// catalog names its path again. So the manifest can go without it, and no later start unlinks
+    /// it before its scan names it.</para>
     ///
     /// <para>What none of this tells apart is a crash from a merge in flight: both are a manifest
     /// beside an output at its final name, or beside none yet. The merge gate keeps them apart: a
@@ -3842,18 +3847,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         lock (_scanDeleteGate)
         {
             for (int i = 0; i < unlink.Length; i++)
-                if (!_pendingSegmentDeletes.ContainsKey(sources[i]))
+                if (!_pendingSegmentDeletes.ContainsKey(sources[i]) && !CatalogNamesPath(keys[i], sources[i]))
                     unlink[i] = sources[i];
             ParkMergeSourceGuards(keys, unlink, guarded);
         }
         try     { SettleMergedSources(keys, unlink, guarded); }
         finally { ReleaseUntriedMergeGuards(guarded); }
 
-        // The manifest goes once nothing it lists is left to it: no source parked, none on disk.
-        // File.Exists, the merge's own test for the same decision.
+        // The manifest goes once nothing it lists is left to it: no source parked, and none on disk
+        // that the catalog does not name. File.Exists, the merge's own test for the same decision.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
-            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]);
+            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i])
+                      || (!CatalogNamesPath(keys[i], sources[i]) && File.Exists(sources[i]));
         if (!anyLeft)
         {
             File.Delete(manifest);
@@ -3903,6 +3909,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
         return default;
     }
+
+    /// <summary>Whether the catalog holds an entry under <paramref name="key"/> for the file at <paramref name="path"/>.</summary>
+    private bool CatalogNamesPath(SegmentKey key, string path) =>
+        _segments.TryGetValue(key, out var current)
+        && string.Equals(current.FilePath, path, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Writes a frozen tier as ONE SEGMENT PER LOG LEVEL, so every segment holds a single

@@ -1041,6 +1041,41 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A file a manifest lists that the catalog names is no longer that manifest's to delete. A path
+    /// comes back into service when a peer pushes a replica again to the path its merged-away copy
+    /// had; recovery used to unlink it out from under the new entry, which then named a file that was
+    /// gone. It is left alone, and it does not hold the manifest either — the rule a parked delete
+    /// already follows when the catalog names its path again — so no later start deletes it.
+    /// Built directly: a manifest whose output exists, listing a live segment.
+    /// </summary>
+    [Fact]
+    public async Task AListedFileTheCatalogNames_IsNeitherDeletedNorWaitedFor()
+    {
+        await _engine.CatalogLoaded;   // a pass is Busy until the boot scan is done
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await WriteSegmentAsync(10, 60);
+        var live   = Assert.Single(_engine.ListSegments(), s => s.FilePath != output).FilePath;
+        var before = ReadEverything();
+        await File.WriteAllLinesAsync(output + ".mergemanifest", [Path.GetFileName(live)]);
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+
+        Assert.True(File.Exists(live), "recovery unlinked a file the catalog serves");
+        Assert.Equal(2, _engine.ListSegments().Count);
+        AssertSameEvents(before, ReadEverything());
+        Assert.Empty(Manifests());   // kept for it, the next start would delete the file before its scan names it
+
+        await RestartAsync();
+
+        Assert.True(File.Exists(live), "the next start unlinked it");
+        Assert.Equal(2, _engine.ListSegments().Count);
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// A source whose HEADER is intact but whose blocks are corrupt opens cleanly during
     /// planning and blows up mid-stream — after the manifest is on disk. That is the one path
     /// where the manifest-first ordering has to unwind itself: the merged file never reaches its
