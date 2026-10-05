@@ -3021,7 +3021,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                       + "suspect the volume it was written to",
                         file, info.MinStartNano, info.MaxStartNano);
             }
-            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            catch (FileNotFoundException)
             {
                 // GONE IS NOT BUSY. Between EnumerateFiles above and ReadSegmentInfo here, a
                 // compaction can publish its merged output and unlink the sources — the ordinary
@@ -3030,6 +3030,14 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // six hundred milliseconds retrying a path that does not exist and then raised the
                 // process-wide incomplete flag, so every later query answered Unreadable for the
                 // life of the process over a handover that lost nothing.
+                //
+                // A MISSING DIRECTORY IS NOT THIS (#119 review). The segments live directly in the
+                // data directory and nothing in this engine removes a directory, so a listed file
+                // whose directory has gone is a volume that dropped after the listing — a share,
+                // a bind mount — not a handover. Skipped here at Debug, every file of the tier was,
+                // and the store read Available over none of it: the #94 hazard. It falls to the
+                // catch below instead — retried, and the store Degraded if it stays gone — which is
+                // the reading MeetMissingSegmentFile gives the same evidence on a request.
                 _logger.LogDebug("Cold segment {File} vanished while loading — retired by the engine", file);
                 continue;
             }

@@ -146,6 +146,38 @@ public sealed class TraceColdScanFailureLogTests : IDisposable
         Assert.Equal(QueryAvailability.Available, e.Availability);
     }
 
+    /// <summary>
+    /// A DATA DIRECTORY THAT DROPS AFTER THE LISTING IS A VOLUME, NOT A HANDOVER (#119 review). Every
+    /// open of a listed segment then throws DirectoryNotFoundException, which the scan filed with
+    /// FileNotFoundException as "vanished": skipped at Debug, no flag, and the store Available over
+    /// a cold tier it had not read. Nothing in the engine removes its data directory, so it is now
+    /// the busy path: retried through the budget (four attempts), then kept, one Error, the tier
+    /// short and the store Degraded.
+    /// </summary>
+    [Fact]
+    public void A_data_directory_gone_after_the_listing_leaves_the_store_degraded_not_available()
+    {
+        string trc   = WriteOneSegment();
+        var logger   = new CapturingLogger();
+        using var e  = new TraceStorageEngine(_dir, logger);
+        int attempts = 0;
+        e._readColdSegmentInfoForTest = path =>
+        {
+            attempts++;
+            throw new DirectoryNotFoundException($"Could not find a part of the path '{path}'.");
+        };
+
+        e.LoadColdSegments();
+
+        Assert.Equal(4, attempts);                                       // the first and three retries
+        Assert.Equal(QueryAvailability.Degraded, e.Availability);
+        Assert.True(e.ColdTierIncompleteForTest);
+        var error = Assert.Single(logger.Entries, static x => x.Level == LogLevel.Error);
+        Assert.IsType<DirectoryNotFoundException>(error.Error);
+        Assert.Contains(trc, error.Message, StringComparison.Ordinal);
+        Assert.True(File.Exists(trc));
+    }
+
     /// <summary>One segment of one span, written and flushed by an engine that is then closed; its path.</summary>
     private string WriteOneSegment()
     {
