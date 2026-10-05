@@ -4410,16 +4410,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
                 MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
-                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
-                // the only honest value — but the field is a plain int on a struct, and its
-                // default of 0 is a VALID pool index, not the sentinel every reader tests for
-                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
-                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
-                // ordinarily this WAL's first template: every recovered event was stamped with
-                // it, and the flush below wrote that string permanently into the recovery
-                // segment's @svc column, where it answers @service queries and skews
-                // per-service counts.
-                ServiceNamePoolIndex     = -1,
+                // The service the event was logged with (WAL v5): its pool index, whose text
+                // is one of the rows force-interned above — templates and services share the
+                // pool — so the flush below resolves it to the string a normal flush would
+                // have written, in the @svc column every @service filter, index bucket and
+                // event JSON reads. -1 when there is none to give back: the event had no
+                // service, the entry is older than v5, or this WAL's pool file lost the row
+                // (then the slot holds whatever the live pool has there, so it is not read).
+                //
+                // Never left unset: the field is a plain int on a struct, and its default of 0
+                // is a VALID pool index, not the sentinel every reader tests for
+                // (`ServiceNamePoolIndex >= 0`). Slot 0 is ordinarily this WAL's first
+                // template, and that is what every recovered event was once stamped with,
+                // permanently, in its segment's @svc column.
+                ServiceNamePoolIndex     = entry.ServiceIndexIn(pool),
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
