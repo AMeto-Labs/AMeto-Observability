@@ -1017,6 +1017,42 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// An output at its final name is a COMMITTED merge only if it is a whole segment. The merge moves
+    /// it there only after the writer's fsync and the event-count check, so no crash of this process
+    /// leaves a torn one; a restored backup, or storage that lost a flushed write in a power cut, can.
+    /// Read as committed, recovery deleted the sources — the batch's only readable copy — and the scan
+    /// then quarantined the output: every event of the batch out of service. At start recovery reads
+    /// the output as the scan will, and a torn one is a merge that never committed: the sources stay
+    /// and are served, the manifest goes, and the scan quarantines the output as it quarantines every
+    /// unreadable segment.
+    /// </summary>
+    [Fact]
+    public async Task ATornOutputAtStart_IsAMergeThatNeverCommitted_ItsSourcesStayServed()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();   // nothing of the engine's holds the output while it is torn
+        var bytes = await File.ReadAllBytesAsync(output);
+        await File.WriteAllBytesAsync(output, bytes[..(bytes.Length / 2)]);   // the tail never reached the disk
+
+        await RestartAsync();
+
+        Assert.Equal(10, _engine.ListSegments().Count);   // 0: the sources deleted against an output nobody can read
+        AssertSameEvents(before, ReadEverything());
+        Assert.Empty(Manifests());
+        Assert.False(File.Exists(output));
+        Assert.True(File.Exists(output + ".corrupt"), "the scan did not quarantine the torn output");
+    }
+
+    /// <summary>
     /// Killed after the last unlink and before the manifest went: nothing is left to delete, so
     /// recovery drops the manifest and touches nothing else.
     /// </summary>

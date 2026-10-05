@@ -3578,7 +3578,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     /// <summary>
     /// Unlinks the sources <see cref="ParkMergeSourceGuards"/> parked — a merge's commit, or merge
-    /// recovery a crashed merge's — each through <see cref="TryCompletePendingSegmentDelete"/>:
+    /// recovery for a crashed merge — each through <see cref="TryCompletePendingSegmentDelete"/>:
     /// under <c>_importLock</c> for that one file, re-checking that no entry names the path again
     /// (a re-push of a replicated source may have landed there since), and recording the path for
     /// a running catalog scan before it leaves the park. <paramref name="paths"/> is cleared for
@@ -3807,21 +3807,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// pass runs this sweep under it, and the catalog scan runs it before the gate opens
     /// (<see cref="TryEnterMergeGate"/>).</para>
     /// </summary>
-    private void RecoverInterruptedMerges()
+    /// <param name="readOutputs">
+    /// The catalog scan's sweep: read each output as a whole segment, as the scan is about to,
+    /// before acting on its manifest. No crash of this process leaves a torn output at its final
+    /// name, but a restored backup, or storage that lost a flushed write in a power cut, can; read
+    /// as committed, its sources — the batch's only readable copy — were deleted, and the scan then
+    /// quarantined the output. A torn output is therefore a merge that never committed: the sources
+    /// stay, the manifest goes, and the scan quarantines the output as it does every unreadable
+    /// segment. One that cannot be opened for any other reason (a scanner holding it) is taken as
+    /// committed: the rename is its proof, and sources kept beside an output that a later start
+    /// reads would be counted twice for good. A pass does not read: the outputs it meets were
+    /// written by this process or read by its scan.
+    /// </param>
+    private void RecoverInterruptedMerges(bool readOutputs = false)
     {
         foreach (var manifest in Directory.EnumerateFiles(_segDir, "*.mergemanifest"))
         {
             // Per manifest, so one that cannot be read does not strand the others behind it.
-            try { RecoverInterruptedMerge(manifest); }
+            try { RecoverInterruptedMerge(manifest, readOutputs); }
             catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest); }
         }
     }
 
     /// <summary>One manifest of <see cref="RecoverInterruptedMerges"/>.</summary>
-    private void RecoverInterruptedMerge(string manifest)
+    private void RecoverInterruptedMerge(string manifest, bool readOutput)
     {
         string output = manifest[..^".mergemanifest".Length];
-        if (!File.Exists(output))
+        if (!IsCommittedMergeOutput(output, readOutput))
         {
             File.Delete(manifest);
             return;
@@ -3876,6 +3888,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 "Merge recovery: {Count} source file(s) of {File} could not be deleted yet — kept out of the catalog and " +
                 "retried; the manifest stays until they are gone",
                 held, Path.GetFileName(output));
+    }
+
+    /// <summary>
+    /// Whether a manifest's merge committed: its output is at its final name and, when
+    /// <paramref name="read"/>, opens as a whole segment (see <see cref="RecoverInterruptedMerges"/>).
+    /// </summary>
+    private bool IsCommittedMergeOutput(string output, bool read)
+    {
+        if (!File.Exists(output)) return false;
+        if (!read) return true;
+        try
+        {
+            // The scan's own open, block frames included, so the two agree on what a whole segment is.
+            using (SegmentReader.Open(output, computeUncompressedBytes: true)) { }
+            return true;
+        }
+        catch (Exception ex) when (FileBounds.DescribesContent(ex))
+        {
+            _logger.LogWarning(ex,
+                "Merge recovery: the output {File} of an interrupted merge is not a whole segment, so the merge never " +
+                "committed — the sources it lists stay in service, and the catalog scan quarantines the output",
+                Path.GetFileName(output));
+            return false;
+        }
+        catch (FileNotFoundException) { return false; }   // gone since the probe above
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Merge recovery: the output {File} of an interrupted merge could not be read now; taken as committed — " +
+                "a merge output reaches its name only once it is on disk — so the sources it lists are deleted",
+                Path.GetFileName(output));
+            return true;
+        }
     }
 
     /// <summary>A manifest line that can name a source: a plain <c>*.seg</c> file name.</summary>
@@ -4267,7 +4312,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // deleting its sources — otherwise those events would be served twice. Before the
         // listing and inside this scan's recording window: a source it cannot unlink is parked
         // and one it unlinks is recorded, so the enumeration below skips it either way (#98).
-        RecoverInterruptedMerges();
+        RecoverInterruptedMerges(readOutputs: true);
 
         // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
         // ran in Directory.EnumerateFiles order, so a directory already holding two files under
