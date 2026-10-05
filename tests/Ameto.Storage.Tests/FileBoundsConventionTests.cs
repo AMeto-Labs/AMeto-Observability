@@ -134,6 +134,8 @@ public sealed class FileBoundsConventionTests
             "copies the open-run map already in memory; not a capacity",
         ["TraceStorageEngine.cs:var live = new HashSet<ulong>(_manifest.Segments.Keys)"] =
             "copies the catalog's key set already in memory; not a capacity",
+        ["TraceStorageEngine.HotTierReads.cs:var blocks = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, capacity))"] =
+            "capacity is the block count of the two in-memory unflushed runs, one line above (#94)",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>

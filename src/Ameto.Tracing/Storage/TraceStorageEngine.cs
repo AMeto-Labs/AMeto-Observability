@@ -2193,8 +2193,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // count back into memory through this set after the segment buffer stopped doing it.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
 
-        // Offers one span to a bounded top-K heap. `present` is the identity of what is IN that
-        // heap right now.
+        // Offers one span of a cold segment to a bounded top-K heap. `present` is the identity of
+        // what is IN that heap right now. (The hot tier has its own walk with the same rules —
+        // AdmitHot, beside SelectHotMatches.)
         //
         // A DUPLICATE MUST NOT COST A SLOT. The dedupe check used to happen on the way in
         // (against `seen`) while the recording happened on the way out, so two copies of one
@@ -2202,8 +2203,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // neither was in `seen` yet — and together evicted a distinct older span to make room.
         // The second copy was then discarded at the drain, and the tier yielded fewer than
         // `limit` DISTINCT spans although more existed. Both duplicate sources are ordinary:
-        // UnflushedSpansLocked concatenates the hot tier with the in-flight flush snapshot, and
-        // a segment can hold spans a WAL replay put back.
+        // the unflushed spans are the hot tier AND the in-flight flush snapshot, and a segment
+        // can hold spans a WAL replay put back.
         //
         // `present` is bounded by the heap it mirrors (at most `limit`), never by what was read
         // — that is the unbounded growth 3fc5472 removed and it must not come back through here.
@@ -2219,10 +2220,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
             if (identified)
             {
-                // `seen` is empty for the whole of the hot-tier pass (nothing has been yielded
-                // yet) and that pass is the biggest walk in the method, so the probe is skipped
-                // rather than performed against an empty set — the same answer, one hash and one
-                // bucket lookup cheaper, inside the read lock WriteSpan contends with.
+                // Skipped while `seen` is empty — the same answer, one hash and one bucket lookup
+                // cheaper.
                 if (seen.Count > 0 && seen.Contains(id)) return false;   // yielded by an earlier tier or segment
                 if (!present.Add(id))  return false;   // a second copy of something already in the heap
             }
@@ -2242,60 +2241,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             return true;
         }
 
-        bool Match(SpanRecord s) =>
-            s.StartTimeUnixNano >= fromNano &&
-            s.StartTimeUnixNano <= toNano   &&
-            (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
-            (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
-            (status           is null || s.Status == status.Value) &&
-            (httpStatusCode   is null || s.HttpStatusCode == httpStatusCode.Value) &&
-            (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
-            (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value);
+        // Hot tier plus any in-flight flush snapshot, newest first: the newest `limit` matches,
+        // taken by a walk that runs AFTER the read lock and stops as soon as nothing it has not
+        // read could still make the cut (#94). See SelectHotMatches.
+        var candidates = SelectHotMatches(
+            new SpanMatch(fromNano, toNano, serviceName, spanName, status, httpStatusCode,
+                          minDurationNanos, maxDurationNanos),
+            limit, out bool hotEvicted);
 
-        // Hot tier plus any in-flight flush snapshot (newest first), in ONE lock hold —
-        // see GetTraceAsync for why the pair must not be read separately.
-        //
-        // Bounded top-K, exactly as the cold segment scan below: a min-heap on start time that
-        // evicts its oldest once full.
-        //
-        // WHAT THIS BOUGHT IS MEMORY, AND ONLY MEMORY. An earlier version of this comment
-        // justified the rewrite by LOCK HOLD TIME, and that was wrong in the direction that
-        // matters. `Where().OrderByDescending().Take(limit)` has gone through IPartition since
-        // .NET Core 3.0: buffering is an array append per match and the finish is a partial
-        // quickselect, not an O(M log M) sort. What replaced it costs a `seen` probe plus a
-        // `present` insert per match — a HashCode.Combine over two ulongs and a bucket probe
-        // each — plus a TryPeek, and for anything admitted an O(log limit) EnqueueDequeue and a
-        // `present` removal. Over the ~100k spans UnflushedSpansLocked can walk (50k hot plus a
-        // 50k in-flight flush snapshot) that is several milliseconds of READ lock against about
-        // one before, and WriteSpan takes the WRITE side of it for every ingested span while the
-        // SSE loop runs these scans back to back. The lock hold got WORSE.
-        //
-        // It is still the right trade, for the reason the segment loop below spells out: the
-        // ordering buffer was O(M) SpanRecords — a kilobyte each once a query touches attributes
-        // — and several hundred thousand matches is what killed a 512 MB server. O(limit) is the
-        // fix; the lock hold is what it cost.
-        //
-        // Moving the heap outside the lock over a taken snapshot was considered and rejected:
-        // the snapshot is an O(M) copy of exactly the references the heap exists to stop
-        // materialising, allocated per scan, back to back, straight onto the LOH at 100k
-        // entries. The cheap part is taken instead — see `Admit`, which skips the `seen` probe
-        // while `seen` is empty, and it always is for this tier.
-        var hotTop     = new PriorityQueue<SpanRecord, long>();
-        var hotPresent = new HashSet<(TraceId Trace, ulong Span)>();
-        bool hotEvicted = false;
-        _lock.EnterReadLock();
-        try
-        {
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (!Match(s)) continue;
-                hotEvicted |= Admit(hotTop, hotPresent, s);
-            }
-        }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
+        // Every candidate is about to be recorded below: one allocation for all of them, not a
+        // doubling per power of two — whose last step, at the 2 000 spans a TraceQL stream page
+        // asks for, is an 87 KB array on the large-object heap.
+        seen.EnsureCapacity(candidates.Count);
 
         // The cold list, walked BY INDEX because the floor below has to name the segment the walk
         // stopped BEFORE — which `OrderByDescending` in a foreach cannot say. Sorted by
@@ -2321,11 +2278,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (Relevant(ordered[j])) return Math.Min(ordered[j].MaxStartNano, toNano);
             return long.MinValue;
         }
-
-        // The heap drains oldest-first; the caller wants newest-first.
-        var candidates = new List<SpanRecord>(hotTop.Count);
-        while (hotTop.TryDequeue(out var kept, out _)) candidates.Add(kept);
-        candidates.Reverse();
 
         // The tier held more matches than a page can carry, so everything below the oldest one
         // it kept is undecided — including spans the cold walk will never be reached to read.
@@ -2856,29 +2808,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             _logger.LogError(failure, "Failed to flush hot-tier spans to cold storage — spans returned to the hot tier");
     }
 
-    /// <summary>
-    /// Every span not yet carried by a REGISTERED cold segment: the live hot tier, plus the
-    /// snapshot a flush has detached but not yet published. <b>Caller holds the read lock.</b>
-    ///
-    /// <para>Aggregates must count from this, not from <c>_hotSpans</c> alone. Once the
-    /// segment build moved off the lock, the detached snapshot — up to
-    /// <see cref="HotFlushThreshold"/> spans — belonged to neither tier for the build's whole
-    /// duration, so the trace list, per-service stats, volume sparkline and service graph
-    /// each carried a rolling hole just behind the live edge. At load, where flushes run
-    /// back to back, that hole was close to permanent: rows visibly vanished at snapshot
-    /// time and reappeared at publish.</para>
-    ///
-    /// <para>Ordering is oldest-first (the detached snapshot left the tier before anything
-    /// now in it arrived), matching what the callers assume of <c>_hotSpans</c>.</para>
-    /// </summary>
-    private IEnumerable<SpanRecord> UnflushedSpansLocked()
-    {
-        if (_flushingSpans is { } flushing)
-            foreach (var s in flushing) yield return s;
-        foreach (var s in _hotSpans) yield return s;
-    }
-
-    /// <summary>Spans in <see cref="UnflushedSpansLocked"/>. Caller holds the read lock.</summary>
+    /// <summary>Spans in <see cref="UnflushedRunsLocked"/>'s two runs. Caller holds the read lock.</summary>
     private int UnflushedCountLocked() => _hotSpans.Count + (_flushingSpans?.Count ?? 0);
 
     /// <summary>

@@ -267,6 +267,195 @@ public sealed class TraceHotTierWindowTests : IDisposable
         AssertQlPages(engine, flushing: [], "replayed");
     }
 
+    // ── What the bounded reads promise beyond their answers ─────────────────────
+
+    /// <summary>
+    /// THE TRACEQL HOT PASS WALKS WITH THE LOCK FREE, and answers for exactly what it captured. It is
+    /// parked inside its walk; from there another thread must take the engine's write lock without
+    /// waiting (TryEnterWriteLock(0): no timer decides it), and 500 newer spans and a whole flush go
+    /// in underneath the parked walk. Let go, it must return the newest of the spans it captured —
+    /// not one of the newer ones. Back inside the read lock, the writer cannot get in.
+    /// </summary>
+    [Fact]
+    public async Task The_TraceQL_hot_pass_walks_with_the_lock_free_and_answers_for_what_it_captured()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 2_000)]);
+        var captured = engine.HotSpansForTest;
+
+        using var parked  = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        bool readLockHeld = true;
+        engine._hotSearchPassForTest = () =>
+        {
+            readLockHeld = engine.LockForTest.IsReadLockHeld;
+            parked.Set();
+            release.Wait(HangGuard);
+        };
+
+        var call = Task.Run(() => engine.SearchSpansAsync(From, To, limit: 300).ToBlockingEnumerable().ToList());
+        Assert.True(parked.Wait(HangGuard), "hang guard: the hot pass never started");
+
+        bool writerGotIn = false;
+        var writer = new Thread(() =>
+        {
+            if (engine.LockForTest.TryEnterWriteLock(0)) { writerGotIn = true; engine.LockForTest.ExitWriteLock(); }
+        });
+        writer.Start();
+        writer.Join();
+        if (writerGotIn)
+        {
+            Write(engine, [.. TraceAggregateLockProbe.Corpus(2_000, 500)]);   // newer than anything captured
+            engine.FlushHotTier();
+        }
+        release.Set();
+        var got = await call.WaitAsync(HangGuard);
+
+        Assert.False(readLockHeld, "the TraceQL hot pass walked holding the read lock");
+        Assert.True(writerGotIn, "a writer could not take the lock while the hot pass was mid-walk");
+        var (kept, _) = ReferenceHotPass(captured, static _ => true, 300);
+        Assert.Equal(kept.Select(Describe), got.Select(Describe));
+    }
+
+    /// <summary>
+    /// A TRACEQL PAGE READS THE TOP OF ITS WINDOW, NOT THE TIER. 20 000 spans in arrival order, a
+    /// page of 200: the walk reads the blocks holding the newest 200 and one block more, where it
+    /// read all 20 000 before. A page deep in the window does not open the blocks above its ceiling
+    /// at all.
+    /// </summary>
+    [Fact]
+    public void A_TraceQL_page_reads_the_top_of_its_window_not_the_tier()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000)]);   // one span a millisecond from Base
+        int visited = -1;
+        engine._hotSearchVisitedForTest = n => visited = n;
+
+        var top = engine.SearchSpansAsync(From, To, limit: 200).ToBlockingEnumerable().ToList();
+        Assert.Equal(200, top.Count);
+        Assert.InRange(visited, 200, 200 + 2 * SpanStartIndex.BlockSize);
+
+        var deep = engine.SearchSpansAsync(From, Base.AddMilliseconds(5_000), limit: 200).ToBlockingEnumerable().ToList();
+        Assert.Equal(200, deep.Count);
+        Assert.Equal(Nano(Base) + 5_000_000_000L, deep[0].StartTimeUnixNano);
+        Assert.InRange(visited, 200, 200 + 2 * SpanStartIndex.BlockSize);
+    }
+
+    /// <summary>
+    /// STOPPING EARLY MUST NOT HIDE A MATCH IT TURNED AWAY. Two blocks, every span a match, and a page
+    /// exactly one block deep: the newest block fills the heap to its last span without evicting
+    /// anything, and the next block lies wholly below what was kept, so the walk stops there — before
+    /// meeting the match the full walk would have turned away. "Turned away" is what makes the page
+    /// CAPPED; without it the stream would call the window read out over a block it never read.
+    /// </summary>
+    [Fact]
+    public void A_pass_that_stops_early_still_reports_the_match_it_turned_away()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 2 * SpanStartIndex.BlockSize)]);
+        int visited = -1;
+        engine._hotSearchVisitedForTest = n => visited = n;
+
+        var floor = new SpanScanFloor();
+        var got   = engine.SearchSpansAsync(From, To, limit: SpanStartIndex.BlockSize, scanFloor: floor)
+                          .ToBlockingEnumerable().ToList();
+        var (kept, evicted) = ReferenceHotPass(engine.HotSpansForTest, static _ => true, SpanStartIndex.BlockSize);
+
+        Assert.True(evicted);
+        Assert.Equal(kept.Select(Describe), got.Select(Describe));
+        Assert.Equal(kept[^1].StartTimeUnixNano, floor.FloorNano);
+        Assert.Equal(SpanStartIndex.BlockSize + 1, visited);   // the block, and the one match below it that settles the floor
+    }
+
+    /// <summary>
+    /// A SPAN ID REUSED BELOW THE CUT IS A COPY, NOT A MATCH TURNED AWAY — the dedupe's rule, which the
+    /// early stop's search for "one more match" has to keep. The id is reused with an OLDER start (a
+    /// malformed producer; a true re-send carries its original's start and can never lie below the
+    /// cut). Which copy a page shows is where the bounded walk and the tier-order heap part: the heap
+    /// showed whichever ARRIVED first, the walk shows the one it meets first — the newer.
+    /// </summary>
+    [Fact]
+    public void A_span_id_reused_below_the_cut_is_a_copy_not_a_match_turned_away()
+    {
+        using var engine = NewEngine();
+        var newest = TraceAggregateLockProbe.Corpus(SpanStartIndex.BlockSize, SpanStartIndex.BlockSize);
+        var older  = TraceAggregateLockProbe.Corpus(0, SpanStartIndex.BlockSize);
+        for (int i = 0; i < newest.Length; i++) newest[i] = Status(newest[i], SpanStatusCode.Error);
+        older[5] = new SpanIngestItem   // the reused id: the same trace and span as newest[17], older, and an error too
+        {
+            TraceId = newest[17].TraceId, SpanId = newest[17].SpanId, ParentSpanId = newest[17].ParentSpanId,
+            StartTimeUnixNano = older[5].StartTimeUnixNano, DurationNanos = 1_000_000L, Name = "reused",
+            ServiceName = "billing", Kind = SpanKind.Client, Status = SpanStatusCode.Error, AttributesBytes = [],
+        };
+        Write(engine, [.. older, .. newest]);
+
+        var floor = new SpanScanFloor();
+        var got   = engine.SearchSpansAsync(From, To, status: SpanStatusCode.Error, limit: SpanStartIndex.BlockSize,
+                                            scanFloor: floor).ToBlockingEnumerable().ToList();
+
+        Assert.Equal(newest.Select(s => s.StartTimeUnixNano).OrderByDescending(s => s), got.Select(s => s.StartTimeUnixNano));
+        Assert.False(floor.Truncated, $"the reused id was counted as a match turned away (floor {floor.FloorNano})");
+    }
+
+    /// <summary>
+    /// A TIE AT THE CUT IS DECIDED BY ARRIVAL. Three hundred spans with one start, a page of a
+    /// hundred: the first hundred to arrive, in the order they arrived — every time, whatever the
+    /// tier's block layout. The heap over the tier left both the choice and the order to its own
+    /// internal arrangement.
+    /// </summary>
+    [Fact]
+    public void A_tie_at_the_cut_is_decided_by_arrival()
+    {
+        using var engine = NewEngine();
+        var items = TraceAggregateLockProbe.Corpus(0, 300);
+        long start = items[150].StartTimeUnixNano;
+        for (int i = 0; i < items.Length; i++) items[i] = At(items[i], start);
+        Write(engine, [.. items]);
+
+        var floor = new SpanScanFloor();
+        var got   = engine.SearchSpansAsync(From, To, limit: 100, scanFloor: floor).ToBlockingEnumerable().ToList();
+
+        Assert.Equal(items.Take(100).Select(s => s.SpanId), got.Select(s => s.SpanId));
+        Assert.Equal(start, floor.FloorNano);
+    }
+
+    /// <summary>
+    /// A SPAN FROM A CLOCK RUNNING AHEAD IS THE NEWEST, WHEREVER IT ARRIVED. It arrives first — in the
+    /// oldest block by arrival — and starts an hour after everything else. The walk orders blocks by
+    /// their newest start, so it reads that block first, keeps the span, and stops; a walk in arrival
+    /// order from the end would have read the whole tier to find it.
+    /// </summary>
+    [Fact]
+    public void A_span_from_a_clock_running_ahead_is_found_first_wherever_it_arrived()
+    {
+        using var engine = NewEngine();
+        var items  = TraceAggregateLockProbe.Corpus(0, 5_000);
+        var future = At(items[0], items[^1].StartTimeUnixNano + 3_600_000_000_000L);
+        items[0]   = future;
+        Write(engine, [.. items]);
+        int visited = -1;
+        engine._hotSearchVisitedForTest = n => visited = n;
+
+        var got = engine.SearchSpansAsync(From, Base.AddHours(2), limit: 1).ToBlockingEnumerable().ToList();
+
+        Assert.Equal(future.StartTimeUnixNano, Assert.Single(got).StartTimeUnixNano);
+        Assert.InRange(visited, 1, 2 * SpanStartIndex.BlockSize);
+    }
+
+    private static SpanIngestItem At(SpanIngestItem s, long start) => new()
+    {
+        TraceId = s.TraceId, SpanId = s.SpanId, ParentSpanId = s.ParentSpanId, StartTimeUnixNano = start,
+        DurationNanos = s.DurationNanos, Name = s.Name, ServiceName = s.ServiceName, Kind = s.Kind,
+        Status = s.Status, HttpStatusCode = s.HttpStatusCode, AttributesBytes = s.AttributesBytes,
+    };
+
+    private static SpanIngestItem Status(SpanIngestItem s, SpanStatusCode status) => new()
+    {
+        TraceId = s.TraceId, SpanId = s.SpanId, ParentSpanId = s.ParentSpanId, StartTimeUnixNano = s.StartTimeUnixNano,
+        DurationNanos = s.DurationNanos, Name = s.Name, ServiceName = s.ServiceName, Kind = s.Kind,
+        Status = status, HttpStatusCode = s.HttpStatusCode, AttributesBytes = s.AttributesBytes,
+    };
+
     // ── The trace list against its model ───────────────────────────────────────
 
     private async Task AssertListPagesAsync(TraceStorageEngine engine, List<SpanRecord> flushing, string state)

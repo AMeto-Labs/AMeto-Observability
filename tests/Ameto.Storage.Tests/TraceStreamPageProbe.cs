@@ -78,16 +78,21 @@ public sealed class TraceStreamPageProbe : IDisposable
         Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: false);
         Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: false);
         Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: false);
+        Walk(engine, starts, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: false);
 
-        var list = Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: true);
-        var all  = Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: true);
-        var err  = Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: true);
+        var list   = Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: true);
+        var all    = Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: true);
+        var err    = Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: true);
+        var search = Walk(engine, starts, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: true);
+        var errHot = Walk(engine, starts, (to, n) => SearchPage(engine, to, n, SpanStatusCode.Error), QlPageRows * 10, measure: true);
 
         _out.WriteLine($"STREAM PAGES over a {Spans:N0}-span hot tier (10 spans/trace, 3 services, 8 attributes); "
                      + $"bytes = this thread, min of {Repeats}; ms = median of {Repeats}");
         Print($"list   GetTraceListAsync({ListPageRows})", list);
         Print($"traceql {{ .db.system = \"mssql\" }} ({QlPageRows} rows)", all);
         Print($"traceql {{ status = error }} ({QlPageRows} rows)", err);
+        Print($"engine SearchSpansAsync({QlPageRows * 10}), no hint — the TraceQL page's own engine call", search);
+        Print($"engine SearchSpansAsync({QlPageRows * 10}, status = Error)", errHot);
 
         Assert.All(list, static p => Assert.True(p.Rows > 0));
     }
@@ -121,6 +126,30 @@ public sealed class TraceStreamPageProbe : IDisposable
         var page = task.GetAwaiter().GetResult();
         var starts = new List<long>(page.Rows.Count);
         foreach (var r in page.Rows) starts.Add(r.StartTimeUnixNano);
+        return (starts, sync);
+    }
+
+    /// <summary>
+    /// The engine call alone: the newest <paramref name="spans"/> unflushed spans, the way the
+    /// TraceQL page asks for them (ten a row). Driven by hand so "completed synchronously" can be
+    /// checked step by step.
+    /// </summary>
+    private static (List<long>, bool) SearchPage(TraceStorageEngine engine, DateTimeOffset to, int spans, SpanStatusCode? status)
+    {
+        var  starts = new List<long>(spans);
+        bool sync   = true;
+        var  e      = engine.SearchSpansAsync(From, to, status: status, limit: spans).GetAsyncEnumerator();
+        while (true)
+        {
+            var  step = e.MoveNextAsync();
+            sync &= step.IsCompleted;
+            bool more = step.IsCompleted ? step.Result : step.AsTask().GetAwaiter().GetResult();
+            if (!more) break;
+            starts.Add(e.Current.StartTimeUnixNano);
+        }
+        var done = e.DisposeAsync();
+        sync &= done.IsCompleted;
+        if (!done.IsCompleted) done.AsTask().GetAwaiter().GetResult();
         return (starts, sync);
     }
 
