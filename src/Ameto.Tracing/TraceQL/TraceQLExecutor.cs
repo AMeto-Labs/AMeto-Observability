@@ -311,15 +311,28 @@ public static class TraceQLExecutor
             groups.RemoveRange(limit, groups.Count - limit);
         }
 
-        // ONE SERVICE SET FOR THE PAGE, cleared by every row — see BuildRow.
+        // ONE SERVICE SET FOR THE PAGE, cleared by every row — see BuildRow — and let go after a
+        // row that filled it past WideRowServices, so one wide trace cannot make every row after it
+        // pay for a wide clear.
         var services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result   = new List<TraceRowDto>(groups.Count);
         foreach (var (_, _, traceSpans) in groups)
+        {
             result.Add(BuildRow(traceSpans, services));
+            if (services.Count > WideRowServices)
+                services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
         return new TraceQueryPage(result, scanFloorNano, scanFloor.Unreadable);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The most services a row may leave in the page's set before the page starts a fresh one. A
+    /// <c>HashSet</c> of up to 64 entries holds at most 89 buckets, so that is the most any clear
+    /// wipes; an ordinary trace crosses a handful of services, so a fresh set is the rare case.
+    /// </summary>
+    internal const int WideRowServices = 64;
 
     /// <summary>
     /// One row for one trace's matching spans.
@@ -331,9 +344,11 @@ public static class TraceQLExecutor
     /// a TraceQL POST takes no admission slot, and every SSE client pages on its own — and a set is
     /// not safe for two of them at once.</para>
     ///
-    /// <para>Clearing costs the set's bucket array, which stays as wide as the widest trace the page
-    /// has met. That is bounded by the page's span limit — 10 000 at the POST clamp, a 40 KB clear
-    /// at the very worst, behind a trace of ten thousand distinct services.</para>
+    /// <para>Clearing costs the set's WHOLE bucket array, and the array keeps the width of the widest
+    /// row the set has held. One trace of nine thousand services — per-pod service names, under the
+    /// 10 000-span clamp — would leave it at 17 519 buckets, and each of up to 999 rows after it would
+    /// clear 70 KB: some 70 MB of memset on one page. So the page lets the set go after a row fills it
+    /// past <see cref="WideRowServices"/>, and no clear is ever of more than 89 buckets.</para>
     /// </summary>
     private static TraceRowDto BuildRow(List<SpanRecord> spans, HashSet<string> services)
     {

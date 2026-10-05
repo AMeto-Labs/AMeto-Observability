@@ -749,12 +749,14 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// EACH ROW LISTS ITS OWN SERVICES AND NO OTHER ROW'S. The page builds its rows through one
     /// service set, cleared by every row (#94); a set that were not cleared would hand every row
     /// the services of every row built before it, and the allocation gate above could not tell —
-    /// it would read LOWER. Three traces on one page, newest first: two services with one of them
-    /// spelled twice in two cases (the set ignores case), then one service, then two again,
-    /// sharing one with the first trace.
+    /// it would read LOWER. Four traces on one page, newest first: one wide enough that the page
+    /// lets its set go (<c>TraceQLExecutor.WideRowServices</c> + 1 services), then two services,
+    /// then one, then two again sharing one with the second trace — so the second row is built
+    /// through the fresh set and the rows after it through a cleared one. The first two rows each
+    /// spell one service twice, in two cases: both sets ignore case.
     ///
-    /// <para>Drop the <c>Clear</c> in <c>BuildRow</c> and the second row reads three services; give
-    /// the page's set the default comparer and the first reads three.</para>
+    /// <para>Drop the <c>Clear</c> in <c>BuildRow</c> and the third row reads three services; give
+    /// either set the default comparer and its row reads one service too many.</para>
     /// </summary>
     [Fact]
     public async Task Each_row_lists_its_own_services_and_no_other_rows()
@@ -782,6 +784,11 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
                 Status            = SpanStatusCode.Unset,
             });
 
+        string[] wide = [.. Enumerable.Range(0, TraceQLExecutor.WideRowServices + 1).Select(static i => $"pod-{i:D3}")];
+        for (int i = 0; i < wide.Length; i++)
+            Write(trace: 4, span: (ulong)(401 + i), parent: i == 0 ? 0UL : 401UL, ms: 400 + i, wide[i]);
+        Write(trace: 4, span: 499, parent: 401, ms: 499, "POD-000");   // the set the page starts with ignores case too
+
         Write(trace: 3, span: 31, parent: 0,  ms: 300, "billing");
         Write(trace: 3, span: 32, parent: 31, ms: 301, "BILLING");
         Write(trace: 3, span: 33, parent: 31, ms: 302, "ledger");
@@ -793,12 +800,13 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
             engine, TraceQLParser.Parse("{ }"), at.AddMinutes(-1), at.AddDays(1), 10, CancellationToken.None);
 
         string[][] services = [.. page.Rows.Select(static r => r.Services)];
-        _out.WriteLine(string.Join("  |  ", services.Select(static s => string.Join(", ", s))));
+        _out.WriteLine(string.Join("  |  ", services.Select(static s => s.Length > 4 ? $"{s.Length} services" : string.Join(", ", s))));
 
-        Assert.Equal(3, services.Length);
-        AssertServices(["billing", "ledger"], services[0]);
-        AssertServices(["gateway"],           services[1]);
-        AssertServices(["auth", "ledger"],    services[2]);
+        Assert.Equal(4, services.Length);
+        AssertServices(wide,                  services[0]);
+        AssertServices(["billing", "ledger"], services[1]);
+        AssertServices(["gateway"],           services[2]);
+        AssertServices(["auth", "ledger"],    services[3]);
 
         static void AssertServices(string[] expected, string[] actual) =>
             Assert.Equal(expected, actual.Select(static s => s.ToLowerInvariant()).Order(StringComparer.Ordinal));
