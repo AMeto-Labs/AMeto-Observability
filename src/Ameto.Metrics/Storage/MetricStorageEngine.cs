@@ -469,6 +469,14 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     internal Task ColdLoadCompleted => _coldLoaded.Task;
 
     /// <summary>
+    /// 1 once the startup cold scan has left segments on disk that it did not load (#94): it failed
+    /// as a whole, or skipped a file it could not reach (#108). Written once, before
+    /// <see cref="_coldLoaded"/> completes, and never cleared — nothing scans again before a
+    /// restart, and the next start reads those files. See <see cref="Availability"/>.
+    /// </summary>
+    private int _coldScanShort;
+
+    /// <summary>
     /// Whether a query issued now gets a TRUE answer (#95) — for a caller that ACTS on the answer
     /// (the alert evaluator, through <see cref="MetricAggregator"/>) and so must not take the empty
     /// answer of a closed tier, or the hot-only answer of one not yet scanned, for a measurement.
@@ -483,12 +491,19 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// segments before it completes that, so Available is never seen ahead of them; a scan that
     /// FAILS ends the window too, as it always has for <see cref="ColdLoadCompleted"/>.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// <para><see cref="QueryAvailability.Degraded"/> after a scan that ended short — see
+    /// <see cref="_coldScanShort"/> — for the rest of the process: queries answer from what loaded,
+    /// and the files it left on disk are read at the next start. The flag is written before the
+    /// scan completes <see cref="_coldLoaded"/> (a release, which the read of <c>IsCompleted</c>
+    /// below acquires), so a store that ends Degraded never reads Available first.</para>
+    ///
+    /// <para>At most three volatile reads, no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
-        Volatile.Read(ref _coldClosed) != 0 ? QueryAvailability.Closed
-      : !_coldLoaded.Task.IsCompleted      ? QueryAvailability.Loading
-      :                                      QueryAvailability.Available;
+        Volatile.Read(ref _coldClosed) != 0     ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted          ? QueryAvailability.Loading
+      : Volatile.Read(ref _coldScanShort) != 0 ? QueryAvailability.Degraded
+      :                                          QueryAvailability.Available;
 
     /// <summary>
     /// Test seam: an engine constructed while this holds a task starts its cold scan only once that
@@ -1661,7 +1676,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
-        catch (Exception ex) { LogColdScanFailed(_logger, ex, _dataDir); }
+        catch (Exception ex)
+        {
+            // Before the load completes, so the store goes from Loading straight to Degraded (#94).
+            Volatile.Write(ref _coldScanShort, 1);
+            LogColdScanFailed(_logger, ex, _dataDir);
+        }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
@@ -2942,17 +2962,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// could not be published — so the cold tier holds none of what was on disk (a file that fails
     /// on its own is handled inside the scan), and nothing will scan again before a restart. The
     /// engine still completes <see cref="ColdLoadCompleted"/>, so every reader goes on answering from
-    /// the hot tier and whatever flushes have published since: the alert evaluator included, which
-    /// reads a missing window as a quiet one. Said once, as an Error, naming that consequence —
-    /// a store that reports itself degraded, and an evaluator that skips it, is the design filed on
-    /// #94; this line is what an operator has until then.
+    /// the hot tier and whatever flushes have published since — and the store says it is
+    /// <see cref="QueryAvailability.Degraded"/>, which the alert evaluator skips rather than reading
+    /// a missing window as a quiet one. Said once, as an Error, naming both.
     /// </summary>
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
         Message = "The cold metric segment scan of {DataDirectory} failed: the segments on disk are not served until a "
-                + "restart, and metric queries answer from the hot tier and what has been flushed since. Metric ALERT "
-                + "RULES keep being evaluated on that partial data: a missing window reads as a quiet one, so a \"<\" "
-                + "rule can fire and a \">\" rule can resolve on points that exist but were not loaded. Restart once the "
-                + "cause is fixed")]
+                + "restart, and metric queries answer from the hot tier and what has been flushed since. The metric "
+                + "store reports itself Degraded until then, and metric ALERT RULES are not evaluated on that partial "
+                + "data (unless Ameto:Alerts:EvaluateOnDegradedStore is set): a missing window would read as a quiet "
+                + "one. Restart once the cause is fixed")]
     private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
 
     /// <summary>

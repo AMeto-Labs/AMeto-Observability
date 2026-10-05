@@ -142,6 +142,11 @@ public sealed class NewerFormatSegmentTests : IDisposable
         Assert.True(e.ColdTierIncompleteForTest,
             "the segment is unreadable and the tier reported itself complete");
         Assert.Equal(0, e.ColdSegmentCountForTest);
+
+        // But the STORE is not Degraded (#94): a format this build cannot read is what the disk holds
+        // for this build, not a load left unfinished — no restart changes it, and skipping every trace
+        // alert until a roll-forward would be the cost. The read paths above already say "short".
+        Assert.Equal(Ameto.Core.QueryAvailability.Available, e.Availability);
     }
 
     [Fact]

@@ -550,16 +550,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// state too; the segments it could not reach are missing either way, and holding "loading"
     /// for ever would stop every log alert from ever being evaluated.</para>
     ///
+    /// <para><see cref="QueryAvailability.Degraded"/> instead of Available after such a scan (#94):
+    /// the task that did not complete successfully IS the record that the catalog is short, and it
+    /// is final — nothing scans again before a restart. A segment the scan cannot read on its own
+    /// is quarantined inside a scan that succeeds, and does not make the store degraded.</para>
+    ///
     /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
     /// step of the teardown after its final flush. Conservative by a few steps — reads stay whole
     /// until <see cref="_snapshotsClosed"/>, after which <see cref="SnapshotTiers"/> THROWS rather
     /// than answering — but past it nothing a caller acts on is worth reading.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// <para>Three volatile reads at most (the task's state is one), no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
         Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
       : !_catalogLoad.IsCompleted             ? QueryAvailability.Loading
+      : !_catalogLoad.IsCompletedSuccessfully ? QueryAvailability.Degraded
       :                                         QueryAvailability.Available;
 
     /// <summary>

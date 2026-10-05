@@ -162,12 +162,27 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// segments it could not reach stay missing for the life of the process either way, and
     /// holding "loading" for ever would only stop every trace alert from ever being evaluated.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation — cheap enough to ask on every request.</para>
+    /// <para><see cref="QueryAvailability.Degraded"/> instead of Available when that scan ended short
+    /// — failed as a whole, or left a segment it could not reach on disk (see
+    /// <see cref="_coldScanShort"/>) — for the rest of the process (#94).</para>
+    ///
+    /// <para>At most three volatile reads, no lock, no allocation — cheap enough to ask on every request.</para>
     /// </summary>
     public QueryAvailability Availability =>
-        Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
-      : !_coldLoaded.Task.IsCompleted        ? QueryAvailability.Loading
-      :                                        QueryAvailability.Available;
+        Volatile.Read(ref _writesClosed) != 0  ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted          ? QueryAvailability.Loading
+      : Volatile.Read(ref _coldScanShort) != 0 ? QueryAvailability.Degraded
+      :                                          QueryAvailability.Available;
+
+    /// <summary>
+    /// 1 once the startup cold scan has left segments on disk that a restart would load (#94): the
+    /// scan failed as a whole, or a segment stayed unreadable through its retries for a reason that
+    /// is not its bytes. Written once, before <see cref="_coldLoaded"/> completes, and never cleared:
+    /// nothing rescans. Narrower than <see cref="_coldTierIncomplete"/>, which a segment of a NEWER
+    /// format, or one damaged past reading its header, also raises — those are what the disk holds
+    /// for this build, not a load left unfinished, and a restart would not change them.
+    /// </summary>
+    private int _coldScanShort;
 
     /// <summary>Completed when the background cold scan has ended, however it ended. See <see cref="Availability"/>.</summary>
     private readonly TaskCompletionSource _coldLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2933,6 +2948,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         catch (Exception ex)
         {
             _coldTierIncomplete = true;
+            Volatile.Write(ref _coldScanShort, 1);   // Degraded, from the end of the load (#94)
             LogColdScanFailed(_logger, ex, _dataDir);
         }
     }
@@ -2944,9 +2960,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
         Message = "The cold trace segment scan of {DataDirectory} failed: the segments on disk are not served until a "
                 + "restart, and trace queries answer from the hot tier and what has been flushed since, reporting the "
-                + "window as unreadable. Trace ALERT RULES keep being evaluated on that partial data: a missing window "
-                + "reads as a quiet one, so a \"<\" rule can fire and a \">\" rule can resolve on spans that exist but "
-                + "were not loaded. Restart once the cause is fixed")]
+                + "window as unreadable. The trace store reports itself Degraded until then, and trace ALERT RULES are "
+                + "not evaluated on that partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set): a missing "
+                + "window would read as a quiet one. Restart once the cause is fixed")]
     private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
 
     /// <summary>
@@ -3007,8 +3023,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
                 // Still not readable. It is NOT deleted — that was the old answer and it took the
                 // sidecars with it — but it is also not in the snapshot, so no read can honestly
-                // call a window complete until a restart picks it up.
+                // call a window complete until a restart picks it up. Degraded until then (#94).
                 _coldTierIncomplete = true;
+                Volatile.Write(ref _coldScanShort, 1);
                 // NOT EVERY FAILURE TO OPEN IS A REASON TO DESTROY. This catch answered anything at
                 // all with DeleteSegmentFiles, so a segment held open by an antivirus, a backup
                 // agent or the compactor's own File.Move was deleted at startup along with its
@@ -3023,7 +3040,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _logger.LogError(ex,
                     "Cold segment {File} could not be read at startup and is left on disk, not deleted — "
                   + "but it is missing from this run's cold tier, so every trace query will report an "
-                  + "unreadable region on the list and span-search paths until the service is restarted", file);
+                  + "unreadable region on the list and span-search paths until the service is restarted, "
+                  + "and the trace store reports itself Degraded: trace alert rules are not evaluated on "
+                  + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set)", file);
                 continue;
             }
             catch (Exception ex)

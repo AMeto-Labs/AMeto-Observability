@@ -93,6 +93,7 @@ public sealed class ColdSegmentStartupDeleteTests : IDisposable
         // The migration behaviour is unchanged — the file that will not parse is still removed.
         Assert.False(File.Exists(doomed), "the unparseable segment was left on disk");
         Assert.Equal(0, e.ColdSegmentCountForTest);
+        Assert.Equal(Ameto.Core.QueryAvailability.Available, e.Availability);   // a deletion is not a load left unfinished (#94)
 
         // THE PART THAT WAS MISSING. Deleting is a decision about disk AND about every later
         // answer, and only one of the two was being made.
@@ -164,6 +165,9 @@ public sealed class ColdSegmentStartupDeleteTests : IDisposable
         // Loud instead: the cold tier is short for this process, and every query says so. That is
         // recoverable — move the file aside and restart — which a deletion is not.
         Assert.True(e.ColdTierIncompleteForTest);
+
+        // Damage is what the disk holds, not a load left unfinished: the store is not Degraded (#94).
+        Assert.Equal(Ameto.Core.QueryAvailability.Available, e.Availability);
     }
 
     [Fact]
