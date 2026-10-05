@@ -3033,6 +3033,14 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         Gone,
 
         /// <summary>
+        /// <see cref="NewerMetricFormatException"/>: written in a format newer than this build reads —
+        /// the file a rollback meets (#119 review). NOT damage: kept on disk, untouched, out of the
+        /// catalog, with an Error; and not a load left unfinished either, so the store is not
+        /// Degraded by it — it is what the disk holds for this build until a build that reads it runs.
+        /// </summary>
+        Newer,
+
+        /// <summary>
         /// <see cref="InvalidDataException"/> or <see cref="EndOfStreamException"/> — what
         /// <see cref="MetricReader.ReadSegmentInfo"/> throws on BYTES it refuses: a v1 file (no bucket
         /// data), a foreign or torn one. Deleted, as every unreadable file used to be.
@@ -3055,14 +3063,29 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// <see cref="EndOfStreamException"/> and <see cref="FileNotFoundException"/> ARE
     /// <see cref="IOException"/>s, so "is it an IOException" would keep a torn file for ever and call
     /// a vanished one busy. A missing DIRECTORY is not a missing file: the engine never removes its
-    /// data directory, so its absence is the volume, not the data.
+    /// data directory, so its absence is the volume, not the data. And a NEWER format is not damage:
+    /// <see cref="NewerMetricFormatException"/> is deliberately not an <see cref="InvalidDataException"/>,
+    /// so no order of these arms can route it to Damaged — and were its own arm lost, it would fall to
+    /// Unreachable: kept, never deleted.
     /// </summary>
     private static ColdReadFault ClassifyColdReadFault(Exception ex) => ex switch
     {
         FileNotFoundException                        => ColdReadFault.Gone,
+        NewerMetricFormatException                   => ColdReadFault.Newer,
         InvalidDataException or EndOfStreamException => ColdReadFault.Damaged,
         _                                            => ColdReadFault.Unreachable,
     };
+
+    /// <summary>
+    /// A file in a newer format than this build reads (#119 review): kept, untouched, out of the
+    /// catalog. An Error, because its points are not served — but not Degraded: no restart of this
+    /// build changes it, and holding every metric alert rule until a roll-forward would be the cost.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Metric segment {File} was written in .mts format v{Version}, newer than this build reads: it is left "
+                + "on disk untouched — deleting it would destroy points a build that knows the format can read — and its "
+                + "points are not served until this node runs such a build")]
+    private static partial void LogNewerColdSegment(ILogger logger, Exception exception, string file, int version);
 
     /// <summary>
     /// A file the scan could not reach through its retries (#108): left on disk, out of this run's
@@ -3107,6 +3130,10 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     _logger.LogWarning(fault, "Metric segment {File} was gone by the time the cold scan opened it — nothing to load", file);
                     return null;
 
+                case ColdReadFault.Newer:
+                    LogNewerColdSegment(_logger, fault, file, ((NewerMetricFormatException)fault).Version);
+                    return null;
+
                 case ColdReadFault.Damaged:
                     // v1 files (no bucket data) are incompatible with the v2 format — delete them.
                     _logger.LogWarning(fault, "Unreadable metric segment {File} — deleting (likely format v1)", file);
@@ -3144,7 +3171,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // migration path, and it took a segment held open for a moment by an antivirus, or read
         // through a share that blinked, along with the v1 files — for good, at a start. Only a
         // failure that says the BYTES are wrong deletes; one that says nothing about them keeps the
-        // file for the next start. See ReadColdSegmentInfo.
+        // file for the next start, and a file a NEWER build wrote is kept for the build that reads
+        // it (#119 review). See ReadColdSegmentInfo.
         var  loaded         = new List<MetricSegmentInfo>();
         long retryTicksLeft = ColdReadRetryBudget.Ticks;
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.mts").OrderBy(f => f))

@@ -292,6 +292,78 @@ public sealed class MetricColdScanFaultTests : IDisposable
         Assert.Single(log.Snapshot(), e => e.Level == MsLogLevel.Warning && e.Message.Contains("deleting"));
     }
 
+    // ── A newer format: kept, as the future it is ─────────────────────────────────────────────
+
+    /// <summary>
+    /// A ROLLBACK MUST NOT DELETE THE FUTURE (#119 review). A segment whose header says a version
+    /// above the newest this build reads — what a binary rolled back from a future v4 writer meets at
+    /// its first start — was refused as "Unsupported .mts version", an <see cref="InvalidDataException"/>
+    /// like any other, classified Damaged and deleted as "likely format v1", with the store Available
+    /// and nothing to say the points were gone. It is kept now, byte for byte, out of the catalog,
+    /// with one Error naming it and its version; it is not retried, and the store is not Degraded —
+    /// no restart of this build changes it.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_in_a_newer_format_is_kept_untouched_and_degrades_nothing()
+    {
+        var files  = await WriteSegmentsAsync("future.metric", "other.metric");
+        string future = files["future.metric"];
+        SetVersion(future, MetricReader.NewestReadableVersion + 1);
+        byte[] before = File.ReadAllBytes(future);
+
+        var newer = Assert.Throws<NewerMetricFormatException>(() => MetricReader.ReadSegmentInfo(future));
+        Assert.Equal(MetricReader.NewestReadableVersion + 1, (int)newer.Version);
+        Assert.False(Ameto.Core.FileBounds.DescribesContent(newer));   // no content classifier calls it damage
+
+        var log = new Entries();
+        await using var engine = await StartAsync(log, new MetricStorageEngine.ColdScanIo
+        {
+            Wait = static _ => throw new InvalidOperationException("a newer format is not retried"),
+        });
+
+        Assert.Equal(before, File.ReadAllBytes(future));
+        Assert.Equal(0, await PointsOfAsync(engine, "future.metric"));
+        Assert.Equal(3, await PointsOfAsync(engine, "other.metric"));
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+        var error = Assert.Single(log.Snapshot(), e => e.Level >= MsLogLevel.Error);
+        Assert.Contains(future, error.Message);
+        Assert.Contains($"format v{MetricReader.NewestReadableVersion + 1}", error.Message);
+        Assert.DoesNotContain(log.Snapshot(), e => e.Message.Contains("Unreadable metric segment"));   // the delete's line
+    }
+
+    /// <summary>
+    /// The guard is for the future only: a v1 segment — release 1.0.0's format — is still deleted, the
+    /// migration path it has always had, with no Error and no Degraded store.
+    /// </summary>
+    [Fact]
+    public async Task A_v1_segment_is_still_deleted()
+    {
+        var files  = await WriteSegmentsAsync("legacy.metric");
+        string legacy = files["legacy.metric"];
+        SetVersion(legacy, 1);
+
+        var log = new Entries();
+        await using var engine = await StartAsync(log, new MetricStorageEngine.ColdScanIo
+        {
+            Wait = static _ => throw new InvalidOperationException("damage is not retried"),
+        });
+
+        Assert.False(File.Exists(legacy), "a v1 segment was kept");
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+        Assert.DoesNotContain(log.Snapshot(), e => e.Level >= MsLogLevel.Error);
+        Assert.Single(log.Snapshot(), e => e.Level == MsLogLevel.Warning && e.Message.Contains("deleting"));
+    }
+
+    /// <summary>Rewrites the format version in a segment's header (bytes 4-5), leaving the rest as written.</summary>
+    private static void SetVersion(string path, int version)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write);
+        fs.Seek(4, SeekOrigin.Begin);
+        Span<byte> v = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(v, (ushort)version);
+        fs.Write(v);
+    }
+
     /// <summary>
     /// The one data error the reader used to throw as a plain <see cref="IOException"/>: a footer
     /// whose name-index offset points before the start of the file. Classified by its type, that
