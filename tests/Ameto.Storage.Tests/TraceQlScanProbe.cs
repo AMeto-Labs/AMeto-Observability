@@ -160,10 +160,15 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         bool? fromBlob = pred.Evaluate(SpanWith(blob, dictionary: false));
         bool? fromDict = pred.Evaluate(SpanWith(blob, dictionary: true));
 
-        _out.WriteLine($"{query,-38} blob={Show(fromBlob)}  dict={Show(fromDict)}");
+        // And what a page runs: the evaluator that reads every key the filter names in ONE walk of
+        // the map (#94) must give the per-predicate blob answer for every shape, the nulls included.
+        bool? shared = new SpanPredicateEvaluator(pred).Evaluate(SpanWith(blob, dictionary: false));
+
+        _out.WriteLine($"{query,-38} blob={Show(fromBlob)}  dict={Show(fromDict)}  shared={Show(shared)}");
 
         Assert.Equal(expected, fromBlob);
         Assert.Equal(fromBlob, fromDict);
+        Assert.Equal(fromBlob, shared);
     }
 
     /// <summary>
@@ -836,12 +841,17 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         var span = SpanWith(torn, dictionary: false);
 
         Assert.Null(span.Attributes);
-        Assert.Null(TraceQLParser.Parse("{ .db.system = \"mssql\" }").Evaluate(span));
-        Assert.Null(TraceQLParser.Parse("{ !(.db.system = \"mssql\") }").Evaluate(span));
+        foreach (var evaluate in (Func<string, bool?>[])
+                 [q => TraceQLParser.Parse(q).Evaluate(span),
+                  q => new SpanPredicateEvaluator(TraceQLParser.Parse(q)).Evaluate(span)])   // a page's shared walk (#94)
+        {
+            Assert.Null(evaluate("{ .db.system = \"mssql\" }"));
+            Assert.Null(evaluate("{ !(.db.system = \"mssql\") }"));
 
-        // Presence is the one question a blob can still be wrong about cheaply, so it is pinned:
-        // an unreadable map holds nothing anybody can name.
-        Assert.False(TraceQLParser.Parse("{ .db.system != nil }").Evaluate(span));
+            // Presence is the one question a blob can still be wrong about cheaply, so it is pinned:
+            // an unreadable map holds nothing anybody can name.
+            Assert.False(evaluate("{ .db.system != nil }"));
+        }
     }
 
     private static string Show(bool? b) => b?.ToString() ?? "unknown";

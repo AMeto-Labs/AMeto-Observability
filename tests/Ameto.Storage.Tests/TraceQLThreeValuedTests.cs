@@ -41,8 +41,18 @@ public sealed class TraceQLThreeValuedTests
         Attributes  = new Dictionary<string, object?> { ["tenant"] = tenant },
     };
 
-    private static bool? Eval(string query, SpanRecord span) =>
-        TraceQLParser.Parse(query).Evaluate(span);
+    /// <summary>
+    /// The predicate's answer — asserted equal to what a page runs, the evaluator that reads every
+    /// attribute the filter names in one walk of the span's map (#94), so every table below holds
+    /// for both.
+    /// </summary>
+    private static bool? Eval(string query, SpanRecord span)
+    {
+        var   pred  = TraceQLParser.Parse(query);
+        bool? alone = pred.Evaluate(span);
+        Assert.Equal(alone, new SpanPredicateEvaluator(pred).Evaluate(span));
+        return alone;
+    }
 
     // Building blocks, chosen so each is unambiguous against WithTenant("acme"):
     private const string True    = ".tenant = \"acme\"";      // present and equal

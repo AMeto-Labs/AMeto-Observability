@@ -762,15 +762,36 @@ internal static class SpanAttributeBlob
     /// msgpack nil, an array or a nested map is a key whose dictionary value is <c>null</c> — so
     /// its bit stays clear and the caller's next key gets its turn, exactly as a <c>v is not
     /// null</c> test would have let it. Zero means nothing was found, or the map is unreadable:
-    /// one answer for both, because a blob that cannot be read cannot say which it is.</para>
+    /// one answer for both, because a blob that cannot be read cannot say which it is. A caller
+    /// that has to tell them apart asks <see cref="TryFindValues"/>.</para>
     /// </summary>
     internal static int FindValues(
-        ReadOnlyMemory<byte> blob, ReadOnlySpan<byte[]> keysUtf8, Span<SpanAttrValue> slots)
+        ReadOnlyMemory<byte> blob, ReadOnlySpan<byte[]> keysUtf8, Span<SpanAttrValue> slots) =>
+        TryFindValues(blob, keysUtf8, slots, out int found) ? found : 0;
+
+    /// <summary>
+    /// <see cref="FindValues"/>, and whether the walk read the map to its end — the one thing its
+    /// zero cannot say, because "none of these keys is here" and "the map would not read" both
+    /// return it. False leaves <paramref name="found"/> zero and the slots in no particular state.
+    ///
+    /// <para>THE DIFFERENCE MATTERS TO A CALLER THAT MUST ANSWER AS <see cref="TryFind"/> DOES,
+    /// one key at a time. A key-at-a-time walk DECODES only that key's values and steps over every
+    /// other, and stepping over is the more forgiving of the two: a uint64 above
+    /// <c>long.MaxValue</c> steps over cleanly and then refuses <c>ReadInt64</c>. Asked alone, such
+    /// a value costs its own key and nothing else; in one walk for several keys it is decoded for
+    /// whichever key it sits under, and the throw costs all of them. So
+    /// <c>SpanPredicateEvaluator</c> asks the keys one at a time whenever this returns false — a
+    /// torn map then answers "not found" for each of them, exactly as before, and the one value
+    /// that will not decode costs one key again.</para>
+    /// </summary>
+    internal static bool TryFindValues(
+        ReadOnlyMemory<byte> blob, ReadOnlySpan<byte[]> keysUtf8, Span<SpanAttrValue> slots, out int found)
     {
         ArgumentOutOfRangeException.ThrowIfGreaterThan(keysUtf8.Length, MaxKeyAlternatives);
         ArgumentOutOfRangeException.ThrowIfLessThan(slots.Length, keysUtf8.Length);
 
-        if (blob.IsEmpty || keysUtf8.Length == 0) return 0;
+        found = 0;
+        if (blob.IsEmpty || keysUtf8.Length == 0) return true;
 
         int seen = 0;   // bit per rank
         try
@@ -818,7 +839,7 @@ internal static class SpanAttributeBlob
         }
         catch
         {
-            return 0;
+            return false;
         }
 
         // A value a dictionary would hold as null is not an answer — see the summary.
@@ -826,7 +847,8 @@ internal static class SpanAttributeBlob
             if ((seen & (1 << j)) != 0 && slots[j].Kind is SpanAttrKind.Null or SpanAttrKind.Other)
                 seen &= ~(1 << j);
 
-        return seen;
+        found = seen;
+        return true;
     }
 
     /// <summary>

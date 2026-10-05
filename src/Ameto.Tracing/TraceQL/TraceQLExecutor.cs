@@ -62,8 +62,9 @@ public sealed class SearchHints
 ///      (service, status, duration range, http status code).
 ///   2. These hints are passed to <c>SearchSpansAsync</c> — the storage engine uses its
 ///      service-name index and block-skip logic to avoid reading irrelevant data.
-///   3. Returned spans are post-filtered with the full AST predicate (handles attribute
-///      predicates not covered by the index).
+///   3. Returned spans are post-filtered with the full predicate (handles attribute
+///      predicates not covered by the index), every attribute it names read in ONE walk of
+///      each span's map — see <see cref="SpanPredicateEvaluator"/>.
 ///   4. Matching spans are grouped by TraceId and returned as <see cref="TraceRowDto"/> list.
 /// </summary>
 public static class TraceQLExecutor
@@ -176,15 +177,29 @@ public static class TraceQLExecutor
     /// produce a page far short of <paramref name="limit"/> with plenty more matching traces
     /// deeper in the window.</para>
     /// </summary>
-    public static async Task<TraceQueryPage> ExecuteAsync(
+    public static Task<TraceQueryPage> ExecuteAsync(
         ITraceProvider  provider,
         SpanPredicate   predicate,
         DateTimeOffset  from,
         DateTimeOffset  to,
         int             limit,
-        CancellationToken ct)
+        CancellationToken ct) =>
+        ExecuteAsync(provider, new SpanPredicateEvaluator(predicate), from, to, limit, ct);
+
+    /// <summary>
+    /// The page, post-filtered by <paramref name="evaluator"/> — ONE per page, never shared: it
+    /// holds the span it is evaluating. Internal so a test can hand in its own and count the walks
+    /// the page made.
+    /// </summary>
+    internal static async Task<TraceQueryPage> ExecuteAsync(
+        ITraceProvider         provider,
+        SpanPredicateEvaluator evaluator,
+        DateTimeOffset         from,
+        DateTimeOffset         to,
+        int                    limit,
+        CancellationToken      ct)
     {
-        var hints = ExtractHints(predicate);
+        var hints = ExtractHints(evaluator.Predicate);
 
         // Fetch spans using indexed filters; multiply limit for grouping headroom.
         //
@@ -200,8 +215,8 @@ public static class TraceQLExecutor
         //     design, so nothing serialises them.
         //
         // It was 1,749 B, 3.6 MB and 17 MB until the attribute map stopped being decoded into a
-        // dictionary for every span a scan touched; the predicate now reads its one key straight
-        // out of the bytes (AttributePredicate.Evaluate).
+        // dictionary for every span a scan touched; the filter now reads its keys straight out of
+        // the bytes, all of them in one walk of each span's map (SpanPredicateEvaluator).
         //
         // LEFT AS IT IS, deliberately. The peak is proportional to what the caller asked for and
         // bounded by it — this is not the unbounded-in-the-match-count shape that killed the
@@ -244,7 +259,10 @@ public static class TraceQLExecutor
             // not answer — the field the query asks about is not on it — and an unanswered question
             // is not a match. Writing this as `!Evaluate(s)` would not compile against bool? and
             // writing it as `Evaluate(s) == false` would silently admit every unknown.
-            if (predicate.Evaluate(s) != true) continue;
+            //
+            // THE EVALUATOR, NOT THE PREDICATE: the same answer, with every attribute the filter
+            // names read in one walk of the span's map instead of one walk per predicate (#94).
+            if (evaluator.Evaluate(s) != true) continue;
             if (!traces.TryGetValue(s.TraceId, out var list))
             {
                 list = new List<SpanRecord>(4);
