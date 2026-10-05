@@ -1,0 +1,168 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
+using Ameto.Tracing;
+using Ameto.Tracing.Storage;
+using Ameto.Tracing.TraceQL;
+using Xunit.Abstractions;
+
+namespace Ameto.Storage.Tests;
+
+/// <summary>
+/// WHAT ONE PAGE OF A TRACE STREAM COSTS OVER THE HOT TIER — the two fetchers behind the SSE
+/// routes, driven down the window the way <c>StreamTracePagesAsync</c> drives them: each page asks
+/// for <c>[from, ceil_ms(cursor)]</c> and the cursor moves to the oldest row it returned (issue #94).
+///
+/// <para>The list path is <c>GetTraceListAsync</c> at the filter stream's 500-row page; the TraceQL
+/// path is <c>TraceQLExecutor.ExecuteAsync</c> at the TraceQL stream's 200-row page, which asks the
+/// engine for ten spans a row. Both over a hot tier only — nothing flushed — so every page is the
+/// hot-tier pass and nothing else, and it completes synchronously: the per-thread allocation
+/// counter sees the whole page (asserted, so a page that starts yielding cannot quietly halve the
+/// figure).</para>
+///
+/// <para>PRINTED, NOT ASSERTED. Per page: the spans in the page's window, the rows, the bytes this
+/// thread allocated (the SMALLEST of <see cref="Repeats"/> calls — a GC inside the window can only
+/// add) and the wall time (their median). The numbers in the commit bodies are Release's, over the
+/// 49 000-span tier; the suite runs this in Debug on a tenth of it.</para>
+/// </summary>
+public sealed class TraceStreamPageProbe : IDisposable
+{
+#if DEBUG
+    private const int Spans   = 5_000;
+#else
+    private const int Spans   = 49_000;   // just under the 50 000-span flush threshold
+#endif
+    private const int Pages   = 6;
+    private const int Repeats = 5;
+
+    /// <summary>What the SSE routes page at: TraceQueryEndpointMapper.FilterStreamPageSize and QlStreamPageSize.</summary>
+    private const int ListPageRows = 500;
+    private const int QlPageRows   = 200;
+
+    private static readonly DateTimeOffset Base = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset From = Base.AddMinutes(-1);
+    private static readonly DateTimeOffset To   = Base.AddDays(1);
+
+    private readonly List<string>      _dirs = [];
+    private readonly ITestOutputHelper _out;
+
+    public TraceStreamPageProbe(ITestOutputHelper output) => _out = output;
+
+    public void Dispose()
+    {
+        foreach (var d in _dirs)
+            try { Directory.Delete(d, true); } catch { }
+    }
+
+    private readonly record struct PageCost(int Page, int WindowSpans, int Rows, long Bytes, double Ms);
+
+    [Fact]
+    public void Stream_pages_over_the_hot_tier()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-pageprobe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        // Three services, every seventh span an error: the list rows carry a real service set and
+        // `{ status = error }` has something to find.
+        var corpus = TraceAggregateLockProbe.Corpus(0, Spans, services: 3);
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        Assert.Equal(Spans, engine.WriteSpans(corpus));
+
+        long[] starts = new long[corpus.Length];
+        for (int i = 0; i < corpus.Length; i++) starts[i] = corpus[i].StartTimeUnixNano;
+
+        var everySpan = TraceQLParser.Parse("{ .db.system = \"mssql\" }");   // no scalar hint: every span matches
+        var errors    = TraceQLParser.Parse("{ status = error }");           // a status hint: one span in seven
+
+        // Warm every path on the first page, so no measured call is jitting.
+        Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: false);
+        Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: false);
+        Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: false);
+
+        var list = Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: true);
+        var all  = Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: true);
+        var err  = Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: true);
+
+        _out.WriteLine($"STREAM PAGES over a {Spans:N0}-span hot tier (10 spans/trace, 3 services, 8 attributes); "
+                     + $"bytes = this thread, min of {Repeats}; ms = median of {Repeats}");
+        Print($"list   GetTraceListAsync({ListPageRows})", list);
+        Print($"traceql {{ .db.system = \"mssql\" }} ({QlPageRows} rows)", all);
+        Print($"traceql {{ status = error }} ({QlPageRows} rows)", err);
+
+        Assert.All(list, static p => Assert.True(p.Rows > 0));
+    }
+
+    private void Print(string title, List<PageCost> pages)
+    {
+        _out.WriteLine("");
+        _out.WriteLine($"  {title}");
+        _out.WriteLine($"    {"page",4} {"window spans",12} {"rows",5} {"KB",9} {"ms",7}");
+        foreach (var p in pages)
+            _out.WriteLine($"    {p.Page,4} {p.WindowSpans,12:N0} {p.Rows,5} {p.Bytes / 1024.0,9:N0} {p.Ms,7:N2}");
+    }
+
+    /// <summary>One page: the rows' start times, and whether the call completed on this thread.</summary>
+    private delegate (List<long> Starts, bool Sync) Fetch(DateTimeOffset pageTo, int rows);
+
+    private static (List<long>, bool) ListPage(TraceStorageEngine engine, DateTimeOffset to, int rows)
+    {
+        var task = engine.GetTraceListAsync(From, to, null, null, null, null, null, rows);
+        bool sync = task.IsCompleted;
+        var page = task.GetAwaiter().GetResult();
+        var starts = new List<long>(page.Rows.Count);
+        foreach (var r in page.Rows) starts.Add(r.RootStartNano);
+        return (starts, sync);
+    }
+
+    private static (List<long>, bool) QlPage(TraceStorageEngine engine, SpanPredicate pred, DateTimeOffset to, int rows)
+    {
+        var task = TraceQLExecutor.ExecuteAsync(engine, pred, From, to, rows, CancellationToken.None);
+        bool sync = task.IsCompleted;
+        var page = task.GetAwaiter().GetResult();
+        var starts = new List<long>(page.Rows.Count);
+        foreach (var r in page.Rows) starts.Add(r.StartTimeUnixNano);
+        return (starts, sync);
+    }
+
+    /// <summary>
+    /// Pages down the window as the stream does: the ask is the cursor rounded UP to its
+    /// millisecond, the next cursor the oldest row returned.
+    /// </summary>
+    private static List<PageCost> Walk(TraceStorageEngine engine, long[] starts, Fetch fetch, int rows, bool measure)
+    {
+        var  result = new List<PageCost>(Pages);
+        long cursor = To.ToUnixTimeMilliseconds() * 1_000_000L;
+        long from   = From.ToUnixTimeMilliseconds() * 1_000_000L;
+        for (int p = 0; p < (measure ? Pages : 1); p++)
+        {
+            Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(cursor, out var pageTo));
+            long toNano = pageTo.ToUnixTimeMilliseconds() * 1_000_000L;
+
+            List<long>? rowStarts = null;
+            long   bytes = long.MaxValue;
+            var    ms    = new double[Repeats];
+            for (int r = 0; r < Repeats; r++)
+            {
+                long a0 = GC.GetAllocatedBytesForCurrentThread();
+                long t0 = Stopwatch.GetTimestamp();
+                var (got, sync) = fetch(pageTo, rows);
+                ms[r]  = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                bytes  = Math.Min(bytes, GC.GetAllocatedBytesForCurrentThread() - a0);
+                Assert.True(sync, "a hot-only page yielded, so this thread's counter saw only part of it");
+                rowStarts = got;
+            }
+            Array.Sort(ms);
+
+            int inWindow = 0;
+            foreach (long s in starts) if (s >= from && s <= toNano) inWindow++;
+            result.Add(new PageCost(p, inWindow, rowStarts!.Count, bytes, ms[Repeats / 2]));
+
+            if (rowStarts.Count == 0) break;
+            long oldest = long.MaxValue;
+            foreach (long s in rowStarts) oldest = Math.Min(oldest, s);
+            if (oldest >= cursor) break;
+            cursor = oldest;
+        }
+        return result;
+    }
+}
