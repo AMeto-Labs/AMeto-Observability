@@ -276,8 +276,8 @@ public static class TraceQLExecutor
         // sort — returned a page whose oldest row was the boundary of nothing: encounter
         // order is only roughly newest-first (grouping by trace shuffles it), so a caller
         // paging on "everything older than my oldest row" skipped real traces. Building rows
-        // after the cut also keeps BuildRow's allocations (a HashSet, id strings, an array)
-        // to the `limit` survivors instead of every matching trace in the window — the
+        // after the cut also keeps BuildRow's allocations (id strings, the services array) to
+        // the `limit` survivors instead of every matching trace in the window — the
         // difference compounds page by page under the client's load-more.
         //
         // The trace-id tiebreak makes equal-millisecond boundaries deterministic: without it,
@@ -311,19 +311,35 @@ public static class TraceQLExecutor
             groups.RemoveRange(limit, groups.Count - limit);
         }
 
-        var result = new List<TraceRowDto>(groups.Count);
+        // ONE SERVICE SET FOR THE PAGE, cleared by every row — see BuildRow.
+        var services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result   = new List<TraceRowDto>(groups.Count);
         foreach (var (_, _, traceSpans) in groups)
-            result.Add(BuildRow(traceSpans));
+            result.Add(BuildRow(traceSpans, services));
         return new TraceQueryPage(result, scanFloorNano, scanFloor.Unreadable);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private static TraceRowDto BuildRow(List<SpanRecord> spans)
+    /// <summary>
+    /// One row for one trace's matching spans.
+    ///
+    /// <para><paramref name="services"/> is the PAGE'S scratch set, cleared here; the row keeps only
+    /// the array made from it. It was a <c>new HashSet</c> per row — 176 B for an ordinary
+    /// one-service row (the set, its buckets, its entries) on a page of up to a thousand rows, of
+    /// which only the array outlived the row. Per page and never static: pages run concurrently —
+    /// a TraceQL POST takes no admission slot, and every SSE client pages on its own — and a set is
+    /// not safe for two of them at once.</para>
+    ///
+    /// <para>Clearing costs the set's bucket array, which stays as wide as the widest trace the page
+    /// has met. That is bounded by the page's span limit — 10 000 at the POST clamp, a 40 KB clear
+    /// at the very worst, behind a trace of ten thousand distinct services.</para>
+    /// </summary>
+    private static TraceRowDto BuildRow(List<SpanRecord> spans, HashSet<string> services)
     {
         SpanRecord? root = null;
         bool hasErr = false;
-        var services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        services.Clear();
 
         foreach (var s in spans)
         {
