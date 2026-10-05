@@ -530,7 +530,7 @@ public static class TraceQueryEndpointMapper
     /// scan window closes can be emitted incomplete.</para>
     ///
     /// <para>WHAT THE PAGING COSTS, honestly. Each page re-enters the fetch over a narrower
-    /// window, and only ONE of the three costs actually falls as the cursor descends:</para>
+    /// window, and what the narrower window saves differs by where the rows live:</para>
     /// <list type="bullet">
     ///   <item>cold segments ENTIRELY newer than the cursor fail the segment-level range check
     ///   and are never opened again. This is the saving, and it is real;</item>
@@ -540,15 +540,21 @@ public static class TraceQueryEndpointMapper
     ///   pagination. The <c>[from, to]</c> bound now pushed into
     ///   <c>TraceSummarySidecar.TryReadSummaries</c> cuts the per-row allocation but not the
     ///   decompression: the body is one LZ4 blob with no index;</item>
-    ///   <item>the HOT TIER is walked in full on every page, by both fetchers. A descending
-    ///   cursor does not shorten that walk at all — it only makes more spans fail the range test
-    ///   inside it, and on the list path each surviving span still costs a MergeSpanInto
-    ///   (dictionary probe, HashSet add, field writes) — outside the read lock since 5de1c8f; the
-    ///   TraceQL path (<c>SearchSpansAsync</c>) still walks the tier and the in-flight flush
-    ///   snapshot under it. Measured (Release, a 49 000-span hot tier, ten spans a trace, 500-row
-    ///   pages of the filter list walking down the window): 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and
-    ///   10.6, 9.2, 13.5, 7.4, 6.0, 5.0 ms for pages 0-5 — falling only as the window loses
-    ///   traces to merge, never below the cost of the walk itself.</item>
+    ///   <item>the HOT TIER is read through its START INDEX (#94): every tier list carries the
+    ///   bounds of each 128-span block of it, in arrival order (<c>SpanStartIndex</c>), and both
+    ///   fetchers read the unflushed spans after the engine's read lock is released. The TraceQL
+    ///   fetch (<c>SearchSpansAsync</c>) visits blocks newest-first and stops once nothing it has
+    ///   not read could make the cut, so a page reads about the spans it returns and a block more,
+    ///   wherever in the window it is. The list fetch CANNOT stop early — every in-window trace is
+    ///   merged, because its filters run after the merge and the cold walk's scan cap counts the
+    ///   merge — but it opens no block wholly outside its window, and it makes rows (a summary, a
+    ///   service array, the root's HTTP method and path) only for the <c>limit</c> it returns.
+    ///   Measured (Release, a 49 000-span hot tier, ten spans a trace, pages 0-5 walking down the
+    ///   window; medians of three runs on a loaded machine): the filter list's 500-row pages
+    ///   3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and 10, 10, 11, 9, 7, 3 ms before, 1.2, 1.2, 1.1, 1.0, 0.9,
+    ///   0.6 MB and 4, 5, 4, 4, 3, 2 ms after; the TraceQL page's engine call (2 000 spans) 638 KB
+    ///   and ~5 ms — all of it inside the read lock — before, 283 KB and ~1.3 ms, none of it inside
+    ///   the lock, after.</item>
     /// </list>
     /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
     /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is
@@ -560,11 +566,11 @@ public static class TraceQueryEndpointMapper
     /// and would never hit here: the window moves every page, and on a live server the hot count
     /// moves between any two pages as well. A memo keyed on the tier alone would have to hold
     /// every trace's spans to re-derive a window's summary from them, which is the walk again with
-    /// a copy of the tier on top. What would actually cut the cost is inside the engine, which this
-    /// file does not own: an index of the unflushed spans by start time, extended per append and
-    /// rebuilt per generation, so a page visits only the spans of its own window, and a hot-tier
-    /// merge bounded like the cold one instead of merging every in-window trace to return
-    /// <c>limit</c> of them.</para>
+    /// a copy of the tier on top. What cut the cost was inside the engine (#94): an index of the
+    /// unflushed spans by start time, extended per append and replaced per generation, so a page
+    /// visits only the blocks of its own window, and a TraceQL hot pass bounded like the cold one.
+    /// The list's hot merge stays unbounded for the reason given above; it is the rows it no longer
+    /// makes, and the blocks it no longer opens, that it saves.</para>
     /// <para>So the cost is bounded by the number of pages, not independent of it, and the
     /// per-page scan budget (<c>max(limit*5, 500)</c> merged summaries) is a budget on the MERGE,
     /// not on the reading: <c>MaxSpansPerPass</c> lets one compacted segment hold 200 000 spans,
