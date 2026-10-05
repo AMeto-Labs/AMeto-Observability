@@ -186,6 +186,27 @@ describe('the service clause under every name the server answers for it', () => 
     }
   });
 
+  it('reads the clause in parentheses, or with the name on the left, as the parser does', () => {
+    // ParseAtom reads `( expr )` as expr; a literal on the left of `=` is moved to the right.
+    const reads: [string, string[]][] = [
+      ["(ServiceName = 'old')", ['old']],
+      ["((service['name'] in ['a', 'b']))", ['a', 'b']],
+      ["'old' = ServiceName", ['old']],
+      ["('old' = ['service'].name)", ['old']],
+    ];
+    for (const [filter, services] of reads) {
+      expect([...parseServicesFromFilter(filter)], filter).toEqual(services);
+      expect(setServicesClause(`${filter} and Region = 'eu'`, new Set(['new'])), filter)
+        .toBe("@service = 'new' and Region = 'eu'");
+    }
+    for (const other of [
+      "not (ServiceName = 'x')", "(ServiceName = 'x' or ServiceName = 'y')", "(ServiceName) = 'x'",
+      "(ServiceName = 'x') or (Region = 'eu')", "'x' <> ServiceName", "'x' = 'y'",
+    ]) {
+      expect(parseServicesFromFilter(other).size, other).toBe(0);
+    }
+  });
+
   it('reads back exactly the names it wrote, quotes and backslashes included', () => {
     const svcs = new Set(["O'Brien", 'DOMAIN\\svc', 'plain']);
     expect(parseServicesFromFilter(setServicesClause("@l = 'Error'", svcs))).toEqual(svcs);

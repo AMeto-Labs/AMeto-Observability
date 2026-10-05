@@ -144,21 +144,44 @@ function readPath(t: readonly Token[], p: number): { key: string; end: number } 
   }
 }
 
+/** `t` without parentheses around ALL of it: the parser reads `( expr )` as expr (ParseAtom). */
+function unwrapped(t: Token[]): Token[] {
+  while (t.length >= 2 && isPunct(t[0], '(') && isPunct(t[t.length - 1], ')')) {
+    let depth = 0;
+    let close = -1;
+    for (let k = 0; k < t.length && close < 0; k++) {
+      if (isPunct(t[k], '(')) depth++;
+      else if (isPunct(t[k], ')') && --depth === 0) close = k;
+    }
+    if (close !== t.length - 1) break;                       // `(a) and (b)`: not one pair
+    t = t.slice(1, -1);
+  }
+  return t;
+}
+
 /**
  * The services a conjunct SELECTS — `field = 'x'` or `field in ['x', …]`, `field` being any
- * spelling the server resolves to the built-in service — or null for anything else: an exclusion
+ * spelling the server resolves to the built-in service, inside any parentheses, and `'x' = field`
+ * too: the parser moves a literal on the left to the right. Null for anything else: an exclusion
  * (`<>`, `not in`), another property, a comparison with something that is not a name, a list
- * holding one, or text after the clause. A name is never empty.
+ * holding one, text after the clause, or an `or` of service tests. A name is never empty.
  */
 function serviceSelection(conjunct: string): string[] | null {
-  const t = lex(conjunct);
-  const path = t && readPath(t, 0);
-  if (!t || !path || !SERVICE_KEYS.has(path.key)) return null;
-
+  const lexed = lex(conjunct);
+  if (!lexed) return null;
+  const t = unwrapped(lexed);
   const isName = (k: number) => t[k]?.kind === 'string' && t[k].text.length > 0;
+  const isEq = (k: number) => t[k]?.kind === 'op' && t[k].text === '=';
+
+  if (isName(0) && isEq(1)) {
+    const right = readPath(t, 2);
+    return right && right.end === t.length && SERVICE_KEYS.has(right.key) ? [t[0].text] : null;
+  }
+
+  const path = readPath(t, 0);
+  if (!path || !SERVICE_KEYS.has(path.key)) return null;
   let p = path.end;
-  if (t[p]?.kind === 'op' && t[p].text === '=')
-    return isName(p + 1) && p + 2 === t.length ? [t[p + 1].text] : null;
+  if (isEq(p)) return isName(p + 1) && p + 2 === t.length ? [t[p + 1].text] : null;
 
   if (t[p]?.kind !== 'ident' || t[p].text.toLowerCase() !== 'in' || !isPunct(t[p + 1], '['))
     return null;
