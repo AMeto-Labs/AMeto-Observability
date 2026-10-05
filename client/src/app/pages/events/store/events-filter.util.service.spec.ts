@@ -112,7 +112,8 @@ describe('the service clause under every name the server answers for it', () => 
   it('reads each spelling as the selection', () => {
     for (const f of SPELLINGS) {
       expect([...parseServicesFromFilter(`${f} = 'api'`)], f).toEqual(['api']);
-      expect([...parseServicesFromFilter(`@l = 'Error' and ${f} in ['a', 'b']`)], f).toEqual(['a', 'b']);
+      expect([...parseServicesFromFilter(`@l = 'Error' and ${f} in ['a', 'b']`)], f)
+        .toEqual(['a', 'b']);
     }
   });
 
@@ -120,7 +121,8 @@ describe('the service clause under every name the server answers for it', () => 
     for (const f of SPELLINGS) {
       expect(setServicesClause(`${f} = 'old' and Region = 'eu'`, new Set(['new'])), f)
         .toBe("@service = 'new' and Region = 'eu'");
-      expect(setServicesClause(`@l = 'Error' and ${f} in ['a', 'b']`, new Set()), f).toBe("@l = 'Error'");
+      expect(setServicesClause(`@l = 'Error' and ${f} in ['a', 'b']`, new Set()), f)
+        .toBe("@l = 'Error'");
     }
   });
 

@@ -208,10 +208,11 @@ describe('flame graph cut node', () => {
 });
 
 /**
- * A ZOOM INSIDE A ZOOMED VIEW (#94, from the #106 review). The zoomed view drew re-scaled COPIES of
- * the focused subtree's nodes, and a click on a bar focused whatever object the bar was drawn from
- * — inside a zoom, a copy, whose x, width and depth were already relative to the first zoom. Applied
- * to the full layout, they put the second zoom's bars at the wrong offset, or off the canvas.
+ * A ZOOM INSIDE A ZOOMED VIEW (#94, from the #106 review). The zoomed view drew re-scaled COPIES
+ * of the focused subtree's nodes, and a click on a bar focused whatever object the bar was drawn
+ * from — inside a zoom, a copy, whose x, width and depth were already relative to the first zoom.
+ * Applied to the full layout, they put the second zoom's bars at the wrong offset, or off the
+ * canvas.
  */
 describe('flame graph zoom', () => {
   /**
@@ -231,7 +232,8 @@ describe('flame graph zoom', () => {
 
   /** The bar drawn for the node named `name`: its title starts with the name. */
   const bar = (el: HTMLElement, name: string) =>
-    Array.from(el.querySelectorAll<HTMLElement>('.fg-bar')).find(b => b.title.startsWith(name + ' '))!;
+    Array.from(el.querySelectorAll<HTMLElement>('.fg-bar'))
+      .find(b => b.title.startsWith(name + ' '))!;
 
   /** Every bar drawn, by node name: [left %, width %, top px]. */
   function geometry(el: HTMLElement): Record<string, [number, number, number]> {
@@ -322,7 +324,7 @@ describe('flame graph zoom', () => {
   it('draws, after any chain of zooms, the clicked node\'s subtree as that subtree\'s own flame graph', async () => {
     const tree = randomTree(11, 400);
     const flat = layoutFlamegraph(tree);
-    for (const n of flat) n.name = n.spanId;      // bars are found by name, and these ids are unique
+    for (const n of flat) n.name = n.spanId;      // bars are found by name; these ids are unique
 
     // The path from the root to the deepest node: one click per level, each inside the last zoom.
     const parentOf = new Map<FlamegraphNode, FlamegraphNode>();

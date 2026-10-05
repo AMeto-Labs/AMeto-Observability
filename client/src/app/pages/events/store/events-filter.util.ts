@@ -232,8 +232,8 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
 
 /**
  * The services the filter SELECTS: those named by the picker's clause when it is a top-level AND
- * conjunct (any spelling of the field). Empty — "all services" — when there is none, including when the
- * clause sits under a `not` or beside a top-level `or`, where it selects nothing.
+ * conjunct (any spelling of the field). Empty — "all services" — when there is none, including
+ * when the clause sits under a `not` or beside a top-level `or`, where it selects nothing.
  */
 export function parseServicesFromFilter(expr: string): Set<string> {
   for (const conjunct of topLevelConjuncts(expr) ?? []) {
@@ -264,9 +264,9 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 /**
  * Rewrites the picker's service clause of `expr` as `@service = …` / `@service in […]` — the
  * built-in field's own name, which the server answers from the event header and its index. Only
- * the picker's own clause (a top-level AND conjunct, in any spelling of the field) is replaced — never
- * duplicated — and a service test the user wrote under a `not` or inside an `or` is left as
- * written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
+ * the picker's own clause (a top-level AND conjunct, in any spelling of the field) is replaced —
+ * never duplicated — and a service test the user wrote under a `not` or inside an `or` is left
+ * as written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
  * all of it. Placed after any `@l` clause, before the rest of the user's expression.
  */
 export function setServicesClause(expr: string, svcs: Set<string>): string {
