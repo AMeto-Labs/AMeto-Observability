@@ -1747,10 +1747,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // A merge's commit takes the same two locks for its sources (see CommitMerge).
         //
         // And under _scanDeleteGate, the one lock the boot catalog scan registers under (that must
-        // never wait for _importLock -- see LoadSegmentCatalog). Removing the entry, recording the path for
-        // a running scan, unlinking the file and parking a failed unlink are then one step to the
-        // scan: it cannot register this path after the entry has gone but before the record or
-        // the park that tells it to leave the path alone.
+        // never wait for _importLock -- see LoadSegmentCatalog). Removing the entry, recording the
+        // path for a running scan, unlinking the file and parking a failed unlink are then one step
+        // to the scan: it cannot register this path after the entry has gone but before the record
+        // or the park that tells it to leave the path alone.
         lock (_importLock)
         lock (_scanDeleteGate)
         {
@@ -3917,17 +3917,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         {
             _logger.LogWarning(ex,
                 "Merge recovery: the output {File} of an interrupted merge could not be read now; taken as committed — " +
-                "a merge output reaches its name only once it is on disk — so the sources it lists are deleted",
+                "a merge output reaches its name only once it is on disk — so the sources it lists go as its duplicates",
                 Path.GetFileName(output));
             return true;
         }
     }
 
-    /// <summary>A manifest line that can name a source: a plain <c>*.seg</c> file name.</summary>
+    /// <summary>
+    /// A manifest line that can name a source: a plain <c>*.seg</c> file name. A line that cannot —
+    /// one a torn or hand-edited manifest holds — would otherwise be parked, fail its unlink on
+    /// every retry and keep the manifest for good.
+    /// </summary>
     private static bool IsListedSourceName(string name) =>
         name.Length > ".seg".Length
         && name.EndsWith(".seg", StringComparison.OrdinalIgnoreCase)
+        && name.AsSpan().IndexOfAny(InvalidFileNameChars) < 0
         && string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal);
+
+    private static readonly SearchValues<char> InvalidFileNameChars = SearchValues.Create(Path.GetInvalidFileNameChars());
 
     /// <summary>
     /// The key a segment file's NAME carries — <c>{node}-{id}-{minTs}-{maxTs}.seg</c> as this node

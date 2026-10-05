@@ -1077,6 +1077,38 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Only a plain <c>*.seg</c> file name in a manifest names a source. A blank line, a path, a name
+    /// no file can carry and the output's own name — what a torn or hand-edited manifest can hold —
+    /// name nothing recovery may unlink. Parked, the blank line (the segments directory itself)
+    /// failed its unlink on every retry and kept the manifest for good; and the output's own name
+    /// was unlinked at start, before the scan could serve it, after the sources it had replaced.
+    /// </summary>
+    [Fact]
+    public async Task ManifestLinesThatNameNoSource_AreIgnored_AndTheOutputIsNeverOneOfThem()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest",
+            [.. snap.Keys, "", Path.Combine("sub", "x.seg"), "torn\0name.seg", Path.GetFileName(output)]);
+
+        await RestartAsync();
+
+        Assert.True(File.Exists(output), "recovery unlinked the output its own manifest names");
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);
+        AssertSameEvents(before, ReadEverything());
+        foreach (var name in snap.Keys) Assert.False(File.Exists(Path.Combine(SegDir, name)), $"{name} survived recovery");
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+        Assert.Empty(Manifests());
+    }
+
+    /// <summary>
     /// A file a manifest lists that the catalog names is no longer that manifest's to delete. A path
     /// comes back into service when a peer pushes a replica again to the path its merged-away copy
     /// had; recovery used to unlink it out from under the new entry, which then named a file that was
