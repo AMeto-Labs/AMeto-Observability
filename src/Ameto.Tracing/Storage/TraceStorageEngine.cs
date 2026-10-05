@@ -4612,12 +4612,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         finally { _lock.ExitReadLock(); }
 
         // Includes the in-flight flush snapshot — otherwise the newest rows disappear from the
-        // trace list for the duration of every segment build.
+        // trace list for the duration of every segment build. Every in-window span, in tier order:
+        // see MergeRunInto for what the start index lets it skip and why it may skip no more.
         if (runs.Flushing.Length + runs.Hot.Length > 0) _aggregatePassForTest?.Invoke(nameof(GetTraceListAsync));
-        foreach (var s in runs.Flushing)
-            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
-        foreach (var s in runs.Hot)
-            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+        int hotVisited = MergeRunInto(merged, runs.Flushing, runs.FlushingStarts, fromNano, toNano)
+                       + MergeRunInto(merged, runs.Hot,      runs.HotStarts,      fromNano, toNano);
+        _listHotVisitedForTest?.Invoke(hotVisited);
 
         // THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW — never a minimum over what it
         // merged, and the difference is the whole finding. Cold segments OVERLAP in time, so one
@@ -4814,8 +4814,14 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // window unreadable rather than a narrower one.
         unreadable |= _coldTierIncomplete || _vanished.Overlaps(fromNano, toNano);
 
-        // Filter + sort newest-first + take limit.
-        var list = new List<TraceSummary>(merged.Count);
+        // Filter + sort newest-first + take limit — and only THEN make rows (#94). A row is a
+        // TraceSummary, its services array, and for a hot root the blob walk for the HTTP method
+        // and path; the merge used to make one for every trace that passed the filters, sort them,
+        // and throw away all but `limit` — 4 900 rows for 500 on a 49 000-span tier, every page.
+        // The merged traces are sorted instead, by the key the row would have carried, in the order
+        // the rows would have been listed in and by the same comparison: the same permutation, so
+        // the same rows in the same order, including among equal keys.
+        var kept = new List<MergedTrace>(merged.Count);
         foreach (var m in merged.Values)
         {
             var rowStatus = m.HasError ? SpanStatusCode.Error : m.RootStatus;
@@ -4824,12 +4830,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             if (spanName is not null && !m.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) continue;
             if (minDurationNanos is not null && m.DurationNanos < minDurationNanos.Value) continue;
             if (maxDurationNanos is not null && m.DurationNanos > maxDurationNanos.Value) continue;
-            list.Add(m.ToSummary());
+            kept.Add(m);
         }
 
-        list.Sort(static (a, b) => b.RootStartNano.CompareTo(a.RootStartNano));
+        kept.Sort(static (a, b) => b.RowStartNano.CompareTo(a.RowStartNano));
 
-        if (list.Count > limit)
+        if (kept.Count > limit)
         {
             // The `limit` cut is the THIRD place this call stopped short. Rows under it were
             // merged and then thrown away without ever being handed to the caller, so the page
@@ -4841,9 +4847,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // rows under the cut come back on the next page. It is the OTHER two floors — the
             // budget break and the unreadable segment — that can sit above such a cursor, and
             // that is precisely the gap the caller has to be told about.
-            scanFloor = Math.Max(scanFloor, list[Math.Max(0, limit - 1)].RootStartNano);
-            list.RemoveRange(limit, list.Count - limit);
+            scanFloor = Math.Max(scanFloor, kept[Math.Max(0, limit - 1)].RowStartNano);
+            kept.RemoveRange(limit, kept.Count - limit);
         }
+
+        var list = new List<TraceSummary>(kept.Count);
+        foreach (var m in kept) list.Add(m.ToSummary());
 
         // CAPPED and "there is a floor" are the same statement, so they are computed once from
         // one another. A floor above long.MinValue is exactly a region of [from, to] this page
@@ -4864,7 +4873,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         var m = GetOrAdd(merged, s.TraceId);
         m.SpanCount++;
         if (s.Status == SpanStatusCode.Error) m.HasError = true;
-        m.Services.Add(s.ServiceName);
+        m.AddService(s.ServiceName);
         if (s.StartTimeUnixNano < m.EarliestNano) { m.EarliestNano = s.StartTimeUnixNano; m.EarliestService = s.ServiceName; }
         if (s.ParentSpanId.IsEmpty && !m.HasRoot)
         {
@@ -4876,7 +4885,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             m.HttpStatusCode = s.HttpStatusCode;
             m.Name           = s.Name;
             m.ServiceName    = s.ServiceName;
-            SetHttpAttrs(s, m);
+            m.HttpFrom       = s;         // read when the row is made — see SetHttpAttrs
         }
     }
 
@@ -4885,7 +4894,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         var m = GetOrAdd(merged, r.TraceId);
         m.SpanCount += r.SpanCount;
         if (r.HasError) m.HasError = true;
-        foreach (var sv in r.Services) m.Services.Add(sv);
+        foreach (var sv in r.Services) m.AddService(sv);
         if (r.RootStartNano < m.EarliestNano) { m.EarliestNano = r.RootStartNano; m.EarliestService = r.ServiceName; }
         if (r.HasRoot && !m.HasRoot)
         {
@@ -4902,43 +4911,38 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         }
     }
 
-    private static bool ServiceMatch(MergedTrace m, string service)
-    {
-        if (m.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
-        foreach (var sv in m.Services)
-            if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
-        return false;
-    }
+    private static bool ServiceMatch(MergedTrace m, string service) =>
+        m.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase) || m.HasService(service);
 
     /// <summary>
     /// THE TRACE LIST READS TWO KEYS, SO IT READS TWO KEYS — not a whole attribute map, and above
     /// all not a whole attribute map from inside <c>_lock.EnterReadLock()</c>.
     ///
-    /// <para><see cref="MergeSpanInto"/> runs under the read lock over every unflushed span and
-    /// asks this for the first root span of each trace. Reaching the answer through
-    /// <see cref="SpanRecord.Attributes"/> made that ask the FIRST touch of the record's blob, so
-    /// the lazy decode ran right there: a <c>Dictionary</c>, a key string and a box per attribute
-    /// per root span of the tier, inside a lock the drainer's <c>WriteSpan</c> has to wait out —
-    /// and memoised on the record afterwards, so a tier that had been listed once stayed that much
-    /// heavier until it flushed. Release, 20 000-span tier, 2 000 traces: 2 023 → 623 B allocated
-    /// per root span, and 1 888 → 498 B LEFT ON THE TIER, which at the 50 000-span threshold is
-    /// 9,0 → 2,4 MB the tier never gives back, on the first page after every flush.</para>
+    /// <para>The merge used to ask it for the first root span of each trace, from inside the read
+    /// lock. Reaching the answer through <see cref="SpanRecord.Attributes"/> made that ask the
+    /// FIRST touch of the record's blob, so the lazy decode ran right there: a <c>Dictionary</c>, a
+    /// key string and a box per attribute per root span of the tier, inside a lock the drainer's
+    /// <c>WriteSpan</c> has to wait out — and memoised on the record afterwards, so a tier that had
+    /// been listed once stayed that much heavier until it flushed. Release, 20 000-span tier, 2 000
+    /// traces: 2 023 → 623 B allocated per root span, and 1 888 → 498 B LEFT ON THE TIER, which at
+    /// the 50 000-span threshold is 9,0 → 2,4 MB the tier never gives back, on the first page after
+    /// every flush.</para>
     ///
-    /// <para>WHAT IT COSTS, because it is not free: the decode was memoised and this walk is not,
-    /// so a second page over the same tier pays it again — the probe measures page 2 at 5,1 ms
-    /// against the memoised path's 3,0 ms, ≈ 1 µs per root span of read-lock hold per page, and
-    /// 96 B per root span for the one <c>GetString</c> the dictionary had already paid for. The
-    /// trade is deliberate and it is the round's stated order — resident memory first, and the
-    /// 512 MB stand died of the live set, not of a millisecond. Memoising the two strings on the
-    /// record instead is the SSE hot-tier re-walk, which the plan gives to WP9.</para>
+    /// <para>The walk is not memoised, so every page pays it again — ≈ 1 µs and 96 B (the one
+    /// <c>GetString</c>) per root span asked. Deliberately: resident memory first, and the 512 MB
+    /// stand died of the live set, not of a millisecond. What #94 changed is WHICH root spans are
+    /// asked: the merge records the root (<see cref="MergedTrace.HttpFrom"/>) and
+    /// <see cref="MergedTrace.ToSummary"/> calls this after the sort and the cut, so a page pays it
+    /// for the rows it returns — 500 on the stream's page — where it paid it for every trace it
+    /// merged, 4 900 of them on a 49 000-span tier. Same record, same walk, same two strings.</para>
     ///
     /// <para>ONE WALK, BOTH QUESTIONS, AND ONE COPY OF IT: the walk itself is
     /// <see cref="HttpSemconvKeys.Resolve"/>, beside the key lists it reads, because
     /// <c>TraceQLExecutor.BuildRow</c> asks the same question of the same records of the same
     /// tier and must not answer it a second way.</para>
     /// </summary>
-    private static void SetHttpAttrs(SpanRecord s, MergedTrace m) =>
-        HttpSemconvKeys.Resolve(s, out m.HttpMethod, out m.HttpPath);
+    private static void SetHttpAttrs(SpanRecord s, out string method, out string path) =>
+        HttpSemconvKeys.Resolve(s, out method, out path);
 
     private struct HotVolAcc
     {
@@ -4968,25 +4972,88 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         public string          HttpMethod  = string.Empty;
         public string          HttpPath    = string.Empty;
 
-        public readonly HashSet<string> Services = new(2, StringComparer.Ordinal);
+        /// <summary>
+        /// The root SPAN the row's HTTP method and path are read from, when the root came from a
+        /// span rather than a summary — read in <see cref="ToSummary"/>, so only for the rows a page
+        /// keeps (see <see cref="SetHttpAttrs"/>). A summary's root carries the two strings already
+        /// and leaves this null.
+        /// </summary>
+        public SpanRecord?     HttpFrom;
 
-        public TraceSummary ToSummary() => new()
+        /// <summary>The start the row carries, and the key the list sorts on.</summary>
+        public long RowStartNano => HasRoot ? RootStartNano : EarliestNano;
+
+        // ── The trace's services: distinct by ordinal, in the order they were first met ──────
+        //
+        // A HashSet<string> per merged trace used to hold them — 176 B for the set's object and
+        // two arrays, on every trace a page merged, in a list whose ordinary trace touches one to
+        // three services. The first three live in fields now and a set exists only from a fourth
+        // on; the order a row lists them in is the order they were added, exactly as the set
+        // enumerated them (it is never removed from, so its enumeration order IS its insertion
+        // order). Strings in the tier are the pools' shared instances, so the comparison is
+        // almost always a reference check.
+
+        private string?          _service0;
+        private string?          _service1;
+        private string?          _service2;
+        private HashSet<string>? _moreServices;
+
+        public void AddService(string service)
         {
-            TraceId        = TraceId,
-            RootSpanId     = RootSpanId,
-            RootStartNano  = HasRoot ? RootStartNano : EarliestNano,
-            DurationNanos  = DurationNanos,
-            SpanCount      = SpanCount,
-            HasRoot        = HasRoot,
-            HasError       = HasError,
-            RootStatus     = RootStatus,
-            HttpStatusCode = HttpStatusCode,
-            Name           = Name,
-            ServiceName    = HasRoot ? ServiceName : EarliestService,
-            HttpMethod     = HttpMethod,
-            HttpPath       = HttpPath,
-            Services       = [.. Services],
-        };
+            if (_service0 is null)                                          { _service0 = service; return; }
+            if (string.Equals(_service0, service, StringComparison.Ordinal)) return;
+            if (_service1 is null)                                          { _service1 = service; return; }
+            if (string.Equals(_service1, service, StringComparison.Ordinal)) return;
+            if (_service2 is null)                                          { _service2 = service; return; }
+            if (string.Equals(_service2, service, StringComparison.Ordinal)) return;
+            (_moreServices ??= new HashSet<string>(StringComparer.Ordinal)).Add(service);
+        }
+
+        /// <summary>Whether any service is <paramref name="service"/>, ignoring case — the list's service filter.</summary>
+        public bool HasService(string service)
+        {
+            if (_service0 is not null && _service0.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_service1 is not null && _service1.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_service2 is not null && _service2.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_moreServices is null) return false;
+            foreach (var sv in _moreServices)
+                if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private string[] ServicesArray()
+        {
+            int inline = _service0 is null ? 0 : _service1 is null ? 1 : _service2 is null ? 2 : 3;
+            var all    = new string[inline + (_moreServices?.Count ?? 0)];
+            if (inline > 0) all[0] = _service0!;
+            if (inline > 1) all[1] = _service1!;
+            if (inline > 2) all[2] = _service2!;
+            if (_moreServices is not null) _moreServices.CopyTo(all, inline);
+            return all;
+        }
+
+        public TraceSummary ToSummary()
+        {
+            string httpMethod = HttpMethod, httpPath = HttpPath;
+            if (HttpFrom is not null) SetHttpAttrs(HttpFrom, out httpMethod, out httpPath);
+            return new()
+            {
+                TraceId        = TraceId,
+                RootSpanId     = RootSpanId,
+                RootStartNano  = RowStartNano,
+                DurationNanos  = DurationNanos,
+                SpanCount      = SpanCount,
+                HasRoot        = HasRoot,
+                HasError       = HasError,
+                RootStatus     = RootStatus,
+                HttpStatusCode = HttpStatusCode,
+                Name           = Name,
+                ServiceName    = HasRoot ? ServiceName : EarliestService,
+                HttpMethod     = httpMethod,
+                HttpPath       = httpPath,
+                Services       = ServicesArray(),
+            };
+        }
     }
 
     /// <summary>

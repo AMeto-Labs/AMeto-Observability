@@ -442,6 +442,107 @@ public sealed class TraceHotTierWindowTests : IDisposable
         Assert.InRange(visited, 1, 2 * SpanStartIndex.BlockSize);
     }
 
+    /// <summary>
+    /// A LIST PAGE DEEP IN ITS WINDOW READS ONLY THE BLOCKS THAT REACH IT. 20 000 spans, one a
+    /// millisecond: a page whose ceiling is five seconds in reads the five thousand spans below it and
+    /// the one block that straddles it — the blocks above are never opened. (It may not stop any
+    /// earlier: see MergeRunInto.)
+    /// </summary>
+    [Fact]
+    public async Task A_list_page_deep_in_its_window_reads_only_the_blocks_that_reach_it()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000)]);
+        int visited = -1;
+        engine._listHotVisitedForTest = n => visited = n;
+
+        var all = await engine.GetTraceListAsync(From, To, null, null, null, null, null, 500);
+        Assert.Equal(20_000, visited);
+        Assert.Equal(500, all.Rows.Count);
+
+        var deep = await engine.GetTraceListAsync(From, Base.AddMilliseconds(5_000), null, null, null, null, null, 500);
+        Assert.InRange(visited, 5_001, 5_001 + SpanStartIndex.BlockSize);
+        Assert.Equal(500, deep.Rows.Count);
+    }
+
+    /// <summary>
+    /// A LIST PAGE MAKES ROWS ONLY FOR WHAT IT RETURNS. 2 000 traces in three services, a page of 100:
+    /// every trace is merged — the filters and the cold walk's cap need all of them — but the row (a
+    /// TraceSummary, its services array) and the root's HTTP method and path (a walk of its attribute
+    /// blob and a string) are made for the 100 the page keeps, and a merged trace no longer carries a
+    /// HashSet for one to three services.
+    ///
+    /// <para>Counted on this thread over a hot-only page, which completes synchronously (asserted).
+    /// Measured (Debug, the smallest of three pages): 639 B per merged trace before #94, 253 after;
+    /// making rows for every trace again reads 509, and giving every trace a HashSet again 429.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_list_page_makes_rows_only_for_the_traces_it_returns()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000, services: 3)]);
+        const int Traces = 2_000;
+
+        await engine.GetTraceListAsync(From, To, null, null, null, null, null, 100);   // warm
+
+        long best = long.MaxValue;
+        for (int r = 0; r < 3; r++)
+        {
+            long a0   = GC.GetAllocatedBytesForCurrentThread();
+            var  task = engine.GetTraceListAsync(From, To, null, null, null, null, null, 100);
+            bool sync = task.IsCompleted;
+            var  page = await task;
+            best = Math.Min(best, GC.GetAllocatedBytesForCurrentThread() - a0);
+            Assert.True(sync, "a hot-only list page yielded, so this thread saw only part of it");
+            Assert.Equal(100, page.Rows.Count);
+            Assert.Equal("/api/v1/tenants/{tenantId}/payments", page.Rows[0].HttpPath);   // resolved for the rows kept
+        }
+
+        _out.WriteLine($"list page of 100 over {Traces:N0} hot traces: {best:N0} B, {best / Traces:N0} B per merged trace");
+        Assert.True(best / Traces < 330,
+            $"a list page allocated {best / Traces:N0} B per merged trace — rows or service sets are being "
+            + "made for traces the page does not return");
+    }
+
+    /// <summary>
+    /// A STREAM OF LIST PAGES LEAVES NO DECODED ATTRIBUTE MAP ON THE TIER. The root's HTTP method and
+    /// path are read straight out of its blob; reaching them through <c>SpanRecord.Attributes</c>
+    /// instead would decode the map and MEMOISE it on a record the tier keeps until it flushes.
+    /// <c>TraceHotTierProbe</c>'s per-page allocation gate caught that while every root of the tier
+    /// was asked on every page; now that only the rows a page returns are asked, a decode put back
+    /// there would cost one page a twentieth of what it did — and still inflate the whole tier, one
+    /// page at a time, over a stream. So the guard is the memo flag itself, read off every record
+    /// after a stream has returned every trace in the tier.
+    /// </summary>
+    [Fact]
+    public async Task A_stream_of_list_pages_leaves_no_decoded_attributes_on_the_tier()
+    {
+        // Private by design; found by name and asserted found, so a rename fails here, loudly.
+        var decodedFlag = typeof(SpanRecord).GetField("_decoded",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(decodedFlag);
+
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 5_000, services: 3)]);
+
+        long fromNano = Nano(From), cursor = Nano(To);
+        var  traces   = new HashSet<TraceId>();   // the stream's dedupe: the ceiling millisecond overlaps
+        int  withPath = 0;
+        for (int page = 0; page < 100; page++)
+        {
+            Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(cursor, out var pageTo));
+            var p = await engine.GetTraceListAsync(From, pageTo, null, null, null, null, null, 100);
+            foreach (var r in p.Rows)
+                if (traces.Add(r.TraceId) && r.HttpPath.Length > 0) withPath++;
+            if (!NextCursor(p, cursor, fromNano, out cursor)) break;
+        }
+
+        Assert.Equal(500, traces.Count);   // every trace of the tier came back
+        Assert.Equal(500, withPath);       // and each row read its path out of its root's blob
+        int decoded = engine.HotSpansForTest.Count(s => !s.AttributesBytes.IsEmpty && (bool)decodedFlag!.GetValue(s)!);
+        Assert.Equal(0, decoded);
+    }
+
     private static SpanIngestItem At(SpanIngestItem s, long start) => new()
     {
         TraceId = s.TraceId, SpanId = s.SpanId, ParentSpanId = s.ParentSpanId, StartTimeUnixNano = start,

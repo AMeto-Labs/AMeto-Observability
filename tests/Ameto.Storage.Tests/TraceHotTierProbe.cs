@@ -101,13 +101,21 @@ public sealed class TraceHotTierProbe : IDisposable
     /// root span against 623. The retained figure says the same thing louder (1 888 against 498)
     /// but cannot be gated here; the comment on it says why.</para>
     ///
+    /// <para>SINCE #94 THIS GATE NO LONGER SEES THAT REVERT, and the guard has moved. The page now
+    /// reads the two attributes for the 100 rows it returns, not for all 2 000 roots, so a decode
+    /// put back there costs this page ~70 B per root span and passes; it still inflates the tier,
+    /// one page at a time, over a stream. <c>TraceHotTierWindowTests.A_stream_of_list_pages_leaves_no_decoded_attributes_on_the_tier</c>
+    /// reads the record's own memo flag after a stream has returned every trace, and fails on it.
+    /// The gate stays for what it still measures: the page's own allocation.</para>
+    ///
     /// <para>PAGE 2 IS PRINTED AND NOT ASSERTED, and it is the half of the trade that is a cost
     /// rather than a saving: the decode was memoised on the record and the blob walk is not, so a
     /// second page over the same tier pays the walk again. Release, this shape: 2,1 ms with no
     /// attributes at all, 3,0 ms through the memoised dictionary, 5,1 ms through the blob — ≈ 1 µs
     /// per root span of read-lock hold, per page, bought for 1 390 B per root span the tier no
-    /// longer keeps. Memoising the two strings on the record is the SSE hot-tier re-walk, which
-    /// the plan gives to WP9; the number is here so that decision has something to stand on.</para>
+    /// longer keeps. Memoising the two strings on the record was the SSE hot-tier re-walk's to
+    /// decide (WP9), and #94 went the other way: nothing is memoised, and the walk runs only for the
+    /// rows a page returns — 100 of the 2 000 root spans here — after the sort and the cut.</para>
     /// </summary>
     [Fact]
     public async Task A_trace_list_page_does_not_inflate_the_hot_tier_it_walks()

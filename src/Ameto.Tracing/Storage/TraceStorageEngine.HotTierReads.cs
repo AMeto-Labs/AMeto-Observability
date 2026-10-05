@@ -271,6 +271,47 @@ public sealed partial class TraceStorageEngine
         return true;
     }
 
+    // ── The trace list ────────────────────────────────────────────────────────────
+
+    /// <summary>Test seam: how many unflushed spans a trace-list page read, reported once per page.</summary>
+    internal Action<int>? _listHotVisitedForTest;
+
+    /// <summary>
+    /// Merges every span of one run that starts inside <c>[fromNano, toNano]</c>, in tier order —
+    /// skipping each block whose start range misses the window without reading one of its
+    /// records. Returns the spans it read.
+    ///
+    /// <para><b>EVERY IN-WINDOW SPAN, AND IN TIER ORDER, BECAUSE THE PAGE IS MADE OF BOTH.</b> A
+    /// row merges ALL of its trace's in-window spans (count, services, error, earliest), the first
+    /// root in tier order is the root, the first span at the earliest start names the service, and
+    /// the services are listed in the order they were met; the merge's size is also what the cold
+    /// walk's scan cap counts. So the list cannot stop early the way the TraceQL pass does — its
+    /// filters run after the merge and can reject any number of traces — and it may not reorder.
+    /// What it can skip is a block NOTHING of which is in the window: a page deep in a stream has
+    /// its ceiling far below the newest blocks, and those cost no record reads at all.</para>
+    /// </summary>
+    private static int MergeRunInto(Dictionary<TraceId, MergedTrace> merged, ReadOnlySpan<SpanRecord> run,
+                                    SpanStartView starts, long fromNano, long toNano)
+    {
+        if (!starts.IsIndexed)
+        {
+            foreach (var s in run)
+                if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+            return run.Length;
+        }
+
+        int read = 0;
+        for (int b = 0, from = 0; from < run.Length; b++, from += SpanStartIndex.BlockSize)
+        {
+            if (!starts.Overlaps(b, fromNano, toNano)) continue;
+            var block = run.Slice(from, Math.Min(SpanStartIndex.BlockSize, run.Length - from));
+            read += block.Length;
+            foreach (var s in block)
+                if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+        }
+        return read;
+    }
+
     /// <summary>
     /// Whether the blocks the walk stopped before hold a match the full walk would have turned
     /// away: any match that is not a copy of a span the heap kept. Nothing in them could have
