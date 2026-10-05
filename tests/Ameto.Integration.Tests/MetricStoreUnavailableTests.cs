@@ -256,6 +256,10 @@ public sealed class MetricStoreUnavailableTests
             Assert.Contains("could not load all of its data", body);
             Assert.Null(preview.Headers.RetryAfter);   // Degraded ends with a restart: nothing to retry
         }
+
+        // Where the state shows, since the queries answer normally.
+        var diagnostics = await client.GetFromJsonAsync<System.Text.Json.JsonElement>("/api/diagnostics");
+        Assert.Equal("degraded", diagnostics.GetProperty("metricsAvailability").GetString());
     }
 
     /// <summary>The host with <c>Ameto:Alerts:EvaluateOnDegradedStore</c> set as given — read by Program.cs, as in production.</summary>

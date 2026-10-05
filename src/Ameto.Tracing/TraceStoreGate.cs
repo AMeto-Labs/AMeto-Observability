@@ -17,7 +17,9 @@ namespace Ameto.Tracing;
 /// queries work from second zero and cold data joins the answers as soon as the scan completes
 /// (<c>TraceCompactionWorker</c>). A page shown for those seconds shows fewer rows, and the next
 /// refresh shows all of them; the alert evaluator, which ACTS on an answer, is the caller that must
-/// not take a part for the whole, and it skips a loading store itself.</para>
+/// not take a part for the whole, and it skips a loading store itself. Nor DEGRADED (#94): a store
+/// whose scan left segments unread answers from what it loaded, and the list and search reads
+/// already report such a window as unreadable; <c>GET /api/diagnostics</c> names the state.</para>
 ///
 /// <para><b>Where it is asked.</b> A buffered endpoint asks AFTER its read, just before it writes:
 /// availability only moves forward, so a read that met the closed door is always followed by a
