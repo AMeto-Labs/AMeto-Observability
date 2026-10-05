@@ -182,8 +182,8 @@ internal sealed class SpanPredicateEvaluator
     /// caller then hands that subtree to the AST as it is.
     ///
     /// <para>Recursive to the AST's own depth, and no deeper than its <c>Evaluate</c> already goes:
-    /// the parser bounds nesting at 64, and a flat chain of a few thousand terms is as deep here as
-    /// it is there.</para>
+    /// the parser bounds nesting at 64, and the longest flat chain its 8 KB cap admits — some 1 600
+    /// terms of <c>a=1||</c> — is as deep here as it is there.</para>
     /// </summary>
     private static Node? Compile(SpanPredicate p, ref List<byte[]>? keys, ref Dictionary<byte[], int>? slots)
     {

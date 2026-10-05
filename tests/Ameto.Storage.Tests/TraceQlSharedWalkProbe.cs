@@ -200,7 +200,7 @@ public sealed class TraceQlSharedWalkProbe : IClassFixture<ColdSpanSegmentFixtur
         var sharedPageMs = new double[PageRounds];
         var alonePageKb  = new double[PageRounds];
         var sharedPageKb = new double[PageRounds];
-        int rows = -1;
+        string[]? rows = null;
         for (int round = -1; round < PageRounds; round++)
         {
             bool sharedFirst = (round & 1) == 1;
@@ -217,8 +217,10 @@ public sealed class TraceQlSharedWalkProbe : IClassFixture<ColdSpanSegmentFixtur
                 long t1 = Stopwatch.GetTimestamp();
                 long a1 = GC.GetTotalAllocatedBytes(precise: true);
 
-                rows = rows < 0 ? page.Rows.Count : rows;
-                Assert.Equal(rows, page.Rows.Count);   // both evaluations select the same traces
+                // Both evaluations select the same traces, in the same order (read after the window).
+                string[] ids = [.. page.Rows.Select(static r => r.TraceId)];
+                rows ??= ids;
+                Assert.Equal(rows, ids);
                 if (round < 0) continue;
 
                 double ms = Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds;
@@ -229,7 +231,7 @@ public sealed class TraceQlSharedWalkProbe : IClassFixture<ColdSpanSegmentFixtur
         }
 
         return new Reading(
-            tier, label, rows, walksPerSpan, perPredicateWalks,
+            tier, label, rows!.Length, walksPerSpan, perPredicateWalks,
             Median(aloneNs), Median(sharedNs), aloneBytes, sharedBytes,
             Median(alonePageMs), Median(sharedPageMs), Median(alonePageKb), Median(sharedPageKb));
     }

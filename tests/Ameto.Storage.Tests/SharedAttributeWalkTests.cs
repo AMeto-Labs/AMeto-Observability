@@ -94,11 +94,12 @@ public sealed class SharedAttributeWalkTests : IDisposable
 
         // ONE POOL OF SPANS, asked of every filter in the same order, so each evaluator meets one
         // span after another exactly as a page does: what one span's walk found must never answer
-        // for the next one, and a span with no map must not disturb the state of the next one that
-        // has.
+        // for the next one, and a span with no map — every thirtieth is built from a dictionary, as
+        // fixtures and the legacy migration build them — must not disturb the state of the next one
+        // that has.
         var spans = new SpanRecord[Maps];
         for (int i = 0; i < spans.Length; i++)
-            spans[i] = RandomSpan(rnd, RandomMap(rnd));
+            spans[i] = RandomSpan(rnd, RandomMap(rnd), dictionary: i % 30 == 29);
 
         int compared = 0, unknown = 0, selected = 0, rejected = 0, wide = 0;
         for (int f = 0; f < Filters; f++)
@@ -195,6 +196,43 @@ public sealed class SharedAttributeWalkTests : IDisposable
         Assert.False(eval.Evaluate(lastOff));
         _out.WriteLine($"{predicates} keys = {batches} batches: {eval.WalksForTest} walks over {2 * Spans + 2} spans");
         Assert.Equal((2 * Spans + 2) * batches, eval.WalksForTest);
+    }
+
+    /// <summary>
+    /// THE DEEPEST FILTER THE PARSER ADMITS: a flat disjunction of one-letter keys, <c>a=1||b=1||…</c>,
+    /// as many terms as the 8 KB cap holds. The parser builds it iteratively but left-deep, so the
+    /// AST's own <c>Evaluate</c> recurses once per term, and so do the evaluator's compile and plan —
+    /// no deeper. Fifty-two distinct keys are seven walks where the per-predicate evaluation made one
+    /// walk per term.
+    /// </summary>
+    [Fact]
+    public void The_deepest_chain_the_parser_admits_compiles_and_answers_as_the_ast()
+    {
+        const string Letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        var sb    = new StringBuilder("{");
+        int terms = 0;
+        while (true)
+        {
+            string term = (terms == 0 ? "" : "||") + Letters[terms % Letters.Length] + "=1";
+            if (sb.Length + term.Length + 1 > TraceQLParser.MaxQueryChars) break;
+            sb.Append(term);
+            terms++;
+        }
+        var pred    = TraceQLParser.Parse(sb.Append('}').ToString());
+        int batches = (Letters.Length + SpanAttributeBlob.MaxKeyAlternatives - 1) / SpanAttributeBlob.MaxKeyAlternatives;
+
+        var lastLetter = WithMap(Map(("Z", 1L)));        // true at the 52nd term: every batch walked
+        var noLetter   = WithMap(Map(("other", 1L)));    // unknown at every term: the whole chain
+
+        var eval = new SpanPredicateEvaluator(pred);
+        Assert.True(pred.Evaluate(lastLetter));
+        Assert.True(eval.Evaluate(lastLetter));
+        Assert.Null(pred.Evaluate(noLetter));
+        Assert.Null(eval.Evaluate(noLetter));
+
+        _out.WriteLine($"{terms} terms, {Letters.Length} keys: {eval.WalksForTest} walks for two spans");
+        Assert.True(terms > 1_500, $"only {terms} terms fit the cap");
+        Assert.Equal(2 * batches, eval.WalksForTest);
     }
 
     /// <summary>
@@ -409,18 +447,25 @@ public sealed class SharedAttributeWalkTests : IDisposable
     private static string KeyText(Random rnd, string key) =>
         BareWordKeys.Contains(key) && rnd.Next(4) == 0 ? key : "." + key;
 
-    private static SpanRecord RandomSpan(Random rnd, byte[] blob) => new()
-    {
-        TraceId           = new TraceId(1, 2),
-        SpanId            = new SpanId(3),
-        Name              = rnd.Next(2) == 0 ? "SELECT payments" : "GET /orders",
-        ServiceName       = rnd.Next(2) == 0 ? "billing" : "gateway",
-        Kind              = (SpanKind)rnd.Next(6),
-        Status            = (SpanStatusCode)rnd.Next(3),
-        DurationNanos     = rnd.Next(3) switch { 0 => 1_000_000L, 1 => 5_000_000L, _ => 2_000_000_000L },
-        HttpStatusCode    = (short)(rnd.Next(3) switch { 0 => 0, 1 => 200, _ => 503 }),
-        AttributesBytes   = blob,
-    };
+    /// <summary>A span carrying <paramref name="blob"/> — or, with <paramref name="dictionary"/>, its decode and no blob.</summary>
+    private static SpanRecord RandomSpan(Random rnd, byte[] blob, bool dictionary) => dictionary
+        ? new SpanRecord
+        {
+            TraceId = new TraceId(1, 2), SpanId = new SpanId(3), Name = "SELECT payments", ServiceName = "billing",
+            DurationNanos = 2_000_000_000L, Attributes = SpanAttributeBlob.Decode(blob),
+        }
+        : new SpanRecord
+        {
+            TraceId           = new TraceId(1, 2),
+            SpanId            = new SpanId(3),
+            Name              = rnd.Next(2) == 0 ? "SELECT payments" : "GET /orders",
+            ServiceName       = rnd.Next(2) == 0 ? "billing" : "gateway",
+            Kind              = (SpanKind)rnd.Next(6),
+            Status            = (SpanStatusCode)rnd.Next(3),
+            DurationNanos     = rnd.Next(3) switch { 0 => 1_000_000L, 1 => 5_000_000L, _ => 2_000_000_000L },
+            HttpStatusCode    = (short)(rnd.Next(3) switch { 0 => 0, 1 => 200, _ => 503 }),
+            AttributesBytes   = blob,
+        };
 
     /// <summary>
     /// A map the way the OTLP mappers write one — and the ways they do not: a header that lies about
