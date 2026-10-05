@@ -56,7 +56,9 @@ internal static class MetricReader
 
         // Name index: nameCount uint32 | nameLen uint16 | name bytes.
         Span<byte> nameHead = stackalloc byte[6];
-        if (nameIdxOffset < 0) throw new IOException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
+        // A claim about the BYTES, so the exception that says so (#108): the startup scan deletes a
+        // file this throws on, and keeps one that throws any other IOException as merely unreachable.
+        if (nameIdxOffset < 0) throw new InvalidDataException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
         if (ReadAt(handle, nameHead, nameIdxOffset) < 6) throw new EndOfStreamException();
         ushort  nameLen = BinaryPrimitives.ReadUInt16LittleEndian(nameHead[4..]);   // 16 bits: the type is the bound
         byte[]? rented  = nameLen > 256 ? ArrayPool<byte>.Shared.Rent(nameLen) : null;
