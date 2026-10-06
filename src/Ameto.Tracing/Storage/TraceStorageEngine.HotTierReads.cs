@@ -150,9 +150,13 @@ public sealed partial class TraceStorageEngine
     /// moved.</para>
     ///
     /// <para><b>THE SAME SPANS AS THE HEAP THAT WALKED THE TIER IN ORDER</b> whenever no two kept
-    /// spans share a start nanosecond — <c>TraceHotTierWindowTests</c> pins it against that heap,
-    /// verbatim. At a tie the order is now <see cref="HotKey"/>'s, which is total; the old one was
-    /// whatever the heap's layout made of the arrival sequence.</para>
+    /// spans share a start nanosecond and no span id is reused with a different start —
+    /// <c>TraceHotTierWindowTests</c> pins it against that heap, verbatim. At a tie the order is now
+    /// <see cref="HotKey"/>'s, which is total; the old one was whatever the heap's layout made of
+    /// the arrival sequence. Of two spans with one id and different starts (a malformed producer;
+    /// a true re-send carries its original's start), the page shows the copy the walk meets first —
+    /// the one in the block with the larger largest start: usually, not always, the newer. If that
+    /// copy is later pushed out of the heap, neither is shown, as with the old heap.</para>
     /// </summary>
     private List<SpanRecord> SelectHotMatches(in SpanMatch match, int limit, out bool evicted)
     {

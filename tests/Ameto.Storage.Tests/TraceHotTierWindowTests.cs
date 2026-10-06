@@ -515,7 +515,9 @@ public sealed class TraceHotTierWindowTests : IDisposable
     /// early stop's search for "one more match" has to keep. The id is reused with an OLDER start (a
     /// malformed producer; a true re-send carries its original's start and can never lie below the
     /// cut). Which copy a page shows is where the bounded walk and the tier-order heap part: the heap
-    /// showed whichever ARRIVED first, the walk shows the one it meets first — the newer.
+    /// showed whichever ARRIVED first, the walk shows the one it meets first — the copy in the block
+    /// with the larger largest start, usually but not always the newer. Here it is the newer: the two
+    /// blocks arrive in start order and no span runs ahead.
     /// </summary>
     [Fact]
     public void A_span_id_reused_below_the_cut_is_a_copy_not_a_match_turned_away()
