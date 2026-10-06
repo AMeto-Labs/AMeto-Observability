@@ -443,6 +443,98 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// A SELECTIVE TRACEQL PAGE PAYS FOR WHAT IT FINDS, NOT FOR ITS LIMIT (#122 review L2). The page
+    /// asks for 2 000 spans; how many it finds is the query's business. The heap and its id set used
+    /// to jump, at 256 entries, to the page's LIMIT — capped only by the spans in the window, not by
+    /// its matches — so a page ending near 300 matches paid for 2 000: 185 KB against main's 76.
+    ///
+    /// <para>The shapes are the review's: a 20 000-span hot tier whose durations cycle through
+    /// 1..2 000 ms, so a duration floor of (2 001 − k) ms matches k spans in every 2 000, spread
+    /// evenly through the window. Each is the smallest of the last five of six pages, on this
+    /// thread, over a page that completes synchronously (asserted). The bounds are main's
+    /// allocation for the same page (Debug: 31.6, 75.6, 158.7, 297.7 and 622.3 KB) rounded up, but
+    /// the all-match page's, which is this change's own 268 KB plus margin: that is the page every
+    /// attribute query is in the hot pass, where nothing narrows the walk but the window.</para>
+    ///
+    /// <para>AND THE SHAPE THE SIZING GETS WRONG, printed and held to its one promise: a burst of
+    /// matches at the top of the window (errors in the newest 300 or 600 spans) looks, 256 matches
+    /// in, like a page about to fill its limit, and is sized for it — never for more than a full
+    /// page. See <c>NextHeapCapacity</c> for why no rule decided at that point can tell the two
+    /// apart, and what the alternative costs.</para>
+    /// </summary>
+    [Fact]
+    public void A_selective_TraceQL_page_pays_for_what_it_finds_not_for_its_limit()
+    {
+        using var engine = NewEngine("spread");
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000)]);
+
+        (string Shape, long? MinDuration, int Matches, long BoundBytes)[] shapes =
+        [
+            ("~100",   1_991_000_000L,    100,  40 * 1024),
+            ("~300",   1_971_000_000L,    300,  90 * 1024),
+            ("~600",   1_941_000_000L,    600, 160 * 1024),
+            ("~1 000", 1_901_000_000L,  1_000, 300 * 1024),
+            ("all",    null,            2_000, 300 * 1024),
+        ];
+
+        var failures = new List<string>();
+        foreach (var (shape, minDuration, matches, bound) in shapes)
+            Gate(engine, shape, minDuration, status: null, matches, bound, failures);
+
+        foreach (int burst in (int[])[300, 600])
+        {
+            using var bursty = NewEngine($"burst-{burst}");
+            var items = TraceAggregateLockProbe.Corpus(0, 20_000);
+            for (int i = items.Length - burst; i < items.Length; i++) items[i] = Status(items[i], SpanStatusCode.Error);
+            Write(bursty, [.. items]);
+            Gate(bursty, $"burst {burst}", null, SpanStatusCode.Error, burst, 300 * 1024, failures);
+        }
+
+        Assert.True(failures.Count == 0,
+            "a TraceQL page allocated more than it should for the matches it found — "
+            + string.Join("; ", failures));
+    }
+
+    /// <summary>The smallest allocation of the last five of six identical pages, against <paramref name="bound"/>.</summary>
+    private void Gate(TraceStorageEngine engine, string shape, long? minDuration, SpanStatusCode? status,
+                      int matches, long bound, List<string> failures)
+    {
+        long best = long.MaxValue;
+        for (int round = 0; round < 6; round++)
+        {
+            long a0    = GC.GetAllocatedBytesForCurrentThread();
+            var (n, sync) = SearchSynchronously(engine, minDuration, status, limit: 2_000);
+            long bytes = GC.GetAllocatedBytesForCurrentThread() - a0;
+            Assert.True(sync, $"{shape}: the hot-only page yielded, so this thread saw only part of it");
+            Assert.Equal(matches, n);
+            if (round > 0) best = Math.Min(best, bytes);   // the first round is the warm-up
+        }
+        _out.WriteLine($"{shape,-9} {matches,5:N0} matches  {best / 1024.0,7:N1} KB  (bound {bound / 1024:N0} KB)");
+        if (best > bound) failures.Add($"{shape}: {best / 1024.0:N1} KB > {bound / 1024:N0} KB");
+    }
+
+    /// <summary>SearchSpansAsync driven by hand: how many spans came back, and whether every step completed synchronously.</summary>
+    private static (int Spans, bool Sync) SearchSynchronously(TraceStorageEngine engine, long? minDuration,
+                                                              SpanStatusCode? status, int limit)
+    {
+        int  n    = 0;
+        bool sync = true;
+        var  e    = engine.SearchSpansAsync(From, To, status: status, minDurationNanos: minDuration, limit: limit)
+                          .GetAsyncEnumerator();
+        while (true)
+        {
+            var step = e.MoveNextAsync();
+            sync &= step.IsCompleted;
+            if (!(step.IsCompleted ? step.Result : step.AsTask().GetAwaiter().GetResult())) break;
+            n++;
+        }
+        var done = e.DisposeAsync();
+        sync &= done.IsCompleted;
+        if (!done.IsCompleted) done.AsTask().GetAwaiter().GetResult();
+        return (n, sync);
+    }
+
+    /// <summary>
     /// A LIST PAGE DEEP IN ITS WINDOW READS ONLY THE BLOCKS THAT REACH IT. 20 000 spans, one a
     /// millisecond: a page whose ceiling is five seconds in reads the five thousand spans below it and
     /// the one block that straddles it — the blocks above are never opened. (It may not stop any

@@ -159,18 +159,18 @@ public sealed partial class TraceStorageEngine
               : a.Run != b.Run ? b.Run.CompareTo(a.Run)
               :                  b.From.CompareTo(a.From));
 
-            // SIZED ONCE THE ANSWER IS PLAINLY BIG. Grown one doubling at a time, the id set of a
-            // 2 000-span page ends at 2 729 entries — 87 KB, one array over the large-object
-            // threshold, every page; the heap re-copies itself nine times on the way. Neither may
-            // be sized up front: a selective query with three matches would pay for 2 000. So they
-            // grow until a page has shown it is filling them, then jump to what it can still need.
+            // SIZED FOR WHAT THE PAGE FINDS, AHEAD OF IT — see NextHeapCapacity. The heap and its id
+            // set grow together, before the heap is full, to sizes this method chooses: left to
+            // themselves, the id set of a 2 000-span page ends at 2 729 entries — 87 KB, one array
+            // over the large-object threshold, every page — and the heap re-copies itself nine
+            // times on the way. `candidates` is the window's span count, an upper bound on matches.
             int candidates = 0;
             for (int k = 0; k < n; k++) candidates += blocks[k].To - blocks[k].From;
             int finalSize = Math.Min(limit, candidates);
 
-            var top     = new PriorityQueue<SpanRecord, HotKey>();
-            var present = new HashSet<(TraceId Trace, ulong Span)>();
-            bool sized  = false;
+            var top      = new PriorityQueue<SpanRecord, HotKey>();
+            var present  = new HashSet<(TraceId Trace, ulong Span)>();
+            int sizedFor = 0;
             evicted = false;
             visited = 0;
 
@@ -190,13 +190,13 @@ public sealed partial class TraceStorageEngine
                     var s = run[i];
                     visited++;
                     if (!match.Matches(s)) continue;
-                    evicted |= AdmitHot(top, present, s, new HotKey(s.StartTimeUnixNano, position + i), limit);
-                    if (!sized && top.Count == SizeHeapAt && finalSize > SizeHeapAt)
+                    if (top.Count == sizedFor && sizedFor < finalSize)
                     {
-                        top.EnsureCapacity(finalSize);
-                        present.EnsureCapacity(finalSize);
-                        sized = true;
+                        sizedFor = NextHeapCapacity(sizedFor, visited, candidates, finalSize);
+                        top.EnsureCapacity(sizedFor);
+                        present.EnsureCapacity(sizedFor + 1);   // + the copy AdmitHot adds before it decides
                     }
+                    evicted |= AdmitHot(top, present, s, new HotKey(s.StartTimeUnixNano, position + i), limit);
                 }
             }
 
@@ -215,8 +215,41 @@ public sealed partial class TraceStorageEngine
         }
     }
 
-    /// <summary>The heap size at which a hot pass stops doubling and sizes for its whole answer.</summary>
+    /// <summary>The heap size at which a hot pass stops doubling and sizes by its match rate.</summary>
     private const int SizeHeapAt = 256;
+
+    /// <summary>
+    /// What a full heap of <paramref name="capacity"/> grows to — never past <paramref name="finalSize"/>
+    /// (the page's limit, or the window's span count when that is smaller).
+    ///
+    /// <para><b>BY THE PAGE'S OWN MATCH RATE, ONCE IT HAS ONE</b> (#122 review L2). Below
+    /// <see cref="SizeHeapAt"/> the heap doubles. Its first time full at that size, the rate it
+    /// has matched at so far — <paramref name="capacity"/> matches in <paramref name="visited"/>
+    /// spans — is extrapolated over the window's <paramref name="candidates"/>, plus a quarter;
+    /// if that proves short, it doubles again. This used to jump straight to the limit, and a page
+    /// ending near 300 matches paid for 2 000: 185 KB, against main's 76.</para>
+    ///
+    /// <para><b>WHY NOT DOUBLING ALL THE WAY</b>, which never pays for more than twice what a page
+    /// finds: the page that fills its limit pays for every step instead — 354 KB against 259 — and
+    /// that is the page every attribute or OR query is in this pass, where nothing narrows the
+    /// walk but the window. Measured (Debug, 20 000 spans, a page of 2 000; KB): matches spread
+    /// through the window, ~300 / ~600 / ~1 000 / all — main 76 / 159 / 298 / 622, doubling
+    /// 78 / 153 / 173 / 354, this 75 / 111 / 172 / 259.</para>
+    ///
+    /// <para><b>WHAT IT GETS WRONG, AND HOW BADLY:</b> a page whose matches crowd the top of its
+    /// window. The walk reads newest first, so the burst looks, 256 matches in, exactly like a page
+    /// about to fill its limit, and it is sized for the limit — 176 / 189 / 208 KB for bursts of
+    /// 300 / 600 / 1 000, which doubling keeps to 78 / 153 / 173 and main's heap paid about as for
+    /// the spread-out shapes. Never more than a full page, and the cost the jump to the limit put on
+    /// every selective page; no rule decided at 256 matches can tell the two apart.</para>
+    /// </summary>
+    private static int NextHeapCapacity(int capacity, int visited, int candidates, int finalSize)
+    {
+        long next = capacity < SizeHeapAt  ? Math.Max(16L, 2L * capacity)
+                  : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * candidates / Math.Max(1, visited) * 5 / 4)
+                  :                          2L * capacity;
+        return (int)Math.Min(finalSize, next);
+    }
 
     /// <summary>Blocks a run contributes at most: its index's, or one for a run read unindexed.</summary>
     private static int BlockCount(int spans, SpanStartView starts) =>
