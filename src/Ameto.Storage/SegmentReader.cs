@@ -34,6 +34,25 @@ public sealed class SegmentReader : ISegmentReader
     /// <summary>Group-directory entry size on disk — one definition, shared with the writer.</summary>
     private const int GroupEntrySize = SegmentWriter.GroupEntrySize;
 
+    /// <summary>The fixed header (magic … min level) every supported version starts with, and the footer every one ends with.</summary>
+    private const int HeaderSize = 39, FooterSize = 44;
+
+    /// <summary>
+    /// An offset the file's own bytes give, checked before anything is read AT it (#119 review F1):
+    /// outside [<paramref name="min"/>, <paramref name="max"/>] it is a torn word, and named as the bytes
+    /// it is. Unchecked, a position inside the view's last few bytes failed
+    /// <c>UnmanagedMemoryAccessor.Read</c> with a plain <see cref="ArgumentException"/> ("not enough
+    /// bytes remaining") — which says nothing about the file to a classifier, so the catalog scan kept
+    /// the torn segment as unreachable, the store Degraded, at every start, instead of setting it aside
+    /// once. One comparison; nothing allocated unless it throws.
+    /// </summary>
+    private static void RequireOffsetWithin(long offset, long min, long max, string what, string filePath)
+    {
+        if (offset < min || offset > max)
+            throw new InvalidDataException(
+                $"{what} offset {offset} in {filePath} is outside [{min}, {max}] — a torn or foreign segment");
+    }
+
     private readonly long _blockIndexOffset;
 
     /// <summary>
@@ -175,8 +194,7 @@ public sealed class SegmentReader : ISegmentReader
         _fileSize = fileSize;
         LastWriteTicks = lastWriteTicks;
 
-        const int footerSize = 44;
-        long footerStart = fileSize - footerSize;
+        long footerStart = fileSize - FooterSize;
 
         // The footer is parsed BEFORE the header, so its five int64 slots are read raw and
         // only interpreted once the version is known. v7 reuses slot 0 for the group
@@ -203,6 +221,8 @@ public sealed class SegmentReader : ISegmentReader
         if (version is < MinSupportedVersion or > MaxSupportedVersion)
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
+        // The index lies between the header and the footer, and its count is read AT it.
+        RequireOffsetWithin(_blockIndexOffset, HeaderSize, footerStart - 4, "Block index", filePath);
         int blockCount = ReadInt32At(_blockIndexOffset);
         // Events live only in blocks, so a segment whose header counts events and whose index lists
         // no block has lost its index page (#119 review F3): it opened "whole", served none of its
@@ -235,6 +255,9 @@ public sealed class SegmentReader : ISegmentReader
             {
                 var entry   = raw.Slice(i * stride, stride);
                 long offset = BinaryPrimitives.ReadInt64LittleEndian(entry);
+                // Checked once, here, for every read of the block's frame that follows: the walk
+                // below and every block read reads 8 frame bytes AT this offset.
+                RequireOffsetWithin(offset, 0, fileSize - 8, "Block", filePath);
                 // v6 stores the block's min timestamp in the slot v4/v5 spent on
                 // FirstEventId (written, never read). Older files have no zone map.
                 long blockMinTs = version >= 6
@@ -302,6 +325,7 @@ public sealed class SegmentReader : ISegmentReader
     {
         if (directoryOffset <= 0)
             throw new InvalidDataException($"v7 segment {filePath} has no group directory");
+        RequireOffsetWithin(directoryOffset, 1, _fileSize - FooterSize - 4, "Group directory", filePath);
 
         int count = ReadInt32At(directoryOffset);
         if (count <= 0) return [];

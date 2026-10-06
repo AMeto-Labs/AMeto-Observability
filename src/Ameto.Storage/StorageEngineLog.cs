@@ -19,7 +19,8 @@ internal static partial class StorageEngineLog
                 + "its contents: it is left where it is — not set aside as .corrupt — and is read at the next start. Until "
                 + "then its events are not served: the log store reports itself Degraded, and log ALERT RULES are not "
                 + "evaluated on the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). Restart once "
-                + "whatever holds the file has let go of it")]
+                + "whatever holds the file has let go of it; if a restart names the same file again, the failure is not "
+                + "transient — check the file's permissions and its volume, or move it aside")]
     internal static partial void CatalogSegmentUnreachable(ILogger logger, Exception exception, string file);
 
     /// <summary>

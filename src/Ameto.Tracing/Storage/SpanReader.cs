@@ -1677,6 +1677,13 @@ internal static class SpanReader
         FileStream fs, BinaryReader br, ushort version)
     {
         int size = version >= 3 ? 28 : 20;
+        // A file too short to hold the 26-byte header AND this footer is torn bytes, and is named so
+        // (#119 review F1): the seek below threw IOException on it ("the parameter is incorrect"),
+        // which no classifier counts as content — the cold scan retried it and left the trace store
+        // Degraded at every start over a file no restart can read.
+        if (fs.Length < 26 + size)
+            throw new InvalidDataException(
+                $".trc {fs.Name} is {fs.Length} bytes — too short for its header and a {size}-byte footer; a torn file");
         fs.Seek(-size, SeekOrigin.End);
         long traceIdx = (long)br.ReadUInt64();
         long svcIdx   = (long)br.ReadUInt64();

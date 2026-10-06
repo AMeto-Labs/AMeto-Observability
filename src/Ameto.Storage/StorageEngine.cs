@@ -4269,7 +4269,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // it would be the case the comment above refuses: a probe a failing mount answers
                 // "not there" for a live segment. Quarantine stays for what the BYTES say
                 // (FileBounds.DescribesContent): a torn frame, a file too short for a footer, a torn
-                // merge output (#98) — the reader names every one of those as content.
+                // merge output (#98) — the reader names every one of those as content, an offset or
+                // a count the file cannot hold included (SegmentReader.RequireOffsetWithin,
+                // RequireCountFits): a tear that surfaced as an ArgumentException or an
+                // OutOfMemoryException would be kept here, the store Degraded, at every start.
                 if (!FileBounds.DescribesContent(ex))
                 {
                     Volatile.Write(ref _catalogScanShort, 1);   // before the scan's task completes

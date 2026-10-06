@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using Microsoft.Extensions.Logging;
@@ -176,6 +177,37 @@ public sealed class TraceColdScanFailureLogTests : IDisposable
         Assert.IsType<DirectoryNotFoundException>(error.Error);
         Assert.Contains(trc, error.Message, StringComparison.Ordinal);
         Assert.True(File.Exists(trc));
+    }
+
+    /// <summary>
+    /// A .TRC TOO SHORT FOR ITS FOOTER IS DAMAGE (#119 review F1). A 26-byte v3 file holds a header and
+    /// nothing else; the reader's seek to the footer threw IOException, which the scan took for a busy
+    /// file — retried, then the store Degraded, at every start, over bytes no restart reads. It is an
+    /// InvalidDataException now, and takes the damage path: the header is readable, so the window is
+    /// recorded and the file deleted; the store is Available and not short.
+    /// </summary>
+    [Fact]
+    public void A_trc_too_short_for_its_footer_is_damage_not_a_busy_file()
+    {
+        string trc = Path.Combine(_dir, "spans-torn.trc");
+        var bytes  = new byte[26];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, 0x52_44_54_43);        // "RDTC"
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(4), 3);           // a version this build reads
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(6), 1);           // span count
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(10), 1);           // min start
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(18), 2);           // max start
+        File.WriteAllBytes(trc, bytes);
+
+        Assert.Throws<InvalidDataException>(() => SpanReader.ReadSegmentInfo(trc));
+
+        var logger  = new CapturingLogger();
+        using var e = new TraceStorageEngine(_dir, logger);
+        e.LoadColdSegments();
+
+        Assert.False(File.Exists(trc), "a torn .trc was kept as a busy file");
+        Assert.Equal(QueryAvailability.Available, e.Availability);
+        Assert.False(e.ColdTierIncompleteForTest);
+        Assert.DoesNotContain(logger.Entries, static x => x.Level == LogLevel.Error);
     }
 
     /// <summary>One segment of one span, written and flushed by an engine that is then closed; its path.</summary>

@@ -3089,7 +3089,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                   + "but it is missing from this run's cold tier, so every trace query will report an "
                   + "unreadable region on the list and span-search paths until the service is restarted, "
                   + "and the trace store reports itself Degraded: trace alert rules are not evaluated on "
-                  + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set)", file);
+                  + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). If a restart names "
+                  + "the same file again, the failure is not transient — check the file's permissions and its "
+                  + "volume, or move it aside", file);
                 continue;
             }
             catch (Exception ex)

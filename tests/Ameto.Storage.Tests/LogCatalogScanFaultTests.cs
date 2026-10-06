@@ -227,6 +227,39 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         Assert.Equal(QueryAvailability.Available, engine.Availability);
     }
 
+    /// <summary>
+    /// AN OFFSET TORN INTO THE FILE'S LAST BYTES IS DAMAGE (#119 review F1). The reader read its count
+    /// or frame AT the offset, and a position inside the view's last few bytes failed with a plain
+    /// ArgumentException, which no content classifier counts: the scan kept the segment as
+    /// unreachable, and the store was Degraded at every start, its alert rules skipped for good. Each
+    /// offset the bytes give is checked first now: InvalidDataException, set aside once, Available.
+    /// A torn BLOCK offset did not even fail the open — only a read of that block, later.
+    /// </summary>
+    [Theory]
+    [InlineData("block index offset")]
+    [InlineData("group directory offset")]
+    [InlineData("block offset")]
+    public async Task An_offset_torn_into_the_last_bytes_is_damage_and_the_segment_set_aside(string which)
+    {
+        var segs = await WriteSegmentsAsync(1);
+        string seg  = segs[0];
+        long length = new FileInfo(seg).Length;
+        long slot   = which switch
+        {
+            "block index offset"     => length - 44 + BlockIndexSlot,
+            "group directory offset" => length - 44 + GroupDirectorySlot,
+            _                        => FooterSlot(seg, BlockIndexSlot) + 4,   // the first block's entry
+        };
+        WriteInt64At(seg, slot, length - 2);
+
+        Assert.Throws<InvalidDataException>(() => SegmentReader.Open(seg));
+
+        await using var engine = await StartAsync(new Entries(), e => e._catalogScanWaitForTest = static _ => { });
+
+        Assert.True(File.Exists(seg + ".corrupt"), $"{which}: the torn segment was kept as unreachable");
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────────────────────
 
     /// <summary>Footer slot offsets (the footer is a file's last 44 bytes): the v7 group directory, and the block index.</summary>

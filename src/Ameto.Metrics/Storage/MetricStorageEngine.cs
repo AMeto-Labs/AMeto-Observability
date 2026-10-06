@@ -3097,7 +3097,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 + "not its contents: it is left on disk, not deleted, and is read at the next start. Until then its points "
                 + "are not served: the metric store reports itself Degraded, and metric ALERT RULES are not evaluated on "
                 + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). Restart once whatever holds the "
-                + "file has let go of it")]
+                + "file has let go of it; if a restart names the same file again, the failure is not transient — check "
+                + "the file's permissions and its volume, or move it aside")]
     private static partial void LogColdSegmentUnreachable(ILogger logger, Exception exception, string file, int attempts);
 
     /// <summary>
