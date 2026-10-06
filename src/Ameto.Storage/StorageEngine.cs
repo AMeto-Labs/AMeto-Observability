@@ -5246,7 +5246,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             }
         }
 
-        live.Wal?.Dispose();
+        // The live log goes with the tiers if nothing was ever appended to it: the successor the final
+        // flush opened, or the boot log of a run that took no event. Kept, it was a preallocated
+        // 64 MB file in wal/ after every clean stop. The next start of the same format deletes it
+        // unread anyway. After a rollback, a release that keeps what it cannot read (this one does,
+        // see ReplayOrphanedWal) could only keep it and report it. Decided under the log's append lock,
+        // in the step that disposes it: an event a write got into the log after the final flush keeps
+        // the log — that log is the event's only copy, replayed at the next start — and a write
+        // arriving later finds the log disposed, as it always did.
+        live.Wal?.DisposeDeletingIfEmpty();
 
         // The three semaphores are deliberately NOT disposed. A SemaphoreSlim holds nothing to
         // release unless its wait handle was asked for, and disposing one turns a late

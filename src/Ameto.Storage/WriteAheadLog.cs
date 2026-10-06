@@ -774,16 +774,30 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     private bool _disposed;
 
-    public void Dispose()
+    public void Dispose() => DisposeCore(deleteIfEmpty: false);
+
+    /// <summary>
+    /// <see cref="Dispose"/>, and then deletes the log and its pool if nothing was ever appended to
+    /// it. Decided under the append lock in the same step that marks the log disposed, so there is
+    /// no window between the two: an append either reached the log, which is then kept, or arrives
+    /// after and throws, exactly as it would after <see cref="Dispose"/>. For the engine's clean
+    /// stop (see its DisposeCoreAsync).
+    /// </summary>
+    /// <returns>True when the log was empty and its file is gone.</returns>
+    public bool DisposeDeletingIfEmpty() => DisposeCore(deleteIfEmpty: true);
+
+    private bool DisposeCore(bool deleteIfEmpty)
     {
+        bool delete;
         // Under _writeLock: rotation disposes the old WAL from the flush thread while a
         // writer that captured it just before the swap may still be inside Append. The
         // lock makes dispose wait that append out; the _disposed flag makes any later
         // append throw instead of dereferencing the released mapping.
         lock (_writeLock)
         {
-            if (_disposed) return;
+            if (_disposed) return false;
             _disposed = true;
+            delete    = deleteIfEmpty && _writeOffset == 0;
             Unmap(); // the view flushes dirty pages on dispose
             try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
             try { _fileStream?.Dispose(); } catch { }
@@ -796,6 +810,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             try { _poolStream?.Flush(flushToDisk: true); _poolStream?.Dispose(); } catch { }
             _poolStream = null;
         }
+        if (!delete) return false;
+
+        // A file that will not go (a scanner holding it, on Windows) is left for the next start,
+        // which finds an empty log and deletes it; its pool then goes with it, so it stays too.
+        try { File.Delete(_filePath); }
+        catch { return false; }
+        try { File.Delete(PoolPath); } catch { /* rows with no entry to name: harmless */ }
+        return true;
     }
 
     public void Delete()
@@ -843,10 +865,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// and only it can read it.
     /// </param>
     /// <param name="headerRecordsEntries">
-    /// False only when the header's WriteOffset is exactly where the first entry would begin: the
-    /// log every clean stop leaves, which no version so far has written anything past. Read before
-    /// the version is looked at, so a later release's file can be told empty too; any other value
-    /// says "may hold entries", which is also what a later format that moved the field would read as.
+    /// False only when the header's WriteOffset is exactly where the first entry would begin, as in
+    /// a log nothing was appended to — what every clean stop before this release left behind, and
+    /// what a later release's may. No version so far writes any other value there for an empty log.
+    /// Read before the version is looked at, so a later release's file can be told empty too; any
+    /// other value says "may hold entries", which is also what a later format that moved the field
+    /// would read as.
     /// </param>
     public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(
         string walPath, out ushort version, out bool headerRecordsEntries)
