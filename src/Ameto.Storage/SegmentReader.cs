@@ -204,8 +204,6 @@ public sealed class SegmentReader : ISegmentReader
         long slot2           = ReadInt64At(footerStart + 16);
         _blockIndexOffset    = ReadInt64At(footerStart + 24);
         uint footerMagic     = (uint)ReadInt32At(footerStart + 40);
-        if (footerMagic != MagicFooter)
-            throw new InvalidDataException($"Segment footer magic mismatch in {filePath}");
 
         uint   magic    = (uint)ReadInt32At(0);
         ushort version  = (ushort)ReadInt16At(4);
@@ -221,11 +219,15 @@ public sealed class SegmentReader : ISegmentReader
         // The FUTURE is not damage (#119 review F2): a version above the newest this build reads is a
         // rollback's file, which a build that knows the format reads whole. Its own exception, so the
         // catalog scan keeps it under its name where it sets torn bytes aside as .seg.corrupt — and
-        // before any offset below is trusted, since a newer layout may put them elsewhere.
+        // before the footer's magic or any offset is trusted, since a newer layout may change the
+        // footer: what a future format has to keep for this to know it is the header's magic and a
+        // higher version, the contract the metric and span readers already hold to.
         if (version > MaxSupportedVersion)
             throw new NewerSegmentFormatException(filePath, version);
         if (version < MinSupportedVersion)
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
+        if (footerMagic != MagicFooter)
+            throw new InvalidDataException($"Segment footer magic mismatch in {filePath}");
 
         // The index lies between the header and the footer, and its count is read AT it.
         RequireOffsetWithin(_blockIndexOffset, HeaderSize, footerStart - 4, "Block index", filePath);

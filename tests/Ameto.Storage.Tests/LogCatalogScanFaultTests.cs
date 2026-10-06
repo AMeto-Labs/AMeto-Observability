@@ -335,6 +335,30 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         Assert.Contains($"format v{v}", error.Message);
     }
 
+    /// <summary>
+    /// THE FUTURE IS RECOGNISED BY ITS HEADER (#119 review F2). A newer build may change the footer,
+    /// and the reader checked the footer's magic before the header's version: a v8 file with another
+    /// footer was refused as torn bytes and set aside. The version is judged first now — the header's
+    /// magic and a higher version are all a future format has to keep, as for metrics and spans.
+    /// </summary>
+    [Fact]
+    public async Task A_newer_segment_with_a_different_footer_is_still_recognised_as_newer()
+    {
+        var segs = await WriteSegmentsAsync(1);
+        string future = segs[0];
+        WriteUInt16At(future, 4, (ushort)(SegmentReader.MaxSupportedVersion + 1));
+        WriteInt32At(future, new FileInfo(future).Length - 4, 0x0BAD_F00D);   // the footer magic, as a newer layout may hold it
+
+        Assert.Throws<NewerSegmentFormatException>(() => SegmentReader.Open(future));
+
+        await using var engine = await StartAsync(new Entries(), e =>
+            e._catalogScanWaitForTest = static _ => throw new InvalidOperationException("a newer format is not retried"));
+
+        Assert.True(File.Exists(future));
+        Assert.False(File.Exists(future + ".corrupt"), "a newer segment with another footer was set aside as torn");
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────────────────────
 
     private static void WriteUInt16At(string path, long at, ushort value)
