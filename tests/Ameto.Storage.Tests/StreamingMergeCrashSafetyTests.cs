@@ -1144,6 +1144,87 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The output of a merge whose manifest waits for a held source is not merged again. Recovery
+    /// decides a manifest on its output alone, so an output the planner merged a second time read
+    /// as a merge that never committed: the next pass dropped its manifest while the held source
+    /// was still on disk, and the next start served that source beside the new output — 540 events
+    /// for 480. Sealed bucket, so the planner takes pairs.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputMergedAgainWhileASourceIsHeld_KeepsTheEventsOnceAcrossARestart()
+    {
+        await _engine.CatalogLoaded;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        for (int round = 0; round < 4; round++)
+            await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
+        var held = _engine.ListSegments().Select(s => s.FilePath).Order(StringComparer.Ordinal).First();
+        _engine._deleteSegmentFile = UnlinkRefusing(held);            // a scanner or backup agent holds one source
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: merge 1");
+        Assert.Single(_engine.ListSegments());
+        Assert.Single(Manifests());
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+
+        for (int round = 4; round < 8; round++)
+            await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
+        var before = ReadEverything();
+
+        int merges = 0;                                               // the size ladder, to a fixpoint
+        while (merges < 6 && await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)) merges++;
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+
+        await RestartAsync();                                         // still held at shutdown: the last retry is refused too
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// The same across a restart: the start's sweep keeps the manifest of a source still held and
+    /// keeps its output out of the planner, as the merge did. Without that, the first merges after
+    /// the start took the output, and with a second manifest surviving to a later start the two
+    /// were resolved in whatever order the directory listed them — the one listing the other's
+    /// output first, which unlinked it, and the other then read as a merge that never committed.
+    /// </summary>
+    [Fact]
+    public async Task AfterARestart_AnOutputWhoseManifestWaitsForAHeldSource_IsStillNotMergedAgain()
+    {
+        await _engine.CatalogLoaded;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        for (int round = 0; round < 4; round++)
+            await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
+        var held = _engine.ListSegments().Select(s => s.FilePath).Order(StringComparer.Ordinal).First();
+        _engine._deleteSegmentFile = UnlinkRefusing(held);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: merge 1");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+
+        await RestartWithSeamsAsync(e => e._deleteSegmentFile = UnlinkRefusing(held));
+        Assert.Single(Manifests());                                   // setup: kept, the source is still held
+
+        for (int round = 4; round < 8; round++)
+            await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
+        var before = ReadEverything();
+
+        int merges = 0;
+        while (merges < 6 && await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)) merges++;
+        Assert.True(merges > 0, "setup: the new segments did not merge");
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == output);   // merged again after the start
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Single(Manifests());
+
+        await RestartWithSeamsAsync(e => e._deleteSegmentFile = UnlinkRefusing(held));
+        AssertSameEvents(before, ReadEverything());
+
+        // Let go: the manifest goes, and with it the hold on the output.
+        _engine._deleteSegmentFile = File.Delete;
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Empty(Manifests());
+        for (int i = 0; i < 6 && await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); i++) { }
+        Assert.DoesNotContain(_engine.ListSegments(), s => s.FilePath == output);   // a candidate again
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// A source whose HEADER is intact but whose blocks are corrupt opens cleanly during
     /// planning and blows up mid-stream — after the manifest is on disk. That is the one path
     /// where the manifest-first ordering has to unwind itself: the merged file never reaches its

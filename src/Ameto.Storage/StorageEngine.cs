@@ -487,6 +487,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private const int MergeDeferEscalationPasses = 3;
 
     /// <summary>
+    /// Merge outputs, by path, whose manifest is kept because a source it lists may still be on
+    /// disk — held by a query's pin, a scanner, a volume that refuses. <see cref="SelectMergeBatch"/>
+    /// does not merge one of them again until its manifest is gone.
+    ///
+    /// <para>Recovery decides a manifest on its output alone, and an output that is gone reads as
+    /// a merge that never committed (<see cref="RecoverInterruptedMerges"/>). Merged a second time
+    /// while a source of its own was still held, the output left before that source did: the next
+    /// sweep dropped the manifest, the held source sat on disk with nothing naming it, and the next
+    /// start served it beside the new output — 540 events for 480. Two manifests surviving to one
+    /// start, the second listing the first one's output, came to the same end in either order the
+    /// directory listed them. An output with a live manifest is never a source, so no manifest
+    /// lists another's output.</para>
+    ///
+    /// <para>Added when a merge keeps its manifest and when a sweep meets a committed one; removed
+    /// when either drops it, so one a sweep could not read stays in. The catalog scan's sweep fills
+    /// it before the merge gate opens, so a restart forgets nothing. Concurrent only because a scan
+    /// a test runs by hand sweeps outside the gate; every other writer and the planner hold it.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _outputsWithKeptManifest = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
     /// can be written as one segment PER LEVEL and the level's id is always
     /// <c>firstId + (byte)level</c>.
@@ -2880,10 +2901,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // matters even though same-level implies same TTL: Information and Error share the
         // 90-day class, and merging them would hand the merged file back the mixed-level shape
         // whose retention the level-split flush exists to make exact.
-        var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
+        var  buckets  = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
+        bool anyKept  = !_outputsWithKeptManifest.IsEmpty;
         foreach (var s in _segments.Values)
         {
             if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
+            // Not while its manifest waits for a held source: see _outputsWithKeptManifest.
+            if (anyKept && _outputsWithKeptManifest.ContainsKey(s.FilePath)) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
@@ -3443,8 +3467,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (allGone)
             try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
         else
+        {
+            // Out of the planner while the manifest waits, or a merge of this output would leave
+            // the manifest naming an output that is gone (see _outputsWithKeptManifest).
+            _outputsWithKeptManifest.TryAdd(segPath, 0);
             _logger.LogInformation("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
                 consumed.Count(s => File.Exists(s.FilePath)));
+        }
 
         _logger.LogInformation(
             "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
@@ -3802,6 +3831,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// catalog names its path again. So the manifest can go without it, and no later start unlinks
     /// it before its scan names it.</para>
     ///
+    /// <para>Deciding on the output alone holds only while the output stays where its manifest
+    /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
+    /// planner until the manifest goes (<see cref="_outputsWithKeptManifest"/>). Merged again first,
+    /// it left before its held source did, read here as never committed, and its manifest went
+    /// while the source still waited.</para>
+    ///
     /// <para>What none of this tells apart is a crash from a merge in flight: both are a manifest
     /// beside an output at its final name, or beside none yet. The merge gate keeps them apart: a
     /// pass runs this sweep under it, and the catalog scan runs it before the gate opens
@@ -3836,8 +3871,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (!IsCommittedMergeOutput(output, readOutput))
         {
             File.Delete(manifest);
+            _outputsWithKeptManifest.TryRemove(output, out _);
             return;
         }
+
+        // Out of the planner until this manifest goes, from before it is even read: one this
+        // sweep fails to finish keeps its output out too (see _outputsWithKeptManifest).
+        _outputsWithKeptManifest.TryAdd(output, 0);
 
         var sources = new List<string>();
         foreach (var name in File.ReadAllLines(manifest))
@@ -3875,6 +3915,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (!anyLeft)
         {
             File.Delete(manifest);
+            _outputsWithKeptManifest.TryRemove(output, out _);
             _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(output));
             return;
         }
