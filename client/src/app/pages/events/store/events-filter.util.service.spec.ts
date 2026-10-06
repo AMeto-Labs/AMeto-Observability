@@ -49,6 +49,25 @@ describe('the service clause the events page writes', () => {
     expect(setServicesClause("@service = 'a' or @l = 'Fatal'", new Set())).toBe("@service = 'a' or @l = 'Fatal'");
   });
 
+  it('reads no selection where a glued `or` makes the clause one branch of a disjunction', () => {
+    // The server's lexer reads `'eu'or`, `)or(`, `]or`, `1or` and `or(` as `or`, and `and`
+    // binds tighter than `or` (#118 review F1).
+    for (const f of [
+      "@service = 'x' and A = 'eu'or B = 'us'",
+      "(A = 1)or B = 2 and ServiceName = 'x'",
+      "@service = 'x' and A = 1or B = 2",
+      "@service in ['x']or B = 1",
+      "@service = 'x' and A = 1 or(B = 2)",
+    ]) expect(parseServicesFromFilter(f).size, f).toBe(0);
+    expect(setServicesClause("(A = 1)or B = 2 and ServiceName = 'x'", new Set(['y'])))
+      .toBe("@service = 'y' and ((A = 1)or B = 2 and ServiceName = 'x')");
+    expect(setServicesClause("A = 'eu'or B = 'us'", new Set(['y'])))
+      .toBe("@service = 'y' and (A = 'eu'or B = 'us')");
+    expect(setServicesClause("ServiceName = 'old'and Region = 'eu'", new Set(['new'])))
+      .toBe("@service = 'new' and Region = 'eu'");
+    expect([...parseServicesFromFilter("(A = 1)and @service = 'x'")]).toEqual(['x']);
+  });
+
   it('does not split at an and inside quotes, brackets or parentheses', () => {
     expect(setServicesClause("Msg = 'x and y' and @service = 'a'", new Set(['b'])))
       .toBe("@service = 'b' and Msg = 'x and y'");

@@ -47,6 +47,9 @@ interface Token {
   kind: 'ident' | 'string' | 'number' | 'punct' | 'op';
   /** An identifier as written; a string's value, its escapes undone; otherwise the symbol. */
   text: string;
+  /** Where the token starts, and ends, in the source: a conjunct is cut out of it verbatim. */
+  start: number;
+  end: number;
 }
 
 /** `char.IsLetter` / `char.IsDigit`, the lexer's tests — one UTF-16 unit at a time, as there. */
@@ -62,15 +65,16 @@ const isPunct = (t: Token | undefined, ch: string) => t?.kind === 'punct' && t.t
  * tokens; `'…'` is a string in which `\x` is x and `''` is a quote; `( ) [ ] ,` stand alone; a
  * `.` not before a digit is a dot; `= != <> < <= > >=` are operators; a number starts with `-`,
  * a digit or `.digit`; an identifier starts with `@`, `_` or a letter and runs on through those,
- * digits AND DOTS; any other character is skipped, as the lexer skips it.
- *
- * One departure: a string still open at the end — which the lexer reads to the end — makes this
- * null. That is a draft being typed (`@service = 'pay`), and the picker reads nothing from it.
+ * digits AND DOTS; any other character is skipped, as the lexer skips it. A string still open at
+ * the end is read to the end, as the lexer reads it, and `open` says so.
  */
-function lex(src: string): Token[] | null {
-  const out: Token[] = [];
+function lex(src: string): { tokens: Token[]; open: boolean } {
+  const tokens: Token[] = [];
+  const add = (kind: Token['kind'], text: string, start: number, end: number) =>
+    tokens.push({ kind, text, start, end });
   let i = 0;
   while (i < src.length) {
+    const start = i;
     const c = src[i];
     const two = src.slice(i, i + 2);
     if (/\s/.test(c)) {
@@ -78,37 +82,38 @@ function lex(src: string): Token[] | null {
     } else if (c === "'") {
       let text = '';
       for (i++; ; ) {
-        if (i >= src.length) return null;
+        if (i >= src.length) {
+          add('string', text, start, i);
+          return { tokens, open: true };
+        }
         if (src[i] === '\\' && i + 1 < src.length) { text += src[i + 1]; i += 2; }
         else if (src[i] === "'" && src[i + 1] === "'") { text += "'"; i += 2; }
         else if (src[i] === "'") { i++; break; }
         else { text += src[i]; i++; }
       }
-      out.push({ kind: 'string', text });
+      add('string', text, start, i);
     } else if ('()[],'.includes(c) || (c === '.' && !isDigit(src[i + 1]))) {
-      out.push({ kind: 'punct', text: c });
       i++;
+      add('punct', c, start, i);
     } else if (two === '!=' || two === '<=' || two === '<>' || two === '>=') {
-      out.push({ kind: 'op', text: two });
       i += 2;
+      add('op', two, start, i);
     } else if (c === '=' || c === '<' || c === '>') {
-      out.push({ kind: 'op', text: c });
       i++;
+      add('op', c, start, i);
     } else if (c === '-' || c === '.' || isDigit(c)) {        // a `.` here has a digit after it
-      let j = c === '-' ? i + 1 : i;
-      while (j < src.length && (src[j] === '.' || isDigit(src[j]))) j++;
-      out.push({ kind: 'number', text: src.slice(i, j) });
-      i = j;
+      if (c === '-') i++;
+      while (i < src.length && (src[i] === '.' || isDigit(src[i]))) i++;
+      add('number', src.slice(start, i), start, i);
     } else if (c === '@' || c === '_' || isLetter(c)) {
-      let j = i + 1;
-      while (j < src.length && isIdentPart(src[j])) j++;
-      out.push({ kind: 'ident', text: src.slice(i, j) });
-      i = j;
+      i++;
+      while (i < src.length && isIdentPart(src[i])) i++;
+      add('ident', src.slice(start, i), start, i);
     } else {
       i++;
     }
   }
-  return out;
+  return { tokens, open: false };
 }
 
 /**
@@ -164,12 +169,14 @@ function unwrapped(t: Token[]): Token[] {
  * spelling the server resolves to the built-in service, inside any parentheses, and `'x' = field`
  * too: the parser moves a literal on the left to the right. Null for anything else: an exclusion
  * (`<>`, `not in`), another property, a comparison with something that is not a name, a list
- * holding one, text after the clause, or an `or` of service tests. A name is never empty.
+ * holding one, text after the clause, or an `or` of service tests. A name is never empty, and a
+ * string still open — a draft being typed, `@service = 'pay` — reads as nothing, where the lexer
+ * would read it to the end.
  */
 function serviceSelection(conjunct: string): string[] | null {
   const lexed = lex(conjunct);
-  if (!lexed) return null;
-  const t = unwrapped(lexed);
+  if (lexed.open) return null;
+  const t = unwrapped(lexed.tokens);
   const isName = (k: number) => t[k]?.kind === 'string' && t[k].text.length > 0;
   const isEq = (k: number) => t[k]?.kind === 'op' && t[k].text === '=';
 
@@ -198,40 +205,36 @@ function serviceSelection(conjunct: string): string[] | null {
 const LEGACY_SERVICE_OR_CLAUSE =
   /^\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)$/;
 
-/** A top-level connective at the scan position: whitespace, `and`/`or`, whitespace. */
-const CONNECTIVE_AT = /^\s+(and|or)\s+/i;
-
 /**
- * The top-level AND conjuncts of `expr` — split outside quotes, brackets and parentheses — or
- * null when `expr` has a top-level `or`, where no single conjunct constrains every row.
+ * The top-level AND conjuncts of `expr` — cut at each `and` outside parentheses and brackets, as
+ * written — or null when `expr` has a top-level `or`, where no single conjunct constrains every
+ * row.
+ *
+ * Cut at the lexer's TOKENS, not at whitespace. The lexer needs none around a connective: a
+ * string ends at its quote, a number at its last digit, and `(`, `)`, `[`, `]` are tokens of their
+ * own, so `'eu'or`, `)or(`, `]or` and `1or` hold an `or`, and `'old'and` an `and`. A splitter that
+ * wanted spaces read `@service = 'x' and A = 'eu'or B = 'us'` as two conjuncts — and since `and`
+ * binds tighter than `or`, it took a service test in one branch of the `or` for a selection of
+ * every row, which a pick then rewrote (#118 review F1). A string still open reads to the end
+ * here, as there.
  */
 function topLevelConjuncts(expr: string): string[] | null {
   const parts: string[] = [];
   let depth = 0;
-  let quoted = false;
-  let start = 0;
-  for (let i = 0; i < expr.length; i++) {
-    const c = expr[i];
-    if (quoted) {
-      if (c === '\\') i++;                                   // \' escapes a quote
-      else if (c === "'") {
-        if (expr[i + 1] === "'") i++;                        // '' is a quote too
-        else quoted = false;
+  let from = 0;
+  for (const tok of lex(expr).tokens) {
+    if (isPunct(tok, '(') || isPunct(tok, '[')) depth++;
+    else if (isPunct(tok, ')') || isPunct(tok, ']')) depth--;
+    else if (depth === 0 && tok.kind === 'ident') {
+      const word = tok.text.toLowerCase();
+      if (word === 'or') return null;
+      if (word === 'and') {
+        parts.push(expr.slice(from, tok.start).trim());
+        from = tok.end;
       }
-      continue;
     }
-    if (c === "'") { quoted = true; continue; }
-    if (c === '(' || c === '[') { depth++; continue; }
-    if (c === ')' || c === ']') { depth--; continue; }
-    if (depth !== 0 || !/\s/.test(c)) continue;
-    const m = CONNECTIVE_AT.exec(expr.slice(i));
-    if (!m) continue;
-    if (m[1].toLowerCase() === 'or') return null;
-    parts.push(expr.slice(start, i).trim());
-    i += m[0].length - 1;
-    start = i + 1;
   }
-  parts.push(expr.slice(start).trim());
+  parts.push(expr.slice(from).trim());
   return parts.filter(p => p.length > 0);
 }
 
