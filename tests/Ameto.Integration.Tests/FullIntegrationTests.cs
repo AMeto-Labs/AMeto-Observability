@@ -1056,6 +1056,11 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
     /// host's routes; on a loaded two-core runner that ran out and the tail answered 499. Started once
     /// the host has answered a request (<see cref="AmetoWebAppFactory.CreateReadyClientAsync"/>), so it
     /// covers the tail's own request alone.
+    ///
+    /// <para>ENFORCED BY <c>WaitAsync</c>, not by the token alone (#124 review N1): under TestServer a
+    /// cancelled client token only cancels <c>RequestAborted</c>, and the client then waits for the
+    /// app — so a tail that blocked before its headers without looking at it would hold the fact past
+    /// the guard, to CI's blame timeout. The token still goes with the request, for a tail that does.</para>
     /// </summary>
     private static readonly TimeSpan HeadersHangGuard = TimeSpan.FromSeconds(30);
 
@@ -1075,7 +1080,7 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
 
         using var request = new HttpRequestMessage(HttpMethod.Get, "/api/events/live");
         using var resp    = await client.SendAsync(
-            request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            request, HttpCompletionOption.ResponseHeadersRead, cts.Token).WaitAsync(HeadersHangGuard);
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         Assert.Equal("text/event-stream", resp.Content.Headers.ContentType?.MediaType);
@@ -1105,7 +1110,7 @@ public sealed class LiveTailTests : IClassFixture<AmetoWebAppFactory>
         using var request = new HttpRequestMessage(
             HttpMethod.Get, "/api/events/live?filter=" + Uri.EscapeDataString("@l = 'Error'"));
         using var resp = await client.SendAsync(
-            request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            request, HttpCompletionOption.ResponseHeadersRead, cts.Token).WaitAsync(HeadersHangGuard);
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 

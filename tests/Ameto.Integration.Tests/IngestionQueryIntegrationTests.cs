@@ -262,16 +262,28 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// that request ran out on a loaded two-core runner, and the tail answered 499 to a test that only
     /// asked whether it opens.</para>
     ///
-    /// <para><c>/health</c> because it runs the whole pipeline — routing, authentication — and no
-    /// engine, and it answers at the root under any base path. No budget of its own beyond the
-    /// client's default timeout: how long a host takes to come up is not what any test here asserts.</para>
+    /// <para><c>/health</c> because it warms what every request shares and touches no engine: routing
+    /// (its table, and every endpoint's request delegate, built on the first match) and the middleware
+    /// chain; and it answers at the root under any base path. It does not warm what a tail's endpoint
+    /// adds (#124 review N1): <c>/health</c> carries no authorization metadata, so only the default
+    /// scheme authenticates it, while the log endpoints' <c>PolicyViewLogs</c> names the JwtBearer
+    /// and ApiKey schemes. Those handlers, the policy and the tail's own handler still run cold inside
+    /// the test's budget — within the 40-170 ms above.</para>
+    ///
+    /// <para>BOUNDED FROM THE TEST SIDE. Under TestServer a cancelled client token — the client's own
+    /// timeout included — only cancels <c>RequestAborted</c>, and the client then waits for the app
+    /// to finish; building the routes and answering <c>/health</c> never look at it. So a first request
+    /// that hung the host would hang the class until CI's blame timeout instead of failing a fact.
+    /// <c>WaitAsync</c> stops waiting whatever the app does, at a bound that is a hang guard, not a
+    /// measure of how long a host takes to come up; the catch disposes the client, which cancels the
+    /// request.</para>
     /// </summary>
     public async Task<HttpClient> CreateReadyClientAsync()
     {
         var client = CreateClient();
         try
         {
-            using var health = await client.GetAsync("/health");
+            using var health = await client.GetAsync("/health").WaitAsync(TimeSpan.FromSeconds(60));
             Assert.Equal(HttpStatusCode.OK, health.StatusCode);
             return client;
         }
