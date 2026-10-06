@@ -32,9 +32,11 @@ namespace Ameto.Tracing.TraceQL;
 /// <item>and a record with no blob — one built from a dictionary — evaluated by the AST, whole, as
 /// before.</item>
 /// </list>
-/// The connectives below are the AST's own truth tables line for line, and a subtree that names no
-/// attribute is handed to the AST untouched. <c>SharedAttributeWalkTests</c> holds the two to one
-/// answer over random maps (torn ones included) and random filters.</para>
+/// The connectives below are the AST's truth tables, each folded over a whole chain of its
+/// connective — the parser's left-deep <c>a &amp;&amp; b &amp;&amp; c</c> is one node here, asked left to right
+/// and stopping where the binary nodes stop — and a subtree that names no attribute is handed to
+/// the AST untouched. <c>SharedAttributeWalkTests</c> holds the two to one answer over random maps
+/// (torn ones included) and random filters, long chains and mixed nesting among them.</para>
 ///
 /// <para><b>Lazy, so a short circuit still saves the walk.</b> A span's map is walked when the first
 /// attribute predicate is reached, not before: <c>{ duration &gt; 1s &amp;&amp; .a = "x" }</c> walks
@@ -181,30 +183,39 @@ internal sealed class SpanPredicateEvaluator
     /// The plan for <paramref name="p"/>, or null when nothing under it names an attribute — the
     /// caller then hands that subtree to the AST as it is.
     ///
-    /// <para>Recursive to the AST's own depth, and no deeper than its <c>Evaluate</c> already goes:
-    /// the parser bounds nesting at 64, and the longest flat chain its 8 KB cap admits — some 1 600
-    /// terms of <c>a=1||</c> — is as deep here as it is there.</para>
+    /// <para>BOUNDED BY NESTING, NOT BY LENGTH (#123 review F2). The parser builds a chain
+    /// <c>a &amp;&amp; b &amp;&amp; c</c> left-deep, one binary node per term, and compiling it one node per
+    /// call made this the deepest stack in a query: 660 KB in Debug for the 1 638 terms the 8 KB cap
+    /// admits and 508 KB at tier 0, 2.4 and 2.9 times what the AST's own <c>Evaluate</c> needs for
+    /// the same chain — and a stack overflow ends the process. A chain of one connective is gathered
+    /// WITHOUT recursion (<see cref="Gather"/>) and compiled into one n-ary node, so this recurses
+    /// once per change of connective or <c>!</c> — the parser's 64 levels of nesting at most —
+    /// however many terms there are, and so does the plan when it is evaluated: both now stay inside
+    /// the stack a fresh thread starts with, at 100 terms and at 1 638.
+    /// <c>SharedAttributeWalkTests.A_chain_costs_no_more_stack_to_compile_or_evaluate_for_more_terms</c>
+    /// holds them to it.</para>
     /// </summary>
     private static Node? Compile(SpanPredicate p, ref List<byte[]>? keys, ref Dictionary<byte[], int>? slots)
     {
         switch (p)
         {
-            case AndPredicate and:
+            case AndPredicate or OrPredicate:
             {
-                Node? l = Compile(and.Left,  ref keys, ref slots);
-                Node? r = Compile(and.Right, ref keys, ref slots);
-                return l is null && r is null
-                    ? null
-                    : new And(l ?? new Ast(and.Left), r ?? new Ast(and.Right));
-            }
+                bool and      = p is AndPredicate;
+                var  operands = Gather(p, and);
+                var  plans    = new Node?[operands.Count];
+                bool names    = false;
+                for (int i = 0; i < plans.Length; i++)
+                {
+                    plans[i] = Compile(operands[i], ref keys, ref slots);   // never this connective: one level of nesting
+                    names   |= plans[i] is not null;
+                }
+                if (!names) return null;
 
-            case OrPredicate or:
-            {
-                Node? l = Compile(or.Left,  ref keys, ref slots);
-                Node? r = Compile(or.Right, ref keys, ref slots);
-                return l is null && r is null
-                    ? null
-                    : new Or(l ?? new Ast(or.Left), r ?? new Ast(or.Right));
+                // An operand that names no attribute is asked of the AST, in its place in the chain.
+                var chain = new Node[plans.Length];
+                for (int i = 0; i < chain.Length; i++) chain[i] = plans[i] ?? new Ast(operands[i]);
+                return and ? new And(chain) : new Or(chain);
             }
 
             case NotPredicate not:
@@ -221,6 +232,30 @@ internal sealed class SpanPredicateEvaluator
                 // or a predicate this type does not know, which then reads what it reads its own way.
                 return null;
         }
+    }
+
+    /// <summary>
+    /// The operands of the chain of one connective rooted at <paramref name="chain"/>, left to right:
+    /// every node of the same connective under it opened up — a left-deep chain as the parser builds
+    /// one, and a group of the same connective in parentheses on either side — with an explicit
+    /// stack, so a chain of any length costs one frame. Left to right is the AST's evaluation order,
+    /// which is what keeps the n-ary node's short circuits exactly where the binary nodes' were.
+    /// </summary>
+    private static List<SpanPredicate> Gather(SpanPredicate chain, bool and)
+    {
+        var operands = new List<SpanPredicate>();
+        var pending  = new Stack<SpanPredicate>();
+        pending.Push(chain);
+        while (pending.TryPop(out var node))
+        {
+            switch (node)
+            {
+                case AndPredicate a when and:  pending.Push(a.Right); pending.Push(a.Left); break;
+                case OrPredicate  o when !and: pending.Push(o.Right); pending.Push(o.Left); break;
+                default:                       operands.Add(node); break;
+            }
+        }
+        return operands;
     }
 
     private static int SlotOf(byte[] keyUtf8, ref List<byte[]>? keys, ref Dictionary<byte[], int>? slots)
@@ -264,29 +299,40 @@ internal sealed class SpanPredicateEvaluator
         public override bool? Evaluate(SpanRecord span, SpanPredicateEvaluator walk) => predicate.Evaluate(span);
     }
 
-    /// <summary><see cref="AndPredicate"/>'s table: false decides, unknown survives only when nothing does.</summary>
-    private sealed class And(Node left, Node right) : Node
+    /// <summary>
+    /// <see cref="AndPredicate"/>'s table over a whole chain, folded left to right: the first false
+    /// decides; otherwise unknown when any operand was unknown; otherwise true. That is the nested
+    /// binary tables' answer for every assignment, and they stop at the same first false, so the same
+    /// operands are asked — and walk the same maps.
+    /// </summary>
+    private sealed class And(Node[] operands) : Node
     {
         public override bool? Evaluate(SpanRecord span, SpanPredicateEvaluator walk)
         {
-            bool? l = left.Evaluate(span, walk);
-            if (l == false) return false;
-            bool? r = right.Evaluate(span, walk);
-            if (r == false) return false;
-            return l is null || r is null ? null : true;
+            bool unknown = false;
+            foreach (var operand in operands)
+            {
+                bool? v = operand.Evaluate(span, walk);
+                if (v == false) return false;
+                if (v is null) unknown = true;
+            }
+            return unknown ? null : true;
         }
     }
 
-    /// <summary><see cref="OrPredicate"/>'s table: true decides, its mirror image.</summary>
-    private sealed class Or(Node left, Node right) : Node
+    /// <summary><see cref="OrPredicate"/>'s table over a whole chain: the mirror image — the first true decides.</summary>
+    private sealed class Or(Node[] operands) : Node
     {
         public override bool? Evaluate(SpanRecord span, SpanPredicateEvaluator walk)
         {
-            bool? l = left.Evaluate(span, walk);
-            if (l == true) return true;
-            bool? r = right.Evaluate(span, walk);
-            if (r == true) return true;
-            return l is null || r is null ? null : false;
+            bool unknown = false;
+            foreach (var operand in operands)
+            {
+                bool? v = operand.Evaluate(span, walk);
+                if (v == true) return true;
+                if (v is null) unknown = true;
+            }
+            return unknown ? null : false;
         }
     }
 

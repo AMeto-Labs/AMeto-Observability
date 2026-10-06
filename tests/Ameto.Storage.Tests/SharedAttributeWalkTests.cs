@@ -101,13 +101,25 @@ public sealed class SharedAttributeWalkTests : IDisposable
         for (int i = 0; i < spans.Length; i++)
             spans[i] = RandomSpan(rnd, RandomMap(rnd), dictionary: i % 30 == 29);
 
-        int compared = 0, unknown = 0, selected = 0, rejected = 0, wide = 0;
+        int compared = 0, unknown = 0, selected = 0, rejected = 0, wide = 0, longChains = 0;
         for (int f = 0; f < Filters; f++)
         {
-            string query = f % 4 == 3 ? WideChain(rnd) : "{ " + Expr(rnd, depth: 4) + " }";
-            var    pred  = TraceQLParser.Parse(query);   // the generator writes only valid TraceQL
-            var    eval  = new SpanPredicateEvaluator(pred);
+            // A quarter wide chains, a quarter long chains of one connective with groups of either
+            // connective among their terms (#123 review F2: the plan folds a chain into one node and
+            // opens same-connective groups into it), and the rest random expressions.
+            string query;
+            do query = (f % 4) switch
+            {
+                3 => WideChain(rnd),
+                2 => "{ " + Chain(rnd, nesting: 2) + " }",
+                _ => "{ " + Expr(rnd, depth: 4) + " }",
+            };
+            while (query.Length > TraceQLParser.MaxQueryChars);
+
+            var pred = TraceQLParser.Parse(query);   // the generator writes only valid TraceQL
+            var eval = new SpanPredicateEvaluator(pred);
             if (DistinctKeys(pred) > SpanAttributeBlob.MaxKeyAlternatives) wide++;
+            if (LongestChain(pred) >= 20) longChains++;
 
             foreach (var span in spans)
             {
@@ -129,10 +141,11 @@ public sealed class SharedAttributeWalkTests : IDisposable
 
         _out.WriteLine($"seed {Seed}: {Filters} filters x {Maps} spans = {compared:N0} answers compared — "
                      + $"{selected:N0} true, {rejected:N0} false, {unknown:N0} unknown; "
-                     + $"{wide} filters name more keys than one walk takes");
+                     + $"{wide} filters name more keys than one walk takes, {longChains} hold a chain of 20 or more");
 
         // THE GENERATOR MUST REACH WHAT THE TEST IS FOR, or it passes by asking nothing.
         Assert.True(wide >= Filters / 8, $"only {wide} filters were wider than one walk");
+        Assert.True(longChains >= Filters / 16, $"only {longChains} filters held a chain of 20 operands or more");
         Assert.True(selected >= compared / 50, $"only {selected} answers were true");
         Assert.True(rejected >= compared / 50, $"only {rejected} answers were false");
         Assert.True(unknown  >= compared / 50, $"only {unknown} answers were unknown");
@@ -201,24 +214,15 @@ public sealed class SharedAttributeWalkTests : IDisposable
     /// <summary>
     /// THE DEEPEST FILTER THE PARSER ADMITS: a flat disjunction of one-letter keys, <c>a=1||b=1||…</c>,
     /// as many terms as the 8 KB cap holds. The parser builds it iteratively but left-deep, so the
-    /// AST's own <c>Evaluate</c> recurses once per term, and so do the evaluator's compile and plan —
-    /// no deeper. Fifty-two distinct keys are seven walks where the per-predicate evaluation made one
-    /// walk per term.
+    /// AST's own <c>Evaluate</c> recurses once per term; the evaluator compiles it into one n-ary node
+    /// and asks the same terms in the same order. Fifty-two distinct keys are seven walks where the
+    /// per-predicate evaluation made one walk per term. The stack it costs is
+    /// <see cref="A_chain_costs_no_more_stack_to_compile_or_evaluate_for_more_terms"/>.
     /// </summary>
     [Fact]
     public void The_deepest_chain_the_parser_admits_compiles_and_answers_as_the_ast()
     {
-        const string Letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        var sb    = new StringBuilder("{");
-        int terms = 0;
-        while (true)
-        {
-            string term = (terms == 0 ? "" : "||") + Letters[terms % Letters.Length] + "=1";
-            if (sb.Length + term.Length + 1 > TraceQLParser.MaxQueryChars) break;
-            sb.Append(term);
-            terms++;
-        }
-        var pred    = TraceQLParser.Parse(sb.Append('}').ToString());
+        var pred    = TraceQLParser.Parse(LetterChain(int.MaxValue, out int terms));
         int batches = (Letters.Length + SpanAttributeBlob.MaxKeyAlternatives - 1) / SpanAttributeBlob.MaxKeyAlternatives;
 
         var lastLetter = WithMap(Map(("Z", 1L)));        // true at the 52nd term: every batch walked
@@ -233,6 +237,142 @@ public sealed class SharedAttributeWalkTests : IDisposable
         _out.WriteLine($"{terms} terms, {Letters.Length} keys: {eval.WalksForTest} walks for two spans");
         Assert.True(terms > 1_500, $"only {terms} terms fit the cap");
         Assert.Equal(2 * batches, eval.WalksForTest);
+    }
+
+    private const string Letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    /// <summary><c>{a=1||b=1||…}</c> over the 52 letters, <paramref name="maxTerms"/> terms or as many as the 8 KB cap holds.</summary>
+    private static string LetterChain(int maxTerms, out int terms)
+    {
+        var sb = new StringBuilder("{");
+        terms = 0;
+        while (terms < maxTerms)
+        {
+            string term = (terms == 0 ? "" : "||") + Letters[terms % Letters.Length] + "=1";
+            if (sb.Length + term.Length + 1 > TraceQLParser.MaxQueryChars) break;
+            sb.Append(term);
+            terms++;
+        }
+        return sb.Append('}').ToString();
+    }
+
+    /// <summary>
+    /// THE STACK A FILTER COSTS DOES NOT GROW WITH ITS LENGTH (#123 review F2). The parser builds a
+    /// chain left-deep, one binary node per term; compiling it one node per call made compiling the
+    /// deepest stack in a query — 664 KB in Debug at the 1 638 terms the 8 KB cap admits, 2.4 to 2.8
+    /// times the AST's own <c>Evaluate</c> on the same chain — and a stack overflow cannot be caught:
+    /// it ends the process. Compiling and evaluating the plan must cost a long chain what they cost a
+    /// short one.
+    ///
+    /// <para>READ, NOT PROVOKED. Each figure is the high-water mark of a FRESH thread's committed stack
+    /// (<c>GetCurrentThreadStackLimits</c> + <c>VirtualQuery</c>: the stack commits page by page as it
+    /// is touched and never gives a page back), around one call, after the code has been jitted on
+    /// another thread. The thread reserves 4 MB, so even the recursive compile this replaced cannot
+    /// overflow it and take the test host down with it. The best of three, because a GC landing on the
+    /// measured thread runs on its stack and can only add. The AST's own figures are printed beside
+    /// them and not asserted: its recursion is the AST's, as before. Windows only — the mark has no
+    /// cheap equivalent elsewhere, and CI's full suite runs on Windows.</para>
+    /// </summary>
+    [Fact]
+    public void A_chain_costs_no_more_stack_to_compile_or_evaluate_for_more_terms()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            _out.WriteLine("the stack's high-water mark is read with GetCurrentThreadStackLimits + VirtualQuery: Windows only");
+            return;
+        }
+
+        var shortChain = TraceQLParser.Parse(LetterChain(100, out int shortTerms));
+        var longChain  = TraceQLParser.Parse(LetterChain(int.MaxValue, out int longTerms));
+        var span       = WithMap(Map(("other", 1L)));   // unknown at every term: the whole chain is asked
+
+        for (int i = 0; i < 3; i++)   // jit everything the measured threads will run, here
+        {
+            Assert.Null(new SpanPredicateEvaluator(shortChain).Evaluate(span));
+            Assert.Null(shortChain.Evaluate(span));
+        }
+
+        var shortPlan = new SpanPredicateEvaluator(shortChain);
+        var longPlan  = new SpanPredicateEvaluator(longChain);
+
+        long compileShort = StackUsed(() => new SpanPredicateEvaluator(shortChain));
+        long compileLong  = StackUsed(() => new SpanPredicateEvaluator(longChain));
+        long planShort    = StackUsed(() => shortPlan.Evaluate(span));
+        long planLong     = StackUsed(() => longPlan.Evaluate(span));
+        long astShort     = StackUsed(() => shortChain.Evaluate(span));
+        long astLong      = StackUsed(() => longChain.Evaluate(span));
+
+        _out.WriteLine($"stack high-water mark, {shortTerms} -> {longTerms} terms:");
+        _out.WriteLine($"  compile        {compileShort / 1024.0,7:N1} -> {compileLong / 1024.0,7:N1} KB");
+        _out.WriteLine($"  plan Evaluate  {planShort / 1024.0,7:N1} -> {planLong / 1024.0,7:N1} KB");
+        _out.WriteLine($"  AST Evaluate   {astShort / 1024.0,7:N1} -> {astLong / 1024.0,7:N1} KB   (the AST's own, not asserted)");
+
+        // 64 KB of slack for the measurement, against 660 KB of growth in Debug and 165 KB fully
+        // optimised for the compile this replaced: a recursion per term cannot hide under it.
+        const long Slack = 64 * 1024;
+        Assert.True(compileLong - compileShort < Slack,
+            $"compiling {longTerms} terms took {(compileLong - compileShort) / 1024} KB more stack than {shortTerms} — "
+            + "the compile recurses per term again");
+        Assert.True(planLong - planShort < Slack,
+            $"evaluating {longTerms} terms took {(planLong - planShort) / 1024} KB more stack than {shortTerms} — "
+            + "the plan recurses per term again");
+    }
+
+    /// <summary>The best of three high-water readings of <paramref name="action"/>, each on a fresh 4 MB thread.</summary>
+    private static long StackUsed(Action action)
+    {
+        long best = long.MaxValue;
+        for (int run = 0; run < 3; run++)
+        {
+            long       used    = -1;
+            Exception? failure = null;
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    nuint before = StackHighWaterMark();
+                    action();
+                    used = (long)(before - StackHighWaterMark());
+                }
+                catch (Exception e) { failure = e; }
+            }, maxStackSize: 4 * 1024 * 1024);
+            thread.Start();
+            thread.Join();
+            if (failure is not null) throw new InvalidOperationException("the measured call threw", failure);
+            best = Math.Min(best, used);
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// The lowest address of this thread's stack ever touched: the never-committed reservation at the
+    /// bottom ends where the guard page — and everything the thread has used — begins.
+    /// </summary>
+    private static nuint StackHighWaterMark()
+    {
+        GetCurrentThreadStackLimits(out nuint low, out _);
+        if (VirtualQuery(low, out var bottom, (nuint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryBasicInformation>()) == 0)
+            throw new InvalidOperationException("VirtualQuery failed on the stack's own reservation");
+        return bottom.BaseAddress + bottom.RegionSize;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern void GetCurrentThreadStackLimits(out nuint lowLimit, out nuint highLimit);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern nuint VirtualQuery(nuint address, out MemoryBasicInformation buffer, nuint length);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MemoryBasicInformation
+    {
+        public nuint  BaseAddress;
+        public nuint  AllocationBase;
+        public uint   AllocationProtect;
+        public ushort PartitionId;
+        public nuint  RegionSize;
+        public uint   State;
+        public uint   Protect;
+        public uint   Type;
     }
 
     /// <summary>
@@ -430,6 +570,26 @@ public sealed class SharedAttributeWalkTests : IDisposable
     private static string Comparison(Random rnd, string key) =>
         $"{KeyText(rnd, key)} {Ops[rnd.Next(Ops.Length)]} {Literals[rnd.Next(Literals.Length)]}";
 
+    /// <summary>
+    /// A long chain of one connective — what the plan compiles into one n-ary node — whose terms are
+    /// leaves, negations of groups, and groups in parentheses: chains of the other connective, and
+    /// chains of the SAME connective, which the plan opens up into the outer chain wherever they stand.
+    /// </summary>
+    private static string Chain(Random rnd, int nesting)
+    {
+        string op    = rnd.Next(2) == 0 ? " && " : " || ";
+        int    terms = rnd.Next(2, nesting == 2 ? 41 : 7);
+        var    sb    = new StringBuilder();
+        for (int i = 0; i < terms; i++)
+        {
+            if (i > 0) sb.Append(op);
+            sb.Append(nesting > 0 && rnd.Next(6) == 0
+                ? (rnd.Next(3) == 0 ? "!(" : "(") + Chain(rnd, nesting - 1) + ")"
+                : Leaf(rnd));
+        }
+        return sb.ToString();
+    }
+
     /// <summary>A filter naming more distinct keys than one walk takes, chained with random connectives.</summary>
     private static string WideChain(Random rnd)
     {
@@ -581,6 +741,25 @@ public sealed class SharedAttributeWalkTests : IDisposable
         }
         Visit(pred);
         return seen.Count;
+    }
+
+    /// <summary>The most operands any one chain of one connective in the filter has, its same-connective groups opened up as the plan opens them.</summary>
+    private static int LongestChain(SpanPredicate p)
+    {
+        static int Operands(SpanPredicate n, bool and) => n switch
+        {
+            AndPredicate a when and  => Operands(a.Left, true)  + Operands(a.Right, true),
+            OrPredicate  o when !and => Operands(o.Left, false) + Operands(o.Right, false),
+            _                        => 1,
+        };
+
+        return p switch
+        {
+            AndPredicate a => Math.Max(Operands(p, true),  Math.Max(LongestChain(a.Left), LongestChain(a.Right))),
+            OrPredicate o  => Math.Max(Operands(p, false), Math.Max(LongestChain(o.Left), LongestChain(o.Right))),
+            NotPredicate n => LongestChain(n.Inner),
+            _              => 0,
+        };
     }
 
     private static string[] KeyNames(int count) => [.. Enumerable.Range(0, count).Select(static i => $"k{i}")];
