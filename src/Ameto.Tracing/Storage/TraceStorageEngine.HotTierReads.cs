@@ -71,11 +71,14 @@ public sealed partial class TraceStorageEngine
         }
     }
 
-    /// <summary>One block of a run the walk may have to read: its start bounds and its span range.</summary>
+    /// <summary>
+    /// One block of a run the walk may have to read: the largest start in it — the key the walk
+    /// orders blocks by and stops on — and its span range. The smallest start is consulted once,
+    /// to leave out a block that misses the window, and is not carried.
+    /// </summary>
     private struct HotBlock
     {
         public long Max;
-        public long Min;
         public int  Run;    // 0 = the detached flush snapshot, 1 = the live tier
         public int  From;   // first span, inclusive
         public int  To;     // last span, exclusive
@@ -230,17 +233,15 @@ public sealed partial class TraceStorageEngine
         if (spans == 0) return n;
         if (!starts.IsIndexed)
         {
-            blocks[n++] = new HotBlock { Max = long.MaxValue, Min = long.MinValue, Run = run, From = 0, To = spans };
+            blocks[n++] = new HotBlock { Max = long.MaxValue, Run = run, From = 0, To = spans };
             return n;
         }
         for (int b = 0, from = 0; from < spans; b++, from += SpanStartIndex.BlockSize)
         {
-            long max = starts.MaxOf(b);
-            long min = starts.MinOf(b);
-            if (max < fromNano || min > toNano) continue;
+            if (!starts.Overlaps(b, fromNano, toNano)) continue;
             blocks[n++] = new HotBlock
             {
-                Max = max, Min = min, Run = run, From = from, To = Math.Min(from + SpanStartIndex.BlockSize, spans),
+                Max = starts.MaxOf(b), Run = run, From = from, To = Math.Min(from + SpanStartIndex.BlockSize, spans),
             };
         }
         return n;
