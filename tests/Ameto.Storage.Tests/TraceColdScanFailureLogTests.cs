@@ -210,6 +210,35 @@ public sealed class TraceColdScanFailureLogTests : IDisposable
         Assert.DoesNotContain(logger.Entries, static x => x.Level == LogLevel.Error);
     }
 
+    /// <summary>
+    /// BUSY, THEN NEWER, IS THE FUTURE (#119 review N1). A segment held on its first open whose retry
+    /// meets a format newer than this build reads is kept: the read that met the version says so with
+    /// its own exception, and no second open is asked — the probe that used to ask answered "not
+    /// newer" whenever its open failed, and the damage path then deleted the file. The tier is short
+    /// (queries say so), the store Available: no restart of this build reads it.
+    /// </summary>
+    [Fact]
+    public void A_segment_busy_and_then_newer_is_kept_not_deleted()
+    {
+        string trc   = WriteOneSegment();
+        var logger   = new CapturingLogger();
+        using var e  = new TraceStorageEngine(_dir, logger);
+        int attempts = 0;
+        e._readColdSegmentInfoForTest = path =>
+        {
+            if (++attempts == 1) throw new IOException("busy");
+            throw new NewerSpanFormatException(path, (ushort)(SpanReader.MaxKnownVersion + 5));
+        };
+
+        e.LoadColdSegments();
+
+        Assert.Equal(2, attempts);                                       // one retry: the future is not retried again
+        Assert.True(File.Exists(trc), "a segment a newer build wrote was deleted");
+        Assert.True(e.ColdTierIncompleteForTest);                        // queries report the window short
+        Assert.Equal(QueryAvailability.Available, e.Availability);
+        Assert.Contains(logger.Entries, static x => x.Level == LogLevel.Error && x.Message.Contains("NEWER format"));
+    }
+
     /// <summary>One segment of one span, written and flushed by an engine that is then closed; its path.</summary>
     private string WriteOneSegment()
     {

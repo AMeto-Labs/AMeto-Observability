@@ -2069,7 +2069,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             catch (Exception ex)
             {
                 last = ex;
-                if (ex is FileNotFoundException || FileBounds.DescribesContent(ex)) break;   // gone is gone; damage is damage
+                if (ex is FileNotFoundException or NewerSpanFormatException || FileBounds.DescribesContent(ex))
+                    break;   // gone is gone; damage is damage; the future stays the future
             }
         }
         return (null, last);
@@ -3041,6 +3042,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 _logger.LogDebug("Cold segment {File} vanished while loading — retired by the engine", file);
                 continue;
             }
+            catch (NewerSpanFormatException ex)
+            {
+                // The future, named by the read that met it (#119 review N1): not busy, not damage.
+                MeetNewerColdSegment(file, ex);
+                continue;
+            }
             catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
             {
                 // Retried first, because most of what lands here clears by itself: an antivirus
@@ -3060,6 +3067,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (last is FileNotFoundException)
                 {
                     _logger.LogDebug(last, "Cold segment {File} vanished while it was being retried — retired by the engine", file);
+                    continue;
+                }
+                if (last is NewerSpanFormatException)
+                {
+                    MeetNewerColdSegment(file, last);
                     continue;
                 }
                 if (FileBounds.DescribesContent(last))
@@ -3120,14 +3132,42 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
+    /// A listed segment written in a NEWER format than this build reads — named so by the read that
+    /// met it (<see cref="NewerSpanFormatException"/>), on the first attempt or the last retry.
+    /// </summary>
+    private void MeetNewerColdSegment(string file, Exception ex)
+    {
+        // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING IT IS
+        // HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` was an InvalidDataException
+        // like any other, so it classified as Corrupt and reached the damage path, where
+        // TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a perfectly good newer
+        // segment — and the file went, with its three sidecars, logged as "likely format v1". Roll
+        // a binary back after a day of writing a newer format and that day is gone, unrecoverably,
+        // on first start.
+        //
+        // A newer file is left alone and the cold tier says it is short: loud, reversible by
+        // rolling forward again, and true. Not Degraded: no restart of this build reads it (#94).
+        // Decided from the read that failed, not from a second open (#119 review N1): the probe
+        // that used to ask answered "not newer" whenever its own open failed, and the damage path
+        // then deleted the file.
+        _coldTierIncomplete = true;
+        _logger.LogError(ex,
+            "Segment {File} was written by a NEWER format than this build understands. "
+          + "It is left untouched — this build cannot read it, and deleting it would "
+          + "destroy data a newer build can. Every trace query reports an unreadable "
+          + "region until this node runs a build that knows the format", file);
+    }
+
+    /// <summary>
     /// A listed segment whose BYTES the reader refused — on the first attempt, or on the last of the
-    /// retries a busy file got (#119 review). See the comments inside for the three verdicts.
+    /// retries a busy file got (#119 review). See the comments inside for the two verdicts.
     /// </summary>
     private void MeetDamagedColdSegment(string file, Exception ex)
     {
         // CONTENT-SHAPED DAMAGE — the caller has already ruled out everything that is about the
-        // MACHINE rather than the file. v1 segments (12-byte footer) land here on the footer magic,
-        // and deleting them is the migration path they have always had.
+        // MACHINE rather than the file, and a newer format (MeetNewerColdSegment). v1 segments
+        // (12-byte footer) land here on the footer magic, and deleting them is the migration path
+        // they have always had.
         //
         // WHAT WAS MISSING IS THE RECORD. Deleting is a decision about disk; it is also, and
         // silently, a decision about every answer this process will ever give. The window
@@ -3140,28 +3180,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // The range comes from the 27-byte header, which is intact in every version this
         // engine has written and is readable even when the rest of the file is not — see
         // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
-        // is nothing left to ask.
-        // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING
-        // IT IS HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` is an
-        // InvalidDataException like any other, so it classified as Corrupt and landed here,
-        // where TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a
-        // perfectly good newer segment — and the file went, with its three sidecars, logged
-        // as "likely format v1". Roll a binary back after a day of writing a newer format
-        // and that day is gone, unrecoverably, on first start.
-        //
-        // A newer file is left alone and the cold tier says it is short: loud, reversible
-        // by rolling forward again, and true. Deletion stays for files whose header cannot
-        // be read at all, which is where the v1 migration path actually lives.
-        if (SpanReader.LooksLikeNewerFormat(file))
-        {
-            _coldTierIncomplete = true;
-            _logger.LogError(ex,
-                "Segment {File} was written by a NEWER format than this build understands. "
-              + "It is left untouched — this build cannot read it, and deleting it would "
-              + "destroy data a newer build can. Every trace query reports an unreadable "
-              + "region until this node runs a build that knows the format", file);
-        }
-        else if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+        // is nothing left to ask. Deletion stays for files whose header cannot be read at all,
+        // which is where the v1 migration path actually lives.
+        if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
         {
             _vanished.Record(minNano, maxNano);
             _vanished.RecordPath(file);

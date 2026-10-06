@@ -11,8 +11,8 @@ namespace Ameto.Storage.Tests;
 ///
 /// <para>The v4 rollback fix has two halves and only the easy one was pinned. That the default
 /// write version is 3 is asserted in two places; that this build LEAVES ALONE a file whose version
-/// it does not recognise — <c>SpanReader.LooksLikeNewerFormat</c> plus the first branch of the
-/// cold-tier damage classifier — was asserted nowhere at all. The asymmetry is the wrong way
+/// it does not recognise — <c>NewerSpanFormatException</c>, thrown by the read that meets it, and the
+/// cold scan's branch for it — was asserted nowhere at all. The asymmetry is the wrong way
 /// round: what was pinned is cheap to check, and what was not costs the data.</para>
 ///
 /// <para>The blast radius is zero today, because this build knows version 4 and so never meets a
@@ -88,8 +88,13 @@ public sealed class NewerFormatSegmentTests : IDisposable
         string dir  = Dir("unit");
         string path = WriteFromTheFuture(dir);
 
-        Assert.True(SpanReader.LooksLikeNewerFormat(path));
-        _out.WriteLine($"version {SpanWriter.NewestVersion + 5} → LooksLikeNewerFormat = true");
+        // Decided by the read itself (#119 review N1): its own exception, which no content classifier
+        // takes for damage — no second open is asked, so none can answer "not newer" for an open that
+        // merely failed.
+        var newer = Assert.Throws<NewerSpanFormatException>(() => SpanReader.ReadSegmentInfo(path));
+        Assert.Equal(9, (int)newer.Version);
+        Assert.False(Ameto.Core.FileBounds.DescribesContent(newer));
+        _out.WriteLine($"version 9 → {newer.GetType().Name}");
 
         // And it does not fire on anything this build writes, which is what keeps the branch from
         // quietly disabling the deletion of genuinely dead files.
@@ -99,7 +104,7 @@ public sealed class NewerFormatSegmentTests : IDisposable
             StartTimeUnixNano = _baseNano, DurationNanos = Ms,
             Name = "GET /", ServiceName = "billing", Kind = SpanKind.Server, Status = SpanStatusCode.Ok,
         }]);
-        Assert.False(SpanReader.LooksLikeNewerFormat(ok3.FilePath));
+        Assert.Equal(SpanWriter.DefaultVersion, SpanReader.ReadSegmentInfo(ok3.FilePath).FormatVersion);
 
         var ok4 = SpanWriter.Write(Dir("v4ok"), [new SpanRecord
         {
@@ -107,13 +112,12 @@ public sealed class NewerFormatSegmentTests : IDisposable
             StartTimeUnixNano = _baseNano, DurationNanos = Ms,
             Name = "GET /", ServiceName = "billing", Kind = SpanKind.Server, Status = SpanStatusCode.Ok,
         }], version: SpanWriter.NewestVersion);
-        Assert.False(SpanReader.LooksLikeNewerFormat(ok4.FilePath),
-            "the version this build writes was classified as coming from the future");
+        Assert.Equal(SpanWriter.NewestVersion, SpanReader.ReadSegmentInfo(ok4.FilePath).FormatVersion);   // not "from the future"
 
         // Not a .trc at all is not "newer" either — it is damage, and must stay classifiable as such.
         string junk = Path.Combine(Dir("junk"), "spans-nonsense.trc");
         File.WriteAllBytes(junk, [.. Enumerable.Repeat((byte)0xEE, 4096)]);
-        Assert.False(SpanReader.LooksLikeNewerFormat(junk));
+        Assert.Throws<InvalidDataException>(() => SpanReader.ReadSegmentInfo(junk));
     }
 
     [Fact]
