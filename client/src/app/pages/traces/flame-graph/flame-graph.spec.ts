@@ -334,6 +334,19 @@ describe('flame graph zoom', () => {
     expect(el.querySelector('.fg-btn')).toBeNull();
   });
 
+  it('does not zoom into a bar of infinite width: a child longer than a 0 ms root (#118 review N1)', async () => {
+    // The root is laid out at width 1 whatever its duration, so its child gets 1 × 5 / 0 = ∞.
+    const tree = node(0, [node(5, [node(2, [], { name: 'g' })], { name: 'c' })], { name: 'root' });
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    const whole = geometry(el);
+
+    bar(el, 'c').click();
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(whole);
+    expect(el.querySelector('.fg-btn')).toBeNull();
+  });
+
   it('draws, after any chain of zooms, the clicked node\'s subtree as that subtree\'s own flame graph', async () => {
     const tree = randomTree(11, 400);
     const flat = layoutFlamegraph(tree);
