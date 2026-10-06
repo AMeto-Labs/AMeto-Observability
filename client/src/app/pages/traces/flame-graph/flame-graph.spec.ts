@@ -1,8 +1,9 @@
 import { TestBed } from '@angular/core/testing';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { of } from 'rxjs';
+import { vi } from 'vitest';
 import {
-  CUT_NOTE, FlamegraphComponent, FlamegraphNode, layoutFlamegraph, subtreeIds,
+  CUT_NOTE, FlamegraphComponent, FlamegraphNode, layoutFlamegraph, subtreeNodes,
 } from './flame-graph';
 import { ApiService } from '../../../core/services/api.service';
 
@@ -34,11 +35,11 @@ function recursiveLayout(r: FlamegraphNode): FlamegraphNode[] {
   return out;
 }
 
-function recursiveIds(f: FlamegraphNode): Set<string> {
-  const ids = new Set<string>();
-  const collect = (n: FlamegraphNode) => { ids.add(n.spanId); n.children.forEach(collect); };
+function recursiveNodes(f: FlamegraphNode): Set<FlamegraphNode> {
+  const nodes = new Set<FlamegraphNode>();
+  const collect = (n: FlamegraphNode) => { nodes.add(n); n.children.forEach(collect); };
   collect(f);
-  return ids;
+  return nodes;
 }
 
 // ── Trees ──
@@ -114,11 +115,15 @@ describe('flame graph layout', () => {
     }
   });
 
-  it('collects the subtree the recursive collect did', () => {
+  it('collects the subtree the recursive collect did — the same node objects', () => {
     const tree = randomTree(9, 2_000);
     const flat = layoutFlamegraph(tree);
-    for (const f of [tree, flat[1], flat[500], flat[flat.length - 1]])
-      expect([...subtreeIds(f)].sort()).toEqual([...recursiveIds(f)].sort());
+    for (const f of [tree, flat[1], flat[500], flat[flat.length - 1]]) {
+      const mine = subtreeNodes(f);
+      const theirs = recursiveNodes(f);
+      expect(mine.size).toBe(theirs.size);
+      expect([...mine].every(n => theirs.has(n))).toBe(true);
+    }
   });
 
   it('lays out a chain far deeper than an engine stack, where the recursive walk overflows', () => {
@@ -132,7 +137,7 @@ describe('flame graph layout', () => {
     expect(flat.length).toBe(levels);
     expect(flat[levels - 1]._depth).toBe(levels - 1);
     expect(flat[levels - 1]._w).toBe(1);
-    expect(subtreeIds(bottom).size).toBe(levels);
+    expect(subtreeNodes(bottom).size).toBe(levels);
   });
 });
 
@@ -345,6 +350,47 @@ describe('flame graph zoom', () => {
     fixture.detectChanges();
     expect(geometry(el)).toEqual(whole);
     expect(el.querySelector('.fg-btn')).toBeNull();
+  });
+
+  it('zooms by the node itself: an id-less span elsewhere in the trace stays out (#118 ultrareview)', async () => {
+    // The empty span id repeats — the server dedupes only non-empty ids — so x and y share one.
+    const idless = { spanId: '0000000000000000' };
+    const tree = node(16, [
+      node(8, [node(4, [], { ...idless, name: 'x' })], { name: 'a' }),
+      node(8, [node(4, [], { ...idless, name: 'y' })], { name: 'b' }),
+    ], { name: 'root' });
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      const fixture = await render(tree);
+      const el: HTMLElement = fixture.nativeElement;
+      const drawn = () => Object.keys(geometry(el));
+      const focusedBars = () =>
+        Array.from(el.querySelectorAll<HTMLElement>('.fg-bar--focused')).map(b => b.title.split(' ')[0]);
+
+      bar(el, 'a').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['a', 'x']);
+
+      bar(el, 'x').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['x']);
+      expect(focusedBars()).toEqual(['x']);
+
+      bar(el, 'x').click();         // the focused bar again: back to the whole tree
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['root', 'a', 'x', 'b', 'y']);
+      expect(focusedBars()).toEqual([]);
+
+      bar(el, 'y').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['y']);
+      expect(focusedBars()).toEqual(['y']);
+
+      // Two bars with one track key make Angular warn (NG0955) and mis-pair their elements.
+      expect(warn.mock.calls.filter(c => String(c[0]).includes('NG0955'))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('draws, after any chain of zooms, the clicked node\'s subtree as that subtree\'s own flame graph', async () => {

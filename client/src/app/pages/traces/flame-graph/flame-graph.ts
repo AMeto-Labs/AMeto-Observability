@@ -61,16 +61,21 @@ export function layoutFlamegraph(root: FlamegraphNode): FlamegraphNode[] {
   return out;
 }
 
-/** The span ids of `node` and every node below it — iteratively, for the reason above. */
-export function subtreeIds(node: FlamegraphNode): Set<string> {
-  const ids = new Set<string>();
+/**
+ * `node` and every node below it — the tree's own objects, walked iteratively, for the reason
+ * above. Not their span ids: an id is not a node's identity here. The empty id repeats (the
+ * server dedupes only non-empty ids), so a subtree gathered by id also took in every id-less span
+ * elsewhere in the trace (#118 ultrareview).
+ */
+export function subtreeNodes(node: FlamegraphNode): Set<FlamegraphNode> {
+  const nodes = new Set<FlamegraphNode>();
   const stack: FlamegraphNode[] = [node];
   while (stack.length) {
     const n = stack.pop()!;
-    ids.add(n.spanId);
+    nodes.add(n);
     for (const c of n.children) stack.push(c);
   }
-  return ids;
+  return nodes;
 }
 
 /** What a cut node's title and tooltip say. */
@@ -125,7 +130,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
         </div>
 
         <div class="fg-canvas" #canvas>
-          @for (node of visibleNodes(); track node.spanId + node._depth) {
+          @for (node of visibleNodes(); track node) {
             <div class="fg-bar"
                  [title]="barTitle(node)"
                  [style.left.%]="barLeft(node)"
@@ -135,7 +140,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
                  [style.background]="barColor(node)"
                  [class.fg-bar--error]="node.status === 'Error'"
                  [class.fg-bar--cut]="node.truncated"
-                 [class.fg-bar--focused]="focused()?.spanId === node.spanId"
+                 [class.fg-bar--focused]="focused() === node"
                  (mouseenter)="hovered.set(node)"
                  (mouseleave)="hovered.set(null)"
                  (click)="focusNode(node)">
@@ -328,14 +333,15 @@ export class FlamegraphComponent implements OnChanges {
    * return re-scaled copies, and a bar clicked inside a zoomed view handed {@link focusNode} its
    * copy, whose `_x` / `_w` / `_depth` were already relative to that zoom: applied to the full
    * layout, they put the next zoom's bars at the wrong offset or off the canvas (#94). A bar now
-   * IS its node, so a click can only focus a node of the tree.
+   * IS its node, so a click can only focus a node of the tree — and the node, not its span id, is
+   * what the focus, the subtree, the focused bar's class and the `@for` track all go by.
    */
   visibleNodes = computed(() => {
     const all = this.flatNodes();
     const f   = this.focused();
     if (!f) return all;
-    const ids = subtreeIds(f);
-    return all.filter(n => ids.has(n.spanId));
+    const inside = subtreeNodes(f);
+    return all.filter(n => inside.has(n));
   });
 
   /**
@@ -383,7 +389,7 @@ export class FlamegraphComponent implements OnChanges {
    * pre-zoom places on the shifted rows (#118 review N1). Such a click leaves the view as it is.
    */
   focusNode(node: FlamegraphNode) {
-    if (this.focused()?.spanId === node.spanId) {
+    if (this.focused() === node) {
       this.focused.set(null);
     } else if (Number.isFinite(node._w) && node._w! > 0) {
       this.focused.set(node);
