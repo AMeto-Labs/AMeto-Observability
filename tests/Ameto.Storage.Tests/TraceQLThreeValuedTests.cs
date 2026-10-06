@@ -42,17 +42,90 @@ public sealed class TraceQLThreeValuedTests
     };
 
     /// <summary>
-    /// The predicate's answer — asserted equal to what a page runs, the evaluator that reads every
-    /// attribute the filter names in one walk of the span's map (#94), so every table below holds
-    /// for both.
+    /// The predicate's answer — and, asserted equal to it, what a page runs: the evaluator that reads
+    /// every attribute the filter names in one walk of the span's map (#94), so every table below
+    /// holds for both.
+    ///
+    /// <para>ASKED OF A SPAN THAT HAS A MAP, which most spans here do not. They are built from a
+    /// dictionary, and for a span with no map the evaluator hands the whole question back to the AST:
+    /// asking it about them compared the AST with itself, and a broken cell in the evaluator's own
+    /// And or Or table left every table in this class green (#123 review F1). The span's MAP TWIN —
+    /// its dictionary written out as msgpack, the shape storage hands a page — is what reaches the
+    /// evaluator's plan, and a filter that names an attribute must walk it, or this check has gone
+    /// vacuous again. Every such filter in this class starts with an attribute, so nothing can have
+    /// short-circuited the walk away.</para>
     /// </summary>
     private static bool? Eval(string query, SpanRecord span)
     {
         var   pred  = TraceQLParser.Parse(query);
         bool? alone = pred.Evaluate(span);
         Assert.Equal(alone, new SpanPredicateEvaluator(pred).Evaluate(span));
+
+        if ((span.AttributesBytes.IsEmpty ? MapTwin(span) : span) is { } withMap)
+        {
+            Assert.Equal(alone, pred.Evaluate(withMap));   // the twin asks the AST the same question
+
+            var shared = new SpanPredicateEvaluator(pred);
+            Assert.Equal(alone, shared.Evaluate(withMap));
+            if (NamesAnAttribute(pred))
+                Assert.True(shared.WalksForTest > 0,
+                    $"{query}: the evaluator never walked the span's map, so its own tables were never asked");
+        }
         return alone;
     }
+
+    /// <summary>
+    /// <paramref name="span"/> with its dictionary written out as one msgpack map instead — null when
+    /// it carries no dictionary. Every value shape the dictionaries in this class hold has a msgpack
+    /// spelling.
+    /// </summary>
+    private static SpanRecord? MapTwin(SpanRecord span)
+    {
+        if (span.Attributes is not { } attrs) return null;
+
+        var buf = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var w   = new MessagePack.MessagePackWriter(buf);
+        w.WriteMapHeader(attrs.Count);
+        foreach (var (key, value) in attrs)
+        {
+            w.Write(key);
+            switch (value)
+            {
+                case null:     w.WriteNil(); break;
+                case string s: w.Write(s);   break;
+                case long l:   w.Write(l);   break;
+                case double d: w.Write(d);   break;
+                case bool b:   w.Write(b);   break;
+                default: throw new ArgumentException($"no msgpack shape for a {value.GetType()} attribute", nameof(span));
+            }
+        }
+        w.Flush();
+
+        return new SpanRecord
+        {
+            TraceId           = span.TraceId,
+            SpanId            = span.SpanId,
+            ParentSpanId      = span.ParentSpanId,
+            StartTimeUnixNano = span.StartTimeUnixNano,
+            DurationNanos     = span.DurationNanos,
+            Name              = span.Name,
+            ServiceName       = span.ServiceName,
+            Kind              = span.Kind,
+            Status            = span.Status,
+            HttpStatusCode    = span.HttpStatusCode,
+            AttributesBytes   = buf.WrittenSpan.ToArray(),
+        };
+    }
+
+    private static bool NamesAnAttribute(SpanPredicate p) => p switch
+    {
+        AndPredicate a             => NamesAnAttribute(a.Left) || NamesAnAttribute(a.Right),
+        OrPredicate o              => NamesAnAttribute(o.Left) || NamesAnAttribute(o.Right),
+        NotPredicate n             => NamesAnAttribute(n.Inner),
+        AttributePredicate         => true,
+        AttributePresencePredicate => true,
+        _                          => false,
+    };
 
     // Building blocks, chosen so each is unambiguous against WithTenant("acme"):
     private const string True    = ".tenant = \"acme\"";      // present and equal
