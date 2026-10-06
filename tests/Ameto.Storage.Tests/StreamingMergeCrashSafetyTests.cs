@@ -1109,12 +1109,12 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A file a manifest lists that the catalog names is no longer that manifest's to delete. A path
-    /// comes back into service when a peer pushes a replica again to the path its merged-away copy
-    /// had; recovery used to unlink it out from under the new entry, which then named a file that was
+    /// A replica a manifest lists that the catalog names is no longer that manifest's to delete. A
+    /// replica's path comes back into service when its peer pushes it again after a merge took it;
+    /// recovery used to unlink it out from under the new entry, which then named a file that was
     /// gone. It is left alone, and it does not hold the manifest either — the rule a parked delete
-    /// already follows when the catalog names its path again — so no later start deletes it.
-    /// Built directly: a manifest whose output exists, listing a live segment.
+    /// already follows when the catalog names its path again — so no later start deletes it. Built
+    /// directly: a manifest whose output exists, listing a replica imported to <c>{node}-{id}.seg</c>.
     /// </summary>
     [Fact]
     public async Task AListedFileTheCatalogNames_IsNeitherDeletedNorWaitedFor()
@@ -1124,8 +1124,8 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
             await WriteSegmentAsync(round, 60);
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
         var output = Assert.Single(_engine.ListSegments()).FilePath;
-        await WriteSegmentAsync(10, 60);
-        var live   = Assert.Single(_engine.ListSegments(), s => s.FilePath != output).FilePath;
+        var live   = WritePeerSegment(903);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(live));
         var before = ReadEverything();
         await File.WriteAllLinesAsync(output + ".mergemanifest", [Path.GetFileName(live)]);
 
@@ -1141,6 +1141,34 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.True(File.Exists(live), "the next start unlinked it");
         Assert.Equal(2, _engine.ListSegments().Count);
         AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// A source with a name only this node writes, in the catalog beside its output, is taken out
+    /// by the next pass's sweep as a commit takes out its sources. It got there because the start's
+    /// sweep missed the manifest (it could not read it) and the scan registered all eleven files.
+    /// The sweep used to leave it in service as if a peer had pushed it again and drop the
+    /// manifest: 1 200 events for 600, for good, and the pass's merge copied the duplicates into a
+    /// new output. Seam-free, so it runs alike on every platform.
+    /// </summary>
+    [Fact]
+    public async Task ASourceTheScanRegisteredBesideItsOutput_IsTakenOutByTheNextPass()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await RestartAsync();                                             // no manifest yet: the scan registers all 11 (a boot-sweep miss)
+        Assert.Equal(11, _engine.ListSegments().Count);                   // setup
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);   // the manifest the boot sweep could not read
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        AssertSameEvents(before, ReadEverything());
+
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);
+        Assert.Empty(Manifests());
+        foreach (var name in snap.Keys) Assert.False(File.Exists(Path.Combine(SegDir, name)), $"{name} survived the pass");
     }
 
     /// <summary>

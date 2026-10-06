@@ -662,7 +662,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// Each hold is short: an import's is a dictionary exchange and a rename (the segment's
     /// contents were read before it); a delete's, a removal and one unlink; a merge commit's, one
     /// swap and a park per source, with no unlink at all; merge recovery's, a lookup and a park
-    /// per source.</para>
+    /// per source, and the removal of an entry a scan registered by mistake.</para>
     /// </summary>
     private readonly System.Threading.Lock                _importLock = new();
 
@@ -3825,11 +3825,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// segment of its window for its whole run (#114), so a merge under a long query leaves every
     /// source it reached parked on Windows, and each 15 s pass logged up to
     /// <see cref="MergeMaxSources"/> Warnings for deletes already being retried. Left to the park,
-    /// the manifest waits a pass longer. One the catalog NAMES is in service again: a peer pushed
-    /// the replica to the path its merged-away copy had. It is neither unlinked — which left its
-    /// entry naming a file that was gone — nor waited for: the rule a parked delete follows when the
-    /// catalog names its path again. So the manifest can go without it, and no later start unlinks
-    /// it before its scan names it.</para>
+    /// the manifest waits a pass longer. A REPLICA the catalog names, <c>{node}-{id}.seg</c>, is in
+    /// service again: a peer pushed it to the path its merged-away copy had. It is neither unlinked
+    /// — which left its entry naming a file that was gone — nor waited for: the rule a parked delete
+    /// follows when the catalog names its path again. So the manifest can go without it, and no
+    /// later start unlinks it before its scan names it.</para>
+    ///
+    /// <para>A name only this node writes cannot come back that way. In the catalog beside its
+    /// output, it is a source a catalog scan registered because the sweep before it missed this
+    /// manifest (it could not read the file), and its events are counted twice. It is taken out as
+    /// a commit takes out its sources: the entry removed and recorded for a running scan under both
+    /// locks, the file parked and unlinked. Left in service with the manifest gone, it stayed a
+    /// duplicate until its TTL, and the next merge copied it into a new output.</para>
     ///
     /// <para>Deciding on the output alone holds only while the output stays where its manifest
     /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
@@ -3890,28 +3897,45 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             if (!string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) sources.Add(path);
         }
 
-        var keys    = new SegmentKey[sources.Count];
-        var unlink  = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
-        var guarded = new bool[sources.Count];
+        var keys      = new SegmentKey[sources.Count];
+        var unlink    = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
+        var guarded   = new bool[sources.Count];
+        var inService = new bool[sources.Count];      // a replica pushed again: no longer this manifest's
         for (int i = 0; i < keys.Length; i++) keys[i] = KeyOfSegmentFileName(sources[i]);
 
         lock (_importLock)
         lock (_scanDeleteGate)
         {
             for (int i = 0; i < unlink.Length; i++)
-                if (!_pendingSegmentDeletes.ContainsKey(sources[i]) && !CatalogNamesPath(keys[i], sources[i]))
-                    unlink[i] = sources[i];
+            {
+                if (_pendingSegmentDeletes.ContainsKey(sources[i])) continue;
+                if (_segments.TryGetValue(keys[i], out var entry)
+                    && string.Equals(entry.FilePath, sources[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    if (IsReplicaFileName(sources[i]))
+                    {
+                        inService[i] = true;
+                        continue;
+                    }
+                    // A name only this node writes: in the catalog beside its output because a
+                    // catalog scan registered it after the sweep before it missed this manifest.
+                    // Taken out as a commit takes out its sources, entry first.
+                    if (!_segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(keys[i], entry))) continue;
+                    ForgetRemovedSegment(keys[i], sources[i]);
+                }
+                unlink[i] = sources[i];
+            }
             ParkMergeSourceGuards(keys, unlink, guarded);
         }
         try     { SettleMergedSources(keys, unlink, guarded); }
         finally { ReleaseUntriedMergeGuards(guarded); }
 
         // The manifest goes once nothing it lists is left to it: no source parked, and none on disk
-        // that the catalog does not name. File.Exists, the merge's own test for the same decision.
+        // but a replica back in service. File.Exists, the merge's own test for the same decision.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
             anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i])
-                      || (!CatalogNamesPath(keys[i], sources[i]) && File.Exists(sources[i]));
+                      || (!inService[i] && File.Exists(sources[i]));
         if (!anyLeft)
         {
             File.Delete(manifest);
@@ -4003,10 +4027,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         return default;
     }
 
-    /// <summary>Whether the catalog holds an entry under <paramref name="key"/> for the file at <paramref name="path"/>.</summary>
-    private bool CatalogNamesPath(SegmentKey key, string path) =>
-        _segments.TryGetValue(key, out var current)
-        && string.Equals(current.FilePath, path, StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Whether a segment file's NAME is a replica's, <c>{node}-{id}.seg</c>: the name an import
+    /// lands a file at, and so the only one a merged-away source can come back into service under.
+    /// Every name this node writes carries the segment's time span after its id.
+    /// </summary>
+    private static bool IsReplicaFileName(string path)
+    {
+        ReadOnlySpan<char> stem = Path.GetFileNameWithoutExtension(path.AsSpan());
+        int dash = stem.IndexOf('-');
+        return dash > 0
+            && stem[(dash + 1)..].IndexOf('-') < 0
+            && uint.TryParse(stem[..dash], System.Globalization.NumberStyles.None,
+                             System.Globalization.CultureInfo.InvariantCulture, out _)
+            && ulong.TryParse(stem[(dash + 1)..], System.Globalization.NumberStyles.None,
+                              System.Globalization.CultureInfo.InvariantCulture, out _);
+    }
 
     /// <summary>
     /// Writes a frozen tier as ONE SEGMENT PER LOG LEVEL, so every segment holds a single
