@@ -26,7 +26,7 @@ public sealed class SegmentReader : ISegmentReader
     //     per file, and a group directory names their offsets and time bounds. v4-v6 files
     //     stay readable as ONE implicit group covering the whole file, so no data is wiped.
     private const ushort MinSupportedVersion = 4;
-    private const ushort MaxSupportedVersion = 7;
+    internal const ushort MaxSupportedVersion = 7;
 
     /// <summary>Block MinTs for a pre-v6 segment, which has no zone map — never prunes.</summary>
     private const long UnknownBlockMinTs = long.MinValue;
@@ -218,7 +218,13 @@ public sealed class SegmentReader : ISegmentReader
 
         if (magic != MagicHeader)
             throw new InvalidDataException($"Segment header magic mismatch in {filePath}");
-        if (version is < MinSupportedVersion or > MaxSupportedVersion)
+        // The FUTURE is not damage (#119 review F2): a version above the newest this build reads is a
+        // rollback's file, which a build that knows the format reads whole. Its own exception, so the
+        // catalog scan keeps it under its name where it sets torn bytes aside as .seg.corrupt — and
+        // before any offset below is trusted, since a newer layout may put them elsewhere.
+        if (version > MaxSupportedVersion)
+            throw new NewerSegmentFormatException(filePath, version);
+        if (version < MinSupportedVersion)
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         // The index lies between the header and the footer, and its count is read AT it.
@@ -1231,4 +1237,24 @@ public readonly struct PooledSection : IDisposable
     {
         if (_rented is not null) ArrayPool<byte>.Shared.Return(_rented);
     }
+}
+
+/// <summary>
+/// A <c>.seg</c> whose header says it was written in a format NEWER than this build reads — the file
+/// a rollback meets, not a damaged one (#119 review F2). The catalog scan sets torn bytes aside as
+/// <c>.seg.corrupt</c>, which nothing enumerates again; this one it must keep under its name for the
+/// build that reads it whole.
+///
+/// <para>Deliberately NOT an <see cref="InvalidDataException"/> (sealed in any case), the metric
+/// engine's <c>NewerMetricFormatException</c>'s reasoning: every classifier of read failures here
+/// decides "the bytes are bad" on that type, so this one cannot fall into a quarantining branch
+/// whatever the order of a classifier's arms — and a caller that does not know it treats it like any
+/// other failure to read (a query skips it, an import refuses it, an incumbent check keeps it).</para>
+/// </summary>
+internal sealed class NewerSegmentFormatException(string filePath, ushort version)
+    : NotSupportedException(
+        $"{filePath} is segment format v{version}, newer than this build reads (v{SegmentReader.MaxSupportedVersion} at most)")
+{
+    /// <summary>The format version the file's header declares.</summary>
+    public ushort Version { get; } = version;
 }

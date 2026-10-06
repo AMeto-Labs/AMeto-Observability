@@ -24,6 +24,17 @@ internal static partial class StorageEngineLog
     internal static partial void CatalogSegmentUnreachable(ILogger logger, Exception exception, string file);
 
     /// <summary>
+    /// A segment in a newer format than this build reads (#119 review F2): kept under its name, out of
+    /// the catalog — not set aside, not Degraded. One Error per such segment at every start, naming it
+    /// and its version, because its events are not served until a build that reads it runs.
+    /// </summary>
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Segment {File} was written in segment format v{Version}, newer than this build reads: it is left on "
+                + "disk untouched, under its name — setting it aside would hide events a build that knows the format can "
+                + "read — and its events are not served until this node runs such a build")]
+    internal static partial void CatalogSegmentNewerFormat(ILogger logger, Exception exception, string file, int version);
+
+    /// <summary>
     /// The catalog scan failed AS A WHOLE (#94): the directory could not be listed, or the recovery of
     /// interrupted merges threw — a file that fails on its own is handled inside the scan (set aside
     /// for its bytes, otherwise left unread with an Error of its own, see above). The

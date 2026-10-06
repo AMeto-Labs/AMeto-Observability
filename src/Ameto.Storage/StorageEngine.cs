@@ -554,8 +554,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// the task that did not complete successfully IS the record that the catalog is short, and it
     /// is final — nothing scans again before a restart. Degraded as well after a scan that left a
     /// segment unread for a reason that is not its bytes (<see cref="_catalogScanShort"/>). A segment
-    /// set aside FOR its bytes (<c>.seg.corrupt</c>) does not make the store degraded: that is what
-    /// the disk holds, not a load left unfinished.</para>
+    /// set aside FOR its bytes (<c>.seg.corrupt</c>), or kept unread because a newer build wrote it,
+    /// does not make the store degraded: that is what the disk holds for this build, not a load left
+    /// unfinished.</para>
     ///
     /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
     /// step of the teardown after its final flush. Conservative by a few steps — reads stay whole
@@ -4257,6 +4258,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 lock (_scanDeleteGate) skip = ScanSkipUnderGate(file);
                 if (LogScanSkip(skip, file, ex)) continue;
 
+                // A NEWER FORMAT IS NEITHER (#119 review F2): not torn bytes to set aside — .seg.corrupt
+                // is enumerated by nothing, so a build that reads the file would never see it again —
+                // and not a load left unfinished, since no restart of THIS build reads it. Kept under
+                // its name and out of the catalog, one Error naming its version, the store not
+                // Degraded; its id stays reserved, the allocator counting file names.
+                if (ex is NewerSegmentFormatException newer)
+                {
+                    StorageEngineLog.CatalogSegmentNewerFormat(_logger, ex, file, newer.Version);
+                    continue;
+                }
+
                 // NOT ABOUT THE BYTES: LEFT WHERE IT IS (#119 review — #108's rule for metrics and
                 // traces). This branch set aside whatever the open threw: a segment an antivirus or
                 // a backup agent held for a moment, one on a share that blinked, one a process out
@@ -4353,7 +4365,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
             bool letGo;
             lock (_scanDeleteGate) letGo = ScanSkipUnderGate(file) != ScanSkip.None;
-            if (letGo || FileBounds.DescribesContent(fault)
+            if (letGo || FileBounds.DescribesContent(fault) || fault is NewerSegmentFormatException
                 || attempt > CatalogReadRetryDelays.Length || retryTicksLeft <= 0)
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(fault);
 

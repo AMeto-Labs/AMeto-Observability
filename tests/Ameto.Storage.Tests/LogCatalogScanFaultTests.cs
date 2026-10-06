@@ -260,7 +260,53 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         Assert.Equal(QueryAvailability.Available, engine.Availability);
     }
 
+    // ── A newer format: kept, as the future it is ─────────────────────────────────────────────
+
+    /// <summary>
+    /// A ROLLBACK MUST NOT SET THE FUTURE ASIDE (#119 review F2). A segment whose header says a version
+    /// above the newest this build reads was refused as "Unsupported segment version", an
+    /// InvalidDataException, and renamed .seg.corrupt — which nothing enumerates again, so after
+    /// rolling forward its events stayed unserved until someone renamed the file back. It is kept now,
+    /// byte for byte, under its name and out of the catalog, with one Error naming its version; it is
+    /// not retried, and the store is not Degraded — no restart of this build changes it.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_in_a_newer_format_is_kept_under_its_name_and_degrades_nothing()
+    {
+        var segs = await WriteSegmentsAsync(2);
+        string future = segs[0];
+        int    v      = SegmentReader.MaxSupportedVersion + 1;
+        WriteUInt16At(future, 4, (ushort)v);   // header bytes 4-5: the format version
+        byte[] before = File.ReadAllBytes(future);
+
+        var newer = Assert.Throws<NewerSegmentFormatException>(() => SegmentReader.Open(future));
+        Assert.Equal(v, (int)newer.Version);
+        Assert.False(FileBounds.DescribesContent(newer));   // no content classifier calls it damage
+
+        var log = new Entries();
+        await using var engine = await StartAsync(log, e =>
+            e._catalogScanWaitForTest = static _ => throw new InvalidOperationException("a newer format is not retried"));
+
+        Assert.Equal(before, File.ReadAllBytes(future));
+        Assert.False(File.Exists(future + ".corrupt"), "a newer-format segment was set aside as corrupt");
+        Assert.DoesNotContain(engine.ListSegments(), s => s.FilePath == future);
+        Assert.Contains(engine.ListSegments(), s => s.FilePath == segs[1]);
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+        var error = Assert.Single(log.Snapshot(), e => e.Level >= MsLogLevel.Error);
+        Assert.Contains(future, error.Message);
+        Assert.Contains($"format v{v}", error.Message);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────────────────────
+
+    private static void WriteUInt16At(string path, long at, ushort value)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write);
+        Span<byte> b = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(b, value);
+        fs.Seek(at, SeekOrigin.Begin);
+        fs.Write(b);
+    }
 
     /// <summary>Footer slot offsets (the footer is a file's last 44 bytes): the v7 group directory, and the block index.</summary>
     private const int GroupDirectorySlot = 0, BlockIndexSlot = 24;

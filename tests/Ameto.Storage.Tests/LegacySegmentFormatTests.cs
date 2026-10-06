@@ -293,12 +293,14 @@ public sealed class LegacySegmentFormatTests : IDisposable
         }
     }
 
-    /// <summary>An unsupported version must be REPORTED, not guessed at — the catalog deletes
-    /// what it cannot open, so a silent mis-parse would be worse than the exception.</summary>
+    /// <summary>An unsupported version must be REPORTED, not guessed at — a silent mis-parse would be
+    /// worse than the exception. An OLDER one is damage to this build (InvalidDataException: the catalog
+    /// sets it aside); a NEWER one is the future (NewerSegmentFormatException: the catalog keeps it under
+    /// its name for the build that reads it, #119 review F2).</summary>
     [Theory]
-    [InlineData((ushort)3)]
-    [InlineData((ushort)8)]
-    public void AnUnsupportedVersionIsRejected(ushort version)
+    [InlineData((ushort)3, typeof(InvalidDataException))]
+    [InlineData((ushort)8, typeof(NewerSegmentFormatException))]
+    public void AnUnsupportedVersionIsRejected(ushort version, Type expected)
     {
         var rows = BuildRows(idBase: 30_000, tsStep: TimeSpan.TicksPerSecond);
         string path = WriteLegacySegment(5, rows, 70, $"bad-{version}.seg");
@@ -309,7 +311,7 @@ public sealed class LegacySegmentFormatTests : IDisposable
             fs.Seek(4, SeekOrigin.Begin);
             fs.Write(v);
         }
-        Assert.Throws<InvalidDataException>(() => SegmentReader.Open(path));
+        Assert.Throws(expected, () => SegmentReader.Open(path));
     }
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
