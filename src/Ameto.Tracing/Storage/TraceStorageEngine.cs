@@ -4608,6 +4608,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             segs = _coldSegments;
             runs = UnflushedRunsLocked();
+            _listCapturedForTest?.Invoke(segs, runs.Flushing.ToArray(), runs.Hot.ToArray());
         }
         finally { _lock.ExitReadLock(); }
 

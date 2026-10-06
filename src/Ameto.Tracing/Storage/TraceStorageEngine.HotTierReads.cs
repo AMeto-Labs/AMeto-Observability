@@ -94,6 +94,23 @@ public sealed partial class TraceStorageEngine
     internal Action<int>? _hotSearchVisitedForTest;
 
     /// <summary>
+    /// Test seam: the two runs the TraceQL hot pass captured — the snapshot's, then the live tier's —
+    /// copied inside the same read-lock hold, on the reading thread. A race test checks every walk
+    /// against exactly these. Copied only when set.
+    /// </summary>
+    internal Action<SpanRecord[], SpanRecord[]>? _hotSearchCapturedForTest;
+
+    /// <summary>
+    /// Test hook: the TraceQL hot pass alone, over <c>[from, to]</c> and an optional status — what
+    /// <see cref="SearchSpansAsync"/> runs before it reads a cold segment.
+    /// </summary>
+    internal List<SpanRecord> HotMatchesForTest(DateTimeOffset from, DateTimeOffset to, SpanStatusCode? status,
+                                                int limit, out bool evicted) =>
+        SelectHotMatches(new SpanMatch(from.ToUnixTimeMilliseconds() * 1_000_000L, to.ToUnixTimeMilliseconds() * 1_000_000L,
+                                       null, null, status, null, null, null),
+                         limit, out evicted);
+
+    /// <summary>
     /// THE NEWEST <paramref name="limit"/> UNFLUSHED SPANS <paramref name="match"/> ACCEPTS, newest
     /// first, and whether a match had to be turned away to keep them — <see cref="SearchSpansAsync"/>'s
     /// hot pass. One copy per (trace, span) id: a re-sent span or a WAL replay must not cost a slot.
@@ -141,7 +158,11 @@ public sealed partial class TraceStorageEngine
     {
         UnflushedRuns runs;
         _lock.EnterReadLock();
-        try     { runs = UnflushedRunsLocked(); }
+        try
+        {
+            runs = UnflushedRunsLocked();
+            _hotSearchCapturedForTest?.Invoke(runs.Flushing.ToArray(), runs.Hot.ToArray());
+        }
         finally { _lock.ExitReadLock(); }
 
         _hotSearchPassForTest?.Invoke();
@@ -330,6 +351,13 @@ public sealed partial class TraceStorageEngine
 
     /// <summary>Test seam: how many unflushed spans a trace-list page read, reported once per page.</summary>
     internal Action<int>? _listHotVisitedForTest;
+
+    /// <summary>
+    /// Test seam: what a trace-list page captured in its one read-lock hold — the cold array, the
+    /// snapshot's run and the live tier's run, the runs copied inside that hold — on the reading
+    /// thread. A race test checks every page against exactly these. Copied only when set.
+    /// </summary>
+    internal Action<SpanSegmentInfo[], SpanRecord[], SpanRecord[]>? _listCapturedForTest;
 
     /// <summary>
     /// Merges every span of one run that starts inside <c>[fromNano, toNano]</c>, in tier order —

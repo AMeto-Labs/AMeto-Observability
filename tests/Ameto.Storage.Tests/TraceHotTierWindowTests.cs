@@ -271,10 +271,15 @@ public sealed class TraceHotTierWindowTests : IDisposable
 
     /// <summary>
     /// THE TRACEQL HOT PASS WALKS WITH THE LOCK FREE, and answers for exactly what it captured. It is
-    /// parked inside its walk; from there another thread must take the engine's write lock without
-    /// waiting (TryEnterWriteLock(0): no timer decides it), and 500 newer spans and a whole flush go
-    /// in underneath the parked walk. Let go, it must return the newest of the spans it captured —
-    /// not one of the newer ones. Back inside the read lock, the writer cannot get in.
+    /// parked after its capture, before its walk; from there another thread must take the engine's
+    /// write lock without waiting (TryEnterWriteLock(0): no timer decides it), and 500 newer spans and
+    /// a whole flush go in underneath it — appends past the captured prefix, a list growth, a
+    /// widening of the captured partial block, a detach and a publish. Let go, the walk must return
+    /// the newest of the spans it captured — not one of the newer ones. Back inside the read lock,
+    /// the writer cannot get in.
+    ///
+    /// <para>This does not race a walk: nothing runs while the walk itself is reading.
+    /// <see cref="Readers_racing_a_writer_get_exactly_the_page_of_what_they_captured"/> does.</para>
     /// </summary>
     [Fact]
     public async Task The_TraceQL_hot_pass_walks_with_the_lock_free_and_answers_for_what_it_captured()
@@ -312,9 +317,147 @@ public sealed class TraceHotTierWindowTests : IDisposable
         var got = await call.WaitAsync(HangGuard);
 
         Assert.False(readLockHeld, "the TraceQL hot pass walked holding the read lock");
-        Assert.True(writerGotIn, "a writer could not take the lock while the hot pass was mid-walk");
+        Assert.True(writerGotIn, "a writer could not take the lock while the hot pass was parked after its capture");
         var (kept, _) = ReferenceHotPass(captured, static _ => true, 300);
         Assert.Equal(kept.Select(Describe), got.Select(Describe));
+    }
+
+    // What the engine captured for the read in progress on this thread — handed over by its seams.
+    [ThreadStatic] private static SpanRecord[]?      t_flushing;
+    [ThreadStatic] private static SpanRecord[]?      t_hot;
+    [ThreadStatic] private static SpanSegmentInfo[]? t_cold;
+
+    /// <summary>
+    /// READERS RACING A WRITER GET EXACTLY THE PAGE OF WHAT THEY CAPTURED (#122 review N2). Three
+    /// readers page both fetchers — the TraceQL hot pass and the trace list — while one thread
+    /// appends spans in drainer-sized holds and another flushes the tier every few tens of
+    /// milliseconds, alternately publishing a segment and failing to (so the tier is detached,
+    /// published, or put back as a rebuilt list underneath the walks). Every page is checked against
+    /// the oracle over EXACTLY the runs it captured, copied in the same read-lock hold through the
+    /// engine's seams: <see cref="ReferenceHotPass"/> for the hot pass, <see cref="ListModel"/> for the
+    /// list. A walk that read anything but its captured prefix — an element overwritten, a block
+    /// skipped on a bound narrower than its spans — returns a page the oracle does not.
+    ///
+    /// <para>NEVER RED BY CHANCE: nothing here is timed, every start is unique (ties would let two
+    /// right answers differ), and a reader's verdict depends only on what it captured. Only the
+    /// amount of racing varies with the machine; the readers each finish at least
+    /// <c>MinPages</c> pages, and the writer does not start until every reader is reading.</para>
+    /// </summary>
+    [Fact]
+    public void Readers_racing_a_writer_get_exactly_the_page_of_what_they_captured()
+    {
+        const int Readers = 3, MinPages = 15, Spans = 16_000, Hold = 256;
+        using var engine = NewEngine();
+        var corpus = RaceCorpus(Spans);
+        engine._hotSearchCapturedForTest = static (f, h) => { t_flushing = f; t_hot = h; };
+        engine._listCapturedForTest      = static (c, f, h) => { t_cold = c; t_flushing = f; t_hot = h; };
+
+        var  failures   = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var  pages      = new int[Readers];
+        int  writerDone = 0;
+        using var reading = new CountdownEvent(Readers);
+        long newest = corpus.Max(static s => s.StartTimeUnixNano);
+
+        var readers = Enumerable.Range(0, Readers).Select(r => new Thread(() =>
+        {
+            var rnd = new Random(1_000 + r);
+            try
+            {
+                reading.Signal();
+                for (int page = 0; Volatile.Read(ref writerDone) == 0 || page < MinPages; page++)
+                {
+                    var to = DateTimeOffset.FromUnixTimeMilliseconds(
+                        rnd.Next(4) == 0 ? To.ToUnixTimeMilliseconds()
+                                         : (Nano(Base) + rnd.NextInt64(0, newest - Nano(Base))) / 1_000_000L);
+                    if (page % 2 == 0) CheckListPage(engine, rnd, to, failures, r, page);
+                    else               CheckHotPass(engine, rnd, to, failures, r, page);
+                    pages[r]++;
+                }
+            }
+            catch (Exception ex) { failures.Enqueue($"reader {r} threw: {ex}"); }
+        }) { IsBackground = true, Name = $"race-reader-{r}" }).ToList();
+        readers.ForEach(static t => t.Start());
+        Assert.True(reading.Wait(HangGuard), "hang guard: the readers never started");
+
+        var flusher = new Thread(() =>
+        {
+            try
+            {
+                for (int n = 0; Volatile.Read(ref writerDone) == 0; n++)
+                {
+                    Thread.Sleep(25);
+                    engine._beforeSegmentWrite = n % 2 == 1 ? (Action)(static () => throw new IOException("simulated")) : null;
+                    engine.FlushHotTier();   // detach, build, then publish — or restore the tier
+                }
+            }
+            catch (Exception ex) { failures.Enqueue($"flusher threw: {ex}"); }
+            finally { engine._beforeSegmentWrite = null; }
+        }) { IsBackground = true, Name = "race-flusher" };
+        flusher.Start();
+
+        for (int i = 0; i < corpus.Count; i += Hold)
+        {
+            var call = corpus.GetRange(i, Math.Min(Hold, corpus.Count - i)).ToArray();
+            if (engine.WriteSpans(call) != call.Length) failures.Enqueue("a hold was refused");
+            Thread.Sleep(2);
+        }
+        Volatile.Write(ref writerDone, 1);
+
+        Assert.True(flusher.Join(HangGuard), "hang guard: the flusher never finished");
+        foreach (var t in readers) Assert.True(t.Join(HangGuard * 4), "hang guard: a reader never finished");
+
+        _out.WriteLine($"pages checked per reader: {string.Join(", ", pages)}; cold segments at the end: "
+                     + $"{engine.ColdSegmentCountForTest}; failures: {failures.Count}");
+        Assert.True(failures.IsEmpty, string.Join(Environment.NewLine, failures.Take(5)));
+        Assert.All(pages, static p => Assert.True(p >= MinPages));
+        Assert.Equal(0, engine.UnindexedCapturesForTest);
+    }
+
+    private static void CheckListPage(TraceStorageEngine engine, Random rnd, DateTimeOffset to,
+                                      System.Collections.Concurrent.ConcurrentQueue<string> failures, int reader, int page)
+    {
+        var f    = ListFilters[rnd.Next(ListFilters.Length)];
+        var task = engine.GetTraceListAsync(From, to, f.Service, f.Name, f.Status, f.MinDur, f.MaxDur, f.Limit);
+        if (!task.IsCompleted) { failures.Enqueue($"reader {reader} page {page}: a list page yielded"); return; }
+        var actual   = task.GetAwaiter().GetResult();
+        var expected = ListModel([.. t_hot!], [.. t_flushing!], t_cold!, f, to);
+        try { AssertSamePage(expected, actual, $"reader {reader} page {page} (list, {f}, to {to:O})"); }
+        catch (Exception ex) { failures.Enqueue(ex.Message); }
+    }
+
+    private static void CheckHotPass(TraceStorageEngine engine, Random rnd, DateTimeOffset to,
+                                     System.Collections.Concurrent.ConcurrentQueue<string> failures, int reader, int page)
+    {
+        SpanStatusCode? status = rnd.Next(3) == 0 ? SpanStatusCode.Error : null;
+        int  limit = rnd.Next(3) switch { 0 => 10, 1 => 200, _ => 2_000 };
+        var  got   = engine.HotMatchesForTest(From, to, status, limit, out bool evicted);
+        long fromNano = Nano(From), toNano = Nano(to);
+        var (kept, expectEvicted) = ReferenceHotPass(
+            [.. t_flushing!, .. t_hot!],
+            s => s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano && (status is null || s.Status == status.Value),
+            limit);
+        if (evicted != expectEvicted || !kept.Select(Describe).SequenceEqual(got.Select(Describe)))
+            failures.Enqueue($"reader {reader} page {page} (hot pass, status {status?.ToString() ?? "-"}, limit {limit}, "
+                           + $"to {to:O}): {got.Count} spans / evicted {evicted}, the reference has "
+                           + $"{kept.Count} / {expectEvicted}");
+    }
+
+    /// <summary>
+    /// The race's spans: three services, one span a millisecond, and the disorder that loosens the
+    /// start index's bounds — one in a hundred 30 s ahead, one in fifty reported 10 s late. Moved by
+    /// a fraction of a millisecond as well, so no two starts are equal.
+    /// </summary>
+    private static List<SpanIngestItem> RaceCorpus(int count)
+    {
+        var items = TraceAggregateLockProbe.Corpus(0, count, services: 3);
+        for (int i = 0; i < items.Length; i++)
+        {
+            long shift = i % 100 == 37 ? 30_000_000_000L + 250_000L
+                       : i % 50  == 11 ? -10_000_000_000L - 500_000L
+                       :                 0;
+            if (shift != 0) items[i] = At(items[i], items[i].StartTimeUnixNano + shift);
+        }
+        return [.. items];
     }
 
     /// <summary>
