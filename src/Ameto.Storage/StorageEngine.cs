@@ -3854,9 +3854,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// a scan whose sweep proved it at the start (<see cref="ReadMergeOutput"/>). No crash of this
     /// process leaves a torn output at its final name, but a restored backup, or storage that lost
     /// a flushed write in a power cut, can; read as committed, its sources — the batch's only
-    /// readable copy — were deleted. A torn output is a merge that never committed: the sources
-    /// stay, and the output is quarantined here, not left to the scan, which only refuses what it
-    /// cannot frame (<see cref="RecoverTornMerge"/>).</para>
+    /// readable copy — were deleted. A torn output is taken out of service instead: the sources
+    /// still on disk stay, and the output is quarantined here, not left to the scan, which only
+    /// refuses what it cannot frame; sources already gone are reported (<see cref="RecoverTornMerge"/>).</para>
     /// </summary>
     private void RecoverInterruptedMerges()
     {
