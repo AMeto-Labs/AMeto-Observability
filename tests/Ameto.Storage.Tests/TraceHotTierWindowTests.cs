@@ -503,7 +503,7 @@ public sealed class TraceHotTierWindowTests : IDisposable
         for (int round = 0; round < 6; round++)
         {
             long a0    = GC.GetAllocatedBytesForCurrentThread();
-            var (n, sync) = SearchSynchronously(engine, minDuration, status, limit: 2_000);
+            var (n, sync, _) = SearchSynchronously(engine, minDuration, status, limit: 2_000);
             long bytes = GC.GetAllocatedBytesForCurrentThread() - a0;
             Assert.True(sync, $"{shape}: the hot-only page yielded, so this thread saw only part of it");
             Assert.Equal(matches, n);
@@ -513,25 +513,71 @@ public sealed class TraceHotTierWindowTests : IDisposable
         if (best > bound) failures.Add($"{shape}: {best / 1024.0:N1} KB > {bound / 1024:N0} KB");
     }
 
-    /// <summary>SearchSpansAsync driven by hand: how many spans came back, and whether every step completed synchronously.</summary>
-    private static (int Spans, bool Sync) SearchSynchronously(TraceStorageEngine engine, long? minDuration,
-                                                              SpanStatusCode? status, int limit)
+    /// <summary>
+    /// A FULL PAGE OF A DISORDERED TIER IS SIZED ONCE (#122 review L2). The tier is the probe's
+    /// disordered one — 1 span in 100 from a clock 30 s ahead, 1 in 50 reported 10 s late — and a
+    /// stream pages down it, 2 000 spans a page. The walk then reads whole blocks that are mostly
+    /// outside a deep page's window, each kept in by one late span; counted against everything it
+    /// read, the match rate came out low and the heap grew in steps, so a full page cost about half
+    /// as much again as a full page of an ordered tier. Every page here must cost what the ordered
+    /// tier's full page is held to.
+    /// </summary>
+    [Fact]
+    public void A_full_page_of_a_disordered_tier_is_sized_once()
     {
-        int  n    = 0;
-        bool sync = true;
-        var  e    = engine.SearchSpansAsync(From, To, status: status, minDurationNanos: minDuration, limit: limit)
-                          .GetAsyncEnumerator();
+        using var engine = NewEngine();
+        Write(engine, [.. TraceStreamPageProbe.Disordered(TraceAggregateLockProbe.Corpus(0, 20_000))]);
+
+        long cursor = Nano(To);
+        var  pages  = new List<string>();
+        for (int page = 0; page < 6; page++)
+        {
+            Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(cursor, out var pageTo));
+            long best = long.MaxValue, oldest = long.MaxValue;
+            for (int round = 0; round < 6; round++)
+            {
+                long a0 = GC.GetAllocatedBytesForCurrentThread();
+                var (n, sync, low) = SearchSynchronously(engine, null, null, limit: 2_000, to: pageTo);
+                long bytes = GC.GetAllocatedBytesForCurrentThread() - a0;
+                Assert.True(sync, $"page {page}: the hot-only page yielded, so this thread saw only part of it");
+                Assert.Equal(2_000, n);
+                if (round > 0) best = Math.Min(best, bytes);
+                oldest = low;
+            }
+            pages.Add($"{best / 1024.0:N1}");
+            _out.WriteLine($"disordered page {page}: {best / 1024.0,7:N1} KB");
+            Assert.True(best <= 300 * 1024,
+                $"page {page} of a disordered tier allocated {best / 1024.0:N1} KB for a full page "
+                + $"(pages so far: {string.Join(", ", pages)} KB) — the heap is growing in steps again");
+            Assert.True(oldest < cursor);
+            cursor = oldest;
+        }
+    }
+
+    /// <summary>
+    /// SearchSpansAsync driven by hand: how many spans came back, the oldest start among them, and
+    /// whether every step completed synchronously.
+    /// </summary>
+    private static (int Spans, bool Sync, long Oldest) SearchSynchronously(
+        TraceStorageEngine engine, long? minDuration, SpanStatusCode? status, int limit, DateTimeOffset? to = null)
+    {
+        int  n      = 0;
+        long oldest = long.MaxValue;
+        bool sync   = true;
+        var  e      = engine.SearchSpansAsync(From, to ?? To, status: status, minDurationNanos: minDuration, limit: limit)
+                            .GetAsyncEnumerator();
         while (true)
         {
             var step = e.MoveNextAsync();
             sync &= step.IsCompleted;
             if (!(step.IsCompleted ? step.Result : step.AsTask().GetAwaiter().GetResult())) break;
+            oldest = Math.Min(oldest, e.Current.StartTimeUnixNano);
             n++;
         }
         var done = e.DisposeAsync();
         sync &= done.IsCompleted;
         if (!done.IsCompleted) done.AsTask().GetAwaiter().GetResult();
-        return (n, sync);
+        return (n, sync, oldest);
     }
 
     /// <summary>

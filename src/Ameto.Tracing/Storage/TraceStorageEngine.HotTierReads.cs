@@ -182,6 +182,7 @@ public sealed partial class TraceStorageEngine
             var top      = new PriorityQueue<SpanRecord, HotKey>();
             var present  = new HashSet<(TraceId Trace, ulong Span)>();
             int sizedFor = 0;
+            int inWindow = 0;   // spans read that could match at all — the match rate's denominator
             evicted = false;
             visited = 0;
 
@@ -200,10 +201,12 @@ public sealed partial class TraceStorageEngine
                 {
                     var s = run[i];
                     visited++;
+                    if (s.StartTimeUnixNano < match.FromNano || s.StartTimeUnixNano > match.ToNano) continue;
+                    inWindow++;
                     if (!match.Matches(s)) continue;
                     if (top.Count == sizedFor && sizedFor < finalSize)
                     {
-                        sizedFor = NextHeapCapacity(sizedFor, visited, candidates, finalSize);
+                        sizedFor = NextHeapCapacity(sizedFor, inWindow, candidates, finalSize);
                         top.EnsureCapacity(sizedFor);
                         present.EnsureCapacity(sizedFor + 1);   // + the copy AdmitHot adds before it decides
                     }
@@ -235,10 +238,17 @@ public sealed partial class TraceStorageEngine
     ///
     /// <para><b>BY THE PAGE'S OWN MATCH RATE, ONCE IT HAS ONE</b> (#122 review L2). Below
     /// <see cref="SizeHeapAt"/> the heap doubles. Its first time full at that size, the rate it
-    /// has matched at so far — <paramref name="capacity"/> matches in <paramref name="visited"/>
-    /// spans — is extrapolated over the window's <paramref name="candidates"/>, plus a quarter;
-    /// if that proves short, it doubles again. This used to jump straight to the limit, and a page
-    /// ending near 300 matches paid for 2 000: 185 KB, against main's 76.</para>
+    /// has matched at so far — <paramref name="capacity"/> matches among the
+    /// <paramref name="inWindowRead"/> spans it has read inside the window — is extrapolated over the
+    /// window's <paramref name="candidates"/>, plus a quarter; if that proves short, it doubles
+    /// again. This used to jump straight to the limit, and a page ending near 300 matches paid for
+    /// 2 000: 185 KB, against main's 76.</para>
+    ///
+    /// <para><b>INSIDE THE WINDOW</b>, because a disordered tier makes the walk read whole blocks
+    /// that are mostly outside it — a block kept in every page by one late span, its other 127 spans
+    /// above the ceiling. Counted against everything read, the rate came out low and a full page
+    /// grew in doubling steps: 379 KB instead of 259 on the third page of a stream down
+    /// <c>TraceStreamPageProbe</c>'s disordered tier (Debug), 367-395 KB instead of 275 in Release.</para>
     ///
     /// <para><b>WHY NOT DOUBLING ALL THE WAY</b>, which never pays for more than twice what a page
     /// finds: the page that fills its limit pays for every step instead — 354 KB against 259 — and
@@ -254,10 +264,10 @@ public sealed partial class TraceStorageEngine
     /// the spread-out shapes. Never more than a full page, and the cost the jump to the limit put on
     /// every selective page; no rule decided at 256 matches can tell the two apart.</para>
     /// </summary>
-    private static int NextHeapCapacity(int capacity, int visited, int candidates, int finalSize)
+    private static int NextHeapCapacity(int capacity, int inWindowRead, int candidates, int finalSize)
     {
         long next = capacity < SizeHeapAt  ? Math.Max(16L, 2L * capacity)
-                  : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * candidates / Math.Max(1, visited) * 5 / 4)
+                  : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * candidates / Math.Max(1, inWindowRead) * 5 / 4)
                   :                          2L * capacity;
         return (int)Math.Min(finalSize, next);
     }

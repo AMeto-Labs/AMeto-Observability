@@ -125,7 +125,7 @@ public sealed class TraceStreamPageProbe : IDisposable
     /// ahead, one in fifty a long span reported 10 s after it started. Same order of arrival, same
     /// ids, the starts moved.
     /// </summary>
-    private static SpanIngestItem[] Disordered(SpanIngestItem[] corpus)
+    internal static SpanIngestItem[] Disordered(SpanIngestItem[] corpus)
     {
         var items = (SpanIngestItem[])corpus.Clone();
         for (int i = 0; i < items.Length; i++)
