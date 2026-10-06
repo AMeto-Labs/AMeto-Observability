@@ -81,6 +81,62 @@ public sealed class WalFromALaterReleaseTests : IDisposable
         Assert.False(File.Exists(walPath));
     }
 
+    /// <summary>
+    /// The most common rollback: the later release stopped CLEANLY. Its stop leaves one log in
+    /// <c>wal/</c>, empty — the final flush hands its events to segments and opens a successor
+    /// that nothing is written to — and that log is the later format too. It is kept and its block
+    /// reserved like any other, but it is no Error: an Error at every start saying it held events
+    /// sent anyone alerting on Error-level self-logs after a file a hex dump would show was empty.
+    /// The file is this release's own clean-stop leftover, stamped one version up.
+    /// </summary>
+    [Fact]
+    public async Task The_empty_log_a_later_releases_clean_stop_leaves_is_kept_without_an_error()
+    {
+        Directory.CreateDirectory(_dir);
+        var engine = NewEngine();
+        await engine.CatalogLoaded;
+        Assert.True(engine.TryWrite(new LogEventHeader
+        {
+            TimestampUtcTicks        = DateTime.UtcNow.Ticks,
+            Level                    = LogLevel.Information,
+            MessageTemplatePoolIndex = engine.TemplatePool.Intern("t {n}"),
+            ServiceNamePoolIndex     = engine.TemplatePool.Intern("Svc.A"),
+        }, Props(1), "t {n}"));
+        await engine.DisposeAsync();                                                     // clean stop
+
+        string wal = Assert.Single(Directory.GetFiles(WalDir, "*.wal"));
+        Assert.Equal(32L, BinaryPrimitives.ReadInt64LittleEndian(ReadHeader(wal).AsSpan(24)));   // WriteOffset: empty
+        ulong block = BinaryPrimitives.ReadUInt64LittleEndian(ReadHeader(wal).AsSpan(16));
+        SetVersion(wal, (ushort)(WriteAheadLog.FormatVersion + 1));                      // what a later release's clean stop leaves
+
+        for (int start = 1; start <= 2; start++)
+        {
+            var logger = new CapturingLogger();
+            var e      = NewEngine(logger);
+            try
+            {
+                await e.CatalogLoaded;
+                Assert.True(e.LiveWalSegmentId >= block + 6, $"start {start}: the live WAL took block {e.LiveWalSegmentId}, inside the kept log's");
+            }
+            finally { await e.DisposeAsync(); }
+
+            Assert.True(File.Exists(wal), $"start {start} deleted the later release's log");
+            Assert.DoesNotContain(logger.Entries, x => x.Level == Microsoft.Extensions.Logging.LogLevel.Error);
+            Assert.Contains(logger.Entries, x =>
+                x.Level == Microsoft.Extensions.Logging.LogLevel.Information
+                && x.Message.Contains(Path.GetFileName(wal), StringComparison.Ordinal)
+                && x.Message.Contains("records no entries", StringComparison.Ordinal));
+        }
+    }
+
+    private static byte[] ReadHeader(string walPath)
+    {
+        var header = new byte[32];
+        using var fs = new FileStream(walPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        fs.ReadExactly(header);
+        return header;
+    }
+
     private static void SetVersion(string walPath, ushort version)
     {
         using var fs = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite);

@@ -4330,7 +4330,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private void ReplayOrphanedWal(string walFile)
     {
         string poolPath   = walFile + ".pool";
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version);
+        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version, out bool recordsEntries);
 
         // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
         // here. Cleaning it up as the branch below does with what it cannot read is what every
@@ -4338,14 +4338,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // the log holds. Left in place, the release that wrote it replays it when it starts again.
         // Its block is reserved all the same, so nothing written meanwhile takes the ids that
         // replay will write into; and this runs again at every start for as long as it stays.
+        //
+        // Kept whether or not its header records entries — this release cannot read the rest of it —
+        // but only a log that may hold events is an Error. The other kind is what the most common
+        // rollback leaves: the empty log of a clean stop. Reported as holding events, it raised an
+        // Error at every start, for a preallocated file nobody could tell was empty.
         if (version > WriteAheadLog.FormatVersion)
         {
             ReserveWalBlock(segId);
-            _logger.LogError(
-                "WAL {File} is format v{Version}, newer than this release reads (v{Current}): left in place, not " +
-                "replayed. Its events come back when the release that wrote it starts again; delete the file and " +
-                "its .pool only to give them up.",
-                walFile, version, WriteAheadLog.FormatVersion);
+            if (recordsEntries)
+                _logger.LogError(
+                    "WAL {File} is format v{Version}, newer than this release reads (v{Current}): left in place, not " +
+                    "replayed. Its events come back when the release that wrote it starts again; delete the file and " +
+                    "its .pool only to give them up.",
+                    walFile, version, WriteAheadLog.FormatVersion);
+            else
+                _logger.LogInformation(
+                    "WAL {File} is format v{Version}, newer than this release reads (v{Current}); its header records " +
+                    "no entries — the log a clean stop of that release leaves. Left in place for the release that wrote it.",
+                    walFile, version, WriteAheadLog.FormatVersion);
             return;
         }
 

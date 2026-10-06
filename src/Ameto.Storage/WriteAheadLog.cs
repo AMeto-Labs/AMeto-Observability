@@ -835,16 +835,24 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     public const ushort FormatVersion = WalVersion;
 
     public static (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath) =>
-        ReadForRecovery(walPath, out _);
+        ReadForRecovery(walPath, out _, out _);
 
     /// <param name="version">
     /// The format the file's header claims, or 0 when the file is not one of these logs. A version
     /// above <see cref="FormatVersion"/> comes back with no entries: a later release wrote the file,
     /// and only it can read it.
     /// </param>
-    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath, out ushort version)
+    /// <param name="headerRecordsEntries">
+    /// False only when the header's WriteOffset is exactly where the first entry would begin: the
+    /// log every clean stop leaves, which no version so far has written anything past. Read before
+    /// the version is looked at, so a later release's file can be told empty too; any other value
+    /// says "may hold entries", which is also what a later format that moved the field would read as.
+    /// </param>
+    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(
+        string walPath, out ushort version, out bool headerRecordsEntries)
     {
-        version = 0;
+        version              = 0;
+        headerRecordsEntries = false;
         if (!File.Exists(walPath)) return (0, []);
         long fileSize = new FileInfo(walPath).Length;
         if (fileSize < FileHeaderSize) return (0, []);
@@ -857,7 +865,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
             if (fh.Magic != MagicNumber) return (0, []);
-            version = fh.Version;
+            version              = fh.Version;
+            headerRecordsEntries = fh.WriteOffset != FileHeaderSize;
             // v5 = current. v4 = the releases before it: checksummed, no service. v3: replayable,
             // no per-entry validation possible. Anything else is unreplayable by construction.
             EntryLayout layout;
