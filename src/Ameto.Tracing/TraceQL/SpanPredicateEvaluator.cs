@@ -22,9 +22,9 @@ namespace Ameto.Tracing.TraceQL;
 /// <c>TryFind</c> reports it found, with a kind <c>AttributePredicate.CompareAttr</c> answers unknown
 /// for and <see cref="AttributePresencePredicate"/> counts as absent; <c>FindValues</c> clears its bit
 /// for exactly those kinds, and a clear bit reads here as the same unknown and the same absent;</item>
-/// <item>the same map that will not read: a walk that throws part-way is asked again one key at a
-/// time, which IS the old walk — see <see cref="SpanAttributeBlob.TryFindValues"/> for the one value
-/// that makes the difference;</item>
+/// <item>the same map that will not read: after a walk that throws part-way, each key is asked
+/// alone when the span first needs it, which IS the old walk — see
+/// <see cref="SpanAttributeBlob.TryFindValues"/> for the one value that makes the difference;</item>
 /// <item>the same comparison, <c>AttributePredicate.CompareAttr</c> itself, and the same keys, the
 /// predicates' own UTF-8 bytes — told apart by those bytes and not by the strings, because the walk
 /// compares bytes: two strings that encode alike (a lone surrogate becomes U+FFFD) are one key to it,
@@ -40,11 +40,13 @@ namespace Ameto.Tracing.TraceQL;
 ///
 /// <para><b>Lazy, so a short circuit still saves the walk.</b> A span's map is walked when the first
 /// attribute predicate is reached, not before: <c>{ duration &gt; 1s &amp;&amp; .a = "x" }</c> walks
-/// nothing for a span the duration has already rejected. A span is never walked more often than the
-/// per-predicate evaluation walked it — one walk per batch reached, where that took one per predicate
-/// reached. The one walk does a little more per pair, comparing each map key with every key of its
-/// batch instead of one, which is what a filter whose first predicate decides every span pays for
-/// the others: <c>TraceQlSharedWalkProbe</c> prints that case beside the ones this is for.</para>
+/// nothing for a span the duration has already rejected. A span is walked once per batch reached,
+/// where the per-predicate evaluation walked once per predicate reached — never more. A map the
+/// shared walk cannot read costs its failed walk plus one per key the span is then asked about: at
+/// most the per-predicate evaluation's walks, plus one per batch that failed. The one walk does a
+/// little more per pair, comparing each map key with every key of its batch instead of one, which
+/// is what a filter whose first predicate decides every span pays for the others:
+/// <c>TraceQlSharedWalkProbe</c> prints that case beside the ones this is for.</para>
 ///
 /// <para><b>More keys than one walk takes.</b> The distinct keys are numbered in order of first
 /// appearance and walked <see cref="SpanAttributeBlob.MaxKeyAlternatives"/> at a time, each batch on
@@ -76,6 +78,12 @@ internal sealed class SpanPredicateEvaluator
     /// <summary>Per batch: the ordinal of the span its bits and slots belong to. Any other is stale.</summary>
     private readonly long[] _walkedFor = [];
 
+    /// <summary>Per batch: the span whose shared walk of it failed. Its keys are then asked alone, each when first needed.</summary>
+    private readonly long[] _aloneFor = [];
+
+    /// <summary>Per key: the span it was last asked alone for.</summary>
+    private readonly long[] _askedFor = [];
+
     private ReadOnlyMemory<byte> _blob;   // the map of the span being evaluated
     private long _span;                   // that span's ordinal: 1 for the first, never reused
     private long _walks;
@@ -94,9 +102,11 @@ internal sealed class SpanPredicateEvaluator
 
         _keys       = [.. keys];
         _values     = new SpanAttrValue[_keys.Length];
+        _askedFor   = new long[_keys.Length];
         int batches = (_keys.Length + KeysPerWalk - 1) / KeysPerWalk;
         _found      = new int[batches];
         _walkedFor  = new long[batches];
+        _aloneFor   = new long[batches];
     }
 
     /// <summary>
@@ -110,7 +120,7 @@ internal sealed class SpanPredicateEvaluator
     /// <summary>The predicate this evaluates — what the executor extracts its scan hints from.</summary>
     public SpanPredicate Predicate => _predicate;
 
-    /// <summary>Test hook: walks of a span's map so far — at most one per batch of keys per span.</summary>
+    /// <summary>Test hook: walks of a span's map so far — one per batch reached per span, and one per key asked alone after a walk that failed.</summary>
     internal long WalksForTest => _walks;
 
     /// <summary>
@@ -133,48 +143,52 @@ internal sealed class SpanPredicateEvaluator
 
     /// <summary>
     /// Whether the span's map holds slot <paramref name="slot"/>'s key with a value a predicate can
-    /// read, walking the slot's batch first if this span has not had it walked.
+    /// read, walking the slot's batch first if this span has not had it walked — or, on a map that
+    /// walk could not read, asking for this one key the first time the span needs it.
     /// </summary>
     private bool Found(int slot)
     {
         int batch = slot / KeysPerWalk;
         if (_walkedFor[batch] != _span) Walk(batch);
-        return (_found[batch] & (1 << (slot - batch * KeysPerWalk))) != 0;
+
+        int bit = 1 << (slot - batch * KeysPerWalk);
+        if (_aloneFor[batch] == _span && _askedFor[slot] != _span) AskAlone(slot, batch, bit);
+        return (_found[batch] & bit) != 0;
     }
 
     private void Walk(int batch)
     {
-        int first  = batch * KeysPerWalk;
-        int count  = Math.Min(KeysPerWalk, _keys.Length - first);
-        var keys   = _keys.AsSpan(first, count);
-        var values = _values.AsSpan(first, count);
+        int first = batch * KeysPerWalk;
+        int count = Math.Min(KeysPerWalk, _keys.Length - first);
 
         _walks++;
-        if (!SpanAttributeBlob.TryFindValues(_blob, keys, values, out int found))
-            found = FindEachAlone(keys, values);
+        if (!SpanAttributeBlob.TryFindValues(_blob, _keys.AsSpan(first, count), _values.AsSpan(first, count), out int found))
+            _aloneFor[batch] = _span;   // found stays 0: every key of the batch is asked alone, if and when it is asked
 
         _found[batch]     = found;
         _walkedFor[batch] = _span;
     }
 
     /// <summary>
-    /// A MAP THE SHARED WALK COULD NOT READ TO ITS END, asked one key at a time — which is exactly
-    /// how every predicate asked it before. A torn map then answers "not found" for each key, as it
-    /// does in one walk; a value that steps over cleanly but will not decode answers "not found"
-    /// for its own key only, where one walk would have lost the whole batch to it. Rare, and the
-    /// cost is the old one: a walk per key.
+    /// A MAP THE SHARED WALK COULD NOT READ TO ITS END, asked about ONE key — the first time this
+    /// span needs it — exactly as that key's predicate asked it before. A torn map then answers "not
+    /// found" for the key, as it does in one walk; a value that steps over cleanly but will not
+    /// decode answers "not found" for its own key only, where one walk lost the whole batch to it.
+    ///
+    /// <para>ONE KEY AT A TIME, AND ONLY THE KEYS THE SPAN IS ASKED ABOUT (#123 review F3): asking
+    /// the whole batch the moment its walk failed cost a span the shared walk plus a walk per key of
+    /// the batch, where the per-predicate evaluation walked only for the predicates it reached — four
+    /// walks for <c>{ .a = nil || .b = "y" || .c = "z" }</c> over a torn map, which it answers in
+    /// one. Now it is at most that evaluation's walks plus the one that failed — fewer when the
+    /// filter names a key twice, which is asked once.</para>
     /// </summary>
-    private int FindEachAlone(ReadOnlySpan<byte[]> keys, Span<SpanAttrValue> values)
+    private void AskAlone(int slot, int batch, int bit)
     {
-        int found = 0;
-        for (int j = 0; j < keys.Length; j++)
-        {
-            _walks++;
-            if (SpanAttributeBlob.TryFind(_blob, keys[j], out values[j])
-                && values[j].Kind is not (SpanAttrKind.Null or SpanAttrKind.Other))
-                found |= 1 << j;
-        }
-        return found;
+        _askedFor[slot] = _span;
+        _walks++;
+        if (SpanAttributeBlob.TryFind(_blob, _keys[slot], out _values[slot])
+            && _values[slot].Kind is not (SpanAttrKind.Null or SpanAttrKind.Other))
+            _found[batch] |= bit;
     }
 
     // ── Compiling the filter ──────────────────────────────────────────────────

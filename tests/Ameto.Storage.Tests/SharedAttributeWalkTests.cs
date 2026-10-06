@@ -425,7 +425,9 @@ public sealed class SharedAttributeWalkTests : IDisposable
     /// decodes only its own key's values and steps over that one, so <c>.a</c> is found; one walk
     /// for both keys decodes it for <c>.big</c> and the throw used to cost <c>.a</c> as well — this
     /// filter answered unknown where every page before it answered true. The evaluator asks such a
-    /// map again one key at a time, which is the old answer at the old price.
+    /// map again one key at a time, which is the old answer — and only for the keys the span is
+    /// asked about, so <c>.big</c>, behind a disjunction <c>.a</c> has already decided, costs nothing
+    /// (#123 review F3: it used to cost a walk of its own).
     /// </summary>
     [Fact]
     public void A_value_that_will_not_decode_costs_only_its_own_key()
@@ -438,12 +440,38 @@ public sealed class SharedAttributeWalkTests : IDisposable
 
         Assert.True(either.Evaluate(span));
         Assert.True(eval.Evaluate(span));
-        Assert.Equal(1 + 2, eval.WalksForTest);   // the shared walk, then one per key of its batch
+        Assert.Equal(1 + 1, eval.WalksForTest);   // the shared walk that failed, then .a alone
 
         // And the key under the value itself is unknown either way, as it always was.
         var big = TraceQLParser.Parse("{ .big > 0 }");
         Assert.Null(big.Evaluate(span));
         Assert.Null(new SpanPredicateEvaluator(big).Evaluate(span));
+    }
+
+    /// <summary>
+    /// A TORN MAP IS ASKED ONLY FOR THE KEYS THE FILTER REACHES (#123 review F3). The shared walk
+    /// fails on it; <c>.a = nil</c> is then asked alone, finds nothing — the map holds nothing anybody
+    /// can name — and so is true, and the disjunction is decided. The per-predicate evaluation made
+    /// one walk; this makes that one plus the one that failed, where asking every key of the batch
+    /// the moment its walk failed made four.
+    /// </summary>
+    [Fact]
+    public void A_torn_map_is_asked_only_for_the_keys_the_filter_reaches()
+    {
+        byte[] whole = Map(("a", "x"), ("b", "y"), ("c", "z"));
+        var    torn  = WithMap(whole[..^2]);   // the last value cut short: no walk reads it to its end
+
+        var pred = TraceQLParser.Parse("{ .a = nil || .b = \"y\" || .c = \"z\" }");
+        var eval = new SpanPredicateEvaluator(pred);
+
+        Assert.True(pred.Evaluate(torn));
+        Assert.True(eval.Evaluate(torn));
+        Assert.Equal(1 + 1, eval.WalksForTest);   // the shared walk that failed, then .a alone
+
+        // A key the filter names twice is asked alone once per span, not once per predicate.
+        var twice = new SpanPredicateEvaluator(TraceQLParser.Parse("{ .a = \"q\" || .a = nil }"));
+        Assert.True(twice.Evaluate(torn));
+        Assert.Equal(1 + 1, twice.WalksForTest);
     }
 
     /// <summary>

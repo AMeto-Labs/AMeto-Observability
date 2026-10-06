@@ -779,10 +779,10 @@ internal static class SpanAttributeBlob
     /// other, and stepping over is the more forgiving of the two: a uint64 above
     /// <c>long.MaxValue</c> steps over cleanly and then refuses <c>ReadInt64</c>. Asked alone, such
     /// a value costs its own key and nothing else; in one walk for several keys it is decoded for
-    /// whichever key it sits under, and the throw costs all of them. So
-    /// <c>SpanPredicateEvaluator</c> asks the keys one at a time whenever this returns false — a
-    /// torn map then answers "not found" for each of them, exactly as before, and the one value
-    /// that will not decode costs one key again.</para>
+    /// whichever key it sits under, and the throw costs all of them. So when this returns false
+    /// <c>SpanPredicateEvaluator</c> asks each key alone, as the span comes to need it — a torn map
+    /// then answers "not found" for each of them, exactly as before, and the one value that will not
+    /// decode costs one key again.</para>
     /// </summary>
     internal static bool TryFindValues(
         ReadOnlyMemory<byte> blob, ReadOnlySpan<byte[]> keysUtf8, Span<SpanAttrValue> slots, out int found)
