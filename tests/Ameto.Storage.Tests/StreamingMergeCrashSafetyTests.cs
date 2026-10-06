@@ -1135,6 +1135,42 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A torn output is kept out of the start's scan before anything that can fail, reading its
+    /// manifest included. With the manifest held without sharing at the start, the sweep fails on
+    /// it, and the scan used to register the torn output (which it can frame) beside its ten
+    /// sources. The next pass, the manifest let go, quarantines the output. Windows only.
+    /// </summary>
+    [Fact]
+    public async Task ATornOutputWhoseManifestCannotBeReadAtStart_IsStillNotServed()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        long blockIndexOffset = BitConverter.ToInt64(bytes, bytes.Length - 44 + 24);   // footer slot 3
+        Array.Clear(bytes, (int)blockIndexOffset, 4);                                  // framing intact, no blocks
+        await File.WriteAllBytesAsync(output, bytes);
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            await RestartAsync();
+            Assert.Equal(10, _engine.ListSegments().Count);   // 11: the torn output registered beside its sources
+            AssertSameEvents(before, ReadEverything());
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.True(File.Exists(output + ".corrupt"), "the next pass did not quarantine the output");
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// A torn output found after some of its sources were already unlinked: the merge committed,
     /// the crash came in the middle of the unlinks, and the output was damaged afterwards. The
     /// sources still on disk stay in service; the events of the missing ones exist only in the

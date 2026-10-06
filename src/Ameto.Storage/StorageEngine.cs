@@ -4006,14 +4006,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
-    /// A merge whose output is torn: it never committed, its sources stay in service, and the
-    /// output goes aside here as the catalog scan quarantines an unreadable segment, to
+    /// A merge whose output is torn: the sources it lists that are still on disk stay in service,
+    /// and the output goes aside here as the catalog scan quarantines an unreadable segment, to
     /// <c>{output}.corrupt</c>. Not left to the scan: the scan refuses only what it cannot frame, and
     /// a torn output it can frame — a block-index count read as 0, a block whose payload was lost —
     /// it registered beside the sources it had replaced, counting their events twice (every header
-    /// count; every row a block still held). Recorded for a running scan as well, so that one does
-    /// not register it even when the move fails; the manifest then stays, and the next sweep, which
-    /// finds the output unserved, proves it again and retries the move.
+    /// count; every row a block still held). Recorded for a running scan first, so that one does
+    /// not register it whatever fails below; when the move fails, the manifest stays, and the next
+    /// sweep, which finds the output unserved, proves it again and retries the move.
     ///
     /// <para>A listed source missing from disk means the merge DID commit and had unlinked it before
     /// the output was damaged: its events now exist only in the quarantined file. That is said at
@@ -4026,6 +4026,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// </summary>
     private void RecoverTornMerge(string manifest, string output)
     {
+        lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
+
         int listed = 0, missing = 0;
         foreach (var name in File.ReadAllLines(manifest))
         {
@@ -4048,7 +4050,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         try { File.Move(output, output + ".corrupt", overwrite: true); }
         catch (Exception ex)
         {
-            lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
             if (listed != 0) File.WriteAllBytes(manifest, []);
             _logger.LogWarning(ex,
                 "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
