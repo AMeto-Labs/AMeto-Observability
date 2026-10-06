@@ -34,14 +34,26 @@ namespace Ameto.Perf;
 /// difference being looked for, so the two streams compared are timed in alternating rounds.</para>
 ///
 /// <para>The one thing asserted is the hot-path rule: an append that names a service allocates
-/// nothing once its pool row is written. Timings are printed, not gated (Debug in CI, a shared box
-/// here); run under -c Release for figures worth quoting.</para>
+/// nothing once its pool row is written. That runs in every configuration. Timings are printed, not
+/// gated, and the END TO END half runs in Release only (see <see cref="EndToEnd"/>): run under
+/// -c Release for figures worth quoting.</para>
 /// </summary>
 public sealed class WalServiceProbe
 {
     private const int  Events   = 16_000;            // per timed round
     private const int  Rounds   = 7;
     private const long Capacity = 64L * 1024 * 1024; // the production default; warm-up + rounds stay under it, so no Grow
+
+    // The END TO END half asserts nothing, and writes and flushes about 1.1 GB through fresh 64 MB
+    // mappings to print its figures: 16 paired streams, two logs each, eight rounds of 16 000
+    // appends. The suite runs Debug on every CI build, on a shared two-core runner, where those
+    // figures mean nothing. So that half runs in Release only. The allocation assertion, about
+    // 9 MB, runs everywhere. Readonly rather than const, so Debug compiles no unreachable block.
+#if DEBUG
+    private static readonly bool EndToEnd = false;
+#else
+    private static readonly bool EndToEnd = true;
+#endif
 
     private readonly ITestOutputHelper _out;
     public WalServiceProbe(ITestOutputHelper o) => _out = o;
@@ -96,19 +108,24 @@ public sealed class WalServiceProbe
         Directory.CreateDirectory(dir);
         try
         {
-            var (emptyNs, _) = Paired(dir, [], NoService, NoService);
-            _out.WriteLine($"\nEND TO END: WriteAheadLog.Append, fresh mapping, best of {Rounds} alternating rounds; " +
-                           $"an empty append (the table's record): {emptyNs:F1} ns");
-            foreach (var (name, payload) in payloads)
+            if (EndToEnd)
             {
-                _out.WriteLine($"  {name}");
-                foreach (var p in Patterns)
+                var (emptyNs, _) = Paired(dir, [], NoService, NoService);
+                _out.WriteLine($"\nEND TO END: WriteAheadLog.Append, fresh mapping, best of {Rounds} alternating rounds; " +
+                               $"an empty append (the table's record): {emptyNs:F1} ns");
+                foreach (var (name, payload) in payloads)
                 {
-                    var (noneNs, v5Ns) = Paired(dir, payload, NoService, p);
-                    _out.WriteLine($"    {p.Name,-36} no service {noneNs,7:F1} ns   v5 {v5Ns,7:F1} ns   " +
-                                   $"table (floor) {noneNs + Changes(p) * emptyNs / Events,7:F1} ns");
+                    _out.WriteLine($"  {name}");
+                    foreach (var p in Patterns)
+                    {
+                        var (noneNs, v5Ns) = Paired(dir, payload, NoService, p);
+                        _out.WriteLine($"    {p.Name,-36} no service {noneNs,7:F1} ns   v5 {v5Ns,7:F1} ns   " +
+                                       $"table (floor) {noneNs + Changes(p) * emptyNs / Events,7:F1} ns");
+                    }
                 }
             }
+            else
+                _out.WriteLine("\nEND TO END: Release only (about 1.1 GB through fresh mappings); run with -c Release");
 
             // The rule this probe exists to pin: once a WAL has written a service's pool row, an
             // append naming that service allocates nothing — no string, no row, no boxing.
