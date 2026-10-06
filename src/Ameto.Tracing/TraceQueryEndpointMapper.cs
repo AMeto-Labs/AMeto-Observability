@@ -544,17 +544,23 @@ public static class TraceQueryEndpointMapper
     ///   bounds of each 128-span block of it, in arrival order (<c>SpanStartIndex</c>), and both
     ///   fetchers read the unflushed spans after the engine's read lock is released. The TraceQL
     ///   fetch (<c>SearchSpansAsync</c>) visits blocks newest-first and stops once nothing it has
-    ///   not read could make the cut, so a page reads about the spans it returns and a block more,
-    ///   wherever in the window it is. The list fetch CANNOT stop early — every in-window trace is
-    ///   merged, because its filters run after the merge and the cold walk's scan cap counts the
-    ///   merge — but it opens no block wholly outside its window, and it makes rows (a summary, a
-    ///   service array, the root's HTTP method and path) only for the <c>limit</c> it returns.
-    ///   Measured (Release, a 49 000-span hot tier, ten spans a trace, pages 0-5 walking down the
-    ///   window; medians of three runs on a loaded machine): the filter list's 500-row pages
-    ///   3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and 10, 10, 11, 9, 7, 3 ms before, 1.2, 1.2, 1.1, 1.0, 0.9,
-    ///   0.6 MB and 4, 5, 4, 4, 3, 2 ms after; the TraceQL page's engine call (2 000 spans) 638 KB
-    ///   and ~5 ms — all of it inside the read lock — before, 283 KB and ~1.3 ms, none of it inside
-    ///   the lock, after.</item>
+    ///   not read could make the cut, so — when spans arrive roughly in start order — a page reads
+    ///   about the spans it returns and a block more, wherever in the window it is. The list fetch
+    ///   CANNOT stop early — every in-window trace is merged, because its filters run after the
+    ///   merge and the cold walk's scan cap counts the merge — but it opens no block wholly outside
+    ///   its window, and it makes rows (a summary, a service array, the root's HTTP method and
+    ///   path) only for the <c>limit</c> it returns. Measured (Release, a 49 000-span hot tier
+    ///   arriving in order, ten spans a trace, pages 0-5 walking down the window; medians of three
+    ///   runs on a loaded machine): the filter list's 500-row pages 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB
+    ///   and 10, 10, 11, 9, 7, 3 ms before, 1.2, 1.2, 1.1, 1.0, 0.9, 0.6 MB and 4, 5, 4, 4, 3, 2 ms
+    ///   after; the TraceQL page's engine call (2 000 spans) 638 KB and ~5 ms — all of it inside the
+    ///   read lock — before, 283 KB and ~1.3 ms, none of it inside the lock, after.
+    ///   <para>DISORDER TAKES THE READ SAVINGS BACK, not the rest (#122 review L1). A block's bounds
+    ///   cover all of its spans, so one span from a clock running ahead keeps its whole block in every
+    ///   TraceQL page, and one long span reported late keeps its block in every list page reaching
+    ///   back over its duration. At one span in a hundred 30 s ahead a TraceQL page reads most of the
+    ///   tier again; <c>TraceStreamPageProbe</c> prints a disordered tier beside the ordered one. The
+    ///   reads off the lock and the rows not made hold whatever the order.</para></item>
     /// </list>
     /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
     /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is

@@ -108,11 +108,22 @@ public sealed partial class TraceStorageEngine
     /// took ingest from ~700 to ~18 000 ns/span). Moving it out was once rejected because the
     /// snapshot it would need was an O(M) copy of the tier; the captured runs are not a copy.</para>
     ///
-    /// <para><b>BOUNDED.</b> The walk reads blocks of <see cref="SpanStartIndex.BlockSize"/> spans in
-    /// order of their LARGEST start, so it meets the newest spans first however late they arrived,
-    /// and it stops at the first block whose largest start is below the oldest span it has already
-    /// kept: no span there, or in any block after it, can make the cut. A page therefore reads the
-    /// top of its window — about <c>limit</c> matches and one block more — instead of the tier.</para>
+    /// <para><b>BOUNDED — WHEN SPANS ARRIVE IN ORDER.</b> The walk reads blocks of
+    /// <see cref="SpanStartIndex.BlockSize"/> spans in order of their LARGEST start, so it meets the
+    /// newest spans first however late they arrived, and it stops at the first block whose largest
+    /// start is below the oldest span it has already kept: no span there, or in any block after it,
+    /// can make the cut. With spans arriving roughly in start order a page therefore reads the top of
+    /// its window — about <c>limit</c> matches and one block more — instead of the tier.</para>
+    ///
+    /// <para><b>A CLOCK RUNNING AHEAD TAKES THAT BACK</b> (#122 review L1). A block's largest start
+    /// covers all 128 of its spans, so one span from a clock running ahead lifts its whole block above
+    /// everything kept: the block is always read, and the walk never stops at it. Interleaved with the
+    /// rest of the traffic such spans poison many blocks — at one span in a hundred, 30 s ahead, nearly
+    /// every block holds one, and a page reads most of the tier again (the review measured 20 000,
+    /// 18 304, 16 256 and 14 208 of 20 000 on pages 0-3; <c>TraceStreamPageProbe</c> prints it).
+    /// Never more than before this walk existed, and still after the lock. Keeping such outliers out
+    /// of the block bounds — as one-span blocks of their own — is the follow-up that would restore
+    /// the bound.</para>
     ///
     /// <para><b>THE FLOOR STILL HAS TO BE HONEST.</b> "A match was turned away" is what tells the
     /// pager the page did not read its window out, and stopping early must not lose it: if nothing
@@ -323,6 +334,12 @@ public sealed partial class TraceStorageEngine
     /// filters run after the merge and can reject any number of traces — and it may not reorder.
     /// What it can skip is a block NOTHING of which is in the window: a page deep in a stream has
     /// its ceiling far below the newest blocks, and those cost no record reads at all.</para>
+    ///
+    /// <para><b>WHEN SPANS ARRIVE IN ORDER</b> (#122 review L1). One long span, reported when it
+    /// ends, lowers its block's smallest start by its whole duration, and that block can then not be
+    /// skipped by any page whose ceiling lies within that duration. The review measured a page five
+    /// seconds deep at 5 120 spans read in order, 6 400 with one span in 1 000 reported 10 s late,
+    /// and 14 976 with one in 50; <c>TraceStreamPageProbe</c> prints it.</para>
     /// </summary>
     private static int MergeRunInto(Dictionary<TraceId, MergedTrace> merged, ReadOnlySpan<SpanRecord> run,
                                     SpanStartView starts, long fromNano, long toNano)

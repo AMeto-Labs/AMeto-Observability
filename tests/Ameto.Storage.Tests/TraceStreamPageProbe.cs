@@ -19,10 +19,17 @@ namespace Ameto.Storage.Tests;
 /// counter sees the whole page (asserted, so a page that starts yielding cannot quietly halve the
 /// figure).</para>
 ///
-/// <para>PRINTED, NOT ASSERTED. Per page: the spans in the page's window, the rows, the bytes this
-/// thread allocated (the SMALLEST of <see cref="Repeats"/> calls — a GC inside the window can only
-/// add) and the wall time (their median). The numbers in the commit bodies are Release's, over the
+/// <para>PRINTED, NOT ASSERTED. Per page: the spans in the page's window, the unflushed spans the
+/// engine read for it (its start index lets it skip the rest), the rows, the bytes this thread
+/// allocated (the SMALLEST of <see cref="Repeats"/> calls — a GC inside the window can only add)
+/// and the wall time (their median). The numbers in the commit bodies are Release's, over the
 /// 49 000-span tier; the suite runs this in Debug on a tenth of it.</para>
+///
+/// <para>TWO TIERS, because the index prunes by ARRIVAL order (#122 review L1). The first arrives in
+/// start order; the second is the same spans arriving as an imperfect fleet sends them — one in a
+/// hundred from a clock 30 s ahead, one in fifty a long span reported 10 s after it started. A
+/// block's bounds cover all of its spans, so those few keep most blocks in every page's walk: the
+/// "read" column is where the pruning goes, and the bytes and rows are what stays.</para>
 /// </summary>
 public sealed class TraceStreamPageProbe : IDisposable
 {
@@ -53,20 +60,34 @@ public sealed class TraceStreamPageProbe : IDisposable
             try { Directory.Delete(d, true); } catch { }
     }
 
-    private readonly record struct PageCost(int Page, int WindowSpans, int Rows, long Bytes, double Ms);
+    private readonly record struct PageCost(int Page, int WindowSpans, int Read, int Rows, long Bytes, double Ms);
 
     [Fact]
     public void Stream_pages_over_the_hot_tier()
+    {
+        // Three services, every seventh span an error: the list rows carry a real service set and
+        // `{ status = error }` has something to find.
+        var corpus = TraceAggregateLockProbe.Corpus(0, Spans, services: 3);
+
+        MeasureTier(corpus, "ARRIVING IN START ORDER");
+        MeasureTier(Disordered(corpus),
+            "ARRIVING DISORDERED (1 span in 100 from a clock 30 s ahead, 1 in 50 reported 10 s late)");
+    }
+
+    private void MeasureTier(SpanIngestItem[] corpus, string arrival)
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-pageprobe-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         _dirs.Add(dir);
 
-        // Three services, every seventh span an error: the list rows carry a real service set and
-        // `{ status = error }` has something to find.
-        var corpus = TraceAggregateLockProbe.Corpus(0, Spans, services: 3);
         using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
         Assert.Equal(Spans, engine.WriteSpans(corpus));
+
+        // What the engine read for the page just fetched: every fetch below makes one hot pass.
+        int read = -1;
+        engine._hotSearchVisitedForTest = n => read = n;
+        engine._listHotVisitedForTest   = n => read = n;
+        Func<int> lastRead = () => read;
 
         long[] starts = new long[corpus.Length];
         for (int i = 0; i < corpus.Length; i++) starts[i] = corpus[i].StartTimeUnixNano;
@@ -75,19 +96,21 @@ public sealed class TraceStreamPageProbe : IDisposable
         var errors    = TraceQLParser.Parse("{ status = error }");           // a status hint: one span in seven
 
         // Warm every path on the first page, so no measured call is jitting.
-        Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: false);
-        Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: false);
-        Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: false);
-        Walk(engine, starts, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: false);
+        Walk(starts, lastRead, (to, n) => ListPage(engine, to, n), ListPageRows, measure: false);
+        Walk(starts, lastRead, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: false);
+        Walk(starts, lastRead, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: false);
+        Walk(starts, lastRead, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: false);
 
-        var list   = Walk(engine, starts, (to, n) => ListPage(engine, to, n), ListPageRows, measure: true);
-        var all    = Walk(engine, starts, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: true);
-        var err    = Walk(engine, starts, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: true);
-        var search = Walk(engine, starts, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: true);
-        var errHot = Walk(engine, starts, (to, n) => SearchPage(engine, to, n, SpanStatusCode.Error), QlPageRows * 10, measure: true);
+        var list   = Walk(starts, lastRead, (to, n) => ListPage(engine, to, n), ListPageRows, measure: true);
+        var all    = Walk(starts, lastRead, (to, n) => QlPage(engine, everySpan, to, n), QlPageRows, measure: true);
+        var err    = Walk(starts, lastRead, (to, n) => QlPage(engine, errors, to, n), QlPageRows, measure: true);
+        var search = Walk(starts, lastRead, (to, n) => SearchPage(engine, to, n, null), QlPageRows * 10, measure: true);
+        var errHot = Walk(starts, lastRead, (to, n) => SearchPage(engine, to, n, SpanStatusCode.Error), QlPageRows * 10, measure: true);
 
-        _out.WriteLine($"STREAM PAGES over a {Spans:N0}-span hot tier (10 spans/trace, 3 services, 8 attributes); "
-                     + $"bytes = this thread, min of {Repeats}; ms = median of {Repeats}");
+        _out.WriteLine("");
+        _out.WriteLine($"STREAM PAGES over a {Spans:N0}-span hot tier {arrival}");
+        _out.WriteLine($"  (10 spans/trace, 3 services, 8 attributes); bytes = this thread, min of {Repeats}; "
+                     + $"ms = median of {Repeats}; read = unflushed spans the engine read for the page");
         Print($"list   GetTraceListAsync({ListPageRows})", list);
         Print($"traceql {{ .db.system = \"mssql\" }} ({QlPageRows} rows)", all);
         Print($"traceql {{ status = error }} ({QlPageRows} rows)", err);
@@ -97,13 +120,39 @@ public sealed class TraceStreamPageProbe : IDisposable
         Assert.All(list, static p => Assert.True(p.Rows > 0));
     }
 
+    /// <summary>
+    /// The same spans, arriving as an imperfect fleet sends them: one in a hundred from a clock 30 s
+    /// ahead, one in fifty a long span reported 10 s after it started. Same order of arrival, same
+    /// ids, the starts moved.
+    /// </summary>
+    private static SpanIngestItem[] Disordered(SpanIngestItem[] corpus)
+    {
+        var items = (SpanIngestItem[])corpus.Clone();
+        for (int i = 0; i < items.Length; i++)
+        {
+            long shift = i % 100 == 37 ? 30_000_000_000L
+                       : i % 50  == 11 ? -10_000_000_000L
+                       :                 0;
+            if (shift == 0) continue;
+            var s = items[i];
+            items[i] = new SpanIngestItem
+            {
+                TraceId = s.TraceId, SpanId = s.SpanId, ParentSpanId = s.ParentSpanId,
+                StartTimeUnixNano = s.StartTimeUnixNano + shift, DurationNanos = s.DurationNanos,
+                Name = s.Name, ServiceName = s.ServiceName, Kind = s.Kind, Status = s.Status,
+                HttpStatusCode = s.HttpStatusCode, AttributesBytes = s.AttributesBytes,
+            };
+        }
+        return items;
+    }
+
     private void Print(string title, List<PageCost> pages)
     {
         _out.WriteLine("");
         _out.WriteLine($"  {title}");
-        _out.WriteLine($"    {"page",4} {"window spans",12} {"rows",5} {"KB",9} {"ms",7}");
+        _out.WriteLine($"    {"page",4} {"window spans",12} {"read",7} {"rows",5} {"KB",9} {"ms",7}");
         foreach (var p in pages)
-            _out.WriteLine($"    {p.Page,4} {p.WindowSpans,12:N0} {p.Rows,5} {p.Bytes / 1024.0,9:N0} {p.Ms,7:N2}");
+            _out.WriteLine($"    {p.Page,4} {p.WindowSpans,12:N0} {p.Read,7:N0} {p.Rows,5} {p.Bytes / 1024.0,9:N0} {p.Ms,7:N2}");
     }
 
     /// <summary>One page: the rows' start times, and whether the call completed on this thread.</summary>
@@ -157,7 +206,7 @@ public sealed class TraceStreamPageProbe : IDisposable
     /// Pages down the window as the stream does: the ask is the cursor rounded UP to its
     /// millisecond, the next cursor the oldest row returned.
     /// </summary>
-    private static List<PageCost> Walk(TraceStorageEngine engine, long[] starts, Fetch fetch, int rows, bool measure)
+    private static List<PageCost> Walk(long[] starts, Func<int> lastRead, Fetch fetch, int rows, bool measure)
     {
         var  result = new List<PageCost>(Pages);
         long cursor = To.ToUnixTimeMilliseconds() * 1_000_000L;
@@ -184,7 +233,7 @@ public sealed class TraceStreamPageProbe : IDisposable
 
             int inWindow = 0;
             foreach (long s in starts) if (s >= from && s <= toNano) inWindow++;
-            result.Add(new PageCost(p, inWindow, rowStarts!.Count, bytes, ms[Repeats / 2]));
+            result.Add(new PageCost(p, inWindow, lastRead(), rowStarts!.Count, bytes, ms[Repeats / 2]));
 
             if (rowStarts.Count == 0) break;
             long oldest = long.MaxValue;
