@@ -3848,38 +3848,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// beside an output at its final name, or beside none yet. The merge gate keeps them apart: a
     /// pass runs this sweep under it, and the catalog scan runs it before the gate opens
     /// (<see cref="TryEnterMergeGate"/>).</para>
+    ///
+    /// <para>An output at its final name is proved whole before its manifest is acted on, unless the
+    /// catalog serves it — published by this process's own commit, which wrote and checked it, or by
+    /// a scan whose sweep proved it at the start (<see cref="ReadMergeOutput"/>). No crash of this
+    /// process leaves a torn output at its final name, but a restored backup, or storage that lost
+    /// a flushed write in a power cut, can; read as committed, its sources — the batch's only
+    /// readable copy — were deleted. A torn output is a merge that never committed: the sources
+    /// stay, and the output is quarantined here, not left to the scan, which only refuses what it
+    /// cannot frame (<see cref="RecoverTornMerge"/>).</para>
     /// </summary>
-    /// <param name="readOutputs">
-    /// The catalog scan's sweep: prove each output whole before acting on its manifest — every row
-    /// decoded and counted against its header (<see cref="ProveWholeMergeOutput"/>). No crash of
-    /// this process leaves a torn output at its final name, but a restored backup, or storage that
-    /// lost a flushed write in a power cut, can; read as committed, its sources — the batch's only
-    /// readable copy — were deleted. A torn output is therefore a merge that never committed: the
-    /// sources stay, the manifest goes, and the output is left to the catalog scan, which
-    /// quarantines what it cannot open. One that cannot be opened for any other reason (a scanner
-    /// holding it) is taken as committed: the rename is its proof, and sources kept beside an
-    /// output that a later start reads would be counted twice for good. A pass does not read: the
-    /// outputs it meets were written by this process or read by its scan.
-    /// </param>
-    private void RecoverInterruptedMerges(bool readOutputs = false)
+    private void RecoverInterruptedMerges()
     {
         foreach (var manifest in Directory.EnumerateFiles(_segDir, "*.mergemanifest"))
         {
             // Per manifest, so one that cannot be read does not strand the others behind it.
-            try { RecoverInterruptedMerge(manifest, readOutputs); }
+            try { RecoverInterruptedMerge(manifest); }
             catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest); }
         }
     }
 
     /// <summary>One manifest of <see cref="RecoverInterruptedMerges"/>.</summary>
-    private void RecoverInterruptedMerge(string manifest, bool readOutput)
+    private void RecoverInterruptedMerge(string manifest)
     {
         string output = manifest[..^".mergemanifest".Length];
-        if (!IsCommittedMergeOutput(output, readOutput))
+        switch (ReadMergeOutput(output))
         {
-            File.Delete(manifest);
-            _outputsWithKeptManifest.TryRemove(output, out _);
-            return;
+            case MergeOutputState.Absent:
+                File.Delete(manifest);
+                _outputsWithKeptManifest.TryRemove(output, out _);
+                return;
+            case MergeOutputState.Torn:
+                RecoverTornMerge(manifest, output);
+                return;
         }
 
         // Out of the planner until this manifest goes, from before it is even read: one this
@@ -3955,40 +3956,82 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 held, Path.GetFileName(output));
     }
 
+    /// <summary>What a sweep finds at a manifest's output name (<see cref="ReadMergeOutput"/>).</summary>
+    private enum MergeOutputState : byte { Absent, Whole, Torn }
+
     /// <summary>
-    /// Whether a manifest's merge committed: its output is at its final name and, when
-    /// <paramref name="read"/>, opens as a whole segment (see <see cref="RecoverInterruptedMerges"/>).
+    /// Whether a manifest's merge committed (see <see cref="RecoverInterruptedMerges"/>): its output
+    /// is absent, whole, or torn.
+    ///
+    /// <para>Proved by reading (<see cref="ProveWholeMergeOutput"/>) unless the catalog serves the
+    /// output, or served it until a delete parked its path: then this process's own commit wrote
+    /// and checked it, or the sweep of the scan that registered it proved it at the start. Every
+    /// output the catalog scan's sweep meets is proved, since nothing is registered yet; a pass
+    /// proves only an output the start found torn and could not move aside, which no scan
+    /// registered — so it never takes that one for committed, and tries the move again.</para>
+    ///
+    /// <para>An output that cannot be read for a reason that is not its bytes (a scanner holding
+    /// it) is taken as whole, as before: the rename is its proof, and sources kept beside an
+    /// output that a later start reads would be counted twice for good.</para>
     /// </summary>
-    private bool IsCommittedMergeOutput(string output, bool read)
+    private MergeOutputState ReadMergeOutput(string output)
     {
-        if (!File.Exists(output)) return false;
-        if (!read) return true;
+        if (!File.Exists(output)) return MergeOutputState.Absent;
+        if ((_segments.TryGetValue(KeyOfSegmentFileName(output), out var entry)
+             && string.Equals(entry.FilePath, output, StringComparison.OrdinalIgnoreCase))
+            || _pendingSegmentDeletes.ContainsKey(output))
+            return MergeOutputState.Whole;
         try
         {
             ProveWholeMergeOutput(output);
-            return true;
+            return MergeOutputState.Whole;
         }
         catch (Exception ex) when (FileBounds.DescribesContent(ex))
         {
             _logger.LogWarning(ex,
                 "Merge recovery: the output {File} of an interrupted merge is not a whole segment, so the merge never " +
-                "committed — the sources it lists stay in service, and the output is left to the catalog scan",
+                "committed — the sources it lists stay in service, and the output is quarantined",
                 Path.GetFileName(output));
-            return false;
+            return MergeOutputState.Torn;
         }
-        catch (FileNotFoundException) { return false; }   // gone since the probe above
+        catch (FileNotFoundException) { return MergeOutputState.Absent; }   // gone since the probe above
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
                 "Merge recovery: the output {File} of an interrupted merge could not be read now; taken as committed — " +
                 "a merge output reaches its name only once it is on disk — so the sources it lists go as its duplicates",
                 Path.GetFileName(output));
-            return true;
+            return MergeOutputState.Whole;
         }
     }
 
     /// <summary>
-    /// Reads a merge output for <see cref="IsCommittedMergeOutput"/>: opened as the catalog scan
+    /// A merge whose output is torn: it never committed, its sources stay in service, and the
+    /// output goes aside here as the catalog scan quarantines an unreadable segment, to
+    /// <c>{output}.corrupt</c>. Not left to the scan: the scan refuses only what it cannot frame, and
+    /// a torn output it can frame — a block-index count read as 0, a block whose payload was lost —
+    /// it registered beside the sources it had replaced, counting their events twice (every header
+    /// count; every row a block still held). Recorded for a running scan as well, so that one does
+    /// not register it even when the move fails; the manifest then stays, and the next sweep, which
+    /// finds the output unserved, proves it again and retries the move.
+    /// </summary>
+    private void RecoverTornMerge(string manifest, string output)
+    {
+        try { File.Move(output, output + ".corrupt", overwrite: true); }
+        catch (Exception ex)
+        {
+            lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
+            _logger.LogWarning(ex,
+                "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
+                "manifest kept until the next sweep moves it", Path.GetFileName(output));
+            return;
+        }
+        File.Delete(manifest);
+        _outputsWithKeptManifest.TryRemove(output, out _);
+    }
+
+    /// <summary>
+    /// Reads a merge output for <see cref="ReadMergeOutput"/>: opened as the catalog scan
     /// opens it (header, footer, block index, every block frame), then every row of every block
     /// decoded as a merge reads its sources, and the rows counted against the event count its
     /// header claims. Throws <see cref="InvalidDataException"/> when the two disagree.
@@ -3996,8 +4039,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <para>The open alone proves framing, not content. A block index whose count reads 0 opens as
     /// a segment with no blocks, and a block whose bytes were lost still frames. Either was taken
     /// for a whole output, and every source was unlinked against a file that serves none of their
-    /// events. The decode costs one read of the whole file, paid only for a manifest that survived
-    /// to a start (normally none).</para>
+    /// events. The decode costs one read of the whole file, paid only for an output no catalog
+    /// serves: a manifest that survived to a start (normally none).</para>
     /// </summary>
     private static void ProveWholeMergeOutput(string output)
     {
@@ -4425,7 +4468,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // deleting its sources — otherwise those events would be served twice. Before the
         // listing and inside this scan's recording window: a source it cannot unlink is parked
         // and one it unlinks is recorded, so the enumeration below skips it either way (#98).
-        RecoverInterruptedMerges(readOutputs: true);
+        RecoverInterruptedMerges();
 
         // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
         // ran in Directory.EnumerateFiles order, so a directory already holding two files under

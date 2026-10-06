@@ -1049,7 +1049,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         AssertSameEvents(before, ReadEverything());
         Assert.Empty(Manifests());
         Assert.False(File.Exists(output));
-        Assert.True(File.Exists(output + ".corrupt"), "the scan did not quarantine the torn output");
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
     }
 
     /// <summary>
@@ -1078,6 +1078,60 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         foreach (var name in snap.Keys) Assert.True(File.Exists(Path.Combine(SegDir, name)), $"{name} was unlinked");
         Assert.Empty(Manifests());
+        // Quarantined by recovery: the scan opens a block index that reads empty, and registered the
+        // output beside the sources it replaced — 11 segments, 1 200 events by their headers.
+        Assert.Equal(10, _engine.ListSegments().Count);
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
+        Assert.False(File.Exists(output));
+    }
+
+    /// <summary>
+    /// A torn output that cannot be moved aside at the start — on Windows a scanner or a backup
+    /// agent holds it without FileShare.Delete — is still kept out of the catalog, recorded for the
+    /// scan as a delete is, and its manifest stays. The next pass finds the output unserved, proves
+    /// it again rather than take it for committed, and moves it aside once it is let go. Windows
+    /// only: elsewhere an open file moves.
+    /// </summary>
+    [Fact]
+    public async Task ATornOutputHeldAtStart_StaysOutOfService_AndIsQuarantinedByTheNextPass()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        long blockIndexOffset = BitConverter.ToInt64(bytes, bytes.Length - 44 + 24);   // footer slot 3
+        Array.Clear(bytes, (int)blockIndexOffset, 4);                                  // framing intact, no blocks
+        await File.WriteAllBytesAsync(output, bytes);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await RestartAsync();
+
+            Assert.Equal(10, _engine.ListSegments().Count);   // 11: the torn output registered beside its sources
+            AssertSameEvents(before, ReadEverything());
+            Assert.True(File.Exists(output), "setup: the holder did not stop the move");
+            Assert.Single(Manifests());
+
+            // Still held: the pass proves it again (it is unserved) instead of taking it for committed,
+            // and its merge takes the ten sources, which are in service like any others.
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.DoesNotContain(_engine.ListSegments(), s => s.FilePath == output);
+            Assert.True(File.Exists(output));
+            Assert.Single(Manifests());
+            AssertSameEvents(before, ReadEverything());
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.True(File.Exists(output + ".corrupt"), "the next pass did not quarantine the output");
+        Assert.False(File.Exists(output));
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
     }
 
     /// <summary>
