@@ -134,6 +134,44 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         Assert.IsType<FileNotFoundException>(Assert.Single(log.Snapshot(), e => e.Level >= MsLogLevel.Error).Error);
     }
 
+    /// <summary>
+    /// A DELETE OF OUR OWN IS NOT A FILE GONE BEHIND OUR BACK (#119 review, note 1). A failed flush's
+    /// retry runs 15 s later and first deletes the level files the failed attempt moved into place;
+    /// the boot scan of a large catalog can still be walking, and can have listed one of them. That
+    /// delete recorded nothing, so the scan met a file gone with no delete of ours — retried, then
+    /// kept as unreachable, the store Degraded until a restart, over the engine's own unlink. Run
+    /// here from inside the scan, between its listing and its open of the file: recorded now, the file
+    /// is skipped at Debug and the store stays Available.
+    /// </summary>
+    [Fact]
+    public async Task A_level_file_the_flush_retry_deletes_under_the_scan_is_skipped_as_our_own_delete()
+    {
+        var segs = await WriteSegmentsAsync(2);
+        string victim = segs[0];
+        ulong  id     = ulong.Parse(Path.GetFileNameWithoutExtension(victim).Split('-')[1]);   // {node}-{id}-{min}-{max}
+        bool   deleted = false;
+        var    log     = new Entries();
+
+        await using var engine = await StartAsync(log, e =>
+        {
+            e._beforeScanOpensSegment = path =>
+            {
+                if (deleted || path != victim) return;
+                deleted = true;
+                e.DeleteUnpublishedLevelFiles(id);   // the flush retry's cleanup, under the scan
+            };
+            e._catalogScanWaitForTest = static _ => { };
+        });
+
+        Assert.True(deleted, "setup: the scan never reached the file");
+        Assert.False(File.Exists(victim), "setup: the cleanup did not delete the file");
+        Assert.True(File.Exists(segs[1]), "setup: the cleanup reached past its block");
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+        Assert.DoesNotContain(log.Snapshot(), x => x.Level >= MsLogLevel.Error);
+        Assert.Contains(log.Snapshot(), x => x.Level == MsLogLevel.Debug
+                                          && x.Message.Contains("was deleted while the catalog scan was running"));
+    }
+
     // ── About the bytes: set aside, as before ─────────────────────────────────────────────────
 
     /// <summary>

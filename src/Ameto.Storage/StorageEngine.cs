@@ -2548,13 +2548,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    /// <summary>Removes level files of a reserved block that were moved into place by a flush attempt that failed before publishing.</summary>
-    private void DeleteUnpublishedLevelFiles(ulong firstSegId)
+    /// <summary>
+    /// Removes level files of a reserved block that were moved into place by a flush attempt that
+    /// failed before publishing. internal so a test can run it under the boot scan.
+    /// </summary>
+    internal void DeleteUnpublishedLevelFiles(ulong firstSegId)
     {
         for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
         {
             foreach (var f in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{firstSegId + s}-*.seg"))
             {
+                // Recorded for a running catalog scan before the unlink, as every other delete of a
+                // segment is (#119 review, note 1). This runs 15 s after a failed flush and a boot
+                // scan of a large catalog runs for minutes, so a level the failed attempt moved into
+                // place before the scan listed the directory met the scan's open as a file gone with
+                // no delete of ours: left unread, the store Degraded until a restart, over our own
+                // unlink. The record makes it the delete it is: skipped at Debug.
+                lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(f);
                 try { File.Delete(f); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete unpublished level file {File}", f); }
             }
