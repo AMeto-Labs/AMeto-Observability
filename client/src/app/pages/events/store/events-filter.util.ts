@@ -149,19 +149,24 @@ function readPath(t: readonly Token[], p: number): { key: string; end: number } 
   }
 }
 
-/** `t` without parentheses around ALL of it: the parser reads `( expr )` as expr (ParseAtom). */
+/**
+ * `t` without the parentheses around ALL of it: the parser reads `( expr )` as expr (ParseAtom).
+ * One pass: each `(` is matched to its `)` once, then pairs are peeled while the first token's
+ * match is the last — `(a) and (b)` is not one pair. It used to peel one pair at a time and scan
+ * the whole conjunct again for each, which costs depth × length, on every keystroke of a draft
+ * (#118 ultrareview).
+ */
 function unwrapped(t: Token[]): Token[] {
-  while (t.length >= 2 && isPunct(t[0], '(') && isPunct(t[t.length - 1], ')')) {
-    let depth = 0;
-    let close = -1;
-    for (let k = 0; k < t.length && close < 0; k++) {
-      if (isPunct(t[k], '(')) depth++;
-      else if (isPunct(t[k], ')') && --depth === 0) close = k;
-    }
-    if (close !== t.length - 1) break;                       // `(a) and (b)`: not one pair
-    t = t.slice(1, -1);
+  const closer = new Map<number, number>();
+  const open: number[] = [];
+  for (let k = 0; k < t.length; k++) {
+    if (isPunct(t[k], '(')) open.push(k);
+    else if (isPunct(t[k], ')') && open.length > 0) closer.set(open.pop()!, k);
   }
-  return t;
+  let lo = 0;
+  let hi = t.length - 1;
+  while (lo < hi && closer.get(lo) === hi) { lo++; hi--; }
+  return t.slice(lo, hi + 1);
 }
 
 /**

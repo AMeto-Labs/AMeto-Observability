@@ -226,6 +226,15 @@ describe('the service clause under every name the server answers for it', () => 
     }
   });
 
+  it('reads a clause however deeply it is parenthesised', () => {
+    const deep = '('.repeat(5_000) + "service['name'] = 'x'" + ')'.repeat(5_000);
+    expect([...parseServicesFromFilter(deep)]).toEqual(['x']);
+    expect(setServicesClause(`${deep} and Region = 'eu'`, new Set(['y'])))
+      .toBe("@service = 'y' and Region = 'eu'");
+    const unbalanced = '('.repeat(5_000) + "ServiceName = 'x'" + ')'.repeat(4_999);
+    expect(parseServicesFromFilter(unbalanced).size).toBe(0);
+  });
+
   it('reads back exactly the names it wrote, quotes and backslashes included', () => {
     const svcs = new Set(["O'Brien", 'DOMAIN\\svc', 'plain']);
     expect(parseServicesFromFilter(setServicesClause("@l = 'Error'", svcs))).toEqual(svcs);
