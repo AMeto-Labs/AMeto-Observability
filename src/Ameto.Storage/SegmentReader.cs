@@ -204,6 +204,13 @@ public sealed class SegmentReader : ISegmentReader
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         int blockCount = ReadInt32At(_blockIndexOffset);
+        // Events live only in blocks, so a segment whose header counts events and whose index lists
+        // no block has lost its index page (#119 review F3): it opened "whole", served none of its
+        // events, and nothing — no quarantine, no Degraded store — said so. Named as the damage it
+        // is; merge recovery's proof that an output committed rests on this open too.
+        if (blockCount == 0 && evCount > 0)
+            throw new InvalidDataException(
+                $"Segment {filePath} counts {evCount} events in its header and lists no block — a lost or torn block index");
         int stride     = version >= 5 ? 20 : 16;
         // A count the file cannot hold is a claim about the BYTES, and is named as one (#119
         // review): unchecked, a torn count failed the allocation below with OutOfMemoryException —

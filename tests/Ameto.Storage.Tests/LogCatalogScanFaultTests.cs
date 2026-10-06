@@ -205,7 +205,60 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         Assert.Equal(QueryAvailability.Available, engine.Availability);
     }
 
+    /// <summary>
+    /// A LOST INDEX PAGE IS DAMAGE, NOT AN EMPTY SEGMENT (#119 review F3). A flushed ten-event
+    /// segment whose block-index count is zeroed opened "whole" — the header's ten events, no block —
+    /// and served none of them, registered, the store Available, nothing said. The reader names it as
+    /// damage now, and the scan sets it aside.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_whose_index_lists_no_block_for_its_events_is_damage_and_set_aside()
+    {
+        var segs = await WriteSegmentsAsync(1);
+        WriteInt32At(segs[0], FooterSlot(segs[0], BlockIndexSlot), 0);   // the block-index count, zeroed
+
+        Assert.Throws<InvalidDataException>(() => SegmentReader.Open(segs[0]));
+
+        await using var engine = await StartAsync(new Entries(), e =>
+            e._catalogScanWaitForTest = static _ => throw new InvalidOperationException("damage is not retried"));
+
+        Assert.True(File.Exists(segs[0] + ".corrupt"), "a segment that serves none of its events was kept in service");
+        Assert.DoesNotContain(engine.ListSegments(), s => s.FilePath == segs[0]);
+        Assert.Equal(QueryAvailability.Available, engine.Availability);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Footer slot offsets (the footer is a file's last 44 bytes): the v7 group directory, and the block index.</summary>
+    private const int GroupDirectorySlot = 0, BlockIndexSlot = 24;
+
+    /// <summary>The int64 in footer slot <paramref name="slot"/> — an offset into the file.</summary>
+    private static long FooterSlot(string path, int slot)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        Span<byte> v = stackalloc byte[8];
+        fs.Seek(fs.Length - 44 + slot, SeekOrigin.Begin);
+        fs.ReadExactly(v);
+        return BinaryPrimitives.ReadInt64LittleEndian(v);
+    }
+
+    private static void WriteInt32At(string path, long at, int value)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write);
+        Span<byte> v = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(v, value);
+        fs.Seek(at, SeekOrigin.Begin);
+        fs.Write(v);
+    }
+
+    private static void WriteInt64At(string path, long at, long value)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write);
+        Span<byte> v = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(v, value);
+        fs.Seek(at, SeekOrigin.Begin);
+        fs.Write(v);
+    }
 
     /// <summary><paramref name="count"/> segments of ten events each, ten minutes ago, written by an engine that is then closed.</summary>
     private async Task<string[]> WriteSegmentsAsync(int count)
@@ -262,23 +315,12 @@ public sealed class LogCatalogScanFaultTests : IDisposable
         fs.SetLength(fs.Length / 2);
     }
 
-    /// <summary>
-    /// Overwrites the block index's count, or the group directory's, with two billion. Their offsets
-    /// are the footer's (its last 44 bytes): the block index at slot 3, the group directory at slot 0.
-    /// </summary>
+    /// <summary>Overwrites the block index's count, or the v7 group directory's, with two billion.</summary>
     private static void TearCount(string path, string which)
     {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite);
-        Span<byte> slot = stackalloc byte[8];
-        fs.Seek(fs.Length - 44 + (which == "block index" ? 24 : 0), SeekOrigin.Begin);
-        fs.ReadExactly(slot);
-        long offset = BinaryPrimitives.ReadInt64LittleEndian(slot);
-        Assert.InRange(offset, 1, fs.Length - 4);   // setup: a v7 segment, whose footer names both
-
-        Span<byte> torn = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(torn, 0x7FFF_FFF0);
-        fs.Seek(offset, SeekOrigin.Begin);
-        fs.Write(torn);
+        long offset = FooterSlot(path, which == "block index" ? BlockIndexSlot : GroupDirectorySlot);
+        Assert.InRange(offset, 1, new FileInfo(path).Length - 4);   // setup: a v7 segment, whose footer names both
+        WriteInt32At(path, offset, 0x7FFF_FFF0);
     }
 
     /// <summary>Every entry at every level, formatted.</summary>
