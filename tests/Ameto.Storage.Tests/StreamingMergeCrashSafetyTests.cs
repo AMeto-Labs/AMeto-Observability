@@ -1135,6 +1135,88 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A torn output found after some of its sources were already unlinked: the merge committed,
+    /// the crash came in the middle of the unlinks, and the output was damaged afterwards. The
+    /// sources still on disk stay in service; the events of the missing ones exist only in the
+    /// quarantined file. That is said at Error with how many, and the manifest is kept aside as
+    /// {output}.corrupt.sources, out of every sweep's way, as the record of which served sources a
+    /// salvage of the .corrupt file would duplicate. It used to be logged as "the sources it lists
+    /// stay in service" and the manifest deleted.
+    /// </summary>
+    [Fact]
+    public async Task ATornOutputWithSourcesAlreadyGone_SaysSo_AndKeepsTheManifestAside()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var snap = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+
+        var half = snap.Keys.Order(StringComparer.Ordinal).Take(5).ToList();   // killed after five of ten unlinks
+        Restore(snap, half);
+        var expected = half.SelectMany(n => ReadRaw(Path.Combine(SegDir, n))).OrderBy(e => e.Id).ToList();
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        await File.WriteAllBytesAsync(output, bytes[..(bytes.Length / 2)]);   // then the output lost its tail
+
+        await RestartAsync();
+
+        Assert.Equal(5, _engine.ListSegments().Count);
+        AssertSameEvents(expected, ReadEverything());
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
+        Assert.Empty(Manifests());
+        var setAside = output + ".corrupt.sources";
+        Assert.True(File.Exists(setAside), "the manifest was not kept aside");
+        Assert.Equal(snap.Keys.Order(StringComparer.Ordinal), File.ReadAllLines(setAside).Order(StringComparer.Ordinal));
+        Assert.Single(_log.Entries, e => e.Message.Contains("5 of 10 sources", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The same, with the torn output held at the start so it cannot be moved aside: the missing
+    /// sources are counted and said once, at the first verdict. The manifest then only keeps the
+    /// output out of service until a pass can move it, and lists nothing more — the sources it
+    /// listed are in service, a pass may merge them, and counted again they would be called
+    /// "already deleted" too. Windows only: elsewhere an open file moves.
+    /// </summary>
+    [Fact]
+    public async Task ATornOutputHeldWithSourcesGone_IsReportedOnce_AcrossThePassesThatWaitForIt()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var snap = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+
+        var half = snap.Keys.Order(StringComparer.Ordinal).Take(5).ToList();
+        Restore(snap, half);
+        var expected = half.SelectMany(n => ReadRaw(Path.Combine(SegDir, n))).OrderBy(e => e.Id).ToList();
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        await File.WriteAllBytesAsync(output, bytes[..(bytes.Length / 2)]);
+
+        int Reports() => _log.Entries.Count(e => e.Message.Contains("were already deleted; their events exist only", StringComparison.Ordinal));
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await RestartAsync();
+            Assert.Equal(1, Reports());
+            Assert.True(File.Exists(output + ".corrupt.sources"), "the manifest was not kept aside");
+            Assert.Equal(0, new FileInfo(output + ".mergemanifest").Length);   // a marker now, listing nothing
+            AssertSameEvents(expected, ReadEverything());
+
+            // A pass while it is still held: it merges the five sources, and says nothing more.
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.Equal(1, Reports());
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.True(File.Exists(output + ".corrupt"), "the next pass did not quarantine the output");
+        Assert.Empty(Manifests());
+        Assert.Equal(1, Reports());
+        AssertSameEvents(expected, ReadEverything());
+    }
+
+    /// <summary>
     /// Killed after the last unlink and before the manifest went: nothing is left to delete, so
     /// recovery drops the manifest and touches nothing else.
     /// </summary>

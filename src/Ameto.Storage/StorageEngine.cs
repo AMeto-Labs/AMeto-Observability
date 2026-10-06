@@ -3989,8 +3989,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         catch (Exception ex) when (FileBounds.DescribesContent(ex))
         {
             _logger.LogWarning(ex,
-                "Merge recovery: the output {File} of an interrupted merge is not a whole segment, so the merge never " +
-                "committed — the sources it lists stay in service, and the output is quarantined",
+                "Merge recovery: the output {File} of an interrupted merge is not a whole segment — it is quarantined, " +
+                "and the sources it lists that are still on disk stay in service",
                 Path.GetFileName(output));
             return MergeOutputState.Torn;
         }
@@ -4014,13 +4014,42 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// count; every row a block still held). Recorded for a running scan as well, so that one does
     /// not register it even when the move fails; the manifest then stays, and the next sweep, which
     /// finds the output unserved, proves it again and retries the move.
+    ///
+    /// <para>A listed source missing from disk means the merge DID commit and had unlinked it before
+    /// the output was damaged: its events now exist only in the quarantined file. That is said at
+    /// Error, with how many, and the manifest is kept aside as <c>{output}.corrupt.sources</c> — a
+    /// name no sweep lists — as the record of which served sources a salvage of the
+    /// <c>.corrupt</c> file would duplicate. It used to be logged as "the sources stay in service"
+    /// and the manifest deleted. Decided once, at the first verdict: when the move fails, the
+    /// manifest is emptied after the list is set aside, and stays only to keep the output out of
+    /// service, since the sources it listed are in service and later merges may take them.</para>
     /// </summary>
     private void RecoverTornMerge(string manifest, string output)
     {
+        int listed = 0, missing = 0;
+        foreach (var name in File.ReadAllLines(manifest))
+        {
+            if (!IsListedSourceName(name)) continue;
+            string path = Path.Combine(_segDir, name);
+            if (string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) continue;
+            listed++;
+            if (!File.Exists(path)) missing++;
+        }
+        string setAside = output + ".corrupt.sources";
+        if (missing != 0)
+        {
+            File.Copy(manifest, setAside, overwrite: true);
+            _logger.LogError(
+                "Merge recovery: {Missing} of {Listed} sources of the torn merge output {File} were already deleted; " +
+                "their events exist only in the quarantined {Corrupt}. The sources it lists are kept in {Sources}",
+                missing, listed, Path.GetFileName(output), Path.GetFileName(output) + ".corrupt", Path.GetFileName(setAside));
+        }
+
         try { File.Move(output, output + ".corrupt", overwrite: true); }
         catch (Exception ex)
         {
             lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
+            if (listed != 0) File.WriteAllBytes(manifest, []);
             _logger.LogWarning(ex,
                 "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
                 "manifest kept until the next sweep moves it", Path.GetFileName(output));
