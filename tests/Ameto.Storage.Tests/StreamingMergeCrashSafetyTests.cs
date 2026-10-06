@@ -1053,6 +1053,34 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The start's proof of an output is its content, not its framing. With the page holding the
+    /// block index's count lost (it reads 0), the output still opens as a segment, one with no
+    /// blocks; taken for a whole output, all ten sources were unlinked and the batch served 0 of
+    /// 600 events. Every row is decoded now and counted against the header.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputWhoseBlockIndexPageWasLost_IsNotTakenAsCommitted()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        long blockIndexOffset = BitConverter.ToInt64(bytes, bytes.Length - 44 + 24);   // footer slot 3
+        Array.Clear(bytes, (int)blockIndexOffset, 4);                                  // the count reads 0
+        await File.WriteAllBytesAsync(output, bytes);
+        await RestartAsync();
+        AssertSameEvents(before, ReadEverything());
+
+        foreach (var name in snap.Keys) Assert.True(File.Exists(Path.Combine(SegDir, name)), $"{name} was unlinked");
+        Assert.Empty(Manifests());
+    }
+
+    /// <summary>
     /// Killed after the last unlink and before the manifest went: nothing is left to delete, so
     /// recovery drops the manifest and touches nothing else.
     /// </summary>

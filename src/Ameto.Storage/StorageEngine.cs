@@ -3850,16 +3850,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// (<see cref="TryEnterMergeGate"/>).</para>
     /// </summary>
     /// <param name="readOutputs">
-    /// The catalog scan's sweep: read each output as a whole segment, as the scan is about to,
-    /// before acting on its manifest. No crash of this process leaves a torn output at its final
-    /// name, but a restored backup, or storage that lost a flushed write in a power cut, can; read
-    /// as committed, its sources — the batch's only readable copy — were deleted, and the scan then
-    /// quarantined the output. A torn output is therefore a merge that never committed: the sources
-    /// stay, the manifest goes, and the scan quarantines the output as it does every unreadable
-    /// segment. One that cannot be opened for any other reason (a scanner holding it) is taken as
-    /// committed: the rename is its proof, and sources kept beside an output that a later start
-    /// reads would be counted twice for good. A pass does not read: the outputs it meets were
-    /// written by this process or read by its scan.
+    /// The catalog scan's sweep: prove each output whole before acting on its manifest — every row
+    /// decoded and counted against its header (<see cref="ProveWholeMergeOutput"/>). No crash of
+    /// this process leaves a torn output at its final name, but a restored backup, or storage that
+    /// lost a flushed write in a power cut, can; read as committed, its sources — the batch's only
+    /// readable copy — were deleted. A torn output is therefore a merge that never committed: the
+    /// sources stay, the manifest goes, and the output is left to the catalog scan, which
+    /// quarantines what it cannot open. One that cannot be opened for any other reason (a scanner
+    /// holding it) is taken as committed: the rename is its proof, and sources kept beside an
+    /// output that a later start reads would be counted twice for good. A pass does not read: the
+    /// outputs it meets were written by this process or read by its scan.
     /// </param>
     private void RecoverInterruptedMerges(bool readOutputs = false)
     {
@@ -3965,15 +3965,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (!read) return true;
         try
         {
-            // The scan's own open, block frames included, so the two agree on what a whole segment is.
-            using (SegmentReader.Open(output, computeUncompressedBytes: true)) { }
+            ProveWholeMergeOutput(output);
             return true;
         }
         catch (Exception ex) when (FileBounds.DescribesContent(ex))
         {
             _logger.LogWarning(ex,
                 "Merge recovery: the output {File} of an interrupted merge is not a whole segment, so the merge never " +
-                "committed — the sources it lists stay in service, and the catalog scan quarantines the output",
+                "committed — the sources it lists stay in service, and the output is left to the catalog scan",
                 Path.GetFileName(output));
             return false;
         }
@@ -3986,6 +3985,36 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 Path.GetFileName(output));
             return true;
         }
+    }
+
+    /// <summary>
+    /// Reads a merge output for <see cref="IsCommittedMergeOutput"/>: opened as the catalog scan
+    /// opens it (header, footer, block index, every block frame), then every row of every block
+    /// decoded as a merge reads its sources, and the rows counted against the event count its
+    /// header claims. Throws <see cref="InvalidDataException"/> when the two disagree.
+    ///
+    /// <para>The open alone proves framing, not content. A block index whose count reads 0 opens as
+    /// a segment with no blocks, and a block whose bytes were lost still frames. Either was taken
+    /// for a whole output, and every source was unlinked against a file that serves none of their
+    /// events. The decode costs one read of the whole file, paid only for a manifest that survived
+    /// to a start (normally none).</para>
+    /// </summary>
+    private static void ProveWholeMergeOutput(string output)
+    {
+        var  reader   = SegmentReader.Open(output, computeUncompressedBytes: true);
+        long expected = reader.Info.EventCount;
+        long rows     = 0;
+        using (var cursor = new SegmentEventCursor(reader, new Dictionary<string, string>(Utf8StringComparer.Instance)))
+        {
+            while (cursor.MoveNext())
+            {
+                _ = cursor.Current;   // every column of the row, as a merge or a query reads it
+                rows++;
+            }
+        }
+        if (rows != expected)
+            throw new InvalidDataException(
+                $"Segment {output} holds {rows} events in its blocks, but its header says {expected}");
     }
 
     /// <summary>
