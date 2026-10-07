@@ -160,10 +160,15 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         bool? fromBlob = pred.Evaluate(SpanWith(blob, dictionary: false));
         bool? fromDict = pred.Evaluate(SpanWith(blob, dictionary: true));
 
-        _out.WriteLine($"{query,-38} blob={Show(fromBlob)}  dict={Show(fromDict)}");
+        // And what a page runs: the evaluator that reads every key the filter names in ONE walk of
+        // the map (#94) must give the per-predicate blob answer for every shape, the nulls included.
+        bool? shared = new SpanPredicateEvaluator(pred).Evaluate(SpanWith(blob, dictionary: false));
+
+        _out.WriteLine($"{query,-38} blob={Show(fromBlob)}  dict={Show(fromDict)}  shared={Show(shared)}");
 
         Assert.Equal(expected, fromBlob);
         Assert.Equal(fromBlob, fromDict);
+        Assert.Equal(fromBlob, shared);
     }
 
     /// <summary>
@@ -199,7 +204,8 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// read at all. The gate's own comment carries the measurements.</para>
     ///
     /// <para>Restore the <c>params string[]</c> signature and its literal arguments at
-    /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 104 B a row above the gate.</para>
+    /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 104 B a row above the gate; give
+    /// <c>BuildRow</c> its own <c>HashSet</c> per row again (#94) and it fails at 176 B a row.</para>
     /// </summary>
     [Fact]
     public async Task Reading_the_http_attributes_of_a_row_allocates_nothing()
@@ -437,17 +443,25 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // A_traceql_page_does_not_inflate_the_hot_tier_it_paged_over measures 368 B per root span
         // left on the tier where the dictionary left 1 545, i.e. 1 177 B of permanent tier memory
         // bought for 88 B of per-page allocation.
+        //
+        // AND FROM 963 TO 788 WHEN BuildRow STOPPED BUILDING A HashSet PER ROW (#94): the page now
+        // clears one set per row instead. Measured 963,504 -> 787,688 B/row in Debug and 787,064 in
+        // Release, so the 176 B of an ordinary one-service set — the object, a 3-bucket int[] and a
+        // 3-entry array — is the whole of the move. The baseline HAD to follow it down: left at 963
+        // the gate would sit at 1 015 and pass the params-array defect, now 892, without a word.
+        // At 788 the gate is 840, under both defects: the key arrays read 892 and the per-row set
+        // 964.
         _out.WriteLine($"              a row's two id strings weigh {idsPerRow:N0} B/row around the pass read "
                      + $"({(idsPerRow >= 200 ? "boxed: the handler is running unoptimised" : "unboxed")})");
         Assert.InRange(idsPerRow, 144, 400);   // 144 is the two strings themselves; anything less is a mis-measurement
 
-        const double Baseline = 963;   // the Debug figure less the id strings, rounded up to the byte
+        const double Baseline = 788;   // the Debug figure less the id strings, rounded up to the byte
         double gate   = Baseline + defectPerRow / 2;
 
         Assert.True(perRow < gate,
             $"a returned row cost {perRow:N0} B beyond its two id strings, against a gate of "
-            + $"{gate:N0} — BuildRow is building its semconv key lists per row again (two params "
-            + $"string[] is {defectPerRow:N0} B a row)");
+            + $"{gate:N0} — BuildRow is allocating per row again: its semconv key lists (two params "
+            + $"string[] are {defectPerRow:N0} B a row) or a service set of its own (a HashSet is 176 B)");
     }
 
     /// <summary>
@@ -731,6 +745,73 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal(hot, cold);
     }
 
+    /// <summary>
+    /// EACH ROW LISTS ITS OWN SERVICES AND NO OTHER ROW'S. The page builds its rows through one
+    /// service set, cleared by every row (#94); a set that were not cleared would hand every row
+    /// the services of every row built before it, and the allocation gate above could not tell —
+    /// it would read LOWER. Four traces on one page, newest first: one wide enough that the page
+    /// lets its set go (<c>TraceQLExecutor.WideRowServices</c> + 1 services), then two services,
+    /// then one, then two again sharing one with the second trace — so the second row is built
+    /// through the fresh set and the rows after it through a cleared one. The first two rows each
+    /// spell one service twice, in two cases: both sets ignore case.
+    ///
+    /// <para>Drop the <c>Clear</c> in <c>BuildRow</c> and the third row reads three services; give
+    /// either set the default comparer and its row reads one service too many.</para>
+    /// </summary>
+    [Fact]
+    public async Task Each_row_lists_its_own_services_and_no_other_rows()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-qlsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var  at       = ColdSpanSegmentFixture.Base;
+        long baseNano = at.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        void Write(ulong trace, ulong span, ulong parent, int ms, string service) =>
+            engine.WriteSpan(new SpanIngestItem
+            {
+                TraceId           = new TraceId(0x5E2F1CE, trace),
+                SpanId            = new SpanId(span),
+                ParentSpanId      = new SpanId(parent),
+                StartTimeUnixNano = baseNano + ms * 1_000_000L,
+                DurationNanos     = 5_000_000L,
+                Name              = "op",
+                ServiceName       = service,
+                Kind              = SpanKind.Server,
+                Status            = SpanStatusCode.Unset,
+            });
+
+        string[] wide = [.. Enumerable.Range(0, TraceQLExecutor.WideRowServices + 1).Select(static i => $"pod-{i:D3}")];
+        for (int i = 0; i < wide.Length; i++)
+            Write(trace: 4, span: (ulong)(401 + i), parent: i == 0 ? 0UL : 401UL, ms: 400 + i, wide[i]);
+        Write(trace: 4, span: 499, parent: 401, ms: 499, "POD-000");   // the set the page starts with ignores case too
+
+        Write(trace: 3, span: 31, parent: 0,  ms: 300, "billing");
+        Write(trace: 3, span: 32, parent: 31, ms: 301, "BILLING");
+        Write(trace: 3, span: 33, parent: 31, ms: 302, "ledger");
+        Write(trace: 2, span: 21, parent: 0,  ms: 200, "gateway");
+        Write(trace: 1, span: 11, parent: 0,  ms: 100, "auth");
+        Write(trace: 1, span: 12, parent: 11, ms: 101, "ledger");
+
+        var page = await TraceQLExecutor.ExecuteAsync(
+            engine, TraceQLParser.Parse("{ }"), at.AddMinutes(-1), at.AddDays(1), 10, CancellationToken.None);
+
+        string[][] services = [.. page.Rows.Select(static r => r.Services)];
+        _out.WriteLine(string.Join("  |  ", services.Select(static s => s.Length > 4 ? $"{s.Length} services" : string.Join(", ", s))));
+
+        Assert.Equal(4, services.Length);
+        AssertServices(wide,                  services[0]);
+        AssertServices(["billing", "ledger"], services[1]);
+        AssertServices(["gateway"],           services[2]);
+        AssertServices(["auth", "ledger"],    services[3]);
+
+        static void AssertServices(string[] expected, string[] actual) =>
+            Assert.Equal(expected, actual.Select(static s => s.ToLowerInvariant()).Order(StringComparer.Ordinal));
+    }
+
     /// <summary>A one-key attribute map.</summary>
     private static byte[] OneAttr(string key, string value)
     {
@@ -836,12 +917,17 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         var span = SpanWith(torn, dictionary: false);
 
         Assert.Null(span.Attributes);
-        Assert.Null(TraceQLParser.Parse("{ .db.system = \"mssql\" }").Evaluate(span));
-        Assert.Null(TraceQLParser.Parse("{ !(.db.system = \"mssql\") }").Evaluate(span));
+        foreach (var evaluate in (Func<string, bool?>[])
+                 [q => TraceQLParser.Parse(q).Evaluate(span),
+                  q => new SpanPredicateEvaluator(TraceQLParser.Parse(q)).Evaluate(span)])   // a page's shared walk (#94)
+        {
+            Assert.Null(evaluate("{ .db.system = \"mssql\" }"));
+            Assert.Null(evaluate("{ !(.db.system = \"mssql\") }"));
 
-        // Presence is the one question a blob can still be wrong about cheaply, so it is pinned:
-        // an unreadable map holds nothing anybody can name.
-        Assert.False(TraceQLParser.Parse("{ .db.system != nil }").Evaluate(span));
+            // Presence is the one question a blob can still be wrong about cheaply, so it is pinned:
+            // an unreadable map holds nothing anybody can name.
+            Assert.False(evaluate("{ .db.system != nil }"));
+        }
     }
 
     private static string Show(bool? b) => b?.ToString() ?? "unknown";

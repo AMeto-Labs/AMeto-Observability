@@ -62,8 +62,9 @@ public sealed class SearchHints
 ///      (service, status, duration range, http status code).
 ///   2. These hints are passed to <c>SearchSpansAsync</c> — the storage engine uses its
 ///      service-name index and block-skip logic to avoid reading irrelevant data.
-///   3. Returned spans are post-filtered with the full AST predicate (handles attribute
-///      predicates not covered by the index).
+///   3. Returned spans are post-filtered with the full predicate (handles attribute
+///      predicates not covered by the index), every attribute it names read in ONE walk of
+///      each span's map — see <see cref="SpanPredicateEvaluator"/>.
 ///   4. Matching spans are grouped by TraceId and returned as <see cref="TraceRowDto"/> list.
 /// </summary>
 public static class TraceQLExecutor
@@ -176,15 +177,29 @@ public static class TraceQLExecutor
     /// produce a page far short of <paramref name="limit"/> with plenty more matching traces
     /// deeper in the window.</para>
     /// </summary>
-    public static async Task<TraceQueryPage> ExecuteAsync(
+    public static Task<TraceQueryPage> ExecuteAsync(
         ITraceProvider  provider,
         SpanPredicate   predicate,
         DateTimeOffset  from,
         DateTimeOffset  to,
         int             limit,
-        CancellationToken ct)
+        CancellationToken ct) =>
+        ExecuteAsync(provider, new SpanPredicateEvaluator(predicate), from, to, limit, ct);
+
+    /// <summary>
+    /// The page, post-filtered by <paramref name="evaluator"/> — ONE per page, never shared: it
+    /// holds the span it is evaluating. Internal so a test can hand in its own and count the walks
+    /// the page made.
+    /// </summary>
+    internal static async Task<TraceQueryPage> ExecuteAsync(
+        ITraceProvider         provider,
+        SpanPredicateEvaluator evaluator,
+        DateTimeOffset         from,
+        DateTimeOffset         to,
+        int                    limit,
+        CancellationToken      ct)
     {
-        var hints = ExtractHints(predicate);
+        var hints = ExtractHints(evaluator.Predicate);
 
         // Fetch spans using indexed filters; multiply limit for grouping headroom.
         //
@@ -200,8 +215,8 @@ public static class TraceQLExecutor
         //     design, so nothing serialises them.
         //
         // It was 1,749 B, 3.6 MB and 17 MB until the attribute map stopped being decoded into a
-        // dictionary for every span a scan touched; the predicate now reads its one key straight
-        // out of the bytes (AttributePredicate.Evaluate).
+        // dictionary for every span a scan touched; the filter now reads its keys straight out of
+        // the bytes, all of them in one walk of each span's map (SpanPredicateEvaluator).
         //
         // LEFT AS IT IS, deliberately. The peak is proportional to what the caller asked for and
         // bounded by it — this is not the unbounded-in-the-match-count shape that killed the
@@ -244,7 +259,10 @@ public static class TraceQLExecutor
             // not answer — the field the query asks about is not on it — and an unanswered question
             // is not a match. Writing this as `!Evaluate(s)` would not compile against bool? and
             // writing it as `Evaluate(s) == false` would silently admit every unknown.
-            if (predicate.Evaluate(s) != true) continue;
+            //
+            // THE EVALUATOR, NOT THE PREDICATE: the same answer, with every attribute the filter
+            // names read in one walk of the span's map instead of one walk per predicate (#94).
+            if (evaluator.Evaluate(s) != true) continue;
             if (!traces.TryGetValue(s.TraceId, out var list))
             {
                 list = new List<SpanRecord>(4);
@@ -258,8 +276,8 @@ public static class TraceQLExecutor
         // sort — returned a page whose oldest row was the boundary of nothing: encounter
         // order is only roughly newest-first (grouping by trace shuffles it), so a caller
         // paging on "everything older than my oldest row" skipped real traces. Building rows
-        // after the cut also keeps BuildRow's allocations (a HashSet, id strings, an array)
-        // to the `limit` survivors instead of every matching trace in the window — the
+        // after the cut also keeps BuildRow's allocations (id strings, the services array) to
+        // the `limit` survivors instead of every matching trace in the window — the
         // difference compounds page by page under the client's load-more.
         //
         // The trace-id tiebreak makes equal-millisecond boundaries deterministic: without it,
@@ -293,19 +311,50 @@ public static class TraceQLExecutor
             groups.RemoveRange(limit, groups.Count - limit);
         }
 
-        var result = new List<TraceRowDto>(groups.Count);
+        // ONE SERVICE SET FOR THE PAGE, cleared by every row — see BuildRow — and let go after a
+        // row that filled it past WideRowServices, so one wide trace cannot make every row after it
+        // pay for a wide clear.
+        var services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result   = new List<TraceRowDto>(groups.Count);
         foreach (var (_, _, traceSpans) in groups)
-            result.Add(BuildRow(traceSpans));
+        {
+            result.Add(BuildRow(traceSpans, services));
+            if (services.Count > WideRowServices)
+                services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
         return new TraceQueryPage(result, scanFloorNano, scanFloor.Unreadable);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private static TraceRowDto BuildRow(List<SpanRecord> spans)
+    /// <summary>
+    /// The most services a row may leave in the page's set before the page starts a fresh one. A
+    /// <c>HashSet</c> of up to 64 entries holds at most 89 buckets, so that is the most any clear
+    /// wipes; an ordinary trace crosses a handful of services, so a fresh set is the rare case.
+    /// </summary>
+    internal const int WideRowServices = 64;
+
+    /// <summary>
+    /// One row for one trace's matching spans.
+    ///
+    /// <para><paramref name="services"/> is the PAGE'S scratch set, cleared here; the row keeps only
+    /// the array made from it. It was a <c>new HashSet</c> per row — 176 B for an ordinary
+    /// one-service row (the set, its buckets, its entries) on a page of up to a thousand rows, of
+    /// which only the array outlived the row. Per page and never static: pages run concurrently —
+    /// a TraceQL POST takes no admission slot, and every SSE client pages on its own — and a set is
+    /// not safe for two of them at once.</para>
+    ///
+    /// <para>Clearing costs the set's WHOLE bucket array, and the array keeps the width of the widest
+    /// row the set has held. One trace of nine thousand services — per-pod service names, under the
+    /// 10 000-span clamp — would leave it at 17 519 buckets, and each of up to 999 rows after it would
+    /// clear 70 KB: some 70 MB of memset on one page. So the page lets the set go after a row fills it
+    /// past <see cref="WideRowServices"/>, and no clear is ever of more than 89 buckets.</para>
+    /// </summary>
+    private static TraceRowDto BuildRow(List<SpanRecord> spans, HashSet<string> services)
     {
         SpanRecord? root = null;
         bool hasErr = false;
-        var services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        services.Clear();
 
         foreach (var s in spans)
         {
