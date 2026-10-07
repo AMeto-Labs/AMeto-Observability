@@ -550,17 +550,21 @@ public static class TraceQueryEndpointMapper
     ///   merge and the cold walk's scan cap counts the merge — but it opens no block wholly outside
     ///   its window, and it makes rows (a summary, a service array, the root's HTTP method and
     ///   path) only for the <c>limit</c> it returns. Measured (Release, a 49 000-span hot tier
-    ///   arriving in order, ten spans a trace, pages 0-5 walking down the window; medians of three
-    ///   runs on a loaded machine): the filter list's 500-row pages 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB
-    ///   and 10, 10, 11, 9, 7, 3 ms before, 1.2, 1.2, 1.1, 1.0, 0.9, 0.6 MB and 4, 5, 4, 4, 3, 2 ms
-    ///   after; the TraceQL page's engine call (2 000 spans) 638 KB and ~5 ms — all of it inside the
-    ///   read lock — before, 283 KB and ~1.3 ms, none of it inside the lock, after.
+    ///   arriving in order, ten spans a trace, pages 0-5 walking down the window; tiered compilation
+    ///   off, so no measured call runs code the JIT has not optimised yet — with it on, a short probe
+    ///   times tier-0 code and reads several times these; old and new runs interleaved, two a side):
+    ///   the filter list's 500-row pages 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and 4.4, 4.5, 4.2, 3.7, 2.6,
+    ///   2.5 ms before, 1.2, 1.2, 1.1, 1.0, 0.9, 0.6 MB and 1.6, 1.3, 1.3, 1.1, 1.1, 0.8 ms after; the
+    ///   TraceQL page's engine call (2 000 spans) 638 KB and 4.5-6.4 ms — all of it inside the read
+    ///   lock — before, 275 KB and 0.33-0.37 ms, none of it inside the lock, after.
     ///   <para>DISORDER TAKES THE READ SAVINGS BACK, not the rest (#122 review L1). A block's bounds
     ///   cover all of its spans, so one span from a clock running ahead keeps its whole block in every
     ///   TraceQL page, and one long span reported late keeps its block in every list page reaching
     ///   back over its duration. At one span in a hundred 30 s ahead a TraceQL page reads most of the
-    ///   tier again; <c>TraceStreamPageProbe</c> prints a disordered tier beside the ordered one. The
-    ///   reads off the lock and the rows not made hold whatever the order.</para></item>
+    ///   tier again — its engine call 31 720 to 41 960 of the 49 000 spans and 1.8-2.0 ms, against
+    ///   about 2 100 and 0.35 ms in order; <c>TraceStreamPageProbe</c> prints a disordered tier
+    ///   beside the ordered one. The reads off the lock and the rows not made hold whatever the
+    ///   order.</para></item>
     /// </list>
     /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
     /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is

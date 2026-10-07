@@ -25,6 +25,12 @@ namespace Ameto.Storage.Tests;
 /// and the wall time (their median). The numbers in the commit bodies are Release's, over the
 /// 49 000-span tier; the suite runs this in Debug on a tenth of it.</para>
 ///
+/// <para>TIME IT WITH TIERED COMPILATION OFF (<c>DOTNET_TieredCompilation=0</c>). The warm-up is
+/// one page an arm, so with tiering on a measured call can still run tier-0 code: the ordered
+/// tier's engine call then reads 1.2-2.1 ms instead of 0.35, and the disordered tier, measured
+/// second, can look no slower than the ordered one while reading fifteen times the spans. The
+/// bytes do not depend on it, except up to 14 KB on the disordered tier's whole TraceQL page.</para>
+///
 /// <para>TWO TIERS, because the index prunes by ARRIVAL order (#122 review L1). The first arrives in
 /// start order; the second is the same spans arriving as an imperfect fleet sends them — one in a
 /// hundred from a clock 30 s ahead, one in fifty a long span reported 10 s after it started. A
