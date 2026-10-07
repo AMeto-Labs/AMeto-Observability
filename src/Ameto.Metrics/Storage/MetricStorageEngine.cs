@@ -2649,7 +2649,24 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     {
         long ttl = Interlocked.Read(ref _retentionTtlTicks);
         if (ttl <= 0) return long.MinValue;
-        return DateTimeOffset.UtcNow.Subtract(TimeSpan.FromTicks(ttl)).ToUnixTimeMilliseconds() * 1_000_000L;
+        return RetentionCutoffNano(DateTimeOffset.UtcNow, TimeSpan.FromTicks(ttl));
+    }
+
+    /// <summary>
+    /// <paramref name="now"/> − <paramref name="ttl"/> in Unix nanoseconds: what retention deletes
+    /// before (by a file's newest point) and a rewrite clips at. <see cref="long.MinValue"/> — nothing
+    /// is older — when the TTL reaches back past the Unix epoch (#125 review F2). It used to be
+    /// computed in <see cref="DateTimeOffset"/> and multiplied out: a TTL reaching past year 1 (about
+    /// 2 025 years) threw, so retention never ran and — once the clip shared the formula — every
+    /// rewrite failed; and a TTL some centuries long (roughly 350 to 585 years: "200000 days" for
+    /// "forever") wrapped the multiplication into a cutoff in the FUTURE, so retention deleted every
+    /// metric file, every hour.
+    /// </summary>
+    internal static long RetentionCutoffNano(DateTimeOffset now, TimeSpan ttl)
+    {
+        long nowMs = now.ToUnixTimeMilliseconds();
+        long ttlMs = Math.Max(0, ttl.Ticks / TimeSpan.TicksPerMillisecond);
+        return ttlMs >= nowMs ? long.MinValue : (nowMs - ttlMs) * 1_000_000L;
     }
 
     /// <summary>The TTL the last retention run pruned with; 0 until one has run. See <see cref="RetentionKeepFromNano"/>.</summary>
@@ -3681,7 +3698,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
         Interlocked.Exchange(ref _lastPruneTtlTicks, ttl.Ticks);
         Interlocked.Exchange(ref _retentionTtlTicks, ttl.Ticks);   // what a rewrite may now clip at (#125)
-        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+        var cutoffNano = RetentionCutoffNano(DateTimeOffset.UtcNow, ttl);
 
         List<MetricSegmentInfo> toDelete;
         if (!TryEnterColdWrite()) return Task.FromResult(0);

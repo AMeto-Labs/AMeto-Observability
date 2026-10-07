@@ -172,6 +172,48 @@ public sealed class MetricRewriteBudgetTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The cutoff is now − TTL, and nothing at all once the TTL reaches back past the Unix epoch
+    /// (#125 review F2): computed in DateTimeOffset and multiplied out, a TTL past year 1 threw and a
+    /// TTL of some centuries wrapped into a cutoff in the future.
+    /// </summary>
+    [Fact]
+    public void The_cutoff_is_now_less_the_TTL_and_nothing_past_the_epoch()
+    {
+        var now = DateTimeOffset.UtcNow;
+        Assert.Equal((now.ToUnixTimeMilliseconds() - 30L * 86_400_000) * 1_000_000L,
+                     MetricStorageEngine.RetentionCutoffNano(now, TimeSpan.FromDays(30)));
+        Assert.Equal(long.MinValue, MetricStorageEngine.RetentionCutoffNano(now, TimeSpan.FromDays(200_000)));
+        Assert.Equal(long.MinValue, MetricStorageEngine.RetentionCutoffNano(now, TimeSpan.FromDays(800_000)));
+        Assert.Equal(long.MinValue, MetricStorageEngine.RetentionCutoffNano(now, TimeSpan.MaxValue));
+    }
+
+    /// <summary>
+    /// A retention of centuries — "200000 days" typed for "forever" — keeps everything: the prune
+    /// deletes nothing and a rewrite clips nothing. It used to wrap into a cutoff in the future and
+    /// delete every metric file (200 000 days), or throw in the prune and then in every rewrite, which
+    /// all failed and backed off to 6 hours, so nothing was ever rolled up again (800 000 days).
+    /// </summary>
+    [Theory]
+    [InlineData(200_000)]
+    [InlineData(800_000)]
+    public async Task A_retention_reaching_back_past_the_epoch_deletes_nothing_and_clips_nothing(int days)
+    {
+        const string metric = "forever.raw";
+        long now = Now() / Hour * Hour;
+        string dir = Sub("forever");
+        Gauges(dir, metric, MetricGranularity.Raw, 3, now - 9 * Day, Hour, [9 * 24 - 2]);
+        await using var engine = await Engine(dir);
+
+        Assert.Equal(0, await engine.PruneAsync(TimeSpan.FromDays(days)));
+        Assert.Single(engine.ColdSegmentsForTest.Where(s => s.Granularity == MetricGranularity.Raw));
+
+        await engine.PerformRollupForTest();
+        var rolled = engine.ColdSegmentsForTest.Where(s => s.Granularity == MetricGranularity.FiveMin).ToList();
+        Assert.NotEmpty(rolled);
+        Assert.True(rolled.Min(s => s.MinNano) < now - 8 * Day, "the rollup clipped points a retention of centuries keeps");
+    }
+
     // ── The gate ──────────────────────────────────────────────────────────────
 
     /// <summary>
