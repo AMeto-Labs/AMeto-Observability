@@ -33,10 +33,13 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
     /// <summary>One arena chunk: a 100 KB span is refused for bytes whatever slots are free.</summary>
     public const long RingMaxBytes = 64 * 1024;
 
+    /// <summary>A rewrite chunk budget no derivation produces (#125).</summary>
+    public const long RewriteBudgetBytes = 7_654_321;
+
     public sealed class Factory : AmetoWebAppFactory
     {
         protected override MetricsOptions ConfiguredMetrics =>
-            new() { HotTierBytes = MetricHotTierBytes, MaxExemplarMetrics = 1 };
+            new() { HotTierBytes = MetricHotTierBytes, MaxExemplarMetrics = 1, RewriteBudgetBytes = RewriteBudgetBytes };
 
         protected override TracesOptions ConfiguredTraces => new() { RingMaxBytes = RingMaxBytes };
     }
@@ -69,6 +72,7 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
         Assert.Equal(metrics.ExemplarsPerMetric, json.GetProperty("metricsExemplarsPerMetric").GetInt32());
         Assert.True(metrics.ExemplarsPerMetric > 0);
         Assert.Equal(1, json.GetProperty("metricsMaxExemplarMetrics").GetInt32());
+        Assert.Equal(RewriteBudgetBytes,      Long(json, "metricsRewriteBudgetBytes"));
 
         // Traces: what the engine and the ring were built with.
         Assert.Equal(RingMaxBytes,                      Long(json, "tracesRingMaxBytes"));
@@ -94,6 +98,19 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
         foreach (string existing in new[] { "diskFreeBytes", "processWorkingSetBytes", "segmentCount",
                                             "metricsStorageBytes", "tracesStorageBytes", "tracesSegmentCount" })
             Assert.True(json.TryGetProperty(existing, out _), existing);
+    }
+
+    /// <summary>
+    /// ONE GATE FOR BOTH BACKGROUND REWRITES (#125). A metric rewrite chunk and a trace compaction
+    /// pass spend the same share of the heap by taking turns; that holds only if the composition gives
+    /// both engines the SAME gate — two would let them run side by side, twice the share.
+    /// </summary>
+    [Fact]
+    public void The_metric_and_trace_engines_take_their_turns_through_one_gate()
+    {
+        var gate = _factory.Services.GetRequiredService<BackgroundRewriteGate>();
+        Assert.Same(gate, _factory.Services.GetRequiredService<MetricStorageEngine>().RewriteGateForTest);
+        Assert.Same(gate, _factory.Services.GetRequiredService<Ameto.Tracing.Storage.TraceStorageEngine>().RewriteGateForTest);
     }
 
     [Fact]

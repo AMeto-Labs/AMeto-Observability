@@ -120,12 +120,19 @@ internal static class MetricWriter
     /// the close is I/O, and the names carry a random nonce so the path cannot be booby-trapped
     /// from outside. Null in production.
     /// </param>
+    /// <param name="sectionSizeHint">
+    /// What the caller expects the largest section to take, when it knows (a rewrite does: it planned
+    /// the chunk from the encoded lengths of its series, #125). The section buffer starts at that size
+    /// rather than doubling up to it from 64 KB — a doubling holds the old and the new buffer at once,
+    /// up to three times the section — and never above the block a reader opens. 0: no hint.
+    /// </param>
     public static List<MetricSegmentInfo> Write(
         string dataDir,
         IList<(SeriesKey Key, HotSeries Series)> series,
         MetricGranularity granularity = MetricGranularity.Raw,
         Action<string>? afterFileWritten = null,
-        Action<string>? duringFileWrite  = null)
+        Action<string>? duringFileWrite  = null,
+        long sectionSizeHint = 0)
     {
         var result   = new List<MetricSegmentInfo>();
         var staged   = new List<string>();   // temp paths, index-aligned with result
@@ -134,7 +141,8 @@ internal static class MetricWriter
         int   count = series.Count;
         int[] order = TakeInts(Math.Max(count, 1));
         int[] ends  = TakeInts(Math.Max(count, 1));
-        using var raw = new RentedBufferWriter();
+        using var raw = new RentedBufferWriter(
+            (int)Math.Min(sectionSizeHint, MaxSectionBytesForTest ?? MetricReader.MaxBlockBytes));
         Span<char> nonceChars = stackalloc char[32];
         try
         {
@@ -699,11 +707,11 @@ internal static class MetricWriter
     /// section is a few hundred KB — is allocated for the call and dropped with it, and only the
     /// small ones go back. <see cref="ReturnedToPoolForTest"/> sees every size handed back.</para>
     /// </summary>
-    private sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
+    private sealed class RentedBufferWriter(int initialBytes) : IBufferWriter<byte>, IDisposable
     {
-        private const int InitialBytes = 64 * 1024;
+        internal const int InitialBytes = 64 * 1024;
 
-        private byte[] _buf = Take(InitialBytes);
+        private byte[] _buf = Take(Math.Max(InitialBytes, initialBytes));
         private int    _len;
 
         public ReadOnlySpan<byte> WrittenSpan => _buf.AsSpan(0, _len);

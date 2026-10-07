@@ -24,6 +24,11 @@ internal static class ChildProcessEntry
 
     public static int Main(string[] args)
     {
+        // Rewrites one metric's sources under whatever GC limits the parent started this process
+        // with, and prints what happened (MetricRewriteUnderStandLimitsTests, #125).
+        if (args.Length == 4 && args[0] == MetricRewriteUnderStandLimitsTests.Command)
+            return MetricRewriteUnderStandLimitsTests.RunChild(args[1], args[2], int.Parse(args[3], System.Globalization.CultureInfo.InvariantCulture));
+
         if (args.Length == 1 && args[0] == MemoryBudgetsCommand)
         {
             var b = MemoryBudgets.Current();
@@ -51,7 +56,8 @@ internal static class ChildProcessEntry
             return 0;
         }
 
-        Console.Error.WriteLine($"usage: {MemoryBudgetsCommand} | {WriteFoldSegmentCommand} <dir>");
+        Console.Error.WriteLine($"usage: {MemoryBudgetsCommand} | {WriteFoldSegmentCommand} <dir> | "
+                              + $"{MetricRewriteUnderStandLimitsTests.Command} <sources> <engine dir> <ballast MiB>");
         return 2;
     }
 }

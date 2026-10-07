@@ -569,6 +569,22 @@ public sealed class MetricsOptions
     public long? WalInitialBytes { get; init; }
 
     /// <summary>
+    /// What one chunk of a metric rewrite — a compaction, a same-granularity merge, a rollup — may
+    /// hold in memory: the points it decodes, their bucket arrays, and the section it writes them back
+    /// as. Unset: <see cref="MemoryBudgets.TraceMergeBytes"/>, the trace compaction pass's share
+    /// (24.2 MB in a 512 MB container, 73 MB with room), taken IN TURN with the trace pass through
+    /// <see cref="BackgroundRewriteGate"/> rather than beside it, so at most one background rewrite
+    /// holds its working set at a time (#125).
+    ///
+    /// <para>A chunk used to be bounded by series count alone (512), so its weight was whatever those
+    /// series' histories weighed: on the 512 MB stand one FiveMin chunk of a histogram reached ~200 MB
+    /// at peak and the compaction failed with an OutOfMemoryException on every pass. A metric larger
+    /// than the budget is now rewritten in more, smaller chunks — more output files, the same points.
+    /// </para>
+    /// </summary>
+    public long? RewriteBudgetBytes { get; init; }
+
+    /// <summary>
     /// How long the tier may hold points before a flush becomes due regardless of size. Matches
     /// the rollup's own first cutoff, so nothing waits longer because of this. Default: 1 h.
     /// </summary>
@@ -691,6 +707,13 @@ public sealed class MetricsOptions
         WalInitialBytes is { } explicitBytes && explicitBytes > 0
             ? explicitBytes
             : Math.Clamp(HotTierBytesFor(in budgets), MinWalInitialBytes, WalInitialCapBytes);
+
+    /// <inheritdoc cref="RewriteBudgetBytes"/>
+    public long EffectiveRewriteBudgetBytes => RewriteBudgetBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="RewriteBudgetBytes"/>
+    public long RewriteBudgetBytesFor(in MemoryBudgets budgets) =>
+        RewriteBudgetBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceMergeBytes;
 
     /// <inheritdoc cref="ExemplarsPerMetric"/>
     public int EffectiveExemplarsPerMetric => ExemplarsPerMetricFor(MemoryBudgets.Current());

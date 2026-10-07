@@ -368,14 +368,26 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
     private readonly long _walInitialBytes;
 
+    /// <summary>What one chunk of a rewrite may hold (<c>Metrics:RewriteBudgetBytes</c>, effective; #125).</summary>
+    public long RewriteBudgetBytes => _rewriteBudgetBytes;
+
+    private readonly long _rewriteBudgetBytes;
+
+    /// <summary>The turn rewrite chunks take with the trace compaction pass (#125).</summary>
+    private readonly BackgroundRewriteGate _rewriteGate;
+
+    /// <summary>Test hook: the gate this engine's rewrites take their turn through.</summary>
+    internal BackgroundRewriteGate RewriteGateForTest => _rewriteGate;
+
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Information,
         Message = "Metric budgets: hot tier {HotTierBytes} B (a flush is forced above it), periodic flush above {MinFlushBytes} B, "
                 + "metrics.wal opened at {WalInitialBytes} B, exemplars {ExemplarsPerMetric} per metric in at most "
-                + "{MaxExemplarMetrics} rings ({ExemplarRingBytes} B resident at most); derived from a {ManagedLimitMB} MB "
-                + "managed-heap limit, explicit Ameto:Metrics values win")]
+                + "{MaxExemplarMetrics} rings ({ExemplarRingBytes} B resident at most), a rewrite chunk {RewriteBudgetBytes} B "
+                + "(in turn with trace compaction); derived from a {ManagedLimitMB} MB managed-heap limit, explicit "
+                + "Ameto:Metrics values win")]
     private static partial void LogBudgets(ILogger logger, long hotTierBytes, long minFlushBytes, long walInitialBytes,
                                            int exemplarsPerMetric, int maxExemplarMetrics, long exemplarRingBytes,
-                                           long managedLimitMB);
+                                           long rewriteBudgetBytes, long managedLimitMB);
 
     private long _exemplarMetricsRefused;
 
@@ -544,13 +556,19 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     private int _ingestClosed;
 
+    /// <param name="rewriteGate">
+    /// The turn the metric rewrites take with the trace compaction pass (#125) — the process's one
+    /// instance, from DI. Null: this engine's own, shared with nothing.
+    /// </param>
     public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger,
-                               MetricsOptions? options = null, TimeProvider? timeProvider = null)
+                               MetricsOptions? options = null, TimeProvider? timeProvider = null,
+                               BackgroundRewriteGate? rewriteGate = null)
     {
         _dataDir = dataDir;
         _logger  = logger;
         _time    = timeProvider ?? TimeProvider.System;
         _options = options ?? new MetricsOptions();
+        _rewriteGate = rewriteGate ?? new BackgroundRewriteGate();
         Directory.CreateDirectory(dataDir);
 
         // ONE MemoryBudgets.Current() for the whole engine: it allocates (the GC's configuration
@@ -573,10 +591,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // instead. See MetricsOptions.MaxExemplarMetricsFor.
         _maxExemplarMetrics        = _options.MaxExemplarMetricsFor(in budgets);
         _walInitialBytes           = _options.WalInitialBytesFor(in budgets);
+        _rewriteBudgetBytes        = Math.Max(1, _options.RewriteBudgetBytesFor(in budgets));
 
         LogBudgets(_logger, _hotFlushBytes, _minFlushBytes, _walInitialBytes, _exemplarsPerMetric, _maxExemplarMetrics,
                    (long)_exemplarsPerMetric * _maxExemplarMetrics * MetricsOptions.ExemplarBytes,
-                   budgets.ManagedLimitBytes / 1048576);
+                   _rewriteBudgetBytes, budgets.ManagedLimitBytes / 1048576);
 
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
@@ -2505,7 +2524,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             try
             {
                 var newInfos = RewriteMetricInChunks(
-                    segs, granularity, static (pts, _) => DedupeByTimestamp(pts));
+                    segs, granularity, static (pts, _) => DedupeByTimestamp(pts), RetentionKeepFromNano());
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -2529,10 +2548,33 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     }
 
     /// <summary>
-    /// Series retained in memory at once while rewriting a metric. Matches the
-    /// writer's per-file cap so each chunk becomes exactly one output file.
+    /// The most series one chunk of a rewrite holds. Matches the writer's per-file cap so a chunk
+    /// is one output file. Since #125 a chunk also ends at <see cref="RewriteBudgetBytes"/>.
     /// </summary>
     private const int SeriesChunk = 512;
+
+    /// <summary>What a point costs a chunk while it is held: its slot in a list.</summary>
+    private static readonly int PointHeapBytes = Unsafe.SizeOf<MetricDataPoint>();
+
+    /// <summary>
+    /// What a series costs a chunk beyond its points: its list, its <see cref="HotSeries"/>, its
+    /// slot in the writer's batch, and the one all-zero bucket array idle histogram points share.
+    /// </summary>
+    private const int SeriesOverheadBytes = 256;
+
+    /// <summary>
+    /// The most heap one ENCODED byte can cost a chunk — a scalar point a few bytes on disk is a
+    /// 40-byte slot, its writer's copy and its compressed copy — by which the headers alone may say
+    /// a whole metric fits one chunk (<see cref="FitsOneChunk"/>). Generous on purpose: a metric it
+    /// turns away is planned exactly instead, which costs a second read and nothing else.
+    /// </summary>
+    private const int MaxHeapPerEncodedByte = 24;
+
+    /// <summary>One hour in nanoseconds: the grid a series too heavy for one chunk is cut on (see <see cref="RewriteMetricInChunks"/>).</summary>
+    private const long HourNanos = 3_600_000_000_000L;
+
+    /// <summary>The most time slices one series is cut into, however heavy — a backstop on the loop, not a budget.</summary>
+    private const int MaxSlicesPerSeries = 4_096;
 
     /// <summary>
     /// Test seam: invoked by <see cref="RewriteMetricInChunks"/> with a chunk's first key index the
@@ -2542,53 +2584,112 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     internal Action<int>? OnRewriteChunkWrittenForTest;
 
     /// <summary>
-    /// Rewrites ONE metric's source files, transforming each series' points, with the
-    /// retained <em>point</em> volume bounded by <see cref="SeriesChunk"/> series. That
-    /// is the bound that matters — points are what scale with time and dominate the
-    /// heap. It is NOT fully independent of cardinality: the key list, its index and the
-    /// bounds hold one entry per series for the whole rewrite, and each source's series
-    /// positions one long and one int per series (a key is a name + kind + unit +
-    /// <see cref="LabelSet"/>, tens of bytes, so 40k series cost single-digit MB against the
-    /// hundreds of MB of points this avoids).
-    ///
-    /// <para>Chunks are key-ordered: the keys are numbered in the order they are first met
-    /// across the sources, and chunk <c>n</c> is keys <c>[n x 512, (n + 1) x 512)</c>. Chunk
-    /// boundaries are deliberately NOT aligned to source files even though
-    /// <see cref="SeriesChunk"/> equals the writer's per-file cap: file membership is insertion
-    /// order at write time, so the same series lands in different file slots across time
-    /// windows, and the sources being merged here are of mixed vintage (pre-cap files carry
-    /// unbounded series counts). Pairing by file index would silently split a series across two
-    /// outputs.</para>
-    ///
-    /// <para><b>Each source is DECODED once for its identities, not once per chunk.</b> The first
-    /// pass reads every source in full order — numbering the keys, gathering bucket bounds,
-    /// recording where each series sits (<see cref="MetricReader.ReadForRewrite"/>), and
-    /// decoding the points of the first chunk's series only, which it keeps: so a metric that fits
-    /// in one chunk is read exactly once. Every later chunk goes back only to the sources that
-    /// hold one of its series, and reads only those series, at their recorded positions, without
-    /// their labels (<see cref="MetricReader.ReadAt"/>). It used to re-open, re-inflate and fully
-    /// decode every source for every chunk — every label string of every series re-materialised,
-    /// only to throw away the series the chunk did not want — after a first pass that had decoded
-    /// every point just to learn the keys. The reader rents its compressed and decompressed
-    /// buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the passes do not churn the LOH
-    /// (this process runs workstation GC, which never compacts it).</para>
-    ///
-    /// <para>What is written is what the per-chunk re-read wrote, byte for byte: the same chunks,
-    /// the same series order within one (first seen), the same points in the same order (sources
-    /// in order, series in file order), the same bounds (the last non-null seen), the same key text.
-    /// <c>MetricDownsampleGoldenTests</c> pins the output files.</para>
+    /// Test seam: invoked by a planned rewrite (one the headers did not show fits a single chunk) for
+    /// each chunk it cuts — its first key index, one past its last, and the weight it planned for it
+    /// (#125). Null in production.
     /// </summary>
+    internal Action<int, int, long>? OnRewriteChunkPlannedForTest;
+
+    /// <summary>
+    /// The retention cutoff a rewrite clips its reads at: points older than it are walked and never
+    /// decoded (#125). <see cref="long.MinValue"/> — nothing clipped — until a retention run has named
+    /// the TTL; <see cref="_lastPruneTtlTicks"/> starts at a 7-day guess, and a guess must not decide
+    /// that points of a 30-day store are expired.
+    /// </summary>
+    private long RetentionKeepFromNano()
+    {
+        long ttl = Interlocked.Read(ref _retentionTtlTicks);
+        if (ttl <= 0) return long.MinValue;
+        return DateTimeOffset.UtcNow.Subtract(TimeSpan.FromTicks(ttl)).ToUnixTimeMilliseconds() * 1_000_000L;
+    }
+
+    /// <summary>The TTL the last retention run pruned with; 0 until one has run. See <see cref="RetentionKeepFromNano"/>.</summary>
+    private long _retentionTtlTicks;
+
+    /// <summary>
+    /// Whether the headers alone say <paramref name="segs"/> fit one chunk: v3 files, at most
+    /// <see cref="SeriesChunk"/> series between them, and sections small enough that no encoding
+    /// could make them heavier than <see cref="RewriteBudgetBytes"/> held. Then the rewrite reads
+    /// every source once and keeps what it decodes, as it always did for a one-chunk metric.
+    /// </summary>
+    private bool FitsOneChunk(List<MetricSegmentInfo> segs)
+    {
+        long series = 0, encoded = 0;
+        foreach (var seg in segs)
+        {
+            if (seg.FormatVersion < 3) return false;
+            var (count, raw) = MetricReader.ReadSectionSize(seg.FilePath);
+            series  += count;
+            encoded += raw;
+            if (series > SeriesChunk || encoded * MaxHeapPerEncodedByte > _rewriteBudgetBytes) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Rewrites ONE metric's source files, transforming each series' points, in chunks bounded BY
+    /// BYTES (#125): a chunk ends at <see cref="SeriesChunk"/> series or at
+    /// <see cref="RewriteBudgetBytes"/> of what its points weigh decoded, written and compressed —
+    /// whichever comes first — and each chunk is held under <see cref="BackgroundRewriteGate"/>, in
+    /// turn with the trace compaction pass, so the two never stack. A chunk used to end at 512
+    /// series and at nothing else, so it weighed whatever those series' histories weighed: on the
+    /// 512 MB stand one FiveMin chunk of <c>http.server.request.duration</c> reached ~200 MB at peak
+    /// and the compaction failed with an OutOfMemoryException on every pass. It is NOT fully
+    /// independent of cardinality: the key list, its index, the bounds and the plan hold a few
+    /// entries per series for the whole rewrite (tens of bytes each, single-digit MB for 40k series).
+    ///
+    /// <para><b>The plan comes before any point is held.</b> Unless the headers alone show the metric
+    /// fits one chunk (<see cref="FitsOneChunk"/> — then every source is read once and kept, as a
+    /// one-chunk metric always was), a first pass walks every source
+    /// (<see cref="MetricReader.PlanForRewrite"/>): it numbers the keys in the order they are first
+    /// met, gathers their bucket bounds, records where each series sits and how many bytes it is
+    /// encoded in, and adds up what its points would weigh decoded — every check a decode makes,
+    /// nothing built. The chunks are cut from those weights, and each goes back only to the sources
+    /// holding one of its series, and reads only those series, at their recorded positions, without
+    /// their labels (<see cref="MetricReader.ReadAt"/>). A series heavier than the budget on its own
+    /// is read in hour-aligned time slices, one output each: the rollups' 5-minute and 1-hour buckets
+    /// never straddle a slice, and a later merge or a query puts the slices back together.</para>
+    ///
+    /// <para><b>Points past the retention cutoff are not read.</b> <paramref name="keepFromNano"/> —
+    /// the cutoff of the last retention run, <see cref="RetentionKeepFromNano"/> — clips every read:
+    /// such points are walked and never decoded, and a series left with none is not written. History
+    /// that a pre-#125 merge carried forward past the TTL in a file whose newest point is fresh goes
+    /// at its next rewrite, instead of the rewrite holding all of it.</para>
+    ///
+    /// <para>Chunks are key-ordered and deliberately NOT aligned to source files: file membership is
+    /// insertion order at write time, so the same series lands in different file slots across time
+    /// windows, and the sources being merged here are of mixed vintage. Pairing by file index would
+    /// silently split a series across two outputs.</para>
+    ///
+    /// <para>Below the budget what is written is what was always written, byte for byte: the same
+    /// chunks, the same series order within one (first seen), the same points in the same order
+    /// (sources in order, series in file order), the same bounds (the last non-null seen), the same
+    /// key text. <c>MetricDownsampleGoldenTests</c> pins the output files.</para>
+    /// </summary>
+    /// <param name="outputBucketNanos">The rollup's bucket, when the transform downsamples (it sizes
+    /// the output a chunk writes); 0 for a merge, whose output is its input less duplicates.</param>
     internal List<MetricSegmentInfo> RewriteMetricInChunks(
         List<MetricSegmentInfo> segs,
         MetricGranularity       target,
-        Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform)
+        Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform,
+        long keepFromNano      = long.MinValue,
+        long outputBucketNanos = 0)
     {
-        // ── Pass 0: key set + bucket bounds + positions, and the first chunk's points ────────
-        var keys    = new List<SeriesKey>();
-        var index   = new Dictionary<SeriesKey, int>();
-        var bounds  = new List<double[]?>();
-        var first   = new List<List<MetricDataPoint>?>();
-        var located = new List<(string Path, List<long> Positions, List<int> Keys)>(segs.Count);
+        var keys   = new List<SeriesKey>();
+        var index  = new Dictionary<SeriesKey, int>();
+        var bounds = new List<double[]?>();
+
+        // One pair of block buffers for every read of this rewrite: the largest source's, held for
+        // the rewrite rather than allocated afresh per read (see MetricReader.ReadScratch).
+        var scratch = new MetricReader.ReadScratch();
+
+        // The plan, per key: what its points add up to across every source (PlanForRewrite).
+        var walked  = new List<long>();
+        var kept    = new List<long>();
+        var weighed = new List<long>();     // bucket arrays a decode builds
+        var encoded = new List<long>();     // encoded bytes of the kept points
+        var minTs   = new List<long>();
+        var maxTs   = new List<long>();
 
         Func<SeriesKey, int> keyOf = key =>
         {
@@ -2597,65 +2698,22 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             index[key] = k;
             keys.Add(key);
             bounds.Add(null);
+            walked.Add(0); kept.Add(0); weighed.Add(0); encoded.Add(0);
+            minTs.Add(long.MaxValue); maxTs.Add(long.MinValue);
             return k;
         };
 
-        foreach (var seg in segs)
-        {
-            var positions = new List<long>();
-            var keyOrder  = new List<int>();
-            foreach (var (position, k, s) in MetricReader.ReadForRewrite(seg.FilePath, keyOf, SeriesChunk))
-            {
-                positions.Add(position);
-                keyOrder.Add(k);
-                if (s.BucketBounds is not null) bounds[k] = s.BucketBounds;
-                if (k < SeriesChunk)
-                {
-                    while (first.Count <= k) first.Add(null);
-                    (first[k] ??= []).AddRange(s.Points);
-                }
-            }
-            located.Add((seg.FilePath, positions, keyOrder));
-        }
-        if (keys.Count == 0) return [];
-
-        // ALL OR NOTHING ON DISK, like MetricWriter.Write itself. Chunk 0 is written before a later
-        // chunk's series are decoded — pass 0 walks past their points, and ReadAt meets them — so a
-        // later chunk can fail AFTER an output exists: a source corrupt past the first chunk, or one
-        // retention deleted mid-rewrite. The caller then keeps the sources and publishes nothing,
-        // and an output left behind would be loaded at the next start beside the sources it
-        // duplicates, one more per failed rewrite. So a failure takes back every output first.
+        // ALL OR NOTHING ON DISK, like MetricWriter.Write itself. A chunk is written before a later
+        // chunk's series are decoded, so a later chunk can fail AFTER an output exists: a source
+        // corrupt past the first chunk, or one retention deleted mid-rewrite. The caller then keeps
+        // the sources and publishes nothing, and an output left behind would be loaded at the next
+        // start beside the sources it duplicates, one more per failed rewrite. So a failure takes
+        // back every output first.
         var written = new List<MetricSegmentInfo>();
         try
         {
-            WriteChunk(0, first);
-            OnRewriteChunkWrittenForTest?.Invoke(0);
-
-            // ── Every later chunk: only its series, at their positions ───────────────────────
-            for (int off = SeriesChunk; off < keys.Count; off += SeriesChunk)
-            {
-                int take = Math.Min(SeriesChunk, keys.Count - off);
-                var acc  = new List<MetricDataPoint>?[Math.Min(SeriesChunk, keys.Count - off)];
-                foreach (var (path, positions, keyOrder) in located)
-                {
-                    var at    = new List<long>();
-                    var atKey = new List<int>();
-                    for (int j = 0; j < positions.Count; j++)
-                    {
-                        int k = keyOrder[j];
-                        if (k < off || k >= off + take) continue;
-                        at.Add(positions[j]);
-                        atKey.Add(k);
-                    }
-                    if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
-
-                    int n = 0;
-                    foreach (var (_, _, s) in MetricReader.ReadAt(path, at))
-                        (acc[atKey[n++] - off] ??= []).AddRange(s.Points);
-                }
-                WriteChunk(off, acc);
-                OnRewriteChunkWrittenForTest?.Invoke(off);
-            }
+            if (FitsOneChunk(segs)) RewriteInOnePass();
+            else                    RewritePlanned();
         }
         catch
         {
@@ -2669,8 +2727,163 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         }
         return written;
 
+        // ── One chunk, known from the headers: every source read once, its points kept as read ──
+        void RewriteInOnePass()
+        {
+            var first = new List<List<MetricDataPoint>?>();
+            long hint = 0;
+            using (_rewriteGate.Enter())
+            {
+                foreach (var seg in segs)
+                {
+                    foreach (var item in MetricReader.ReadForRewrite(seg.FilePath, keyOf, int.MaxValue, keepFromNano, scratch))
+                    {
+                        int k = item.Key;
+                        if (item.Series.BucketBounds is not null) bounds[k] = item.Series.BucketBounds;
+                        if (item.Series.Points.Count == 0 && item.Stats.Walked > 0) continue;   // all of it past the cutoff
+                        while (first.Count <= k) first.Add(null);
+                        (first[k] ??= []).AddRange(item.Series.Points);
+                        hint += item.Length;
+                    }
+                }
+                if (keys.Count == 0) return;
+                WriteChunk(0, first, hint);
+                OnRewriteChunkWrittenForTest?.Invoke(0);
+            }
+        }
+
+        // ── Plan from the weights, then each chunk: only its series, at their positions ──
+        void RewritePlanned()
+        {
+            var located = new List<(string Path, List<long> Positions, List<int> Keys)>(segs.Count);
+            foreach (var seg in segs)
+            {
+                var positions = new List<long>();
+                var keyOrder  = new List<int>();
+                foreach (var item in MetricReader.PlanForRewrite(seg.FilePath, keyOf, keepFromNano, scratch))
+                {
+                    int k = item.Key;
+                    positions.Add(item.Position);
+                    keyOrder.Add(k);
+                    if (item.Series.BucketBounds is not null) bounds[k] = item.Series.BucketBounds;
+
+                    var st = item.Stats;
+                    walked[k]  += st.Walked;
+                    kept[k]    += st.Kept;
+                    weighed[k] += st.BucketBytes;
+                    if (st.Walked > 0) encoded[k] += (long)((double)item.Length * st.Kept / st.Walked);
+                    if (st.Kept > 0)
+                    {
+                        minTs[k] = Math.Min(minTs[k], st.MinKept);
+                        maxTs[k] = Math.Max(maxTs[k], st.MaxKept);
+                    }
+                }
+                located.Add((seg.FilePath, positions, keyOrder));
+            }
+            if (keys.Count == 0) return;
+
+            int start = 0;
+            long load = 0;
+            for (int k = 0; k <= keys.Count; k++)
+            {
+                long w = k < keys.Count ? Weight(k) : 0;
+                if (k == keys.Count || (k > start && (k - start == SeriesChunk || load + w > _rewriteBudgetBytes)))
+                {
+                    OnRewriteChunkPlannedForTest?.Invoke(start, k, load);
+                    if (k - start == 1 && load > _rewriteBudgetBytes && CanSlice(start)) WriteSlices(start, located);
+                    else                                                                   WriteKeys(start, k, located);
+                    start = k;
+                    load  = 0;
+                }
+                load += w;
+            }
+        }
+
+        // Keys [off, end), read back from every source that holds one, as one chunk.
+        void WriteKeys(int off, int end, List<(string Path, List<long> Positions, List<int> Keys)> located)
+        {
+            using var turn = _rewriteGate.Enter();
+            var acc  = new List<MetricDataPoint>?[end - off];
+            long hint = 0;
+            foreach (var (path, positions, keyOrder) in located)
+            {
+                var at    = new List<long>();
+                var atKey = new List<int>();
+                for (int j = 0; j < positions.Count; j++)
+                {
+                    int k = keyOrder[j];
+                    if (k < off || k >= end) continue;
+                    if (walked[k] > 0 && kept[k] == 0) continue;   // every point of it is past the cutoff
+                    at.Add(positions[j]);
+                    atKey.Add(k);
+                }
+                if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
+
+                int n = 0;
+                foreach (var item in MetricReader.ReadAt(path, at, keepFromNano, scratch: scratch))
+                {
+                    int k = atKey[n++];
+                    (acc[k - off] ??= new List<MetricDataPoint>(FileBounds.PreallocFor(kept[k], PointHeapBytes))).AddRange(item.Series.Points);
+                }
+            }
+            for (int k = off; k < end; k++) hint += OutputBytes(k);
+            WriteChunk(off, acc, hint);
+            OnRewriteChunkWrittenForTest?.Invoke(off);
+        }
+
+        // One key heavier than a chunk: its points in hour-aligned time slices, each a chunk of its own.
+        void WriteSlices(int k, List<(string Path, List<long> Positions, List<int> Keys)> located)
+        {
+            int  slices = (int)Math.Min(MaxSlicesPerSeries, (Weight(k) + _rewriteBudgetBytes - 1) / _rewriteBudgetBytes);
+            long lo     = minTs[k] / HourNanos * HourNanos;
+            long width  = Math.Max(HourNanos, ((maxTs[k] - lo) / slices + HourNanos) / HourNanos * HourNanos);
+            for (long from = lo; from <= maxTs[k]; from = from > long.MaxValue - width ? long.MaxValue : from + width)
+            {
+                long to = from > long.MaxValue - width ? long.MaxValue : from + width - 1;
+                using var turn = _rewriteGate.Enter();
+                List<MetricDataPoint>? acc = null;
+                foreach (var (path, positions, keyOrder) in located)
+                {
+                    List<long>? at = null;
+                    for (int j = 0; j < positions.Count; j++)
+                        if (keyOrder[j] == k) (at ??= []).Add(positions[j]);
+                    if (at is null) continue;
+                    foreach (var item in MetricReader.ReadAt(path, at, Math.Max(from, keepFromNano), to, scratch))
+                        (acc ??= []).AddRange(item.Series.Points);
+                }
+                if (acc is { Count: > 0 })
+                {
+                    WriteChunk(k, [acc], OutputBytes(k) / slices);
+                    OnRewriteChunkWrittenForTest?.Invoke(k);
+                }
+                if (to == long.MaxValue) break;
+            }
+        }
+
+        // A series can be cut in time when it has a range to cut, in timestamps the hour grid and the
+        // rollups' truncating bucket keys agree on (they part below zero).
+        bool CanSlice(int k) => kept[k] > 1 && minTs[k] >= 0 && maxTs[k] > minTs[k];
+
+        // What key k costs the chunk holding it: its points and their bucket arrays as decoded, and
+        // the section it is written as with that section's LZ4 copy. A rollup also holds the stable
+        // sort's copy (RollupPoints, when its input is out of order) and the downsampled list.
+        long Weight(int k)
+        {
+            long w = SeriesOverheadBytes + kept[k] * PointHeapBytes + weighed[k];
+            if (kept[k] == 0) return w;
+            if (outputBucketNanos > 0) w += (kept[k] + OutputPoints(k)) * PointHeapBytes;
+            return w + 2 * OutputBytes(k);
+        }
+
+        long OutputPoints(int k) =>
+            outputBucketNanos <= 0 || kept[k] == 0
+                ? kept[k]
+                : Math.Min(kept[k], maxTs[k] / outputBucketNanos - minTs[k] / outputBucketNanos + 1);
+
+        long OutputBytes(int k) => kept[k] == 0 ? 0 : (long)((double)encoded[k] * OutputPoints(k) / kept[k]);
+
         // One chunk's series, in key order, to its output file(s).
-        void WriteChunk(int off, IReadOnlyList<List<MetricDataPoint>?> points)
+        void WriteChunk(int off, IReadOnlyList<List<MetricDataPoint>?> points, long sectionSizeHint)
         {
             var batch = new List<(SeriesKey, HotSeries)>(points.Count);
             for (int i = 0; i < points.Count; i++)
@@ -2679,22 +2892,28 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 var key = keys[off + i];
                 batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds[off + i])));
             }
-            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target, sectionSizeHint: sectionSizeHint));
         }
     }
 
-    /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
+    /// <summary>
+    /// Sorts by timestamp and drops duplicate-timestamp points (last wins) — IN PLACE: the list it is
+    /// given is the list it returns (#125). A merge used to build a second list of every point of
+    /// every series in a chunk beside the first, both held until the chunk was written.
+    /// </summary>
     internal static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
     {
         pts.Sort(static (a, b) => a.TimestampUnixNano.CompareTo(b.TimestampUnixNano));
-        var result = new List<MetricDataPoint>(pts.Count);
-        for (int i = 0; i < pts.Count; i++)
+        var span = CollectionsMarshal.AsSpan(pts);
+        int kept = 0;
+        for (int i = 0; i < span.Length; i++)
         {
-            if (i + 1 < pts.Count && pts[i + 1].TimestampUnixNano == pts[i].TimestampUnixNano)
+            if (i + 1 < span.Length && span[i + 1].TimestampUnixNano == span[i].TimestampUnixNano)
                 continue; // superseded by the later entry with the same ts
-            result.Add(pts[i]);
+            span[kept++] = span[i];
         }
-        return result;
+        pts.RemoveRange(kept, pts.Count - kept);
+        return pts;
     }
 
     private void Rollup(
@@ -2714,7 +2933,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 // hundreds of MB while it is rewritten.
                 var newInfos = RewriteMetricInChunks(
                     group.ToList(), targetGranularity,
-                    (pts, kind) => RollupPoints(pts, bucketSize, kind));
+                    (pts, kind) => RollupPoints(pts, bucketSize, kind),
+                    RetentionKeepFromNano(), (long)bucketSize.TotalMilliseconds * 1_000_000L);
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -3220,6 +3440,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         if (Volatile.Read(ref _disposed) != 0) return Task.FromResult(0);
 
         Interlocked.Exchange(ref _lastPruneTtlTicks, ttl.Ticks);
+        Interlocked.Exchange(ref _retentionTtlTicks, ttl.Ticks);   // what a rewrite may now clip at (#125)
         var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
 
         List<MetricSegmentInfo> toDelete;
