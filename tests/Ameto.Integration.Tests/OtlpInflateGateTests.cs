@@ -45,6 +45,10 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
     private static readonly OtlpGzipTooLargeLog NoLog =
         new(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
 
+    /// <summary>The out-of-memory error, discarded likewise.</summary>
+    private static readonly OtlpOutOfMemoryLog NoMemoryLog =
+        new(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+
     private readonly Factory    _factory;
     private readonly HttpClient _client;
 
@@ -198,7 +202,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         Assert.True(await gate.TryEnterAsync(default));
         var full = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
 
         Assert.Equal("14", full.Response.Headers["grpc-status"].ToString());
         Assert.Equal(OtlpGrpcEndpointMapper.GateFullMessage, full.Response.Headers["grpc-message"].ToString());
@@ -206,13 +210,13 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal(0, gate.Available);                                       // released nothing it did not take
 
         var identity = GrpcCall(Frame(message, compressed: false));
-        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
         Assert.Equal("0", identity.Response.Headers["grpc-status"].ToString());
         Assert.Equal(1, decoded);
 
         gate.Exit();
         var freed = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
         Assert.Equal("0", freed.Response.Headers["grpc-status"].ToString());
         Assert.Equal(2, decoded);
         Assert.Equal(1, gate.Available);                                       // and the slot came back
@@ -229,7 +233,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         using var ledger = IngestBufferPoolLedger.Open();
         ledger.FailRent(2, new OutOfMemoryException());
-        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate, NoLog,
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
             static (_, _) => throw new InvalidOperationException("nothing should reach the decoder"));
 
         Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
@@ -255,7 +259,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         var first = GrpcCall(Frame(gz, compressed: true));
         first.Response.Body = stalled;
-        Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog,
+        Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
             static (_, _) => (true, 0, null));
 
         await stalled.Writing.Task.WaitAsync(TimeSpan.FromSeconds(15));   // decoded; the response is stuck
@@ -264,7 +268,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
             Assert.Equal(gate.Capacity, gate.Available);
 
             var second = GrpcCall(Frame(gz, compressed: true));
-            await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog,
+            await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
                 static (_, _) => (true, 0, null));
             Assert.Equal("0", second.Response.Headers["grpc-status"].ToString());
         }

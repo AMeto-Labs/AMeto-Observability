@@ -45,16 +45,19 @@ public static class OtlpEndpointMapper
 
     /// <summary>
     /// What the OTLP receivers — HTTP and gRPC — share across requests: the gate that bounds how
-    /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>), and the
-    /// throttled warning for one that inflated past the limit (<see cref="OtlpGzipTooLargeLog"/>).
-    /// TryAdd, so a host that already registered either — a test with a smaller gate or a clock
-    /// of its own — keeps it.
+    /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>), the throttled
+    /// warning for one that inflated past the limit (<see cref="OtlpGzipTooLargeLog"/>), and the
+    /// throttled error for a batch the server ran out of memory taking in
+    /// (<see cref="OtlpOutOfMemoryLog"/>). TryAdd, so a host that already registered any of them —
+    /// a test with a smaller gate or a clock of its own — keeps it.
     /// </summary>
     public static IServiceCollection AddOtlpReceivers(this IServiceCollection services)
     {
         services.TryAddSingleton(static sp => OtlpInflateGate.For(
             sp.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes));
         services.TryAddSingleton(static sp => new OtlpGzipTooLargeLog(
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
+        services.TryAddSingleton(static sp => new OtlpOutOfMemoryLog(
             sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
         return services;
     }
@@ -85,36 +88,56 @@ public static class OtlpEndpointMapper
         // instance, its logger created once, shared with the gRPC receiver.
         OtlpGzipTooLargeLog tooLargeLog = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
 
+        // And the throttled error for a batch the server ran out of memory taking in.
+        OtlpOutOfMemoryLog outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
+
+        // OUT OF MEMORY IS THE SERVER'S FAILURE, NOT THE BATCH'S (#125). Each handler below takes
+        // its batch in — reads, inflates, parses, stores — inside one try whose catch answers an
+        // OutOfMemoryException 503 with Retry-After, which OTLP exporters retry. It used to leave
+        // the handler: on the 512 MB stand the metric WAL's append ran out while compaction held
+        // the heap, hosting answered 500, and exporters, which never retry a 500, dropped the
+        // batch. A parser's own catch-all (malformed payload: 400) must therefore let it pass.
+        // The answer to an ACCEPTED batch is written outside: once the batch is stored, a retry
+        // would only store it twice.
+
         // ── Traces ────────────────────────────────────────────────────────────
         var traces = async (HttpContext ctx, ISpanSink sink) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
-            if (body is null) return;
-
             int ingested, refused;
             try
             {
-                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
+                if (body is null) return;
 
-                // Both encodings STREAM straight into the span ring (TI#3) — no OTLP object graph,
-                // no SpanIngestItem, no name string, no attribute array per span: the parser hands
-                // each span over as slices of this body and the sink copies them into the ring's
-                // arena. Protobuf is what SDK exporters and the collector send (see
-                // OtlpTraceProtoParser). A malformed tail leaves its prefix ingested and answers
-                // 400, which OTLP defines as not retryable — the log route's behaviour.
-                (ingested, refused) = isProto
-                    ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
-                    : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
+                try
+                {
+                    bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+                    // Both encodings STREAM straight into the span ring (TI#3) — no OTLP object graph,
+                    // no SpanIngestItem, no name string, no attribute array per span: the parser hands
+                    // each span over as slices of this body and the sink copies them into the ring's
+                    // arena. Protobuf is what SDK exporters and the collector send (see
+                    // OtlpTraceProtoParser). A malformed tail leaves its prefix ingested and answers
+                    // 400, which OTLP defines as not retryable — the log route's behaviour.
+                    (ingested, refused) = isProto
+                        ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
+                        : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    LogTracesDecodeFailed(tracesLogger, bodyLen, ctx.Request.ContentType, ex);
+                    ctx.Response.StatusCode = 400;
+                    return;
+                }
+                finally { IngestBufferPool.Return(body); slot?.Exit(); }
             }
-            catch (Exception ex)
+            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
             {
-                LogTracesDecodeFailed(tracesLogger, bodyLen, ctx.Request.ContentType, ex);
-                ctx.Response.StatusCode = 400;
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
                 return;
             }
-            finally { IngestBufferPool.Return(body); slot?.Exit(); }
 
             LogTracesDecoded(tracesLogger, ingested + refused);
             await WriteJsonOk(ctx, ingested, refused);
@@ -126,33 +149,48 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
-            if (body is null) return;
-
-            List<Ameto.Metrics.MetricIngestItem> points;
+            int accepted, refused;
             try
             {
-                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                if (isProto)
-                {
-                    // Protobuf: parse straight to ingest items — no OTLP object graph, no
-                    // parser object per nested message, no wire-int→string→int round trip
-                    // (see OtlpMetricProtoParser). This is the encoding SDK exporters use.
-                    points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen));
-                }
-                else
-                {
-                    var request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(
-                        body.AsSpan(0, bodyLen), _jsonOptions);
-                    if (request is null) { ctx.Response.StatusCode = 400; return; }
-                    points = OtlpMetricMapper.Map(request);
-                }
-            }
-            catch { ctx.Response.StatusCode = 400; return; }
-            finally { IngestBufferPool.Return(body); slot?.Exit(); }
+                var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
+                if (body is null) return;
 
-            int refused = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-            await WriteJsonOk(ctx, points.Count - refused, refused);
+                List<Ameto.Metrics.MetricIngestItem> points;
+                try
+                {
+                    bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                    if (isProto)
+                    {
+                        // Protobuf: parse straight to ingest items — no OTLP object graph, no
+                        // parser object per nested message, no wire-int→string→int round trip
+                        // (see OtlpMetricProtoParser). This is the encoding SDK exporters use.
+                        points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen));
+                    }
+                    else
+                    {
+                        var request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(
+                            body.AsSpan(0, bodyLen), _jsonOptions);
+                        if (request is null) { ctx.Response.StatusCode = 400; return; }
+                        points = OtlpMetricMapper.Map(request);
+                    }
+                    OnMetricsParsedForTest?.Invoke(points);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException) { ctx.Response.StatusCode = 400; return; }
+                finally { IngestBufferPool.Return(body); slot?.Exit(); }
+
+                // Where the stand ran out: the WAL append, under a heap compaction had filled. The
+                // append is all-or-nothing (MetricStorageEngine.Ingest), so a batch it failed
+                // comes back whole on the retry and is stored once.
+                refused  = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
+                accepted = points.Count - refused;
+            }
+            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
+            {
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
+
+            await WriteJsonOk(ctx, accepted, refused);
         };
 
         // ── Logs ──────────────────────────────────────────────────────────────
@@ -161,24 +199,32 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
-            var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
-            if (body is null) return;
-
             int ingested = 0, dropped = 0;
             try
             {
-                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
+                if (body is null) return;
 
-                // Both encodings stream straight into the ring — no OTLP object graph, no
-                // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
-                // exporters and the collector send, so it is the one that had to stop
-                // decoding to a DOM first (see OtlpLogProtoParser).
-                (ingested, dropped) = isProto
-                    ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), endpoint)
-                    : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
+                try
+                {
+                    bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+                    // Both encodings stream straight into the ring — no OTLP object graph, no
+                    // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
+                    // exporters and the collector send, so it is the one that had to stop
+                    // decoding to a DOM first (see OtlpLogProtoParser).
+                    (ingested, dropped) = isProto
+                        ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), endpoint)
+                        : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException) { ctx.Response.StatusCode = 400; return; }
+                finally { IngestBufferPool.Return(body); slot?.Exit(); }
             }
-            catch { ctx.Response.StatusCode = 400; return; }
-            finally { IngestBufferPool.Return(body); slot?.Exit(); }
+            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
+            {
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
 
             await WriteJsonOk(ctx, ingested, dropped);
         };
@@ -208,6 +254,14 @@ public static class OtlpEndpointMapper
         // Metric query endpoints live in Ameto.Metrics.MetricQueryEndpointMapper
         // (mapped via app.MapMetricEndpoints()).
     }
+
+    /// <summary>
+    /// Test seam: each OTLP/HTTP metrics batch as parsed, called inside the parse's try — where an
+    /// OutOfMemoryException from the parse lands, and must not be taken for a malformed payload
+    /// (#125). Process-wide, so a test that sets it acts only on batches of its own. Null in
+    /// production.
+    /// </summary>
+    internal static Action<List<Ameto.Metrics.MetricIngestItem>>? OnMetricsParsedForTest;
 
     // ── Logging ───────────────────────────────────────────────────────────────
 
@@ -412,6 +466,9 @@ public static class OtlpEndpointMapper
     /// <summary>What a 503 says when the inflate ran out of memory.</summary>
     internal static ReadOnlySpan<byte> MemoryShortMessage => "the server ran short of memory inflating this batch; retry"u8;
 
+    /// <summary>What a 503 says when anything else taking the batch in ran out of memory: the read, the parse, the store.</summary>
+    internal static ReadOnlySpan<byte> IngestMemoryShortMessage => "the server ran short of memory taking in this batch; retry"u8;
+
     /// <summary>
     /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and
     /// one parse, milliseconds for an ordinary batch, so the gate is rarely full for longer — and
@@ -436,6 +493,24 @@ public static class OtlpEndpointMapper
 
         var writer = response.BodyWriter;
         writer.Advance(FormatStatus(writer.GetSpan(StatusBodyMaxBytes), message, isProto));
+    }
+
+    /// <summary>
+    /// The answer to a batch the server ran out of memory taking in (#125): the retryable 503,
+    /// then the throttled error line — in that order, so a line that cannot be written either
+    /// does not cost the exporter its answer. Reached with the batch's buffers and inflate slot
+    /// already given back: the handlers' finally blocks run as the exception leaves them.
+    ///
+    /// <para>What was stored before the failure stays stored, as on the 400 road — but this answer
+    /// is retried, so a prefix a streaming parser had already handed the ring (logs, traces) is
+    /// stored again: at least once, where the 500 was at most once. The metric store's append is
+    /// all-or-nothing, so the stand's case — the WAL append running out — comes back whole and
+    /// is stored once.</para>
+    /// </summary>
+    private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, OutOfMemoryException ex)
+    {
+        WriteRetryLater(ctx, IngestMemoryShortMessage);
+        log.Note(ctx, ex);
     }
 
     // ── Content-Encoding ──────────────────────────────────────────────────────
