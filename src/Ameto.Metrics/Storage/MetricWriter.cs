@@ -67,8 +67,9 @@ internal static class MetricWriter
 
     /// <summary>
     /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>
-    /// (several, if a name carries more than <see cref="MaxSeriesPerFile"/> series). Returns
-    /// metadata for all created files.
+    /// (several, if a name carries more than <see cref="MaxSeriesPerFile"/> series, or more than
+    /// fits the block a reader opens — <see cref="MetricReader.MaxBlockBytes"/>, see the loop).
+    /// Returns metadata for all created files.
     ///
     /// <para><b>All or nothing on disk.</b> The caller reads a throw as "no file carries these
     /// points", puts the whole snapshot back into the hot tier and leaves the log generation
@@ -137,86 +138,69 @@ internal static class MetricWriter
         Span<char> nonceChars = stackalloc char[32];
         try
         {
-            int groups = GroupByName(series, order.AsSpan(0, count), ends.AsSpan(0, count));
-            int start  = 0;
+            int groups     = GroupByName(series, order.AsSpan(0, count), ends.AsSpan(0, count));
+            int start      = 0;
+            int maxSection = MaxSectionBytesForTest ?? MetricReader.MaxBlockBytes;
             for (int g = 0; g < groups; g++)
             {
                 int    end        = ends[g];
                 string metricName = series[order[start]].Key.Name;   // the group's key, as GroupBy's was: its first item's
                 string namePart   = FileNamePart(metricName);
-                for (int from = start; from < end; from += MaxSeriesPerFile)
+
+                // Serialize ALL a file's series into one msgpack buffer, then compress it as a single
+                // LZ4-HC block: repeated label keys/values across series (routes, instance ids, GUIDs)
+                // deduplicate inside the shared compression window. The file's time range is taken on
+                // the same pass, from each series' first and last point.
+                //
+                // A FILE ENDS AT MaxSeriesPerFile SERIES, OR BEFORE A SERIES THAT MIGHT NOT FIT THE
+                // BLOCK A READER WILL OPEN (#125). The reader refuses a section over
+                // MetricReader.MaxBlockBytes, and this writer used to write one anyway: 512 busy
+                // histogram series of 1 600 five-minute points made an 87.5 MiB section, written
+                // without complaint and refused by every query, merge and rollup that met it. A
+                // series is admitted against an upper bound on its encoding (EncodedBound), so a
+                // section never passes the line; one series that is larger than a block on its own
+                // goes out in time-ordered runs of its points, one file each. Below the line every
+                // file is exactly what it was, byte for byte.
+                int  fileSeries = 0;
+                long minNano = long.MaxValue, maxNano = long.MinValue;
+                raw.Reset();
+                for (int at = start; at < end; at++)
                 {
-                    ReadOnlySpan<int> items = order.AsSpan(from, Math.Min(MaxSeriesPerFile, end - from));
+                    var (key, hs) = series[order[at]];
+                    ReadOnlySpan<MetricDataPoint> pts = hs.PointsForWrite();
+                    long bound = EncodedBound(key, hs.Bounds, pts);
 
-                    // Serialize ALL the file's series into one msgpack buffer, then compress it as a
-                    // single LZ4-HC block: repeated label keys/values across series (routes, instance
-                    // ids, GUIDs) deduplicate inside the shared compression window. The file's time
-                    // range is taken on the same pass, from each series' first and last point.
-                    raw.Reset();
-                    var  w       = new MessagePackWriter(raw);
-                    long minNano = long.MaxValue, maxNano = long.MinValue;
-                    foreach (int i in items)
+                    if (fileSeries > 0 && (fileSeries == MaxSeriesPerFile || raw.WrittenSpan.Length + bound > maxSection))
                     {
-                        var (key, hs) = series[i];
-                        ReadOnlySpan<MetricDataPoint> pts = hs.PointsForWrite();
-                        if (pts.Length > 0)
-                        {
-                            minNano = Math.Min(minNano, pts[0].TimestampUnixNano);
-                            maxNano = Math.Max(maxNano, pts[^1].TimestampUnixNano);
-                        }
-                        WriteSeries(ref w, key, hs.Bounds, pts);
+                        EmitFile(dataDir, metricName, namePart, granularity, fileSeries, minNano, maxNano, raw,
+                                 nonceChars, duringFileWrite, staged, result);
+                        raw.Reset();
+                        fileSeries = 0;
+                        minNano    = long.MaxValue;
+                        maxNano    = long.MinValue;
                     }
+
+                    if (bound > maxSection)
+                    {
+                        WriteInRuns(dataDir, metricName, namePart, granularity, key, hs.Bounds, pts, maxSection, raw,
+                                    nonceChars, duringFileWrite, staged, result);
+                        raw.Reset();
+                        continue;
+                    }
+
+                    var w = new MessagePackWriter(raw);
+                    WriteSeries(ref w, key, hs.Bounds, pts);
                     w.Flush();
-                    if (minNano == long.MaxValue) continue;   // not one point: no file
-
-                    // HC level: writes happen on background flush/rollup threads only, so we trade
-                    // CPU for the much better ratio. The span overload, not the IBufferWriter one:
-                    // the two disagree on the header of some sizes (a 64 KB input gets a wider size
-                    // field), and this is the one whose bytes the files on disk carry.
-                    byte[] compressed = LZ4Pickler.Pickle(raw.WrittenSpan, LZ4Level.L09_HC);
-
-                    // A short nonce keeps the name unique: the (name, min, max, granularity)
-                    // tuple is NOT — a v2→v3 migration re-writes the same time range, and two
-                    // files of the same range can legitimately coexist until the next merge
-                    // dedupes them. Without it, WriteFile's FileMode.CreateNew throws
-                    // "already exists" and the compaction fails every pass. The name is never
-                    // parsed back (all metadata is read from the file's own header/index).
-                    Guid.NewGuid().TryFormat(nonceChars, out _, "N");
-                    ReadOnlySpan<char> nonce = nonceChars[..8];
-                    string fileName = $"metrics-{namePart}-{minNano}-{maxNano}-{Suffix(granularity)}-{nonce}.mts";
-                    string filePath = Path.Combine(dataDir, fileName);
-                    string tmpPath  = filePath + TempSuffix;
-
-                    try
+                    fileSeries++;
+                    if (pts.Length > 0)
                     {
-                        long size = WriteFile(tmpPath, metricName, granularity, items.Length, minNano, maxNano,
-                                              raw.WrittenSpan.Length, compressed, duringFileWrite);
-
-                        // Staged before it is described, so the retraction below owns the file from
-                        // the instant it exists. Sized by what was written to the temp file: reading
-                        // the length through the final path is one more call that can throw, and it
-                        // would throw with a complete file sitting at a path nothing has recorded.
-                        staged.Add(tmpPath);
-                        result.Add(new MetricSegmentInfo
-                        {
-                            FilePath      = filePath,
-                            MetricName    = metricName,
-                            MinNano       = minNano,
-                            MaxNano       = maxNano,
-                            Granularity   = granularity,
-                            FormatVersion = Version,
-                            SizeBytes     = size,
-                        });
-                    }
-                    catch
-                    {
-                        // The half-written file. Deleting it here is not redundant with the
-                        // retraction: it reaches this line before it has been staged, which is
-                        // exactly the state the retraction cannot name.
-                        try { File.Delete(tmpPath); } catch { /* leave it; the throw still stands */ }
-                        throw;
+                        minNano = Math.Min(minNano, pts[0].TimestampUnixNano);
+                        maxNano = Math.Max(maxNano, pts[^1].TimestampUnixNano);
                     }
                 }
+                if (fileSeries > 0)
+                    EmitFile(dataDir, metricName, namePart, granularity, fileSeries, minNano, maxNano, raw,
+                             nonceChars, duringFileWrite, staged, result);
                 start = end;
             }
 
@@ -252,6 +236,144 @@ internal static class MetricWriter
 
         return result;
     }
+
+    /// <summary>
+    /// One file from the section in <paramref name="raw"/>: compressed, written at a temp name and
+    /// staged for the publish in <see cref="Write"/> — or nothing at all when the section's series
+    /// hold not one point (<paramref name="minNano"/> still <see cref="long.MaxValue"/>).
+    /// </summary>
+    private static void EmitFile(
+        string dataDir, string metricName, string namePart, MetricGranularity granularity,
+        int seriesCount, long minNano, long maxNano, RentedBufferWriter raw, Span<char> nonceChars,
+        Action<string>? duringFileWrite, List<string> staged, List<MetricSegmentInfo> result)
+    {
+        if (minNano == long.MaxValue) return;   // not one point: no file
+
+        // HC level: writes happen on background flush/rollup threads only, so we trade
+        // CPU for the much better ratio. The span overload, not the IBufferWriter one:
+        // the two disagree on the header of some sizes (a 64 KB input gets a wider size
+        // field), and this is the one whose bytes the files on disk carry.
+        byte[] compressed = LZ4Pickler.Pickle(raw.WrittenSpan, LZ4Level.L09_HC);
+
+        // A short nonce keeps the name unique: the (name, min, max, granularity)
+        // tuple is NOT — a v2→v3 migration re-writes the same time range, and two
+        // files of the same range can legitimately coexist until the next merge
+        // dedupes them. Without it, WriteFile's FileMode.CreateNew throws
+        // "already exists" and the compaction fails every pass. The name is never
+        // parsed back (all metadata is read from the file's own header/index).
+        Guid.NewGuid().TryFormat(nonceChars, out _, "N");
+        ReadOnlySpan<char> nonce = nonceChars[..8];
+        string fileName = $"metrics-{namePart}-{minNano}-{maxNano}-{Suffix(granularity)}-{nonce}.mts";
+        string filePath = Path.Combine(dataDir, fileName);
+        string tmpPath  = filePath + TempSuffix;
+
+        try
+        {
+            long size = WriteFile(tmpPath, metricName, granularity, seriesCount, minNano, maxNano,
+                                  raw.WrittenSpan.Length, compressed, duringFileWrite);
+
+            // Staged before it is described, so the retraction in Write owns the file from
+            // the instant it exists. Sized by what was written to the temp file: reading
+            // the length through the final path is one more call that can throw, and it
+            // would throw with a complete file sitting at a path nothing has recorded.
+            staged.Add(tmpPath);
+            result.Add(new MetricSegmentInfo
+            {
+                FilePath      = filePath,
+                MetricName    = metricName,
+                MinNano       = minNano,
+                MaxNano       = maxNano,
+                Granularity   = granularity,
+                FormatVersion = Version,
+                SizeBytes     = size,
+            });
+        }
+        catch
+        {
+            // The half-written file. Deleting it here is not redundant with the
+            // retraction: it reaches this line before it has been staged, which is
+            // exactly the state the retraction cannot name.
+            try { File.Delete(tmpPath); } catch { /* leave it; the throw still stands */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// ONE SERIES WHOSE ENCODING MAY NOT FIT A BLOCK ON ITS OWN: its points go out in time order, as
+    /// many runs as they need, each run a one-series file whose bound fits <paramref name="maxSection"/>.
+    /// The points are already in timestamp order (<see cref="HotSeries.PointsForWrite"/>), so the runs
+    /// are disjoint in time and a reader merges them back like any two files of one series. Only a
+    /// single POINT larger than a block cannot be written — a histogram of millions of buckets, which
+    /// nothing ingests — and that throws, which retracts the whole call as any write failure does.
+    /// </summary>
+    private static void WriteInRuns(
+        string dataDir, string metricName, string namePart, MetricGranularity granularity,
+        SeriesKey key, double[]? bounds, ReadOnlySpan<MetricDataPoint> pts, int maxSection,
+        RentedBufferWriter raw, Span<char> nonceChars, Action<string>? duringFileWrite,
+        List<string> staged, List<MetricSegmentInfo> result)
+    {
+        long identity = IdentityBound(key, bounds);
+        if (pts.Length == 0) throw TooLargeForABlock(metricName, maxSection);
+
+        int from = 0;
+        while (from < pts.Length)
+        {
+            long used = identity + PointBound(in pts[from]);
+            if (used > maxSection) throw TooLargeForABlock(metricName, maxSection);
+            int  to   = from + 1;
+            while (to < pts.Length)
+            {
+                long next = PointBound(in pts[to]);
+                if (used + next > maxSection) break;
+                used += next;
+                to++;
+            }
+
+            raw.Reset();
+            var w = new MessagePackWriter(raw);
+            WriteSeries(ref w, key, bounds, pts[from..to]);
+            w.Flush();
+            EmitFile(dataDir, metricName, namePart, granularity, seriesCount: 1,
+                     pts[from].TimestampUnixNano, pts[to - 1].TimestampUnixNano, raw,
+                     nonceChars, duringFileWrite, staged, result);
+            from = to;
+        }
+    }
+
+    private static InvalidDataException TooLargeForABlock(string metricName, int maxSection) =>
+        new($"A series of '{metricName}' cannot be written in a block of {maxSection:N0} bytes, the most a reader opens");
+
+    /// <summary>
+    /// An upper bound on the bytes <see cref="WriteSeries"/> writes for this series: every string at
+    /// its msgpack header's widest plus three UTF-8 bytes a UTF-16 unit, every number at nine bytes,
+    /// and every point as a FULL histogram point (<see cref="PointBound"/>). Typically 1.5–2x the
+    /// real encoding — which only matters for a section that is already tens of megabytes.
+    /// </summary>
+    internal static long EncodedBound(SeriesKey key, double[]? bounds, ReadOnlySpan<MetricDataPoint> pts)
+    {
+        long bytes = IdentityBound(key, bounds);
+        for (int i = 0; i < pts.Length; i++) bytes += PointBound(in pts[i]);
+        return bytes;
+    }
+
+    /// <summary>The series' map, keys, kind, unit, labels, bounds and the two array/count headers.</summary>
+    private static long IdentityBound(SeriesKey key, double[]? bounds)
+    {
+        long bytes = 64 + 3L * key.Unit.Length + 9L * (bounds?.Length ?? 0);
+        ReadOnlySpan<string> kv = key.Labels.Interleaved;
+        for (int i = 0; i < kv.Length; i++) bytes += 5 + 3L * kv[i].Length;
+        return bytes;
+    }
+
+    /// <summary>A point at its widest: array header, delta, value, count, sum, and its bucket array.</summary>
+    private static long PointBound(in MetricDataPoint p) => 42 + 9L * (p.BucketCounts?.Length ?? 0);
+
+    /// <summary>
+    /// Test seam: the most a file's section may hold, in place of <see cref="MetricReader.MaxBlockBytes"/>,
+    /// on the writing thread only (the writer is synchronous), so a test can reach the split without
+    /// building 64 MiB of points. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static int? MaxSectionBytesForTest;
 
     /// <summary>
     /// Fills <paramref name="order"/> with the indices of <paramref name="series"/> grouped by metric
