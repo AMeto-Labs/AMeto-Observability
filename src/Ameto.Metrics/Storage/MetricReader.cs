@@ -16,8 +16,41 @@ namespace Ameto.Metrics.Storage;
 internal static class MetricReader
 {
     /// <summary>Largest block this reader will decompress. The same ceiling SpanReader uses, and
-    /// for the same reason: nothing on disk bounds what an LZ4 payload claims to expand to.</summary>
-    private const int MaxBlockBytes = 64 * 1024 * 1024;
+    /// for the same reason: nothing on disk bounds what an LZ4 payload claims to expand to. The
+    /// writer keeps every section it writes at or under it (<c>MetricWriter</c>).</summary>
+    internal const int MaxBlockBytes = 64 * 1024 * 1024;
+
+    /// <summary>
+    /// THE LARGEST BLOCK BUFFER A READ TAKES FROM, AND GIVES BACK TO, THE SHARED POOL: 8 MiB, the
+    /// largest array this process already parks on a routine I/O path (<c>IngestBufferPool</c>'s top
+    /// bucket). Above it a buffer is allocated for the read and dropped with it (#125).
+    ///
+    /// <para>There was no line at all: a block — a WHOLE file's series section, up to
+    /// <see cref="MaxBlockBytes"/> — was rented at any size, the pool rounds it up to a power of two
+    /// and keeps what it is handed, and on the 512 MB stand a 58 MiB block parked two 64 MiB arrays
+    /// there. Why not the writer's megabyte (<see cref="MetricWriter.MaxPooledBytes"/>): the writer's
+    /// buffer lives for one flush, a read happens per QUERY — the alert evaluator runs one per rule
+    /// every 15 s — and at a megabyte an ordinary 512-series file's block was allocated by every cold
+    /// query that met it: <c>MetricQueryAllocProbe</c> measured 93.9 B a stored point against its
+    /// 64 B guard. What lies above 8 MiB is a day of a busy histogram's five-minute points or a
+    /// legacy file that carried its history forward — read rarely enough to allocate, large enough
+    /// that parking it costs the stand real heap.</para>
+    /// </summary>
+    internal const int MaxPooledBytes = 8 * 1024 * 1024;
+
+    /// <summary>A block buffer back to the shared pool when it came from there — 8 MiB or less; left to the collector above.</summary>
+    private static void Give(byte[] buffer)
+    {
+        if (buffer.Length > MaxPooledBytes) return;
+        ArrayPool<byte>.Shared.Return(buffer);
+        ReturnedToPoolForTest?.Invoke(buffer.Length);
+    }
+
+    /// <summary>
+    /// Test seam: the length of every block buffer this reader hands back to the shared pool, on the
+    /// reading thread (a read is synchronous on the thread that enumerates it). Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
 
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
@@ -304,7 +337,13 @@ internal static class MetricReader
             uint compSize = br.ReadUInt32();
             FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, "Series block", filePath);
 
-            byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+            // POOLED UP TO 8 MiB AND NO FURTHER (#125, see MaxPooledBytes). A block is a WHOLE file's
+            // series section, up to MaxBlockBytes, and ArrayPool rounds it up to a power of two: a
+            // 58 MiB block took two 64 MiB arrays from the shared pool, and the pool kept both after
+            // the read — 128 MiB of gen2 parked for a caller that may never come, on a box whose whole
+            // heap is 384 MiB. A block above the line is allocated for the read and left to the collector.
+            byte[] comp = compSize <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent((int)compSize) : GC.AllocateUninitializedArray<byte>((int)compSize);
+            bool   compHeld = true;
             byte[]? raw  = null;
             try
             {
@@ -314,8 +353,14 @@ internal static class MetricReader
                 // for gigabytes.
                 int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
                 FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, "Series block uncompressed", filePath);
-                raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                raw = rawLen <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent(rawLen) : GC.AllocateUninitializedArray<byte>(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+
+                // The compressed copy has done its work: given back BEFORE the series are walked, so
+                // a read holds one block and not two for as long as its caller takes over the series
+                // (a rewrite decodes and accumulates a whole chunk while this iterator is suspended).
+                Give(comp);
+                compHeld = false;
 
                 if (at is null)
                 {
@@ -342,8 +387,8 @@ internal static class MetricReader
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(comp);
-                if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+                if (compHeld) Give(comp);
+                if (raw is not null) Give(raw);
             }
         }
         else
@@ -371,7 +416,8 @@ internal static class MetricReader
                 uint compSize = br.ReadUInt32();
                 FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
 
-                byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+                // Pooled up to 8 MiB, allocated above — see the v3 block above.
+                byte[] comp = compSize <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent((int)compSize) : GC.AllocateUninitializedArray<byte>((int)compSize);
                 byte[]? raw = null;
                 MetricSeries? series;
                 int key;
@@ -380,14 +426,14 @@ internal static class MetricReader
                     fs.ReadExactly(comp, 0, (int)compSize);
                     int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
-                    raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                    raw = rawLen <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent(rawLen) : GC.AllocateUninitializedArray<byte>(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
                     series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, share, out _, out key);
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(comp);
-                    if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+                    Give(comp);
+                    if (raw is not null) Give(raw);
                 }
 
                 if (series is not null) yield return (position, key, series);
