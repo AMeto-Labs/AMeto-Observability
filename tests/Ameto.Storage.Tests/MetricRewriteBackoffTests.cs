@@ -152,6 +152,77 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         Assert.Equal(4, again.Count);
     }
 
+    /// <summary>
+    /// A SOURCE THAT WILL NOT DECODE IS LEFT OUT, NOT ALLOWED TO HOLD ITS METRIC BACK (#125 review F1).
+    /// A rollup rewrites all of a metric's aged files together, so one file every read refuses — a
+    /// pre-#125 merge's block over the reader's 64 MiB, written by a host with more memory than the
+    /// stand — failed the rollup of every other file of its metric, backing off to 6 hours, until
+    /// retention took it a TTL later. Here a 5-minute file whose block size no read accepts sits
+    /// among healthy ones of its metric: the first pass meets it and leaves it out, with one warning
+    /// and no back-off, and the next rewrites the others — three a day old rolled up, or four fresh
+    /// ones merged. It stays on disk.
+    /// </summary>
+    [Theory]
+    [InlineData("one pass")]    // a rollup; the headers show one chunk: the single read meets it
+    [InlineData("planned")]     // a rollup; a 4 KB budget: the planning walk meets it
+    [InlineData("truncated")]   // a rollup; cut short after the start loaded it: the header read meets it
+    [InlineData("merge")]       // a 5-minute merge of the last 24 hours
+    public async Task A_source_that_will_not_decode_is_left_out_and_its_metric_is_rewritten_without_it(string where)
+    {
+        const string metric = "unreadable.gauge";
+        long now   = Now() / Min * Min;
+        bool merge = where == "merge";
+        var files  = new List<MetricSegmentInfo>();
+        for (int i = 0; i < (merge ? 5 : 4); i++)
+            files.AddRange(Write(_dir, metric, MetricGranularity.FiveMin, 3,
+                                 merge ? now - 10 * Hour + i * Hour : now - 3 * 24 * Hour + i * 6 * Hour, 12));
+        string bad = files[1].FilePath;
+        if (where != "truncated")
+            using (var fs = new FileStream(bad, FileMode.Open, FileAccess.Write))
+            {
+                fs.Position = 32;                                  // the compressed block's size, after the 28-byte header and its raw size
+                fs.Write([0xFF, 0xFF, 0xFF, 0x7F]);
+            }
+
+        var log = new CapturingLogger();
+        await using var engine = new MetricStorageEngine(_dir, log, where == "planned" ? new Ameto.Core.MetricsOptions { RewriteBudgetBytes = 4096 } : null);
+        await engine.ColdLoadCompleted;
+        if (where == "truncated")
+            using (var fs = new FileStream(bad, FileMode.Open, FileAccess.Write)) fs.SetLength(20);
+
+        // (The start's catalog seed warns about the file too, when it can see the damage: that is its own line.)
+        List<string> LeftOut()
+        {
+            lock (log.Entries)
+                return log.Entries.Where(e => e.Level == LogLevel.Warning && e.Text.Contains("will not decode", StringComparison.Ordinal))
+                                  .Select(e => e.Text).ToList();
+        }
+        List<string> Errors()
+        {
+            lock (log.Entries) return log.Entries.Where(e => e.Level == LogLevel.Error).Select(e => e.Text).ToList();
+        }
+
+        var before = Paths(engine, metric, MetricGranularity.FiveMin);
+        await engine.PerformRollupForTest();
+        Assert.Equal(before, Paths(engine, metric, MetricGranularity.FiveMin));     // met the file: nothing rewritten yet
+        Assert.Contains(bad, Assert.Single(LeftOut()));
+        Assert.Empty(Errors());                                                      // the file's fault, not the work's: no back-off
+
+        await engine.PerformRollupForTest();
+        var after = Paths(engine, metric, MetricGranularity.FiveMin);
+        Assert.Contains(bad, after);                                                 // left where it was
+        Assert.True(File.Exists(bad));
+        var rewritten = merge
+            ? engine.ColdSegmentsForTest.Where(s => s.MetricName == metric && s.FilePath != bad).ToList()
+            : engine.ColdSegmentsForTest.Where(s => s.MetricName == metric && s.Granularity == MetricGranularity.OneHour).ToList();
+        if (merge) Assert.Empty(rewritten.Select(s => s.FilePath).Intersect(before));   // the four healthy ones merged
+        else       Assert.Equal([bad], after);                                          // the three healthy ones rolled up
+        Assert.NotEmpty(rewritten);
+        Assert.Equal(3, rewritten.SelectMany(s => MetricReader.ReadAllSync(s.FilePath)).Select(s => s.Labels).Distinct().Count());
+        Assert.Single(LeftOut());                                                    // said once
+        Assert.Empty(Errors());
+    }
+
     [Fact]
     public async Task A_Raw_compaction_whose_inputs_are_its_own_outputs_is_not_rewritten()
     {
