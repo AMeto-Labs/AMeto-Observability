@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -66,6 +67,46 @@ public sealed class SpanWriteScratchTests : IDisposable
         Assert.Same(first.Body,  second.Body);
         Assert.Same(first.Pairs, second.Pairs);
         Assert.Equal(2, e.ColdSegmentCountForTest);
+    }
+
+    /// <summary>
+    /// A FULL FLUSH OF SINGLE-SPAN TRACES KEEPS ITS BODY TOO (#124 review F1) — the shape #90 named.
+    /// The writer sizes the <c>.tracesum</c> body at <c>traces × 80 + spans × 4 + 256</c> bytes, which
+    /// for one span per trace passes 4 MiB at 49 930 spans: a threshold flush rents 8 MiB. Under a
+    /// 4 MiB cap that went to the shared pool, into the returning thread's slot, and a flush on
+    /// another thread rented it afresh. 49 990 spans, so no flush starts on its own (the threshold is
+    /// 50 000) and each one runs on the thread the test gives it; a hot-tier budget no host derives
+    /// below, so bytes do not start one either. Reverted (cap 4 MiB): the engine holds no body.
+    /// </summary>
+    [Fact]
+    public void A_full_flush_of_single_span_traces_keeps_its_body_for_a_flush_on_another_thread()
+    {
+        const int Spans = 49_990;
+        using var e = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance,
+                                             options: new TracesOptions { HotTierMaxBytes = 256L << 20 });
+
+        FillSingleSpan(e, 0, Spans);
+        OnFreshThread(e.FlushHotTier);
+        var first = e.WriteScratchForTest.HeldForTest.Body;
+        Assert.NotNull(first);
+        Assert.True(first.Length > 4 << 20, $"setup: a {first.Length}-byte body is not past the old 4 MiB cap");
+
+        FillSingleSpan(e, Spans, Spans);
+        OnFreshThread(e.FlushHotTier);                                 // another thread, an empty pool slot
+
+        Assert.Same(first, e.WriteScratchForTest.HeldForTest.Body);
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+    }
+
+    private static void FillSingleSpan(TraceStorageEngine e, int first, int count)
+    {
+        for (int i = first; i < first + count; i++)
+            e.WriteSpan(new SpanIngestItem
+            {
+                TraceId = new TraceId(0x5C4C, (ulong)(i + 1)), SpanId = new SpanId((ulong)(i + 1)),
+                StartTimeUnixNano = 1_785_000_000_000_000_000L + i * 1_000L, DurationNanos = 1_000,
+                Name = "op", ServiceName = "svc", Kind = SpanKind.Server,
+            });
     }
 
     /// <summary>

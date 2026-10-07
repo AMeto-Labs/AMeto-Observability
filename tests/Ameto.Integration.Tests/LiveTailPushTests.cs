@@ -51,8 +51,10 @@ public sealed class LiveTailPushTests : IClassFixture<AmetoWebAppFactory>
 
     private async Task<Tail> OpenTailAsync(string? filter, TimeSpan budget, string? levels = null)
     {
+        // The budget is the TAIL's: started once the host has answered a request, so the class's
+        // host start and its first request — the route table — cannot spend it (#115).
+        var client = await _factory.CreateReadyClientAsync();
         var cts    = new CancellationTokenSource(budget);
-        var client = _factory.CreateClient();
 
         var query = new List<string>();
         if (filter is not null) query.Add("filter=" + Uri.EscapeDataString(filter));

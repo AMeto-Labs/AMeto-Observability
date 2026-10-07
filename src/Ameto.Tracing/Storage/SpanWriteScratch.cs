@@ -18,7 +18,8 @@ namespace Ameto.Tracing.Storage;
 /// <para>BOUNDED, because an engine slot is never trimmed. An array is kept only up to a flush's own
 /// size (<see cref="MaxKeptElements"/> spans, <see cref="MaxKeptBodyBytes"/> of body); a compaction
 /// pass's larger arrays go back to the shared pool as before. What this holds at rest is what one
-/// ordinary flush used — 3.1 MB for 50 000 spans of 10-span traces, at most 6.1 MB.</para>
+/// ordinary flush used — 3 MiB for 50 000 spans of 10-span traces, 10 MiB for 50 000 single-span
+/// traces, and never more than 10 MiB (0.25 + 0.5 + 1.25 + 8).</para>
 ///
 /// <para>Exclusive by exchange: a flush and a compaction pass running together each take a slot
 /// with <see cref="Interlocked.Exchange{T}(ref T, T)"/>, so the second finds it empty and rents from
@@ -34,10 +35,26 @@ internal sealed class SpanWriteScratch
     internal const int MaxKeptElements = 1 << 16;
 
     /// <summary>
-    /// The largest <c>.tracesum</c> body kept. Ordinary traces fit (50 000 spans of 10-span traces
-    /// rent 1 MB); a full flush of single-span traces rents 8 MB and is not kept.
+    /// The largest <c>.tracesum</c> body kept: what a FULL flush rents for it — the writer sizes the
+    /// body at <c>traces × 80 + spans × 4 + 256</c> bytes, and 50 000 single-span traces ask for
+    /// 4 200 256, which the pool rounds up to 8 MiB. 50 000 spans of 10-span traces rent 1 MiB.
+    ///
+    /// <para>IT WAS 4 MiB, AND THAT MISSED THE SHAPE #90 IS ABOUT (#124 review F1). Single-span traces
+    /// pass 4 MiB at 49 930 spans, so every threshold flush of them gave its 8 MiB body to the shared
+    /// pool — to the returning thread's slot, which the next flush, on another pool thread, cannot
+    /// see — and allocated a new one: 35.65 MiB per flush on a fresh thread instead of 27.65 measured
+    /// (Debug). Tightening the estimate instead would not have done it: an HTTP server span's row
+    /// (name, method, path) made the real body 5.40 MB, past 4 MiB whatever the estimate. The price is
+    /// paid at rest: the ceiling of what this holds goes from 6 to 10 MiB — memory every such flush
+    /// rents anyway, and 2.6 % of the 512 MB stand's 384 MB heap.</para>
+    ///
+    /// <para>A constant, like <see cref="MaxKeptElements"/>: the body follows the flush's span count,
+    /// which <c>HotFlushThreshold</c> caps at 50 000 on every host — even the smallest hot-tier budget
+    /// (8 MiB) takes 50 000 attribute-less spans — so a budget-derived cap would bring the churn back
+    /// where memory is tightest. A body that outgrows its estimate (rows averaging over ~167 bytes)
+    /// rents 16 MiB and goes to the shared pool, like a compaction pass's.</para>
     /// </summary>
-    internal const int MaxKeptBodyBytes = 4 << 20;
+    internal const int MaxKeptBodyBytes = 8 << 20;
 
     private int[]?          _order;
     private long[]?         _keys;
