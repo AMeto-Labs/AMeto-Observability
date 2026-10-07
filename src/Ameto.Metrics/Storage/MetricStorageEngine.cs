@@ -2829,6 +2829,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             {
                 var positions = new List<long>();
                 var keyOrder  = new List<int>();
+
+                // The planning walk takes its turn as well (#125 review F4): it inflates each source's
+                // whole block, the largest thing a rewrite reads. Source by source, so a trace pass
+                // gets in between two of them.
+                using var turn = _rewriteGate.Enter();
                 foreach (var item in ReadingFrom(seg, MetricReader.PlanForRewrite(seg.FilePath, keyOf, keepFromNano, scratch)))
                 {
                     int k = item.Key;

@@ -251,11 +251,16 @@ public sealed class MetricRewriteBudgetTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Neither a chunk nor the planning walk before it runs while the trace side holds the gate: the
+    /// walk inflates every source's whole block (#125 review F4), so a plan cut while the gate was
+    /// held means a source was read beside a trace pass.
+    /// </summary>
     [Theory]
     [InlineData("one pass")]       // 10 series: the headers show it fits one chunk
     [InlineData("planned")]        // 600 series: more than one chunk holds
     [InlineData("time slices")]    // one series ~13x a 64 KB budget
-    public async Task A_metric_rewrite_chunk_waits_its_turn_while_another_rewrite_holds_the_gate(string shape)
+    public async Task A_metric_rewrite_waits_its_turn_while_another_rewrite_holds_the_gate(string shape)
     {
         var gate    = new BackgroundRewriteGate();
         var sources = shape switch
@@ -267,8 +272,9 @@ public sealed class MetricRewriteBudgetTests : IDisposable
         };
         var options = shape == "time slices" ? new MetricsOptions { RewriteBudgetBytes = 64 * 1024 } : null;
         await using var engine = await Engine(Sub("eng"), options, gate);
-        int chunks = 0;
+        int chunks = 0, planned = 0;
         engine.OnRewriteChunkWrittenForTest = _ => Interlocked.Increment(ref chunks);
+        engine.OnRewriteChunkPlannedForTest = (_, _, _) => Interlocked.Increment(ref planned);
 
         Task<List<MetricSegmentInfo>> rewrite;
         using (var holder = new GateHolder(gate))
@@ -279,11 +285,13 @@ public sealed class MetricRewriteBudgetTests : IDisposable
             await Task.WhenAny(rewrite, Task.Delay(500));
             Assert.False(rewrite.IsCompleted, "a rewrite chunk ran while another rewrite held the gate");
             Assert.Equal(0, Volatile.Read(ref chunks));
+            Assert.Equal(0, Volatile.Read(ref planned));                    // and no source was walked to plan one
         }
 
         var outputs = await rewrite.WaitAsync(TimeSpan.FromSeconds(60));
         Assert.NotEmpty(outputs);
         Assert.True(Volatile.Read(ref chunks) >= 1);
+        Assert.Equal(shape != "one pass", Volatile.Read(ref planned) >= 1);
     }
 
     [Fact]

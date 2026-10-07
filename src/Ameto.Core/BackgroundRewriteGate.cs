@@ -16,9 +16,14 @@ namespace Ameto.Core;
 /// at one bucket set, the cache at the stand's recommended 48 MB, the tiers at their flush cadence,
 /// the trace merge at the segment count it buys.</para>
 ///
-/// <para>Held for one unit of work at a time — a trace pass, a metric chunk — and never across an
-/// await: both rewrites are synchronous on the thread that runs them. Nothing takes another lock that
-/// the other side holds while it waits here, so the wait is bounded by the other side's unit.</para>
+/// <para>Held for one unit of work at a time — a trace pass; a metric chunk, a time slice, or the
+/// planning walk over one source — and never across an await: both rewrites are synchronous on the
+/// thread that runs them. Nothing takes another lock that the other side holds while it waits here,
+/// so the wait is bounded by the other side's unit.</para>
+///
+/// <para>What a turn does not cover: a metric rewrite keeps its block buffers
+/// (<c>MetricReader.ReadScratch</c>) for its whole length, between turns as well — up to twice its
+/// largest source's block, beside the share rather than inside it.</para>
 /// </summary>
 public sealed class BackgroundRewriteGate
 {
