@@ -1177,6 +1177,17 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// <summary>Test hook: one rollup pass, now — what the rollup loop runs on its timer.</summary>
     internal Task PerformRollupForTest() => PerformRollupAsync(CancellationToken.None);
 
+    /// <summary>Test hook: the cold tier's catalog, copied under its read lock. Empty once the tier is closed.</summary>
+    internal List<MetricSegmentInfo> ColdSegmentsForTest
+    {
+        get
+        {
+            if (!TryEnterColdRead()) return [];
+            try { return [.. _coldSegments]; }
+            finally { _coldLock.ExitReadLock(); }
+        }
+    }
+
     /// <summary>
     /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
     /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
@@ -2320,8 +2331,21 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         if (!TryEnterColdRead()) return Task.CompletedTask;
         try
         {
+            // A SAME-GRANULARITY MERGE TAKES ONLY FILES LYING WHOLLY INSIDE ITS TIER'S WINDOW (#125):
+            // MinNano as well as MaxNano. Selected by MaxNano alone, a merged file was always the
+            // freshest thing in the tier — its output keeps the OLDEST point of every input and the
+            // NEWEST MaxNano — so it was merged again with every new arrival, never aged past the
+            // tier boundary into the next rollup, and never expired: retention decides by MaxNano
+            // too. The FiveMin tier carried its whole history forward that way, ~288 points a series
+            // a day, until one 512-series chunk of a histogram no longer fit a 384 MB heap and every
+            // pass ended in an OutOfMemoryException. The trace planner closes the same trap with a
+            // 24-hour window on both ends (TraceStorageEngine.SelectCompactionBatch). A file that
+            // reaches back past the window is left alone here: its MaxNano ages, and it is rolled up
+            // (or expires) as a file of the tier below would be. The MaxNano bounds stay beside the
+            // MinNano ones so a file whose header claims MaxNano < MinNano cannot land in two lists.
             toCompact  = _coldSegments
                 .Where(s => s.Granularity == MetricGranularity.Raw
+                         && s.MinNano >= cutoff1h
                          && s.MaxNano < compactCutoff
                          && s.MaxNano >= cutoff1h)
                 .ToList();
@@ -2336,7 +2360,9 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             // hundreds of label-repeating files per metric over the retention
             // window. Also selects lone legacy-v2 files so old data migrates to v3.
             toMerge5m  = _coldSegments
-                .Where(s => s.Granularity == MetricGranularity.FiveMin && s.MaxNano >= cutoff24h)
+                .Where(s => s.Granularity == MetricGranularity.FiveMin
+                         && s.MinNano >= cutoff24h
+                         && s.MaxNano >= cutoff24h)
                 .ToList();
             toMerge1h  = _coldSegments
                 .Where(s => s.Granularity == MetricGranularity.OneHour)
@@ -2428,6 +2454,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// or when any is still in the legacy v2 format (so old data migrates to v3
     /// and shrinks). <paramref name="maxSpan"/> windows the merge so one file
     /// never grows beyond that time range (used for the long-lived 1-h tier).
+    ///
+    /// <para><b>A file belongs to a window only when BOTH its ends are in it</b> (#125). Grouped by
+    /// MinNano alone, a file reaching into the next window joined the merge of the one it started
+    /// in, and the output carried that window's start to the later MaxNano — the window bounded
+    /// where a merged file BEGAN and nothing about where it ended, so it was neither the merge's
+    /// bound nor the retention granularity the 1-h tier's caller takes it for. A file straddling a
+    /// boundary is left as it is and expires on its own MaxNano.</para>
     /// </summary>
     private void MergeTier(List<MetricSegmentInfo> tier, MetricGranularity granularity, TimeSpan? maxSpan = null)
     {
@@ -2439,6 +2472,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             {
                 long spanNanos = (long)span.TotalMilliseconds * 1_000_000L;
                 windows = group
+                    .Where(s => s.MinNano / spanNanos == s.MaxNano / spanNanos)
                     .GroupBy(s => s.MinNano / spanNanos)
                     .Select(g => g.ToList());
             }
