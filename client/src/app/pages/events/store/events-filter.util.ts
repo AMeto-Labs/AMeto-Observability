@@ -16,67 +16,239 @@ const LEVEL_CLAUSE_RE =
 // ── The services picker's clause ────────────────────────────────────────────
 //
 // The picker owns ONE clause: a top-level AND conjunct `@service = '…'` / `@service in […]` —
-// or the `['service.name']` spelling it wrote before, which saved searches, history and shared
-// URLs still carry. Only such a conjunct is a SELECTION: it constrains every row. The same text
-// under a `not`, or beside a top-level `or`, does not, and reading it as one hid rows the server
-// had rightly returned. The field names are matched ORDINALLY, as the server matches its aliases
-// (`@SERVICE` is a user property there); the `in` keyword, like every keyword, in any case.
+// under any name the server answers for the field. Only such a conjunct is a SELECTION: it
+// constrains every row. The same text under a `not`, or beside a top-level `or`, does not, and
+// reading it as one hid rows the server had rightly returned. The field names are matched
+// ORDINALLY, as the server matches its aliases (`@SERVICE` is a user property there); the `in`
+// keyword, like every keyword, in any case.
 
-/** `@service = 'x'` — either spelling of the field; group 1 is the service. */
-const SERVICE_EQ_CLAUSE = /^(?:@service|\['service\.name'\])\s*=\s*'([^']+)'$/;
+/** PropertyPath.Separator: what the server's parser joins a property path's segments with. */
+const PATH_SEP = '\u0001';
 
-/** `@service in ['a', 'b']` — either spelling; group 1 is the list body. */
-const SERVICE_IN_CLAUSE = /^(?:@service|\['service\.name'\])\s+[Ii][Nn]\s*\[([^\]]+)\]$/;
+/**
+ * The KEYS the server resolves to the field (BuiltinFields, the ServiceName row): `@service`;
+ * `ServiceName`; `service.name` as one key, which only a bracket writes (`['service.name']`, the
+ * spelling the picker wrote before `@service` — saved searches, history and shared URLs still
+ * carry it); and the path `service`/`name`, which bare `service.name` becomes, and
+ * `service['name']`, `['service'].name` and `['service']['name']` too.
+ *
+ * The picker used to match SPELLINGS, with a regex, and every spelling it missed kept its clause
+ * as the user's own text while a pick ANDed `@service = 'new'` in front of it: two service
+ * clauses that contradict, and an empty page. So a conjunct is now read the way the server reads
+ * it ({@link lex}, {@link readPath}) and the KEY that comes out is what is compared — ordinally,
+ * as the server compares it, so `service.namespace`, `servicename` and `service['name']['x']`
+ * stay properties here as they are there.
+ */
+const SERVICE_KEYS: ReadonlySet<string> =
+  new Set(['@service', 'ServiceName', 'service.name', `service${PATH_SEP}name`]);
 
-/** The quoted items of an `in […]` list body. */
-const QUOTED_ITEM = /'([^']+)'/g;
+/** A token of the server's filter lexer, as far as the picker's clause needs one. */
+interface Token {
+  kind: 'ident' | 'string' | 'number' | 'punct' | 'op';
+  /** An identifier as written; a string's value, its escapes undone; otherwise the symbol. */
+  text: string;
+  /** Where the token starts, and ends, in the source: a conjunct is cut out of it verbatim. */
+  start: number;
+  end: number;
+}
+
+/** `char.IsLetter` / `char.IsDigit`, the lexer's tests — one UTF-16 unit at a time, as there. */
+const isLetter = (ch: string) => /\p{L}/u.test(ch);
+const isDigit = (ch: string | undefined) => ch !== undefined && /\p{Nd}/u.test(ch);
+const isIdentPart = (ch: string) =>
+  ch === '@' || ch === '_' || ch === '.' || isLetter(ch) || isDigit(ch);
+
+const isPunct = (t: Token | undefined, ch: string) => t?.kind === 'punct' && t.text === ch;
+
+/**
+ * `src` in the server lexer's tokens (Lexer.Tokenise), rule for rule: whitespace separates
+ * tokens; `'…'` is a string in which `\x` is x and `''` is a quote; `( ) [ ] ,` stand alone; a
+ * `.` not before a digit is a dot; `= != <> < <= > >=` are operators; a number starts with `-`,
+ * a digit or `.digit`; an identifier starts with `@`, `_` or a letter and runs on through those,
+ * digits AND DOTS; any other character is skipped, as the lexer skips it. A string still open at
+ * the end is read to the end, as the lexer reads it, and `open` says so.
+ */
+function lex(src: string): { tokens: Token[]; open: boolean } {
+  const tokens: Token[] = [];
+  const add = (kind: Token['kind'], text: string, start: number, end: number) =>
+    tokens.push({ kind, text, start, end });
+  let i = 0;
+  while (i < src.length) {
+    const start = i;
+    const c = src[i];
+    const two = src.slice(i, i + 2);
+    if (/\s/.test(c)) {
+      i++;
+    } else if (c === "'") {
+      let text = '';
+      for (i++; ; ) {
+        if (i >= src.length) {
+          add('string', text, start, i);
+          return { tokens, open: true };
+        }
+        if (src[i] === '\\' && i + 1 < src.length) { text += src[i + 1]; i += 2; }
+        else if (src[i] === "'" && src[i + 1] === "'") { text += "'"; i += 2; }
+        else if (src[i] === "'") { i++; break; }
+        else { text += src[i]; i++; }
+      }
+      add('string', text, start, i);
+    } else if ('()[],'.includes(c) || (c === '.' && !isDigit(src[i + 1]))) {
+      i++;
+      add('punct', c, start, i);
+    } else if (two === '!=' || two === '<=' || two === '<>' || two === '>=') {
+      i += 2;
+      add('op', two, start, i);
+    } else if (c === '=' || c === '<' || c === '>') {
+      i++;
+      add('op', c, start, i);
+    } else if (c === '-' || c === '.' || isDigit(c)) {        // a `.` here has a digit after it
+      if (c === '-') i++;
+      while (i < src.length && (src[i] === '.' || isDigit(src[i]))) i++;
+      add('number', src.slice(start, i), start, i);
+    } else if (c === '@' || c === '_' || isLetter(c)) {
+      i++;
+      while (i < src.length && isIdentPart(src[i])) i++;
+      add('ident', src.slice(start, i), start, i);
+    } else {
+      i++;
+    }
+  }
+  return { tokens, open: false };
+}
+
+/**
+ * The key the server's parser makes of the property path starting at `t[p]`
+ * (FilterParser.ReadPropertyPath) — an identifier split at its dots, a bracketed string kept whole
+ * as one segment, then any run of `.identifier` and `['segment']`, all joined with U+0001 — and
+ * the position after it; null when no path starts there. A bracketed number, an array index, is
+ * not read: no key of the field has one, so a clause holding one is not the picker's.
+ */
+function readPath(t: readonly Token[], p: number): { key: string; end: number } | null {
+  const bracketed = (k: number): string | null =>
+    isPunct(t[k], '[') && t[k + 1]?.kind === 'string' && isPunct(t[k + 2], ']')
+      ? t[k + 1].text
+      : null;
+
+  const segs: string[] = [];
+  const first = bracketed(p);
+  if (first !== null) { segs.push(first); p += 3; }
+  else if (t[p]?.kind === 'ident') { segs.push(...t[p].text.split('.')); p++; }
+  else return null;
+
+  for (;;) {
+    const seg = bracketed(p);
+    if (seg !== null) {
+      segs.push(seg);
+      p += 3;
+    } else if (isPunct(t[p], '.') && t[p + 1]?.kind === 'ident') {
+      segs.push(...t[p + 1].text.split('.'));
+      p += 2;
+    } else {
+      return { key: segs.join(PATH_SEP), end: p };
+    }
+  }
+}
+
+/**
+ * `t` without the parentheses around ALL of it: the parser reads `( expr )` as expr (ParseAtom).
+ * One pass: each `(` is matched to its `)` once, then pairs are peeled while the first token's
+ * match is the last — `(a) and (b)` is not one pair. It used to peel one pair at a time and scan
+ * the whole conjunct again for each, which costs depth × length, on every keystroke of a draft
+ * (#118 ultrareview).
+ */
+function unwrapped(t: Token[]): Token[] {
+  const closer = new Map<number, number>();
+  const open: number[] = [];
+  for (let k = 0; k < t.length; k++) {
+    if (isPunct(t[k], '(')) open.push(k);
+    else if (isPunct(t[k], ')') && open.length > 0) closer.set(open.pop()!, k);
+  }
+  let lo = 0;
+  let hi = t.length - 1;
+  while (lo < hi && closer.get(lo) === hi) { lo++; hi--; }
+  return t.slice(lo, hi + 1);
+}
+
+/**
+ * The services a conjunct SELECTS — `field = 'x'` or `field in ['x', …]`, `field` being any
+ * spelling the server resolves to the built-in service, inside any parentheses, and `'x' = field`
+ * too: the parser moves a literal on the left to the right. Null for anything else: an exclusion
+ * (`<>`, `not in`), another property, a comparison with something that is not a name, a list
+ * holding one, text after the clause, or an `or` of service tests. A name is never empty, and a
+ * string still open — a draft being typed, `@service = 'pay` — reads as nothing, where the lexer
+ * would read it to the end.
+ */
+function serviceSelection(conjunct: string): string[] | null {
+  const lexed = lex(conjunct);
+  if (lexed.open) return null;
+  const t = unwrapped(lexed.tokens);
+  const isName = (k: number) => t[k]?.kind === 'string' && t[k].text.length > 0;
+  const isEq = (k: number) => t[k]?.kind === 'op' && t[k].text === '=';
+
+  if (isName(0) && isEq(1)) {
+    const right = readPath(t, 2);
+    return right && right.end === t.length && SERVICE_KEYS.has(right.key) ? [t[0].text] : null;
+  }
+
+  const path = readPath(t, 0);
+  if (!path || !SERVICE_KEYS.has(path.key)) return null;
+  let p = path.end;
+  if (isEq(p)) return isName(p + 1) && p + 2 === t.length ? [t[p + 1].text] : null;
+
+  if (t[p]?.kind !== 'ident' || t[p].text.toLowerCase() !== 'in' || !isPunct(t[p + 1], '['))
+    return null;
+  const names: string[] = [];
+  for (p += 2; isName(p); ) {
+    names.push(t[p++].text);
+    if (!isPunct(t[p], ',')) break;
+    p++;                                                      // the parser takes a trailing comma
+  }
+  return names.length > 0 && isPunct(t[p], ']') && p + 1 === t.length ? names : null;
+}
 
 /** The picker's oldest clause, `(service.name = 'x' or ApplicationContext = 'x')`: replaced, never read. */
 const LEGACY_SERVICE_OR_CLAUSE =
   /^\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)$/;
 
-/** A top-level connective at the scan position: whitespace, `and`/`or`, whitespace. */
-const CONNECTIVE_AT = /^\s+(and|or)\s+/i;
-
 /**
- * The top-level AND conjuncts of `expr` — split outside quotes, brackets and parentheses — or
- * null when `expr` has a top-level `or`, where no single conjunct constrains every row.
+ * The top-level AND conjuncts of `expr` — cut at each `and` outside parentheses and brackets, as
+ * written — or null when `expr` has a top-level `or`, where no single conjunct constrains every
+ * row.
+ *
+ * Cut at the lexer's TOKENS, not at whitespace. The lexer needs none around a connective: a
+ * string ends at its quote, a number at its last digit, and `(`, `)`, `[`, `]` are tokens of their
+ * own, so `'eu'or`, `)or(`, `]or` and `1or` hold an `or`, and `'old'and` an `and`. A splitter that
+ * wanted spaces read `@service = 'x' and A = 'eu'or B = 'us'` as two conjuncts — and since `and`
+ * binds tighter than `or`, it took a service test in one branch of the `or` for a selection of
+ * every row, which a pick then rewrote (#118 review F1). A string still open reads to the end
+ * here, as there.
  */
 function topLevelConjuncts(expr: string): string[] | null {
   const parts: string[] = [];
   let depth = 0;
-  let quoted = false;
-  let start = 0;
-  for (let i = 0; i < expr.length; i++) {
-    const c = expr[i];
-    if (quoted) {
-      if (c === '\\') i++;                                   // \' escapes a quote
-      else if (c === "'") {
-        if (expr[i + 1] === "'") i++;                        // '' is a quote too
-        else quoted = false;
+  let from = 0;
+  for (const tok of lex(expr).tokens) {
+    if (isPunct(tok, '(') || isPunct(tok, '[')) depth++;
+    else if (isPunct(tok, ')') || isPunct(tok, ']')) depth--;
+    else if (depth === 0 && tok.kind === 'ident') {
+      const word = tok.text.toLowerCase();
+      if (word === 'or') return null;
+      if (word === 'and') {
+        parts.push(expr.slice(from, tok.start).trim());
+        from = tok.end;
       }
-      continue;
     }
-    if (c === "'") { quoted = true; continue; }
-    if (c === '(' || c === '[') { depth++; continue; }
-    if (c === ')' || c === ']') { depth--; continue; }
-    if (depth !== 0 || !/\s/.test(c)) continue;
-    const m = CONNECTIVE_AT.exec(expr.slice(i));
-    if (!m) continue;
-    if (m[1].toLowerCase() === 'or') return null;
-    parts.push(expr.slice(start, i).trim());
-    i += m[0].length - 1;
-    start = i + 1;
   }
-  parts.push(expr.slice(start).trim());
+  parts.push(expr.slice(from).trim());
   return parts.filter(p => p.length > 0);
 }
 
-/** True for a conjunct the picker writes, or wrote in an earlier spelling. */
+/**
+ * True for a conjunct that selects services, under any name of the field, or for the picker's
+ * oldest clause.
+ */
 function isServiceClause(conjunct: string): boolean {
-  return SERVICE_EQ_CLAUSE.test(conjunct)
-      || SERVICE_IN_CLAUSE.test(conjunct)
-      || LEGACY_SERVICE_OR_CLAUSE.test(conjunct);
+  return serviceSelection(conjunct) !== null || LEGACY_SERVICE_OR_CLAUSE.test(conjunct);
 }
 
 /** Milliseconds between .NET DateTime min (0001-01-01 UTC) and Unix epoch (1970-01-01 UTC). */
@@ -217,15 +389,13 @@ export function parseLevelsFromFilter(expr: string): Set<string> {
 
 /**
  * The services the filter SELECTS: those named by the picker's clause when it is a top-level AND
- * conjunct (either spelling). Empty — "all services" — when there is none, including when the
- * clause sits under a `not` or beside a top-level `or`, where it selects nothing.
+ * conjunct (any spelling of the field). Empty — "all services" — when there is none, including
+ * when the clause sits under a `not` or beside a top-level `or`, where it selects nothing.
  */
 export function parseServicesFromFilter(expr: string): Set<string> {
   for (const conjunct of topLevelConjuncts(expr) ?? []) {
-    const inMatch = SERVICE_IN_CLAUSE.exec(conjunct);
-    if (inMatch) return new Set([...inMatch[1].matchAll(QUOTED_ITEM)].map(m => m[1]));
-    const eqMatch = SERVICE_EQ_CLAUSE.exec(conjunct);
-    if (eqMatch) return new Set([eqMatch[1]]);
+    const names = serviceSelection(conjunct);
+    if (names) return new Set(names);
   }
   return new Set<string>();
 }
@@ -247,11 +417,21 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
 }
 
 /**
+ * `s` as a string literal the server's lexer reads back as `s`. It ends a string at a lone quote
+ * and takes a backslash as an escape of the character after it, so `'O'Brien'` was the name `O`
+ * followed by text it could not use, and `'DOMAIN\svc'` the name `DOMAINsvc`. The quote is
+ * doubled, as `jvLiteral` writes it; the backslash is escaped.
+ */
+function quoted(s: string): string {
+  return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+}
+
+/**
  * Rewrites the picker's service clause of `expr` as `@service = …` / `@service in […]` — the
  * built-in field's own name, which the server answers from the event header and its index. Only
- * the picker's own clause (a top-level AND conjunct, in either spelling) is replaced — never
- * duplicated — and a service test the user wrote under a `not` or inside an `or` is left as
- * written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
+ * the picker's own clause (a top-level AND conjunct, in any spelling of the field) is replaced —
+ * never duplicated — and a service test the user wrote under a `not` or inside an `or` is left
+ * as written. When `expr` has a top-level `or`, it is parenthesised so the selection applies to
  * all of it. Placed after any `@l` clause, before the rest of the user's expression.
  */
 export function setServicesClause(expr: string, svcs: Set<string>): string {
@@ -261,8 +441,8 @@ export function setServicesClause(expr: string, svcs: Set<string>): string {
     : `(${expr.trim()})`;
   if (svcs.size === 0) return conjuncts ? stripped : expr.trim();
   const clause = svcs.size === 1
-    ? `@service = '${[...svcs][0]}'`
-    : `@service in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
+    ? `@service = ${quoted([...svcs][0])}`
+    : `@service in [${[...svcs].map(quoted).join(', ')}]`;
   const lvlMatch = stripped.match(/^(@l\s+(?:not\s+in|in)\s*\[[^\]]+\]|@l\s*(?:<>|!=|=)\s*'[^']*')(\s+and\s+|$)/i);
   if (lvlMatch) {
     const rest = stripped.slice(lvlMatch[0].length).trim();

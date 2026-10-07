@@ -39,9 +39,11 @@ describe('Event detail — the service and the properties beside it', () => {
     expect(Object.keys(view)).toEqual(['@t', '@l', '@mt', '@service', 'n']);
   });
 
-  it('the JSON tab reads an older server\'s service.name as @service', () => {
-    const view = buildClefView({ ...base, 'service.name': 'legacy' });
-    expect(view['@service']).toBe('legacy');
+  it('the JSON tab takes the service from @service alone, not from the key servers before it sent', () => {
+    // A server older than @service sent the service as a top-level `service.name`. The client is
+    // built into the wwwroot of the server it ships with, so it never meets one: no header field.
+    const view = buildClefView({ ...base, 'service.name': 'legacy' } as EventDto);
+    expect('@service' in view).toBe(false);
     expect('service.name' in view).toBe(false);
   });
 });

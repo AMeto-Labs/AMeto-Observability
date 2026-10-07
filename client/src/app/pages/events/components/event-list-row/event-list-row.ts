@@ -6,7 +6,7 @@ import { DatePipe } from '@angular/common';
 import { DomSanitizer } from '@angular/platform-browser';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto, eventService } from '../../../../core/models/event.model';
+import { EventDto } from '../../../../core/models/event.model';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
 
@@ -96,7 +96,7 @@ export class EventListRowComponent {
   readonly levelShort = computed(() =>
     LEVEL_SHORT[this.levelKey()] ?? this.levelKey().slice(0, 3).toUpperCase());
 
-  readonly service = computed(() => eventService(this.event()) ?? '');
+  readonly service = computed(() => this.event()['@service'] ?? '');
 
   readonly renderedHtml = computed(() =>
     this.sanitizer.bypassSecurityTrustHtml(
