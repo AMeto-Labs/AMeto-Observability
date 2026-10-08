@@ -227,7 +227,11 @@ if (enableAlerts)
             path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
                 "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
                 path)));
-    builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
+    // Read beside Ameto:Alerts:Enabled, the one other alert setting: see AlertEvaluatorOptions.
+    builder.Services.AddAmetoAlerts(serverOptions.DataDirectory, new Ameto.Alerts.AlertEvaluatorOptions
+    {
+        EvaluateOnDegradedStore = builder.Configuration.GetValue("Ameto:Alerts:EvaluateOnDegradedStore", false),
+    });
 }
 
 // ── Kestrel ───────────────────────────────────────────────────────────────────

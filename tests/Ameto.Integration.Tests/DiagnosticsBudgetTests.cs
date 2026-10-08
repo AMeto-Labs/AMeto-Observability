@@ -55,6 +55,26 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
 
     private static long Long(JsonElement json, string name) => json.GetProperty(name).GetInt64();
 
+    /// <summary>
+    /// WHERE A STORE'S STATE SHOWS (#94): the HTTP APIs answer a degraded store like any other, so
+    /// diagnostics is where an operator reads it — "available" for each store once its startup scan
+    /// has ended clean. (A degraded one reads "degraded": MetricStoreUnavailableTests.)
+    /// </summary>
+    [Fact]
+    public async Task Diagnostics_reports_each_store_available_once_its_startup_scan_has_ended()
+    {
+        var wait = TimeSpan.FromSeconds(60);
+        await _factory.Services.GetRequiredService<Ameto.Storage.StorageEngine>().CatalogLoaded.WaitAsync(wait);
+        await _factory.Services.GetRequiredService<MetricStorageEngine>().ColdLoadCompleted.WaitAsync(wait);
+        await _factory.Services.GetRequiredService<Ameto.Tracing.Storage.TraceStorageEngine>().ColdLoadCompleted.WaitAsync(wait);
+
+        var json = await Diagnostics();
+
+        Assert.Equal("available", json.GetProperty("logsAvailability").GetString());
+        Assert.Equal("available", json.GetProperty("metricsAvailability").GetString());
+        Assert.Equal("available", json.GetProperty("tracesAvailability").GetString());
+    }
+
     [Fact]
     public async Task Diagnostics_reports_the_effective_metric_and_trace_budgets()
     {

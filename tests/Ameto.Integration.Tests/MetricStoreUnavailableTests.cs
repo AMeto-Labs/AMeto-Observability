@@ -157,6 +157,121 @@ public sealed class MetricStoreUnavailableTests
         }
     }
 
+    /// <summary>
+    /// THE RESTART WHOSE COLD SCAN FAILS (#94). The rule was Firing at 120; the restarted engine's
+    /// scan fails as a whole, so its queries answer from an empty hot tier until the NEXT restart — a
+    /// load that ended short, not one still running. That ended Loading in Available, and the first
+    /// tick read 0: the "&gt;" rule resolved with an Ok and the "&lt;" rule fired. The store is
+    /// Degraded instead, and both rules are left as they were, tick after tick.
+    /// </summary>
+    [Fact]
+    public async Task A_restart_whose_cold_scan_fails_leaves_the_metric_rules_alone()
+    {
+        using var dir = new TempDir();
+        string metrics = Path.Combine(dir.Path, "metrics"), alerts = Path.Combine(dir.Path, "alerts");
+        Directory.CreateDirectory(alerts);
+
+        var before = new MetricStorageEngine(metrics, NullLogger<MetricStorageEngine>.Instance);
+        await before.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+        Ingest(before);
+        var first = NewEvaluator(alerts, before, out _, out var store);
+        store.Upsert(Rule("above", AlertComparator.GreaterThan, Peak - 1));
+        store.Upsert(Rule("below", AlertComparator.LessThan, 5));
+        await first.EvaluateOnceAsync();
+        Assert.Equal(AlertState.Firing, StateOf(first, "above"));
+        Assert.Equal(AlertState.Ok,     StateOf(first, "below"));
+        await first.DisposeAsync();
+        await before.DisposeAsync();   // the final flush: every point is now cold
+
+        MetricStorageEngine.FailColdScanForTest.Value = new IOException("the data directory cannot be listed");
+        MetricStorageEngine after;
+        try { after = new MetricStorageEngine(metrics, NullLogger<MetricStorageEngine>.Instance); }
+        finally { MetricStorageEngine.FailColdScanForTest.Value = null; }
+
+        var evaluator = NewEvaluator(alerts, after, out var dispatched, out _);
+        try
+        {
+            await after.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+            Assert.Equal(QueryAvailability.Degraded, after.Availability);
+            Assert.Equal(QueryAvailability.Degraded, new MetricAggregator(after).Availability);
+            Assert.Empty(await new MetricAggregator(after).QueryAsync(Request()));   // the part a degraded store gives
+
+            await evaluator.EvaluateOnceAsync();
+            await evaluator.EvaluateOnceAsync();
+
+            Assert.Equal(AlertState.Firing, StateOf(evaluator, "above"));
+            Assert.Equal(AlertState.Ok,     StateOf(evaluator, "below"));
+            Assert.Empty(dispatched);
+            Assert.DoesNotContain(evaluator.GetHistory(), h => h.State == AlertState.Ok);
+        }
+        finally
+        {
+            await evaluator.DisposeAsync();
+            await after.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A DEGRADED METRIC STORE OVER HTTP (#94). Its queries answer 200 with what it holds — a part
+    /// is not an empty, and a 503 would hide the points the store does have until a restart — while
+    /// the preview of a rule over it answers as the evaluator would act: 503 with its own sentence and
+    /// no Retry-After (a restart ends it, not a wait), or, with
+    /// <c>Ameto:Alerts:EvaluateOnDegradedStore: true</c> in the host's configuration, the value.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_degraded_metric_store_answers_queries_and_previews_as_the_setting_says(bool evaluateOnDegraded)
+    {
+        using var factory = new EvaluateOnDegradedFactory(evaluateOnDegraded);
+        HttpClient client;
+        MetricStorageEngine.FailColdScanForTest.Value = new IOException("the data directory cannot be listed");
+        try { client = factory.CreateClient(); }
+        finally { MetricStorageEngine.FailColdScanForTest.Value = null; }
+
+        var engine = factory.Services.GetRequiredService<MetricStorageEngine>();
+        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(QueryAvailability.Degraded, engine.Availability);
+        Ingest(engine);   // the hot tier: what a degraded store does hold
+
+        using var series = await client.GetAsync($"/api/metrics/{Metric}");
+        string seriesBody = await series.Content.ReadAsStringAsync();
+        Assert.True(series.StatusCode == HttpStatusCode.OK, $"{(int)series.StatusCode} — {seriesBody}");
+        Assert.Contains(Metric, seriesBody);
+
+        using var preview = await client.PostAsJsonAsync("/api/alerts/preview", new
+        {
+            name = "preview", source = "Metric", metric = Metric, aggregation = "max",
+            comparator = "GreaterThan", threshold = 1, windowSeconds = 3600,
+        });
+        string body = await preview.Content.ReadAsStringAsync();
+        if (evaluateOnDegraded)
+        {
+            Assert.True(preview.StatusCode == HttpStatusCode.OK, $"{(int)preview.StatusCode} — {body}");
+            Assert.Contains("\"wouldFire\":true", body);
+        }
+        else
+        {
+            Assert.True(preview.StatusCode == HttpStatusCode.ServiceUnavailable, $"{(int)preview.StatusCode} — {body}");
+            Assert.Contains("could not load all of its data", body);
+            Assert.Null(preview.Headers.RetryAfter);   // Degraded ends with a restart: nothing to retry
+        }
+
+        // Where the state shows, since the queries answer normally.
+        var diagnostics = await client.GetFromJsonAsync<System.Text.Json.JsonElement>("/api/diagnostics");
+        Assert.Equal("degraded", diagnostics.GetProperty("metricsAvailability").GetString());
+    }
+
+    /// <summary>The host with <c>Ameto:Alerts:EvaluateOnDegradedStore</c> set as given — read by Program.cs, as in production.</summary>
+    private sealed class EvaluateOnDegradedFactory(bool evaluateOnDegraded) : AmetoWebAppFactory
+    {
+        protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.UseSetting("Ameto:Alerts:EvaluateOnDegradedStore", evaluateOnDegraded ? "true" : "false");
+        }
+    }
+
     private static AlertEvaluator NewEvaluator(
         string alerts, MetricStorageEngine engine,
         out ConcurrentQueue<AlertFiredEvent> dispatched, out AlertRuleStore store)

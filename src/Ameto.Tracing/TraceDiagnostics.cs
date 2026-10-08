@@ -26,6 +26,9 @@ public sealed partial class TraceDiagnostics
         _ring   = ring;
     }
 
+    /// <summary>Whether the trace store's reads are whole right now (#94) — two or three volatile reads.</summary>
+    public QueryAvailability Availability => _engine.Availability;
+
     /// <summary>Bytes the hot tier may hold before a flush is forced (<c>Traces:HotTierMaxBytes</c>, effective).</summary>
     public long HotTierBudgetBytes => _engine.HotTierBudgetBytes;
 

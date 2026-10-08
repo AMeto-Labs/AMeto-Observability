@@ -20,7 +20,9 @@ namespace Ameto.Server;
 /// <para><b>Only CLOSED is refused, not LOADING:</b> before the catalog scan has ended a search
 /// sees the hot tier and the segments registered so far, which is how the engine has always
 /// served its first seconds. The alert evaluator, which acts on a count, skips a loading store
-/// itself.</para>
+/// itself. Nor DEGRADED (#94), a store whose catalog scan failed: it answers from what it has, a
+/// part rather than an empty; <c>GET /api/diagnostics</c> names the state, and the evaluator skips
+/// it as well.</para>
 /// </summary>
 internal static class LogStoreGate
 {

@@ -1,8 +1,9 @@
 import { TestBed } from '@angular/core/testing';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { of } from 'rxjs';
+import { vi } from 'vitest';
 import {
-  CUT_NOTE, FlamegraphComponent, FlamegraphNode, layoutFlamegraph, subtreeIds,
+  CUT_NOTE, FlamegraphComponent, FlamegraphNode, layoutFlamegraph, subtreeNodes,
 } from './flame-graph';
 import { ApiService } from '../../../core/services/api.service';
 
@@ -34,11 +35,11 @@ function recursiveLayout(r: FlamegraphNode): FlamegraphNode[] {
   return out;
 }
 
-function recursiveIds(f: FlamegraphNode): Set<string> {
-  const ids = new Set<string>();
-  const collect = (n: FlamegraphNode) => { ids.add(n.spanId); n.children.forEach(collect); };
+function recursiveNodes(f: FlamegraphNode): Set<FlamegraphNode> {
+  const nodes = new Set<FlamegraphNode>();
+  const collect = (n: FlamegraphNode) => { nodes.add(n); n.children.forEach(collect); };
   collect(f);
-  return ids;
+  return nodes;
 }
 
 // ── Trees ──
@@ -114,11 +115,15 @@ describe('flame graph layout', () => {
     }
   });
 
-  it('collects the subtree the recursive collect did', () => {
+  it('collects the subtree the recursive collect did — the same node objects', () => {
     const tree = randomTree(9, 2_000);
     const flat = layoutFlamegraph(tree);
-    for (const f of [tree, flat[1], flat[500], flat[flat.length - 1]])
-      expect([...subtreeIds(f)].sort()).toEqual([...recursiveIds(f)].sort());
+    for (const f of [tree, flat[1], flat[500], flat[flat.length - 1]]) {
+      const mine = subtreeNodes(f);
+      const theirs = recursiveNodes(f);
+      expect(mine.size).toBe(theirs.size);
+      expect([...mine].every(n => theirs.has(n))).toBe(true);
+    }
   });
 
   it('lays out a chain far deeper than an engine stack, where the recursive walk overflows', () => {
@@ -132,27 +137,27 @@ describe('flame graph layout', () => {
     expect(flat.length).toBe(levels);
     expect(flat[levels - 1]._depth).toBe(levels - 1);
     expect(flat[levels - 1]._w).toBe(1);
-    expect(subtreeIds(bottom).size).toBe(levels);
+    expect(subtreeNodes(bottom).size).toBe(levels);
   });
 });
 
-describe('flame graph cut node', () => {
-  async function render(tree: FlamegraphNode) {
-    TestBed.configureTestingModule({
-      imports: [FlamegraphComponent],
-      providers: [
-        { provide: ApiService, useValue: { getFlamegraph: () => of(tree) } },
-        { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider(icons) },
-      ],
-    });
-    const fixture = TestBed.createComponent(FlamegraphComponent);
-    fixture.componentRef.setInput('traceId', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-    fixture.detectChanges();
-    await fixture.whenStable();
-    fixture.detectChanges();
-    return fixture;
-  }
+async function render(tree: FlamegraphNode) {
+  TestBed.configureTestingModule({
+    imports: [FlamegraphComponent],
+    providers: [
+      { provide: ApiService, useValue: { getFlamegraph: () => of(tree) } },
+      { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider(icons) },
+    ],
+  });
+  const fixture = TestBed.createComponent(FlamegraphComponent);
+  fixture.componentRef.setInput('traceId', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  fixture.detectChanges();
+  await fixture.whenStable();
+  fixture.detectChanges();
+  return fixture;
+}
 
+describe('flame graph cut node', () => {
   it('is marked: its bar, its title, the hover tooltip, a toolbar note and the legend — and nothing else is', async () => {
     const cut  = node(6, [], { name: 'deepest-sent', truncated: true });
     const tree = node(10, [node(7, [cut]), node(2)]);
@@ -204,5 +209,218 @@ describe('flame graph cut node', () => {
     expect(el.querySelector('.fg-bar--cut')).toBeNull();
     expect(el.querySelector('.fg-cut-note')).toBeNull();
     expect(el.querySelector('.fg-legend')?.textContent).not.toContain('Cut');
+  });
+});
+
+/**
+ * A ZOOM INSIDE A ZOOMED VIEW (#94, from the #106 review). The zoomed view drew re-scaled COPIES
+ * of the focused subtree's nodes, and a click on a bar focused whatever object the bar was drawn
+ * from — inside a zoom, a copy, whose x, width and depth were already relative to the first zoom.
+ * Applied to the full layout, they put the second zoom's bars at the wrong offset, or off the
+ * canvas.
+ */
+describe('flame graph zoom', () => {
+  /**
+   *   root 16 ┬ e 8
+   *           └ a 8 ┬ d 4
+   *                 └ b 4 ┬ c 2
+   *                       └ f 1
+   *
+   * Durations in powers of two, so every fraction of the layout is exact. `cut` names the nodes
+   * the server marked `truncated` (all of them leaves, as a cut node is sent).
+   */
+  function zoomTree(cut: readonly string[] = []): FlamegraphNode {
+    const n = (name: string, totalMs: number, children: FlamegraphNode[] = []) =>
+      node(totalMs, children, cut.includes(name) ? { name, truncated: true } : { name });
+    return n('root', 16, [n('e', 8), n('a', 8, [n('d', 4), n('b', 4, [n('c', 2), n('f', 1)])])]);
+  }
+
+  /** The bar drawn for the node named `name`: its title starts with the name. */
+  const bar = (el: HTMLElement, name: string) =>
+    Array.from(el.querySelectorAll<HTMLElement>('.fg-bar'))
+      .find(b => b.title.startsWith(name + ' '))!;
+
+  /** Every bar drawn, by node name: [left %, width %, top px]. */
+  function geometry(el: HTMLElement): Record<string, [number, number, number]> {
+    const out: Record<string, [number, number, number]> = {};
+    for (const b of Array.from(el.querySelectorAll<HTMLElement>('.fg-bar'))) {
+      const name = b.title.split(' ')[0];
+      out[name] = [parseFloat(b.style.left), parseFloat(b.style.width), parseFloat(b.style.top)];
+    }
+    return out;
+  }
+
+  const WHOLE = {
+    root: [0, 100, 0], e: [0, 50, 24], a: [50, 50, 24], d: [50, 25, 48], b: [75, 25, 48],
+    c: [75, 12.5, 72], f: [87.5, 6.25, 72],
+  };
+
+  it('zooms into the node clicked inside a zoomed view: full width on the top row, its subtree at its own offsets', async () => {
+    const fixture = await render(zoomTree());
+    const el: HTMLElement = fixture.nativeElement;
+    expect(geometry(el)).toEqual(WHOLE);
+
+    bar(el, 'a').click();
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual({
+      a: [0, 100, 0], d: [0, 50, 24], b: [50, 50, 24], c: [50, 25, 48], f: [75, 12.5, 48],
+    });
+
+    bar(el, 'b').click();         // a bar of the zoomed view
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual({ b: [0, 100, 0], c: [0, 50, 24], f: [50, 25, 24] });
+    expect(el.querySelector<HTMLElement>('.fg-bar--focused')?.title).toMatch(/^b /);
+
+    bar(el, 'f').click();         // and once more
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual({ f: [0, 100, 0] });
+  });
+
+  it('shows the whole tree again on a second click on the focused bar, or on Reset zoom — from a zoom inside a zoom too', async () => {
+    const fixture = await render(zoomTree());
+    const el: HTMLElement = fixture.nativeElement;
+    const zoomAThenB = () => {
+      bar(el, 'a').click();
+      fixture.detectChanges();
+      bar(el, 'b').click();
+      fixture.detectChanges();
+      expect(Object.keys(geometry(el))).toEqual(['b', 'c', 'f']);
+    };
+
+    zoomAThenB();
+    bar(el, 'b').click();         // the focused bar again
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(WHOLE);
+    expect(el.querySelector('.fg-btn')).toBeNull();
+
+    zoomAThenB();
+    (el.querySelector('.fg-btn') as HTMLElement).click();   // Reset zoom
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(WHOLE);
+    expect(el.querySelector('.fg-bar--focused')).toBeNull();
+  });
+
+  it('after a zoom inside a zoom, the tooltip and the cut note are about the bars in view', async () => {
+    const fixture = await render(zoomTree(['e', 'd', 'f']));
+    const el: HTMLElement = fixture.nativeElement;
+    const note = () => el.querySelector('.fg-cut-note')?.textContent ?? '';
+    expect(note()).toContain('3 branches cut');
+
+    bar(el, 'a').click();
+    fixture.detectChanges();
+    expect(note()).toContain('2 branches cut');   // d and f; e is outside a
+
+    bar(el, 'b').click();
+    fixture.detectChanges();
+    expect(note()).toContain('1 branch cut');     // f alone
+
+    bar(el, 'f').dispatchEvent(new MouseEvent('mouseenter'));
+    fixture.detectChanges();
+    expect(el.querySelector('.fg-tooltip strong')?.textContent).toBe('f');
+    expect(el.querySelector('.fg-tt-dur')?.textContent).toContain('1.00ms total');
+    expect(el.querySelector('.fg-tt-cut')?.textContent).toContain(CUT_NOTE);
+
+    bar(el, 'c').dispatchEvent(new MouseEvent('mouseenter'));
+    fixture.detectChanges();
+    expect(el.querySelector('.fg-tooltip strong')?.textContent).toBe('c');
+    expect(el.querySelector('.fg-tt-cut')).toBeNull();
+  });
+
+  it('does not zoom into a bar of zero width: a span the server rounded to 0 ms has nothing to stretch', async () => {
+    const tree = node(16, [node(0, [], { name: 'z' }), node(16, [], { name: 'a' })], { name: 'root' });
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    const whole = geometry(el);
+    expect(whole['z']).toEqual([0, 0.05, 24]);    // drawn as the minimum sliver, so it can be clicked
+
+    bar(el, 'z').click();
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(whole);
+    expect(el.querySelector('.fg-btn')).toBeNull();
+  });
+
+  it('does not zoom into a bar of infinite width: a child longer than a 0 ms root (#118 review N1)', async () => {
+    // The root is laid out at width 1 whatever its duration, so its child gets 1 × 5 / 0 = ∞.
+    const tree = node(0, [node(5, [node(2, [], { name: 'g' })], { name: 'c' })], { name: 'root' });
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    const whole = geometry(el);
+
+    bar(el, 'c').click();
+    fixture.detectChanges();
+    expect(geometry(el)).toEqual(whole);
+    expect(el.querySelector('.fg-btn')).toBeNull();
+  });
+
+  it('zooms by the node itself: an id-less span elsewhere in the trace stays out (#118 ultrareview)', async () => {
+    // The empty span id repeats — the server dedupes only non-empty ids — so x and y share one.
+    const idless = { spanId: '0000000000000000' };
+    const tree = node(16, [
+      node(8, [node(4, [], { ...idless, name: 'x' })], { name: 'a' }),
+      node(8, [node(4, [], { ...idless, name: 'y' })], { name: 'b' }),
+    ], { name: 'root' });
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      const fixture = await render(tree);
+      const el: HTMLElement = fixture.nativeElement;
+      const drawn = () => Object.keys(geometry(el));
+      const focusedBars = () =>
+        Array.from(el.querySelectorAll<HTMLElement>('.fg-bar--focused')).map(b => b.title.split(' ')[0]);
+
+      bar(el, 'a').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['a', 'x']);
+
+      bar(el, 'x').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['x']);
+      expect(focusedBars()).toEqual(['x']);
+
+      bar(el, 'x').click();         // the focused bar again: back to the whole tree
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['root', 'a', 'x', 'b', 'y']);
+      expect(focusedBars()).toEqual([]);
+
+      bar(el, 'y').click();
+      fixture.detectChanges();
+      expect(drawn()).toEqual(['y']);
+      expect(focusedBars()).toEqual(['y']);
+
+      // Two bars with one track key make Angular warn (NG0955) and mis-pair their elements.
+      expect(warn.mock.calls.filter(c => String(c[0]).includes('NG0955'))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('draws, after any chain of zooms, the clicked node\'s subtree as that subtree\'s own flame graph', async () => {
+    const tree = randomTree(11, 400);
+    const flat = layoutFlamegraph(tree);
+    for (const n of flat) n.name = n.spanId;      // bars are found by name; these ids are unique
+
+    // The path from the root to the deepest node: one click per level, each inside the last zoom.
+    const parentOf = new Map<FlamegraphNode, FlamegraphNode>();
+    for (const n of flat) for (const c of n.children) parentOf.set(c, n);
+    let deepest = tree;
+    for (const n of flat) if (n._depth! > deepest._depth!) deepest = n;
+    const path: FlamegraphNode[] = [];
+    for (let n = deepest; n !== tree; n = parentOf.get(n)!) path.unshift(n);
+    expect(path.length).toBeGreaterThan(4);
+
+    const fixture = await render(tree);
+    const el: HTMLElement = fixture.nativeElement;
+    for (const focus of path) {
+      bar(el, focus.name).click();
+      fixture.detectChanges();
+      const own = layoutFlamegraph(cloneTree(focus));   // the subtree laid out as a tree of its own
+      const drawn = geometry(el);
+      expect(Object.keys(drawn).sort()).toEqual(own.map(n => n.name).sort());
+      for (const n of own) {
+        const [left, width, top] = drawn[n.name];
+        expect(left).toBeCloseTo(n._x! * 100, 4);
+        expect(width).toBeCloseTo(Math.max(0.05, n._w! * 100), 4);
+        expect(top).toBe(n._depth! * 24);
+      }
+    }
   });
 });

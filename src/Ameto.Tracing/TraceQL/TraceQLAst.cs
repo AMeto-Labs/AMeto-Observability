@@ -156,6 +156,13 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// </summary>
     private readonly byte[] _keyUtf8 = System.Text.Encoding.UTF8.GetBytes(key);
 
+    /// <summary>
+    /// The bytes <see cref="Evaluate"/> looks the key up by — and the ones
+    /// <see cref="SpanPredicateEvaluator"/> hands its shared walk, so that walk compares exactly
+    /// what this predicate's own walk compares.
+    /// </summary>
+    internal byte[] KeyUtf8 => _keyUtf8;
+
     public override bool? Evaluate(SpanRecord s)
     {
         // THE BLOB IS SCANNED, NOT DECODED. A predicate reads ONE key; building the whole
@@ -498,6 +505,9 @@ public sealed class AttributePresencePredicate(string key, bool present) : SpanP
     public readonly bool   Present = present;
 
     private readonly byte[] _keyUtf8 = System.Text.Encoding.UTF8.GetBytes(key);
+
+    /// <summary>The bytes <see cref="Evaluate"/> looks the key up by; see <see cref="AttributePredicate.KeyUtf8"/>.</summary>
+    internal byte[] KeyUtf8 => _keyUtf8;
 
     /// <summary>
     /// PRESENT MEANS "PRESENT WITH A VALUE THE DICTIONARY PATH WOULD HAVE HELD", which is why an

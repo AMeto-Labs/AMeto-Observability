@@ -120,8 +120,10 @@ public sealed class EventsSearchStreamingTests : IClassFixture<EventsSearchStrea
     [Fact]
     public async Task A_sparse_search_shows_each_row_before_the_scans_next_wait_ends()
     {
+        // The token is the search's alone: it starts once the host has answered a request, so the
+        // class's host start and its first request do not spend it (#115).
+        using var client   = await _factory.CreateReadyClientAsync();
         using var cts      = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        using var client   = _factory.CreateClient();
         using var request  = new HttpRequestMessage(HttpMethod.Get, $"/api/events?count={ProbeCount}");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
 

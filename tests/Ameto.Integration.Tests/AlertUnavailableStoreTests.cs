@@ -194,6 +194,145 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
         Assert.Empty(_dispatched);
     }
 
+    // ── The degraded store ────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A DEGRADED STORE IS A PART THAT WILL NOT GROW (#94): its startup scan ended without reaching
+    /// everything on disk — here, none of the 20 spans. Read as a value, that part resolves the
+    /// Firing "&gt;" rule and fires the "&lt;" one, over two ticks or two hundred: nothing loads the
+    /// rest before a restart. Both rules are left exactly as they were, and the store is not read.
+    /// </summary>
+    [Fact]
+    public async Task A_degraded_store_neither_resolves_a_firing_rule_nor_fires_a_less_than_rule()
+    {
+        var above = TraceRule(AlertComparator.GreaterThan, Spans - 1, "above");
+        var below = TraceRule(AlertComparator.LessThan, 5, "below");
+        await _evaluator.EvaluateOnceAsync();
+        Assert.Equal(AlertState.Firing, StateOf(above).State);
+        Assert.Equal(AlertState.Ok,     StateOf(below).State);
+        Assert.Single(_dispatched);
+        int reads = _traces.Reads;
+
+        _traces.Availability = QueryAvailability.Degraded;
+        await _evaluator.EvaluateOnceAsync();
+        await _evaluator.EvaluateOnceAsync();
+
+        AssertUntouched(above, AlertState.Firing, Spans);
+        AssertUntouched(below, AlertState.Ok, Spans);
+        Assert.Single(_dispatched);              // the firing notification, and nothing after it
+        Assert.Equal(reads, _traces.Reads);      // asked before the read: a degraded store is not even read
+    }
+
+    /// <summary>
+    /// DEGRADED IS ITS OWN LINE. A store whose load ENDS degraded, inside the minute of its Loading
+    /// line, is reported Degraded at once — in the Loading slot it would wait out that minute and
+    /// then be called "Loading", which says "wait" about a store that will not finish before a
+    /// restart. The line says so, names the setting that evaluates anyway, and is said again a
+    /// minute later with the skips held back in between.
+    /// </summary>
+    [Fact]
+    public async Task A_store_whose_load_ends_degraded_is_reported_degraded_at_once_and_once_a_minute()
+    {
+        TraceRule(AlertComparator.GreaterThan, 1);
+
+        _traces.Availability = QueryAvailability.Loading;
+        await _evaluator.EvaluateOnceAsync();
+        _traces.Availability = QueryAvailability.Degraded;
+        await _evaluator.EvaluateOnceAsync();
+        await _evaluator.EvaluateOnceAsync();   // held: the Degraded slot was said a tick ago
+
+        Assert.Single(_log.Lines, l => l.Message.Contains("Trace store is Loading"));
+        var line = Assert.Single(_log.Lines, l => l.Message.Contains("Trace store is Degraded"));
+        Assert.Equal(LogLevel.Warning, line.Level);
+        Assert.Contains("until a restart", line.Message);
+        Assert.Contains("Ameto:Alerts:EvaluateOnDegradedStore", line.Message);
+        Assert.Contains("— 1 rule evaluation(s) skipped", line.Message);
+
+        _clock.Advance(TimeSpan.FromMinutes(1));
+        await _evaluator.EvaluateOnceAsync();
+
+        var lines = _log.Lines.Where(l => l.Message.Contains("Trace store is Degraded")).ToList();
+        Assert.Equal(2, lines.Count);
+        Assert.Contains("— 2 rule evaluation(s) skipped", lines[1].Message);   // the held tick and this one
+    }
+
+    /// <summary>The editor's preview over a degraded store is "cannot say", not the part it would read.</summary>
+    [Fact]
+    public async Task The_preview_of_a_rule_over_a_degraded_store_is_unavailable_not_its_partial_value()
+    {
+        var rule = TraceRule(AlertComparator.LessThan, 5);
+        _traces.Availability = QueryAvailability.Degraded;
+
+        var value = await _evaluator.PreviewAsync(rule);
+
+        Assert.False(value.IsAvailable);
+        Assert.Equal(QueryAvailability.Degraded, value.Availability);
+        Assert.True(double.IsNaN(value.Value));
+    }
+
+    /// <summary>
+    /// <c>Ameto:Alerts:EvaluateOnDegradedStore</c>: the operator has chosen rules over the partial
+    /// data to rules that wait for a restart, and gets exactly that — the Firing "&gt;" rule reads the
+    /// degraded store's 0 and resolves, the preview answers the same 0, and no "not evaluated" line
+    /// is written. A store still LOADING is skipped all the same: that wait ends by itself.
+    /// </summary>
+    [Fact]
+    public async Task EvaluateOnDegradedStore_evaluates_rules_over_a_degraded_store_and_still_skips_a_loading_one()
+    {
+        string dir = Path.Combine(_dir, "evaluate-on-degraded");
+        Directory.CreateDirectory(dir);
+        var store = new AlertRuleStore(dir, new NoopProtector(), NullLogger<AlertRuleStore>.Instance);
+        var log   = new CapturingLogger();
+        var sent  = new ConcurrentQueue<AlertFiredEvent>();
+        AlertEvaluator evaluator;
+        AlertEvaluator.NoTimedLoopForTest.Value = true;
+        try
+        {
+            evaluator = new AlertEvaluator(
+                store,
+                new AlertDispatcher(NullLogger<AlertDispatcher>.Instance),
+                new AlertPersistence(dir, NullLogger<AlertPersistence>.Instance),
+                AlertHeaderCountTests.ThrowingProxy.For<IQueryExecutor>(),
+                null!,
+                _metrics,
+                _traces,
+                log,
+                _clock,
+                new AlertEvaluatorOptions { EvaluateOnDegradedStore = true });
+        }
+        finally { AlertEvaluator.NoTimedLoopForTest.Value = false; }
+        evaluator._onDispatchForTest = sent.Enqueue;
+
+        await using (evaluator)
+        {
+            var rule = new AlertRule
+            {
+                Id = "above", Name = "above", Source = AlertSource.Trace, Service = "checkout",
+                TraceMetric = TraceMetricKind.SpanCount, Comparator = AlertComparator.GreaterThan,
+                Threshold = Spans - 1, Window = TimeSpan.FromHours(1), For = TimeSpan.Zero, Cooldown = TimeSpan.Zero,
+            };
+            store.Upsert(rule);
+            await evaluator.EvaluateOnceAsync();
+            Assert.Equal(AlertState.Firing, evaluator.GetStates().Single().State);
+
+            _traces.Availability = QueryAvailability.Loading;
+            await evaluator.EvaluateOnceAsync();
+            Assert.Equal(AlertState.Firing, evaluator.GetStates().Single().State);   // Loading: skipped as ever
+
+            _traces.Availability = QueryAvailability.Degraded;
+            var preview = await evaluator.PreviewAsync(rule);
+            Assert.True(preview.IsAvailable);
+            Assert.Equal(0, preview.Value);
+
+            await evaluator.EvaluateOnceAsync();
+            var st = evaluator.GetStates().Single();
+            Assert.Equal(AlertState.Ok, st.State);   // resolved on the partial answer, as asked
+            Assert.Equal(0, st.LastValue);
+            Assert.Equal([AlertState.Firing, AlertState.Ok], sent.Select(e => e.State));
+            Assert.DoesNotContain(log.Lines, l => l.Message.Contains("store is Degraded"));
+        }
+    }
+
     // ── What the operator sees ────────────────────────────────────────────────────────────────
 
     /// <summary>

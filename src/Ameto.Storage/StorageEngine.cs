@@ -487,6 +487,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private const int MergeDeferEscalationPasses = 3;
 
     /// <summary>
+    /// Merge outputs, by path, whose manifest is kept because a source it lists may still be on
+    /// disk — held by a query's pin, a scanner, a volume that refuses. <see cref="SelectMergeBatch"/>
+    /// does not merge one of them again until its manifest is gone.
+    ///
+    /// <para>Recovery decides a manifest on its output alone, and an output that is gone reads as
+    /// a merge that never committed (<see cref="RecoverInterruptedMerges"/>). Merged a second time
+    /// while a source of its own was still held, the output left before that source did: the next
+    /// sweep dropped the manifest, the held source sat on disk with nothing naming it, and the next
+    /// start served it beside the new output — 540 events for 480. Two manifests surviving to one
+    /// start, the second listing the first one's output, came to the same end in either order the
+    /// directory listed them. An output with a live manifest is never a source, so no manifest
+    /// lists another's output.</para>
+    ///
+    /// <para>Added when a merge keeps its manifest and when a sweep meets a committed one; removed
+    /// when either drops it, so one a sweep could not read stays in. The catalog scan's sweep fills
+    /// it before the merge gate opens, so a restart forgets nothing. Concurrent only because a scan
+    /// a test runs by hand sweeps outside the gate; every other writer and the planner hold it.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _outputsWithKeptManifest = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
     /// can be written as one segment PER LEVEL and the level's id is always
     /// <c>firstId + (byte)level</c>.
@@ -550,17 +571,36 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// state too; the segments it could not reach are missing either way, and holding "loading"
     /// for ever would stop every log alert from ever being evaluated.</para>
     ///
+    /// <para><see cref="QueryAvailability.Degraded"/> instead of Available after such a scan (#94):
+    /// the task that did not complete successfully IS the record that the catalog is short, and it
+    /// is final — nothing scans again before a restart. Degraded as well after a scan that left a
+    /// segment unread for a reason that is not its bytes (<see cref="_catalogScanShort"/>). A segment
+    /// set aside FOR its bytes (<c>.seg.corrupt</c>), or kept unread because a newer build wrote it,
+    /// does not make the store degraded: that is what the disk holds for this build, not a load left
+    /// unfinished.</para>
+    ///
     /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
     /// step of the teardown after its final flush. Conservative by a few steps — reads stay whole
     /// until <see cref="_snapshotsClosed"/>, after which <see cref="SnapshotTiers"/> THROWS rather
     /// than answering — but past it nothing a caller acts on is worth reading.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// <para>Four volatile reads at most (the task's state is two), no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
         Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
       : !_catalogLoad.IsCompleted             ? QueryAvailability.Loading
+      : !_catalogLoad.IsCompletedSuccessfully
+        || Volatile.Read(ref _catalogScanShort) != 0 ? QueryAvailability.Degraded
       :                                         QueryAvailability.Available;
+
+    /// <summary>
+    /// 1 once the boot catalog scan has left a segment on disk unregistered for a reason that is not
+    /// its bytes — held open by another process, on a share that dropped, a process out of handles —
+    /// after its retries (#108's rule, here per the #119 review). Written by the scan, so before its
+    /// task completes (a release the <c>IsCompleted</c> read above acquires), and never cleared: the
+    /// next start reads the file. See <see cref="LoadSegmentCatalogCore"/>.
+    /// </summary>
+    private int _catalogScanShort;
 
     /// <summary>
     /// Test seam: an engine constructed while this holds a task starts its catalog scan only once
@@ -622,7 +662,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// inside an import's publish-to-rename window would otherwise orphan the file the rename
     /// lands — by the parked-delete retry (<see cref="TryCompletePendingSegmentDelete"/>), by a
     /// merge's commit for its swap (<see cref="CommitMerge"/>) and, one source file at a time, by
-    /// the unlinks after it (<see cref="SettleMergedSources"/>, through the retry); and emptied
+    /// the unlinks after it (<see cref="SettleMergedSources"/>, through the retry), by merge
+    /// recovery the same way for a crashed merge's sources (<see cref="RecoverInterruptedMerges"/>,
+    /// the catalog scan's own sweep included, before it lists the directory); and emptied
     /// by the header scan's missing-file fallback (<see cref="OpenForHeaderScan"/>) to wait out
     /// an import's rename. It still excludes none of the other writers into the catalog: flush
     /// publication holds <c>_frozenLock</c>, WAL recovery holds nothing, and the boot scan runs
@@ -638,7 +680,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// floor is raised before an import enters, so <c>_segIdLock</c> is never taken under it.
     /// Each hold is short: an import's is a dictionary exchange and a rename (the segment's
     /// contents were read before it); a delete's, a removal and one unlink; a merge commit's, one
-    /// swap and a park per source, with no unlink at all.</para>
+    /// swap and a park per source, with no unlink at all; merge recovery's, a lookup and a park
+    /// per source, and the removal of an entry a scan registered by mistake.</para>
     /// </summary>
     private readonly System.Threading.Lock                _importLock = new();
 
@@ -1743,11 +1786,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // is the caller that can land there (an imported segment may already be past its TTL).
         // A merge's commit takes the same two locks for its sources (see CommitMerge).
         //
-        // And under _scanDeleteGate, the one lock the boot catalog scan takes (it must never
-        // take _importLock -- see LoadSegmentCatalog). Removing the entry, recording the path for
-        // a running scan, unlinking the file and parking a failed unlink are then one step to the
-        // scan: it cannot register this path after the entry has gone but before the record or
-        // the park that tells it to leave the path alone.
+        // And under _scanDeleteGate, the one lock the boot catalog scan registers under (that must
+        // never wait for _importLock -- see LoadSegmentCatalog). Removing the entry, recording the
+        // path for a running scan, unlinking the file and parking a failed unlink are then one step
+        // to the scan: it cannot register this path after the entry has gone but before the record
+        // or the park that tells it to leave the path alone.
         lock (_importLock)
         lock (_scanDeleteGate)
         {
@@ -1845,7 +1888,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// only under <c>_importLock</c>, so the cap check and the add are one step. A merge's commit
     /// adds its sources past the cap on purpose, as a guard for the catalog scan until their
     /// unlinks, and holds what is left to the cap once those are tried
-    /// (<see cref="SettleMergedSources"/>).</para>
+    /// (<see cref="SettleMergedSources"/>); merge recovery does the same with a crashed merge's
+    /// (<see cref="RecoverInterruptedMerges"/>).</para>
     /// </summary>
     private readonly ConcurrentDictionary<string, PendingSegmentDelete> _pendingSegmentDeletes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1865,15 +1909,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     /// <summary>
     /// Serialises the boot catalog scan's check-and-register with <see cref="DeleteSegmentAsync"/>'s
-    /// remove, record, unlink and park, and with a merge commit's swap, record and park
-    /// (<see cref="CommitMerge"/>), and guards <see cref="_deletedDuringCatalogScan"/> and
-    /// <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
+    /// remove, record, unlink and park, with a merge commit's swap, record and park
+    /// (<see cref="CommitMerge"/>) and with merge recovery's park
+    /// (<see cref="RecoverInterruptedMerges"/>), and guards <see cref="_deletedDuringCatalogScan"/>
+    /// and <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
     /// import holds that one across its publish and the scan must still be able to land inside
     /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
-    /// <c>_importLock</c> by the delete, the merge's commit and cap check, and the parked
-    /// retry's record; alone by the scan. Under it only the two leaves a merge's commit takes:
-    /// the catalog's build lock and <see cref="_mergedAwayGate"/> (see <c>_importLock</c> for the
-    /// whole order).
+    /// <c>_importLock</c> by the delete, the merge's commit and cap check, merge recovery's park
+    /// (the scan's own sweep's too, before its listing, holding nothing else) and the parked
+    /// retry's record; alone by the scan's registrations. Under it only the two leaves a merge's
+    /// commit takes: the catalog's build lock and <see cref="_mergedAwayGate"/> (see
+    /// <c>_importLock</c> for the whole order).
     /// </summary>
     private readonly System.Threading.Lock _scanDeleteGate = new();
 
@@ -1919,9 +1965,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     /// <summary>
     /// Test hook: called by <see cref="LoadSegmentCatalog"/> with a listed file's path just before
-    /// it opens the file: the window in which a delete can remove the file under the scan before
-    /// the scan has read it. It runs inside the scan's per-file try, so a throw from it is handled
-    /// as an unreadable file.
+    /// each attempt to open the file: the window in which a delete can remove the file under the
+    /// scan before the scan has read it. It runs inside the scan's open, so a throw from it is
+    /// handled as that attempt's failure — classified, and retried when it says nothing about the
+    /// bytes (see <see cref="ReadCatalogSegmentInfo"/>).
     /// </summary>
     internal Action<string>? _beforeScanOpensSegment;
 
@@ -2528,13 +2575,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    /// <summary>Removes level files of a reserved block that were moved into place by a flush attempt that failed before publishing.</summary>
-    private void DeleteUnpublishedLevelFiles(ulong firstSegId)
+    /// <summary>
+    /// Removes level files of a reserved block that were moved into place by a flush attempt that
+    /// failed before publishing. internal so a test can run it under the boot scan.
+    /// </summary>
+    internal void DeleteUnpublishedLevelFiles(ulong firstSegId)
     {
         for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
         {
             foreach (var f in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{firstSegId + s}-*.seg"))
             {
+                // Recorded for a running catalog scan before the unlink, as every other delete of a
+                // segment is (#119 review, note 1). This runs 15 s after a failed flush and a boot
+                // scan of a large catalog runs for minutes, so a level the failed attempt moved into
+                // place before the scan listed the directory met the scan's open as a file gone with
+                // no delete of ours: left unread, the store Degraded until a restart, over our own
+                // unlink. The record makes it the delete it is: skipped at Debug.
+                lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(f);
                 try { File.Delete(f); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete unpublished level file {File}", f); }
             }
@@ -2874,10 +2931,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // matters even though same-level implies same TTL: Information and Error share the
         // 90-day class, and merging them would hand the merged file back the mixed-level shape
         // whose retention the level-split flush exists to make exact.
-        var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
+        var  buckets  = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
+        bool anyKept  = !_outputsWithKeptManifest.IsEmpty;
+        bool anyWait  = !_undecidedMergeOutputs.IsEmpty;
         foreach (var s in _segments.Values)
         {
             if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
+            // Not while its manifest waits for a held source: see _outputsWithKeptManifest.
+            if (anyKept && _outputsWithKeptManifest.ContainsKey(s.FilePath)) continue;
+            // Nor inside the span of an output whose verdict waits: see _undecidedMergeOutputs.
+            if (anyWait && OverlapsUndecidedMergeOutput(s)) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
@@ -3437,8 +3500,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (allGone)
             try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
         else
+        {
+            // Out of the planner while the manifest waits, or a merge of this output would leave
+            // the manifest naming an output that is gone (see _outputsWithKeptManifest).
+            _outputsWithKeptManifest.TryAdd(segPath, 0);
             _logger.LogInformation("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
                 consumed.Count(s => File.Exists(s.FilePath)));
+        }
 
         _logger.LogInformation(
             "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
@@ -3462,8 +3530,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// its entry before it lands its file, and the boot catalog scan must find each source either
     /// still named, or gone from the catalog with its path recorded for it or parked. So each
     /// removed source is recorded AND PARKED in the same hold, whatever the pending-delete cap
-    /// says: the park is what keeps a scan that starts after the hold off a file still on disk
-    /// (its own merge recovery deletes such a file first, unless a reader holds it).</para>
+    /// says (<see cref="ParkMergeSourceGuards"/>): the park is what keeps a scan that starts after
+    /// the hold off a file still on disk (its own merge recovery leaves a parked source to its
+    /// retry).</para>
     ///
     /// <para>The unlinks come after, outside that hold, one file per take of <c>_importLock</c>
     /// (<see cref="SettleMergedSources"/>). Held across all of them, the commit made every import
@@ -3477,6 +3546,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private void CommitMerge(SegmentInfo output, SegmentKey[] sources)
     {
         var          removed = new SegmentInfo?[sources.Length];
+        var          paths   = new string?[sources.Length];
         var          guarded = new bool[sources.Length];
         SegmentInfo? displaced;
 
@@ -3486,25 +3556,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             displaced = _segments.Swap(output, sources, removed);
             PublishMergedAwayMark();
 
-            long parkedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-            int  guards   = 0;
             for (int i = 0; i < removed.Length; i++)
             {
                 if (removed[i] is not { } gone) continue;
                 ForgetRemovedSegment(sources[i], gone.FilePath);
-                // Past PendingSegmentDeleteCap too: this park is not a failed delete waiting for a
-                // retry but the scan's guard until the unlink below, and the cap is applied to
-                // what is still parked once that has been tried (see SettleMergedSources).
-                if (_pendingSegmentDeletes.TryAdd(gone.FilePath, new PendingSegmentDelete(sources[i], parkedAt)))
-                {
-                    guarded[i] = true;
-                    guards++;
-                }
+                paths[i] = gone.FilePath;
             }
-            // Counted out of the cap check a failed delete meets (ParkSegmentDelete) until each is
-            // tried: a retention delete landing between two of the unlinks below must not find the
-            // set "full" of the merge's guards and give up on its file.
-            Volatile.Write(ref _mergeGuardParks, guards);
+            ParkMergeSourceGuards(sources, paths, guarded);
         }
 
         try
@@ -3514,64 +3572,116 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
             _afterMergeSwap?.Invoke();
 
-            SettleMergedSources(sources, removed, guarded);
+            SettleMergedSources(sources, paths, guarded);
         }
         finally
         {
             // Whatever was not tried stays parked as an ordinary parked delete, retried by the
             // background loop, the passes and shutdown, and from here on counts toward the cap.
-            Volatile.Write(ref _mergeGuardParks, 0);
+            ReleaseUntriedMergeGuards(guarded);
         }
     }
 
     /// <summary>
-    /// Parks <see cref="CommitMerge"/> made as guards and has not tried to unlink yet; merges run
-    /// one at a time, so they are one merge's. <see cref="ParkSegmentDelete"/> leaves them out of
-    /// its cap check. Written under <c>_importLock</c> and <see cref="_scanDeleteGate"/> by the
-    /// commit, decremented without them as each is tried: read between an attempt's unpark and
-    /// its decrement, the check is lenient by one — the cap is a bound on retries, not a count
+    /// Parks each path in <paramref name="paths"/> (null: nothing to park) under its key, as the
+    /// catalog scan's guard until <see cref="SettleMergedSources"/> tries its unlink, and marks in
+    /// <paramref name="guarded"/> the parks it made. For a merge's commit and for merge recovery
+    /// (<see cref="RecoverInterruptedMerges"/>); the caller holds <c>_importLock</c> and
+    /// <see cref="_scanDeleteGate"/>, as every add to the set does.
+    ///
+    /// <para>Past <see cref="PendingSegmentDeleteCap"/> too: such a park is not a failed delete
+    /// waiting for a retry but the scan's guard until the unlink, and the cap is applied to what
+    /// is still parked once that has been tried. Until then the parks are counted out of the cap
+    /// check a failed delete meets (<see cref="ParkSegmentDelete"/>): a retention delete landing
+    /// between two of the unlinks must not find the set "full" of guards and give up on its
+    /// file.</para>
+    /// </summary>
+    private void ParkMergeSourceGuards(SegmentKey[] keys, string?[] paths, bool[] guarded)
+    {
+        long parkedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        int  guards   = 0;
+        for (int i = 0; i < paths.Length; i++)
+        {
+            if (paths[i] is not { } path) continue;
+            if (_pendingSegmentDeletes.TryAdd(path, new PendingSegmentDelete(keys[i], parkedAt)))
+            {
+                guarded[i] = true;
+                guards++;
+            }
+        }
+        Interlocked.Add(ref _mergeGuardParks, guards);
+    }
+
+    /// <summary>
+    /// Takes the guards <see cref="SettleMergedSources"/> never got to — a commit or a recovery
+    /// that threw before its unlinks — out of <see cref="_mergeGuardParks"/>. They stay parked as
+    /// ordinary parked deletes, and count toward the cap from here on.
+    /// </summary>
+    private void ReleaseUntriedMergeGuards(bool[] guarded)
+    {
+        int untried = 0;
+        foreach (bool g in guarded)
+            if (g) untried++;
+        if (untried != 0) Interlocked.Add(ref _mergeGuardParks, -untried);
+    }
+
+    /// <summary>
+    /// Guard parks (<see cref="ParkMergeSourceGuards"/>) whose unlink has not been tried yet.
+    /// Merges and merge recovery do not overlap — a pass runs its recovery under the merge gate,
+    /// and the catalog scan runs its own before the gate opens — so they are one batch's.
+    /// <see cref="ParkSegmentDelete"/> leaves them out of its cap check. Raised under
+    /// <c>_importLock</c> and <see cref="_scanDeleteGate"/> with the parks, lowered without them as
+    /// each is tried, and by exactly the guards a holder made, so a scan a test runs by hand inside
+    /// a commit cannot clobber the commit's count: read between an attempt's unpark and its
+    /// decrement, the check is lenient by one — the cap is a bound on retries, not a count
     /// anything depends on.
     /// </summary>
     private int _mergeGuardParks;
 
     /// <summary>
-    /// Unlinks the sources <see cref="CommitMerge"/> parked, each through
-    /// <see cref="TryCompletePendingSegmentDelete"/>: under <c>_importLock</c> for that one file,
-    /// re-checking that no entry names the path again (a re-push of a replicated source may have
-    /// landed there since), and recording the path for a running catalog scan before it leaves
-    /// the park.
+    /// Unlinks the sources <see cref="ParkMergeSourceGuards"/> parked — a merge's commit, or merge
+    /// recovery for a crashed merge — each through <see cref="TryCompletePendingSegmentDelete"/>:
+    /// under <c>_importLock</c> for that one file, re-checking that no entry names the path again
+    /// (a re-push of a replicated source may have landed there since), and recording the path for
+    /// a running catalog scan before it leaves the park. <paramref name="paths"/> is cleared for
+    /// each path this settles; what is left in it was not unlinked: still parked, or let go past
+    /// the cap.
     ///
     /// <para>A source that cannot be unlinked yet — on Windows, a query still maps it — stays
     /// parked for the background retry, as a failed delete does, and the manifest keeps it for
     /// the recovery sweep as well. Only up to <see cref="PendingSegmentDeleteCap"/>: past it, a
     /// path is let go as a failed delete past the cap is (logged, left on disk, the park's record
-    /// handed to a running scan), and the recovery sweep retries it from the manifest. The commit
-    /// parked past the cap only for the moment between its hold and this attempt, and those
+    /// handed to a running scan), and the recovery sweep retries it from the manifest. The park
+    /// went past the cap only for the moment between its hold and this attempt, and those
     /// guard parks do not count against a failed delete's park in the meantime
     /// (<see cref="_mergeGuardParks"/>).</para>
     /// </summary>
-    private void SettleMergedSources(SegmentKey[] sources, SegmentInfo?[] removed, bool[] guarded)
+    private void SettleMergedSources(SegmentKey[] keys, string?[] paths, bool[] guarded)
     {
         bool anyLeft = false;
-        for (int i = 0; i < removed.Length; i++)
+        for (int i = 0; i < paths.Length; i++)
         {
-            if (removed[i] is not { } gone) continue;
-            if (TryCompletePendingSegmentDelete(gone.FilePath)) removed[i] = null;
+            if (paths[i] is not { } path) continue;
+            if (TryCompletePendingSegmentDelete(path)) paths[i] = null;
             else anyLeft = true;
-            if (guarded[i]) Interlocked.Decrement(ref _mergeGuardParks);
+            if (guarded[i])
+            {
+                guarded[i] = false;
+                Interlocked.Decrement(ref _mergeGuardParks);
+            }
         }
         if (!anyLeft) return;
 
         lock (_importLock)
         lock (_scanDeleteGate)
         {
-            for (int i = 0; i < removed.Length && _pendingSegmentDeletes.Count > PendingSegmentDeleteCap; i++)
+            for (int i = 0; i < paths.Length && _pendingSegmentDeletes.Count > PendingSegmentDeleteCap; i++)
             {
-                if (removed[i] is not { } gone) continue;
-                if (!_pendingSegmentDeletes.TryGetValue(gone.FilePath, out var pending) || pending.Key != sources[i]) continue;
-                _deletedDuringCatalogScan?.Add(gone.FilePath);
-                Unpark(gone.FilePath);
-                LogNotRetried(gone.FilePath, error: null);
+                if (paths[i] is not { } path) continue;
+                if (!_pendingSegmentDeletes.TryGetValue(path, out var pending) || pending.Key != keys[i]) continue;
+                _deletedDuringCatalogScan?.Add(path);
+                Unpark(path);
+                LogNotRetried(path, error: null);
             }
         }
         EnsureSegmentDeleteRetryLoop();
@@ -3716,51 +3826,521 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
-    /// Finishes merges interrupted mid-deletion: a manifest whose merged segment
-    /// exists means the listed source files are already duplicated — delete them.
-    /// A manifest without its merged segment is a merge that never committed.
+    /// Finishes the merges a crash, or a source its commit could not unlink, left behind. A merge
+    /// writes <c>{output}.mergemanifest</c> before anything else, listing its sources by file name,
+    /// and drops it only once every one of them is gone (<see cref="MergeSmallSegmentsOnceAsync"/>).
+    ///
+    /// <para>COMMITTED is decided on the output alone. The manifest is written through before the
+    /// output exists anywhere but at <c>.seg.tmp</c>, and the output reaches its final name only by
+    /// the rename that follows the writer's fsync and its event-count check
+    /// (<see cref="MergeToColdAsync"/>). So a manifest without its output is a merge that never
+    /// committed — killed while streaming, or before the rename: its sources are the only copy and
+    /// stay in service, the constructor has swept the <c>.seg.tmp</c>, and the manifest goes. With
+    /// its output, every source still on disk is a duplicate of events the output holds.</para>
+    ///
+    /// <para>A duplicate goes the way a merge's commit sends its sources
+    /// (<see cref="ParkMergeSourceGuards"/>, then <see cref="SettleMergedSources"/>): parked under
+    /// <c>_importLock</c> and <see cref="_scanDeleteGate"/>, then unlinked one file at a time
+    /// through <see cref="TryCompletePendingSegmentDelete"/>, which records the path for a running
+    /// catalog scan before the park goes. One that cannot be unlinked — on Windows a scanner or a
+    /// backup agent holding it, or a query's pin; anywhere, a volume that refuses — STAYS PARKED:
+    /// the catalog scan skips it, the background retry and every maintenance and retention pass try
+    /// it again, and the manifest stays until it is gone. It used to be warned about and left
+    /// where it was, and the scan behind this sweep then registered it beside the output: its
+    /// events counted twice, until a pass unlinked the file out from under its entry. And the bare
+    /// File.Delete it got otherwise, outside the gate, recorded nothing, so a scan already running
+    /// could register a source this sweep had just deleted (#98).</para>
+    ///
+    /// <para>Two kinds of listed file are not this sweep's to touch. One still PARKED has an owner:
+    /// the retry it was parked for, which deletes it once nothing holds it, under
+    /// <c>_importLock</c> and against the catalog, and says so at Warning once its window is spent.
+    /// Tried here as well it failed again on every pass, at Warning per source: a query pins every
+    /// segment of its window for its whole run (#114), so a merge under a long query leaves every
+    /// source it reached parked on Windows, and each 15 s pass logged up to
+    /// <see cref="MergeMaxSources"/> Warnings for deletes already being retried. Left to the park,
+    /// the manifest waits a pass longer. A REPLICA the catalog names, <c>{node}-{id}.seg</c>, is in
+    /// service again: a peer pushed it to the path its merged-away copy had. It is neither unlinked
+    /// — which left its entry naming a file that was gone — nor waited for: the rule a parked delete
+    /// follows when the catalog names its path again. So the manifest can go without it, and no
+    /// later start unlinks it before its scan names it.</para>
+    ///
+    /// <para>A name only this node writes cannot come back that way. In the catalog beside its
+    /// output, it is a source a catalog scan registered because the sweep before it missed this
+    /// manifest (it could not read the file), and its events are counted twice. It is taken out as
+    /// a commit takes out its sources: the entry removed and recorded for a running scan under both
+    /// locks, the file parked and unlinked. Left in service with the manifest gone, it stayed a
+    /// duplicate until its TTL, and the next merge copied it into a new output.</para>
+    ///
+    /// <para>Deciding on the output alone holds only while the output stays where its manifest
+    /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
+    /// planner until the manifest goes (<see cref="_outputsWithKeptManifest"/>). Merged again first,
+    /// it left before its held source did, read here as never committed, and its manifest went
+    /// while the source still waited.</para>
+    ///
+    /// <para>What none of this tells apart is a crash from a merge in flight: both are a manifest
+    /// beside an output at its final name, or beside none yet. The merge gate keeps them apart: a
+    /// pass runs this sweep under it, and the catalog scan runs it before the gate opens
+    /// (<see cref="TryEnterMergeGate"/>).</para>
+    ///
+    /// <para>An output at its final name is proved whole before its manifest is acted on, unless the
+    /// catalog serves it — published by this process's own commit, which wrote and checked it, or by
+    /// a scan whose sweep proved it at the start (<see cref="ReadMergeOutput"/>). No crash of this
+    /// process leaves a torn output at its final name, but a restored backup, or storage that lost
+    /// a flushed write in a power cut, can; read as committed, its sources — the batch's only
+    /// readable copy — were deleted. A torn output is taken out of service instead: the sources
+    /// still on disk stay, and the output is quarantined here, not left to the scan, which only
+    /// refuses what it cannot frame; sources already gone are reported (<see cref="RecoverTornMerge"/>).
+    /// That verdict, once reached, holds. An output nobody has been able to read (a holder that
+    /// shares nothing) is neither: its verdict waits, the output out of service and its sources in
+    /// (<see cref="DeferMergeVerdict"/>), and a pass that reads it commits it there.</para>
     /// </summary>
     private void RecoverInterruptedMerges()
     {
         foreach (var manifest in Directory.EnumerateFiles(_segDir, "*.mergemanifest"))
         {
-            try
-            {
-                string mergedSeg = manifest[..^".mergemanifest".Length];
-                bool   allGone   = true;
-                if (File.Exists(mergedSeg))
+            // Per manifest, so one that cannot be read does not strand the others behind it.
+            try { RecoverInterruptedMerge(manifest); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest); }
+        }
+    }
+
+    /// <summary>One manifest of <see cref="RecoverInterruptedMerges"/>.</summary>
+    private void RecoverInterruptedMerge(string manifest)
+    {
+        string output = manifest[..^".mergemanifest".Length];
+
+        // A torn verdict holds. The manifest RecoverTornMerge emptied when it could not move the output
+        // aside is never decided by a read again: a holder that lets nothing read the file answers any
+        // read with a failure that says nothing about the bytes.
+        if (File.Exists(output) && new FileInfo(manifest).Length == 0)
+        {
+            RecoverTornMerge(manifest, output);
+            return;
+        }
+
+        switch (ReadMergeOutput(output, out var proved, out var unreadable))
+        {
+            case MergeOutputState.Absent:
+                File.Delete(manifest);
+                _outputsWithKeptManifest.TryRemove(output, out _);
+                _undecidedMergeOutputs.TryRemove(output, out _);
+                return;
+            case MergeOutputState.Torn:
+                _undecidedMergeOutputs.TryRemove(output, out _);
+                RecoverTornMerge(manifest, output);
+                return;
+            case MergeOutputState.Unknown:
+                DeferMergeVerdict(output, unreadable!);
+                return;
+            case MergeOutputState.Newer:
+                // A format this release cannot read (#119): a rollback's file, or a version field a
+                // bit flip pushed past the newest. While every source is still on disk the merge can
+                // be rolled back whole, and is: the sources stay in service, the output goes aside.
+                // With one already unlinked, the merge did commit and that source's events live only
+                // in this output, which a release that reads it can still commit: it waits, kept.
+                if (EveryListedSourceOnDisk(manifest, output))
                 {
-                    foreach (var name in File.ReadAllLines(manifest))
-                    {
-                        var src = Path.Combine(_segDir, name);
-                        // A source still PARKED already has an owner: the retry its commit parked
-                        // it for (SettleMergedSources), which deletes it once nothing holds it, under
-                        // _importLock and against the catalog, and says so at Warning once its
-                        // window is spent. Tried here as well it failed again on every pass, at
-                        // Warning per source. Since a query pins every segment of its window for its
-                        // whole run (#114), a merge under a long query leaves every source it reached
-                        // parked — on Windows, where the pin fails the unlink — and each 15 s pass
-                        // then logged up to MergeMaxSources Warnings for a delete that was already
-                        // being retried and would succeed the moment the query ended. Left to the
-                        // park, the manifest simply waits a pass longer. Nothing is parked at boot,
-                        // so the start-up sweep is unchanged.
-                        if (_pendingSegmentDeletes.ContainsKey(src)) { allGone = false; continue; }
-                        try { if (File.Exists(src)) File.Delete(src); }
-                        catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery: failed to delete {File}", src); }
-                        if (File.Exists(src)) allGone = false;
-                    }
-                    if (allGone)
-                        _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(mergedSeg));
+                    _logger.LogWarning(unreadable,
+                        "Merge recovery: the output {File} of an interrupted merge is in a segment format newer than " +
+                        "this release reads, and every source it lists is still on disk — the merge is rolled back: the " +
+                        "sources stay in service and the output is set aside as .corrupt", Path.GetFileName(output));
+                    _undecidedMergeOutputs.TryRemove(output, out _);
+                    RecoverTornMerge(manifest, output);
                 }
-                // Keep the manifest while any duplicate source survives (a reader
-                // may still hold it open) — the next sweep retries.
-                if (allGone) File.Delete(manifest);
-            }
-            catch (Exception ex)
+                else DeferMergeVerdict(output, unreadable!);
+                return;
+        }
+        // Whole. While its range is still pinned (a verdict that waited) no merge can take a source:
+        // a pass runs this under the merge gate, and the commit below happens in the same pass.
+        _undecidedMergeOutputs.TryRemove(output, out _);
+
+        // Out of the planner until this manifest goes, from before it is even read: one this
+        // sweep fails to finish keeps its output out too (see _outputsWithKeptManifest).
+        _outputsWithKeptManifest.TryAdd(output, 0);
+
+        var sources = new List<string>();
+        foreach (var name in File.ReadAllLines(manifest))
+        {
+            // One plain *.seg file name a line, and never the output's, is all a merge writes here.
+            // Anything else names nothing this sweep may unlink: a blank line, parked, would retry
+            // unlinking the directory itself for the life of the process.
+            if (!IsListedSourceName(name)) continue;
+            string path = Path.Combine(_segDir, name);
+            if (!string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) sources.Add(path);
+        }
+
+        var keys      = new SegmentKey[sources.Count];
+        var unlink    = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
+        var guarded   = new bool[sources.Count];
+        var inService = new bool[sources.Count];      // a replica pushed again: no longer this manifest's
+        for (int i = 0; i < keys.Length; i++) keys[i] = KeyOfSegmentFileName(sources[i]);
+
+        SegmentInfo? displaced = null;
+        bool         committed = false;
+        lock (_importLock)
+        lock (_scanDeleteGate)
+        {
+            List<(int Index, SegmentInfo Entry)>? named = null;
+            for (int i = 0; i < unlink.Length; i++)
             {
-                _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest);
+                if (_pendingSegmentDeletes.ContainsKey(sources[i])) continue;
+                if (_segments.TryGetValue(keys[i], out var entry)
+                    && string.Equals(entry.FilePath, sources[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    if (IsReplicaFileName(sources[i]))
+                    {
+                        inService[i] = true;
+                        continue;
+                    }
+                    // A name only this node writes, in the catalog beside its output: a catalog scan
+                    // registered it because no sweep before it could settle this manifest. Taken out
+                    // as a commit takes out its sources, entry first.
+                    (named ??= []).Add((i, entry));
+                }
+                unlink[i] = sources[i];
+            }
+
+            // An output proved here and not served, with no catalog scan running to register it: a
+            // verdict that waited (see DeferMergeVerdict). It goes in as a merge's commit puts its
+            // output in, with the sources' entries coming out in the same catalog generation, each
+            // recorded as merged away first for a header scan running across the swap.
+            if (proved is not null && _catalogScansRunning == 0)
+            {
+                var outKey  = SegmentKey.Of(proved);
+                var remove  = new SegmentKey[named?.Count ?? 0];
+                var removed = new SegmentInfo?[remove.Length];
+                for (int j = 0; j < remove.Length; j++)
+                {
+                    remove[j] = keys[named![j].Index];
+                    RecordMergedAwaySegment(remove[j], outKey);
+                }
+                displaced = _segments.Swap(proved, remove, removed);
+                PublishMergedAwayMark();
+                for (int j = 0; j < remove.Length; j++)
+                {
+                    if (removed[j] is { } gone) ForgetRemovedSegment(remove[j], gone.FilePath);
+                    else unlink[named![j].Index] = null;   // gone some other way first: its remover's
+                }
+                committed = true;
+            }
+            else if (named is not null)
+            {
+                foreach (var (i, entry) in named)
+                {
+                    if (_segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(keys[i], entry)))
+                        ForgetRemovedSegment(keys[i], sources[i]);
+                    else unlink[i] = null;
+                }
+            }
+            ParkMergeSourceGuards(keys, unlink, guarded);
+        }
+        if (committed)
+        {
+            if (displaced is not null && !IsTheSameSegment(displaced, proved!)) LogDisplacedLocalSegment(proved!, displaced);
+            _logger.LogInformation(
+                "Merge recovery: the output {File} of an interrupted merge, unread until now, is whole — committed: in " +
+                "service, and the sources it lists out", Path.GetFileName(output));
+        }
+        try     { SettleMergedSources(keys, unlink, guarded); }
+        finally { ReleaseUntriedMergeGuards(guarded); }
+
+        // The manifest goes once nothing it lists is left to it: no source parked, and none on disk
+        // but a replica back in service. File.Exists, the merge's own test for the same decision.
+        bool anyLeft = false;
+        for (int i = 0; i < sources.Count && !anyLeft; i++)
+            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i])
+                      || (!inService[i] && File.Exists(sources[i]));
+        if (!anyLeft)
+        {
+            File.Delete(manifest);
+            _outputsWithKeptManifest.TryRemove(output, out _);
+            _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(output));
+            return;
+        }
+
+        // Only for what this sweep tried: a source an earlier park still holds is that park's to report.
+        int held = 0;
+        foreach (var path in unlink)
+            if (path is not null) held++;
+        if (held != 0)
+            _logger.LogInformation(
+                "Merge recovery: {Count} source file(s) of {File} could not be deleted yet — kept out of the catalog and " +
+                "retried; the manifest stays until they are gone",
+                held, Path.GetFileName(output));
+    }
+
+    /// <summary>What a sweep finds at a manifest's output name (<see cref="ReadMergeOutput"/>).</summary>
+    private enum MergeOutputState : byte { Absent, Whole, Torn, Unknown, Newer }
+
+    /// <summary>
+    /// Whether a manifest's merge committed (see <see cref="RecoverInterruptedMerges"/>): its output
+    /// is absent, whole, torn, or not known — read by nobody yet.
+    ///
+    /// <para>Proved by reading (<see cref="ProveWholeMergeOutput"/>) unless the catalog serves the
+    /// output, or served it until a delete parked its path: then this process's own commit wrote
+    /// and checked it, or the sweep that let a scan register it proved it. An output no catalog serves
+    /// is proved by every sweep that meets it: at a start every one, at a pass one whose verdict
+    /// waits. <paramref name="proved"/> is its entry when proved here, for the commit to put in.</para>
+    ///
+    /// <para>One that cannot be read for a reason that is not its bytes — a scanner or a backup agent
+    /// holding it without sharing — is <see cref="MergeOutputState.Unknown"/>, never whole. It used
+    /// to be taken as committed, the rename being the proof of a whole file; but this proof exists
+    /// because a restored backup or a lost write tears the file after the rename, and an output
+    /// nobody has read may be that one. Taken as committed, every source was unlinked against it:
+    /// 0 of 600 events served when it was torn, at a start and at a pass alike.</para>
+    ///
+    /// <para>One in a segment format newer than this release reads (#119's
+    /// <see cref="NewerSegmentFormatException"/>) is <see cref="MergeOutputState.Newer"/>: a
+    /// rollback's file, or a version field a bit flip pushed past the newest. It went down the same
+    /// "taken as committed" road. <see cref="RecoverInterruptedMerge"/> rolls such a merge back while
+    /// every source is on disk, and otherwise keeps the output waiting for a release that reads it.</para>
+    /// </summary>
+    private MergeOutputState ReadMergeOutput(string output, out SegmentInfo? proved, out Exception? unreadable)
+    {
+        proved     = null;
+        unreadable = null;
+        if (!File.Exists(output)) return MergeOutputState.Absent;
+        if ((_segments.TryGetValue(KeyOfSegmentFileName(output), out var entry)
+             && string.Equals(entry.FilePath, output, StringComparison.OrdinalIgnoreCase))
+            || _pendingSegmentDeletes.ContainsKey(output))
+            return MergeOutputState.Whole;
+        try
+        {
+            proved = ProveWholeMergeOutput(output);
+            return MergeOutputState.Whole;
+        }
+        catch (Exception ex) when (FileBounds.DescribesContent(ex))
+        {
+            _logger.LogWarning(ex,
+                "Merge recovery: the output {File} of an interrupted merge is not a whole segment — it is quarantined, " +
+                "and the sources it lists that are still on disk stay in service",
+                Path.GetFileName(output));
+            return MergeOutputState.Torn;
+        }
+        catch (FileNotFoundException) { return MergeOutputState.Absent; }   // gone since the probe above
+        catch (NewerSegmentFormatException ex)
+        {
+            unreadable = ex;
+            return MergeOutputState.Newer;
+        }
+        catch (Exception ex)
+        {
+            unreadable = ex;
+            return MergeOutputState.Unknown;
+        }
+    }
+
+    /// <summary>Whether every source <paramref name="manifest"/> lists is still on disk (see <see cref="IsListedSourceName"/>).</summary>
+    private bool EveryListedSourceOnDisk(string manifest, string output)
+    {
+        foreach (var name in File.ReadAllLines(manifest))
+        {
+            if (!IsListedSourceName(name)) continue;
+            string path = Path.Combine(_segDir, name);
+            if (!string.Equals(path, output, StringComparison.OrdinalIgnoreCase) && !File.Exists(path)) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Merge outputs no sweep has been able to read, by path, with the time span their file names
+    /// carry (<c>{node}-{id}-{minTs}-{maxTs}.seg</c>, every source inside it). While one is here,
+    /// <see cref="SelectMergeBatch"/> takes no segment overlapping that span: a source merged while
+    /// the verdict waits would put its events in a new output, and the waiting one, committed later,
+    /// would serve them a second time. Written by the sweeps, under the merge gate or before it
+    /// opens; concurrent for the same reason as <see cref="_outputsWithKeptManifest"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, (long Min, long Max)> _undecidedMergeOutputs = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The verdict on an output no sweep could read waits for one that can. Until then, the output
+    /// is kept out of this run's catalog, recorded for a running scan as a delete is. The sources
+    /// it lists stay in service, out of the merge planner's way (<see cref="_undecidedMergeOutputs"/>).
+    /// The manifest stays as it is. The next pass proves the output again: whole, it is committed
+    /// there; torn, it is quarantined. A start decides it the same way from the start.
+    /// </summary>
+    private void DeferMergeVerdict(string output, Exception unreadable)
+    {
+        lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
+        if (_undecidedMergeOutputs.TryAdd(output, SpanOfMergeOutputName(output)))
+            _logger.LogWarning(unreadable,
+                "Merge recovery: the output {File} of an interrupted merge could not be read; it stays out of service, " +
+                "and the sources it lists stay in, until a sweep can read it", Path.GetFileName(output));
+        else
+            _logger.LogDebug(unreadable, "Merge recovery: the output {File} still cannot be read", Path.GetFileName(output));
+    }
+
+    /// <summary>
+    /// The time span a merge output's NAME carries, <c>{node}-{id}-{minTs}-{maxTs}.seg</c>, which
+    /// holds every source the merge took; all of time for a name of another shape.
+    /// </summary>
+    private static (long Min, long Max) SpanOfMergeOutputName(string path)
+    {
+        ReadOnlySpan<char> stem  = Path.GetFileNameWithoutExtension(path.AsSpan());
+        Span<Range>        parts = stackalloc Range[5];
+        if (stem.Split(parts, '-') == 4
+            && long.TryParse(stem[parts[2]], System.Globalization.NumberStyles.None,
+                             System.Globalization.CultureInfo.InvariantCulture, out long min)
+            && long.TryParse(stem[parts[3]], System.Globalization.NumberStyles.None,
+                             System.Globalization.CultureInfo.InvariantCulture, out long max))
+            return (min, max);
+        return (long.MinValue, long.MaxValue);
+    }
+
+    /// <summary>Whether <paramref name="s"/> overlaps the span of an output whose verdict waits (see <see cref="_undecidedMergeOutputs"/>).</summary>
+    private bool OverlapsUndecidedMergeOutput(SegmentInfo s)
+    {
+        foreach (var (_, span) in _undecidedMergeOutputs)
+            if (s.MaxTimestampTicks >= span.Min && s.MinTimestampTicks <= span.Max) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// A merge whose output is torn: the sources it lists that are still on disk stay in service,
+    /// and the output goes aside here as the catalog scan quarantines an unreadable segment, to
+    /// <c>{output}.corrupt</c>. Not left to the scan: the scan refuses only what it cannot frame, and
+    /// a torn output it can frame — a block-index count read as 0, a block whose payload was lost —
+    /// it registered beside the sources it had replaced, counting their events twice (every header
+    /// count; every row a block still held). Recorded for a running scan first, so that one does
+    /// not register it whatever fails below; when the move fails, the manifest stays, and the next
+    /// sweep, which finds the output unserved, proves it again and retries the move.
+    ///
+    /// <para>A listed source missing from disk means the merge DID commit and had unlinked it before
+    /// the output was damaged: its events now exist only in the quarantined file. That is said at
+    /// Error, with how many, and the manifest is kept aside as <c>{output}.corrupt.sources</c> — a
+    /// name no sweep lists — as the record of which served sources a salvage of the
+    /// <c>.corrupt</c> file would duplicate. It used to be logged as "the sources stay in service"
+    /// and the manifest deleted. Decided once, at the first verdict: when the move fails, the
+    /// manifest is emptied after the list is set aside, and stays only to keep the output out of
+    /// service, since the sources it listed are in service and later merges may take them.</para>
+    ///
+    /// <para>The emptied manifest is the verdict, kept: every later sweep comes straight here and
+    /// only retries the move (<see cref="RecoverInterruptedMerge"/>). Proved again, the output
+    /// would be read by whoever holds it last: one held without sharing failed the read, and that
+    /// failure was taken for "committed" — the marker dropped, and the next start served the torn
+    /// output beside what its sources had been merged into, 1 200 events for 600.</para>
+    /// </summary>
+    private void RecoverTornMerge(string manifest, string output)
+    {
+        lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
+
+        int listed = 0, missing = 0;
+        foreach (var name in File.ReadAllLines(manifest))
+        {
+            if (!IsListedSourceName(name)) continue;
+            string path = Path.Combine(_segDir, name);
+            if (string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) continue;
+            listed++;
+            if (!File.Exists(path)) missing++;
+        }
+        string setAside = output + ".corrupt.sources";
+        if (missing != 0)
+        {
+            File.Copy(manifest, setAside, overwrite: true);
+            _logger.LogError(
+                "Merge recovery: {Missing} of {Listed} sources of the torn merge output {File} were already deleted; " +
+                "their events exist only in the quarantined {Corrupt}. The sources it lists are kept in {Sources}",
+                missing, listed, Path.GetFileName(output), Path.GetFileName(output) + ".corrupt", Path.GetFileName(setAside));
+        }
+
+        try { File.Move(output, output + ".corrupt", overwrite: true); }
+        catch (Exception ex)
+        {
+            if (listed != 0) File.WriteAllBytes(manifest, []);
+            _logger.LogWarning(ex,
+                "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
+                "manifest kept until the next sweep moves it", Path.GetFileName(output));
+            return;
+        }
+        File.Delete(manifest);
+        _outputsWithKeptManifest.TryRemove(output, out _);
+    }
+
+    /// <summary>
+    /// Reads a merge output for <see cref="ReadMergeOutput"/>: opened as the catalog scan
+    /// opens it (header, footer, block index, every block frame), then every row of every block
+    /// decoded as a merge reads its sources, and the rows counted against the event count its
+    /// header claims. Throws <see cref="InvalidDataException"/> when the two disagree; returns the
+    /// entry the scan would register for it.
+    ///
+    /// <para>The open alone proves framing, not content. A block whose bytes were lost still frames,
+    /// and was taken for a whole output: every source was unlinked against a file that cannot serve
+    /// their events. The decode costs one read of the whole file, paid only for an output no catalog
+    /// serves: a manifest that survived to a start (normally none).</para>
+    /// </summary>
+    private static SegmentInfo ProveWholeMergeOutput(string output)
+    {
+        var  reader   = SegmentReader.Open(output, computeUncompressedBytes: true);
+        var  info     = reader.Info;
+        long rows     = 0;
+        using (var cursor = new SegmentEventCursor(reader, new Dictionary<string, string>(Utf8StringComparer.Instance)))
+        {
+            while (cursor.MoveNext())
+            {
+                _ = cursor.Current;   // every column of the row, as a merge or a query reads it
+                rows++;
             }
         }
+        if (rows != info.EventCount)
+            throw new InvalidDataException(
+                $"Segment {output} holds {rows} events in its blocks, but its header says {info.EventCount}");
+        return info;
+    }
+
+    /// <summary>
+    /// A manifest line that can name a source: a plain <c>*.seg</c> file name. A line that cannot —
+    /// one a torn or hand-edited manifest holds — would otherwise be parked, fail its unlink on
+    /// every retry and keep the manifest for good.
+    /// </summary>
+    private static bool IsListedSourceName(string name) =>
+        name.Length > ".seg".Length
+        && name.EndsWith(".seg", StringComparison.OrdinalIgnoreCase)
+        && name.AsSpan().IndexOfAny(InvalidFileNameChars) < 0
+        && string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal);
+
+    private static readonly SearchValues<char> InvalidFileNameChars = SearchValues.Create(Path.GetInvalidFileNameChars());
+
+    /// <summary>
+    /// The key a segment file's NAME carries — <c>{node}-{id}-{minTs}-{maxTs}.seg</c> as this node
+    /// writes one, <c>{node}-{id}.seg</c> as a replica lands — for a source merge recovery parks with
+    /// no catalog entry to take it from. It is what the park's retry checks the catalog for before
+    /// its unlink (<see cref="TryCompletePendingSegmentDelete"/>), and what any registration of that
+    /// path carries: a replica is pushed to the name of its key, and every other writer names its
+    /// file after the key it writes. <c>default</c>, which no segment carries (ids start at 1), for
+    /// a name of neither shape: only the catalog scan registers such a file, and it skips a parked
+    /// path.
+    /// </summary>
+    private static SegmentKey KeyOfSegmentFileName(string path)
+    {
+        ReadOnlySpan<char> stem = Path.GetFileNameWithoutExtension(path.AsSpan());
+        int dash = stem.IndexOf('-');
+        if (dash > 0 && uint.TryParse(stem[..dash], System.Globalization.NumberStyles.None,
+                                      System.Globalization.CultureInfo.InvariantCulture, out uint node))
+        {
+            var rest = stem[(dash + 1)..];
+            int end  = rest.IndexOf('-');
+            if (ulong.TryParse(end < 0 ? rest : rest[..end], System.Globalization.NumberStyles.None,
+                               System.Globalization.CultureInfo.InvariantCulture, out ulong id))
+                return new SegmentKey(new NodeId(node), new SegmentId(id));
+        }
+        return default;
+    }
+
+    /// <summary>
+    /// Whether a segment file's NAME is a replica's, <c>{node}-{id}.seg</c>: the name an import
+    /// lands a file at, and so the only one a merged-away source can come back into service under.
+    /// Every name this node writes carries the segment's time span after its id.
+    /// </summary>
+    private static bool IsReplicaFileName(string path)
+    {
+        ReadOnlySpan<char> stem = Path.GetFileNameWithoutExtension(path.AsSpan());
+        int dash = stem.IndexOf('-');
+        return dash > 0
+            && stem[(dash + 1)..].IndexOf('-') < 0
+            && uint.TryParse(stem[..dash], System.Globalization.NumberStyles.None,
+                             System.Globalization.CultureInfo.InvariantCulture, out _)
+            && ulong.TryParse(stem[(dash + 1)..], System.Globalization.NumberStyles.None,
+                              System.Globalization.CultureInfo.InvariantCulture, out _);
     }
 
     /// <summary>
@@ -4112,7 +4692,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // Finish merges interrupted between publishing the merged segment and
-        // deleting its sources — otherwise those events would be served twice.
+        // deleting its sources — otherwise those events would be served twice. Before the
+        // listing and inside this scan's recording window: a source it cannot unlink is parked
+        // and one it unlinks is recorded, so the enumeration below skips it either way (#98).
         RecoverInterruptedMerges();
 
         // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
@@ -4137,18 +4719,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // and an error at every start, which is how an operator finds out at all.
         var files = Directory.GetFiles(_segDir, "*.seg");
         Array.Sort(files, StringComparer.Ordinal);
+        long retryTicksLeft = CatalogReadRetryBudget.Ticks;
         foreach (var file in files)
         {
             try
             {
-                _beforeScanOpensSegment?.Invoke(file);
-
                 // Closed before the gate: nothing below reads the file, and on Windows a mapping
                 // held while waiting for the gate is what made a delete of this very file fail
-                // its unlink and park.
-                SegmentInfo info;
-                using (var reader = SegmentReader.Open(file, computeUncompressedBytes: true))
-                    info = reader.Info;
+                // its unlink and park. Retried there if the failure may clear by itself (#119).
+                SegmentInfo info = ReadCatalogSegmentInfo(file, ref retryTicksLeft);
                 var key = SegmentKey.Of(info);
 
                 _beforeScanRegistersSegment?.Invoke(file);
@@ -4241,6 +4820,40 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 lock (_scanDeleteGate) skip = ScanSkipUnderGate(file);
                 if (LogScanSkip(skip, file, ex)) continue;
 
+                // A NEWER FORMAT IS NEITHER (#119 review F2): not torn bytes to set aside — .seg.corrupt
+                // is enumerated by nothing, so a build that reads the file would never see it again —
+                // and not a load left unfinished, since no restart of THIS build reads it. Kept under
+                // its name and out of the catalog, one Error naming its version, the store not
+                // Degraded; its id stays reserved, the allocator counting file names.
+                if (ex is NewerSegmentFormatException newer)
+                {
+                    StorageEngineLog.CatalogSegmentNewerFormat(_logger, ex, file, newer.Version);
+                    continue;
+                }
+
+                // NOT ABOUT THE BYTES: LEFT WHERE IT IS (#119 review — #108's rule for metrics and
+                // traces). This branch set aside whatever the open threw: a segment an antivirus or
+                // a backup agent held for a moment, one on a share that blinked, one a process out
+                // of handles could not open — every byte of it good, renamed .seg.corrupt and served
+                // by nobody until an operator renamed it back. ReadCatalogSegmentInfo has retried
+                // such a failure; one that outlasted the retries is the LAST attempt's, and it leaves
+                // the file under its name, out of this run's catalog, for the next start to read:
+                // the store is Degraded until then, its alert rules not evaluated on the part it
+                // holds. That includes a file gone with no delete of ours recorded — skipped quietly
+                // it would be the case the comment above refuses: a probe a failing mount answers
+                // "not there" for a live segment. Quarantine stays for what the BYTES say
+                // (FileBounds.DescribesContent): a torn frame, a file too short for a footer, a torn
+                // merge output (#98) — the reader names every one of those as content, an offset or
+                // a count the file cannot hold included (SegmentReader.RequireOffsetWithin,
+                // RequireCountFits): a tear that surfaced as an ArgumentException or an
+                // OutOfMemoryException would be kept here, the store Degraded, at every start.
+                if (!FileBounds.DescribesContent(ex))
+                {
+                    Volatile.Write(ref _catalogScanShort, 1);   // before the scan's task completes
+                    StorageEngineLog.CatalogSegmentUnreachable(_logger, ex, file);
+                    continue;
+                }
+
                 // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
                 // header or footer that nothing could ever parse; the reader now also throws on
                 // one torn block FRAME -- four bad bytes in a file whose every other block is
@@ -4259,6 +4872,70 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>
+    /// The pauses between the catalog scan's attempts at a segment it could not open for a reason
+    /// that is not its bytes: six attempts over ~0.8 s — the metric WAL upgrade's schedule (#105),
+    /// which the metric and trace cold scans also follow (#108, #119 review).
+    /// </summary>
+    private static readonly TimeSpan[] CatalogReadRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>
+    /// What one scan may spend waiting on such segments, IN ALL — the other scans' figure: forty
+    /// files a backup agent holds must not keep every log alert in Loading for half a minute. Past
+    /// it, a segment that cannot be opened gets one attempt.
+    /// </summary>
+    private static readonly TimeSpan CatalogReadRetryBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Test seam: the pause between the catalog scan's attempts at a segment, in place of
+    /// <see cref="Thread.Sleep(TimeSpan)"/>. Set it on an engine built with its boot scan held. Null
+    /// in production.
+    /// </summary>
+    internal Action<TimeSpan>? _catalogScanWaitForTest;
+
+    /// <summary>
+    /// One listed segment's info, the reader closed again — or the failure of the LAST attempt,
+    /// rethrown for the scan's catch to classify (#119 review). A failure that may clear by itself
+    /// is retried after each of <see cref="CatalogReadRetryDelays"/> while
+    /// <paramref name="retryTicksLeft"/> lasts: one that says nothing about the bytes
+    /// (<see cref="FileBounds.DescribesContent"/>), for a file no delete has let go. Content is not
+    /// retried — the same bytes fail the same way — and a file parked for deletion, or deleted
+    /// while the scan runs, is the delete's (see <see cref="ScanSkipUnderGate"/>), whatever a wait
+    /// would show. No lock is held across a pause.
+    /// </summary>
+    private SegmentInfo ReadCatalogSegmentInfo(string file, ref long retryTicksLeft)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            Exception fault;
+            try
+            {
+                _beforeScanOpensSegment?.Invoke(file);
+                using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
+                if (attempt > 1)
+                    _logger.LogWarning("Segment {File} could not be read at first and was read on attempt {Attempt}",
+                                       file, attempt);
+                return reader.Info;
+            }
+            catch (Exception ex) { fault = ex; }
+
+            bool letGo;
+            lock (_scanDeleteGate) letGo = ScanSkipUnderGate(file) != ScanSkip.None;
+            if (letGo || FileBounds.DescribesContent(fault) || fault is NewerSegmentFormatException
+                || attempt > CatalogReadRetryDelays.Length || retryTicksLeft <= 0)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(fault);
+
+            long wait = Math.Min(CatalogReadRetryDelays[attempt - 1].Ticks, retryTicksLeft);
+            retryTicksLeft -= wait;
+            if (_catalogScanWaitForTest is { } pause) pause(TimeSpan.FromTicks(wait));
+            else                                      Thread.Sleep(TimeSpan.FromTicks(wait));
+        }
     }
 
     /// <summary>Why the catalog scan leaves a file alone, if it does.</summary>

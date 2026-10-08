@@ -10,7 +10,7 @@ import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto, eventService } from '../../../../core/models/event.model';
+import { EventDto } from '../../../../core/models/event.model';
 import { SpanDto } from '../../../../core/models/span.model';
 import { MetricSeriesDto } from '../../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
@@ -125,7 +125,7 @@ export function buildClefView(ev: EventDto): Record<string, unknown> {
   if (ev['@x']  !== undefined) view['@x']  = ev['@x'];
   if (ev['@tr'] !== undefined) view['@tr'] = ev['@tr'];
   if (ev['@sp'] !== undefined) view['@sp'] = ev['@sp'];
-  const service = eventService(ev);
+  const service = ev['@service'];
   if (service !== undefined) view['@service'] = service;
   Object.assign(view, ev.props ?? {});
   if (service !== undefined) view['@service'] = service;
@@ -358,7 +358,7 @@ export class EventDetailComponent {
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
 
-  service = computed(() => eventService(this.event()) ?? '');
+  service = computed(() => this.event()['@service'] ?? '');
 
   /** Stable per-service colour, shared with the list rows / dropdown / waterfall. */
   svcColor = computed(() => serviceColor(this.service()));
@@ -395,7 +395,7 @@ export class EventDetailComponent {
    *  - Object/array   → structured row rendered inline by the JSON viewer
    *                     (collapsed to one line, expandable — Seq/Datalust-style)
    */
-  allProps = computed(() => buildProps(this.event().props ?? {}, eventService(this.event())));
+  allProps = computed(() => buildProps(this.event().props ?? {}, this.event()['@service']));
 
   hasException  = computed(() => !!this.event()['@x']);
 

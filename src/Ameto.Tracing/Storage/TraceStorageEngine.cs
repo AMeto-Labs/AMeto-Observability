@@ -166,12 +166,27 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// segments it could not reach stay missing for the life of the process either way, and
     /// holding "loading" for ever would only stop every trace alert from ever being evaluated.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation — cheap enough to ask on every request.</para>
+    /// <para><see cref="QueryAvailability.Degraded"/> instead of Available when that scan ended short
+    /// — failed as a whole, or left a segment it could not reach on disk (see
+    /// <see cref="_coldScanShort"/>) — for the rest of the process (#94).</para>
+    ///
+    /// <para>At most three volatile reads, no lock, no allocation — cheap enough to ask on every request.</para>
     /// </summary>
     public QueryAvailability Availability =>
-        Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
-      : !_coldLoaded.Task.IsCompleted        ? QueryAvailability.Loading
-      :                                        QueryAvailability.Available;
+        Volatile.Read(ref _writesClosed) != 0  ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted          ? QueryAvailability.Loading
+      : Volatile.Read(ref _coldScanShort) != 0 ? QueryAvailability.Degraded
+      :                                          QueryAvailability.Available;
+
+    /// <summary>
+    /// 1 once the startup cold scan has left segments on disk that a restart would load (#94): the
+    /// scan failed as a whole, or a segment stayed unreadable through its retries for a reason that
+    /// is not its bytes. Written once, before <see cref="_coldLoaded"/> completes, and never cleared:
+    /// nothing rescans. Narrower than <see cref="_coldTierIncomplete"/>, which a segment of a NEWER
+    /// format, or one damaged past reading its header, also raises — those are what the disk holds
+    /// for this build, not a load left unfinished, and a restart would not change them.
+    /// </summary>
+    private int _coldScanShort;
 
     /// <summary>Completed when the background cold scan has ended, however it ended. See <see cref="Availability"/>.</summary>
     private readonly TaskCompletionSource _coldLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2013,10 +2028,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private readonly string _walPath;
 
     /// <summary>
-    /// One more chance for a segment whose file was busy rather than broken. Returns null when it
-    /// is still unreadable; the caller then has to admit the cold tier is short.
-    /// </summary>
-    /// <summary>
     /// Time the whole load may spend waiting on busy files, TOTAL. Per-file retries looked cheap
     /// and are not: at six hundred milliseconds each, forty segments inside a backup window parks
     /// startup for twenty-four seconds with the cold tier unavailable throughout.
@@ -2036,24 +2047,39 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         catch (UnauthorizedAccessException) { return info; }
     }
 
-    private SpanSegmentInfo? RetryReadSegmentInfo(string file)
+    /// <summary>
+    /// More chances for a segment whose file was busy rather than broken: its info, or null with the
+    /// failure of the LAST attempt — which the caller classifies the way it classified the first
+    /// (#119 review). It used to swallow every failure and answer null, and the caller raised the
+    /// short-tier flags for whatever the null hid: a file gone by the retry, or one whose bytes the
+    /// reader now refused. A failure no wait can change — gone, or content — ends the retries at
+    /// once. With the load's retry budget spent there is no attempt, and the last failure is
+    /// <paramref name="first"/>.
+    /// </summary>
+    private (SpanSegmentInfo? Info, Exception LastFailure) RetryReadSegmentInfo(string file, Exception first)
     {
+        Exception last = first;
         for (int attempt = 1; attempt <= 3; attempt++)
         {
-            if (_loadRetryUsedTicks >= LoadRetryBudget.Ticks) return null;
+            if (_loadRetryUsedTicks >= LoadRetryBudget.Ticks) break;
             var waited = TimeSpan.FromMilliseconds(100 * attempt);
             _loadRetryUsedTicks += waited.Ticks;
             Thread.Sleep(waited);
             try
             {
-                var info = WithFileLength(SpanReader.ReadSegmentInfo(file));
+                var info = ReadColdSegmentInfo(file);
                 _logger.LogWarning(
                     "Cold segment {File} was busy at startup and read on attempt {Attempt}", file, attempt + 1);
-                return info;
+                return (info, last);
             }
-            catch { /* still busy, or now broken — the caller decides */ }
+            catch (Exception ex)
+            {
+                last = ex;
+                if (ex is FileNotFoundException or NewerSpanFormatException || FileBounds.DescribesContent(ex))
+                    break;   // gone is gone; damage is damage; the future stays the future
+            }
         }
-        return null;
+        return (null, last);
     }
 
     /// <summary>
@@ -2879,6 +2905,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         catch (Exception ex)
         {
             _coldTierIncomplete = true;
+            Volatile.Write(ref _coldScanShort, 1);   // Degraded, from the end of the load (#94)
             LogColdScanFailed(_logger, ex, _dataDir);
         }
     }
@@ -2890,9 +2917,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
         Message = "The cold trace segment scan of {DataDirectory} failed: the segments on disk are not served until a "
                 + "restart, and trace queries answer from the hot tier and what has been flushed since, reporting the "
-                + "window as unreadable. Trace ALERT RULES keep being evaluated on that partial data: a missing window "
-                + "reads as a quiet one, so a \"<\" rule can fire and a \">\" rule can resolve on spans that exist but "
-                + "were not loaded. Restart once the cause is fixed")]
+                + "window as unreadable. The trace store reports itself Degraded until then, and trace ALERT RULES are "
+                + "not evaluated on that partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set): a missing "
+                + "window would read as a quiet one. Restart once the cause is fixed")]
     private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
 
     /// <summary>
@@ -2900,6 +2927,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// nothing else produces on demand. Null in production.
     /// </summary>
     internal Exception? _failColdScanForTest;
+
+    /// <summary>
+    /// Test seam: reads a listed segment's header for the cold scan — its first attempt and every
+    /// retry — in place of <see cref="SpanReader.ReadSegmentInfo"/>, so a test can fail one file's
+    /// open the way a busy, vanishing or unreachable file fails it. Null in production.
+    /// </summary>
+    internal Func<string, SpanSegmentInfo>? _readColdSegmentInfoForTest;
+
+    /// <summary>One attempt at a listed segment's header, with its file's length (see <see cref="WithFileLength"/>).</summary>
+    private SpanSegmentInfo ReadColdSegmentInfo(string file) =>
+        WithFileLength(_readColdSegmentInfoForTest is { } read ? read(file) : SpanReader.ReadSegmentInfo(file));
 
     private void ScanColdSegments()
     {
@@ -2916,7 +2954,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
             try
             {
-                var info = WithFileLength(SpanReader.ReadSegmentInfo(file));
+                var info = ReadColdSegmentInfo(file);
                 loaded.Add(info);
 
                 // A header time range that cannot be true. The segment is kept and queried on the
@@ -2930,7 +2968,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                       + "suspect the volume it was written to",
                         file, info.MinStartNano, info.MaxStartNano);
             }
-            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            catch (FileNotFoundException)
             {
                 // GONE IS NOT BUSY. Between EnumerateFiles above and ReadSegmentInfo here, a
                 // compaction can publish its merged output and unlink the sources — the ordinary
@@ -2939,7 +2977,21 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // six hundred milliseconds retrying a path that does not exist and then raised the
                 // process-wide incomplete flag, so every later query answered Unreadable for the
                 // life of the process over a handover that lost nothing.
+                //
+                // A MISSING DIRECTORY IS NOT THIS (#119 review). The segments live directly in the
+                // data directory and nothing in this engine removes a directory, so a listed file
+                // whose directory has gone is a volume that dropped after the listing — a share,
+                // a bind mount — not a handover. Skipped here at Debug, every file of the tier was,
+                // and the store read Available over none of it: the #94 hazard. It falls to the
+                // catch below instead — retried, and the store Degraded if it stays gone — which is
+                // the reading MeetMissingSegmentFile gives the same evidence on a request.
                 _logger.LogDebug("Cold segment {File} vanished while loading — retired by the engine", file);
+                continue;
+            }
+            catch (NewerSpanFormatException ex)
+            {
+                // The future, named by the read that met it (#119 review N1): not busy, not damage.
+                MeetNewerColdSegment(file, ex);
                 continue;
             }
             catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
@@ -2948,13 +3000,37 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // scanning a freshly written file, a backup agent's handle, the compactor's own
                 // File.Move. A few hundred milliseconds is the difference between a segment that
                 // is missing for this process and one that was never really unavailable.
-                var recovered = RetryReadSegmentInfo(file);
+                var (recovered, last) = RetryReadSegmentInfo(file, ex);
                 if (recovered is not null) { loaded.Add(recovered); continue; }
+
+                // THE LAST FAILURE DECIDES, NOT THE FIRST (#119 review) — the metric scan's rule. A
+                // retry that ends in a vanished file was a handover: on Windows the compactor's
+                // delete-pending source refuses the first open with access denied and is gone by the
+                // second, its spans already in the published merge. One that ends in refused bytes
+                // is damage, and takes the damage path. Raising the flags below for either made the
+                // store Degraded, and every trace alert rule silent, until a restart, over a file
+                // that is not there or not readable by any restart.
+                if (last is FileNotFoundException)
+                {
+                    _logger.LogDebug(last, "Cold segment {File} vanished while it was being retried — retired by the engine", file);
+                    continue;
+                }
+                if (last is NewerSpanFormatException)
+                {
+                    MeetNewerColdSegment(file, last);
+                    continue;
+                }
+                if (FileBounds.DescribesContent(last))
+                {
+                    MeetDamagedColdSegment(file, last);
+                    continue;
+                }
 
                 // Still not readable. It is NOT deleted — that was the old answer and it took the
                 // sidecars with it — but it is also not in the snapshot, so no read can honestly
-                // call a window complete until a restart picks it up.
+                // call a window complete until a restart picks it up. Degraded until then (#94).
                 _coldTierIncomplete = true;
+                Volatile.Write(ref _coldScanShort, 1);
                 // NOT EVERY FAILURE TO OPEN IS A REASON TO DESTROY. This catch answered anything at
                 // all with DeleteSegmentFiles, so a segment held open by an antivirus, a backup
                 // agent or the compactor's own File.Move was deleted at startup along with its
@@ -2966,75 +3042,19 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 // Skipped rather than loaded: the file is not readable NOW, and nothing rescans, so
                 // the next restart is what picks it up. That is a cold-tier gap until then, which
                 // is strictly better than a deletion that cannot be undone.
-                _logger.LogError(ex,
+                _logger.LogError(last,
                     "Cold segment {File} could not be read at startup and is left on disk, not deleted — "
                   + "but it is missing from this run's cold tier, so every trace query will report an "
-                  + "unreadable region on the list and span-search paths until the service is restarted", file);
+                  + "unreadable region on the list and span-search paths until the service is restarted, "
+                  + "and the trace store reports itself Degraded: trace alert rules are not evaluated on "
+                  + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). If a restart names "
+                  + "the same file again, the failure is not transient — check the file's permissions and its "
+                  + "volume, or move it aside", file);
                 continue;
             }
             catch (Exception ex)
             {
-                // CONTENT-SHAPED DAMAGE — the catch above has already ruled out everything that is
-                // about the MACHINE rather than the file. v1 segments (12-byte footer) land here on
-                // the footer magic, and deleting them is the migration path they have always had.
-                //
-                // WHAT WAS MISSING IS THE RECORD. Deleting is a decision about disk; it is also, and
-                // silently, a decision about every answer this process will ever give. The window
-                // the file covered is now on no disk at all, so every later page over that band
-                // reads out every file that still exists and makes the strong positive claim that
-                // it read the window — `done {"complete":true}`. That claim is exactly what
-                // VanishedRegionLog was added in this same branch to make impossible, and the query
-                // path was taught it while the startup path went on destroying data behind its back.
-                //
-                // The range comes from the 27-byte header, which is intact in every version this
-                // engine has written and is readable even when the rest of the file is not — see
-                // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
-                // is nothing left to ask.
-                // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING
-                // IT IS HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` is an
-                // InvalidDataException like any other, so it classified as Corrupt and landed here,
-                // where TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a
-                // perfectly good newer segment — and the file went, with its three sidecars, logged
-                // as "likely format v1". Roll a binary back after a day of writing a newer format
-                // and that day is gone, unrecoverably, on first start.
-                //
-                // A newer file is left alone and the cold tier says it is short: loud, reversible
-                // by rolling forward again, and true. Deletion stays for files whose header cannot
-                // be read at all, which is where the v1 migration path actually lives.
-                if (SpanReader.LooksLikeNewerFormat(file))
-                {
-                    _coldTierIncomplete = true;
-                    _logger.LogError(ex,
-                        "Segment {File} was written by a NEWER format than this build understands. "
-                      + "It is left untouched — this build cannot read it, and deleting it would "
-                      + "destroy data a newer build can. Every trace query reports an unreadable "
-                      + "region until this node runs a build that knows the format", file);
-                }
-                else if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
-                {
-                    _vanished.Record(minNano, maxNano);
-                    _vanished.RecordPath(file);
-                    _logger.LogWarning(ex,
-                        "Unreadable segment {File} — deleting (likely format v1). The window "
-                      + "[{MinNano}, {MaxNano}] it covered is recorded as unreadable, so queries over "
-                      + "that range will report truncation rather than claim to be complete",
-                        file, minNano, maxNano);
-                    DeleteSegmentFiles(file);
-                }
-                else
-                {
-                    // NOT BEING ABLE TO RECORD A LOSS IS NOT A LICENCE TO CAUSE ONE. Without a range
-                    // the deletion would be unreportable: no region to overlap, no path to classify,
-                    // and every later window silently whole. The file stays, and the process-wide
-                    // flag says the cold tier is short — which is loud, recoverable by a restart
-                    // once someone moves the file, and true.
-                    _coldTierIncomplete = true;
-                    _logger.LogError(ex,
-                        "Segment {File} is unreadable AND its header range cannot be read, so deleting "
-                      + "it would lose a window nothing could report. It is left on disk and excluded "
-                      + "from this run's cold tier; every trace query will report an unreadable region "
-                      + "until the file is moved aside and the service restarted", file);
-                }
+                MeetDamagedColdSegment(file, ex);
             }
         }
 
@@ -3055,6 +3075,84 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         _logger.LogInformation("Loaded {Count} cold span segments in {Ms} ms",
             _coldSegments.Length, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>
+    /// A listed segment written in a NEWER format than this build reads — named so by the read that
+    /// met it (<see cref="NewerSpanFormatException"/>), on the first attempt or the last retry.
+    /// </summary>
+    private void MeetNewerColdSegment(string file, Exception ex)
+    {
+        // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING IT IS
+        // HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` was an InvalidDataException
+        // like any other, so it classified as Corrupt and reached the damage path, where
+        // TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a perfectly good newer
+        // segment — and the file went, with its three sidecars, logged as "likely format v1". Roll
+        // a binary back after a day of writing a newer format and that day is gone, unrecoverably,
+        // on first start.
+        //
+        // A newer file is left alone and the cold tier says it is short: loud, reversible by
+        // rolling forward again, and true. Not Degraded: no restart of this build reads it (#94).
+        // Decided from the read that failed, not from a second open (#119 review N1): the probe
+        // that used to ask answered "not newer" whenever its own open failed, and the damage path
+        // then deleted the file.
+        _coldTierIncomplete = true;
+        _logger.LogError(ex,
+            "Segment {File} was written by a NEWER format than this build understands. "
+          + "It is left untouched — this build cannot read it, and deleting it would "
+          + "destroy data a newer build can. Every trace query reports an unreadable "
+          + "region until this node runs a build that knows the format", file);
+    }
+
+    /// <summary>
+    /// A listed segment whose BYTES the reader refused — on the first attempt, or on the last of the
+    /// retries a busy file got (#119 review). See the comments inside for the two verdicts.
+    /// </summary>
+    private void MeetDamagedColdSegment(string file, Exception ex)
+    {
+        // CONTENT-SHAPED DAMAGE — the caller has already ruled out everything that is about the
+        // MACHINE rather than the file, and a newer format (MeetNewerColdSegment). v1 segments
+        // (12-byte footer) land here on the footer magic, and deleting them is the migration path
+        // they have always had.
+        //
+        // WHAT WAS MISSING IS THE RECORD. Deleting is a decision about disk; it is also, and
+        // silently, a decision about every answer this process will ever give. The window
+        // the file covered is now on no disk at all, so every later page over that band
+        // reads out every file that still exists and makes the strong positive claim that
+        // it read the window — `done {"complete":true}`. That claim is exactly what
+        // VanishedRegionLog was added in this same branch to make impossible, and the query
+        // path was taught it while the startup path went on destroying data behind its back.
+        //
+        // The range comes from the 27-byte header, which is intact in every version this
+        // engine has written and is readable even when the rest of the file is not — see
+        // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
+        // is nothing left to ask. Deletion stays for files whose header cannot be read at all,
+        // which is where the v1 migration path actually lives.
+        if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+        {
+            _vanished.Record(minNano, maxNano);
+            _vanished.RecordPath(file);
+            _logger.LogWarning(ex,
+                "Unreadable segment {File} — deleting (likely format v1). The window "
+              + "[{MinNano}, {MaxNano}] it covered is recorded as unreadable, so queries over "
+              + "that range will report truncation rather than claim to be complete",
+                file, minNano, maxNano);
+            DeleteSegmentFiles(file);
+        }
+        else
+        {
+            // NOT BEING ABLE TO RECORD A LOSS IS NOT A LICENCE TO CAUSE ONE. Without a range
+            // the deletion would be unreportable: no region to overlap, no path to classify,
+            // and every later window silently whole. The file stays, and the process-wide
+            // flag says the cold tier is short — which is loud, recoverable by a restart
+            // once someone moves the file, and true.
+            _coldTierIncomplete = true;
+            _logger.LogError(ex,
+                "Segment {File} is unreadable AND its header range cannot be read, so deleting "
+              + "it would lose a window nothing could report. It is left on disk and excluded "
+              + "from this run's cold tier; every trace query will report an unreadable region "
+              + "until the file is moved aside and the service restarted", file);
+        }
     }
 
     /// <summary>The <c>.tix</c> that sits beside a segment: same base name, different extension.</summary>
