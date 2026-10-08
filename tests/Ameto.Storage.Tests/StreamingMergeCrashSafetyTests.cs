@@ -550,6 +550,42 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.Equal(TimeSpan.FromSeconds(600), StorageEngine.PauseAfter(MergeOutcome.NothingToMerge));
     }
 
+    /// <summary>
+    /// A replicated segment shaped like this fixture's own flushes — <paramref name="count"/> events of
+    /// round <paramref name="round"/>, now — so the planner takes it into a merge beside them.
+    /// </summary>
+    private string WritePeerSegment(ulong segId, int round, int count)
+    {
+        var peer = new NodeId(7);
+        var pool = new StringInternPool();
+        using var hot = new HotTierSegment(count * 2, 1L << 22);
+        long now = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < count; i++)
+        {
+            int n = round * 1000 + i;
+            string template = "evt {n} round " + round % 3;
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(peer.Value, (uint)(round * 100_000 + i)).RawValue,
+                TimestampUtcTicks        = now + n * TimeSpan.TicksPerMillisecond,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = pool.Intern(template),
+                ServiceNamePoolIndex     = pool.Intern("Svc." + round % 4),
+                TraceIdHi                = (ulong)(n + 1),
+                TraceIdLo                = (ulong)(n + 2),
+                SpanId                   = (ulong)(n + 3),
+            }, Props(n), template));
+        }
+        hot.Freeze();
+        string path = Path.Combine(SegDir, $"{peer.Value}-{segId}.seg");
+        using (var writer = new SegmentWriter(path))
+        {
+            writer.WriteEvents(hot, pool);
+            writer.Finalise(peer, new SegmentId(segId));
+        }
+        return path;
+    }
+
     /// <summary>A replicated segment's file, as a peer pushes it: another node's id, four events.</summary>
     private string WritePeerSegment(ulong segId)
     {
@@ -1400,6 +1436,110 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         AssertSameEvents(before, ReadEverything());
     }
 
+    // ── Every listed source the catalog names is taken out, a replica too (#120 round 4) ──
+
+    /// <summary>
+    /// A merge whose sources include a replica (<c>{node}-{id}.seg</c>, a merge candidate like any
+    /// other), killed after the move. The start could not read the output, so it waited, and the
+    /// scan registered every source, the replica too. The pass that read the output whole committed
+    /// it but took only the sources with local names out: the replica stayed in service as if its
+    /// peer had pushed it again, and the manifest went. Its events were served twice, 660 for 600,
+    /// for good. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task AReplicaSourceTheWaitKeptInService_IsTakenOutByTheCommit()
+    {
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 9; round++) await WriteSegmentAsync(round, 60);
+        var replica = WritePeerSegment(900, 9, 60);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.Equal(10, snap.Count);                                     // setup: nine local and the replica
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Assert.False(File.Exists(replica), "setup: the replica was not a source");
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);                                        // killed after the move, before any unlink
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.None))
+            await RestartAsync();
+        Assert.Equal(10, _engine.ListSegments().Count);                  // setup: the output waits, all ten sources serve
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);   // reads the output whole: the commit
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);   // 2: the replica beside the output
+        AssertSameEvents(before, ReadEverything());
+        Assert.False(File.Exists(replica), "the replica source survived the commit");
+
+        await RestartAsync();
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// The same replica road through round 2's take-out: the start's sweep could not read the
+    /// manifest, so the scan registered the output and all ten sources, and the next pass took out
+    /// the nine local names but kept the replica as "pushed again": 660 for 600, for good.
+    /// No seam, any OS.
+    /// </summary>
+    [Fact]
+    public async Task AReplicaSourceTheScanRegisteredBesideItsOutput_IsTakenOutByTheNextPass()
+    {
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 9; round++) await WriteSegmentAsync(round, 60);
+        var replica = WritePeerSegment(900, 9, 60);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Assert.False(File.Exists(replica), "setup: the replica was not a source");
+        Restore(snap, snap.Keys);
+        await RestartAsync();                                             // no manifest yet: the scan registers all 11
+        Assert.Equal(11, _engine.ListSegments().Count);                   // setup
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);   // 2: the replica beside the output
+        AssertSameEvents(before, ReadEverything());
+        Assert.Empty(Manifests());
+    }
+
+    /// <summary>
+    /// A replica its peer pushes AGAIN while the manifest of the merge that took it still lives (another
+    /// source held): the same segment, whose events the output holds, so it is taken out like any
+    /// source the manifest lists. It used to be left in service as "in service again" and the double
+    /// count kept for good; the one segment that would be wrongly taken out is a DIFFERENT one pushed
+    /// under the same node id and segment id, a duplicate NodeId — the deployment error no key can
+    /// resolve.
+    /// </summary>
+    [Fact]
+    public async Task AReplicaPushedAgainWhileItsManifestLives_IsTakenOut()
+    {
+        await _engine.CatalogLoaded;   // a pass is Busy until the boot scan is done
+        for (int round = 0; round < 9; round++) await WriteSegmentAsync(round, 60);
+        var held    = _engine.ListSegments().Select(s => s.FilePath).Order(StringComparer.Ordinal).First();
+        var replica = WritePeerSegment(904, 9, 60);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));
+        var replicaBytes = await File.ReadAllBytesAsync(replica);
+        _engine._deleteSegmentFile = UnlinkRefusing(held);              // keeps the manifest alive
+
+        var before = ReadEverything();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        Assert.False(File.Exists(replica), "setup: the replica was not a source");
+        Assert.Single(Manifests());
+
+        var staged = replica + ".push";                                  // the peer pushes it again
+        await File.WriteAllBytesAsync(staged, replicaBytes);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(staged, replica));
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == replica);   // setup: back in service, beside the output
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.DoesNotContain(_engine.ListSegments(), s => s.FilePath == replica);
+        AssertSameEvents(before, ReadEverything());
+    }
+
     /// <summary>
     /// An output in a segment format newer than this release reads, every source still on disk:
     /// a version field a bit flip pushed past the newest (v263 = 7 + 256), or a rollback's merge
@@ -1600,41 +1740,6 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         foreach (var name in snap.Keys) Assert.False(File.Exists(Path.Combine(SegDir, name)), $"{name} survived recovery");
         Assert.Equal(0, _engine.PendingSegmentDeleteCount);
         Assert.Empty(Manifests());
-    }
-
-    /// <summary>
-    /// A replica a manifest lists that the catalog names is no longer that manifest's to delete. A
-    /// replica's path comes back into service when its peer pushes it again after a merge took it;
-    /// recovery used to unlink it out from under the new entry, which then named a file that was
-    /// gone. It is left alone, and it does not hold the manifest either — the rule a parked delete
-    /// already follows when the catalog names its path again — so no later start deletes it. Built
-    /// directly: a manifest whose output exists, listing a replica imported to <c>{node}-{id}.seg</c>.
-    /// </summary>
-    [Fact]
-    public async Task AListedFileTheCatalogNames_IsNeitherDeletedNorWaitedFor()
-    {
-        await _engine.CatalogLoaded;   // a pass is Busy until the boot scan is done
-        for (int round = 0; round < 10; round++)
-            await WriteSegmentAsync(round, 60);
-        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
-        var output = Assert.Single(_engine.ListSegments()).FilePath;
-        var live   = WritePeerSegment(903);
-        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(live));
-        var before = ReadEverything();
-        await File.WriteAllLinesAsync(output + ".mergemanifest", [Path.GetFileName(live)]);
-
-        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
-
-        Assert.True(File.Exists(live), "recovery unlinked a file the catalog serves");
-        Assert.Equal(2, _engine.ListSegments().Count);
-        AssertSameEvents(before, ReadEverything());
-        Assert.Empty(Manifests());   // kept for it, the next start would delete the file before its scan names it
-
-        await RestartAsync();
-
-        Assert.True(File.Exists(live), "the next start unlinked it");
-        Assert.Equal(2, _engine.ListSegments().Count);
-        AssertSameEvents(before, ReadEverything());
     }
 
     /// <summary>

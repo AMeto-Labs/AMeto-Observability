@@ -3851,25 +3851,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// File.Delete it got otherwise, outside the gate, recorded nothing, so a scan already running
     /// could register a source this sweep had just deleted (#98).</para>
     ///
-    /// <para>Two kinds of listed file are not this sweep's to touch. One still PARKED has an owner:
-    /// the retry it was parked for, which deletes it once nothing holds it, under
-    /// <c>_importLock</c> and against the catalog, and says so at Warning once its window is spent.
-    /// Tried here as well it failed again on every pass, at Warning per source: a query pins every
-    /// segment of its window for its whole run (#114), so a merge under a long query leaves every
-    /// source it reached parked on Windows, and each 15 s pass logged up to
-    /// <see cref="MergeMaxSources"/> Warnings for deletes already being retried. Left to the park,
-    /// the manifest waits a pass longer. A REPLICA the catalog names, <c>{node}-{id}.seg</c>, is in
-    /// service again: a peer pushed it to the path its merged-away copy had. It is neither unlinked
-    /// — which left its entry naming a file that was gone — nor waited for: the rule a parked delete
-    /// follows when the catalog names its path again. So the manifest can go without it, and no
-    /// later start unlinks it before its scan names it.</para>
+    /// <para>A listed file still PARKED is not this sweep's to touch: it has an owner, the retry it
+    /// was parked for, which deletes it once nothing holds it, under <c>_importLock</c> and against
+    /// the catalog, and says so at Warning once its window is spent. Tried here as well it failed
+    /// again on every pass, at Warning per source: a query pins every segment of its window for its
+    /// whole run (#114), so a merge under a long query leaves every source it reached parked on
+    /// Windows, and each 15 s pass logged up to <see cref="MergeMaxSources"/> Warnings for deletes
+    /// already being retried. Left to the park, the manifest waits a pass longer.</para>
     ///
-    /// <para>A name only this node writes cannot come back that way. In the catalog beside its
-    /// output, it is a source a catalog scan registered because the sweep before it missed this
-    /// manifest (it could not read the file), and its events are counted twice. It is taken out as
-    /// a commit takes out its sources: the entry removed and recorded for a running scan under both
-    /// locks, the file parked and unlinked. Left in service with the manifest gone, it stayed a
-    /// duplicate until its TTL, and the next merge copied it into a new output.</para>
+    /// <para>A listed file the catalog NAMES is a source served beside the output that holds its
+    /// events: a catalog scan registered it because no sweep before it could settle this manifest
+    /// (it could not read it, or the output's verdict waited), or its peer pushed the replica again
+    /// after the merge took it. It is taken out as a commit takes out its sources: the entry removed
+    /// and recorded for a running scan under both locks, the file parked and unlinked, the entry
+    /// first so no entry is left naming a file that is gone. A replica name used to be left in
+    /// service as "pushed again" and the manifest dropped: that kept its events counted twice for
+    /// good, 660 for 600 whichever way it had come back. The one file wrongly taken out this way is
+    /// a DIFFERENT segment pushed under the same node id and segment id: two nodes configured with
+    /// one NodeId, the deployment error <see cref="ImportSegment(string, string)"/> cannot resolve
+    /// either.</para>
     ///
     /// <para>Deciding on the output alone holds only while the output stays where its manifest
     /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
@@ -3969,10 +3969,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             if (!string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) sources.Add(path);
         }
 
-        var keys      = new SegmentKey[sources.Count];
-        var unlink    = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
-        var guarded   = new bool[sources.Count];
-        var inService = new bool[sources.Count];      // a replica pushed again: no longer this manifest's
+        var keys    = new SegmentKey[sources.Count];
+        var unlink  = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
+        var guarded = new bool[sources.Count];
         for (int i = 0; i < keys.Length; i++) keys[i] = KeyOfSegmentFileName(sources[i]);
 
         SegmentInfo? displaced = null;
@@ -3987,14 +3986,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 if (_segments.TryGetValue(keys[i], out var entry)
                     && string.Equals(entry.FilePath, sources[i], StringComparison.OrdinalIgnoreCase))
                 {
-                    if (IsReplicaFileName(sources[i]))
-                    {
-                        inService[i] = true;
-                        continue;
-                    }
-                    // A name only this node writes, in the catalog beside its output: a catalog scan
-                    // registered it because no sweep before it could settle this manifest. Taken out
-                    // as a commit takes out its sources, entry first.
+                    // In the catalog beside its output: a catalog scan registered it because no sweep
+                    // before it could settle this manifest, or its peer pushed a replica again. Either
+                    // way its events are the output's, and it is taken out as a commit takes out its
+                    // sources, entry first (see RecoverInterruptedMerges).
                     (named ??= []).Add((i, entry));
                 }
                 unlink[i] = sources[i];
@@ -4044,12 +4039,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         try     { SettleMergedSources(keys, unlink, guarded); }
         finally { ReleaseUntriedMergeGuards(guarded); }
 
-        // The manifest goes once nothing it lists is left to it: no source parked, and none on disk
-        // but a replica back in service. File.Exists, the merge's own test for the same decision.
+        // The manifest goes once nothing it lists is left to it: no source parked, none on disk.
+        // File.Exists, the merge's own test for the same decision.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
-            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i])
-                      || (!inService[i] && File.Exists(sources[i]));
+            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]);
         if (!anyLeft)
         {
             File.Delete(manifest);
@@ -4324,23 +4318,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 return new SegmentKey(new NodeId(node), new SegmentId(id));
         }
         return default;
-    }
-
-    /// <summary>
-    /// Whether a segment file's NAME is a replica's, <c>{node}-{id}.seg</c>: the name an import
-    /// lands a file at, and so the only one a merged-away source can come back into service under.
-    /// Every name this node writes carries the segment's time span after its id.
-    /// </summary>
-    private static bool IsReplicaFileName(string path)
-    {
-        ReadOnlySpan<char> stem = Path.GetFileNameWithoutExtension(path.AsSpan());
-        int dash = stem.IndexOf('-');
-        return dash > 0
-            && stem[(dash + 1)..].IndexOf('-') < 0
-            && uint.TryParse(stem[..dash], System.Globalization.NumberStyles.None,
-                             System.Globalization.CultureInfo.InvariantCulture, out _)
-            && ulong.TryParse(stem[(dash + 1)..], System.Globalization.NumberStyles.None,
-                              System.Globalization.CultureInfo.InvariantCulture, out _);
     }
 
     /// <summary>
