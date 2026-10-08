@@ -114,4 +114,37 @@ public sealed class MetricReaderPoolTests : IDisposable
 
         Assert.Equal(2, returned.Count);                              // and the block itself once the walk is over
     }
+
+    /// <summary>
+    /// ...AND A COMPRESSED BLOCK OVER THE LINE IS NOT KEPT ALIVE BY THE WALK EITHER (#126 review L1). A
+    /// block above 8 MiB is allocated, not rented, so "giving it back" handed nothing to the pool — and
+    /// the iterator still held it in its <c>finally</c>, so it stayed reachable until the last series
+    /// was consumed: a query over the stand's carried 5-minute file held the ~43 MiB compressed block
+    /// beside the 58 MiB inflated one for its whole walk. The read now drops its reference.
+    /// </summary>
+    [Fact]
+    public void A_compressed_block_over_the_line_is_unreachable_once_the_walk_begins()
+    {
+        var big = V3File(series: 512, points: 2_400, seed: 5);
+        Assert.True(Sizes(big.FilePath).Comp > 9 * 1024 * 1024, "setup: the compressed block must be over the line");
+
+        WeakReference? released = null;
+        MetricReader.CompressedReleasedForTest = block => released ??= new WeakReference(block);
+        try
+        {
+            using var e = MetricReader.ReadAllSync(big.FilePath).GetEnumerator();
+            Assert.True(e.MoveNext());
+            Assert.NotNull(released);
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert.False(released.IsAlive, "the compressed block is still reachable while its series are walked");
+
+            int series = 1;
+            while (e.MoveNext()) series++;
+            Assert.Equal(512, series);
+        }
+        finally { MetricReader.CompressedReleasedForTest = null; }
+    }
 }

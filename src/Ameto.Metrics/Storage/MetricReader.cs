@@ -81,6 +81,12 @@ internal static class MetricReader
     /// </summary>
     [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
 
+    /// <summary>
+    /// Test seam: a v3 read's compressed block at the moment the read lets go of it, before the first
+    /// series is walked — pooled or not (#126 review L1). On the reading thread. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<byte[]>? CompressedReleasedForTest;
+
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
 
@@ -435,10 +441,10 @@ internal static class MetricReader
             // the read — 128 MiB of gen2 parked for a caller that may never come, on a box whose whole
             // heap is 384 MiB. A block above the line is allocated for the read and left to the collector.
             // A rewrite brings its own buffers instead (ReadScratch), which this read neither pools nor drops.
-            byte[] comp = scratch is not null
+            byte[]? comp = scratch is not null
                 ? scratch.Compressed((int)compSize)
                 : compSize <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent((int)compSize) : GC.AllocateUninitializedArray<byte>((int)compSize);
-            bool   compHeld = scratch is null;
+            bool    compHeld = scratch is null;
             byte[]? raw  = null;
             try
             {
@@ -456,11 +462,16 @@ internal static class MetricReader
                 // The compressed copy has done its work: given back BEFORE the series are walked, so
                 // a read holds one block and not two for as long as its caller takes over the series
                 // (a rewrite decodes and accumulates a whole chunk while this iterator is suspended).
+                // And the reference DROPPED (#126 review L1): a block over the line is not pooled, so
+                // giving it back hands nothing anywhere, and this iterator kept it reachable for the
+                // whole walk — a query over a 58 MiB block held its ~43 MiB compressed copy beside it.
                 if (compHeld)
                 {
                     Give(comp);
                     compHeld = false;
                 }
+                CompressedReleasedForTest?.Invoke(comp);
+                comp = null;
 
                 if (at is null)
                 {
@@ -489,7 +500,7 @@ internal static class MetricReader
             }
             finally
             {
-                if (compHeld) Give(comp);
+                if (compHeld) Give(comp!);
                 if (raw is not null && scratch is null) Give(raw);
             }
         }
