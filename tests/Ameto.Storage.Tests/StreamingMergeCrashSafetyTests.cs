@@ -49,6 +49,20 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// A fact that needs a file held open with a share mode only Windows enforces: a holder that lets
+    /// nothing delete, move or read it. Elsewhere an open file unlinks, moves and reads, so the fact
+    /// has nothing to show there; it is reported SKIPPED, not passed by returning early.
+    /// </summary>
+    public sealed class WindowsFactAttribute : FactAttribute
+    {
+        public WindowsFactAttribute()
+        {
+            if (!OperatingSystem.IsWindows())
+                Skip = "Windows only: holds a file open with a share mode only Windows enforces";
+        }
+    }
+
     public Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
@@ -613,10 +627,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// one it lists, and the park the commit made in its hold is what keeps it from registering
     /// the file beside the output. Windows-only: elsewhere the held file is deleted anyway.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ACatalogScanStartingBetweenTheSwapAndTheUnlinks_RegistersNoHeldSource()
     {
-        if (!OperatingSystem.IsWindows()) return;
         await _engine.CatalogLoaded;
         for (int round = 0; round < 10; round++)
             await WriteSegmentAsync(round, 60);
@@ -923,10 +936,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// before #98 with the double count itself, the held source served beside the output. Linux
     /// unlinks an open file, so there the seam above is the only way to this state.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ASourceHeldOpenAcrossARestart_IsNotServedBesideTheOutput()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++)
             await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
@@ -1137,10 +1149,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// takes the verdict from it rather than read the output again, and moves the output aside once
     /// it is let go. Windows only: elsewhere an open file moves.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ATornOutputHeldAtStart_StaysOutOfService_AndIsQuarantinedByTheNextPass()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1182,10 +1193,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// it, and the scan used to register the torn output (which it can frame) beside its ten
     /// sources. The next pass, the manifest let go, quarantines the output. Windows only.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ATornOutputWhoseManifestCannotBeReadAtStart_IsStillNotServed()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1219,10 +1229,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// output beside the segment its sources had been merged into: 1 200 events for 600.
     /// Windows only: elsewhere an open file moves and reads.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ATornVerdict_IsNotUndoneByALaterReadFailure()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1258,10 +1267,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// and its ten sources in. The next pass, unable to open the output, took it for committed and
     /// unlinked every source: 0 of 600 events served. Windows only.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task AnOutputAPassCannotRead_IsNotTakenAsCommitted()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1296,10 +1304,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// that one: every source unlinked, 0 of 600 served, and the output torn. The verdict waits for
     /// a sweep that can read it. Windows only.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task AnOutputTheStartCannotRead_IsNotTakenAsCommitted()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1333,10 +1340,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// in and those five come out in one catalog generation, so every event is served once from
     /// then on. Windows only.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task AnOutputTheStartCouldNotRead_IsCommittedByThePassThatReadsIt()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1370,10 +1376,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// merged meanwhile would put its events in a new output, and the waiting output, committed
     /// later, would serve them a second time. Windows only.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task WhileAnOutputsVerdictWaits_ItsSourcesAreNotMerged()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var before = ReadEverything();
         var snap   = SnapshotSources();
@@ -1504,10 +1509,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// listed are in service, a pass may merge them, and counted again they would be called
     /// "already deleted" too. Windows only: elsewhere an open file moves.
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task ATornOutputHeldWithSourcesGone_IsReportedOnce_AcrossThePassesThatWaitForIt()
     {
-        if (!OperatingSystem.IsWindows()) return;
         for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
         var snap = SnapshotSources();
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
