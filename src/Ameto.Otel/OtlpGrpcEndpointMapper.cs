@@ -71,14 +71,32 @@ public static class OtlpGrpcEndpointMapper
                     IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
+        {
+            // Built once, here: it carries the point limit, and a capturing lambda inside the route
+            // handler would be a new closure per call.
+            int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
+            Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decodeMetrics = (c, msg) =>
+                DecodeMetrics(c, msg.AsSpan(), maxMetricPoints);
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, outOfMemoryLog, static (c, msg) =>
-                {
-                    var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
-                    int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
-                     .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-                    return (true, refused, "points stamped more than 24 h in the future were refused");
-                }));
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, outOfMemoryLog, decodeMetrics));
+        }
+    }
+
+    /// <summary>
+    /// The metrics Export's decode and store. The data points are counted before one is built
+    /// (#126 review F2): a batch over <c>Ingestion.MaxOtlpMetricPoints</c> throws
+    /// <see cref="OtlpMetricPointBudget.TooManyPointsException"/>, answered RESOURCE_EXHAUSTED — its
+    /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried.
+    /// </summary>
+    internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints)
+    {
+        int count = OtlpMetricPointBudget.CountProto(message);
+        if (count > maxPoints) throw new OtlpMetricPointBudget.TooManyPointsException(count, maxPoints);
+
+        var points  = OtlpMetricProtoParser.Parse(message);
+        int refused = ctx.RequestServices.GetRequiredService<IMetricIngester>()
+            .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
+        return (true, refused, "points stamped more than 24 h in the future were refused");
     }
 
     /// <summary>
@@ -232,6 +250,14 @@ public static class OtlpGrpcEndpointMapper
             try
             {
                 (ok, rejected, why) = decode(ctx, segment);
+            }
+            catch (OtlpMetricPointBudget.TooManyPointsException)
+            {
+                // More data points than the server decodes in one request, refused before one was
+                // built (#126 review F2): the "batch too large" answer, as for one over the byte limit.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
+                return;
             }
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {

@@ -188,6 +188,8 @@ printf '%s' '{"resourceLogs":[…]}' | gzip \
 
 **Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length`, proved it by arriving, or, gzip-compressed, **inflated** past it. The inflated size is decided on bytes already written, so a body that would inflate to gigabytes (deflate reaches ~1032:1) is stopped after at most one limit of output: no single buffer is ever rented past the limit, and the request holds at most the compressed body plus one and a half limits of inflate buffer — one limit when the gzip trailer states the size honestly, one and a half when it understates it and the buffer doubles its way up (about 20 MiB in all at the 8 MB default); that refusal is also logged as a warning (`OtlpGzipTooLarge`, shared with the gRPC receiver), since it is a misconfigured exporter or a probe — at most once a second, with the count since the last line and the latest sender: its API key as `GET /api/auth/keys` lists it (`keyPreview`, never the key) and its remote address. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
 
+A **metrics** batch is also `413` when it carries more data points than `Ingestion.MaxOtlpMetricPoints` (~157 000 in a 512 MB container): the points are counted before one is decoded, by a walk that allocates nothing, because a data point can be two bytes on the wire and ~125 B decoded — a batch inside the byte limit could otherwise decode past the server's heap. Nothing of it is ingested; the response is an OTLP `Status` encoded like the request — `{ "message": "the batch holds more data points than this server decodes in one request; split it" }` — and over gRPC `RESOURCE_EXHAUSTED` (8) with the same message. Split the batch.
+
 **Response `415 Unsupported Media Type`:** `Content-Encoding` names a coding other than gzip — `deflate`, `br`, `zstd`, gzip applied twice, anything else. Refused before the body is read, so nothing was ingested. The response carries `Accept-Encoding: gzip, identity` and, encoded like the request (protobuf or JSON), an OTLP `Status` whose `message` names what was sent — the collector prints that message in its own log:
 
 ```json
@@ -230,7 +232,7 @@ before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 |---|---|
 | `0` OK | accepted; the response carries `partial_success.rejected_…` when the ingest buffer dropped records |
 | `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
-| `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes` |
+| `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes`, or a metrics batch over `Ingestion.MaxOtlpMetricPoints` data points |
 | `12` UNIMPLEMENTED | unsupported compression |
 | `14` UNAVAILABLE | a gzip message arrived while every inflate slot shared with the HTTP receivers stayed taken for a second, or the server ran out of memory inflating it, reading it, or decoding and storing it (a decode that ran out used to be `3`; see the `503` above); retried by exporters |
 | `16` UNAUTHENTICATED | missing or insufficient API key |

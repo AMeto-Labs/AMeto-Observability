@@ -125,6 +125,39 @@ public sealed class IngestionOptions
     public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;
 
     /// <summary>
+    /// The most data points one OTLP METRICS batch may carry. Counted before a point is built, by a
+    /// walk of the batch that allocates nothing; a batch over it is refused 413 (gRPC:
+    /// RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested (#126 review F2).
+    ///
+    /// <para>Why a count and not just <see cref="MaxOtlpBatchBytes"/>: a metric data point can be two
+    /// bytes on the wire and ~125 decoded (~200 from JSON) — measured, 62–67× — so a batch inside the
+    /// byte limit could decode to ~500 MiB, past a 512 MB container's whole 384 MiB heap. Its own
+    /// decode then ran out of memory, which since #125 is answered 503, and the exporter retried it,
+    /// out of memory every time. Logs and traces are not counted: they stream into bounded rings and
+    /// do not expand like this.</para>
+    ///
+    /// <para>Unset: <see cref="DefaultMaxOtlpMetricPointsFor"/> — the request-body share of the heap
+    /// (<c>MemoryBudgets.IngestBufferBytes</c>) at <see cref="DecodedMetricPointBytes"/> a point,
+    /// never below <see cref="MinOtlpMetricPoints"/>: ~157 000 on a 512 MB container, ~1 048 000 where
+    /// the share's 128 MiB cap applies. An explicit value always wins.</para>
+    /// </summary>
+    public int? MaxOtlpMetricPoints { get; init; }
+
+    /// <summary>What one decoded metric data point costs, about: an item and its list slot (measured 125 B from protobuf).</summary>
+    public const int DecodedMetricPointBytes = 128;
+
+    /// <summary>The floor of the derived limit: eight OpenTelemetry Collector batches at their default size.</summary>
+    public const int MinOtlpMetricPoints = 65_536;
+
+    /// <summary>The configured point limit, or the default rule applied to this host when unset.</summary>
+    public int EffectiveMaxOtlpMetricPoints =>
+        MaxOtlpMetricPoints is > 0 and int explicitPoints ? explicitPoints : DefaultMaxOtlpMetricPointsFor(MemoryBudgets.Current());
+
+    /// <summary>The default point limit as a pure function of the host's budgets. See <see cref="MaxOtlpMetricPoints"/>.</summary>
+    public static int DefaultMaxOtlpMetricPointsFor(in MemoryBudgets budgets) =>
+        (int)Math.Clamp(budgets.IngestBufferBytes / DecodedMetricPointBytes, MinOtlpMetricPoints, int.MaxValue);
+
+    /// <summary>
     /// Ring-buffer sequencing slots between the HTTP ingest endpoints and the storage
     /// drainer. Rounded up to a power of two. This is the absorption window for hot-tier
     /// flush stalls: at 100k events/s, 65536 slots ≈ 650 ms of headroom before events

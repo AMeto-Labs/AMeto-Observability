@@ -91,6 +91,9 @@ public static class OtlpEndpointMapper
         // And the throttled error for a batch the server ran out of memory taking in.
         OtlpOutOfMemoryLog outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
+        // The most data points one metrics batch may carry (Ingestion.MaxOtlpMetricPoints), read once.
+        int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
+
         // OUT OF MEMORY IS THE SERVER'S FAILURE, NOT THE BATCH'S (#125). Each handler below takes
         // its batch in — reads, inflates, parses, stores — inside one try whose catch answers an
         // OutOfMemoryException 503 with Retry-After, which OTLP exporters retry. It used to leave
@@ -161,6 +164,19 @@ public static class OtlpEndpointMapper
                 try
                 {
                     bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+                    // THE POINTS ARE COUNTED BEFORE ONE IS BUILT (#126 review F2): a data point can
+                    // be two bytes on the wire and ~125 decoded, so a batch inside the byte limit
+                    // could decode past the heap — and its own out-of-memory failure, answered 503,
+                    // was retried for minutes. Over the limit it is refused as what it is: too large.
+                    int count = isProto ? OtlpMetricPointBudget.CountProto(body.AsSpan(0, bodyLen))
+                                        : OtlpMetricPointBudget.CountJson(body.AsSpan(0, bodyLen));
+                    if (count > maxMetricPoints)
+                    {
+                        WriteTooManyPoints(ctx, isProto);
+                        return;
+                    }
+
                     if (isProto)
                     {
                         // Protobuf: parse straight to ingest items — no OTLP object graph, no
@@ -518,6 +534,21 @@ public static class OtlpEndpointMapper
     {
         WriteRetryLater(ctx, IngestMemoryShortMessage);
         log.Note(ctx, ex);
+    }
+
+    /// <summary>
+    /// The refusal of a metrics batch over <c>Ingestion.MaxOtlpMetricPoints</c> (#126 review F2): 413,
+    /// as for a batch over the byte limit — one remedy, split it — with the OTLP failure shape saying
+    /// so, encoded like the request. Not retryable, and nothing of the batch was decoded or ingested.
+    /// </summary>
+    private static void WriteTooManyPoints(HttpContext ctx, bool isProto)
+    {
+        var response = ctx.Response;
+        response.StatusCode  = StatusCodes.Status413PayloadTooLarge;
+        response.ContentType = isProto ? ProtobufContentType : JsonContentType;
+
+        var writer = response.BodyWriter;
+        writer.Advance(FormatStatus(writer.GetSpan(StatusBodyMaxBytes), OtlpMetricPointBudget.RefusalMessageUtf8, isProto));
     }
 
     // ── Content-Encoding ──────────────────────────────────────────────────────
