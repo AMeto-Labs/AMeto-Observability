@@ -91,6 +91,14 @@ internal static class MetricReader
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
 
     /// <summary>
+    /// The newest <c>.mts</c> format this build reads (<c>MetricWriter</c> writes it). A file under
+    /// the same magic that says a higher version was written by a NEWER build: see
+    /// <see cref="NewerMetricFormatException"/>. A future format has to keep the magic and raise the
+    /// version for an older build to know it for what it is.
+    /// </summary>
+    internal const ushort NewestReadableVersion = 3;
+
+    /// <summary>
     /// A file's header and name — what the startup scan registers it by. Positioned reads into the
     /// stack (#94): these are 27 bytes at the start, 12 at the end and the name, and they used to
     /// be read through <see cref="OpenRead"/>'s 64 KB buffer, allocated per file — 64 MB for a
@@ -110,6 +118,10 @@ internal static class MetricReader
         if (magic != Magic) throw new InvalidDataException($"Invalid .mts magic in {filePath}");
         if (got < 6) throw new EndOfStreamException();
         ushort version = BinaryPrimitives.ReadUInt16LittleEndian(head[4..]);
+        // The FUTURE is not damage (#119 review): a version above the newest this build reads is a
+        // rollback's file, which a build that knows the format reads whole. Its own exception, so the
+        // startup scan keeps it where it deletes a v1 file or a torn one.
+        if (version > NewestReadableVersion) throw new NewerMetricFormatException(filePath, version);
         if (version is not (2 or 3)) throw new InvalidDataException($"Unsupported .mts version {version} in {filePath}");
         if (got < 27) throw new EndOfStreamException();
         var  granularity = (MetricGranularity)head[6];
@@ -124,7 +136,9 @@ internal static class MetricReader
 
         // Name index: nameCount uint32 | nameLen uint16 | name bytes.
         Span<byte> nameHead = stackalloc byte[6];
-        if (nameIdxOffset < 0) throw new IOException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
+        // A claim about the BYTES, so the exception that says so (#108): the startup scan deletes a
+        // file this throws on, and keeps one that throws any other IOException as merely unreachable.
+        if (nameIdxOffset < 0) throw new InvalidDataException($"Name index offset {nameIdxOffset} is before the start of {filePath}");
         if (ReadAt(handle, nameHead, nameIdxOffset) < 6) throw new EndOfStreamException();
         ushort  nameLen = BinaryPrimitives.ReadUInt16LittleEndian(nameHead[4..]);   // 16 bits: the type is the bound
         byte[]? rented  = nameLen > 256 ? ArrayPool<byte>.Shared.Rent(nameLen) : null;
@@ -1156,4 +1170,23 @@ internal static class MetricReader
     /// </summary>
     private static FileStream OpenRead(string path) =>
         new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+}
+
+/// <summary>
+/// A <c>.mts</c> whose header says it was written in a format NEWER than this build reads — the file
+/// a rollback meets, not a damaged one (#119 review). The startup scan deletes a v1 or torn file, and
+/// must keep this one, which a build that knows the format reads whole.
+///
+/// <para>Deliberately NOT an <see cref="InvalidDataException"/> (which is sealed in any case): every
+/// classifier of read failures here — the scan's, <c>FileBounds.DescribesContent</c> — decides "the
+/// bytes are bad" on that type, and a newer format is not bad bytes. So it cannot fall into a
+/// deleting branch whatever the order of a classifier's arms, and one that does not know this type
+/// keeps the file as unreachable rather than destroying it.</para>
+/// </summary>
+internal sealed class NewerMetricFormatException(string filePath, ushort version)
+    : NotSupportedException(
+        $"{filePath} is .mts format v{version}, newer than this build reads (v{MetricReader.NewestReadableVersion} at most)")
+{
+    /// <summary>The format version the file's header declares.</summary>
+    public ushort Version { get; } = version;
 }

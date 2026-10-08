@@ -26,13 +26,32 @@ public sealed class SegmentReader : ISegmentReader
     //     per file, and a group directory names their offsets and time bounds. v4-v6 files
     //     stay readable as ONE implicit group covering the whole file, so no data is wiped.
     private const ushort MinSupportedVersion = 4;
-    private const ushort MaxSupportedVersion = 7;
+    internal const ushort MaxSupportedVersion = 7;
 
     /// <summary>Block MinTs for a pre-v6 segment, which has no zone map — never prunes.</summary>
     private const long UnknownBlockMinTs = long.MinValue;
 
     /// <summary>Group-directory entry size on disk — one definition, shared with the writer.</summary>
     private const int GroupEntrySize = SegmentWriter.GroupEntrySize;
+
+    /// <summary>The fixed header (magic … min level) every supported version starts with, and the footer every one ends with.</summary>
+    private const int HeaderSize = 39, FooterSize = 44;
+
+    /// <summary>
+    /// An offset the file's own bytes give, checked before anything is read AT it (#119 review F1):
+    /// outside [<paramref name="min"/>, <paramref name="max"/>] it is a torn word, and named as the bytes
+    /// it is. Unchecked, a position inside the view's last few bytes failed
+    /// <c>UnmanagedMemoryAccessor.Read</c> with a plain <see cref="ArgumentException"/> ("not enough
+    /// bytes remaining") — which says nothing about the file to a classifier, so the catalog scan kept
+    /// the torn segment as unreachable, the store Degraded, at every start, instead of setting it aside
+    /// once. One comparison; nothing allocated unless it throws.
+    /// </summary>
+    private static void RequireOffsetWithin(long offset, long min, long max, string what, string filePath)
+    {
+        if (offset < min || offset > max)
+            throw new InvalidDataException(
+                $"{what} offset {offset} in {filePath} is outside [{min}, {max}] — a torn or foreign segment");
+    }
 
     private readonly long _blockIndexOffset;
 
@@ -175,8 +194,7 @@ public sealed class SegmentReader : ISegmentReader
         _fileSize = fileSize;
         LastWriteTicks = lastWriteTicks;
 
-        const int footerSize = 44;
-        long footerStart = fileSize - footerSize;
+        long footerStart = fileSize - FooterSize;
 
         // The footer is parsed BEFORE the header, so its five int64 slots are read raw and
         // only interpreted once the version is known. v7 reuses slot 0 for the group
@@ -186,8 +204,6 @@ public sealed class SegmentReader : ISegmentReader
         long slot2           = ReadInt64At(footerStart + 16);
         _blockIndexOffset    = ReadInt64At(footerStart + 24);
         uint footerMagic     = (uint)ReadInt32At(footerStart + 40);
-        if (footerMagic != MagicFooter)
-            throw new InvalidDataException($"Segment footer magic mismatch in {filePath}");
 
         uint   magic    = (uint)ReadInt32At(0);
         ushort version  = (ushort)ReadInt16At(4);
@@ -200,13 +216,37 @@ public sealed class SegmentReader : ISegmentReader
 
         if (magic != MagicHeader)
             throw new InvalidDataException($"Segment header magic mismatch in {filePath}");
-        if (version is < MinSupportedVersion or > MaxSupportedVersion)
+        // The FUTURE is not damage (#119 review F2): a version above the newest this build reads is a
+        // rollback's file, which a build that knows the format reads whole. Its own exception, so the
+        // catalog scan keeps it under its name where it sets torn bytes aside as .seg.corrupt — and
+        // before the footer's magic or any offset is trusted, since a newer layout may change the
+        // footer: what a future format has to keep for this to know it is the header's magic and a
+        // higher version, the contract the metric and span readers already hold to.
+        if (version > MaxSupportedVersion)
+            throw new NewerSegmentFormatException(filePath, version);
+        if (version < MinSupportedVersion)
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
+        if (footerMagic != MagicFooter)
+            throw new InvalidDataException($"Segment footer magic mismatch in {filePath}");
 
+        // The index lies between the header and the footer, and its count is read AT it.
+        RequireOffsetWithin(_blockIndexOffset, HeaderSize, footerStart - 4, "Block index", filePath);
         int blockCount = ReadInt32At(_blockIndexOffset);
+        // Events live only in blocks, so a segment whose header counts events and whose index lists
+        // no block has lost its index page (#119 review F3): it opened "whole", served none of its
+        // events, and nothing — no quarantine, no Degraded store — said so. Named as the damage it
+        // is; merge recovery's proof that an output committed rests on this open too.
+        if (blockCount == 0 && evCount > 0)
+            throw new InvalidDataException(
+                $"Segment {filePath} counts {evCount} events in its header and lists no block — a lost or torn block index");
+        int stride     = version >= 5 ? 20 : 16;
+        // A count the file cannot hold is a claim about the BYTES, and is named as one (#119
+        // review): unchecked, a torn count failed the allocation below with OutOfMemoryException —
+        // a word about the machine, not the file — and the catalog scan, which sets a segment aside
+        // only for bytes it refuses, would have kept it as unreachable at every start instead.
+        FileBounds.RequireCountFits(blockCount, fileSize - _blockIndexOffset - 4, stride, "Block index", filePath);
         _blocks        = new (long, long)[blockCount];
         _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
-        int stride = version >= 5 ? 20 : 16;
 
         // Pull the whole block index in ONE mapped read and parse it from the span. The
         // per-entry shape cost three MemoryMappedViewAccessor calls per block, so opening a
@@ -223,6 +263,9 @@ public sealed class SegmentReader : ISegmentReader
             {
                 var entry   = raw.Slice(i * stride, stride);
                 long offset = BinaryPrimitives.ReadInt64LittleEndian(entry);
+                // Checked once, here, for every read of the block's frame that follows: the walk
+                // below and every block read reads 8 frame bytes AT this offset.
+                RequireOffsetWithin(offset, 0, fileSize - 8, "Block", filePath);
                 // v6 stores the block's min timestamp in the slot v4/v5 spent on
                 // FirstEventId (written, never read). Older files have no zone map.
                 long blockMinTs = version >= 6
@@ -290,9 +333,12 @@ public sealed class SegmentReader : ISegmentReader
     {
         if (directoryOffset <= 0)
             throw new InvalidDataException($"v7 segment {filePath} has no group directory");
+        RequireOffsetWithin(directoryOffset, 1, _fileSize - FooterSize - 4, "Group directory", filePath);
 
         int count = ReadInt32At(directoryOffset);
         if (count <= 0) return [];
+        // The same rule as the block index's count: what the file cannot hold is torn bytes.
+        FileBounds.RequireCountFits(count, _fileSize - directoryOffset - 4, GroupEntrySize, "Group directory", filePath);
 
         var groups = new SegmentIndexGroup[count];
         int bytes  = count * GroupEntrySize;
@@ -1193,4 +1239,24 @@ public readonly struct PooledSection : IDisposable
     {
         if (_rented is not null) ArrayPool<byte>.Shared.Return(_rented);
     }
+}
+
+/// <summary>
+/// A <c>.seg</c> whose header says it was written in a format NEWER than this build reads — the file
+/// a rollback meets, not a damaged one (#119 review F2). The catalog scan sets torn bytes aside as
+/// <c>.seg.corrupt</c>, which nothing enumerates again; this one it must keep under its name for the
+/// build that reads it whole.
+///
+/// <para>Deliberately NOT an <see cref="InvalidDataException"/> (sealed in any case), the metric
+/// engine's <c>NewerMetricFormatException</c>'s reasoning: every classifier of read failures here
+/// decides "the bytes are bad" on that type, so this one cannot fall into a quarantining branch
+/// whatever the order of a classifier's arms — and a caller that does not know it treats it like any
+/// other failure to read (a query skips it, an import refuses it, an incumbent check keeps it).</para>
+/// </summary>
+internal sealed class NewerSegmentFormatException(string filePath, ushort version)
+    : NotSupportedException(
+        $"{filePath} is segment format v{version}, newer than this build reads (v{SegmentReader.MaxSupportedVersion} at most)")
+{
+    /// <summary>The format version the file's header declares.</summary>
+    public ushort Version { get; } = version;
 }

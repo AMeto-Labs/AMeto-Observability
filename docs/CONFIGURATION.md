@@ -233,6 +233,8 @@ Every ceiling here is a quantity of **bytes** or of objects, and the ones left u
 
 **The exemplar rings are the one piece of metric memory nothing takes back.** A ring is allocated at full depth the first time a metric name carries an exemplar, and it is never pruned, never aged out, invisible to the tier's byte accounting and out of reach of the RAM-pressure shed — so `MaxExemplarMetrics` × `ExemplarsPerMetric` × 208 B is resident for the life of the process. That is why the two knobs trade against each other inside one budget (half the hot tier) instead of multiplying freely: at the old defaults, 4 000 slots × 256 names was 213 MB pinned inside a 384 MB heap limit. If a deployment wants deeper rings, it lowers the count.
 
+**A segment the startup scan cannot read is deleted only when its bytes are wrong.** After a start the metric store reads the header of every `.mts` in the background. A file the reader refuses — a v1 file from release 1.0.0, a torn or foreign one — is deleted with a Warning beginning `Unreadable metric segment`, as it always was. A file it cannot *reach* — held open by an antivirus or a backup agent, on a share that dropped, with the process out of file handles — is tried again for up to ~0.8 s (2 s for the whole scan), and is then **kept**: it is not served until the next start reads it, an Error beginning `Metric segment … could not be read at startup` names it, and the store is degraded until that restart (see [Alert options](#alert-options-ametoalerts)). It used to be deleted, for good, like a v1 file. A segment in a **newer** `.mts` format than the build reads — what a rollback meets, should a later release write one — is neither: it is left on disk untouched and not served, with an Error beginning `Metric segment … was written in .mts format v…`, until the node runs a build that reads it. It does not make the store degraded, since no restart of the older build changes it. (Before this release such a file was deleted as "likely format v1".)
+
 **Upgrading — the flush cadence is now a byte budget.** An install that never set anything keeps the same cadence on a host with room (32 MB *is* the old 500 000 points at 64 B a point) and flushes earlier on a constrained one, which is the point. `ExemplarsPerMetric` is the exception that changes everywhere: it derives now, to ~300 slots at the 32 MB tier. To pin the old behaviour, set `HotTierBytes: 32000000`, `MinFlushBytes: 3200000` and `ExemplarsPerMetric: 4000` — and on a 512 MB host, expect the exemplar rings to claim the heap that the derivation exists to protect.
 
 **Rollup tiers, merges and retention.** A flush writes `raw` files. A background pass every 5 minutes (four metric names at a time, in rotation) merges a metric's raw files of the last hour, rolls raw files older than an hour into 5-minute buckets (`fivemin`), merges the 5-minute files of the last 24 hours, rolls 5-minute files older than 24 hours into 1-hour buckets (`onehour`), and merges 1-hour files within 7-day windows (shorter when `MetricsDays` is). **A merge takes only files that lie wholly inside its tier's window** — the raw hour, the 5-minute tier's 24 hours, one 7-day window: a file reaching back past it is left as it is, ages past the tier boundary, and is rolled up or expired the way any file of that tier is. Retention (`MetricsDays`, see [Retention](#retention-ametoretention)) deletes a file once its newest point is past the TTL, by the same rule in every tier. A merge does not rewrite its own last outputs: it runs again once three new files (one, in the raw tier) have joined them. A rewrite that fails — one metric's work of one kind, in one window — is not tried again for 5 minutes, doubling to 6 hours, with one log line a step (`… compaction failed for metric '…', N time(s) in a row; it is not tried again for …`) and one more when it succeeds again. A file that fails on its **content** (it will not decode) is not the work's failure: it is left on disk and out of every later compaction and rollup, with one warning naming it (`Metric file … will not decode — left on disk and out of compaction and rollup from now on`), the rest of its metric is rewritten without it, and retention removes it as usual.
@@ -262,6 +264,25 @@ Like the metrics options, every memory ceiling is a quantity of **bytes** derive
 **More cold segments at rest on a small host.** On the 512 MB container a compaction pass can afford 1.2 tiers read back, not the two a pair of full flushes needs, so **a full flush is not a compaction candidate there**: segments stay at one flush each (~37 600 ordinary spans) instead of pairing up to ~100 000 as they do on a host with room — about **2.7× as many cold segments** for the same data. What still merges there is the small segments a quiet hour's timed flushes leave. Shrinking the tier so that full flushes could pair would give the same number of segments at rest and rewrite every span once more. The trace-id index keeps a lookup from paying for the extra segments; raise `MergeBudgetBytes` above ~2.3 × `HotTierMaxBytes` (a full tier weighs ~1.14 × its budget read back, and a candidate must be under half a pass) to have full flushes merge again.
 
 **Upgrading.** An install that never set anything keeps its cadence, its compaction pairs and its ring on a host with room. After a restart, segments are priced from their span count and their file size until a pass has read them; a heavy one that turns out larger than the budget is weighed once and left alone rather than read again every hour.
+
+---
+
+## Alert options (`Ameto:Alerts`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `Enabled` | bool | `true` | Runs the alert evaluator and the `/api/alerts` endpoints. It needs metrics and tracing as well: with `Ameto:Metrics:Enabled` or `Ameto:Tracing:Enabled` off, alerts are switched off too. |
+| `EvaluateOnDegradedStore` | bool | `false` | Evaluate rules over a **degraded** store on the partial data it has, instead of skipping them until a restart — see below. |
+
+**A rule is evaluated only over a store that can answer for everything it holds.** On every tick (15 s) the evaluator asks the store the rule reads — logs, metrics or traces — whether its answer would be whole, and when it would not, leaves the rule exactly as it was (state, last value, evaluation time) and sends nothing:
+
+* **loading** — the first seconds or minutes after a start, while the store reads what it holds on disk. Ends by itself.
+* **degraded** — that startup read ended without reaching everything on disk: it failed as a whole (the data directory could not be listed), or it left behind a file it could not read, after a few retries, for a reason other than the file's own bytes: held open by another process (an antivirus, a backup agent), a network share or data volume that dropped, too many open files. Such a file is kept on disk under its own name — never deleted, never set aside — and is read at the next start. The store logs an Error at startup saying what it left behind, stays degraded **until a restart**, and `GET /api/diagnostics` reports it as `"degraded"` (`logsAvailability`, `metricsAvailability`, `tracesAvailability`). Its queries go on answering from what it has. A file whose bytes are damaged is not this: it is deleted or set aside (a log segment as `.seg.corrupt`), with a log line of its own, and it does not make the store degraded. Neither does a segment written in a newer format than the build reads: it is kept, not served, until a build that reads it runs.
+* **closed** — the store has shut down.
+
+A skipped tick does not count toward a rule's `For`. The evaluator logs one Warning per store and state at most once a minute, counting the evaluations it skipped since the last one (`Alert rule … was not evaluated: the Metric store is Degraded …`), and `POST /api/alerts/preview` answers such a rule with `503` — carrying `Retry-After` only while the store is loading.
+
+Evaluating on a degraded store reads the window it failed to load as a quiet one: a `<` rule can fire, and a `>` rule can resolve, on data that exists but was not loaded. That is why it is off by default. Set `EvaluateOnDegradedStore: true` when rules that can misfire suit you better than rules that stay silent until the restart; the store's startup Error is then the only word about it. A loading or closed store is skipped either way.
 
 ---
 
@@ -464,6 +485,10 @@ Ameto:
     IndexBackfill: "Idle"         # Off | Idle | Eager
     SegmentFormatV4: false        # one-way door — see the Traces section
     IndexEnabled: true
+
+  Alerts:
+    Enabled: true                 # needs Metrics and Tracing enabled as well
+    EvaluateOnDegradedStore: false   # true = evaluate rules on a degraded store's partial data
 
   Retention:
     VerboseDays: 90

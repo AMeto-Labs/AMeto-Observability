@@ -481,6 +481,14 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     internal Task ColdLoadCompleted => _coldLoaded.Task;
 
     /// <summary>
+    /// 1 once the startup cold scan has left segments on disk that it did not load (#94): it failed
+    /// as a whole, or skipped a file it could not reach (#108). Written once, before
+    /// <see cref="_coldLoaded"/> completes, and never cleared — nothing scans again before a
+    /// restart, and the next start reads those files. See <see cref="Availability"/>.
+    /// </summary>
+    private int _coldScanShort;
+
+    /// <summary>
     /// Whether a query issued now gets a TRUE answer (#95) — for a caller that ACTS on the answer
     /// (the alert evaluator, through <see cref="MetricAggregator"/>) and so must not take the empty
     /// answer of a closed tier, or the hot-only answer of one not yet scanned, for a measurement.
@@ -495,12 +503,19 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// segments before it completes that, so Available is never seen ahead of them; a scan that
     /// FAILS ends the window too, as it always has for <see cref="ColdLoadCompleted"/>.</para>
     ///
-    /// <para>Two volatile reads, no lock, no allocation.</para>
+    /// <para><see cref="QueryAvailability.Degraded"/> after a scan that ended short — see
+    /// <see cref="_coldScanShort"/> — for the rest of the process: queries answer from what loaded,
+    /// and the files it left on disk are read at the next start. The flag is written before the
+    /// scan completes <see cref="_coldLoaded"/> (a release, which the read of <c>IsCompleted</c>
+    /// below acquires), so a store that ends Degraded never reads Available first.</para>
+    ///
+    /// <para>At most three volatile reads, no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
-        Volatile.Read(ref _coldClosed) != 0 ? QueryAvailability.Closed
-      : !_coldLoaded.Task.IsCompleted      ? QueryAvailability.Loading
-      :                                      QueryAvailability.Available;
+        Volatile.Read(ref _coldClosed) != 0     ? QueryAvailability.Closed
+      : !_coldLoaded.Task.IsCompleted          ? QueryAvailability.Loading
+      : Volatile.Read(ref _coldScanShort) != 0 ? QueryAvailability.Degraded
+      :                                          QueryAvailability.Available;
 
     /// <summary>
     /// Test seam: an engine constructed while this holds a task starts its cold scan only once that
@@ -1702,7 +1717,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
-        catch (Exception ex) { LogColdScanFailed(_logger, ex, _dataDir); }
+        catch (Exception ex)
+        {
+            // Before the load completes, so the store goes from Loading straight to Degraded (#94).
+            Volatile.Write(ref _coldScanShort, 1);
+            LogColdScanFailed(_logger, ex, _dataDir);
+        }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
@@ -3509,17 +3529,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// could not be published — so the cold tier holds none of what was on disk (a file that fails
     /// on its own is handled inside the scan), and nothing will scan again before a restart. The
     /// engine still completes <see cref="ColdLoadCompleted"/>, so every reader goes on answering from
-    /// the hot tier and whatever flushes have published since: the alert evaluator included, which
-    /// reads a missing window as a quiet one. Said once, as an Error, naming that consequence —
-    /// a store that reports itself degraded, and an evaluator that skips it, is the design filed on
-    /// #94; this line is what an operator has until then.
+    /// the hot tier and whatever flushes have published since — and the store says it is
+    /// <see cref="QueryAvailability.Degraded"/>, which the alert evaluator skips rather than reading
+    /// a missing window as a quiet one. Said once, as an Error, naming both.
     /// </summary>
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
         Message = "The cold metric segment scan of {DataDirectory} failed: the segments on disk are not served until a "
-                + "restart, and metric queries answer from the hot tier and what has been flushed since. Metric ALERT "
-                + "RULES keep being evaluated on that partial data: a missing window reads as a quiet one, so a \"<\" "
-                + "rule can fire and a \">\" rule can resolve on points that exist but were not loaded. Restart once the "
-                + "cause is fixed")]
+                + "restart, and metric queries answer from the hot tier and what has been flushed since. The metric "
+                + "store reports itself Degraded until then, and metric ALERT RULES are not evaluated on that partial "
+                + "data (unless Ameto:Alerts:EvaluateOnDegradedStore is set): a missing window would read as a quiet "
+                + "one. Restart once the cause is fixed")]
     private static partial void LogColdScanFailed(ILogger logger, Exception exception, string dataDirectory);
 
     /// <summary>
@@ -3530,9 +3549,185 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     internal static readonly AsyncLocal<Exception?> FailColdScanForTest = new();
 
+    /// <summary>
+    /// The cold scan's read of one file's header, and the pause between its attempts at a file it
+    /// could not reach, as a seam (#108) — the metric WAL upgrade's <c>UpgradeIo</c> is the model: a
+    /// test fails one file's read the way a busy disk does and waits for nothing. Production uses
+    /// <see cref="Default"/>.
+    /// </summary>
+    internal sealed class ColdScanIo
+    {
+        public static readonly ColdScanIo Default = new();
+
+        public Func<string, MetricSegmentInfo> ReadSegmentInfo { get; init; } = MetricReader.ReadSegmentInfo;
+        public Action<TimeSpan>                Wait            { get; init; } = static d => Thread.Sleep(d);
+    }
+
+    /// <summary>
+    /// Test seam: the <see cref="ColdScanIo"/> of the engines constructed while this holds one. An
+    /// <see cref="AsyncLocal{T}"/>, which the constructor's <c>Task.Run</c> carries into the flush loop,
+    /// so it reaches only the engines the setting test constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<ColdScanIo?> ColdScanIoForTest = new();
+
+    /// <summary>
+    /// The pauses between the scan's attempts at a file it could not reach: six attempts over
+    /// ~0.8 s — the metric WAL upgrade's schedule (#105), and for the same reason: long enough for an
+    /// antivirus scanner or a backup agent to let go of a file, short enough that one that never
+    /// lets go costs the start less than a second.
+    /// </summary>
+    private static readonly TimeSpan[] ColdReadRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>
+    /// What one scan may spend waiting on such files, IN ALL — the trace scan's figure, for the
+    /// trace scan's reason: per file the pauses look cheap and are not, and forty files a backup
+    /// agent holds would keep every metric alert in Loading for half a minute. Past it, a file that
+    /// cannot be reached gets one attempt.
+    /// </summary>
+    private static readonly TimeSpan ColdReadRetryBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>What the cold scan may conclude about a file whose header it could not read (#108).</summary>
+    private enum ColdReadFault : byte
+    {
+        /// <summary>
+        /// <see cref="FileNotFoundException"/>: listed, and gone by the time it was opened. There is
+        /// nothing to load and nothing to delete.
+        /// </summary>
+        Gone,
+
+        /// <summary>
+        /// <see cref="NewerMetricFormatException"/>: written in a format newer than this build reads —
+        /// the file a rollback meets (#119 review). NOT damage: kept on disk, untouched, out of the
+        /// catalog, with an Error; and not a load left unfinished either, so the store is not
+        /// Degraded by it — it is what the disk holds for this build until a build that reads it runs.
+        /// </summary>
+        Newer,
+
+        /// <summary>
+        /// <see cref="InvalidDataException"/> or <see cref="EndOfStreamException"/> — what
+        /// <see cref="MetricReader.ReadSegmentInfo"/> throws on BYTES it refuses: a v1 file (no bucket
+        /// data), a foreign or torn one. Deleted, as every unreadable file used to be.
+        /// </summary>
+        Damaged,
+
+        /// <summary>
+        /// Anything else: a sharing violation (an antivirus, a backup agent), a network share that
+        /// dropped, too many open files, access denied, the data directory itself gone. None of it is
+        /// a word about the file's contents, so the file is kept, and read at the next start.
+        /// </summary>
+        Unreachable,
+    }
+
+    /// <summary>
+    /// The verdict on a failed header read. An ALLOW-LIST for deletion: only the two exceptions that
+    /// describe the bytes condemn a file, so an exception nobody foresaw keeps it — the cost of being
+    /// wrong that way is a file read again at the next start, the cost of being wrong the other way
+    /// was a segment gone for good (#108). Ordered by type, not by base class:
+    /// <see cref="EndOfStreamException"/> and <see cref="FileNotFoundException"/> ARE
+    /// <see cref="IOException"/>s, so "is it an IOException" would keep a torn file for ever and call
+    /// a vanished one busy. A missing DIRECTORY is not a missing file: the engine never removes its
+    /// data directory, so its absence is the volume, not the data. And a NEWER format is not damage:
+    /// <see cref="NewerMetricFormatException"/> is deliberately not an <see cref="InvalidDataException"/>,
+    /// so no order of these arms can route it to Damaged — and were its own arm lost, it would fall to
+    /// Unreachable: kept, never deleted.
+    /// </summary>
+    private static ColdReadFault ClassifyColdReadFault(Exception ex) => ex switch
+    {
+        FileNotFoundException                        => ColdReadFault.Gone,
+        NewerMetricFormatException                   => ColdReadFault.Newer,
+        InvalidDataException or EndOfStreamException => ColdReadFault.Damaged,
+        _                                            => ColdReadFault.Unreachable,
+    };
+
+    /// <summary>
+    /// A file in a newer format than this build reads (#119 review): kept, untouched, out of the
+    /// catalog. An Error, because its points are not served — but not Degraded: no restart of this
+    /// build changes it, and holding every metric alert rule until a roll-forward would be the cost.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Metric segment {File} was written in .mts format v{Version}, newer than this build reads: it is left "
+                + "on disk untouched — deleting it would destroy points a build that knows the format can read — and its "
+                + "points are not served until this node runs such a build")]
+    private static partial void LogNewerColdSegment(ILogger logger, Exception exception, string file, int version);
+
+    /// <summary>
+    /// A file the scan could not reach through its retries (#108): left on disk, out of this run's
+    /// cold tier, and the store <see cref="QueryAvailability.Degraded"/> until a restart reads it.
+    /// One Error per such file, naming it.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Metric segment {File} could not be read at startup after {Attempts} attempt(s), for a reason that is "
+                + "not its contents: it is left on disk, not deleted, and is read at the next start. Until then its points "
+                + "are not served: the metric store reports itself Degraded, and metric ALERT RULES are not evaluated on "
+                + "the partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set). Restart once whatever holds the "
+                + "file has let go of it; if a restart names the same file again, the failure is not transient — check "
+                + "the file's permissions and its volume, or move it aside")]
+    private static partial void LogColdSegmentUnreachable(ILogger logger, Exception exception, string file, int attempts);
+
+    /// <summary>
+    /// One listed file's header — or null, the file not loaded, with what happens to it decided by
+    /// what the failure says (<see cref="ClassifyColdReadFault"/>). A file that cannot be REACHED is
+    /// tried again after each of <see cref="ColdReadRetryDelays"/> while
+    /// <paramref name="retryTicksLeft"/> lasts: most of what lands there clears by itself, and a file
+    /// that stays out makes the store Degraded until a restart. The LAST attempt's failure is the
+    /// verdict, so a file held open while its deleter finished (on Windows a delete-pending file
+    /// refuses an open with access denied) ends as Gone, not as a store Degraded over nothing.
+    /// </summary>
+    private MetricSegmentInfo? ReadColdSegmentInfo(string file, ColdScanIo io, ref long retryTicksLeft)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            Exception fault;
+            try
+            {
+                var info = io.ReadSegmentInfo(file);
+                if (attempt > 1)
+                    _logger.LogWarning("Metric segment {File} could not be read at first and was read on attempt {Attempt}",
+                                       file, attempt);
+                return info;
+            }
+            catch (Exception ex) { fault = ex; }
+
+            switch (ClassifyColdReadFault(fault))
+            {
+                case ColdReadFault.Gone:
+                    _logger.LogWarning(fault, "Metric segment {File} was gone by the time the cold scan opened it — nothing to load", file);
+                    return null;
+
+                case ColdReadFault.Newer:
+                    LogNewerColdSegment(_logger, fault, file, ((NewerMetricFormatException)fault).Version);
+                    return null;
+
+                case ColdReadFault.Damaged:
+                    // v1 files (no bucket data) are incompatible with the v2 format — delete them.
+                    _logger.LogWarning(fault, "Unreadable metric segment {File} — deleting (likely format v1)", file);
+                    try { File.Delete(file); } catch { /* best effort */ }
+                    return null;
+
+                default:
+                    if (attempt <= ColdReadRetryDelays.Length && retryTicksLeft > 0)
+                    {
+                        long wait = Math.Min(ColdReadRetryDelays[attempt - 1].Ticks, retryTicksLeft);
+                        retryTicksLeft -= wait;
+                        io.Wait(TimeSpan.FromTicks(wait));
+                        continue;
+                    }
+                    // Before the scan completes the load: the store goes from Loading to Degraded.
+                    Volatile.Write(ref _coldScanShort, 1);
+                    LogColdSegmentUnreachable(_logger, fault, file, attempt);
+                    return null;
+            }
+        }
+    }
+
     private void LoadColdSegments()
     {
         if (FailColdScanForTest.Value is { } fail) throw fail;
+        var io = ColdScanIoForTest.Value ?? ColdScanIo.Default;
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -3540,20 +3735,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // flush loop with ingest already live, so the files a wildcard would match include the
         // ones a concurrent flush has open.
 
-        var loaded = new List<MetricSegmentInfo>();
+        // A file that fails is no longer deleted whatever the failure (#108): deleting was the v1
+        // migration path, and it took a segment held open for a moment by an antivirus, or read
+        // through a share that blinked, along with the v1 files — for good, at a start. Only a
+        // failure that says the BYTES are wrong deletes; one that says nothing about them keeps the
+        // file for the next start, and a file a NEWER build wrote is kept for the build that reads
+        // it (#119 review). See ReadColdSegmentInfo.
+        var  loaded         = new List<MetricSegmentInfo>();
+        long retryTicksLeft = ColdReadRetryBudget.Ticks;
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.mts").OrderBy(f => f))
-        {
-            try
-            {
-                loaded.Add(MetricReader.ReadSegmentInfo(file));
-            }
-            catch (Exception ex)
-            {
-                // v1 files (no bucket data) are incompatible with the v2 format — delete them.
-                _logger.LogWarning(ex, "Unreadable metric segment {File} — deleting (likely format v1)", file);
-                try { File.Delete(file); } catch { /* best effort */ }
-            }
-        }
+            if (ReadColdSegmentInfo(file, io, ref retryTicksLeft) is { } info) loaded.Add(info);
 
         // Runs in the background, so flushes may already have registered new
         // segments — merge, don't overwrite (dedup by path).

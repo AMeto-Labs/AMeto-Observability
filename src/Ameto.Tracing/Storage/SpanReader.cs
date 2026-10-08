@@ -101,7 +101,12 @@ internal static class SpanReader
         if (magic != Magic) throw new InvalidDataException($"Invalid .trc magic in {filePath}");
 
         ushort version = br.ReadUInt16();
-        if (version is < 2 or > MaxKnownVersion) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
+        // The FUTURE is not damage, and it is decided HERE, by the read that met it (#119 review N1):
+        // a version above the newest this build reads gets its own exception, so the cold scan keeps
+        // the file without opening it a second time to ask — a second open answered "not newer"
+        // whenever it merely failed, and the damage path then deleted the newer segment.
+        if (version > MaxKnownVersion) throw new NewerSpanFormatException(filePath, version);
+        if (version < 2) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
         uint spanCount = br.ReadUInt32();
         long minNano   = br.ReadInt64();
         long maxNano   = br.ReadInt64();
@@ -206,28 +211,6 @@ internal static class SpanReader
             // thing to the caller, and it is the caller that decides what to do about it.
             return false;
         }
-    }
-
-    /// <summary>
-    /// Whether the file is a well-formed <c>.trc</c> whose VERSION this build does not know.
-    ///
-    /// <para>The distinction the startup path needs and did not have. An unsupported version
-    /// raises the same InvalidDataException as real damage, so it classified as corruption and
-    /// the segment was deleted — which turns rolling a binary back after a format bump into
-    /// unrecoverable data loss, since a newer file is perfectly good and only this build cannot
-    /// read it. Damage is a reason to delete; the future is not.</para>
-    /// </summary>
-    public static bool LooksLikeNewerFormat(string filePath)
-    {
-        try
-        {
-            using var fs = OpenRead(filePath);
-            Span<byte> head = stackalloc byte[6];
-            fs.ReadExactly(head);
-            if (BinaryPrimitives.ReadUInt32LittleEndian(head) != Magic) return false;
-            return BinaryPrimitives.ReadUInt16LittleEndian(head[4..]) > MaxKnownVersion;
-        }
-        catch { return false; }
     }
 
     /// <summary>
@@ -1677,6 +1660,13 @@ internal static class SpanReader
         FileStream fs, BinaryReader br, ushort version)
     {
         int size = version >= 3 ? 28 : 20;
+        // A file too short to hold the 26-byte header AND this footer is torn bytes, and is named so
+        // (#119 review F1): the seek below threw IOException on it ("the parameter is incorrect"),
+        // which no classifier counts as content — the cold scan retried it and left the trace store
+        // Degraded at every start over a file no restart can read.
+        if (fs.Length < 26 + size)
+            throw new InvalidDataException(
+                $".trc {fs.Name} is {fs.Length} bytes — too short for its header and a {size}-byte footer; a torn file");
         fs.Seek(-size, SeekOrigin.End);
         long traceIdx = (long)br.ReadUInt64();
         long svcIdx   = (long)br.ReadUInt64();
@@ -1892,4 +1882,22 @@ internal static class SpanReader
 
     private static FileStream OpenRead(string path) =>
         new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+}
+
+/// <summary>
+/// A <c>.trc</c> whose header says it was written in a format NEWER than this build reads — the file a
+/// rollback meets, not a damaged one. Damage is a reason to delete; the future is not: a newer file is
+/// perfectly good, and only this build cannot read it.
+///
+/// <para>It used to be an <see cref="InvalidDataException"/> like real damage, and the cold scan then
+/// asked a second open whether the file was newer (#119 review N1) — an open that answered "not newer"
+/// whenever it failed. Its own type now, deliberately not an InvalidDataException, so no classifier
+/// of read failures can take it for damage, and the scan decides from the read that met it.</para>
+/// </summary>
+internal sealed class NewerSpanFormatException(string filePath, ushort version)
+    : NotSupportedException(
+        $"{filePath} is .trc format v{version}, newer than this build reads (v{SpanReader.MaxKnownVersion} at most)")
+{
+    /// <summary>The format version the file's header declares.</summary>
+    public ushort Version { get; } = version;
 }

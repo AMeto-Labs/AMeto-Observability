@@ -15,7 +15,10 @@ namespace Ameto.Metrics;
 /// <para><b>Only CLOSED is refused, not LOADING.</b> Before the background cold scan has run, a
 /// query answers from the hot tier; that window is this engine's documented design, and a page shown
 /// in it catches up on its next refresh. The alert evaluator, which acts on an answer, skips a
-/// loading store itself.</para>
+/// loading store itself. Nor DEGRADED (#94): a store whose scan left files unread answers from what
+/// it loaded — a part is not an empty, and refusing it would hide data the store does hold until a
+/// restart. <c>GET /api/diagnostics</c> says which state the store is in; the evaluator skips that
+/// one too.</para>
 ///
 /// <para><b>Where it is asked.</b> A buffered endpoint asks AFTER its read — availability only moves
 /// forward, so a read that met the closed fence is always followed by a Closed answer — and the raw
