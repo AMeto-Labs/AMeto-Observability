@@ -53,6 +53,8 @@ public sealed class FileBoundsConventionTests
         ["SpanWriteScratch.cs"] = "the segment WRITER's scratch arrays: every size is a batch's own span count or a body "
                                 + "sized from in-memory counts; it reads no file",
         ["MetricWriter.cs"] = "writes files rather than reading them",
+        ["SpanStartIndex.cs"] = "the hot tier's in-memory start index: sized from a tier list's own span count or a "
+                              + "constant, and doubled from its own length; it reads no file",
     };
 
     /// <summary>
@@ -132,6 +134,10 @@ public sealed class FileBoundsConventionTests
             "copies the open-run map already in memory; not a capacity",
         ["TraceStorageEngine.cs:var live = new HashSet<ulong>(_manifest.Segments.Keys)"] =
             "copies the catalog's key set already in memory; not a capacity",
+        ["TraceStorageEngine.HotTierReads.cs:var blocks = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, capacity))"] =
+            "capacity is the block count of the two in-memory unflushed runs, one line above (#94)",
+        ["TraceStorageEngine.HotTierReads.cs:var grown = new PriorityQueue<SpanRecord, HotKey>(capacity)"] =
+            "capacity is the hot pass's own heap size from NextHeapCapacity, never past the page's limit; no file (#122)",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>

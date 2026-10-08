@@ -23,6 +23,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private          List<SpanRecord>                          _hotSpans  = new();
     private readonly Dictionary<TraceId, List<int>>            _traceIdx  = new();
     private readonly ReaderWriterLockSlim                      _lock      = new();
+    // The start-time bounds of _hotSpans, block by block (#94) — replaced wherever _hotSpans is,
+    // and travelling with it into _flushingStarts. See SpanStartIndex. Under _lock.
+    private          SpanStartIndex                            _hotStarts;
+    private          SpanStartIndex?                           _flushingStarts;
 
     // ── In-flight flush ──────────────────────────────────────────────────────
     // The segment build (sort + LZ4-HC + four indexes + three sidecars) used to run
@@ -798,6 +802,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                                 bool writeSegmentFormatV4, bool indexEnabled,
                                 TracesOptions? options, SpanStringPools? pools)
     {
+        _hotStarts = new SpanStartIndex(_hotSpans);
         _pools = pools ?? new SpanStringPools();
         options ??= new TracesOptions();
         var budgets = MemoryBudgets.Current();
@@ -1365,6 +1370,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         };
 
         int offset = _hotSpans.Count;
+        _hotStarts.Append(h.StartTimeUnixNano);   // first: see SpanStartIndex.Append for the order
         _hotSpans.Add(record);
         _hotBytes += HotSpanBytes(attributes.Length)
                    + (namePooled    ? 0 : SpanStringPools.UnpooledStringBytes(name))
@@ -2213,8 +2219,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // count back into memory through this set after the segment buffer stopped doing it.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
 
-        // Offers one span to a bounded top-K heap. `present` is the identity of what is IN that
-        // heap right now.
+        // Offers one span of a cold segment to a bounded top-K heap. `present` is the identity of
+        // what is IN that heap right now. (The hot tier has its own walk with the same rules —
+        // AdmitHot, beside SelectHotMatches.)
         //
         // A DUPLICATE MUST NOT COST A SLOT. The dedupe check used to happen on the way in
         // (against `seen`) while the recording happened on the way out, so two copies of one
@@ -2222,8 +2229,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // neither was in `seen` yet — and together evicted a distinct older span to make room.
         // The second copy was then discarded at the drain, and the tier yielded fewer than
         // `limit` DISTINCT spans although more existed. Both duplicate sources are ordinary:
-        // UnflushedSpansLocked concatenates the hot tier with the in-flight flush snapshot, and
-        // a segment can hold spans a WAL replay put back.
+        // the unflushed spans are the hot tier AND the in-flight flush snapshot, and a segment
+        // can hold spans a WAL replay put back.
         //
         // `present` is bounded by the heap it mirrors (at most `limit`), never by what was read
         // — that is the unbounded growth 3fc5472 removed and it must not come back through here.
@@ -2239,10 +2246,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
             if (identified)
             {
-                // `seen` is empty for the whole of the hot-tier pass (nothing has been yielded
-                // yet) and that pass is the biggest walk in the method, so the probe is skipped
-                // rather than performed against an empty set — the same answer, one hash and one
-                // bucket lookup cheaper, inside the read lock WriteSpan contends with.
+                // Skipped while `seen` is empty — the same answer, one hash and one bucket lookup
+                // cheaper.
                 if (seen.Count > 0 && seen.Contains(id)) return false;   // yielded by an earlier tier or segment
                 if (!present.Add(id))  return false;   // a second copy of something already in the heap
             }
@@ -2262,60 +2267,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             return true;
         }
 
-        bool Match(SpanRecord s) =>
-            s.StartTimeUnixNano >= fromNano &&
-            s.StartTimeUnixNano <= toNano   &&
-            (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
-            (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
-            (status           is null || s.Status == status.Value) &&
-            (httpStatusCode   is null || s.HttpStatusCode == httpStatusCode.Value) &&
-            (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
-            (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value);
+        // Hot tier plus any in-flight flush snapshot, newest first: the newest `limit` matches,
+        // taken by a walk that runs AFTER the read lock and stops as soon as nothing it has not
+        // read could still make the cut (#94). See SelectHotMatches.
+        var candidates = SelectHotMatches(
+            new SpanMatch(fromNano, toNano, serviceName, spanName, status, httpStatusCode,
+                          minDurationNanos, maxDurationNanos),
+            limit, out bool hotEvicted);
 
-        // Hot tier plus any in-flight flush snapshot (newest first), in ONE lock hold —
-        // see GetTraceAsync for why the pair must not be read separately.
-        //
-        // Bounded top-K, exactly as the cold segment scan below: a min-heap on start time that
-        // evicts its oldest once full.
-        //
-        // WHAT THIS BOUGHT IS MEMORY, AND ONLY MEMORY. An earlier version of this comment
-        // justified the rewrite by LOCK HOLD TIME, and that was wrong in the direction that
-        // matters. `Where().OrderByDescending().Take(limit)` has gone through IPartition since
-        // .NET Core 3.0: buffering is an array append per match and the finish is a partial
-        // quickselect, not an O(M log M) sort. What replaced it costs a `seen` probe plus a
-        // `present` insert per match — a HashCode.Combine over two ulongs and a bucket probe
-        // each — plus a TryPeek, and for anything admitted an O(log limit) EnqueueDequeue and a
-        // `present` removal. Over the ~100k spans UnflushedSpansLocked can walk (50k hot plus a
-        // 50k in-flight flush snapshot) that is several milliseconds of READ lock against about
-        // one before, and WriteSpan takes the WRITE side of it for every ingested span while the
-        // SSE loop runs these scans back to back. The lock hold got WORSE.
-        //
-        // It is still the right trade, for the reason the segment loop below spells out: the
-        // ordering buffer was O(M) SpanRecords — a kilobyte each once a query touches attributes
-        // — and several hundred thousand matches is what killed a 512 MB server. O(limit) is the
-        // fix; the lock hold is what it cost.
-        //
-        // Moving the heap outside the lock over a taken snapshot was considered and rejected:
-        // the snapshot is an O(M) copy of exactly the references the heap exists to stop
-        // materialising, allocated per scan, back to back, straight onto the LOH at 100k
-        // entries. The cheap part is taken instead — see `Admit`, which skips the `seen` probe
-        // while `seen` is empty, and it always is for this tier.
-        var hotTop     = new PriorityQueue<SpanRecord, long>();
-        var hotPresent = new HashSet<(TraceId Trace, ulong Span)>();
-        bool hotEvicted = false;
-        _lock.EnterReadLock();
-        try
-        {
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (!Match(s)) continue;
-                hotEvicted |= Admit(hotTop, hotPresent, s);
-            }
-        }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
+        // Every candidate is about to be recorded below: one allocation for all of them, not a
+        // doubling per power of two — whose last step, at the 2 000 spans a TraceQL stream page
+        // asks for, is an 87 KB array on the large-object heap.
+        seen.EnsureCapacity(candidates.Count);
 
         // The cold list, walked BY INDEX because the floor below has to name the segment the walk
         // stopped BEFORE — which `OrderByDescending` in a foreach cannot say. Sorted by
@@ -2341,11 +2304,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (Relevant(ordered[j])) return Math.Min(ordered[j].MaxStartNano, toNano);
             return long.MinValue;
         }
-
-        // The heap drains oldest-first; the caller wants newest-first.
-        var candidates = new List<SpanRecord>(hotTop.Count);
-        while (hotTop.TryDequeue(out var kept, out _)) candidates.Add(kept);
-        candidates.Reverse();
 
         // The tier held more matches than a page can carry, so everything below the oldest one
         // it kept is undecided — including spans the cold walk will never be reached to read.
@@ -2589,25 +2547,30 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// </summary>
     private List<SpanRecord> TakeSnapshotLocked()
     {
-        var nextTier  = new List<SpanRecord>();
-        var nextNames = _pools.CreateNamePool();
+        var nextTier   = new List<SpanRecord>();
+        var nextStarts = new SpanStartIndex(nextTier);
+        var nextNames  = _pools.CreateNamePool();
 
         // The log opens its window only now, and first of the two: if BeginFlush throws, the tier
         // must still be where it was — detaching first would strand the snapshot with no flush to
         // carry it and no caller holding a reference.
         _wal.BeginFlush();
-        return DetachTierLocked(nextTier, nextNames);
+        return DetachTierLocked(nextTier, nextStarts, nextNames);
     }
 
     /// <summary>
     /// The detach itself, once the log's window is open: stores and a <c>Clear</c>, nothing that
-    /// allocates or throws. <paramref name="nextTier"/> and <paramref name="nextNames"/> were built
-    /// by the caller before the window opened. Under _lock(write).
+    /// allocates or throws. <paramref name="nextTier"/>, its <paramref name="nextStarts"/> and
+    /// <paramref name="nextNames"/> were built by the caller before the window opened. The snapshot
+    /// takes its start index with it. Under _lock(write).
     /// </summary>
-    private List<SpanRecord> DetachTierLocked(List<SpanRecord> nextTier, Ameto.Core.StringInternPool nextNames)
+    private List<SpanRecord> DetachTierLocked(
+        List<SpanRecord> nextTier, SpanStartIndex nextStarts, Ameto.Core.StringInternPool nextNames)
     {
         var snapshot = _hotSpans;
-        _hotSpans = nextTier;
+        _flushingStarts = _hotStarts;
+        _hotSpans  = nextTier;
+        _hotStarts = nextStarts;
         _traceIdx.Clear();
         _hotSince = null;
         _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
@@ -2659,10 +2622,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         bool started = false;
         try
         {
-            var snapshot  = _hotSpans;
-            var nextTier  = new List<SpanRecord>();
-            var nextNames = _pools.CreateNamePool();
-            var flush     = new Task(() =>
+            var snapshot   = _hotSpans;
+            var nextTier   = new List<SpanRecord>();
+            var nextStarts = new SpanStartIndex(nextTier);
+            var nextNames  = _pools.CreateNamePool();
+            var flush      = new Task(() =>
             {
                 try     { CompleteFlush(snapshot); }
                 finally { EndHeavyPhase(); }
@@ -2681,7 +2645,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             }
             started = true;                                     // the slot is the task's to release now
 
-            DetachTierLocked(nextTier, nextNames);
+            DetachTierLocked(nextTier, nextStarts, nextNames);
             _flushTask = flush;
         }
         finally
@@ -2808,8 +2772,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     _wal.AbandonFlush();          // flag-only, no I/O — fine under the lock
                     RestoreSnapshotLocked(snapshot);
                 }
-                _flushingSpans = null;            // the segment (or the restored tier) now carries them
-                _flushingBytes = 0;
+                _flushingSpans  = null;           // the segment (or the restored tier) now carries them
+                _flushingStarts = null;
+                _flushingBytes  = 0;
                 _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
@@ -2869,29 +2834,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             _logger.LogError(failure, "Failed to flush hot-tier spans to cold storage — spans returned to the hot tier");
     }
 
-    /// <summary>
-    /// Every span not yet carried by a REGISTERED cold segment: the live hot tier, plus the
-    /// snapshot a flush has detached but not yet published. <b>Caller holds the read lock.</b>
-    ///
-    /// <para>Aggregates must count from this, not from <c>_hotSpans</c> alone. Once the
-    /// segment build moved off the lock, the detached snapshot — up to
-    /// <see cref="HotFlushThreshold"/> spans — belonged to neither tier for the build's whole
-    /// duration, so the trace list, per-service stats, volume sparkline and service graph
-    /// each carried a rolling hole just behind the live edge. At load, where flushes run
-    /// back to back, that hole was close to permanent: rows visibly vanished at snapshot
-    /// time and reappeared at publish.</para>
-    ///
-    /// <para>Ordering is oldest-first (the detached snapshot left the tier before anything
-    /// now in it arrived), matching what the callers assume of <c>_hotSpans</c>.</para>
-    /// </summary>
-    private IEnumerable<SpanRecord> UnflushedSpansLocked()
-    {
-        if (_flushingSpans is { } flushing)
-            foreach (var s in flushing) yield return s;
-        foreach (var s in _hotSpans) yield return s;
-    }
-
-    /// <summary>Spans in <see cref="UnflushedSpansLocked"/>. Caller holds the read lock.</summary>
+    /// <summary>Spans in <see cref="UnflushedRunsLocked"/>'s two runs. Caller holds the read lock.</summary>
     private int UnflushedCountLocked() => _hotSpans.Count + (_flushingSpans?.Count ?? 0);
 
     /// <summary>
@@ -2899,14 +2842,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// rebuilds the trace index over the combined list. Under _lock(write). A NEW list —
     /// never the snapshot itself: readers may still be iterating it through the
     /// <see cref="_flushingSpans"/> reference they took lock-free, and mutating a list
-    /// under a live enumerator faults them.
+    /// under a live enumerator faults them. Its start index is a new one too, built before
+    /// anything is swapped, for the same readers.
     /// </summary>
     private void RestoreSnapshotLocked(List<SpanRecord> snapshot)
     {
         var combined = new List<SpanRecord>(snapshot.Count + _hotSpans.Count);
         combined.AddRange(snapshot);
         combined.AddRange(_hotSpans);
-        _hotSpans = combined;
+        var starts = SpanStartIndex.Build(combined);
+        _hotSpans  = combined;
+        _hotStarts = starts;
         _hotBytes += _flushingBytes;      // the snapshot's bytes come back with its spans
         _unflushedGeneration++;
 
@@ -4230,17 +4176,54 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// mutated — the segment writer sorts a copy (<c>SpanWriter.Write</c>), which readers already
     /// rely on when they take <see cref="_flushingSpans"/> lock-free. A <c>SpanRecord</c> is
     /// init-only. So the elements a run covers cannot change while it is walked.</para>
+    ///
+    /// <para><b>BOTH RUNS, ALWAYS.</b> Every reader of the unflushed spans reads the snapshot as well
+    /// as the live tier. Once the segment build moved off the lock, the detached snapshot — up to
+    /// <see cref="HotFlushThreshold"/> spans — belonged to neither tier for the build's whole
+    /// duration, so the trace list, per-service stats, volume sparkline and service graph each
+    /// carried a rolling hole just behind the live edge; at load, where flushes run back to back,
+    /// that hole was close to permanent. Tier order is the snapshot, then the live tier: the
+    /// snapshot left the tier before anything now in it arrived.</para>
+    ///
+    /// <para><b>EACH RUN WITH ITS START INDEX</b> (#94), captured in the same hold and safe to read
+    /// after it for the reason <see cref="SpanStartIndex"/> gives. A run whose index is not the one
+    /// built for its list, or does not count exactly its spans, is captured UNINDEXED and walked
+    /// whole — the pairing is maintained at four sites by hand, and a slip at one of them must cost
+    /// speed, never rows. <see cref="UnindexedCapturesForTest"/> counts it happening.</para>
     /// </summary>
-    private readonly ref struct UnflushedRuns(ReadOnlySpan<SpanRecord> flushing, ReadOnlySpan<SpanRecord> hot)
+    private readonly ref struct UnflushedRuns(
+        ReadOnlySpan<SpanRecord> flushing, SpanStartView flushingStarts,
+        ReadOnlySpan<SpanRecord> hot,      SpanStartView hotStarts)
     {
-        public readonly ReadOnlySpan<SpanRecord> Flushing = flushing;
-        public readonly ReadOnlySpan<SpanRecord> Hot      = hot;
+        public readonly ReadOnlySpan<SpanRecord> Flushing       = flushing;
+        public readonly SpanStartView            FlushingStarts = flushingStarts;
+        public readonly ReadOnlySpan<SpanRecord> Hot            = hot;
+        public readonly SpanStartView            HotStarts      = hotStarts;
     }
 
     /// <summary>See <see cref="UnflushedRuns"/>. Caller holds the read lock.</summary>
-    private UnflushedRuns UnflushedRunsLocked() => new(
-        _flushingSpans is { } flushing ? CollectionsMarshal.AsSpan(flushing) : default,
-        CollectionsMarshal.AsSpan(_hotSpans));
+    private UnflushedRuns UnflushedRunsLocked()
+    {
+        var flushing = _flushingSpans;
+        return new(
+            flushing is not null ? CollectionsMarshal.AsSpan(flushing) : default, StartViewLocked(_flushingStarts, flushing),
+            CollectionsMarshal.AsSpan(_hotSpans),                                StartViewLocked(_hotStarts, _hotSpans));
+    }
+
+    /// <summary>The start view of <paramref name="list"/>, or an unindexed one when the index is not provably its own.</summary>
+    private SpanStartView StartViewLocked(SpanStartIndex? index, List<SpanRecord>? list)
+    {
+        if (list is null) return default;
+        if (index is not null && ReferenceEquals(index.Owner, list) && index.Count == list.Count)
+            return index.View(list.Count);
+        Interlocked.Increment(ref _unindexedCaptures);
+        return default;
+    }
+
+    private long _unindexedCaptures;
+
+    /// <summary>Test hook: runs captured without a start index they could prove was theirs. Zero in a healthy engine.</summary>
+    internal long UnindexedCapturesForTest => Interlocked.Read(ref _unindexedCaptures);
 
     /// <summary>
     /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:
@@ -4723,16 +4706,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             segs = _coldSegments;
             runs = UnflushedRunsLocked();
+            _listCapturedForTest?.Invoke(segs, runs.Flushing.ToArray(), runs.Hot.ToArray());
         }
         finally { _lock.ExitReadLock(); }
 
         // Includes the in-flight flush snapshot — otherwise the newest rows disappear from the
-        // trace list for the duration of every segment build.
+        // trace list for the duration of every segment build. Every in-window span, in tier order:
+        // see MergeRunInto for what the start index lets it skip and why it may skip no more.
         if (runs.Flushing.Length + runs.Hot.Length > 0) _aggregatePassForTest?.Invoke(nameof(GetTraceListAsync));
-        foreach (var s in runs.Flushing)
-            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
-        foreach (var s in runs.Hot)
-            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+        int hotVisited = MergeRunInto(merged, runs.Flushing, runs.FlushingStarts, fromNano, toNano)
+                       + MergeRunInto(merged, runs.Hot,      runs.HotStarts,      fromNano, toNano);
+        _listHotVisitedForTest?.Invoke(hotVisited);
 
         // THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW — never a minimum over what it
         // merged, and the difference is the whole finding. Cold segments OVERLAP in time, so one
@@ -4929,8 +4913,14 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // window unreadable rather than a narrower one.
         unreadable |= _coldTierIncomplete || _vanished.Overlaps(fromNano, toNano);
 
-        // Filter + sort newest-first + take limit.
-        var list = new List<TraceSummary>(merged.Count);
+        // Filter + sort newest-first + take limit — and only THEN make rows (#94). A row is a
+        // TraceSummary, its services array, and for a hot root the blob walk for the HTTP method
+        // and path; the merge used to make one for every trace that passed the filters, sort them,
+        // and throw away all but `limit` — 4 900 rows for 500 on a 49 000-span tier, every page.
+        // The merged traces are sorted instead, by the key the row would have carried, in the order
+        // the rows would have been listed in and by the same comparison: the same permutation, so
+        // the same rows in the same order, including among equal keys.
+        var kept = new List<MergedTrace>(merged.Count);
         foreach (var m in merged.Values)
         {
             var rowStatus = m.HasError ? SpanStatusCode.Error : m.RootStatus;
@@ -4939,12 +4929,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             if (spanName is not null && !m.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) continue;
             if (minDurationNanos is not null && m.DurationNanos < minDurationNanos.Value) continue;
             if (maxDurationNanos is not null && m.DurationNanos > maxDurationNanos.Value) continue;
-            list.Add(m.ToSummary());
+            kept.Add(m);
         }
 
-        list.Sort(static (a, b) => b.RootStartNano.CompareTo(a.RootStartNano));
+        kept.Sort(static (a, b) => b.RowStartNano.CompareTo(a.RowStartNano));
 
-        if (list.Count > limit)
+        if (kept.Count > limit)
         {
             // The `limit` cut is the THIRD place this call stopped short. Rows under it were
             // merged and then thrown away without ever being handed to the caller, so the page
@@ -4956,9 +4946,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // rows under the cut come back on the next page. It is the OTHER two floors — the
             // budget break and the unreadable segment — that can sit above such a cursor, and
             // that is precisely the gap the caller has to be told about.
-            scanFloor = Math.Max(scanFloor, list[Math.Max(0, limit - 1)].RootStartNano);
-            list.RemoveRange(limit, list.Count - limit);
+            scanFloor = Math.Max(scanFloor, kept[Math.Max(0, limit - 1)].RowStartNano);
+            kept.RemoveRange(limit, kept.Count - limit);
         }
+
+        var list = new List<TraceSummary>(kept.Count);
+        foreach (var m in kept) list.Add(m.ToSummary());
 
         // CAPPED and "there is a floor" are the same statement, so they are computed once from
         // one another. A floor above long.MinValue is exactly a region of [from, to] this page
@@ -4979,7 +4972,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         var m = GetOrAdd(merged, s.TraceId);
         m.SpanCount++;
         if (s.Status == SpanStatusCode.Error) m.HasError = true;
-        m.Services.Add(s.ServiceName);
+        m.AddService(s.ServiceName);
         if (s.StartTimeUnixNano < m.EarliestNano) { m.EarliestNano = s.StartTimeUnixNano; m.EarliestService = s.ServiceName; }
         if (s.ParentSpanId.IsEmpty && !m.HasRoot)
         {
@@ -4991,7 +4984,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             m.HttpStatusCode = s.HttpStatusCode;
             m.Name           = s.Name;
             m.ServiceName    = s.ServiceName;
-            SetHttpAttrs(s, m);
+            m.HttpFrom       = s;         // read when the row is made — see SetHttpAttrs
         }
     }
 
@@ -5000,7 +4993,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         var m = GetOrAdd(merged, r.TraceId);
         m.SpanCount += r.SpanCount;
         if (r.HasError) m.HasError = true;
-        foreach (var sv in r.Services) m.Services.Add(sv);
+        foreach (var sv in r.Services) m.AddService(sv);
         if (r.RootStartNano < m.EarliestNano) { m.EarliestNano = r.RootStartNano; m.EarliestService = r.ServiceName; }
         if (r.HasRoot && !m.HasRoot)
         {
@@ -5017,43 +5010,38 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         }
     }
 
-    private static bool ServiceMatch(MergedTrace m, string service)
-    {
-        if (m.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
-        foreach (var sv in m.Services)
-            if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
-        return false;
-    }
+    private static bool ServiceMatch(MergedTrace m, string service) =>
+        m.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase) || m.HasService(service);
 
     /// <summary>
     /// THE TRACE LIST READS TWO KEYS, SO IT READS TWO KEYS — not a whole attribute map, and above
     /// all not a whole attribute map from inside <c>_lock.EnterReadLock()</c>.
     ///
-    /// <para><see cref="MergeSpanInto"/> runs under the read lock over every unflushed span and
-    /// asks this for the first root span of each trace. Reaching the answer through
-    /// <see cref="SpanRecord.Attributes"/> made that ask the FIRST touch of the record's blob, so
-    /// the lazy decode ran right there: a <c>Dictionary</c>, a key string and a box per attribute
-    /// per root span of the tier, inside a lock the drainer's <c>WriteSpan</c> has to wait out —
-    /// and memoised on the record afterwards, so a tier that had been listed once stayed that much
-    /// heavier until it flushed. Release, 20 000-span tier, 2 000 traces: 2 023 → 623 B allocated
-    /// per root span, and 1 888 → 498 B LEFT ON THE TIER, which at the 50 000-span threshold is
-    /// 9,0 → 2,4 MB the tier never gives back, on the first page after every flush.</para>
+    /// <para>The merge used to ask it for the first root span of each trace, from inside the read
+    /// lock. Reaching the answer through <see cref="SpanRecord.Attributes"/> made that ask the
+    /// FIRST touch of the record's blob, so the lazy decode ran right there: a <c>Dictionary</c>, a
+    /// key string and a box per attribute per root span of the tier, inside a lock the drainer's
+    /// <c>WriteSpan</c> has to wait out — and memoised on the record afterwards, so a tier that had
+    /// been listed once stayed that much heavier until it flushed. Release, 20 000-span tier, 2 000
+    /// traces: 2 023 → 623 B allocated per root span, and 1 888 → 498 B LEFT ON THE TIER, which at
+    /// the 50 000-span threshold is 9,0 → 2,4 MB the tier never gives back, on the first page after
+    /// every flush.</para>
     ///
-    /// <para>WHAT IT COSTS, because it is not free: the decode was memoised and this walk is not,
-    /// so a second page over the same tier pays it again — the probe measures page 2 at 5,1 ms
-    /// against the memoised path's 3,0 ms, ≈ 1 µs per root span of read-lock hold per page, and
-    /// 96 B per root span for the one <c>GetString</c> the dictionary had already paid for. The
-    /// trade is deliberate and it is the round's stated order — resident memory first, and the
-    /// 512 MB stand died of the live set, not of a millisecond. Memoising the two strings on the
-    /// record instead is the SSE hot-tier re-walk, which the plan gives to WP9.</para>
+    /// <para>The walk is not memoised, so every page pays it again — ≈ 1 µs and 96 B (the one
+    /// <c>GetString</c>) per root span asked. Deliberately: resident memory first, and the 512 MB
+    /// stand died of the live set, not of a millisecond. What #94 changed is WHICH root spans are
+    /// asked: the merge records the root (<see cref="MergedTrace.HttpFrom"/>) and
+    /// <see cref="MergedTrace.ToSummary"/> calls this after the sort and the cut, so a page pays it
+    /// for the rows it returns — 500 on the stream's page — where it paid it for every trace it
+    /// merged, 4 900 of them on a 49 000-span tier. Same record, same walk, same two strings.</para>
     ///
     /// <para>ONE WALK, BOTH QUESTIONS, AND ONE COPY OF IT: the walk itself is
     /// <see cref="HttpSemconvKeys.Resolve"/>, beside the key lists it reads, because
     /// <c>TraceQLExecutor.BuildRow</c> asks the same question of the same records of the same
     /// tier and must not answer it a second way.</para>
     /// </summary>
-    private static void SetHttpAttrs(SpanRecord s, MergedTrace m) =>
-        HttpSemconvKeys.Resolve(s, out m.HttpMethod, out m.HttpPath);
+    private static void SetHttpAttrs(SpanRecord s, out string method, out string path) =>
+        HttpSemconvKeys.Resolve(s, out method, out path);
 
     private struct HotVolAcc
     {
@@ -5083,25 +5071,88 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         public string          HttpMethod  = string.Empty;
         public string          HttpPath    = string.Empty;
 
-        public readonly HashSet<string> Services = new(2, StringComparer.Ordinal);
+        /// <summary>
+        /// The root SPAN the row's HTTP method and path are read from, when the root came from a
+        /// span rather than a summary — read in <see cref="ToSummary"/>, so only for the rows a page
+        /// keeps (see <see cref="SetHttpAttrs"/>). A summary's root carries the two strings already
+        /// and leaves this null.
+        /// </summary>
+        public SpanRecord?     HttpFrom;
 
-        public TraceSummary ToSummary() => new()
+        /// <summary>The start the row carries, and the key the list sorts on.</summary>
+        public long RowStartNano => HasRoot ? RootStartNano : EarliestNano;
+
+        // ── The trace's services: distinct by ordinal, in the order they were first met ──────
+        //
+        // A HashSet<string> per merged trace used to hold them — 176 B for the set's object and
+        // two arrays, on every trace a page merged, in a list whose ordinary trace touches one to
+        // three services. The first three live in fields now and a set exists only from a fourth
+        // on; the order a row lists them in is the order they were added, exactly as the set
+        // enumerated them (it is never removed from, so its enumeration order IS its insertion
+        // order). Strings in the tier are the pools' shared instances, so the comparison is
+        // almost always a reference check.
+
+        private string?          _service0;
+        private string?          _service1;
+        private string?          _service2;
+        private HashSet<string>? _moreServices;
+
+        public void AddService(string service)
         {
-            TraceId        = TraceId,
-            RootSpanId     = RootSpanId,
-            RootStartNano  = HasRoot ? RootStartNano : EarliestNano,
-            DurationNanos  = DurationNanos,
-            SpanCount      = SpanCount,
-            HasRoot        = HasRoot,
-            HasError       = HasError,
-            RootStatus     = RootStatus,
-            HttpStatusCode = HttpStatusCode,
-            Name           = Name,
-            ServiceName    = HasRoot ? ServiceName : EarliestService,
-            HttpMethod     = HttpMethod,
-            HttpPath       = HttpPath,
-            Services       = [.. Services],
-        };
+            if (_service0 is null)                                          { _service0 = service; return; }
+            if (string.Equals(_service0, service, StringComparison.Ordinal)) return;
+            if (_service1 is null)                                          { _service1 = service; return; }
+            if (string.Equals(_service1, service, StringComparison.Ordinal)) return;
+            if (_service2 is null)                                          { _service2 = service; return; }
+            if (string.Equals(_service2, service, StringComparison.Ordinal)) return;
+            (_moreServices ??= new HashSet<string>(StringComparer.Ordinal)).Add(service);
+        }
+
+        /// <summary>Whether any service is <paramref name="service"/>, ignoring case — the list's service filter.</summary>
+        public bool HasService(string service)
+        {
+            if (_service0 is not null && _service0.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_service1 is not null && _service1.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_service2 is not null && _service2.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            if (_moreServices is null) return false;
+            foreach (var sv in _moreServices)
+                if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private string[] ServicesArray()
+        {
+            int inline = _service0 is null ? 0 : _service1 is null ? 1 : _service2 is null ? 2 : 3;
+            var all    = new string[inline + (_moreServices?.Count ?? 0)];
+            if (inline > 0) all[0] = _service0!;
+            if (inline > 1) all[1] = _service1!;
+            if (inline > 2) all[2] = _service2!;
+            if (_moreServices is not null) _moreServices.CopyTo(all, inline);
+            return all;
+        }
+
+        public TraceSummary ToSummary()
+        {
+            string httpMethod = HttpMethod, httpPath = HttpPath;
+            if (HttpFrom is not null) SetHttpAttrs(HttpFrom, out httpMethod, out httpPath);
+            return new()
+            {
+                TraceId        = TraceId,
+                RootSpanId     = RootSpanId,
+                RootStartNano  = RowStartNano,
+                DurationNanos  = DurationNanos,
+                SpanCount      = SpanCount,
+                HasRoot        = HasRoot,
+                HasError       = HasError,
+                RootStatus     = RootStatus,
+                HttpStatusCode = HttpStatusCode,
+                Name           = Name,
+                ServiceName    = HasRoot ? ServiceName : EarliestService,
+                HttpMethod     = httpMethod,
+                HttpPath       = httpPath,
+                Services       = ServicesArray(),
+            };
+        }
     }
 
     /// <summary>
