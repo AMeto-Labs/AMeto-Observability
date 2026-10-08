@@ -282,9 +282,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// not allowed to turn a merge back into a silent low count: <see cref="_mergedAwayEvictedThrough"/>
     /// says how far it has reached, and a scan that may have lost a record to it reports the
     /// removal as a merge (see <see cref="MayHaveBeenMergedAway"/>). Everything here is under
-    /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge — alone for its records, and
+    /// <see cref="_mergedAwayGate"/>, a leaf, taken by the merge — alone for its records, and
     /// under <c>_importLock</c> and <see cref="_scanDeleteGate"/> to publish the mark in its commit —
-    /// and by a scan that has already failed to read a segment.</para>
+    /// by merge recovery's late commit of an output whose verdict waited, under both for its
+    /// records and its mark (<see cref="RecoverInterruptedMerges"/>), and by a scan that has
+    /// already failed to read a segment.</para>
     /// </summary>
     private readonly Dictionary<SegmentKey, MergedAwayRecord> _mergedAwaySegments = new();
     /// <summary>One entry of <see cref="_mergedAwaySegments"/>: which record named the source, and where its events went.</summary>
@@ -675,13 +677,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     ///
     /// <para>Lock order: this, then <see cref="_scanDeleteGate"/>, then either of two leaves —
     /// the catalog's build lock (<see cref="SegmentCatalog.Swap"/>) and
-    /// <see cref="_mergedAwayGate"/> (<see cref="PublishMergedAwayMark"/>), both taken only by a
-    /// merge's commit. Nothing that holds any of those three takes this one, and the allocator
-    /// floor is raised before an import enters, so <c>_segIdLock</c> is never taken under it.
-    /// Each hold is short: an import's is a dictionary exchange and a rename (the segment's
-    /// contents were read before it); a delete's, a removal and one unlink; a merge commit's, one
-    /// swap and a park per source, with no unlink at all; merge recovery's, a lookup and a park
-    /// per source, and the removal of an entry a scan registered by mistake.</para>
+    /// <see cref="_mergedAwayGate"/> (<see cref="RecordMergedAwaySegment"/>,
+    /// <see cref="PublishMergedAwayMark"/>), both taken under the two by a merge's commit and by
+    /// merge recovery's late commit of an output whose verdict waited
+    /// (<see cref="RecoverInterruptedMerges"/>). Nothing that holds any of those three takes this
+    /// one, and the allocator floor is raised before an import enters, so <c>_segIdLock</c> is never
+    /// taken under it. Each hold is short: an import's is a dictionary exchange and a rename (the
+    /// segment's contents were read before it); a delete's, a removal and one unlink; a merge
+    /// commit's, one swap and a park per source, with no unlink at all; merge recovery's, a lookup
+    /// and a park per source, the removal of each listed source the catalog names, and — committing
+    /// a verdict that waited — one swap with a record per source.</para>
     /// </summary>
     private readonly System.Threading.Lock                _importLock = new();
 
@@ -1910,16 +1915,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <summary>
     /// Serialises the boot catalog scan's check-and-register with <see cref="DeleteSegmentAsync"/>'s
     /// remove, record, unlink and park, with a merge commit's swap, record and park
-    /// (<see cref="CommitMerge"/>) and with merge recovery's park
+    /// (<see cref="CommitMerge"/>) and with merge recovery's removals, park and late commit
     /// (<see cref="RecoverInterruptedMerges"/>), and guards <see cref="_deletedDuringCatalogScan"/>
     /// and <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
     /// import holds that one across its publish and the scan must still be able to land inside
     /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
-    /// <c>_importLock</c> by the delete, the merge's commit and cap check, merge recovery's park
-    /// (the scan's own sweep's too, before its listing, holding nothing else) and the parked
-    /// retry's record; alone by the scan's registrations. Under it only the two leaves a merge's
-    /// commit takes: the catalog's build lock and <see cref="_mergedAwayGate"/> (see
-    /// <c>_importLock</c> for the whole order).
+    /// <c>_importLock</c> by the delete, the merge's commit and cap check, merge recovery's
+    /// removals, park and late commit (the scan's own sweep's too, before its listing, holding
+    /// nothing else) and the parked retry's record; alone by the scan's registrations and by the
+    /// record of a file that leaves with no entry to remove (a flush's unpublished level files,
+    /// merge recovery's output set aside or left waiting). Under it only the two leaves a merge's
+    /// commit and merge recovery's late commit take: the catalog's build lock and
+    /// <see cref="_mergedAwayGate"/> (see <c>_importLock</c> for the whole order).
     /// </summary>
     private readonly System.Threading.Lock _scanDeleteGate = new();
 
@@ -3963,11 +3970,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 DeferMergeVerdict(manifest, output, unreadable!, newer: false);
                 return;
             case MergeOutputState.Newer:
-                // A format this release cannot read (#119): a rollback's file, or a version field a
-                // bit flip pushed past the newest. While every source is still on disk the merge can
-                // be rolled back whole, and is: the sources stay in service, the output goes aside.
-                // With one already unlinked, the merge did commit and that source's events live only
-                // in this output, which a release that reads it can still commit: it waits, kept.
+                // A file in a format this release cannot read (#119): written by a newer release and met
+                // after a rollback to this one, or a version field a bit flip pushed past the newest.
+                // While every source is still on disk the merge can be rolled back whole, and is: the
+                // sources stay in service, the output goes aside. With one already unlinked, the merge
+                // did commit and that source's events live only in this output, which a release that
+                // reads it can still commit: it waits, kept.
                 if (EveryListedSourceOnDisk(manifest, output))
                 {
                     _logger.LogWarning(unreadable,
@@ -4116,10 +4124,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// 0 of 600 events served when it was torn, at a start and at a pass alike.</para>
     ///
     /// <para>One in a segment format newer than this release reads (#119's
-    /// <see cref="NewerSegmentFormatException"/>) is <see cref="MergeOutputState.Newer"/>: a
-    /// rollback's file, or a version field a bit flip pushed past the newest. It went down the same
-    /// "taken as committed" road. <see cref="RecoverInterruptedMerge"/> rolls such a merge back while
-    /// every source is on disk, and otherwise keeps the output waiting for a release that reads it.</para>
+    /// <see cref="NewerSegmentFormatException"/>) is <see cref="MergeOutputState.Newer"/>: written
+    /// by a newer release and met after a rollback to this one, or a version field a bit flip
+    /// pushed past the newest. It went down the same "taken as committed" road.
+    /// <see cref="RecoverInterruptedMerge"/> rolls such a merge back while every source is on disk,
+    /// and otherwise keeps the output waiting for a release that reads it.</para>
     /// </summary>
     private MergeOutputState ReadMergeOutput(string output, out SegmentInfo? proved, out Exception? unreadable)
     {

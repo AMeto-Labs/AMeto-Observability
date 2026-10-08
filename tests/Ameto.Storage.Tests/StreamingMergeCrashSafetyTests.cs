@@ -1792,10 +1792,10 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
     /// <summary>
     /// An output in a segment format newer than this release reads, every source still on disk:
-    /// a version field a bit flip pushed past the newest (v263 = 7 + 256), or a rollback's merge
-    /// killed before its unlinks. Taken as committed, every source was unlinked against a file
-    /// this release cannot read: 0 of 600. The merge is rolled back instead: the sources stay and
-    /// the output goes aside.
+    /// a version field a bit flip pushed past the newest (v263 = 7 + 256), or a merge a newer release
+    /// wrote, killed before its unlinks and met after a rollback to this one. Taken as committed,
+    /// every source was unlinked against a file this release cannot read: 0 of 600. The merge is
+    /// rolled back instead: the sources stay and the output goes aside.
     /// </summary>
     [Fact]
     public async Task AnOutputInANewerFormat_WithEverySourceOnDisk_IsRolledBack()
