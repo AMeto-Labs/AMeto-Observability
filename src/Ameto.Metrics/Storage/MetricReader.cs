@@ -255,10 +255,10 @@ internal static class MetricReader
     /// </summary>
     internal static IEnumerable<ReadItem> ReadForRewrite(
         string filePath, Func<SeriesKey, int> keyOf, int pointsBelow, long fromNano = long.MinValue,
-        ReadScratch? scratch = null) =>
+        ReadScratch? scratch = null, CancellationToken ct = default) =>
         ReadCore(filePath, metricName: null,
                  new ReadWindow(fromNano, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow),
-                 at: null, CancellationToken.None, scratch);
+                 at: null, ct, scratch);
 
     /// <summary>
     /// The rewrite's PLANNING pass over one source (#125): every series in file order with its
@@ -269,10 +269,10 @@ internal static class MetricReader
     /// and nothing is built: the rewrite plans its chunks by this before it holds a single point.
     /// </summary>
     internal static IEnumerable<ReadItem> PlanForRewrite(string filePath, Func<SeriesKey, int> keyOf, long fromNano = long.MinValue,
-                                                         ReadScratch? scratch = null) =>
+                                                         ReadScratch? scratch = null, CancellationToken ct = default) =>
         ReadCore(filePath, metricName: null,
                  new ReadWindow(fromNano, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow: 0, stats: true),
-                 at: null, CancellationToken.None, scratch);
+                 at: null, ct, scratch);
 
     /// <summary>
     /// The series at <paramref name="positions"/> (as <see cref="PlanForRewrite"/> or
@@ -283,10 +283,10 @@ internal static class MetricReader
     /// </summary>
     internal static IEnumerable<ReadItem> ReadAt(string filePath, List<long> positions,
                                                   long fromNano = long.MinValue, long toNano = long.MaxValue,
-                                                  ReadScratch? scratch = null) =>
+                                                  ReadScratch? scratch = null, CancellationToken ct = default) =>
         ReadCore(filePath, metricName: null,
                  new ReadWindow(fromNano, toNano, null, buckets: true, labels: false),
-                 at: positions, CancellationToken.None, scratch);
+                 at: positions, ct, scratch);
 
     /// <summary>
     /// One series as a rewrite read meets it: where it sits (for v3 its offset in the inflated block,

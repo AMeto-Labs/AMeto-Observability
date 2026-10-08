@@ -1194,7 +1194,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
 
     /// <summary>Test hook: one rollup pass, now — what the rollup loop runs on its timer.</summary>
-    internal Task PerformRollupForTest() => PerformRollupAsync(CancellationToken.None);
+    internal Task PerformRollupForTest(CancellationToken ct = default) => PerformRollupAsync(ct);
 
     /// <summary>
     /// Test hook: files written beside the engine into its data directory, entered into the cold
@@ -2352,6 +2352,15 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// One pass of compactions, merges and rollups. <paramref name="ct"/> — the engine's shutdown —
+    /// is honoured between units of work (#126 review L2): between metrics, and before every turn at
+    /// <see cref="BackgroundRewriteGate"/> a rewrite takes (each chunk, slice and planning walk). A
+    /// rewrite stopped part-way takes back the outputs it wrote, its sources stay as they were, and
+    /// a stop is neither an Error line nor a back-off. It used to run to the end of the pass —
+    /// with #125's byte-bounded chunks, many more units — past a container's stop timeout, which
+    /// killed the process mid-rewrite with outputs beside their sources.
+    /// </summary>
     private void PerformRollupPass(CancellationToken ct)
     {
         // Compact raw files older than 10 min but newer than the 1-h rollup cutoff
@@ -2446,16 +2455,17 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         long passBytes = TotalSizeBytes(toCompact) + TotalSizeBytes(toMerge5m) + TotalSizeBytes(toMerge1h)
                        + TotalSizeBytes(toRollup5m) + TotalSizeBytes(toRollup1h);
 
-        if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw, RewriteWork.RawCompaction, minFiles: 2);
-        MergeTier(toMerge5m, MetricGranularity.FiveMin, RewriteWork.FiveMinMerge);
+        if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw, RewriteWork.RawCompaction, minFiles: 2, ct);
+        MergeTier(toMerge5m, MetricGranularity.FiveMin, RewriteWork.FiveMinMerge, ct);
         // A merged file expires whole (MaxNano vs the retention cutoff), so its
         // window is also its retention granularity — never let it exceed the TTL
         // itself, or a short retention would be violated several times over.
         var window1h = TimeSpan.FromTicks(Math.Min(TimeSpan.FromDays(7).Ticks,
             Interlocked.Read(ref _lastPruneTtlTicks)));
-        MergeTier(toMerge1h, MetricGranularity.OneHour, RewriteWork.OneHourMerge, maxSpan: window1h);
-        if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5), RewriteWork.FiveMinRollup);
-        if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1), RewriteWork.OneHourRollup);
+        MergeTier(toMerge1h, MetricGranularity.OneHour, RewriteWork.OneHourMerge, ct, maxSpan: window1h);
+        if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5), RewriteWork.FiveMinRollup, ct);
+        if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1), RewriteWork.OneHourRollup, ct);
+        if (ct.IsCancellationRequested) return;    // stopped: no collection for a pass cut short
 
         // Hand the pass's peak back to the OS instead of letting it ratchet up across
         // passes — but only when there WAS a peak. This used to run unconditionally:
@@ -2518,10 +2528,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// bound nor the retention granularity the 1-h tier's caller takes it for. A file straddling a
     /// boundary is left as it is and expires on its own MaxNano.</para>
     /// </summary>
-    private void MergeTier(List<MetricSegmentInfo> tier, MetricGranularity granularity, RewriteWork work, TimeSpan? maxSpan = null)
+    private void MergeTier(List<MetricSegmentInfo> tier, MetricGranularity granularity, RewriteWork work,
+                           CancellationToken ct, TimeSpan? maxSpan = null)
     {
         foreach (var group in tier.GroupBy(s => s.MetricName))
         {
+            if (ct.IsCancellationRequested) return;
             // Window by maxSpan so a merged file's range stays bounded. A window is known by where
             // it starts (0 for the unwindowed tier): the back-off and the merge record are per window.
             IEnumerable<(long Start, List<MetricSegmentInfo> Files)> windows;
@@ -2539,7 +2551,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             }
 
             foreach (var (start, files) in windows)
-                CompactSegments(files, granularity, work, minFiles: 4, start);
+                CompactSegments(files, granularity, work, minFiles: 4, ct, start);
         }
     }
 
@@ -2553,10 +2565,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// last outputs is a rewrite of the same points into the same files (#125).</para>
     /// </summary>
     private void CompactSegments(List<MetricSegmentInfo> sources, MetricGranularity granularity, RewriteWork work,
-                                 int minFiles, long windowStart = 0)
+                                 int minFiles, CancellationToken ct, long windowStart = 0)
     {
         foreach (var group in sources.GroupBy(s => s.MetricName))
         {
+            if (ct.IsCancellationRequested) return;
             var slot = new RewriteSlot(group.Key, work, windowStart);
             var segs = group.ToList();
             if (segs.Count < 2 && segs.All(s => s.FormatVersion >= 3)) continue;
@@ -2565,7 +2578,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             try
             {
                 var newInfos = RewriteMetricInChunks(
-                    segs, granularity, static (pts, _) => DedupeByTimestamp(pts), RetentionKeepFromNano());
+                    segs, granularity, static (pts, _) => DedupeByTimestamp(pts), RetentionKeepFromNano(), ct: ct);
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -2582,6 +2595,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 RewriteSucceeded(slot);
                 _logger.LogDebug("Compacted {Count} {Granularity} segment(s) for metric '{Metric}'",
                     segs.Count, granularity, group.Key);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Stopping (#126 review L2): the rewrite took back what it wrote, the sources are as
+                // they were. Not a failure of the work — no Error line, no back-off.
+                return;
             }
             catch (UnreadableSourceException ex)
             {
@@ -2737,12 +2756,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     /// <param name="outputBucketNanos">The rollup's bucket, when the transform downsamples (it sizes
     /// the output a chunk writes); 0 for a merge, whose output is its input less duplicates.</param>
+    /// <param name="ct">The engine's stop (#126 review L2): checked before every turn at the gate —
+    /// each chunk, slice and planning walk — and inside each read. A rewrite stopped part-way throws
+    /// <see cref="OperationCanceledException"/> having taken back every output it wrote.</param>
     internal List<MetricSegmentInfo> RewriteMetricInChunks(
         List<MetricSegmentInfo> segs,
         MetricGranularity       target,
         Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform,
         long keepFromNano      = long.MinValue,
-        long outputBucketNanos = 0)
+        long outputBucketNanos = 0,
+        CancellationToken ct   = default)
     {
         var keys   = new List<SeriesKey>();
         var index  = new Dictionary<SeriesKey, int>();
@@ -2801,11 +2824,12 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         {
             var first = new List<List<MetricDataPoint>?>();
             long hint = 0;
+            ct.ThrowIfCancellationRequested();
             using (_rewriteGate.Enter())
             {
                 foreach (var seg in segs)
                 {
-                    foreach (var item in ReadingFrom(seg, MetricReader.ReadForRewrite(seg.FilePath, keyOf, int.MaxValue, keepFromNano, scratch)))
+                    foreach (var item in ReadingFrom(seg, MetricReader.ReadForRewrite(seg.FilePath, keyOf, int.MaxValue, keepFromNano, scratch, ct)))
                     {
                         int k = item.Key;
                         if (item.Series.BucketBounds is not null) bounds[k] = item.Series.BucketBounds;
@@ -2833,8 +2857,9 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 // The planning walk takes its turn as well (#125 review F4): it inflates each source's
                 // whole block, the largest thing a rewrite reads. Source by source, so a trace pass
                 // gets in between two of them.
+                ct.ThrowIfCancellationRequested();
                 using var turn = _rewriteGate.Enter();
-                foreach (var item in ReadingFrom(seg, MetricReader.PlanForRewrite(seg.FilePath, keyOf, keepFromNano, scratch)))
+                foreach (var item in ReadingFrom(seg, MetricReader.PlanForRewrite(seg.FilePath, keyOf, keepFromNano, scratch, ct)))
                 {
                     int k = item.Key;
                     positions.Add(item.Position);
@@ -2876,6 +2901,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // Keys [off, end), read back from every source that holds one, as one chunk.
         void WriteKeys(int off, int end, List<(MetricSegmentInfo Seg, List<long> Positions, List<int> Keys)> located)
         {
+            ct.ThrowIfCancellationRequested();
             using var turn = _rewriteGate.Enter();
             var acc  = new List<MetricDataPoint>?[end - off];
             long hint = 0;
@@ -2894,7 +2920,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
 
                 int n = 0;
-                foreach (var item in ReadingFrom(seg, MetricReader.ReadAt(seg.FilePath, at, keepFromNano, scratch: scratch)))
+                foreach (var item in ReadingFrom(seg, MetricReader.ReadAt(seg.FilePath, at, keepFromNano, scratch: scratch, ct: ct)))
                 {
                     int k = atKey[n++];
                     (acc[k - off] ??= new List<MetricDataPoint>(FileBounds.PreallocFor(kept[k], PointHeapBytes))).AddRange(item.Series.Points);
@@ -2914,6 +2940,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             for (long from = lo; from <= maxTs[k]; from = from > long.MaxValue - width ? long.MaxValue : from + width)
             {
                 long to = from > long.MaxValue - width ? long.MaxValue : from + width - 1;
+                ct.ThrowIfCancellationRequested();
                 using var turn = _rewriteGate.Enter();
                 List<MetricDataPoint>? acc = null;
                 foreach (var (seg, positions, keyOrder) in located)
@@ -2922,7 +2949,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     for (int j = 0; j < positions.Count; j++)
                         if (keyOrder[j] == k) (at ??= []).Add(positions[j]);
                     if (at is null) continue;
-                    foreach (var item in ReadingFrom(seg, MetricReader.ReadAt(seg.FilePath, at, Math.Max(from, keepFromNano), to, scratch)))
+                    foreach (var item in ReadingFrom(seg, MetricReader.ReadAt(seg.FilePath, at, Math.Max(from, keepFromNano), to, scratch, ct)))
                         (acc ??= []).AddRange(item.Series.Points);
                 }
                 if (acc is { Count: > 0 })
@@ -2994,13 +3021,15 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         List<MetricSegmentInfo> sources,
         MetricGranularity       targetGranularity,
         TimeSpan                bucketSize,
-        RewriteWork             work)
+        RewriteWork             work,
+        CancellationToken       ct)
     {
         // Group source files by metric name, aggregate points into buckets
         var groupedByMetric = sources.GroupBy(s => s.MetricName);
 
         foreach (var group in groupedByMetric)
         {
+            if (ct.IsCancellationRequested) return;
             var slot = new RewriteSlot(group.Key, work, Window: 0);
             if (BackingOff(slot)) continue;
             try
@@ -3011,7 +3040,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 var newInfos = RewriteMetricInChunks(
                     group.ToList(), targetGranularity,
                     (pts, kind) => RollupPoints(pts, bucketSize, kind),
-                    RetentionKeepFromNano(), (long)bucketSize.TotalMilliseconds * 1_000_000L);
+                    RetentionKeepFromNano(), (long)bucketSize.TotalMilliseconds * 1_000_000L, ct);
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -3028,6 +3057,10 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 RewriteSucceeded(slot);
                 _logger.LogDebug("Rolled up {Count} segments for metric '{Metric}' → {Granularity}",
                     group.Count(), group.Key, targetGranularity);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;                                // stopping: as in CompactSegments
             }
             catch (UnreadableSourceException ex)
             {

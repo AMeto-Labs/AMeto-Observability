@@ -223,6 +223,49 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         Assert.Empty(Errors());
     }
 
+    /// <summary>
+    /// A STOP IS HONOURED BETWEEN UNITS OF A REWRITE, AND IS NOT A FAILURE (#126 review L2). The pass
+    /// never read its token, so a shutdown waited for every remaining chunk of every metric — with
+    /// byte-bounded chunks, many — and a container's stop timeout killed the process mid-rewrite,
+    /// leaving outputs beside their sources. Here a Raw compaction planned in many 64 KB chunks is
+    /// stopped once its first chunk is written: the pass returns with that output taken back, only
+    /// the sources on disk and in the catalog, no Error line — and no back-off: the next pass, not
+    /// stopped, compacts.
+    /// </summary>
+    [Fact]
+    public async Task A_rewrite_stopped_after_its_first_chunk_leaves_only_its_sources_and_no_error()
+    {
+        const string metric = "stopped.raw";
+        long now = Now() / Min * Min;
+        Write(_dir, metric, MetricGranularity.Raw, 600, now - 50 * Min, 3);
+        Write(_dir, metric, MetricGranularity.Raw, 600, now - 40 * Min, 3);
+        var sources = Directory.GetFiles(_dir, "*.mts").OrderBy(p => p, StringComparer.Ordinal).ToList();
+
+        var log = new CapturingLogger();
+        await using var engine = new MetricStorageEngine(_dir, log, new Ameto.Core.MetricsOptions { RewriteBudgetBytes = 64 * 1024 });
+        await engine.ColdLoadCompleted;
+        Assert.Equal(sources, Paths(engine, metric, MetricGranularity.Raw));
+
+        using var stop = new CancellationTokenSource();
+        int written = 0, planned = 0;
+        engine.OnRewriteChunkPlannedForTest = (_, _, _) => planned++;
+        engine.OnRewriteChunkWrittenForTest = _ => { written++; stop.Cancel(); };
+
+        await engine.PerformRollupForTest(stop.Token);
+
+        Assert.Equal(1, written);                                                    // it began, and stopped after one chunk
+        Assert.Equal(sources, Directory.GetFiles(_dir, "*.mts").OrderBy(p => p, StringComparer.Ordinal).ToList());
+        Assert.Equal(sources, Paths(engine, metric, MetricGranularity.Raw));
+        lock (log.Entries) Assert.DoesNotContain(log.Entries, e => e.Level == LogLevel.Error);
+
+        // Not backing off: the next pass, not stopped, does the work — in several chunks.
+        engine.OnRewriteChunkWrittenForTest = null;
+        planned = 0;
+        await engine.PerformRollupForTest();
+        Assert.Empty(Paths(engine, metric, MetricGranularity.Raw).Intersect(sources));
+        Assert.True(planned >= 5, $"setup: the compaction must take several chunks, it took {planned}");
+    }
+
     [Fact]
     public async Task A_Raw_compaction_whose_inputs_are_its_own_outputs_is_not_rewritten()
     {
