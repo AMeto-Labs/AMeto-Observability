@@ -3236,7 +3236,9 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// <summary>
     /// Source files a rewrite could not read for their CONTENT, by path: left out of every rewrite this
     /// process plans, on disk, until retention removes them (#125 review F1). Owned by the pass, like
-    /// <see cref="_rewriteFailures"/>; a path is forgotten when its file leaves the catalog.
+    /// <see cref="_rewriteFailures"/>; a path is forgotten when its file leaves the catalog. In memory
+    /// only, so for the life of this process: after a restart the first rewrite that meets the file
+    /// fails its group once more, warns again and leaves it out again — still with no back-off.
     ///
     /// <para>A rollup or merge rewrites ALL of a metric's files of its kind together, so one file that
     /// fails the same way on every read failed every attempt for its whole group. The case #125 left
@@ -3288,7 +3290,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     }
 
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Warning,
-        Message = "Metric file {File} of '{Metric}' will not decode — left on disk and out of compaction and rollup from now on; retention removes it as usual")]
+        Message = "Metric file {File} of '{Metric}' will not decode — left on disk and out of compaction and rollup for the life of this process "
+                + "(a restart meets it once more); retention removes it as usual")]
     private static partial void LogSourceQuarantined(ILogger logger, Exception exception, string file, string metric);
 
     /// <summary>

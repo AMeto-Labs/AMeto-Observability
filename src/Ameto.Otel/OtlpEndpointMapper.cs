@@ -199,8 +199,9 @@ public static class OtlpEndpointMapper
                 // Where the stand ran out: the WAL append, under a heap compaction had filled. The
                 // append is all-or-nothing (MetricStorageEngine.Ingest), so a batch it failed
                 // comes back whole on the retry and is stored once. One that runs out AFTER the
-                // append, filing its points in memory, is durable already, and the retry stores
-                // what was filed a second time: at least once, as a log or trace prefix is.
+                // append, filing its points in memory, is in the log but only partly in memory, and
+                // the next flush commits the log without writing the unfiled points: the retry is
+                // what keeps them, and it stores the filed ones a second time — at least once.
                 refused  = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
                 accepted = points.Count - refused;
             }
@@ -525,10 +526,12 @@ public static class OtlpEndpointMapper
     ///
     /// <para>What was stored before the failure stays stored, as on the 400 road — but this answer
     /// is retried, so a prefix a streaming parser had already handed the ring (logs, traces) is
-    /// stored again: at least once, where the 500 was at most once. The metric store's append is
-    /// all-or-nothing, so the stand's case — the WAL append running out — comes back whole and
-    /// is stored once; a metric batch that runs out after its append, while its points are filed
-    /// in memory, is durable already, and the retry stores what was filed again.</para>
+    /// stored again: at least once, where the old answer (400 for logs and traces, 500 for metrics)
+    /// was at most once. The metric store's append is all-or-nothing, so the stand's case — the
+    /// WAL append running out — comes back whole and is stored once. A metric batch that runs out
+    /// after its append, while its points are filed in memory, is in the log but only partly in
+    /// memory, and the next flush commits the log without writing the unfiled points: the retry is
+    /// what keeps them, and it stores the filed ones again.</para>
     /// </summary>
     private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
     {

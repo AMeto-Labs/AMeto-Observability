@@ -77,8 +77,8 @@ Ameto:
     # WalInitialBytes: 8388608
     #
     # What one chunk of a background rewrite (compaction, merge, rollup) may hold. Unset = the
-    # trace compaction pass's share, min(73 MB, 6% of the managed-heap limit) — 24.2 MB in a
-    # 512 MB container — taken IN TURN with the trace pass, never beside it. A metric heavier than
+    # trace compaction pass's share, min(73 MB, 6% of the managed-heap limit), never below 16 MiB —
+    # 24.2 MB in a 512 MB container — taken IN TURN with the trace pass, never beside it. A metric heavier than
     # this is rewritten in more, smaller chunks: more files, the same points.
     # RewriteBudgetBytes: 24159191
     #

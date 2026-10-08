@@ -605,7 +605,7 @@ public sealed class MetricsOptions
     /// What one chunk of a metric rewrite — a compaction, a same-granularity merge, a rollup — may
     /// hold in memory: the points it decodes, their bucket arrays, and the section it writes them back
     /// as. Unset: <see cref="MemoryBudgets.TraceMergeBytes"/>, the trace compaction pass's share
-    /// (24.2 MB in a 512 MB container, 73 MB with room), taken IN TURN with the trace pass through
+    /// (24.2 MB in a 512 MB container, 73 MB with room, never below 16 MiB), taken IN TURN with the trace pass through
     /// <see cref="BackgroundRewriteGate"/> rather than beside it, so at most one background rewrite
     /// holds its working set at a time (#125).
     ///
