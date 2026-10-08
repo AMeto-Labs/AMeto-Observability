@@ -2939,7 +2939,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
             // Not while its manifest waits for a held source: see _outputsWithKeptManifest.
             if (anyKept && _outputsWithKeptManifest.ContainsKey(s.FilePath)) continue;
-            // Nor inside the span of an output whose verdict waits: see _undecidedMergeOutputs.
+            // Nor inside the span of an output whose verdict is not carried out yet: see _undecidedMergeOutputs.
             if (anyWait && OverlapsUndecidedMergeOutput(s)) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
@@ -3898,22 +3898,45 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     {
         foreach (var manifest in Directory.EnumerateFiles(_segDir, "*.mergemanifest"))
         {
-            // Per manifest, so one that cannot be read does not strand the others behind it.
+            // Per manifest, so one that cannot be read does not strand the others behind it. One that
+            // throws keeps its span pinned (see RecoverInterruptedMerge).
             try { RecoverInterruptedMerge(manifest); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Merge recovery failed for {Manifest}; the segments in its span are kept out of merges until a " +
+                    "sweep finishes it", manifest);
+            }
         }
     }
 
-    /// <summary>One manifest of <see cref="RecoverInterruptedMerges"/>.</summary>
+    /// <summary>
+    /// One manifest of <see cref="RecoverInterruptedMerges"/>. The output's span is pinned out of the
+    /// merge planner's way (<see cref="_undecidedMergeOutputs"/>) from the moment a sweep meets the
+    /// manifest until one has carried its verdict out: the output committed with every source out of
+    /// the catalog, or set aside. A verdict that waits keeps it, and so does a sweep that throws on
+    /// the way. Until then the sources the manifest lists may be in the catalog — a scan registered
+    /// them, or the verdict waits — and merged they put its events in a second output, which this
+    /// manifest's own verdict then served beside it or called lost. The pin used to be let go on
+    /// reaching the verdict, before the manifest was read: a pass that could read the waiting output
+    /// but not its manifest merged the ten sources it had just failed to settle, and the next pass
+    /// committed the output beside that merge, 1 200 events for 600 for good; torn, it called them
+    /// already deleted, at Error. And a start that could not read a manifest pinned nothing at all.
+    /// Two verdicts need no pin and let it go at once: a merge whose output never landed, whose
+    /// sources are the only copy of its events, and a torn verdict already recorded.
+    /// </summary>
     private void RecoverInterruptedMerge(string manifest)
     {
         string output = manifest[..^".mergemanifest".Length];
+        _undecidedMergeOutputs.TryAdd(output, SpanOfMergeOutputName(output));
 
         // A torn verdict holds. The manifest RecoverTornMerge emptied when it could not move the output
         // aside is never decided by a read again: a holder that lets nothing read the file answers any
-        // read with a failure that says nothing about the bytes.
+        // read with a failure that says nothing about the bytes. Recorded with what it costs already
+        // counted (and the list set aside), so the sources it listed are free to merge.
         if (File.Exists(output) && new FileInfo(manifest).Length == 0)
         {
+            _undecidedMergeOutputs.TryRemove(output, out _);
             RecoverTornMerge(manifest, output);
             return;
         }
@@ -3921,13 +3944,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         switch (ReadMergeOutput(output, out var proved, out var unreadable))
         {
             case MergeOutputState.Absent:
+                // Never committed (or gone since): the sources are the only copy, free to merge.
+                _undecidedMergeOutputs.TryRemove(output, out _);
                 File.Delete(manifest);
                 _outputsWithKeptManifest.TryRemove(output, out _);
-                _undecidedMergeOutputs.TryRemove(output, out _);
+                ForgetMergeOutputWarnings(output);
                 return;
             case MergeOutputState.Torn:
-                _undecidedMergeOutputs.TryRemove(output, out _);
                 RecoverTornMerge(manifest, output);
+                _undecidedMergeOutputs.TryRemove(output, out _);
                 return;
             case MergeOutputState.Unknown:
                 DeferMergeVerdict(output, unreadable!);
@@ -3944,15 +3969,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                         "Merge recovery: the output {File} of an interrupted merge is in a segment format newer than " +
                         "this release reads, and every source it lists is still on disk — the merge is rolled back: the " +
                         "sources stay in service and the output is set aside as .corrupt", Path.GetFileName(output));
-                    _undecidedMergeOutputs.TryRemove(output, out _);
                     RecoverTornMerge(manifest, output);
+                    _undecidedMergeOutputs.TryRemove(output, out _);
                 }
                 else DeferMergeVerdict(output, unreadable!);
                 return;
         }
-        // Whole. While its range is still pinned (a verdict that waited) no merge can take a source:
-        // a pass runs this under the merge gate, and the commit below happens in the same pass.
-        _undecidedMergeOutputs.TryRemove(output, out _);
+        // Whole. The pin stays until every source is out of the catalog, below.
 
         // Out of the planner until this manifest goes, from before it is even read: one this
         // sweep fails to finish keeps its output out too (see _outputsWithKeptManifest).
@@ -4029,6 +4052,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             }
             ParkMergeSourceGuards(keys, unlink, guarded);
         }
+        // The verdict carried out: every source the manifest lists is out of the catalog — taken out,
+        // parked or gone — so none of them can be merged any more, and the span is let go.
+        _undecidedMergeOutputs.TryRemove(output, out _);
         if (committed)
         {
             if (displaced is not null && !IsTheSameSegment(displaced, proved!)) LogDisplacedLocalSegment(proved!, displaced);
@@ -4048,6 +4074,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         {
             File.Delete(manifest);
             _outputsWithKeptManifest.TryRemove(output, out _);
+            ForgetMergeOutputWarnings(output);
             _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(output));
             return;
         }
@@ -4137,32 +4164,50 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
-    /// Merge outputs no sweep has been able to read, by path, with the time span their file names
-    /// carry (<c>{node}-{id}-{minTs}-{maxTs}.seg</c>, every source inside it). While one is here,
-    /// <see cref="SelectMergeBatch"/> takes no segment overlapping that span: a source merged while
-    /// the verdict waits would put its events in a new output, and the waiting one, committed later,
-    /// would serve them a second time. Written by the sweeps, under the merge gate or before it
-    /// opens; concurrent for the same reason as <see cref="_outputsWithKeptManifest"/>.
+    /// Merge outputs whose manifest no sweep has finished, by path, with the time span their file
+    /// names carry (<c>{node}-{id}-{minTs}-{maxTs}.seg</c>, every source inside it): one no sweep has
+    /// been able to read, or one a sweep threw on (see <see cref="RecoverInterruptedMerge"/>). While
+    /// one is here, <see cref="SelectMergeBatch"/> takes no segment overlapping that span: a source
+    /// merged before the verdict is carried out would put its events in a new output, and the
+    /// verdict would then serve them a second time or call them lost. Written by the sweeps, under
+    /// the merge gate or before it opens; concurrent for the same reason as
+    /// <see cref="_outputsWithKeptManifest"/>.
     /// </summary>
     private readonly ConcurrentDictionary<string, (long Min, long Max)> _undecidedMergeOutputs = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// The verdict on an output no sweep could read waits for one that can. Until then, the output
     /// is kept out of this run's catalog, recorded for a running scan as a delete is. The sources
-    /// it lists stay in service, out of the merge planner's way (<see cref="_undecidedMergeOutputs"/>).
-    /// The manifest stays as it is. The next pass proves the output again: whole, it is committed
-    /// there; torn, it is quarantined. A start decides it the same way from the start.
+    /// it lists stay in service, out of the merge planner's way (the sweep's pin on the span stays,
+    /// see <see cref="_undecidedMergeOutputs"/>), and the manifest stays as it is. The next pass
+    /// proves the output again: whole, it is committed there; torn, it is quarantined. A start
+    /// decides it the same way from the start. Said once at Warning (see <see cref="_mergeOutputWarnings"/>).
     /// </summary>
     private void DeferMergeVerdict(string output, Exception unreadable)
     {
         lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
-        if (_undecidedMergeOutputs.TryAdd(output, SpanOfMergeOutputName(output)))
+        if (FirstMergeOutputWarning("wait", output))
             _logger.LogWarning(unreadable,
                 "Merge recovery: the output {File} of an interrupted merge could not be read; it stays out of service, " +
                 "and the sources it lists stay in, until a sweep can read it", Path.GetFileName(output));
         else
             _logger.LogDebug(unreadable, "Merge recovery: the output {File} still cannot be read", Path.GetFileName(output));
     }
+
+    /// <summary>
+    /// What a sweep has said at Warning about a merge output, by kind and path: that its verdict
+    /// waits. A held file is met by every pass while it is held, and the same Warning from each was
+    /// noise; the repeats go to Debug. The pin used to tell the first sweep from the rest, being
+    /// added only by it; every sweep that meets a manifest pins its span now. Cleared for an output
+    /// when its manifest goes.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _mergeOutputWarnings = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>True the first time <paramref name="kind"/> is said about <paramref name="output"/> (see <see cref="_mergeOutputWarnings"/>).</summary>
+    private bool FirstMergeOutputWarning(string kind, string output) => _mergeOutputWarnings.TryAdd(kind + "|" + output, 0);
+
+    /// <summary>Lets <see cref="_mergeOutputWarnings"/> say again about an output whose manifest has gone.</summary>
+    private void ForgetMergeOutputWarnings(string output) => _mergeOutputWarnings.TryRemove("wait|" + output, out _);
 
     /// <summary>
     /// The time span a merge output's NAME carries, <c>{node}-{id}-{minTs}-{maxTs}.seg</c>, which
@@ -4181,7 +4226,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         return (long.MinValue, long.MaxValue);
     }
 
-    /// <summary>Whether <paramref name="s"/> overlaps the span of an output whose verdict waits (see <see cref="_undecidedMergeOutputs"/>).</summary>
+    /// <summary>Whether <paramref name="s"/> overlaps the span of an output whose verdict is not carried out yet (see <see cref="_undecidedMergeOutputs"/>).</summary>
     private bool OverlapsUndecidedMergeOutput(SegmentInfo s)
     {
         foreach (var (_, span) in _undecidedMergeOutputs)
@@ -4248,6 +4293,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
         File.Delete(manifest);
         _outputsWithKeptManifest.TryRemove(output, out _);
+        ForgetMergeOutputWarnings(output);
     }
 
     /// <summary>

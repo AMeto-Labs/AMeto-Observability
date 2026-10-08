@@ -359,6 +359,66 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The same, with the output named as a real merge names it, so its span covers the sources:
+    /// the span the sweep pins while it settles the manifest is let go with the manifest, and the
+    /// sources are merge candidates again. Left pinned, they were never merged for the life of
+    /// the process.
+    /// </summary>
+    [Fact]
+    public async Task AMergeWhoseOutputNeverLanded_LeavesItsSourcesMergeable()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        File.Delete(output);                                              // killed before the output reached its name
+
+        await RestartAsync();
+        Assert.Equal(10, _engine.ListSegments().Count);
+        Assert.Empty(Manifests());
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the sources were kept out of merges");
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// The same while the manifest cannot be deleted (held without FileShare.Delete): the verdict
+    /// needs no pin — the sources are the only copy of their events — so a sweep that fails to drop
+    /// the manifest does not keep them out of merges either. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task AMergeWhoseOutputNeverLanded_LeavesItsSourcesMergeable_WhileItsManifestCannotBeDeleted()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        File.Delete(output);
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await RestartAsync();
+            Assert.Equal(10, _engine.ListSegments().Count);
+            Assert.Single(Manifests());                                   // setup: the delete was refused
+
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.Single(_engine.ListSegments());                        // 10: the sources kept out of merges
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// Killed after the merged file was in place but before any source was deleted — the window
     /// where the data exists TWICE on disk. Recovery must finish the deletion; serving both would
     /// double every event in the batch.
@@ -1298,6 +1358,42 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A torn verdict already recorded needs no pin: what it costs was counted when it was reached,
+    /// and the sources it listed are in service like any others. So a sweep that cannot finish
+    /// setting the output aside — here it cannot even read the emptied manifest, held without
+    /// sharing — does not keep them out of merges. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task ARecordedTornVerdict_LeavesItsSourcesMergeable_WhileItsManifestCannotBeRead()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        await LoseTheFirstBlockPayloadAsync(output);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))   // readable, not movable
+            await RestartAsync();
+        Assert.Equal(0, new FileInfo(output + ".mergemanifest").Length);   // setup: the verdict recorded
+        Assert.Equal(10, _engine.ListSegments().Count);
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.Single(_engine.ListSegments());                        // 10: the sources kept out of merges
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// An output a pass cannot read is not taken as committed. The start's sweep proved this one torn
     /// but could not read its manifest (held without sharing), so it kept the output out of service
     /// and its ten sources in. The next pass, unable to open the output, took it for committed and
@@ -1434,6 +1530,154 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
         Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);
         AssertSameEvents(before, ReadEverything());
+    }
+
+    // ── A manifest a sweep cannot finish keeps its sources out of merges (#120 round 4) ──
+
+    /// <summary>
+    /// The pin on a waiting output's span holds until a sweep has carried out its verdict, not merely
+    /// reached it. The first pass that reads the output whole used to drop the pin before it read the
+    /// manifest; with the manifest held (a holder moved from the output to it) the commit never
+    /// happened, and the same pass merged the ten sources. The next pass committed the output beside
+    /// that merge's output: 1 200 events for 600, for good. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task APassThatCannotReadTheManifest_KeepsTheWaitingOutputsSourcesOutOfMerges()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);                                        // killed after the move, before any unlink
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.None))
+            await RestartAsync();
+        Assert.Equal(10, _engine.ListSegments().Count);                  // setup: the output waits, the sources serve
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);   // the output reads whole; the manifest does not
+            Assert.Equal(10, _engine.ListSegments().Count);              // 1: the pass's merge took the ten sources
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);       // both readable: the commit
+        Assert.Equal(600, _engine.ListSegments().Sum(s => (long)s.EventCount));  // 1 200: the output beside their merge
+        AssertSameEvents(before, ReadEverything());
+
+        await RestartAsync();
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// The start's road to the same merge: its sweep proved the output whole but could not read the
+    /// manifest, and pinned nothing, so the scan registered the output and the ten sources beside it
+    /// and a pass that still could not read the manifest merged the ten. The pass that read it at
+    /// last found every source gone and dropped it: the output and that merge's output served the
+    /// same 600 events, for good. Served twice until a sweep reads the manifest, and no longer.
+    /// Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task AManifestTheStartCannotRead_KeepsTheSourcesTheScanRegisteredOutOfMerges()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);                                        // killed after the move, before any unlink
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            await RestartAsync();
+            Assert.Equal(11, _engine.ListSegments().Count);              // setup: the output and its ten sources
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.Equal(11, _engine.ListSegments().Count);              // 2: the pass merged the ten
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);   // 2: that merge's output beside this one
+        AssertSameEvents(before, ReadEverything());
+        Assert.Empty(Manifests());
+
+        await RestartAsync();
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// The same dropped pin on the torn road: the pass proved the waiting output torn and could not
+    /// read the manifest, and its merge took the sources. The next pass found them "already deleted"
+    /// and said so at Error, keeping a loss record aside: false, their events were in that merge's
+    /// output all along. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task ATornWaitingOutput_DoesNotReportItsMergedSourcesAsLost()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await LoseTheFirstBlockPayloadAsync(output);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.None))
+            await RestartAsync();
+        Assert.Equal(10, _engine.ListSegments().Count);                  // setup
+
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        AssertSameEvents(before, ReadEverything());
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("were already deleted; their events exist only", StringComparison.Ordinal));
+        Assert.False(File.Exists(output + ".corrupt.sources"), "a false loss record was kept");
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
+    }
+
+    /// <summary>
+    /// The newer-format road: the pass read the waiting output as a format newer than this release
+    /// reads, every source on disk, and let go of the span before the rollback, which then failed —
+    /// the output held so it could not be moved aside, the manifest held so it could not be rewritten.
+    /// The same pass merged the ten sources; the next found them gone and kept the output waiting for
+    /// a release that reads it, to be committed beside their merge. Windows only.
+    /// </summary>
+    [WindowsFact]
+    public async Task ANewerFormatWaitingOutputWhoseRollbackFails_KeepsItsSourcesOutOfMerges()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        var bytes = await File.ReadAllBytesAsync(output);
+        bytes[5] ^= 0x01;                                                // the version's high byte: v7 reads as v263
+        await File.WriteAllBytesAsync(output, bytes);
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.None))
+            await RestartAsync();                                        // read by nobody: the verdict waits
+        Assert.Equal(10, _engine.ListSegments().Count);                  // setup
+
+        using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))                     // read, not moved
+        using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.Read))  // read, not rewritten
+        {
+            await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+            Assert.Equal(10, _engine.ListSegments().Count);              // 1: the pass merged the ten
+        }
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);   // the rollback (and a merge of the ten, now free)
+        AssertSameEvents(before, ReadEverything());
+        Assert.True(File.Exists(output + ".corrupt"), "the output was not set aside");
+        Assert.Empty(Manifests());
     }
 
     // ── Every listed source the catalog names is taken out, a replica too (#120 round 4) ──
