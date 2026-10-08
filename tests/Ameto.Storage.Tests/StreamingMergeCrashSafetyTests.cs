@@ -1355,6 +1355,10 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.Equal(600, _engine.ListSegments().Sum(s => (long)s.EventCount));   // 1 200: the torn output served beside its sources' merge
         Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
         AssertSameEvents(before, ReadEverything());
+        // The start that takes the verdict from the marker says so, once (the earlier process said it
+        // when it left the marker).
+        Assert.Single(_log.Entries, e => e.Message.Contains(
+            "is empty — an earlier sweep found the output torn", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -1646,7 +1650,8 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// reads, every source on disk, and let go of the span before the rollback, which then failed —
     /// the output held so it could not be moved aside, the manifest held so it could not be rewritten.
     /// The same pass merged the ten sources; the next found them gone and kept the output waiting for
-    /// a release that reads it, to be committed beside their merge. Windows only.
+    /// a release that reads it, to be committed beside their merge, saying meanwhile that their
+    /// events were served by nobody. Windows only.
     /// </summary>
     [WindowsFact]
     public async Task ANewerFormatWaitingOutputWhoseRollbackFails_KeepsItsSourcesOutOfMerges()
@@ -1678,6 +1683,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         AssertSameEvents(before, ReadEverything());
         Assert.True(File.Exists(output + ".corrupt"), "the output was not set aside");
         Assert.Empty(Manifests());
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("are already gone", StringComparison.Ordinal));
     }
 
     // ── Every listed source the catalog names is taken out, a replica too (#120 round 4) ──
@@ -1847,6 +1853,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Assert.True(File.Exists(output));
         Assert.Single(Manifests());
         AssertSameEvents(expected, ReadEverything());
+        // What the wait costs is said, once: the five gone sources' events are served by nobody.
+        Assert.Single(_log.Entries, e => e.Message.Contains(
+            "5 of the 10 sources it lists are already gone, and their events are served by nobody", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -1918,9 +1927,11 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
             Assert.Equal(0, new FileInfo(output + ".mergemanifest").Length);   // a marker now, listing nothing
             AssertSameEvents(expected, ReadEverything());
 
-            // A pass while it is still held: it merges the five sources, and says nothing more.
+            // A pass while it is still held: it merges the five sources, and says nothing more —
+            // the failed move included, which every pass meets while the holder stays.
             await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
             Assert.Equal(1, Reports());
+            Assert.Single(_log.Entries, e => e.Message.Contains("could not be moved aside", StringComparison.Ordinal));
         }
 
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);

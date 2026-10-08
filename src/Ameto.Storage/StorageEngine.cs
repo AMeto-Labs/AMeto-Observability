@@ -3937,6 +3937,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         if (File.Exists(output) && new FileInfo(manifest).Length == 0)
         {
             _undecidedMergeOutputs.TryRemove(output, out _);
+            if (FirstMergeOutputWarning("torn", output))
+                _logger.LogWarning(
+                    "Merge recovery: the manifest of {File} is empty — an earlier sweep found the output torn and could " +
+                    "not set it aside; it stays out of service until it can be moved aside, and the sources still on " +
+                    "disk stay in service", Path.GetFileName(output));
             RecoverTornMerge(manifest, output);
             return;
         }
@@ -3955,7 +3960,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 _undecidedMergeOutputs.TryRemove(output, out _);
                 return;
             case MergeOutputState.Unknown:
-                DeferMergeVerdict(output, unreadable!);
+                DeferMergeVerdict(manifest, output, unreadable!, newer: false);
                 return;
             case MergeOutputState.Newer:
                 // A format this release cannot read (#119): a rollback's file, or a version field a
@@ -3972,7 +3977,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                     RecoverTornMerge(manifest, output);
                     _undecidedMergeOutputs.TryRemove(output, out _);
                 }
-                else DeferMergeVerdict(output, unreadable!);
+                else DeferMergeVerdict(manifest, output, unreadable!, newer: true);
                 return;
         }
         // Whole. The pin stays until every source is out of the catalog, below.
@@ -4178,28 +4183,66 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <summary>
     /// The verdict on an output no sweep could read waits for one that can. Until then, the output
     /// is kept out of this run's catalog, recorded for a running scan as a delete is. The sources
-    /// it lists stay in service, out of the merge planner's way (the sweep's pin on the span stays,
-    /// see <see cref="_undecidedMergeOutputs"/>), and the manifest stays as it is. The next pass
-    /// proves the output again: whole, it is committed there; torn, it is quarantined. A start
-    /// decides it the same way from the start. Said once at Warning (see <see cref="_mergeOutputWarnings"/>).
+    /// it lists that are on disk stay in service, out of the merge planner's way (the sweep's pin
+    /// on the span stays, see <see cref="_undecidedMergeOutputs"/>), and the manifest stays as it
+    /// is. The next pass proves the output again: whole, it is committed there; torn, it is
+    /// quarantined. A start decides it the same way from the start. <paramref name="newer"/>: the
+    /// output is in a format this release does not read, so only a release that does can decide it.
+    ///
+    /// <para>Said once at Warning, with what the wait costs: the events of a listed source already
+    /// gone (the merge committed and unlinked it before it was interrupted) exist only in this output,
+    /// and nobody serves them until it is committed.</para>
     /// </summary>
-    private void DeferMergeVerdict(string output, Exception unreadable)
+    private void DeferMergeVerdict(string manifest, string output, Exception unreadable, bool newer)
     {
         lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
-        if (FirstMergeOutputWarning("wait", output))
+        if (!FirstMergeOutputWarning("wait", output))
+        {
+            _logger.LogDebug(unreadable, "Merge recovery: the output {File} still waits for its verdict", Path.GetFileName(output));
+            return;
+        }
+
+        string until = newer ? "a release that reads its format commits the merge" : "a sweep can read it";
+        var (listed, missing) = CountListedSources(manifest, output);
+        if (missing > 0)
             _logger.LogWarning(unreadable,
-                "Merge recovery: the output {File} of an interrupted merge could not be read; it stays out of service, " +
-                "and the sources it lists stay in, until a sweep can read it", Path.GetFileName(output));
+                "Merge recovery: the output {File} of an interrupted merge cannot be read here; it stays out of service " +
+                "until {Until}. {Missing} of the {Listed} sources it lists are already gone, and their events are served " +
+                "by nobody until then; the other sources stay in service", Path.GetFileName(output), until, missing, listed);
         else
-            _logger.LogDebug(unreadable, "Merge recovery: the output {File} still cannot be read", Path.GetFileName(output));
+            _logger.LogWarning(unreadable,
+                "Merge recovery: the output {File} of an interrupted merge cannot be read here; it stays out of service, " +
+                "and the sources it lists that are on disk stay in, until {Until}", Path.GetFileName(output), until);
+    }
+
+    /// <summary>
+    /// How many sources a manifest lists and how many of those are not on disk, for a log line;
+    /// (0, 0) when it cannot be read.
+    /// </summary>
+    private (int Listed, int Missing) CountListedSources(string manifest, string output)
+    {
+        try
+        {
+            int listed = 0, missing = 0;
+            foreach (var name in File.ReadAllLines(manifest))
+            {
+                if (!IsListedSourceName(name)) continue;
+                string path = Path.Combine(_segDir, name);
+                if (string.Equals(path, output, StringComparison.OrdinalIgnoreCase)) continue;
+                listed++;
+                if (!File.Exists(path)) missing++;
+            }
+            return (listed, missing);
+        }
+        catch (Exception) { return (0, 0); }   // said without the count
     }
 
     /// <summary>
     /// What a sweep has said at Warning about a merge output, by kind and path: that its verdict
-    /// waits. A held file is met by every pass while it is held, and the same Warning from each was
-    /// noise; the repeats go to Debug. The pin used to tell the first sweep from the rest, being
-    /// added only by it; every sweep that meets a manifest pins its span now. Cleared for an output
-    /// when its manifest goes.
+    /// waits, that it is torn and cannot be set aside. A held file is met by every pass while it is
+    /// held, and the same Warning from each was noise; the repeats go to Debug. The pin used to tell
+    /// the first sweep from the rest, being added only by it; every sweep that meets a manifest pins
+    /// its span now. Cleared for an output when its manifest goes.
     /// </summary>
     private readonly ConcurrentDictionary<string, byte> _mergeOutputWarnings = new(StringComparer.OrdinalIgnoreCase);
 
@@ -4207,7 +4250,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private bool FirstMergeOutputWarning(string kind, string output) => _mergeOutputWarnings.TryAdd(kind + "|" + output, 0);
 
     /// <summary>Lets <see cref="_mergeOutputWarnings"/> say again about an output whose manifest has gone.</summary>
-    private void ForgetMergeOutputWarnings(string output) => _mergeOutputWarnings.TryRemove("wait|" + output, out _);
+    private void ForgetMergeOutputWarnings(string output)
+    {
+        _mergeOutputWarnings.TryRemove("wait|" + output, out _);
+        _mergeOutputWarnings.TryRemove("torn|" + output, out _);
+    }
 
     /// <summary>
     /// The time span a merge output's NAME carries, <c>{node}-{id}-{minTs}-{maxTs}.seg</c>, which
@@ -4286,9 +4333,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         catch (Exception ex)
         {
             if (listed != 0) File.WriteAllBytes(manifest, []);
-            _logger.LogWarning(ex,
-                "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
-                "manifest kept until the next sweep moves it", Path.GetFileName(output));
+            if (FirstMergeOutputWarning("torn", output))
+                _logger.LogWarning(ex,
+                    "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
+                    "manifest kept until a sweep moves it", Path.GetFileName(output));
+            else
+                _logger.LogDebug(ex, "Merge recovery: the torn output {File} still cannot be moved aside", Path.GetFileName(output));
             return;
         }
         File.Delete(manifest);
