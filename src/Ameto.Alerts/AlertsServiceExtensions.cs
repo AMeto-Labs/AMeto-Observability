@@ -55,10 +55,14 @@ internal sealed class AlertsHostedService : IHostedService, IAsyncDisposable
 /// </summary>
 public static class AlertsServiceExtensions
 {
+    /// <param name="options">The <c>Ameto:Alerts</c> settings the evaluator reads; the defaults when null.</param>
     public static IServiceCollection AddAmetoAlerts(
         this IServiceCollection services,
-        string dataDirectory)
+        string dataDirectory,
+        AlertEvaluatorOptions? options = null)
     {
+        services.AddSingleton(options ?? new AlertEvaluatorOptions());
+
         services.AddSingleton<AlertRuleStore>(sp =>
             new AlertRuleStore(
                 dataDirectory,

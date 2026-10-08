@@ -21,18 +21,8 @@ export interface EventDto {
   '@sp'?: string;
   /** The service the event came from — the server's built-in `@service` field. */
   '@service'?: string;
-  /**
-   * The same field under the key servers before `@service` sent it. Tolerated for one release
-   * (a tab left open across the upgrade, a cached page); read it only through {@link eventService}.
-   */
-  'service.name'?: string;
   id: string;
   props?: Record<string, unknown>;
-}
-
-/** The event's service: `@service`, else the key an older server sent it under. */
-export function eventService(ev: EventDto): string | undefined {
-  return ev['@service'] ?? ev['service.name'];
 }
 
 export interface EventQueryResult {

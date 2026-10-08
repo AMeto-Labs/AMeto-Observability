@@ -101,6 +101,37 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A DEGRADED STORE'S TICKS ARE SKIPS LIKE ANY OTHER (#94). Pending at tick 0, seen at ticks 1
+    /// and 2; then eighteen ticks over a store whose load ended short — skipped, its partial answer
+    /// never read — and the store whole again, which in production is the restart that ends the
+    /// state (a restart is the same arithmetic, through the persisted evaluation time — see
+    /// <see cref="A_restart_keeps_the_credit_seen_before_it_and_does_not_count_the_downtime"/>). The
+    /// first tick after has 45 s seen, not 315: Pending. The one after, 60 s: Firing.
+    /// </summary>
+    [Fact]
+    public async Task Ticks_skipped_over_a_degraded_store_do_not_count_toward_For()
+    {
+        await using var evaluator = NewEvaluator();
+
+        for (int t = 0; t <= 2; t++) await evaluator.EvaluateOnceAsync(At(t));
+        Assert.Equal(AlertState.Pending, StateOf(evaluator).State);
+
+        _traces.Availability = QueryAvailability.Degraded;
+        for (int t = 3; t <= 20; t++) await evaluator.EvaluateOnceAsync(At(t));
+        Assert.Equal(AlertState.Pending, StateOf(evaluator).State);
+        Assert.Equal(At(2), StateOf(evaluator).EvaluatedAt);   // not one of them evaluated it
+
+        _traces.Availability = QueryAvailability.Available;
+        await evaluator.EvaluateOnceAsync(At(21));
+        var st = StateOf(evaluator);
+        Assert.Equal(AlertState.Pending, st.State);
+        Assert.Equal(At(0) + (At(20) - At(2)), st.PendingSince);   // moved past ticks 3..20: 45 s held
+
+        await evaluator.EvaluateOnceAsync(At(22));
+        Assert.Equal(AlertState.Firing, StateOf(evaluator).State);   // 60 s seen
+    }
+
+    /// <summary>
     /// Consecutive ticks keep the rule they always had: Pending at tick 0, Firing at the tick that
     /// makes 60 s — a slow gap between two ticks (40 s here) is a cycle that ran late, not a skip,
     /// and is credited whole.
@@ -239,10 +270,16 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
         Assert.Equal(old.Pending, again.Pending);
     }
 
-    /// <summary>A trace store answering 20 spans, or failing the read while <see cref="Failing"/> is set.</summary>
+    /// <summary>
+    /// A trace store answering 20 spans, or failing the read while <see cref="Failing"/> is set, and
+    /// saying it cannot answer truly while <see cref="Availability"/> is not Available.
+    /// </summary>
     private sealed class FlakyTraces : ITraceStatsProvider
     {
         public volatile bool Failing;
+
+        private volatile QueryAvailability _availability;
+        public QueryAvailability Availability { get => _availability; set => _availability = value; }
 
         public Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsAsync(
             DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>

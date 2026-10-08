@@ -214,6 +214,59 @@ public sealed class LogStoreUnavailableTests
         }
     }
 
+    /// <summary>
+    /// THE RESTART WHOSE CATALOG SCAN FAILS (#94). The rule fired over 90 events; the new engine's
+    /// boot scan faults — the segments directory would not list — so its counts cover the hot tier
+    /// alone, now and until the next restart: not a load still running, a load that ENDED short.
+    /// That ended Loading in Available, and the next tick read 0, resolved the rule and sent Ok. The
+    /// store is Degraded instead; both rules are left as they were, tick after tick, and the
+    /// operator gets one line saying why.
+    /// </summary>
+    [Fact]
+    public async Task A_restart_whose_catalog_scan_fails_leaves_the_log_rules_alone()
+    {
+        using var dir = new TempDir();
+        var before = await EngineWithEventsAsync(dir.Data);
+        await using (var rig = new EvaluatorRig(dir.Alerts, before, new UnusedExecutor()))
+        {
+            rig.Rule("above", AlertComparator.GreaterOrEqual, Events);
+            rig.Rule("below", AlertComparator.LessThan, 5);
+            await rig.Evaluator.EvaluateOnceAsync();
+            Assert.Equal(AlertState.Firing, rig.StateOf("above"));
+            Assert.Equal(AlertState.Ok,     rig.StateOf("below"));
+        }
+        await before.DisposeAsync();   // the final flush: every event is now in a cold segment
+
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        StorageEngine.HoldCatalogScanForTest.Value = hold.Task;
+        StorageEngine after;
+        try { after = NewEngine(dir.Data); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+
+        try
+        {
+            after._beforeCatalogScanForTest = static () => throw new IOException("the segments directory cannot be listed");
+            hold.SetResult();
+            await Assert.ThrowsAsync<IOException>(() => after.CatalogLoaded.WaitAsync(TimeSpan.FromSeconds(60)));
+            Assert.Equal(QueryAvailability.Degraded, after.Availability);
+
+            await using var rig = new EvaluatorRig(dir.Alerts, after, new UnusedExecutor());
+            await rig.Evaluator.EvaluateOnceAsync();
+            await rig.Evaluator.EvaluateOnceAsync();
+
+            Assert.Equal(AlertState.Firing, rig.StateOf("above"));
+            Assert.Equal(AlertState.Ok,     rig.StateOf("below"));
+            Assert.Empty(rig.Dispatched);
+            Assert.Equal(AlertState.Firing, rig.PersistedStateOf("above"));
+            Assert.Single(rig.Log.Lines, l => l.Level == LogLevel.Warning && l.Message.Contains("Log store is Degraded"));
+        }
+        finally
+        {
+            hold.TrySetResult();
+            await after.DisposeAsync();
+        }
+    }
+
     // ── The API ───────────────────────────────────────────────────────────────────────────────
 
     /// <summary>

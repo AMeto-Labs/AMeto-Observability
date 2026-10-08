@@ -187,6 +187,16 @@ public static class DiagnosticsEndpointMapper
                 metricsSegmentCount  = dir.MetricsSegments,
                 tracesSegmentCount   = dir.TracesSegments,
 
+                // ── Stores: whether each one's reads are whole (#94) ───────────
+                // "loading" in the first seconds after a start, "available" after it; "degraded"
+                // when the startup scan left data on disk unread — the store answers from what it
+                // has, and alert rules over it are not evaluated, until a restart; "closed" once it
+                // has shut down. The HTTP APIs answer a degraded store normally (a part is not an
+                // empty), so this is where the state shows. Null when the signal is disabled.
+                logsAvailability     = AvailabilityName(storage.Availability),
+                metricsAvailability  = metrics is null ? null : AvailabilityName(metrics.Availability),
+                tracesAvailability   = traces  is null ? null : AvailabilityName(traces.Availability),
+
                 // ── Ingest ─────────────────────────────────────────────────────
                 // Overload used to be invisible: a client that got a 200 with a "dropped"
                 // count had no server-side counterpart, so nobody could see that the ring
@@ -284,4 +294,14 @@ public static class DiagnosticsEndpointMapper
             });
         }).RequireAuthorization();
     }
+
+    /// <summary>A store's state as the API spells it — a constant per state, so a poll formats nothing.</summary>
+    private static string AvailabilityName(QueryAvailability availability) => availability switch
+    {
+        QueryAvailability.Available => "available",
+        QueryAvailability.Loading   => "loading",
+        QueryAvailability.Degraded  => "degraded",
+        QueryAvailability.Closed    => "closed",
+        _                           => availability.ToString().ToLowerInvariant(),
+    };
 }

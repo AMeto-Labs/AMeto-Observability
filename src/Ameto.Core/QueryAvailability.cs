@@ -13,12 +13,14 @@ namespace Ameto.Core;
 /// asks. See issue #95.</para>
 ///
 /// <para><b>The states only move forward:</b> <see cref="Loading"/> → <see cref="Available"/> →
-/// <see cref="Closed"/>. That is what makes the question answerable around an asynchronous read
-/// with two volatile reads and no lock: an answer taken while the store was still loading was
-/// preceded by a <see cref="Loading"/> answer to a question asked BEFORE the read, and an answer
-/// taken after the store closed is followed by a <see cref="Closed"/> answer to one asked AFTER
-/// it. A caller that asks both times and acts only on <see cref="Available"/> twice cannot act on
-/// either.</para>
+/// <see cref="Closed"/>, or <see cref="Loading"/> → <see cref="Degraded"/> → <see cref="Closed"/>.
+/// A store is Degraded from the instant its load ends, or never — never after it has been
+/// Available — so the two PARTIAL states are a prefix of its life. That is what makes the question
+/// answerable around an asynchronous read with two volatile reads and no lock: an answer taken
+/// while the store was partial was preceded by a <see cref="Loading"/> or <see cref="Degraded"/>
+/// answer to a question asked BEFORE the read, and an answer taken after the store closed is
+/// followed by a <see cref="Closed"/> answer to one asked AFTER it. A caller that asks both times
+/// and acts only on <see cref="Available"/> twice cannot act on either.</para>
 /// </summary>
 public enum QueryAvailability : byte
 {
@@ -33,6 +35,18 @@ public enum QueryAvailability : byte
 
     /// <summary>The store's teardown has shut the door: a read now answers EMPTY. Final.</summary>
     Closed = 2,
+
+    /// <summary>
+    /// The store has finished discovering what it holds and did NOT reach all of it (#94): its
+    /// startup scan failed as a whole, or left a file behind that it could not read for a reason
+    /// other than the file's own bytes — a file held open by another process, a network share that
+    /// dropped (#108). A read answers from what it has, a PART as while <see cref="Loading"/> —
+    /// and unlike Loading the part will not grow, because nothing scans again before a restart.
+    ///
+    /// <para>A file whose BYTES are bad is not this: one deleted or set aside as unreadable, with a
+    /// log line of its own, is the store's data from then on, not a load left unfinished.</para>
+    /// </summary>
+    Degraded = 3,
 }
 
 /// <summary>

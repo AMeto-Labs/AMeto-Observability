@@ -88,7 +88,7 @@ internal static class SpanWriter
     /// sidecars. So the day after an upgrade, rolling the binary back — one container command on
     /// this deployment — costs every trace written since, unrecoverably, and the log calls it
     /// "likely format v1". This build no longer does that (see
-    /// <c>SpanReader.LooksLikeNewerFormat</c>), but the builds already out there do, and a format
+    /// <c>NewerSpanFormatException</c>), but the builds already out there do, and a format
     /// bump is only safe once every binary that might read the files tolerates it.</para>
     ///
     /// <para>Hence two phases. This release READS v4 and refuses to destroy it; a later one, once

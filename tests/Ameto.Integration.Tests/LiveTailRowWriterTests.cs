@@ -215,11 +215,15 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
         }
     }
 
-    /// <summary>Opens a tail on <paramref name="filter"/> and consumes the keepalive it opens with.</summary>
+    /// <summary>
+    /// Opens a tail on <paramref name="filter"/> and consumes the keepalive it opens with. The 30 s
+    /// token is the tail's own — the one a buffered row fails by — so it starts once the host has
+    /// answered a request: the class's host start and its first request do not spend it (#115).
+    /// </summary>
     private async Task<Tail> OpenTailAsync(string filter)
     {
+        var client = await _factory.CreateReadyClientAsync();
         var cts    = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var client = _factory.CreateClient();
 
         using var request = new HttpRequestMessage(HttpMethod.Get, "/api/events/live?filter=" + Uri.EscapeDataString(filter));
         var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);

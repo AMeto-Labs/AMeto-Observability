@@ -87,17 +87,26 @@ public static class AlertEndpointMapper
                 return Results.BadRequest(new { error });
             var value = await ev.PreviewAsync(rule, ct);
 
-            // The store the rule reads cannot answer truly (#95): closed, or still loading its cold
-            // tier. A preview of 0 would say "would not fire" about a number nobody measured.
+            // The store the rule reads cannot answer truly (#95): closed, still loading its cold
+            // tier, or degraded — done loading without having reached everything on disk (#94),
+            // which the evaluator skips unless Ameto:Alerts:EvaluateOnDegradedStore says otherwise.
+            // A preview of 0 would say "would not fire" about a number nobody measured.
             if (!value.IsAvailable)
             {
-                // Retry-After only for Loading, which ends by itself; Closed ends with a restart.
+                // Retry-After only for Loading, which ends by itself; Degraded and Closed end with a restart.
                 if (value.Availability == Ameto.Core.QueryAvailability.Loading)
                     ctx.Response.Headers.RetryAfter = "5";
+                string source = rule.Source.ToString().ToLowerInvariant();
                 return Results.Json(
-                    new { error = value.Availability == Ameto.Core.QueryAvailability.Loading
-                        ? $"The {rule.Source.ToString().ToLowerInvariant()} store is still loading its data, so the rule cannot be previewed yet. Try again in a moment."
-                        : $"The {rule.Source.ToString().ToLowerInvariant()} store is shut down, so the rule cannot be previewed." },
+                    new { error = value.Availability switch
+                    {
+                        Ameto.Core.QueryAvailability.Loading =>
+                            $"The {source} store is still loading its data, so the rule cannot be previewed yet. Try again in a moment.",
+                        Ameto.Core.QueryAvailability.Degraded =>
+                            $"The {source} store could not load all of its data at startup, so the rule's value would be partial: "
+                          + "rules over it are not evaluated until the server restarts (see Ameto:Alerts:EvaluateOnDegradedStore).",
+                        _ => $"The {source} store is shut down, so the rule cannot be previewed.",
+                    } },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
 

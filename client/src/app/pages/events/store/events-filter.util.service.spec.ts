@@ -1,4 +1,3 @@
-import { EventDto, eventService } from '../../../core/models/event.model';
 import { BUILTIN_SUGGESTIONS, parseServicesFromFilter, setServicesClause } from './events-filter.util';
 
 /**
@@ -50,6 +49,25 @@ describe('the service clause the events page writes', () => {
     expect(setServicesClause("@service = 'a' or @l = 'Fatal'", new Set())).toBe("@service = 'a' or @l = 'Fatal'");
   });
 
+  it('reads no selection where a glued `or` makes the clause one branch of a disjunction', () => {
+    // The server's lexer reads `'eu'or`, `)or(`, `]or`, `1or` and `or(` as `or`, and `and`
+    // binds tighter than `or` (#118 review F1).
+    for (const f of [
+      "@service = 'x' and A = 'eu'or B = 'us'",
+      "(A = 1)or B = 2 and ServiceName = 'x'",
+      "@service = 'x' and A = 1or B = 2",
+      "@service in ['x']or B = 1",
+      "@service = 'x' and A = 1 or(B = 2)",
+    ]) expect(parseServicesFromFilter(f).size, f).toBe(0);
+    expect(setServicesClause("(A = 1)or B = 2 and ServiceName = 'x'", new Set(['y'])))
+      .toBe("@service = 'y' and ((A = 1)or B = 2 and ServiceName = 'x')");
+    expect(setServicesClause("A = 'eu'or B = 'us'", new Set(['y'])))
+      .toBe("@service = 'y' and (A = 'eu'or B = 'us')");
+    expect(setServicesClause("ServiceName = 'old'and Region = 'eu'", new Set(['new'])))
+      .toBe("@service = 'new' and Region = 'eu'");
+    expect([...parseServicesFromFilter("(A = 1)and @service = 'x'")]).toEqual(['x']);
+  });
+
   it('does not split at an and inside quotes, brackets or parentheses', () => {
     expect(setServicesClause("Msg = 'x and y' and @service = 'a'", new Set(['b'])))
       .toBe("@service = 'b' and Msg = 'x and y'");
@@ -59,6 +77,13 @@ describe('the service clause the events page writes', () => {
 
   it('matches the field ordinally, as the server does: @SERVICE is a user property', () => {
     expect(setServicesClause("@SERVICE = 'x'", new Set(['a']))).toBe("@service = 'a' and @SERVICE = 'x'");
+  });
+
+  it('writes a quote or a backslash in a service name escaped, so the server reads the name', () => {
+    // The lexer ends a string at a lone quote and drops a backslash before the next character.
+    expect(setServicesClause('', new Set(["O'Brien"]))).toBe("@service = 'O''Brien'");
+    expect(setServicesClause('', new Set(['DOMAIN\\svc', "it's"])))
+      .toBe("@service in ['DOMAIN\\\\svc', 'it''s']");
   });
 });
 
@@ -99,23 +124,143 @@ describe('reading the selected services back out of a filter', () => {
   });
 });
 
-describe('eventService', () => {
-  const base: EventDto = { '@t': '2026-10-01T09:00:00.0000000Z', '@mt': 'x', '@l': 'Information', id: '1' };
+/**
+ * The server answers the field under four KEYS — BuiltinFields' ServiceName row, matched
+ * ordinally: `@service`, `ServiceName`, `service.name` as one key, and the path `service` U+0001
+ * `name`. Which key a spelling becomes is the parser's business: it splits an identifier at its
+ * dots, keeps a bracketed string as one segment, and joins the segments with U+0001 — so
+ * `service['name']`, `['service'].name` and `['service']['name']` are the path as much as bare
+ * `service.name` is. A spelling the picker did not know kept its clause as the user's text, and
+ * a pick ANDed `@service = 'new'` in front of it: two service clauses that contradict each other,
+ * and an empty page.
+ */
+describe('the service clause under every name the server answers for it', () => {
+  const SPELLINGS = [
+    '@service', 'ServiceName', 'service.name', "['service.name']",
+    "['@service']", "['ServiceName']", "service['name']", "['service']['name']", "['service'].name",
+  ];
 
-  it('reads @service', () => {
-    expect(eventService({ ...base, '@service': 'api' })).toBe('api');
+  it('reads each spelling as the selection', () => {
+    for (const f of SPELLINGS) {
+      expect([...parseServicesFromFilter(`${f} = 'api'`)], f).toEqual(['api']);
+      expect([...parseServicesFromFilter(`@l = 'Error' and ${f} in ['a', 'b']`)], f)
+        .toEqual(['a', 'b']);
+    }
   });
 
-  it('falls back to service.name, the key an older server sent', () => {
-    expect(eventService({ ...base, 'service.name': 'legacy' })).toBe('legacy');
+  it('replaces each spelling with the pick, and clears it when nothing is picked', () => {
+    for (const f of SPELLINGS) {
+      expect(setServicesClause(`${f} = 'old' and Region = 'eu'`, new Set(['new'])), f)
+        .toBe("@service = 'new' and Region = 'eu'");
+      expect(setServicesClause(`@l = 'Error' and ${f} in ['a', 'b']`, new Set()), f)
+        .toBe("@l = 'Error'");
+    }
   });
 
-  it('prefers @service when both are present', () => {
-    expect(eventService({ ...base, '@service': 'api', 'service.name': 'legacy' })).toBe('api');
+  it("turns a saved ServiceName = 'old' and a pick into one clause, not two that contradict", () => {
+    const saved = "ServiceName = 'old' and Region = 'eu'";
+    const opened = parseServicesFromFilter(saved);          // what the picker opens with
+    expect([...opened]).toEqual(['old']);
+    expect(setServicesClause(saved, new Set([...opened, 'new'])))
+      .toBe("@service in ['old', 'new'] and Region = 'eu'");
+    expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
   });
 
-  it('is undefined for an event without a service', () => {
-    expect(eventService(base)).toBeUndefined();
+  it('repairs, at the next pick, a contradiction the old picker already saved', () => {
+    const saved = "@service = 'new' and ServiceName = 'old' and Region = 'eu'";
+    expect([...parseServicesFromFilter(saved)]).toEqual(['new']);   // it opens with the first
+    expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
+  });
+
+  it("still replaces, and never reads, the picker's oldest clause", () => {
+    const saved = "(service.name = 'x' or ApplicationContext = 'x') and Region = 'eu'";
+    expect(parseServicesFromFilter(saved).size).toBe(0);
+    expect(setServicesClause(saved, new Set(['a']))).toBe("@service = 'a' and Region = 'eu'");
+  });
+
+  it("turns a saved service['name'] = 'old' and a pick into one clause, keeping the rest", () => {
+    const saved = "service['name'] = 'old' and Region = 'eu'";
+    expect([...parseServicesFromFilter(saved)]).toEqual(['old']);
+    expect(setServicesClause(saved, new Set(['new']))).toBe("@service = 'new' and Region = 'eu'");
+  });
+
+  it('reads the clause as the lexer does: spaces between tokens, `in` right after `]`, escapes', () => {
+    const reads: [string, string[]][] = [
+      ["service . name = 'a'", ['a']],
+      ["[ 'service.name' ] = 'a'", ['a']],
+      ["service [ 'name' ] = 'a'", ['a']],
+      ["['service\\.name'] = 'a'", ['a']],              // a backslash escapes the dot: one key
+      ["ServiceName='a'", ['a']],
+      ["['service.name']in ['a', 'b']", ['a', 'b']],
+      ["service['name']in['a']", ['a']],
+      ["@service in ['a', 'b',]", ['a', 'b']],          // the parser takes a trailing comma
+      ["@service = 'O''Brien'", ["O'Brien"]],
+      ["@service = 'it\\'s'", ["it's"]],
+      ["@service = 'DOMAIN\\\\svc'", ['DOMAIN\\svc']],
+    ];
+    for (const [filter, services] of reads) {
+      expect([...parseServicesFromFilter(filter)], filter).toEqual(services);
+      expect(setServicesClause(`${filter} and Region = 'eu'`, new Set(['new'])), filter)
+        .toBe("@service = 'new' and Region = 'eu'");
+    }
+  });
+
+  it('reads the clause in parentheses, or with the name on the left, as the parser does', () => {
+    // ParseAtom reads `( expr )` as expr; a literal on the left of `=` is moved to the right.
+    const reads: [string, string[]][] = [
+      ["(ServiceName = 'old')", ['old']],
+      ["((service['name'] in ['a', 'b']))", ['a', 'b']],
+      ["'old' = ServiceName", ['old']],
+      ["('old' = ['service'].name)", ['old']],
+    ];
+    for (const [filter, services] of reads) {
+      expect([...parseServicesFromFilter(filter)], filter).toEqual(services);
+      expect(setServicesClause(`${filter} and Region = 'eu'`, new Set(['new'])), filter)
+        .toBe("@service = 'new' and Region = 'eu'");
+    }
+    for (const other of [
+      "not (ServiceName = 'x')", "(ServiceName = 'x' or ServiceName = 'y')", "(ServiceName) = 'x'",
+      "(ServiceName = 'x') or (Region = 'eu')", "'x' <> ServiceName", "'x' = 'y'",
+    ]) {
+      expect(parseServicesFromFilter(other).size, other).toBe(0);
+    }
+  });
+
+  it('reads a clause however deeply it is parenthesised', () => {
+    const deep = '('.repeat(5_000) + "service['name'] = 'x'" + ')'.repeat(5_000);
+    expect([...parseServicesFromFilter(deep)]).toEqual(['x']);
+    expect(setServicesClause(`${deep} and Region = 'eu'`, new Set(['y'])))
+      .toBe("@service = 'y' and Region = 'eu'");
+    const unbalanced = '('.repeat(5_000) + "ServiceName = 'x'" + ')'.repeat(4_999);
+    expect(parseServicesFromFilter(unbalanced).size).toBe(0);
+  });
+
+  it('reads back exactly the names it wrote, quotes and backslashes included', () => {
+    const svcs = new Set(["O'Brien", 'DOMAIN\\svc', 'plain']);
+    expect(parseServicesFromFilter(setServicesClause("@l = 'Error'", svcs))).toEqual(svcs);
+    const one = new Set(["it's"]);
+    expect(parseServicesFromFilter(setServicesClause('', one))).toEqual(one);
+  });
+
+  it('reads nothing from a string still open — a draft being typed', () => {
+    expect(parseServicesFromFilter("@service = 'pay").size).toBe(0);
+    expect(parseServicesFromFilter("service['name").size).toBe(0);
+  });
+
+  it('leaves alone what only looks like the field: other properties, other cases, other tests', () => {
+    for (const other of [
+      "service.namespace = 'x'", "['service.namespace'] = 'x'", "service.name.id = 'x'",
+      "service['name']['x'] = 'x'", "['service.name'].x = 'x'", "['service']['namespace'] = 'x'",
+      "service['name.x'] = 'x'", "service[0] = 'x'", "service. name = 'x'",
+      "@service.name = 'x'", "ServiceNameX = 'x'", "MyServiceName = 'x'",
+      "servicename = 'x'", "SERVICENAME = 'x'", "Service.Name = 'x'", "['Service.Name'] = 'x'",
+      "['servicename'] = 'x'", "service['Name'] = 'x'", "['@SERVICE'] = 'x'",
+      "ServiceName <> 'x'", "service.name like 'x%'", "not ServiceName = 'x'",
+      "ServiceName not in ['x']", "ServiceName = OtherProp", "ServiceName = 'x' 'y'",
+    ]) {
+      expect(parseServicesFromFilter(other).size, other).toBe(0);
+      expect(setServicesClause(other, new Set(['a'])), other).toBe(`@service = 'a' and ${other}`);
+    }
   });
 });
 
