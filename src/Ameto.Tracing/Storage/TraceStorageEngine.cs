@@ -4127,6 +4127,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <summary>Test hook: runs captured without a start index they could prove was theirs. Zero in a healthy engine.</summary>
     internal long UnindexedCapturesForTest => Interlocked.Read(ref _unindexedCaptures);
 
+    /// <summary>Test hook: the unflushed spans the start indexes keep out of their blocks' ranges (#127).</summary>
+    internal int HotOutliersForTest
+    {
+        get
+        {
+            _lock.EnterReadLock();
+            try     { return _hotStarts.Outliers + (_flushingStarts?.Outliers ?? 0); }
+            finally { _lock.ExitReadLock(); }
+        }
+    }
+
     /// <summary>
     /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:
     /// a flush detaching the tier, a failed flush restoring it, a publish dropping the snapshot.
