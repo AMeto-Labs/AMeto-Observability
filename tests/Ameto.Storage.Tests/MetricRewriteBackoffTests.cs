@@ -242,6 +242,42 @@ public sealed class MetricRewriteBackoffTests : IDisposable
     }
 
     /// <summary>
+    /// A BACK-OFF OUTLIVES ITS SLOT'S STALE MERGE RECORD (#126 review N4). The record and the back-off
+    /// were forgotten together, so a window that merged once and then failed was tried again early,
+    /// two minutes into its five, as soon as retention took the record's outputs. Each is now
+    /// forgotten for its own reason: the record when its outputs are gone, the back-off when its
+    /// metric has no file left or when it ends.
+    /// </summary>
+    [Fact]
+    public async Task A_back_off_outlives_its_slots_stale_merge_record()
+    {
+        const string metric = "stale.record";
+        long now = Now() / Min * Min;
+        for (int i = 0; i < 4; i++) Write(_dir, metric, MetricGranularity.FiveMin, 3, now - (20 - i) * Hour, 5);
+
+        var clock = new ManualTimeProvider();
+        await using var engine = new MetricStorageEngine(_dir, new CapturingLogger(), timeProvider: clock);
+        await engine.ColdLoadCompleted;
+
+        await engine.PerformRollupForTest();                                         // merged once: the record
+        var merged = Assert.Single(Paths(engine, metric, MetricGranularity.FiveMin));
+
+        for (int i = 0; i < 4; i++)
+            engine.AdoptColdSegmentsForTest(Write(_dir, metric, MetricGranularity.FiveMin, 3, now - (4 - i) * Hour, 5));
+        int attempts = 0;
+        engine.OnRewriteChunkWrittenForTest = _ => { attempts++; throw new IOException("injected failure"); };
+        await engine.PerformRollupForTest();
+        Assert.Equal(1, attempts);                                                   // failed: 5 minutes off
+
+        Assert.Equal(1, await engine.PruneAsync(TimeSpan.FromHours(10)));             // retention takes the record's output
+        Assert.DoesNotContain(merged, Paths(engine, metric, MetricGranularity.FiveMin));
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await engine.PerformRollupForTest();
+        Assert.Equal(1, attempts);                                                   // still off: the back-off held
+    }
+
+    /// <summary>
     /// A STOP IS HONOURED BETWEEN UNITS OF A REWRITE, AND IS NOT A FAILURE (#126 review L2). The pass
     /// never read its token, so a shutdown waited for every remaining chunk of every metric — with
     /// byte-bounded chunks, many — and a container's stop timeout killed the process mid-rewrite,

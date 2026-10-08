@@ -3176,17 +3176,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     {
         if (_rewriteQuarantine.Count > 0) _rewriteQuarantine.RemoveWhere(path => !catalogPaths.Contains(path));
 
-        List<RewriteSlot>? gone = null;
+        // Two lists, each forgotten from its own map (#126 review N4): a stale merge record used to
+        // take its slot's live back-off with it, so a window that had merged once, then failed,
+        // was tried again early as soon as retention took the record's outputs.
+        List<RewriteSlot>? staleRecords = null, deadFailures = null;
         foreach (var (slot, own) in _lastMergeOutputs)
-            if (!own.Overlaps(catalogPaths)) (gone ??= []).Add(slot);
+            if (!own.Overlaps(catalogPaths)) (staleRecords ??= []).Add(slot);
         foreach (var slot in _rewriteFailures.Keys)
-            if (!catalogNames.Contains(slot.Metric)) (gone ??= []).Add(slot);
-        if (gone is null) return;
-        foreach (var slot in gone)
-        {
-            _lastMergeOutputs.Remove(slot);
-            _rewriteFailures.Remove(slot);
-        }
+            if (!catalogNames.Contains(slot.Metric)) (deadFailures ??= []).Add(slot);
+        if (staleRecords is not null) foreach (var slot in staleRecords) _lastMergeOutputs.Remove(slot);
+        if (deadFailures is not null) foreach (var slot in deadFailures) _rewriteFailures.Remove(slot);
     }
 
     private static string WorkName(RewriteWork work) => work switch
