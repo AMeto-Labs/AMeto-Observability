@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using Ameto.Core;
@@ -278,30 +279,50 @@ internal static class OtlpGzip
 /// <para><b>Full</b> is a brief wait (<see cref="DefaultPatience"/>), then a refusal the receiver
 /// answers as HTTP 503 with <c>Retry-After</c> or gRPC <c>UNAVAILABLE</c> — the two answers OTLP
 /// exporters retry. The wait is asynchronous: a queued request holds its compressed body and its
-/// connection, not a thread. Uncontended, entering is <see cref="SemaphoreSlim"/>'s fast path — a
-/// cached completed task, no allocation.</para>
+/// connection, not a thread. Uncontended, entering is one compare-and-swap and a cached completed
+/// task, no allocation.</para>
+///
+/// <para><b>A counter and a poll, not a <see cref="SemaphoreSlim"/></b> (#126 review F4). The
+/// semaphore's timed wait queues its waiter and only then allocates the timeout's machinery; an
+/// OutOfMemoryException there — a heap peak is exactly when a gzip batch finds the gate full —
+/// left the waiter queued with nobody to collect it, and the next release handed it a slot no one
+/// would ever give back. On the stand's two slots, two such events and every compressed batch,
+/// the Collector's default, waited a second and got 503 until a restart. Here a waiter is never
+/// queued: it looks again every <see cref="PollInterval"/> until its patience runs out, and a wait
+/// that fails — memory, cancellation — leaves the count exactly as it was.</para>
 /// </summary>
 internal sealed class OtlpInflateGate
 {
     /// <summary>How long a compressed batch waits for a slot before it is told to retry.</summary>
     internal static readonly TimeSpan DefaultPatience = TimeSpan.FromSeconds(1);
 
-    private readonly SemaphoreSlim _slots;
-    private readonly TimeSpan      _patience;
+    /// <summary>How often a waiting batch looks at the gate again — small beside an inflate and a parse.</summary>
+    internal static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
+
+    private readonly TimeSpan _patience;
+
+    /// <summary>Slots free; taken by compare-and-swap, given back by an increment.</summary>
+    private int _available;
 
     public OtlpInflateGate(int capacity, TimeSpan patience)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
-        Capacity  = capacity;
-        _patience = patience;
-        _slots    = new SemaphoreSlim(capacity, capacity);
+        Capacity   = capacity;
+        _patience  = patience;
+        _available = capacity;
     }
 
     /// <summary>Slots in all.</summary>
     public int Capacity { get; }
 
     /// <summary>Slots free right now.</summary>
-    public int Available => _slots.CurrentCount;
+    public int Available => Volatile.Read(ref _available);
+
+    /// <summary>
+    /// Test seam: the wait between two looks at a full gate, in place of <see cref="Task.Delay(TimeSpan, CancellationToken)"/>
+    /// — where an OutOfMemoryException allocating the timer would surface (#126 review F4). Null in production.
+    /// </summary>
+    internal Func<TimeSpan, CancellationToken, Task>? DelayForTest;
 
     /// <summary>The sizing rule, separated so it can be checked against the figures it is argued from.</summary>
     public static int CapacityFor(long ingestBufferBytes, int maxOtlpBatchBytes, int processorCount)
@@ -318,11 +339,51 @@ internal sealed class OtlpInflateGate
 
     /// <summary>
     /// Takes a slot, waiting at most the gate's patience. False: none came free — the caller
-    /// answers "retry" and must NOT call <see cref="Exit"/>. Throws only if
-    /// <paramref name="ct"/> (the request's abort) fires.
+    /// answers "retry" and must NOT call <see cref="Exit"/>. Throws if <paramref name="ct"/> (the
+    /// request's abort) fires, or if the wait itself cannot be had (out of memory for its timer);
+    /// either way no slot is taken and none is owed.
     /// </summary>
-    public Task<bool> TryEnterAsync(CancellationToken ct) => _slots.WaitAsync(_patience, ct);
+    public Task<bool> TryEnterAsync(CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return Task.FromCanceled<bool>(ct);
+        return TryTake() ? Task.FromResult(true) : WaitAsync(ct);
+    }
 
-    /// <summary>Gives back a slot <see cref="TryEnterAsync"/> granted — once, when the inflated buffer goes back.</summary>
-    public void Exit() => _slots.Release();
+    private async Task<bool> WaitAsync(CancellationToken ct)
+    {
+        long deadline = Stopwatch.GetTimestamp() + (long)(_patience.TotalSeconds * Stopwatch.Frequency);
+        while (true)
+        {
+            long remaining = deadline - Stopwatch.GetTimestamp();
+            if (remaining <= 0) return TryTake();
+            var pause = TimeSpan.FromSeconds(Math.Clamp((double)remaining / Stopwatch.Frequency, 0.001, PollInterval.TotalSeconds));
+            await (DelayForTest?.Invoke(pause, ct) ?? Task.Delay(pause, ct)).ConfigureAwait(false);
+            if (TryTake()) return true;
+        }
+    }
+
+    private bool TryTake()
+    {
+        int free = Volatile.Read(ref _available);
+        while (free > 0)
+        {
+            int seen = Interlocked.CompareExchange(ref _available, free - 1, free);
+            if (seen == free) return true;
+            free = seen;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Gives back a slot <see cref="TryEnterAsync"/> granted — once, when the inflated buffer goes
+    /// back. A second give-back is refused as the semaphore refused it, rather than widening the gate.
+    /// </summary>
+    public void Exit()
+    {
+        if (Interlocked.Increment(ref _available) > Capacity)
+        {
+            Interlocked.Decrement(ref _available);
+            throw new SemaphoreFullException("an inflate slot was given back that the gate did not grant");
+        }
+    }
 }

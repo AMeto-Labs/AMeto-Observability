@@ -93,6 +93,53 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.True(await gate.TryEnterAsync(default));
     }
 
+    /// <summary>
+    /// A WAIT THAT CANNOT BE HAD LEAVES NO SLOT OWED (#126 review F4). The gate was a
+    /// <see cref="SemaphoreSlim"/>, whose timed wait queues its waiter and only then allocates the
+    /// timeout's machinery: an OutOfMemoryException there left the waiter queued with nobody to
+    /// collect it, and the next release handed it a slot that was never given back — on the stand's
+    /// two slots, two such events made every compressed batch wait and get 503 until a restart (from
+    /// the runtime's source: the fault needs an allocation failure inside the runtime). The gate now
+    /// polls a counter; here the wait between two looks fails, the call fails, and once the holders
+    /// leave every slot is free and usable.
+    /// </summary>
+    [Fact]
+    public async Task A_wait_that_runs_out_of_memory_leaves_no_slot_owed()
+    {
+        var gate = new OtlpInflateGate(2, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        gate.DelayForTest = static (_, _) => throw new OutOfMemoryException("injected: the wait's timer");
+        await Assert.ThrowsAsync<OutOfMemoryException>(() => gate.TryEnterAsync(default));
+        gate.DelayForTest = null;
+
+        gate.Exit();
+        gate.Exit();
+        Assert.Equal(gate.Capacity, gate.Available);
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.Equal(0, gate.Available);
+    }
+
+    [Fact]
+    public async Task A_waiter_takes_a_slot_freed_within_its_patience_and_a_second_give_back_is_refused()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(10));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        Task<bool> waiting = gate.TryEnterAsync(default);
+        await Task.Delay(50);
+        Assert.False(waiting.IsCompleted, "a full gate let a waiter in");
+        gate.Exit();
+        Assert.True(await waiting.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, gate.Available);
+
+        gate.Exit();
+        Assert.Throws<SemaphoreFullException>(gate.Exit);              // never wider than its capacity
+        Assert.Equal(1, gate.Available);
+    }
+
     // ── OTLP/HTTP: 503 + Retry-After ──────────────────────────────────────────
 
     [Theory]
