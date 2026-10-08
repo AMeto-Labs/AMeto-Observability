@@ -96,7 +96,9 @@ public static class OtlpEndpointMapper
         // OutOfMemoryException 503 with Retry-After, which OTLP exporters retry. It used to leave
         // the handler: on the 512 MB stand the metric WAL's append ran out while compaction held
         // the heap, hosting answered 500, and exporters, which never retry a 500, dropped the
-        // batch. A parser's own catch-all (malformed payload: 400) must therefore let it pass.
+        // batch. A parser's own catch-all (malformed payload: 400) must therefore let it pass —
+        // also when it arrives inside an AggregateException, as one from a sink's own log call
+        // does (OtlpOutOfMemoryLog.IsOutOfMemory, #126 review F3).
         // The answer to an ACCEPTED batch is written outside: once the batch is stored, a retry
         // would only store it twice.
 
@@ -125,7 +127,7 @@ public static class OtlpEndpointMapper
                         ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
                         : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
                 }
-                catch (Exception ex) when (ex is not OutOfMemoryException)
+                catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex))
                 {
                     LogTracesDecodeFailed(tracesLogger, bodyLen, ctx.Request.ContentType, ex);
                     ctx.Response.StatusCode = 400;
@@ -133,7 +135,7 @@ public static class OtlpEndpointMapper
                 }
                 finally { IngestBufferPool.Return(body); slot?.Exit(); }
             }
-            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
                 return;
@@ -175,7 +177,7 @@ public static class OtlpEndpointMapper
                     }
                     OnMetricsParsedForTest?.Invoke(points);
                 }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { ctx.Response.StatusCode = 400; return; }
+                catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) { ctx.Response.StatusCode = 400; return; }
                 finally { IngestBufferPool.Return(body); slot?.Exit(); }
 
                 // Where the stand ran out: the WAL append, under a heap compaction had filled. The
@@ -186,7 +188,7 @@ public static class OtlpEndpointMapper
                 refused  = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
                 accepted = points.Count - refused;
             }
-            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
                 return;
@@ -219,10 +221,10 @@ public static class OtlpEndpointMapper
                         ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), endpoint)
                         : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
                 }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { ctx.Response.StatusCode = 400; return; }
+                catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) { ctx.Response.StatusCode = 400; return; }
                 finally { IngestBufferPool.Return(body); slot?.Exit(); }
             }
-            catch (OutOfMemoryException ex) when (!ctx.Response.HasStarted)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
                 return;
@@ -499,9 +501,11 @@ public static class OtlpEndpointMapper
 
     /// <summary>
     /// The answer to a batch the server ran out of memory taking in (#125): the retryable 503,
-    /// then the throttled error line — in that order, so a line that cannot be written either
-    /// does not cost the exporter its answer. Reached with the batch's buffers and inflate slot
-    /// already given back: the handlers' finally blocks run as the exception leaves them.
+    /// then the throttled error line. The 503 is only BUFFERED when the line is written — writing
+    /// it does not start the response — so a throw from the line would still turn it into
+    /// hosting's 500 with no Retry-After; <see cref="OtlpOutOfMemoryLog.Note"/> therefore never
+    /// throws, whatever its logger does (#126 review F3). Reached with the batch's buffers and
+    /// inflate slot already given back: the handlers' finally blocks run as the exception leaves them.
     ///
     /// <para>What was stored before the failure stays stored, as on the 400 road — but this answer
     /// is retried, so a prefix a streaming parser had already handed the ring (logs, traces) is
@@ -510,7 +514,7 @@ public static class OtlpEndpointMapper
     /// is stored once; a metric batch that runs out after its append, while its points are filed
     /// in memory, is durable already, and the retry stores what was filed again.</para>
     /// </summary>
-    private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, OutOfMemoryException ex)
+    private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
     {
         WriteRetryLater(ctx, IngestMemoryShortMessage);
         log.Note(ctx, ex);

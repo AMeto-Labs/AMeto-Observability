@@ -50,19 +50,38 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         /// <summary>The signal ("logs", "traces", "metrics") whose store throws on this class's batches; null for none.</summary>
         internal volatile string? Failing;
 
+        /// <summary>
+        /// The metric and span faults arrive as an <see cref="AggregateException"/> around the
+        /// OutOfMemoryException — what Microsoft.Extensions.Logging's logger rethrows when a provider
+        /// fails inside a sink's own log call (#126 review F3). The log fault always does: its logger
+        /// is built through a <see cref="LoggerFactory"/>, as production's is.
+        /// </summary>
+        internal volatile bool Aggregate;
+
+        /// <summary>A log provider of the host fails while it writes the OtlpOutOfMemory line itself.</summary>
+        internal volatile bool FailingLine;
+
         /// <summary>What the host logs, with exceptions.</summary>
         public CapturedLog Log { get; } = new();
 
         /// <summary>The clock the out-of-memory error is throttled by: it moves only when a test says so.</summary>
         internal ManualTimeProvider Clock { get; } = new();
 
+        /// <summary>The log sink's own logger factory: a provider that fails on an oversized record of this class's.</summary>
+        private ILoggerFactory? _sinkLoggers;
+
+        internal Exception Fault(string what) =>
+            Aggregate ? new AggregateException(new OutOfMemoryException(what)) : new OutOfMemoryException(what);
+
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
+            _sinkLoggers = LoggerFactory.Create(b => b.AddProvider(new FailingSinkProvider(this)));
             // After the app's own registrations, so each of these is the one resolved.
             builder.ConfigureTestServices(services =>
             {
                 services.AddSingleton<ILoggerProvider>(Log);
+                services.AddSingleton<ILoggerProvider>(new FailingLineProvider(this));
                 services.AddSingleton(sp => new OtlpOutOfMemoryLog(
                     sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), Clock));
                 services.AddSingleton<IMetricIngester>(sp =>
@@ -74,8 +93,14 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
                     sp.GetRequiredService<StringInternPool>(),
                     sp.GetRequiredService<IngestionDrainer>(),
                     sp.GetRequiredService<ServerOptions>(),
-                    new FailingLogger(this)));
+                    _sinkLoggers.CreateLogger<IngestionEndpoint>()));
             });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing) _sinkLoggers?.Dispose();
         }
     }
 
@@ -134,23 +159,108 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
     }
 
     /// <summary>
-    /// The metric parse runs out — building a big batch's items is an allocation like any other —
-    /// and the parse's catch-all, there for malformed payloads, took it for one: a 400. (A log or
-    /// trace parse stores as it goes, so the store faults above are their parse faults too.)
+    /// The same, when the OutOfMemoryException arrives inside an <see cref="AggregateException"/> —
+    /// what Microsoft.Extensions.Logging's logger rethrows when a provider fails inside a sink's own
+    /// log call, such as the span ring's ring-full warning (#126 review F3). It was answered 400:
+    /// the parsers' catch-alls tested for OutOfMemoryException alone. (The log route's fault above
+    /// always arrives that way: its sink's logger is built through a LoggerFactory.)
     /// </summary>
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task A_metric_parse_that_runs_out_of_memory_is_503_not_400(bool gzip)
+    [InlineData("/v1/metrics")]
+    [InlineData("/v1/traces")]
+    public async Task A_store_out_of_memory_wrapped_in_an_AggregateException_is_still_503(string route)
+    {
+        _factory.Failing   = SignalOf(route);
+        _factory.Aggregate = true;
+        try
+        {
+            using var refused = await PostAsync(route, Batch(route), protobuf: false, gzip: false);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, refused.StatusCode);
+            Assert.Equal(TimeSpan.FromSeconds(1), refused.Headers.RetryAfter?.Delta);
+            Assert.Equal(Message, StatusMessage(await refused.Content.ReadAsByteArrayAsync(), protobuf: false));
+        }
+        finally
+        {
+            _factory.Failing   = null;
+            _factory.Aggregate = false;
+        }
+    }
+
+    /// <summary>
+    /// A log provider that fails while it writes the OtlpOutOfMemory line itself — formatting the
+    /// exception's stack is an allocation, and the heap is short — must not cost the exporter its
+    /// 503 (#126 review F3). On HTTP the 503 is only buffered when the line is written, and the
+    /// logger rethrows a provider's failure as an <see cref="AggregateException"/>, which
+    /// <see cref="OtlpOutOfMemoryLog.Note"/> did not catch: hosting then answered 500, with no
+    /// Retry-After, and the batch was lost.
+    /// </summary>
+    [Fact]
+    public async Task A_log_provider_that_fails_on_the_line_does_not_cost_the_503()
+    {
+        _factory.Clock.Advance(OtlpOutOfMemoryLog.Interval);                 // a new second: the line is written
+        _factory.Failing     = "metrics";
+        _factory.FailingLine = true;
+        try
+        {
+            using var refused = await PostAsync("/v1/metrics", Batch("/v1/metrics"), protobuf: false, gzip: false);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, refused.StatusCode);
+            Assert.Equal(TimeSpan.FromSeconds(1), refused.Headers.RetryAfter?.Delta);
+            Assert.Equal(Message, StatusMessage(await refused.Content.ReadAsByteArrayAsync(), protobuf: false));
+        }
+        finally
+        {
+            _factory.Failing     = null;
+            _factory.FailingLine = false;
+        }
+    }
+
+    [Fact]
+    public void Note_never_throws_whatever_a_log_provider_does()
+    {
+        using var loggers = LoggerFactory.Create(b => b.AddProvider(new ThrowingProvider()));
+        var log = new OtlpOutOfMemoryLog(loggers.CreateLogger("Ameto.Otel"), TimeProvider.System);
+        var ctx = new DefaultHttpContext();
+        ctx.Request.Path = "/v1/metrics";
+
+        log.Note(ctx, new OutOfMemoryException("injected"));                  // AggregateException out of the logger, today
+    }
+
+    private sealed class ThrowingProvider : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => new Sink();
+        public void Dispose() { }
+
+        private sealed class Sink : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                    Func<TState, Exception?, string> formatter)
+                => throw new InvalidOperationException("injected: the provider failed");
+        }
+    }
+
+    /// <summary>
+    /// The metric parse runs out — building a big batch's items is an allocation like any other —
+    /// and the parse's catch-all, there for malformed payloads, took it for one: a 400. (A log or
+    /// trace parse stores as it goes, so the store faults above are their parse faults too.) Also
+    /// when the failure arrives inside an <see cref="AggregateException"/> (#126 review F3).
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true,  false)]
+    [InlineData(false, true)]
+    public async Task A_metric_parse_that_runs_out_of_memory_is_503_not_400(bool gzip, bool aggregate)
     {
         byte[] message = Batch("/v1/metrics");
         byte[] body    = gzip ? OtlpGzipTests.Gzip(message) : message;
         var gate       = _factory.Services.GetRequiredService<OtlpInflateGate>();
 
-        OtlpEndpointMapper.OnMetricsParsedForTest = static points =>
+        OtlpEndpointMapper.OnMetricsParsedForTest = points =>
         {
             if (points.Count > 0 && points[0].Name.StartsWith(Marker, StringComparison.Ordinal))
-                throw new OutOfMemoryException("injected: the metric parse ran out");
+                throw aggregate ? new AggregateException(new OutOfMemoryException("injected: the metric parse ran out"))
+                                : new OutOfMemoryException("injected: the metric parse ran out");
         };
         try
         {
@@ -228,7 +338,9 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
             var line = _factory.Log.Last("OtlpOutOfMemory");
             Assert.Equal(3L, line.Values["Count"]);
             Assert.Equal("/v1/logs", line.Values["Path"]);
-            Assert.IsType<OutOfMemoryException>(line.Exception);
+            // The log sink's failure came through its logger factory: the line carries what was caught.
+            var caught = Assert.IsType<AggregateException>(line.Exception);
+            Assert.IsType<OutOfMemoryException>(Assert.Single(caught.InnerExceptions));
         }
         finally
         {
@@ -252,25 +364,30 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
     /// TestServer cannot honestly carry gRPC (see <see cref="OtlpGrpcFramingTests"/>).
     /// </summary>
     [Theory]
-    [InlineData(false, true,  "14")]
-    [InlineData(true,  true,  "14")]
-    [InlineData(false, false, "3")]
-    [InlineData(true,  false, "3")]
+    [InlineData(false, "oom",       "14")]
+    [InlineData(true,  "oom",       "14")]
+    [InlineData(false, "aggregate", "14")]   // a sink's log call that ran out (#126 review F3)
+    [InlineData(false, "other",     "3")]
+    [InlineData(true,  "other",     "3")]
     public async Task A_grpc_decode_that_runs_out_of_memory_is_UNAVAILABLE_and_any_other_failure_INVALID_ARGUMENT(
-        bool compressed, bool outOfMemory, string expected)
+        bool compressed, string kind, string expected)
     {
         var gate = new OtlpInflateGate(1, TimeSpan.Zero);
         byte[] message = [0x0A, 0x00];
         var call = GrpcCall(Frame(compressed ? OtlpGzipTests.Gzip(message) : message, compressed));
-        Exception fault = outOfMemory ? new OutOfMemoryException("injected: the metric WAL append ran out")
-                                      : new InvalidDataException("injected: a malformed message");
+        Exception fault = kind switch
+        {
+            "oom"       => new OutOfMemoryException("injected: the metric WAL append ran out"),
+            "aggregate" => new AggregateException(new OutOfMemoryException("injected: a sink's logger ran out")),
+            _           => new InvalidDataException("injected: a malformed message"),
+        };
 
         using var ledger = IngestBufferPoolLedger.Open();
         await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, NoLog, NoMemoryLog,
             (_, _) => throw fault);
 
         Assert.Equal(expected, call.Response.Headers["grpc-status"].ToString());
-        if (outOfMemory)
+        if (kind != "other")
             Assert.Equal(OtlpGrpcEndpointMapper.IngestMemoryShortMessage, call.Response.Headers["grpc-message"].ToString());
         Assert.Equal(1, gate.Available);
         ledger.AssertEveryBufferCameBackOnce(minRents: compressed ? 2 : 1);
@@ -302,7 +419,7 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         public int Ingest(ReadOnlySpan<MetricIngestItem> points)
         {
             if (host.Failing == "metrics" && points.Length > 0 && points[0].Name.StartsWith(Marker, StringComparison.Ordinal))
-                throw new OutOfMemoryException("injected: the metric WAL append ran out");
+                throw host.Fault("injected: the metric WAL append ran out");
             return inner.Ingest(points);
         }
     }
@@ -317,7 +434,7 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
                                  short httpStatusCode, ReadOnlySpan<byte> msgpackAttributes)
         {
             if (host.Failing == "traces" && nameUtf8.StartsWith(Encoding.UTF8.GetBytes(Marker)))
-                throw new OutOfMemoryException("injected: the span ring ran out");
+                throw host.Fault("injected: the span ring ran out");
             return inner.TryIngestRaw(traceId, spanId, parentSpanId, startTimeUnixNano, durationNanos, nameUtf8,
                                       serviceIdx, serviceUtf8, kind, status, httpStatusCode, msgpackAttributes);
         }
@@ -325,16 +442,45 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         public void EndBatch() => inner.EndBatch();
     }
 
-    /// <summary>The log sink's logger, which it calls for an oversized record — this class's log batch is one.</summary>
-    private sealed class FailingLogger(Factory host) : ILogger<IngestionEndpoint>
+    /// <summary>
+    /// A provider of the log sink's logger, which the sink calls for an oversized record — this
+    /// class's log batch is one. Behind a <see cref="LoggerFactory"/>, as in production, so what
+    /// reaches the receiver is the factory's <see cref="AggregateException"/> around it.
+    /// </summary>
+    private sealed class FailingSinkProvider(Factory host) : ILoggerProvider
     {
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(LogLevel logLevel) => true;
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
-                                Func<TState, Exception?, string> formatter)
+        public ILogger CreateLogger(string categoryName) => new Sink(host);
+        public void Dispose() { }
+
+        private sealed class Sink(Factory host) : ILogger
         {
-            if (host.Failing == "logs" && formatter(state, exception).Contains(Marker, StringComparison.Ordinal))
-                throw new OutOfMemoryException("injected: the log sink ran out");
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                    Func<TState, Exception?, string> formatter)
+            {
+                if (host.Failing == "logs" && formatter(state, exception).Contains(Marker, StringComparison.Ordinal))
+                    throw new OutOfMemoryException("injected: the log sink ran out");
+            }
+        }
+    }
+
+    /// <summary>A provider of the host that fails, when armed, on the OtlpOutOfMemory line — formatting a stack is an allocation.</summary>
+    private sealed class FailingLineProvider(Factory host) : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => new Sink(host);
+        public void Dispose() { }
+
+        private sealed class Sink(Factory host) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                    Func<TState, Exception?, string> formatter)
+            {
+                if (host.FailingLine && eventId.Name == "OtlpOutOfMemory")
+                    throw new OutOfMemoryException("injected: the provider ran out formatting the line");
+            }
         }
     }
 

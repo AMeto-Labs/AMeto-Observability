@@ -50,27 +50,46 @@ internal sealed class OtlpOutOfMemoryLog
 
     /// <summary>
     /// Counts one failure; writes the line, carrying <paramref name="ex"/>, if a second has passed
-    /// since the last. Called AFTER the refusal is written, and never throws: a line lost to the
-    /// same shortage must not cost the exporter the answer it retries on.
+    /// since the last. Called after the refusal is decided, and NEVER throws, whatever the logger
+    /// does (#126 review F3): on HTTP the 503 is only buffered at that point, so a throw here turned
+    /// it into hosting's 500 — and the logger rethrows any provider's failure, a provider that runs
+    /// out of memory formatting this line's stack included, as an <see cref="AggregateException"/>,
+    /// which the narrower catch this had let through. The line is best-effort; the answer is not.
     /// </summary>
-    public void Note(HttpContext ctx, OutOfMemoryException ex)
+    public void Note(HttpContext ctx, Exception ex)
     {
-        Interlocked.Increment(ref _pending);
-
-        long now  = _time.GetTimestamp();
-        long next = Volatile.Read(ref _nextAt);
-        if (now < next) return;
-        long step = (long)(Interval.TotalSeconds * _time.TimestampFrequency);
-        if (Interlocked.CompareExchange(ref _nextAt, now + step, next) != next) return;
-
-        long count = Interlocked.Exchange(ref _pending, 0);
         try
         {
+            Interlocked.Increment(ref _pending);
+
+            long now  = _time.GetTimestamp();
+            long next = Volatile.Read(ref _nextAt);
+            if (now < next) return;
+            long step = (long)(Interval.TotalSeconds * _time.TimestampFrequency);
+            if (Interlocked.CompareExchange(ref _nextAt, now + step, next) != next) return;
+
+            long count = Interlocked.Exchange(ref _pending, 0);
             _write(_logger, count, ctx.Request.Path.Value ?? "", ex);
         }
-        catch (OutOfMemoryException)
+        catch
         {
-            // Still short: the line is lost, the answer is not.
+            // Lost: the line, never the answer.
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="ex"/> is the server running out of memory — the exception itself, or
+    /// an <see cref="AggregateException"/> holding one (#126 review F3): Microsoft.Extensions.Logging's
+    /// logger rethrows a provider's failure that way, so an OutOfMemoryException inside a log call a
+    /// sink makes — the log ring's oversized-record warning, the span ring's ring-full warning —
+    /// reaches the receivers wrapped, and was taken for a malformed payload.
+    /// </summary>
+    internal static bool IsOutOfMemory(Exception ex)
+    {
+        if (ex is OutOfMemoryException) return true;
+        if (ex is AggregateException aggregate)
+            foreach (var inner in aggregate.InnerExceptions)
+                if (IsOutOfMemory(inner)) return true;
+        return false;
     }
 }

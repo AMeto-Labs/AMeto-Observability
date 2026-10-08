@@ -154,7 +154,7 @@ public static class OtlpGrpcEndpointMapper
         {
             (body, bodyLen) = await ReadBodyAsync(ctx);
         }
-        catch (OutOfMemoryException ex)
+        catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
         {
             await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
             return;
@@ -233,11 +233,12 @@ public static class OtlpGrpcEndpointMapper
             {
                 (ok, rejected, why) = decode(ctx, segment);
             }
-            catch (OutOfMemoryException ex)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {
                 // It used to be the INVALID_ARGUMENT below, and an exporter drops a batch it is told
                 // is invalid. The metric decode's store is the WAL append the 512 MB stand ran out
-                // in. The buffer and the slot go back before the answer, as below.
+                // in; a sink's own log call that ran out arrives wrapped in an AggregateException
+                // (#126 review F3). The buffer and the slot go back before the answer, as below.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                 return;
@@ -330,11 +331,11 @@ public static class OtlpGrpcEndpointMapper
 
     /// <summary>
     /// The answer to a batch the server ran out of memory taking in (#125): UNAVAILABLE, then the
-    /// throttled error line the HTTP receivers write too (<see cref="OtlpOutOfMemoryLog"/>) — in
-    /// that order, so a line that cannot be written does not cost the exporter its answer. What a
-    /// decode had stored before it ran out stays stored, and the retry stores it again.
+    /// throttled error line the HTTP receivers write too (<see cref="OtlpOutOfMemoryLog"/>). Here the
+    /// status is already complete when the line is written, and the line never throws anyway. What
+    /// a decode had stored before it ran out stays stored, and the retry stores it again.
     /// </summary>
-    private static async Task RefuseOutOfMemoryAsync(HttpContext ctx, OtlpOutOfMemoryLog log, OutOfMemoryException ex)
+    private static async Task RefuseOutOfMemoryAsync(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
     {
         await FinishAsync(ctx, StatusUnavailable, IngestMemoryShortMessage);
         log.Note(ctx, ex);
