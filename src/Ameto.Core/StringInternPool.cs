@@ -37,6 +37,12 @@ public sealed class StringInternPool
 
     public static readonly StringInternPool Shared = new();
 
+    /// <summary>
+    /// Test seam fired right after a claim publishes its string → index mapping — where the
+    /// dictionary's own <c>GrowTable</c> throws when the heap is out (#126 review F5). Null in production.
+    /// </summary>
+    internal Action? OnClaimedForTest;
+
     public StringInternPool() : this(DefaultMaxPoolSize) { }
 
     /// <param name="maxPoolSize">How many distinct strings this pool will ever hold. Past it
@@ -69,19 +75,22 @@ public sealed class StringInternPool
     /// The one place an index is claimed. Everything else routes through it, so the
     /// index→string publication order is reasoned about once.
     ///
-    /// <para><paramref name="canonical"/> is NEVER resolved through <see cref="Get"/>.
-    /// <c>TryAdd</c> publishes the key — and therefore the index — BEFORE
-    /// <see cref="SetSlot"/> stores the index→string slot, so a thread that loses the race
-    /// and reads the winner's index in that window would see <see cref="Get"/> return
-    /// <see cref="string.Empty"/> (the slot is still null). The caller
-    /// stores that empty string as the event's template, the hot tier prefers an attached
-    /// string over the pool (a <c>??</c> does not catch <c>""</c>), and the event is served
-    /// with no template at all while the WAL pool row is skipped as empty. Measured at 4 875
-    /// events out of 8 threads × 64 fresh names × 200 rounds.</para>
+    /// <para><paramref name="canonical"/> is NEVER resolved through <see cref="Get"/>. When
+    /// <c>TryAdd</c> published the key — and therefore the index — BEFORE
+    /// <see cref="SetSlot"/> stored the index→string slot, a thread that lost the race and read
+    /// the winner's index in that window saw <see cref="Get"/> return
+    /// <see cref="string.Empty"/> (the slot still null). The caller stored that empty string as
+    /// the event's template, the hot tier prefers an attached string over the pool (a <c>??</c>
+    /// does not catch <c>""</c>), and the event was served with no template at all while the
+    /// WAL pool row was skipped as empty. Measured at 4 875 events out of 8 threads × 64 fresh
+    /// names × 200 rounds.</para>
     ///
     /// <para>So: the winner returns the very instance it stored, and a loser re-probes the
     /// dictionary, whose KEY is the winner's instance and is present by the time
-    /// <c>TryAdd</c> failed.</para>
+    /// <c>TryAdd</c> failed. Since #126 review F5 the slot is stored BEFORE the mapping is
+    /// published (see the claim itself), which closes that window for every reader of
+    /// <see cref="Get"/> as well, and an OutOfMemoryException between the two can no longer
+    /// leave a published index with an empty slot.</para>
     /// </summary>
     private int Claim(string template, out string canonical)
     {
@@ -101,14 +110,25 @@ public sealed class StringInternPool
         if (newIdx >= _maxPoolSize)
             return Exhausted();
 
+        // THE SLOT BEFORE THE MAPPING (#126 review F5). TryAdd links the key and only then grows
+        // its table, and SetSlot may double the slot array: an OutOfMemoryException between the
+        // two, with the mapping first, left the string mapped to an index whose slot stayed null,
+        // and Get answered "" for it for the life of the pool — a log event carries its service
+        // only as this index, so a new service's first batch, answered 503 during a heap peak,
+        // left every later event of that service unattributed until a restart. Stored first, a
+        // failure leaves either an unreferenced slot (this claim lost, or never published) or
+        // the mapping with its slot; and no reader can see a published index with an empty slot.
+        SetSlot(newIdx, template);
         if (_stringToIndex.TryAdd(template, newIdx))
         {
-            SetSlot(newIdx, template);
+            OnClaimedForTest?.Invoke();
             return newIdx;          // canonical is `template` — the instance just stored
         }
 
         // Another thread beat us: accept their index AND their instance, from the one
-        // structure that is guaranteed to hold both.
+        // structure that is guaranteed to hold both. Our own slot is unreferenced: it is
+        // emptied, so the pool does not keep our duplicate of the string alive.
+        SetSlot(newIdx, null);
         var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
         if (lookup.TryGetValue(template.AsSpan(), out string? winner, out int winnerIdx))
         {
@@ -334,9 +354,9 @@ public sealed class StringInternPool
     /// <summary>
     /// Stores <paramref name="template"/> at <paramref name="index"/>, growing the array as
     /// needed. Under the lock so that a growth (copy old → new, then publish new) cannot
-    /// race a store into the old array and drop it.
+    /// race a store into the old array and drop it. Null empties a slot a lost claim filled.
     /// </summary>
-    private void SetSlot(int index, string template)
+    private void SetSlot(int index, string? template)
     {
         // The growth loop below is bounded by the cap; an index at or past it would
         // spin it for ever — under the lock, with ingest behind it. No such id is ever
