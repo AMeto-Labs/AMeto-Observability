@@ -2449,11 +2449,10 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         toRollup5m = TakeMetricSlice(toRollup5m);
         toRollup1h = TakeMetricSlice(toRollup1h);
 
-        // Bytes this pass is about to chew through, from catalog metadata (sized once
-        // at write/load — no per-pass stat calls). The five lists are disjoint by
-        // construction (granularity/cutoff windows don't overlap), so no double count.
-        long passBytes = TotalSizeBytes(toCompact) + TotalSizeBytes(toMerge5m) + TotalSizeBytes(toMerge1h)
-                       + TotalSizeBytes(toRollup5m) + TotalSizeBytes(toRollup1h);
+        // The source bytes this pass actually hands to a rewrite — counted by CompactSegments and
+        // Rollup as they do — not the bytes it LISTED (#126 review L3): a listed file is often
+        // left alone (not due, backing off, alone in its window, straddling one).
+        _passRewrittenBytes = 0;
 
         if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw, RewriteWork.RawCompaction, minFiles: 2, ct);
         MergeTier(toMerge5m, MetricGranularity.FiveMin, RewriteWork.FiveMinMerge, ct);
@@ -2478,9 +2477,26 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // The gate interval still applies when the floor is met (see AggressiveGcGate);
         // without coordination this call and StorageEngine's maintenance collect once
         // landed 8 s apart mid-load — the two longest pauses in a 7-minute GC trace.
-        if (passBytes >= AggressiveGcGate.MaintenancePassBytesFloor)
+        // The floor is met by what was REWRITTEN (#126 review L3). It used to be the bytes the
+        // pass listed, and since #125 stopped re-merging a window's own outputs and carried files
+        // every pass, most passes list a metric's 1-hour files and rewrite nothing: each still
+        // stopped the world for 100–250 ms on the 5-minute cadence.
+        if (_passRewrittenBytes >= AggressiveGcGate.MaintenancePassBytesFloor)
+        {
+            OnAggressiveCollectRequestedForTest?.Invoke(_passRewrittenBytes);
             AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
+        }
     }
+
+    /// <summary>The source bytes the running pass has handed to rewrites. Owned by the pass.</summary>
+    private long _passRewrittenBytes;
+
+    /// <summary>
+    /// Test seam: a pass is about to ask for the aggressive collection, with the source bytes it
+    /// rewrote (#126 review L3). <see cref="AggressiveGcGate"/> is process-wide and rate-limited, so the
+    /// decision is observed here rather than there. Null in production.
+    /// </summary>
+    internal Action<long>? OnAggressiveCollectRequestedForTest;
 
     /// <summary>Metrics processed per rollup pass (rotating) — bounds peak memory.</summary>
     private const int MaxMetricsPerPass = 4;
@@ -2577,6 +2593,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
 
             try
             {
+                _passRewrittenBytes += TotalSizeBytes(segs);
                 var newInfos = RewriteMetricInChunks(
                     segs, granularity, static (pts, _) => DedupeByTimestamp(pts), RetentionKeepFromNano(), ct: ct);
 
@@ -3037,8 +3054,10 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 // Aggregate into time buckets — type-aware (see Downsample) — in
                 // bounded series chunks so a high-cardinality metric can't pin
                 // hundreds of MB while it is rewritten.
+                var segs = group.ToList();
+                _passRewrittenBytes += TotalSizeBytes(segs);
                 var newInfos = RewriteMetricInChunks(
-                    group.ToList(), targetGranularity,
+                    segs, targetGranularity,
                     (pts, kind) => RollupPoints(pts, bucketSize, kind),
                     RetentionKeepFromNano(), (long)bucketSize.TotalMilliseconds * 1_000_000L, ct);
 

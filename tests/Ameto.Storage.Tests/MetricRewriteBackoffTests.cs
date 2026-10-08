@@ -59,6 +59,24 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         return MetricWriter.Write(dir, items, granularity);
     }
 
+    /// <summary>Gauge series whose values are random doubles, which do not compress: files of a known, large size.</summary>
+    private static List<MetricSegmentInfo> RandomGauges(string dir, string metric, MetricGranularity granularity, int series,
+                                                        long from, long step, int points, int seed)
+    {
+        Directory.CreateDirectory(dir);
+        var rng   = new Random(seed);
+        var items = new List<(SeriesKey, HotSeries)>(series);
+        for (int s = 0; s < series; s++)
+        {
+            var pts = new List<MetricDataPoint>(points);
+            for (int p = 0; p < points; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = from + p * step, Value = rng.NextDouble() * 1e6 });
+            items.Add((new SeriesKey(metric, MetricKind.Gauge, "1", new LabelSet([new("replica", s.ToString(CultureInfo.InvariantCulture))])),
+                       new HotSeries(pts)));
+        }
+        return MetricWriter.Write(dir, items, granularity);
+    }
+
     private static List<string> Paths(MetricStorageEngine e, string metric, MetricGranularity granularity) =>
         e.ColdSegmentsForTest.Where(s => s.MetricName == metric && s.Granularity == granularity)
                              .Select(s => s.FilePath).OrderBy(p => p, StringComparer.Ordinal).ToList();
@@ -264,6 +282,52 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         await engine.PerformRollupForTest();
         Assert.Empty(Paths(engine, metric, MetricGranularity.Raw).Intersect(sources));
         Assert.True(planned >= 5, $"setup: the compaction must take several chunks, it took {planned}");
+    }
+
+    /// <summary>
+    /// A PASS ASKS FOR THE AGGRESSIVE COLLECTION ONLY WHEN IT REWROTE ENOUGH (#126 review L3). The
+    /// blocking, compacting gen2 at the end of a pass was gated on the bytes of the files the pass
+    /// LISTED. Since #125 a window's own outputs and carried files are no longer rewritten on every
+    /// pass, so most passes list a metric's 1-hour files and rewrite nothing — and each still stopped
+    /// the world on the 5-minute cadence. Here a 1-hour file over the 8 MiB floor, alone in its 7-day
+    /// window 40 days back, is listed and left: no collection asked. Two raw files of the last hour,
+    /// over the floor between them, are compacted: asked, with exactly their bytes.
+    /// </summary>
+    [Fact]
+    public async Task A_pass_asks_for_the_aggressive_collection_only_when_it_rewrote_enough()
+    {
+        long floor = Ameto.Core.AggressiveGcGate.MaintenancePassBytesFloor;
+
+        string idleDir = Path.Combine(_dir, "idle");
+        long window = 7 * 24 * Hour;
+        long start  = (Now() - 40 * 24 * Hour) / window * window + Hour;
+        var big = RandomGauges(idleDir, "idle.gauge", MetricGranularity.OneHour, 512, start, Min, 2_400, seed: 1);
+        Assert.True(big.Sum(s => s.SizeBytes) >= floor, "setup: the 1-hour file must be over the floor");
+        await using (var engine = new MetricStorageEngine(idleDir, new CapturingLogger()))
+        {
+            await engine.ColdLoadCompleted;
+            long? asked = null;
+            engine.OnAggressiveCollectRequestedForTest = bytes => asked = bytes;
+            await engine.PerformRollupForTest();
+            Assert.Null(asked);
+            Assert.Equal(big.Select(s => s.FilePath).OrderBy(p => p, StringComparer.Ordinal),
+                         Paths(engine, "idle.gauge", MetricGranularity.OneHour));                 // listed, and left alone
+        }
+
+        string busyDir = Path.Combine(_dir, "busy");
+        long now = Now() / Min * Min;
+        var raw = RandomGauges(busyDir, "busy.gauge", MetricGranularity.Raw, 512, now - 50 * Min, Sec, 1_500, seed: 2);
+        raw.AddRange(RandomGauges(busyDir, "busy.gauge", MetricGranularity.Raw, 512, now - 50 * Min + Sec / 2, Sec, 1_500, seed: 3));
+        Assert.True(raw.Sum(s => s.SizeBytes) >= floor, "setup: the raw files must be over the floor between them");
+        await using (var engine = new MetricStorageEngine(busyDir, new CapturingLogger()))
+        {
+            await engine.ColdLoadCompleted;
+            long? asked = null;
+            engine.OnAggressiveCollectRequestedForTest = bytes => asked = bytes;
+            await engine.PerformRollupForTest();
+            Assert.Equal(raw.Sum(s => s.SizeBytes), asked);
+            Assert.Empty(Paths(engine, "busy.gauge", MetricGranularity.Raw).Intersect(raw.Select(s => s.FilePath)));
+        }
     }
 
     [Fact]
