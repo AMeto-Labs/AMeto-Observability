@@ -72,6 +72,40 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
         Assert.True(long.Parse(child["maxOutputBlock"], CultureInfo.InvariantCulture) <= MetricReader.MaxBlockBytes);
     }
 
+    /// <summary>
+    /// ...AND THE ROLLUP THAT FILE TAKES NOW (#126 review, a note on the description). Since #125 the
+    /// carried 5-minute file is no longer merged with fresh ones: a day after the upgrade it ages past
+    /// the 5-minute tier and is rolled up into 1-hour buckets. Measured by the review on this shape
+    /// under the same limits: ok at 0, 160, 200 and 230 MiB resting, 135–147 MiB above resting at its
+    /// peak, 6 outputs whose blocks are at most 0.93 MB. Every series must come out exactly as the
+    /// rollup's rule says: per hour, its latest point, stamped with the hour.
+    /// </summary>
+    [Theory]
+    [InlineData(160)]
+    [InlineData(0)]
+    public void The_OneHour_rollup_of_the_carried_FiveMin_file_finishes_inside_the_stands_heap(int restingMiB)
+    {
+        string src = Path.Combine(_dir, "src");
+        var sources = MetricHistogramShapes.Write(src, MetricGranularity.FiveMin, series: 512, T0, Min5,
+                                                  [1064, 12, 12, 12], activeFraction: 1.0, seed: 6);
+        long block = sources.Max(s => (long)MetricHistogramShapes.BlockSizes(s.FilePath).Raw);
+        Assert.True(block > 48 * MiB, $"setup: the carried-history file's block is only {block:N0} B");
+
+        var child = Run(src, Path.Combine(_dir, "eng"), restingMiB, rollup: true);
+        string report = $"OneHour rollup of 512 x 1 100 FiveMin histogram points at a 384 MiB limit, {restingMiB} MiB resting: "
+                      + string.Join(", ", child.Values.Where(kv => kv.Key != "stack").Select(kv => kv.Key + "=" + kv.Value));
+        _out.WriteLine(report);
+        foreach (string line in child.Stack) _out.WriteLine("  " + line);
+        if (Environment.GetEnvironmentVariable("AMETO_PROBE_OUT") is { Length: > 0 } probe)
+            File.AppendAllText(probe, report + Environment.NewLine + string.Join(Environment.NewLine, child.Stack) + Environment.NewLine);
+
+        Assert.Equal(384 * MiB, long.Parse(child["heapLimit"], CultureInfo.InvariantCulture));
+        Assert.True(child["result"] == "ok", $"the rollup failed: {child["result"]}{Environment.NewLine}{string.Join(Environment.NewLine, child.Stack)}");
+        Assert.Equal("512", child["series"]);
+        Assert.Equal("True", child["same"]);
+        Assert.True(long.Parse(child["maxOutputBlock"], CultureInfo.InvariantCulture) <= MetricReader.MaxBlockBytes);
+    }
+
     private sealed class ChildResult
     {
         public Dictionary<string, string> Values { get; } = new(StringComparer.Ordinal);
@@ -84,7 +118,7 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
     /// (the GC takes 75 % of it as its heap hard limit, exactly as under a 512 MB cgroup), Workstation,
     /// <c>GCConserveMemory=5</c> as the stand's Dockerfile sets.
     /// </summary>
-    private static ChildResult Run(string sources, string engineDir, int restingMiB)
+    private static ChildResult Run(string sources, string engineDir, int restingMiB, bool rollup = false)
     {
         string? hostPath = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
         var psi = new ProcessStartInfo(hostPath is { Length: > 0 } && File.Exists(hostPath) ? hostPath : "dotnet")
@@ -99,6 +133,7 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
         psi.ArgumentList.Add(sources);
         psi.ArgumentList.Add(engineDir);
         psi.ArgumentList.Add(restingMiB.ToString(CultureInfo.InvariantCulture));
+        if (rollup) psi.ArgumentList.Add("rollup");
 
         // Nothing inherited may pre-empt the settings under test.
         foreach (string prefix in (string[])["DOTNET_", "COMPlus_"])
@@ -132,16 +167,20 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
         return result;
     }
 
+    private const long HourNanos = 3_600_000_000_000L;
+
     /// <summary>
-    /// The child's side (<see cref="ChildProcessEntry"/>): digest the sources, take on the resting heap,
-    /// run the rewrite the FiveMin merge runs, then release the resting heap and digest what it wrote.
+    /// The child's side (<see cref="ChildProcessEntry"/>): digest what the sources must become, take on
+    /// the resting heap, run the rewrite the FiveMin merge runs — or, with <paramref name="rollup"/>, the
+    /// one the OneHour rollup runs — then release the resting heap and digest what it wrote.
     /// </summary>
-    internal static int RunChild(string sources, string engineDir, int restingMiB)
+    internal static int RunChild(string sources, string engineDir, int restingMiB, bool rollup = false)
     {
         Console.WriteLine($"heapLimit={GC.GetGCMemoryInfo().TotalAvailableMemoryBytes}");
 
         var files = Directory.EnumerateFiles(sources, "*.mts").OrderBy(f => f, StringComparer.Ordinal).ToList();
-        var input = MetricHistogramShapes.Digests(files);   // a series at a time, before the resting heap
+        // A series at a time, before the resting heap: the points as they are, or as the rollup must make them.
+        var input = rollup ? RolledUp(files) : MetricHistogramShapes.Digests(files);
         var infos = files.Select(MetricReader.ReadSegmentInfo).ToList();
 
         // The stand's resting managed heap, as live 1 MiB arrays.
@@ -176,8 +215,12 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
         var sw = Stopwatch.StartNew();
         try
         {
-            outputs = engine.RewriteMetricInChunks(infos, MetricGranularity.FiveMin,
-                                                   static (pts, _) => MetricStorageEngine.DedupeByTimestamp(pts));
+            outputs = rollup
+                ? engine.RewriteMetricInChunks(infos, MetricGranularity.OneHour,
+                                               static (pts, kind) => MetricStorageEngine.RollupPoints(pts, TimeSpan.FromHours(1), kind),
+                                               outputBucketNanos: HourNanos)
+                : engine.RewriteMetricInChunks(infos, MetricGranularity.FiveMin,
+                                               static (pts, _) => MetricStorageEngine.DedupeByTimestamp(pts));
             result = "ok";
         }
         catch (OutOfMemoryException ex) { result = "OOM"; stack = ex.StackTrace; }
@@ -212,5 +255,46 @@ public sealed class MetricRewriteUnderStandLimitsTests : IDisposable
 
         try { engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { /* the verdict is printed */ }
         return 0;
+    }
+
+    /// <summary>
+    /// What the 1-hour rollup must make of every series, digested as <see cref="MetricHistogramShapes.Digests"/>
+    /// digests a file: per hour, the series' latest point stamped with the hour — the rule
+    /// <c>Downsample</c> applies to a histogram. Streamed: the files hold consecutive stretches of
+    /// every series in name (= time) order, so one open hour a series is all that is held.
+    /// </summary>
+    private static Dictionary<string, MetricHistogramShapes.SeriesDigest> RolledUp(List<string> files)
+    {
+        var into = new Dictionary<string, MetricHistogramShapes.SeriesDigest>(StringComparer.Ordinal);
+        var open = new Dictionary<string, (LabelSet Labels, long Hour, MetricDataPoint Last)>(StringComparer.Ordinal);
+        foreach (string f in files)
+            foreach (var s in MetricReader.ReadAllSync(f))
+            {
+                string id = string.Join('\u0001', s.Labels.Interleaved.ToArray());
+                bool known = open.TryGetValue(id, out var cur);
+                foreach (var p in s.Points)
+                {
+                    long hour = p.TimestampUnixNano / HourNanos * HourNanos;
+                    if (known && hour != cur.Hour) Emit(into, cur);
+                    cur   = (s.Labels, hour, p);
+                    known = true;
+                }
+                if (known) open[id] = cur;
+            }
+        foreach (var cur in open.Values) Emit(into, cur);
+        return into;
+
+        static void Emit(Dictionary<string, MetricHistogramShapes.SeriesDigest> into, (LabelSet Labels, long Hour, MetricDataPoint Last) bucket) =>
+            MetricHistogramShapes.Add(into, bucket.Labels,
+            [
+                new MetricDataPoint
+                {
+                    TimestampUnixNano = bucket.Hour,
+                    Value             = bucket.Last.Value,
+                    Count             = bucket.Last.Count,
+                    Sum               = bucket.Last.Sum,
+                    BucketCounts      = bucket.Last.BucketCounts,
+                },
+            ]);
     }
 }
