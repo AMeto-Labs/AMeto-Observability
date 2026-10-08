@@ -606,6 +606,10 @@ public sealed class TraceHotTierWindowTests : IDisposable
     /// in, like a page about to fill its limit, and is sized for it — never for more than a full
     /// page. See <c>NextHeapCapacity</c> for why no rule decided at that point can tell the two
     /// apart, and what the alternative costs.</para>
+    ///
+    /// <para>AND THE LAST PAGE OF A SELECTIVE STREAM (#122 review, round 3), in order and down the
+    /// probe's disordered tier, each held to main's figure for its match count rounded up like the
+    /// spread shapes. Disordered, it used to be sized for the limit: see <c>NextHeapCapacity</c>.</para>
     /// </summary>
     [Fact]
     public void A_selective_TraceQL_page_pays_for_what_it_finds_not_for_its_limit()
@@ -626,6 +630,21 @@ public sealed class TraceHotTierWindowTests : IDisposable
         foreach (var (shape, minDuration, matches, bound) in shapes)
             Gate(engine, shape, minDuration, status: null, matches, bound, failures);
 
+        // THE LAST PAGE OF A SELECTIVE STREAM (round 3): matches in runs of 230 and 260 in every
+        // 2 000 spans, so page 0 fills and page 1 keeps the other 301 and 601. In order, and
+        // DISORDERED — where page 1's window overlaps every block a late span reaches back from, most
+        // of whose spans lie above its ceiling, and an estimate over all of them sized the heap for
+        // the limit: 176 and 189 KB, against main's 76 and 159.
+        Gate(engine, "last ~300", 1_771_000_000L, null, 301, 90 * 1024, failures, SecondPageCeiling(engine, 1_771_000_000L));
+        using (var disordered = NewEngine("disordered"))
+        {
+            Write(disordered, [.. TraceStreamPageProbe.Disordered(TraceAggregateLockProbe.Corpus(0, 20_000))]);
+            foreach (var (shape, minDuration, matches, bound) in new (string, long, int, long)[]
+                     { ("~300", 1_771_000_000L, 301, 90 * 1024), ("~600", 1_741_000_000L, 601, 160 * 1024) })
+                Gate(disordered, $"last {shape}, disordered", minDuration, null, matches, bound, failures,
+                     SecondPageCeiling(disordered, minDuration));
+        }
+
         foreach (int burst in (int[])[300, 600])
         {
             using var bursty = NewEngine($"burst-{burst}");
@@ -642,13 +661,13 @@ public sealed class TraceHotTierWindowTests : IDisposable
 
     /// <summary>The smallest allocation of the last five of six identical pages, against <paramref name="bound"/>.</summary>
     private void Gate(TraceStorageEngine engine, string shape, long? minDuration, SpanStatusCode? status,
-                      int matches, long bound, List<string> failures)
+                      int matches, long bound, List<string> failures, DateTimeOffset? to = null)
     {
         long best = long.MaxValue;
         for (int round = 0; round < 6; round++)
         {
             long a0    = GC.GetAllocatedBytesForCurrentThread();
-            var (n, sync, _) = SearchSynchronously(engine, minDuration, status, limit: 2_000);
+            var (n, sync, _) = SearchSynchronously(engine, minDuration, status, limit: 2_000, to: to);
             long bytes = GC.GetAllocatedBytesForCurrentThread() - a0;
             Assert.True(sync, $"{shape}: the hot-only page yielded, so this thread saw only part of it");
             Assert.Equal(matches, n);
@@ -656,6 +675,15 @@ public sealed class TraceHotTierWindowTests : IDisposable
         }
         _out.WriteLine($"{shape,-9} {matches,5:N0} matches  {best / 1024.0,7:N1} KB  (bound {bound / 1024:N0} KB)");
         if (best > bound) failures.Add($"{shape}: {best / 1024.0:N1} KB > {bound / 1024:N0} KB");
+    }
+
+    /// <summary>The ceiling of a stream's second page: its full first page's oldest row, rounded up to its millisecond.</summary>
+    private static DateTimeOffset SecondPageCeiling(TraceStorageEngine engine, long minDuration)
+    {
+        var (n, _, oldest) = SearchSynchronously(engine, minDuration, null, limit: 2_000);
+        Assert.Equal(2_000, n);
+        Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(oldest, out var ceiling));
+        return ceiling;
     }
 
     /// <summary>
@@ -733,6 +761,46 @@ public sealed class TraceHotTierWindowTests : IDisposable
                 + $"{string.Join(", ", pages)}) — a last step was doubled past the limit");
             cursor = oldest;
         }
+    }
+
+    /// <summary>
+    /// A FULL PAGE WHOSE ESTIMATE LANDS JUST SHORT OF ITS LIMIT IS STILL SIZED ONCE (#122 review,
+    /// round 3). Matches come in runs of 400 in every 2 000 spans; page 1's window holds 2 001 of
+    /// them, and 256 matches in, its estimate is 1 998 — two short of the limit. A heap sized to it
+    /// fills, and the last step to 2 000 pays a second array of the limit for two slots: 306 KB for
+    /// the page against page 0's 259. Within a sixteenth of the limit, the limit — so page 1 costs
+    /// what page 0 does.
+    /// </summary>
+    [Fact]
+    public void A_full_page_whose_estimate_lands_just_short_of_its_limit_is_sized_once()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000)]);
+
+        long minDuration = 1_601_000_000L;   // i % 2 000 >= 1 600: runs of 400 matches
+        long cursor      = Nano(To);
+        var  cost        = new long[2];
+        for (int page = 0; page < 2; page++)
+        {
+            Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(cursor, out var pageTo));
+            long best = long.MaxValue, oldest = long.MaxValue;
+            for (int round = 0; round < 6; round++)
+            {
+                long a0 = GC.GetAllocatedBytesForCurrentThread();
+                var (n, sync, low) = SearchSynchronously(engine, minDuration, null, limit: 2_000, to: pageTo);
+                long bytes = GC.GetAllocatedBytesForCurrentThread() - a0;
+                Assert.True(sync, $"page {page}: the hot-only page yielded, so this thread saw only part of it");
+                Assert.Equal(2_000, n);
+                if (round > 0) best = Math.Min(best, bytes);
+                oldest = low;
+            }
+            cost[page] = best;
+            _out.WriteLine($"page {page}: {best / 1024.0,7:N1} KB");
+            cursor = oldest;
+        }
+        Assert.True(cost[1] <= cost[0] + 4 * 1024,
+            $"page 1 allocated {cost[1] / 1024.0:N1} KB against page 0's {cost[0] / 1024.0:N1} KB for the same "
+            + "2 000 spans — its heap was sized just short of the limit and grew a second time");
     }
 
     /// <summary>

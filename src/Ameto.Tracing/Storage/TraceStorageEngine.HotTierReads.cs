@@ -206,7 +206,8 @@ public sealed partial class TraceStorageEngine
             // set grow together, before the heap is full, to sizes this method chooses: left to
             // themselves, the id set of a 2 000-span page ends at 2 729 entries — 87 KB, one array
             // over the large-object threshold, every page — and the heap re-copies itself nine
-            // times on the way. `candidates` is the window's span count, an upper bound on matches.
+            // times on the way. `candidates` is the span count of the blocks the window overlaps, an
+            // upper bound on its matches.
             int candidates = 0;
             for (int k = 0; k < n; k++) candidates += blocks[k].To - blocks[k].From;
             int finalSize = Math.Min(limit, candidates);
@@ -238,7 +239,9 @@ public sealed partial class TraceStorageEngine
                     if (!match.Matches(s)) continue;
                     if (top.Count == sizedFor && sizedFor < finalSize)
                     {
-                        int size = NextHeapCapacity(sizedFor, inWindow, candidates, finalSize);
+                        // Over the in-window spans read and every span not read yet: the spans read
+                        // OUTSIDE the window are candidates no longer (see NextHeapCapacity).
+                        int size = NextHeapCapacity(sizedFor, inWindow, inWindow + (candidates - visited), finalSize);
                         top      = GrownTo(top, sizedFor, size);
                         present.EnsureCapacity(size + 1);   // + the copy AdmitHot adds before it decides
                         sizedFor = size;
@@ -269,21 +272,40 @@ public sealed partial class TraceStorageEngine
 
     /// <summary>
     /// What a full heap of <paramref name="capacity"/> grows to — never past <paramref name="finalSize"/>
-    /// (the page's limit, or the window's span count when that is smaller).
+    /// (the page's limit, or the span count of the blocks its window overlaps when that is smaller).
     ///
     /// <para><b>BY THE PAGE'S OWN MATCH RATE, ONCE IT HAS ONE</b> (#122 review L2). Below
     /// <see cref="SizeHeapAt"/> the heap doubles. Its first time full at that size, the rate it
     /// has matched at so far — <paramref name="capacity"/> matches among the
-    /// <paramref name="inWindowRead"/> spans it has read inside the window — is extrapolated over the
-    /// window's <paramref name="candidates"/>, plus a quarter; if that proves short, it doubles
-    /// again. This used to jump straight to the limit, and a page ending near 300 matches paid for
-    /// 2 000: 185 KB, against main's 76.</para>
+    /// <paramref name="inWindowRead"/> spans it has read inside the window — is extrapolated over
+    /// <paramref name="windowAtMost"/>, plus a quarter; if that proves short, it doubles again. This
+    /// used to jump straight to the limit, and a page ending near 300 matches paid for 2 000:
+    /// 185 KB, against main's 76.</para>
     ///
     /// <para><b>INSIDE THE WINDOW</b>, because a disordered tier makes the walk read whole blocks
     /// that are mostly outside it — a block kept in every page by one late span, its other 127 spans
     /// above the ceiling. Counted against everything read, the rate came out low and a full page
     /// grew in doubling steps: 379 KB instead of 259 on the third page of a stream down
     /// <c>TraceStreamPageProbe</c>'s disordered tier (Debug), 367-395 KB instead of 275 in Release.</para>
+    ///
+    /// <para><b>OVER WHAT CAN STILL BE INSIDE IT</b> (#122 review, round 3):
+    /// <paramref name="windowAtMost"/> is the in-window spans read plus every span not read yet —
+    /// the span count of the blocks the window overlaps, less the spans already read OUTSIDE it.
+    /// Extrapolated over that whole count, the same blocks inflated the estimate instead: a deep
+    /// page's window overlaps every block a late span reaches back from, most of whose spans lie
+    /// above its ceiling, and the walk reads those blocks first, their largest starts being the
+    /// highest. The last page of a selective stream down a disordered tier was then sized for its
+    /// limit: 301 matches, 176 KB, against 84 for the same page of the tier in order — and now 83,
+    /// main's being 76. The count is never above the old one and drops only by spans that cannot
+    /// match, so the rate projects no fewer matches than the window can still hold at it.</para>
+    ///
+    /// <para><b>AND NEVER JUST SHORT OF THE LIMIT</b> (#122 review, round 3): a size within a
+    /// sixteenth of <paramref name="finalSize"/> is the limit. The count above moved some full pages
+    /// just below it — an estimate of 1 998 for a stream page whose window held 2 001 matches — and
+    /// a heap that fills a size that close pays a second array of the limit for its last few slots:
+    /// 306 KB instead of 259 (353 before <see cref="GrownTo"/>, with a 96 KB second array on the
+    /// large-object heap). Rounding up costs at most a sixteenth of the heap — 125 nodes, 3 KB, at a
+    /// limit of 2 000 — and the id set one size of its prime table at most.</para>
     ///
     /// <para><b>WHY NOT DOUBLING ALL THE WAY</b>, which never pays for more than twice what a page
     /// finds: the page that fills its limit pays for every step instead — 354 KB against 259 — and
@@ -299,12 +321,12 @@ public sealed partial class TraceStorageEngine
     /// the spread-out shapes. Never more than a full page, and the cost the jump to the limit put on
     /// every selective page; no rule decided at 256 matches can tell the two apart.</para>
     /// </summary>
-    private static int NextHeapCapacity(int capacity, int inWindowRead, int candidates, int finalSize)
+    private static int NextHeapCapacity(int capacity, int inWindowRead, int windowAtMost, int finalSize)
     {
         long next = capacity < SizeHeapAt  ? Math.Max(16L, 2L * capacity)
-                  : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * candidates / Math.Max(1, inWindowRead) * 5 / 4)
+                  : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * windowAtMost / Math.Max(1, inWindowRead) * 5 / 4)
                   :                          2L * capacity;
-        return (int)Math.Min(finalSize, next);
+        return next >= finalSize - finalSize / 16 ? finalSize : (int)next;
     }
 
     /// <summary>
