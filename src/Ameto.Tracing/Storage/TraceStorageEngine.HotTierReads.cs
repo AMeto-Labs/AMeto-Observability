@@ -94,6 +94,12 @@ public sealed partial class TraceStorageEngine
     internal Action<int>? _hotSearchVisitedForTest;
 
     /// <summary>
+    /// Test seam: the node count the TraceQL hot pass's heap was grown to, reported once per pass —
+    /// what its array cost, which no allocation total separates from the id set's.
+    /// </summary>
+    internal Action<int>? _hotHeapCapacityForTest;
+
+    /// <summary>
     /// Test seam: the two runs the TraceQL hot pass captured — the snapshot's, then the live tier's —
     /// copied inside the same read-lock hold, on the reading thread. A race test checks every walk
     /// against exactly these. Copied only when set.
@@ -171,15 +177,16 @@ public sealed partial class TraceStorageEngine
 
         _hotSearchPassForTest?.Invoke();
         var kept = NewestMatches(runs.Flushing, runs.FlushingStarts, runs.Hot, runs.HotStarts,
-                                 match, limit, out evicted, out int visited);
+                                 match, limit, out evicted, out int visited, out int heapCapacity);
         _hotSearchVisitedForTest?.Invoke(visited);
+        _hotHeapCapacityForTest?.Invoke(heapCapacity);
         return kept;
     }
 
     private static List<SpanRecord> NewestMatches(
         ReadOnlySpan<SpanRecord> flushing, SpanStartView flushingStarts,
         ReadOnlySpan<SpanRecord> hot,      SpanStartView hotStarts,
-        in SpanMatch match, int limit, out bool evicted, out int visited)
+        in SpanMatch match, int limit, out bool evicted, out int visited, out int heapCapacity)
     {
         int capacity = BlockCount(flushing.Length, flushingStarts) + BlockCount(hot.Length, hotStarts);
         var blocks = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, capacity));
@@ -231,9 +238,10 @@ public sealed partial class TraceStorageEngine
                     if (!match.Matches(s)) continue;
                     if (top.Count == sizedFor && sizedFor < finalSize)
                     {
-                        sizedFor = NextHeapCapacity(sizedFor, inWindow, candidates, finalSize);
-                        top.EnsureCapacity(sizedFor);
-                        present.EnsureCapacity(sizedFor + 1);   // + the copy AdmitHot adds before it decides
+                        int size = NextHeapCapacity(sizedFor, inWindow, candidates, finalSize);
+                        top      = GrownTo(top, sizedFor, size);
+                        present.EnsureCapacity(size + 1);   // + the copy AdmitHot adds before it decides
+                        sizedFor = size;
                     }
                     evicted |= AdmitHot(top, present, s, new HotKey(s.StartTimeUnixNano, position + i), limit);
                 }
@@ -241,6 +249,8 @@ public sealed partial class TraceStorageEngine
 
             if (next < n && !evicted)
                 evicted = AnyMatchNotKept(blocks.AsSpan(next, n - next), flushing, hot, match, present, ref visited);
+
+            heapCapacity = top.EnsureCapacity(0);   // its node array's length; grows nothing
 
             // The heap drains oldest-first; the caller wants newest-first.
             var kept = new List<SpanRecord>(top.Count);
@@ -280,7 +290,7 @@ public sealed partial class TraceStorageEngine
     /// that is the page every attribute or OR query is in this pass, where nothing narrows the
     /// walk but the window. Measured (Debug, 20 000 spans, a page of 2 000; KB): matches spread
     /// through the window, ~300 / ~600 / ~1 000 / all — main 76 / 159 / 298 / 622, doubling
-    /// 78 / 153 / 173 / 354, this 75 / 111 / 172 / 259.</para>
+    /// 78 / 153 / 173 / 354, this 72 / 111 / 172 / 259.</para>
     ///
     /// <para><b>WHAT IT GETS WRONG, AND HOW BADLY:</b> a page whose matches crowd the top of its
     /// window. The walk reads newest first, so the burst looks, 256 matches in, exactly like a page
@@ -295,6 +305,30 @@ public sealed partial class TraceStorageEngine
                   : capacity == SizeHeapAt ? Math.Max(capacity + 1L, (long)capacity * candidates / Math.Max(1, inWindowRead) * 5 / 4)
                   :                          2L * capacity;
         return (int)Math.Min(finalSize, next);
+    }
+
+    /// <summary>
+    /// The heap, grown to EXACTLY <paramref name="capacity"/> nodes (#122 review, round 3).
+    /// <c>PriorityQueue.EnsureCapacity</c> grows to at least twice its current length, so a step
+    /// short of that — the jump at <see cref="SizeHeapAt"/> to an estimate under 512, or a last
+    /// doubling cut down to the limit — overshot what <see cref="NextHeapCapacity"/> chose: from
+    /// 1 900 nodes to a limit of 2 000 it allocates 3 800, 91 KB, on the large-object heap, and a
+    /// stream page whose matches come in runs ended at 2 604 nodes for its 2 000. Below twice its
+    /// length the heap is rebuilt at the size asked; its nodes, copied in their heap order, need no
+    /// sifting.
+    ///
+    /// <para><b>THE BOUND THAT GIVES:</b> the heap's array never passes <c>finalSize</c> nodes of
+    /// 24 bytes, and the id set's entries never pass the first prime above <c>finalSize</c>, of 32
+    /// bytes — at the TraceQL page's 2 000, 48 KB and 75 KB, both under the 85 000-byte large-object
+    /// threshold. A caller asking for more than 2 332 spans puts the id set's entries on that heap,
+    /// and more than about 3 500 the heap's array.</para>
+    /// </summary>
+    private static PriorityQueue<SpanRecord, HotKey> GrownTo(PriorityQueue<SpanRecord, HotKey> top, int length, int capacity)
+    {
+        if (capacity >= 2 * length) { top.EnsureCapacity(capacity); return top; }   // grows to exactly `capacity`
+        var grown = new PriorityQueue<SpanRecord, HotKey>(capacity);
+        foreach (var (span, key) in top.UnorderedItems) grown.Enqueue(span, key);
+        return grown;
     }
 
     /// <summary>Blocks a run contributes at most: its index's, or one for a run read unindexed.</summary>

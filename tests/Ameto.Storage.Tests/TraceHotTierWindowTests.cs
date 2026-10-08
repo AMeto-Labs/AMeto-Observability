@@ -700,6 +700,42 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// A HEAP NEVER GROWS PAST ITS PAGE'S LIMIT (#122 review, round 3). <c>PriorityQueue.EnsureCapacity</c>
+    /// grows to at least twice the heap's length, so a last step cut down to the limit overshot it:
+    /// from 1 900 nodes to a limit of 2 000 it allocates 3 800, on the large-object heap. The stream
+    /// is one whose matches come in runs — 1 000 of every 2 000 spans, newest run first — so a deep
+    /// page's top reads a whole run of non-matches, its estimate comes out low, and the heap needs a
+    /// second step to the limit: page 4 ended at 2 604 nodes. Every page of the stream must stay at
+    /// or under 2 000; the seam reports the heap's array, which no allocation total separates from
+    /// the id set's.
+    /// </summary>
+    [Fact]
+    public void A_heap_never_grows_past_its_pages_limit()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 20_000)]);
+        int capacity = -1;
+        engine._hotHeapCapacityForTest = c => capacity = c;
+
+        long minDuration = 1_001_000_000L;   // i % 2 000 >= 1 000: runs of 1 000 matches
+        long cursor      = Nano(To);
+        var  pages       = new List<string>();
+        for (int page = 0; page < 5; page++)
+        {
+            Assert.True(TraceQueryEndpointMapper.TryCeilToMillisecond(cursor, out var pageTo));
+            var (n, sync, oldest) = SearchSynchronously(engine, minDuration, null, limit: 2_000, to: pageTo);
+            Assert.True(sync);
+            Assert.Equal(2_000, n);
+            pages.Add($"{capacity:N0}");
+            _out.WriteLine($"page {page}: heap {capacity:N0} nodes");
+            Assert.True(capacity <= 2_000,
+                $"page {page}'s heap grew to {capacity:N0} nodes for a limit of 2 000 (pages so far: "
+                + $"{string.Join(", ", pages)}) — a last step was doubled past the limit");
+            cursor = oldest;
+        }
+    }
+
+    /// <summary>
     /// SearchSpansAsync driven by hand: how many spans came back, the oldest start among them, and
     /// whether every step completed synchronously.
     /// </summary>
