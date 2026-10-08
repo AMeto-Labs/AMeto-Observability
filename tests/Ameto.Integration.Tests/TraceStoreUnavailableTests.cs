@@ -139,6 +139,52 @@ public sealed class TraceStoreUnavailableTests
         finally { await after.DisposeAsync(); }
     }
 
+    /// <summary>
+    /// THE RESTART WHOSE COLD SCAN FAILS (#94). The rule was Firing over 20 spans; the restarted
+    /// engine's cold scan fails as a whole, so its reads answer nothing on disk until the NEXT restart
+    /// — a load that ended short, not one still running. That ended Loading in Available, and the
+    /// first tick read 0, resolved the "&gt;" rule and fired the "&lt;" one. The store is Degraded
+    /// instead, and both rules are left as they were, tick after tick.
+    /// </summary>
+    [Fact]
+    public async Task A_restart_whose_cold_scan_fails_leaves_the_trace_rules_alone()
+    {
+        using var dir = new TempDir();
+        string traces = Path.Combine(dir.Path, "traces"), alerts = Path.Combine(dir.Path, "alerts");
+
+        var before = new TraceStorageEngine(traces, NullLogger<TraceStorageEngine>.Instance);
+        before.LoadColdSegments();
+        WriteSpans(before);
+        await using (var rig = new EvaluatorRig(alerts, before))
+        {
+            rig.Rule("above", AlertComparator.GreaterThan, Spans - 1);
+            rig.Rule("below", AlertComparator.LessThan, 5);
+            await rig.Evaluator.EvaluateOnceAsync();
+            Assert.Equal(AlertState.Firing, rig.StateOf("above"));
+            Assert.Equal(AlertState.Ok,     rig.StateOf("below"));
+        }
+        await before.DisposeAsync();   // the final flush: every span is now cold
+
+        var after = new TraceStorageEngine(traces, NullLogger<TraceStorageEngine>.Instance);
+        try
+        {
+            after._failColdScanForTest = new IOException("injected: the data directory would not list");
+            after.LoadColdSegments();
+            Assert.Equal(QueryAvailability.Degraded, after.Availability);
+            Assert.Empty(await after.GetAggregateStatsAsync(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow));
+
+            await using var rig = new EvaluatorRig(alerts, after);
+            await rig.Evaluator.EvaluateOnceAsync();
+            await rig.Evaluator.EvaluateOnceAsync();
+
+            Assert.Equal(AlertState.Firing, rig.StateOf("above"));
+            Assert.Equal(AlertState.Ok,     rig.StateOf("below"));
+            Assert.Empty(rig.Dispatched);
+            Assert.Equal(AlertState.Firing, rig.PersistedStateOf("above"));
+        }
+        finally { await after.DisposeAsync(); }
+    }
+
     // ── The read API ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
