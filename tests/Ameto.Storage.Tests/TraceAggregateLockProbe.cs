@@ -21,7 +21,8 @@ namespace Ameto.Storage.Tests;
 /// per 512 (the whole drained batch, the uncapped design the cap exists to refuse), and the cap
 /// without the hand-off between holds, whose readers starve — each against
 /// two readers: a point lookup, whose latency is almost all lock wait, and the span search, whose
-/// read-lock hold is a walk of the whole tier and which the writer waits out in turn.</para>
+/// read-lock hold was a walk of the whole tier, which the writer waited out in turn. Since #94 the
+/// search holds the lock only to capture the tier, and walks it after, newest block first.</para>
 ///
 /// <para>PRINTED, NOT ASSERTED. Wall-clock figures move with the machine and the configuration
 /// (the suite runs in Debug on a two-core CI box); a probe that asserts them is a flaky test. The
@@ -134,7 +135,8 @@ public sealed class TraceAggregateLockProbe : IDisposable
         _out.WriteLine("  alone = no reader. cyc/span = the writer thread's own CPU cycles, alone (Windows).");
         _out.WriteLine("  +lookup / +search = the same ingest with that reader looping on its own thread; its");
         _out.WriteLine("  latency includes the wait for the write lock. lookup = GetTraceAsync of one 10-span hot");
-        _out.WriteLine("  trace; search = SearchSpansAsync(limit 20), a walk of the whole tier under the read lock.");
+        _out.WriteLine("  trace; search = SearchSpansAsync(limit 20), which since #94 holds the read lock only to");
+        _out.WriteLine("  capture the tier, and walks it after, newest block first.");
     }
 
     private static WriteResult[][] Grid()
