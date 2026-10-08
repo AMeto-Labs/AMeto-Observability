@@ -1396,6 +1396,71 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// An output in a segment format newer than this release reads, every source still on disk:
+    /// a version field a bit flip pushed past the newest (v263 = 7 + 256), or a rollback's merge
+    /// killed before its unlinks. Taken as committed, every source was unlinked against a file
+    /// this release cannot read: 0 of 600. The merge is rolled back instead: the sources stay and
+    /// the output goes aside.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputInANewerFormat_WithEverySourceOnDisk_IsRolledBack()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        bytes[5] ^= 0x01;                                    // the version's high byte: v7 reads as v263
+        await File.WriteAllBytesAsync(output, bytes);
+
+        await RestartAsync();
+
+        AssertSameEvents(before, ReadEverything());          // 0: every source unlinked
+        Assert.Equal(10, _engine.ListSegments().Count);
+        Assert.True(File.Exists(output + ".corrupt"), "the output was not set aside");
+        Assert.Empty(Manifests());
+    }
+
+    /// <summary>
+    /// With a source already unlinked, the merge did commit, and that source's events live only in
+    /// the newer-format output. So the output is kept as it is, out of service, for a release that
+    /// reads it; the sources still on disk serve their events meanwhile. It is not set aside (#119
+    /// keeps a newer-format segment under its name), and not taken as committed either.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputInANewerFormat_WithASourceGone_IsKeptForAReleaseThatReadsIt()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var snap = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        var half   = snap.Keys.Order(StringComparer.Ordinal).Take(5).ToList();
+        Restore(snap, half);
+        var expected = half.SelectMany(n => ReadRaw(Path.Combine(SegDir, n))).OrderBy(e => e.Id).ToList();
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        var bytes = await File.ReadAllBytesAsync(output);
+        bytes[5] ^= 0x01;
+        await File.WriteAllBytesAsync(output, bytes);
+
+        await RestartAsync();
+
+        AssertSameEvents(expected, ReadEverything());
+        Assert.True(File.Exists(output), "the newer-format output was set aside");
+        Assert.False(File.Exists(output + ".corrupt"));
+        Assert.Single(Manifests());
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);   // still waiting, still kept
+        Assert.True(File.Exists(output));
+        Assert.Single(Manifests());
+        AssertSameEvents(expected, ReadEverything());
+    }
+
+    /// <summary>
     /// A torn output found after some of its sources were already unlinked: the merge committed,
     /// the crash came in the middle of the unlinks, and the output was damaged afterwards. The
     /// sources still on disk stay in service; the events of the missing ones exist only in the

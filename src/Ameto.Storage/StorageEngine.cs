@@ -3932,6 +3932,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             case MergeOutputState.Unknown:
                 DeferMergeVerdict(output, unreadable!);
                 return;
+            case MergeOutputState.Newer:
+                // A format this release cannot read (#119): a rollback's file, or a version field a
+                // bit flip pushed past the newest. While every source is still on disk the merge can
+                // be rolled back whole, and is: the sources stay in service, the output goes aside.
+                // With one already unlinked, the merge did commit and that source's events live only
+                // in this output, which a release that reads it can still commit: it waits, kept.
+                if (EveryListedSourceOnDisk(manifest, output))
+                {
+                    _logger.LogWarning(unreadable,
+                        "Merge recovery: the output {File} of an interrupted merge is in a segment format newer than " +
+                        "this release reads, and every source it lists is still on disk — the merge is rolled back: the " +
+                        "sources stay in service and the output is set aside as .corrupt", Path.GetFileName(output));
+                    _undecidedMergeOutputs.TryRemove(output, out _);
+                    RecoverTornMerge(manifest, output);
+                }
+                else DeferMergeVerdict(output, unreadable!);
+                return;
         }
         // Whole. While its range is still pinned (a verdict that waited) no merge can take a source:
         // a pass runs this under the merge gate, and the commit below happens in the same pass.
@@ -4053,7 +4070,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>What a sweep finds at a manifest's output name (<see cref="ReadMergeOutput"/>).</summary>
-    private enum MergeOutputState : byte { Absent, Whole, Torn, Unknown }
+    private enum MergeOutputState : byte { Absent, Whole, Torn, Unknown, Newer }
 
     /// <summary>
     /// Whether a manifest's merge committed (see <see cref="RecoverInterruptedMerges"/>): its output
@@ -4071,6 +4088,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// because a restored backup or a lost write tears the file after the rename, and an output
     /// nobody has read may be that one. Taken as committed, every source was unlinked against it:
     /// 0 of 600 events served when it was torn, at a start and at a pass alike.</para>
+    ///
+    /// <para>One in a segment format newer than this release reads (#119's
+    /// <see cref="NewerSegmentFormatException"/>) is <see cref="MergeOutputState.Newer"/>: a
+    /// rollback's file, or a version field a bit flip pushed past the newest. It went down the same
+    /// "taken as committed" road. <see cref="RecoverInterruptedMerge"/> rolls such a merge back while
+    /// every source is on disk, and otherwise keeps the output waiting for a release that reads it.</para>
     /// </summary>
     private MergeOutputState ReadMergeOutput(string output, out SegmentInfo? proved, out Exception? unreadable)
     {
@@ -4095,11 +4118,28 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             return MergeOutputState.Torn;
         }
         catch (FileNotFoundException) { return MergeOutputState.Absent; }   // gone since the probe above
+        catch (NewerSegmentFormatException ex)
+        {
+            unreadable = ex;
+            return MergeOutputState.Newer;
+        }
         catch (Exception ex)
         {
             unreadable = ex;
             return MergeOutputState.Unknown;
         }
+    }
+
+    /// <summary>Whether every source <paramref name="manifest"/> lists is still on disk (see <see cref="IsListedSourceName"/>).</summary>
+    private bool EveryListedSourceOnDisk(string manifest, string output)
+    {
+        foreach (var name in File.ReadAllLines(manifest))
+        {
+            if (!IsListedSourceName(name)) continue;
+            string path = Path.Combine(_segDir, name);
+            if (!string.Equals(path, output, StringComparison.OrdinalIgnoreCase) && !File.Exists(path)) return false;
+        }
+        return true;
     }
 
     /// <summary>
