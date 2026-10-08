@@ -144,41 +144,6 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
-    /// The clean stop's dispose: a log nothing was appended to goes, with its pool; a log with one
-    /// entry stays, readable; an append after either throws as it does after a plain dispose; a
-    /// second call does nothing.
-    /// </summary>
-    [Fact]
-    public void DisposeDeletingIfEmpty_deletes_only_a_log_nothing_was_appended_to()
-    {
-        string empty = NewWalPath(), kept = NewWalPath();
-        try
-        {
-            var a = WriteAheadLog.Open(empty, new NodeId(0), new SegmentId(1UL), initialCapacity: 64 * 1024);
-            Assert.True(a.DisposeDeletingIfEmpty());
-            Assert.False(File.Exists(empty));
-            Assert.False(File.Exists(empty + ".pool"));
-            Assert.Throws<ObjectDisposedException>(() => a.Append(1, LogLevel.Information, 0, "tmpl", [1]));
-            Assert.False(a.DisposeDeletingIfEmpty());
-
-            var b = WriteAheadLog.Open(kept, new NodeId(0), new SegmentId(1UL), initialCapacity: 64 * 1024);
-            b.Append(100, LogLevel.Information, 0, "tmpl", [1], serviceIndex: 1, service: "Svc.A");
-            Assert.False(b.DisposeDeletingIfEmpty());
-            Assert.True(File.Exists(kept));
-            Assert.Throws<ObjectDisposedException>(() => b.Append(2, LogLevel.Information, 0, "tmpl", [2]));
-
-            var (_, entries) = WriteAheadLog.ReadForRecovery(kept);
-            Assert.Equal(1, Assert.Single(entries).ServiceIndex);
-            Assert.Equal("Svc.A", WriteAheadLog.LoadPool(kept + ".pool")[1]);
-        }
-        finally
-        {
-            foreach (var p in new[] { empty, empty + ".pool", kept, kept + ".pool" })
-                try { File.Delete(p); } catch { }
-        }
-    }
-
-    /// <summary>
     /// An entry's service resolves only against its own WAL's pool rows: an index whose row did not
     /// survive is no service, whatever a live pool holds at that slot.
     /// </summary>

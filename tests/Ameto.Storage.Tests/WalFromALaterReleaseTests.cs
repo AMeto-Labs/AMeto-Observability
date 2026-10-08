@@ -82,23 +82,29 @@ public sealed class WalFromALaterReleaseTests : IDisposable
     }
 
     /// <summary>
-    /// The most common rollback: the later release stopped CLEANLY. A stop can leave one log in
-    /// <c>wal/</c>, empty — the successor its final flush opened, which nothing was written to —
-    /// and that log is the later format too. It is kept and its block reserved like any other, but
-    /// it is no Error: an Error at every start saying it held events sent anyone alerting on
-    /// Error-level self-logs after a file a hex dump would show was empty.
-    ///
-    /// <para>Every clean stop up to this release left exactly that log, and this one no longer does
-    /// (<see cref="WalCleanStopTests"/>), so it is built here as those stops built it: opened,
-    /// nothing appended, closed — then stamped one version up.</para>
+    /// The most common rollback: the later release stopped CLEANLY. Its stop leaves one log in
+    /// <c>wal/</c>, empty — the final flush hands its events to segments and opens a successor
+    /// that nothing is written to — and that log is the later format too. It is kept and its block
+    /// reserved like any other, but it is no Error: an Error at every start saying it held events
+    /// sent anyone alerting on Error-level self-logs after a file a hex dump would show was empty.
+    /// The file is this release's own clean-stop leftover, stamped one version up.
     /// </summary>
     [Fact]
     public async Task The_empty_log_a_later_releases_clean_stop_leaves_is_kept_without_an_error()
     {
-        Directory.CreateDirectory(WalDir);
-        string wal = Path.Combine(WalDir, $"{NodeId.Local.Value}-{KeptBlock}.wal");
-        WriteAheadLog.Open(wal, NodeId.Local, new SegmentId(KeptBlock), 64 * 1024).Dispose();
+        Directory.CreateDirectory(_dir);
+        var engine = NewEngine();
+        await engine.CatalogLoaded;
+        Assert.True(engine.TryWrite(new LogEventHeader
+        {
+            TimestampUtcTicks        = DateTime.UtcNow.Ticks,
+            Level                    = LogLevel.Information,
+            MessageTemplatePoolIndex = engine.TemplatePool.Intern("t {n}"),
+            ServiceNamePoolIndex     = engine.TemplatePool.Intern("Svc.A"),
+        }, Props(1), "t {n}"));
+        await engine.DisposeAsync();                                                     // clean stop
 
+        string wal = Assert.Single(Directory.GetFiles(WalDir, "*.wal"));
         Assert.Equal(32L, BinaryPrimitives.ReadInt64LittleEndian(ReadHeader(wal).AsSpan(24)));   // WriteOffset: empty
         ulong block = BinaryPrimitives.ReadUInt64LittleEndian(ReadHeader(wal).AsSpan(16));
         SetVersion(wal, (ushort)(WriteAheadLog.FormatVersion + 1));                      // what a later release's clean stop leaves
