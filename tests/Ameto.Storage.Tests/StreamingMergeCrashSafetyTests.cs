@@ -221,6 +221,23 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
     private string[] Manifests() => Directory.GetFiles(SegDir, "*.mergemanifest");
 
+    /// <summary>
+    /// Tears a segment where the catalog scan cannot see it: the first block's compressed payload is
+    /// overwritten, its frame and the file's footer left whole. The scan's open reads frames, not
+    /// payloads, so it registers such a file; only a decode of its rows refuses it. (A lost
+    /// block-index count no longer serves for this: the reader refuses a file that lists no block
+    /// for the events its header counts, #119.)
+    /// </summary>
+    private static async Task LoseTheFirstBlockPayloadAsync(string path)
+    {
+        var bytes = await File.ReadAllBytesAsync(path);
+        const int header = 46;   // SegmentFileHeader.Size: the first block's frame follows it
+        int compressed = BitConverter.ToInt32(bytes, header + 4);
+        for (int i = header + 8; i < header + 8 + Math.Min(compressed, 256); i++) bytes[i] = 0xFF;
+        await File.WriteAllBytesAsync(path, bytes);
+        using (SegmentReader.Open(path, computeUncompressedBytes: true)) { }   // still opens: the damage is inside a block
+    }
+
     // ── Byte parity ───────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1086,6 +1103,34 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The same proof for damage the open cannot see: the first block's payload lost, every frame
+    /// and the footer whole. Taken for committed on its open alone, all ten sources were unlinked
+    /// against a file that cannot serve its first block; and left to the catalog scan, which opens
+    /// it, it was registered beside the sources it had replaced.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputWhoseBlockPayloadWasLost_IsNotTakenAsCommitted()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        await _engine.DisposeAsync();
+        await LoseTheFirstBlockPayloadAsync(output);
+
+        await RestartAsync();
+
+        foreach (var name in snap.Keys) Assert.True(File.Exists(Path.Combine(SegDir, name)), $"{name} was unlinked");
+        Assert.Equal(10, _engine.ListSegments().Count);   // 11: the torn output registered beside its sources
+        AssertSameEvents(before, ReadEverything());
+        Assert.True(File.Exists(output + ".corrupt"), "the torn output was not quarantined");
+        Assert.Empty(Manifests());
+    }
+
+    /// <summary>
     /// A torn output that cannot be moved aside at the start — on Windows a scanner or a backup
     /// agent holds it without FileShare.Delete — is still kept out of the catalog, recorded for the
     /// scan as a delete is, and its manifest stays. The next pass finds the output unserved, proves
@@ -1104,10 +1149,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Restore(snap, snap.Keys);
         await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
         await _engine.DisposeAsync();
-        var bytes = await File.ReadAllBytesAsync(output);
-        long blockIndexOffset = BitConverter.ToInt64(bytes, bytes.Length - 44 + 24);   // footer slot 3
-        Array.Clear(bytes, (int)blockIndexOffset, 4);                                  // framing intact, no blocks
-        await File.WriteAllBytesAsync(output, bytes);
+        await LoseTheFirstBlockPayloadAsync(output);   // a tear the scan's open does not see
 
         using (new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
@@ -1152,10 +1194,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         Restore(snap, snap.Keys);
         await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
         await _engine.DisposeAsync();
-        var bytes = await File.ReadAllBytesAsync(output);
-        long blockIndexOffset = BitConverter.ToInt64(bytes, bytes.Length - 44 + 24);   // footer slot 3
-        Array.Clear(bytes, (int)blockIndexOffset, 4);                                  // framing intact, no blocks
-        await File.WriteAllBytesAsync(output, bytes);
+        await LoseTheFirstBlockPayloadAsync(output);   // a tear the scan's open does not see
 
         using (new FileStream(output + ".mergemanifest", FileMode.Open, FileAccess.Read, FileShare.None))
         {
