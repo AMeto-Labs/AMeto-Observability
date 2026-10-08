@@ -557,14 +557,18 @@ public static class TraceQueryEndpointMapper
     ///   2.5 ms before, 1.2, 1.2, 1.1, 1.0, 0.9, 0.6 MB and 1.6, 1.3, 1.3, 1.1, 1.1, 0.8 ms after; the
     ///   TraceQL page's engine call (2 000 spans) 638 KB and 4.5-6.4 ms — all of it inside the read
     ///   lock — before, 275 KB and 0.33-0.37 ms, none of it inside the lock, after.
-    ///   <para>DISORDER TAKES THE READ SAVINGS BACK, not the rest (#122 review L1). A block's bounds
-    ///   cover all of its spans, so one span from a clock running ahead keeps its whole block in every
-    ///   TraceQL page, and one long span reported late keeps its block in every list page reaching
-    ///   back over its duration. At one span in a hundred 30 s ahead a TraceQL page reads most of the
-    ///   tier again — its engine call 31 720 to 41 960 of the 49 000 spans and 1.8-2.0 ms, against
-    ///   about 2 100 and 0.35 ms in order; <c>TraceStreamPageProbe</c> prints a disordered tier
-    ///   beside the ordered one. The reads off the lock and the rows not made hold whatever the
-    ///   order.</para></item>
+    ///   <para>AND WHEN THEY DO NOT (#127). A block's bounds used to cover all of its spans, so one
+    ///   span from a clock running ahead kept its whole block in every TraceQL page, and one long span
+    ///   reported late kept its block in every list page reaching back over its duration: at one span
+    ///   in a hundred 30 s ahead a TraceQL page read most of the tier again (#122 review L1). The index
+    ///   now lists a span more than a second outside its block's range instead of widening the range,
+    ///   and both fetchers read each listed span on its own. On <c>TraceStreamPageProbe</c>'s
+    ///   disordered tier (one span in a hundred 30 s ahead, one in fifty 10 s late) the TraceQL page's
+    ///   engine call reads 2 032-2 168 of the 49 000 spans, against 31 720-41 960 before, in
+    ///   0.39-0.48 ms against 1.8-2.0; a list page reads its window and the late spans that start in
+    ///   it — 39 239 for a window of 38 911, against 49 000. A skew under the second, a skewed
+    ///   producer's run of four or more, and anything past the list's 4 096 still widen their blocks,
+    ///   as before.</para></item>
     /// </list>
     /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
     /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is
