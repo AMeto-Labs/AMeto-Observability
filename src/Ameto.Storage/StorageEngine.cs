@@ -3858,13 +3858,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// File.Delete it got otherwise, outside the gate, recorded nothing, so a scan already running
     /// could register a source this sweep had just deleted (#98).</para>
     ///
-    /// <para>A listed file still PARKED is not this sweep's to touch: it has an owner, the retry it
+    /// <para>A listed file still PARKED is not this sweep's to unlink: it has an owner, the retry it
     /// was parked for, which deletes it once nothing holds it, under <c>_importLock</c> and against
     /// the catalog, and says so at Warning once its window is spent. Tried here as well it failed
     /// again on every pass, at Warning per source: a query pins every segment of its window for its
     /// whole run (#114), so a merge under a long query leaves every source it reached parked on
     /// Windows, and each 15 s pass logged up to <see cref="MergeMaxSources"/> Warnings for deletes
-    /// already being retried. Left to the park, the manifest waits a pass longer.</para>
+    /// already being retried. Left to the park, the manifest waits a pass longer. One the catalog
+    /// names again — its peer pushed the replica again, and the import found the old file in place
+    /// — is still taken out of the catalog, as below: skipped, it stayed in service, the retry let
+    /// the park go for the path being named again, and the next merge took it into a second
+    /// output, 1 080 events for 1 020.</para>
     ///
     /// <para>A listed file the catalog NAMES is a source served beside the output that holds its
     /// events: a catalog scan registered it because no sweep before it could settle this manifest
@@ -4026,7 +4030,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             List<(int Index, SegmentInfo Entry)>? named = null;
             for (int i = 0; i < unlink.Length; i++)
             {
-                if (_pendingSegmentDeletes.ContainsKey(sources[i])) continue;
+                // The catalog first, then the park: a replica its peer pushed again while the merge's
+                // unlink of it was parked is named at the parked path. Skipped as parked, it stayed in
+                // service, the park's retry let it go for being named again, and the next merge took
+                // it into a second output.
+                bool parked = _pendingSegmentDeletes.ContainsKey(sources[i]);
                 if (_segments.TryGetValue(keys[i], out var entry)
                     && string.Equals(entry.FilePath, sources[i], StringComparison.OrdinalIgnoreCase))
                 {
@@ -4044,10 +4052,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                     // In the catalog beside its output: a catalog scan registered it because no sweep
                     // before it could settle this manifest, or its peer pushed a replica again. Either
                     // way its events are the output's, and it is taken out as a commit takes out its
-                    // sources, entry first (see RecoverInterruptedMerges).
+                    // sources, entry first (see RecoverInterruptedMerges). One still parked stays its
+                    // park's to unlink, once no entry names it.
                     (named ??= []).Add((i, entry));
                 }
-                unlink[i] = sources[i];
+                if (!parked) unlink[i] = sources[i];
             }
 
             // An output proved here and not served, with no catalog scan running to register it: a

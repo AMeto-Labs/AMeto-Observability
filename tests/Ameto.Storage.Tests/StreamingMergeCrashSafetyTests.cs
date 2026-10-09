@@ -1807,6 +1807,48 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A replica its peer pushes again while the merge's unlink of it is still parked: the import
+    /// finds the old file in place, the same segment, and registers it at the parked path. The
+    /// sweep skipped a parked source before it looked at the catalog, so the entry stayed; the
+    /// retry then found the path named again and dropped the park, and the same pass's merge took
+    /// the replica into a second output: 1 080 events for 1 020, for good. A parked path the
+    /// catalog names again is taken out like any listed source, and its park unlinks it once no
+    /// entry names it. Seams only, any OS.
+    /// </summary>
+    [Fact]
+    public async Task AReplicaPushedAgainWhileItsUnlinkIsParked_IsNotMergedASecondTime()
+    {
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 9; round++) await WriteSegmentAsync(round, 60);
+        var replica = WritePeerSegment(900, 9, 60);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));
+        _engine._deleteSegmentFile = UnlinkRefusing(replica);           // the merge's unlink of it is parked
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        Assert.Single(_engine.ListSegments());
+        Assert.True(File.Exists(replica), "setup: the replica's unlink was not refused");
+        Assert.Single(Manifests());
+
+        for (int round = 10; round < 17; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();                                    // 600 merged and 420 new: 1 020
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));   // pushed again
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == replica);              // setup: named again, parked
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Equal(1_020, _engine.ListSegments().Sum(s => (long)s.EventCount));   // 1 080: merged a second time
+        AssertSameEvents(before, ReadEverything());
+
+        _engine._deleteSegmentFile = File.Delete;                         // let go: the park unlinks it
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Empty(Manifests());
+        Assert.False(File.Exists(replica), "the parked replica was never unlinked");
+        AssertSameEvents(before, ReadEverything());
+
+        await RestartAsync();
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
     /// A DIFFERENT segment pushed under a merged replica's key is not the merge's to take out. The
     /// merge took replica 7-904, which freed its key; a peer reinstalled with the same NodeId (its
     /// segment ids restarted from 1) or a second node configured with it then pushed a new 7-904
