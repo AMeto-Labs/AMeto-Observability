@@ -3958,7 +3958,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             case MergeOutputState.Absent:
                 // Never committed (or gone since): the sources are the only copy, free to merge.
                 _undecidedMergeOutputs.TryRemove(output, out _);
-                File.Delete(manifest);
+                _deleteMergeManifest(manifest);
                 _outputsWithKeptManifest.TryRemove(output, out _);
                 ForgetMergeOutputWarnings(output);
                 return;
@@ -3995,7 +3995,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         _outputsWithKeptManifest.TryAdd(output, 0);
 
         var sources = new List<string>();
-        foreach (var name in File.ReadAllLines(manifest))
+        foreach (var name in _readMergeManifest(manifest))
         {
             // One plain *.seg file name a line, and never the output's, is all a merge writes here.
             // Anything else names nothing this sweep may unlink: a blank line, parked, would retry
@@ -4085,7 +4085,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]);
         if (!anyLeft)
         {
-            File.Delete(manifest);
+            _deleteMergeManifest(manifest);
             _outputsWithKeptManifest.TryRemove(output, out _);
             ForgetMergeOutputWarnings(output);
             _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(output));
@@ -4141,7 +4141,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             return MergeOutputState.Whole;
         try
         {
-            proved = ProveWholeMergeOutput(output);
+            proved = _proveMergeOutput(output);
             return MergeOutputState.Whole;
         }
         catch (Exception ex) when (FileBounds.DescribesContent(ex))
@@ -4168,7 +4168,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <summary>Whether every source <paramref name="manifest"/> lists is still on disk (see <see cref="IsListedSourceName"/>).</summary>
     private bool EveryListedSourceOnDisk(string manifest, string output)
     {
-        foreach (var name in File.ReadAllLines(manifest))
+        foreach (var name in _readMergeManifest(manifest))
         {
             if (!IsListedSourceName(name)) continue;
             string path = Path.Combine(_segDir, name);
@@ -4188,6 +4188,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <see cref="_outputsWithKeptManifest"/>.
     /// </summary>
     private readonly ConcurrentDictionary<string, (long Min, long Max)> _undecidedMergeOutputs = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Reads a merge manifest for the recovery sweep: File.ReadAllLines, except in a test that swaps
+    /// in the refusal of a holder that shares nothing, which only Windows' share modes produce on
+    /// disk. With <see cref="_deleteMergeManifest"/> and <see cref="_proveMergeOutput"/>, it lets
+    /// the roads a holder opens run on every platform. Costs production one field read.
+    /// </summary>
+    internal Func<string, string[]> _readMergeManifest = File.ReadAllLines;
+
+    /// <summary>Deletes a merge manifest the recovery sweep is done with: File.Delete, or a test's refusal.</summary>
+    internal Action<string> _deleteMergeManifest = File.Delete;
+
+    /// <summary>
+    /// Proves an unserved merge output whole for the recovery sweep (<see cref="ProveWholeMergeOutput"/>),
+    /// or, in a test, refuses as a holder that shares nothing does: the road to a verdict that waits.
+    /// </summary>
+    internal Func<string, SegmentInfo> _proveMergeOutput = ProveWholeMergeOutput;
 
     /// <summary>
     /// The verdict on an output no sweep could read waits for one that can. Until then, the output
@@ -4233,7 +4250,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         try
         {
             int listed = 0, missing = 0;
-            foreach (var name in File.ReadAllLines(manifest))
+            foreach (var name in _readMergeManifest(manifest))
             {
                 if (!IsListedSourceName(name)) continue;
                 string path = Path.Combine(_segDir, name);
@@ -4320,7 +4337,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
 
         int listed = 0, missing = 0;
-        foreach (var name in File.ReadAllLines(manifest))
+        foreach (var name in _readMergeManifest(manifest))
         {
             if (!IsListedSourceName(name)) continue;
             string path = Path.Combine(_segDir, name);
@@ -4350,7 +4367,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 _logger.LogDebug(ex, "Merge recovery: the torn output {File} still cannot be moved aside", Path.GetFileName(output));
             return;
         }
-        File.Delete(manifest);
+        _deleteMergeManifest(manifest);
         _outputsWithKeptManifest.TryRemove(output, out _);
         ForgetMergeOutputWarnings(output);
     }
