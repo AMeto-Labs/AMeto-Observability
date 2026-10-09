@@ -393,6 +393,39 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         ledger.AssertEveryBufferCameBackOnce(minRents: compressed ? 2 : 1);
     }
 
+    /// <summary>
+    /// A WAIT FOR THE INFLATE GATE THAT RUNS OUT OF MEMORY IS UNAVAILABLE (#126 review NEW-4). The
+    /// wait sat in a try with only a finally: the OutOfMemoryException left the handler before a
+    /// status was written, hosting answered 500, the client read UNKNOWN, and the Collector does not
+    /// retry that. With the gate's only slot held and its wait failing, a gzip metrics frame now gets
+    /// UNAVAILABLE with the out-of-memory message; no slot is taken and every buffer comes back.
+    /// </summary>
+    [Fact]
+    public async Task A_grpc_wait_for_the_inflate_gate_that_runs_out_of_memory_is_UNAVAILABLE()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));                        // the only slot, held
+        gate.WaitForTest = static (_, _) => throw new OutOfMemoryException("injected: the wait's timer");
+        var call = GrpcCall(Frame(OtlpGzipTests.Gzip([0x0A, 0x00]), compressed: true));
+        int decoded = 0;
+
+        using (var ledger = IngestBufferPoolLedger.Open())
+        {
+            await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, NoLog, NoMemoryLog,
+                (_, _) => { decoded++; return (true, 0, null); });
+
+            Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
+            Assert.Equal(OtlpGrpcEndpointMapper.IngestMemoryShortMessage, call.Response.Headers["grpc-message"].ToString());
+            Assert.Equal(0, decoded);
+            Assert.Equal(0, gate.Available);                                   // the holder's, untouched
+            ledger.AssertEveryBufferCameBackOnce(minRents: 1);                 // the framed body
+        }
+
+        gate.WaitForTest = null;
+        gate.Exit();
+        Assert.Equal(1, gate.Available);
+    }
+
     [Fact]
     public async Task A_grpc_body_read_that_runs_out_of_memory_is_UNAVAILABLE()
     {

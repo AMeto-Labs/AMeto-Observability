@@ -230,7 +230,21 @@ public static class OtlpGrpcEndpointMapper
             // it any more, and always BEFORE a response is written (see ReleaseInflate).
             if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
             {
-                if (!await inflateGate.TryEnterAsync(ctx.RequestAborted))
+                bool entered;
+                try
+                {
+                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted);
+                }
+                catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                {
+                    // The wait itself ran out — its timer, the doorbell's queue node (#126 review
+                    // NEW-4): the server's failure, answered as the read's is, UNAVAILABLE. It used to
+                    // leave the handler, which hosting answered 500 and a client reads as UNKNOWN,
+                    // never retried. No slot was taken; the body goes back in the finally below.
+                    await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+                    return;
+                }
+                if (!entered)
                 {
                     await FinishAsync(ctx, StatusUnavailable, GateFullMessage);
                     return;
