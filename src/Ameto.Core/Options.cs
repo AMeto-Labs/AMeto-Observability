@@ -127,9 +127,12 @@ public sealed class IngestionOptions
     /// <summary>
     /// The most one OTLP METRICS batch may decode to, in data points. The batch is weighed before a
     /// point is built, by a walk that allocates nothing: <see cref="DecodedMetricPointBytes"/> a data
-    /// point, and a histogram point's arrays at what they decode to — 24 B a bucket count, 16 B a
-    /// bound, 160 B an exemplar. A batch weighing more than this many points is refused 413 (gRPC:
-    /// RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested (#126 review F2, NEW-1).
+    /// point, and a histogram point's arrays at the most they can decode to — 24 B a bucket count,
+    /// 16 B a bound, 160 B an exemplar. An ordinary histogram decodes to a third or a quarter of its
+    /// weight (its points share their bounds, and the parser reuses its scratch), so a store of wide
+    /// histograms sent in large batches may need this raised. A batch weighing more than this many
+    /// points is refused 413 (gRPC: RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested
+    /// (#126 review F2, NEW-1).
     ///
     /// <para>Why a weight and not just <see cref="MaxOtlpBatchBytes"/>: a metric data point can be two
     /// bytes on the wire and ~125 decoded (~200 from JSON) — measured, 62–67× — and a histogram's
