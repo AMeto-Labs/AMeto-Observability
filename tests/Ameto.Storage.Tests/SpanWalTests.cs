@@ -256,7 +256,8 @@ public sealed class SpanWalTests : IDisposable
     [Fact]
     public void A_real_batch_still_writes_a_segment_and_clears_the_log()
     {
-        var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance,   // a due check writes 500 spans at once
+                                            options: new Ameto.Core.TracesOptions { HotTierFlushAge = TimeSpan.Zero });
 
         for (int i = 0; i < 600; i++)                       // over MinSegmentSpans (500)
             engine.WriteSpan(Item(i, 1_784_800_000_000_000_000L + i * 1_000L));

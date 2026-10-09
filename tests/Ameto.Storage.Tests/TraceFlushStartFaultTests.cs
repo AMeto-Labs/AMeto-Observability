@@ -55,8 +55,9 @@ public sealed class TraceFlushStartFaultTests : IDisposable
     {
         string dir = Path.Combine(_root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
+        // The due check is what these facts drive, so it flushes as soon as the tier holds 500 spans.
         var e = new TraceStorageEngine(dir, logger ?? NullLogger<TraceStorageEngine>.Instance,
-                                       false, true, options, pools);
+                                       false, true, options ?? new TracesOptions { HotTierFlushAge = TimeSpan.Zero }, pools);
         _engines.Add(e);
         return e;
     }

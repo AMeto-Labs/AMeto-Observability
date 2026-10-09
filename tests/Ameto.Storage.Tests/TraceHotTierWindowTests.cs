@@ -62,7 +62,8 @@ public sealed class TraceHotTierWindowTests : IDisposable
     {
         string dir = sub is null ? _dir : Path.Combine(_dir, sub);
         Directory.CreateDirectory(dir);
-        return new(dir, NullLogger<TraceStorageEngine>.Instance);
+        // The due check is how these facts start a flush: it writes a tier of 500 spans at once.
+        return new(dir, NullLogger<TraceStorageEngine>.Instance, options: new Ameto.Core.TracesOptions { HotTierFlushAge = TimeSpan.Zero });
     }
 
     // ── The filters each state is paged under ───────────────────────────────────

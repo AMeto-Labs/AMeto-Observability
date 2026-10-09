@@ -51,6 +51,11 @@ Ameto:
     # unrecognised value falls back to Idle rather than failing the start.
     IndexBackfill: Idle
     #
+    # How long the hot tier accumulates before the periodic check writes it as a segment (once it
+    # holds 500 spans). The byte budget, the 50 000-span cap and the one-hour bound still flush at
+    # once. "00:00:00" = the old cadence: a ~3 000-span segment every 30 s at 100 spans/s.
+    # HotTierFlushAge: "00:05:00"
+    #
     # Cold segments are merged by STREAMING them: a k-way merge that holds a block per source,
     # not every span of every source, so even a 512 MB container merges full flushes (~4 into
     # one segment at its derived 24 MB pass budget). false = the old materialising merge.
