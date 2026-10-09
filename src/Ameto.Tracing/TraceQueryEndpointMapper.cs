@@ -566,9 +566,11 @@ public static class TraceQueryEndpointMapper
     ///   disordered tier (one span in a hundred 30 s ahead, one in fifty 10 s late) the TraceQL page's
     ///   engine call reads 2 032-2 168 of the 49 000 spans, against 31 720-41 960 before, in
     ///   0.39-0.48 ms against 1.8-2.0; a list page reads its window and the late spans that start in
-    ///   it — 39 239 for a window of 38 911, against 49 000. A skew under the second, a skewed
-    ///   producer's run of four or more, and anything past the list's 4 096 still widen their blocks,
-    ///   as before.</para></item>
+    ///   it — page 2 of that stream reads 39 239 spans for the 38 911 in its window, against 49 000. A
+    ///   skew under the second, a skewed producer's run of four or more, and anything past the list's
+    ///   4 096 still widen their blocks, as before. The walk's pooled buffers stay under the
+    ///   large-object threshold at any number of outliers: the blocks' at 24 bytes and the tier's block
+    ///   count, the window's outliers apart at 16 bytes each, 64 KB at a list's cap.</para></item>
     /// </list>
     /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
     /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is
