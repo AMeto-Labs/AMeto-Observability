@@ -758,7 +758,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     // blocks and the trace index, four index structures and a .stats sidecar — that is a
     // price worth paying for a real batch and pure waste for five spans. Below the
     // minimum the hot tier simply keeps accumulating; the hard age bound still lands a
-    // trickle on disk so it becomes eligible for compaction and retention.
+    // trickle on disk so it becomes eligible for compaction and retention. A minimum in
+    // spans alone was not enough: 500 spans is five seconds of a modest install, so the
+    // periodic check also waits for the tier to be _hotFlushAge old — see FlushIfDue.
     private const int MinSegmentSpans = 500;
     private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
 
@@ -817,6 +819,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         _mergeBudgetBytes   = options.MergeBudgetBytesFor(budgets);
         _streamingCompaction = options.StreamingCompaction;
         _compactionMinAge    = options.EffectiveCompactionMinAge;
+        _hotFlushAge         = options.EffectiveHotTierFlushAge;
 
         _segmentVersion = writeSegmentFormatV4 ? SpanWriter.NewestVersion : SpanWriter.DefaultVersion;
         _indexEnabled   = indexEnabled;
@@ -2523,22 +2526,40 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>
     /// Flushes only when the hot tier has earned a segment: enough spans to be worth the
-    /// index build and compression, or old enough that it should become compactable and
-    /// retention-eligible regardless. Called on <see cref="Ingestion.SpanDrainer"/>'s tick;
-    /// spans that do not meet either bar stay in memory, durable through the WAL.
+    /// index build and compression AND old enough (<see cref="_hotFlushAge"/>), or old enough
+    /// that it should become compactable and retention-eligible whatever its size
+    /// (<see cref="MaxHotAge"/>). Called on <see cref="Ingestion.SpanDrainer"/>'s tick; spans that
+    /// do not meet either bar stay in memory, durable through the WAL. A tier that reaches its
+    /// byte budget or the span cap is flushed by the write path, without waiting for this.
+    ///
+    /// <para><b>THE AGE BAR IS WHAT KEEPS A SEGMENT A SEGMENT.</b> This used to flush any tier of
+    /// <see cref="MinSegmentSpans"/> on every 30-second tick, so at a hundred spans a second —
+    /// a modest production install — the tier never came near its budget: it wrote a ~3 000-span
+    /// segment every 30 s, 120 an hour, each with its sort, LZ4-HC, four sidecars, an index run
+    /// and an fsync, and every one of them a file the cold walks, the index and compaction then
+    /// had to handle. Five minutes of the same traffic is one segment of ~30 000 spans.</para>
     /// </summary>
     internal void FlushIfDue()
     {
         _lock.EnterWriteLock();
         try
         {
-            if (_hotSpans.Count == 0) return;
-            bool due = _hotSpans.Count >= MinSegmentSpans
-                    || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
+            if (_hotSpans.Count == 0 || _hotSince is not { } since) return;
+            var  age = FlushClockNow() - since;
+            bool due = (_hotSpans.Count >= MinSegmentSpans && age >= _hotFlushAge)
+                    || age >= MaxHotAge;
             if (due) TryStartFlushLocked();
         }
         finally { _lock.ExitWriteLock(); }
     }
+
+    /// <summary>How old the hot tier must be before a due check writes it (<see cref="TracesOptions.HotTierFlushAge"/>).</summary>
+    private readonly TimeSpan _hotFlushAge;
+
+    /// <summary>Test seam: the clock <see cref="FlushIfDue"/> measures the tier's age against. Null: the wall clock.</summary>
+    internal Func<DateTime>? _flushClockForTest;
+
+    private DateTime FlushClockNow() => _flushClockForTest?.Invoke() ?? DateTime.UtcNow;
 
     /// <summary>
     /// Detaches the hot tier for a flush: the snapshot goes to the writer, a fresh list

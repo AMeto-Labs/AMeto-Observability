@@ -579,6 +579,27 @@ public sealed class TracesOptions
     /// </summary>
     public TimeSpan? CompactionMinAge { get; init; }
 
+    /// <summary>
+    /// How long the trace hot tier accumulates before the periodic check writes it to a segment.
+    /// Unset: <see cref="DefaultHotTierFlushAge"/>; <c>00:00:00</c> is the old cadence — any tier
+    /// of 500 spans or more on every 30-second check. The tier is still written as soon as it
+    /// reaches <see cref="HotTierMaxBytes"/> or 50 000 spans, and at one hour whatever its size;
+    /// every span in it is durable in <c>spans.wal</c> and queryable meanwhile.
+    ///
+    /// <para><b>WHY.</b> At a hundred spans a second the old cadence wrote a ~3 000-span segment
+    /// every 30 seconds — 120 an hour — and the tier never came near its budget. Each segment is a
+    /// sort, an LZ4-HC pass, four sidecars, an index run and an fsync, and one more file for every
+    /// wide query, the index and compaction. Five minutes is ~30 000 spans of the same traffic.</para>
+    /// </summary>
+    public TimeSpan? HotTierFlushAge { get; init; }
+
+    /// <summary>What <see cref="HotTierFlushAge"/> is when nothing is configured: five minutes.</summary>
+    public static readonly TimeSpan DefaultHotTierFlushAge = TimeSpan.FromMinutes(5);
+
+    /// <inheritdoc cref="HotTierFlushAge"/>
+    public TimeSpan EffectiveHotTierFlushAge =>
+        HotTierFlushAge is { } age && age >= TimeSpan.Zero ? age : DefaultHotTierFlushAge;
+
     /// <summary>What <see cref="CompactionMinAge"/> is when nothing is configured: one hour.</summary>
     public static readonly TimeSpan DefaultCompactionMinAge = TimeSpan.FromHours(1);
 

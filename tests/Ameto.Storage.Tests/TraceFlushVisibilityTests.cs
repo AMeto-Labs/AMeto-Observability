@@ -26,7 +26,8 @@ public sealed class TraceFlushVisibilityTests : IDisposable
     public TraceFlushVisibilityTests()
     {
         Directory.CreateDirectory(_dir);
-        _engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        _engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance,   // the due check flushes at once
+                                         options: new Ameto.Core.TracesOptions { HotTierFlushAge = TimeSpan.Zero });
 
         long baseNano = Base.ToUnixTimeMilliseconds() * 1_000_000L;
         for (int t = 0; t < Traces; t++)
