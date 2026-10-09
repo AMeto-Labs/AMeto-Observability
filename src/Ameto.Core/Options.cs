@@ -138,20 +138,25 @@ public sealed class IngestionOptions
     /// is answered 503, and the exporter retried it, out of memory every time. Logs and traces are not
     /// weighed: they stream into bounded rings and do not expand like this.</para>
     ///
-    /// <para>Unset: <see cref="DefaultMaxOtlpMetricPointsFor"/> — the request-body share of the heap
-    /// (<c>MemoryBudgets.IngestBufferBytes</c>) at <see cref="DecodedMetricPointBytes"/> a point,
-    /// never below <see cref="MinOtlpMetricPoints"/>: ~157 000 on a 512 MB container, ~1 048 000 where
-    /// the share's 128 MiB cap applies. An explicit value always wins.</para>
+    /// <para>Unset — or 0 or below, which mean the same — <see cref="DefaultMaxOtlpMetricPointsFor"/>:
+    /// the request-body share of the heap (<c>MemoryBudgets.IngestBufferBytes</c>) at
+    /// <see cref="DecodedMetricPointBytes"/> a point: ~157 000 on a 512 MB container, ~1 048 000 where
+    /// the share's 128 MiB cap applies, and never below 131 040, because the share is itself floored
+    /// at 16 MiB − 4 KiB (#126 review NEW-7). A positive value always wins, below that or above.</para>
     /// </summary>
     public int? MaxOtlpMetricPoints { get; init; }
 
     /// <summary>What one decoded metric data point costs, about: an item and its list slot (measured 125 B from protobuf).</summary>
     public const int DecodedMetricPointBytes = 128;
 
-    /// <summary>The floor of the derived limit: eight OpenTelemetry Collector batches at their default size.</summary>
+    /// <summary>
+    /// The floor of the derived limit: eight OpenTelemetry Collector batches at their default size. It
+    /// never binds on a host (#126 review NEW-7): the request-body share is floored at 16 MiB − 4 KiB,
+    /// so the derived limit is at least 131 040. It holds only for budgets that were never derived.
+    /// </summary>
     public const int MinOtlpMetricPoints = 65_536;
 
-    /// <summary>The configured point limit, or the default rule applied to this host when unset.</summary>
+    /// <summary>The configured point limit when it is positive, or the default rule applied to this host.</summary>
     public int EffectiveMaxOtlpMetricPoints =>
         MaxOtlpMetricPoints is > 0 and int explicitPoints ? explicitPoints : DefaultMaxOtlpMetricPointsFor(MemoryBudgets.Current());
 

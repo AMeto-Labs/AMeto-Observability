@@ -130,6 +130,37 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Equal(4, OtlpMetricPointBudget.CountJson(json));
     }
 
+    // ── The limit ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The default limit is the request-body share over 128 B, and never below 131 040: the share is
+    /// floored at 16 MiB − 4 KiB, so the rule's own floor of 65 536 never binds (#126 review NEW-7).
+    /// The heaps are the review's table: 288 MiB, the stand's 384 MiB, 768 MiB, and 3 GiB where the
+    /// share's 128 MiB cap applies.
+    /// </summary>
+    [Theory]
+    [InlineData(288L << 20,  131_040)]
+    [InlineData(384L << 20,  157_286)]
+    [InlineData(768L << 20,  314_572)]
+    [InlineData(3L   << 30, 1_048_576)]
+    public void The_default_limit_is_the_body_share_over_128_bytes_and_its_own_floor_never_binds(long managedHeap, int expected)
+    {
+        int derived = IngestionOptions.DefaultMaxOtlpMetricPointsFor(MemoryBudgets.Derive(managedHeap, managedHeap * 4 / 3));
+        Assert.Equal(expected, derived);
+        Assert.True(derived > IngestionOptions.MinOtlpMetricPoints);
+    }
+
+    /// <summary>0 or below, configured, means the default rule — as unset does (#126 review NEW-7).</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void A_limit_of_zero_or_below_means_the_default_rule(int configured)
+    {
+        Assert.Equal(new IngestionOptions().EffectiveMaxOtlpMetricPoints,
+                     new IngestionOptions { MaxOtlpMetricPoints = configured }.EffectiveMaxOtlpMetricPoints);
+        Assert.Equal(7, new IngestionOptions { MaxOtlpMetricPoints = 7 }.EffectiveMaxOtlpMetricPoints);
+    }
+
     // ── OTLP/HTTP: 413 ────────────────────────────────────────────────────────
 
     [Theory]
