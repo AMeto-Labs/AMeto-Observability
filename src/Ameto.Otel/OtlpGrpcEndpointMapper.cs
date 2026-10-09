@@ -27,8 +27,18 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpGrpcEndpointMapper
 {
-    /// <summary>One string for the one reason logs and traces refuse: TryIngest's bounded ring was full.</summary>
+    /// <summary>Why spans were refused: the trace ingest ring was full.</summary>
     private const string BufferFullReason = "the ingest buffer was full";
+
+    /// <summary>
+    /// Why log records were refused: over the per-event size limit (each leaves a marker event in
+    /// its place), or not written because the store had no room for them within the wait.
+    /// </summary>
+    internal const string LogsRefusedReason =
+        "log records over the per-event size limit, or that the store had no room for within the wait, were refused";
+
+    /// <summary>What UNAVAILABLE says when the log store had no room for any of the batch — retried by every OTLP exporter.</summary>
+    internal const string LogStoreBusyMessage = "the log store is behind and had no room for this batch; retry";
 
     private const string GrpcContentType = "application/grpc";
 
@@ -57,13 +67,11 @@ public static class OtlpGrpcEndpointMapper
         OtlpGzipTooLargeLog tooLargeLog    = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
         OtlpOutOfMemoryLog  outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
+        // Logs decode into a batch that is written — and the call answered — only once its records
+        // are in the store (see HandleCoreAsync), so OK means they survive the death of this process.
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog, static (c, msg) =>
-            {
-                var (_, dropped) = OtlpLogProtoParser.Parse(
-                    msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
-                return (true, dropped, BufferFullReason);
-            }));
+            (HttpContext ctx) => HandleCoreAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog,
+                                                 decode: null, logs: true));
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
@@ -154,13 +162,30 @@ public static class OtlpGrpcEndpointMapper
     /// the protobuf to that signal's own decoder, and answer in trailers. Internal so the
     /// gate's answer can be tested over a plain context — see <c>OtlpInflateGateTests</c>.
     /// </summary>
-    internal static async Task HandleAsync(
+    internal static Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
         OtlpInflateGate inflateGate,
         OtlpGzipTooLargeLog tooLargeLog,
         OtlpOutOfMemoryLog outOfMemoryLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
+        => HandleCoreAsync(ctx, required, inflateGate, tooLargeLog, outOfMemoryLog, decode, logs: false);
+
+    /// <summary>
+    /// <see cref="HandleAsync"/>, and the logs Export: with <paramref name="logs"/> the message is
+    /// decoded into a <see cref="LogIngestBatch"/> (<paramref name="decode"/> unused), the inflate
+    /// buffer and its slot go back, and the batch is then written into the store — waiting for room
+    /// if it must — before the call is answered: OK once its records are in a WAL, UNAVAILABLE when
+    /// the store had no room for any of them, so the retry duplicates nothing.
+    /// </summary>
+    private static async Task HandleCoreAsync(
+        HttpContext ctx,
+        ApiKeyPermissions required,
+        OtlpInflateGate inflateGate,
+        OtlpGzipTooLargeLog tooLargeLog,
+        OtlpOutOfMemoryLog outOfMemoryLog,
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)>? decode,
+        bool logs)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
@@ -218,6 +243,7 @@ public static class OtlpGrpcEndpointMapper
 
         byte[]? inflated = null;
         bool holdsSlot   = false;
+        LogIngestBatch? batch = null;
         try
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
@@ -293,7 +319,16 @@ public static class OtlpGrpcEndpointMapper
             string? why;
             try
             {
-                (ok, rejected, why) = decode(ctx, segment);
+                if (logs)
+                {
+                    batch = ctx.RequestServices.GetRequiredService<IngestionEndpoint>().BeginBatch(payloadSizeHint: segment.Count);
+                    OtlpLogProtoParser.Parse(segment.AsSpan(), batch);
+                    (ok, rejected, why) = (true, 0, null);
+                }
+                else
+                {
+                    (ok, rejected, why) = decode!(ctx, segment);
+                }
             }
             catch (OtlpMetricPointBudget.TooManyPointsException)
             {
@@ -319,6 +354,9 @@ public static class OtlpGrpcEndpointMapper
                 ctx.RequestServices.GetRequiredService<ILoggerFactory>()
                    .CreateLogger("Ameto.Otel.Grpc")
                    .LogWarning(ex, "OTLP/gRPC: failed to decode {Bytes} bytes", segment.Count);
+                // The records decoded before the fault are written, as they always were: OTLP
+                // defines INVALID_ARGUMENT as not retryable, so they would not come again.
+                if (batch is not null) await batch.CommitAsync(ctx.RequestAborted);
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
             }
@@ -339,6 +377,20 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
+            if (batch is not null)
+            {
+                // Logs: answered once the records are in the store — the hot tier and its WAL, or a
+                // spill file. After the inflate slot went back (above), since this may wait for room.
+                var result = await batch.CommitAsync(ctx.RequestAborted);
+                if (result.Busy)
+                {
+                    await FinishAsync(ctx, StatusUnavailable, LogStoreBusyMessage);
+                    return;
+                }
+                rejected = result.Dropped;
+                why      = LogsRefusedReason;
+            }
+
             // Accepted — and it says how much was dropped, and why: each signal's decode lambda
             // supplies its own reason (traces/logs: the ingest buffer was full; metrics: a
             // far-future timestamp), so this no longer reports a clean success — or the wrong
@@ -351,6 +403,7 @@ public static class OtlpGrpcEndpointMapper
         {
             IngestBufferPool.Return(body);
             ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
+            batch?.Dispose();
         }
     }
 

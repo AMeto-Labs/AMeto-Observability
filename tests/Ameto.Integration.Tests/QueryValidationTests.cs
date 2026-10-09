@@ -204,15 +204,15 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
         var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
         foreach (var field in new[]
                  {
-                     "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
-                     "ingestSlabCapacity",
-                     "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
-                     "ingestDroppedNoCommit",
-                     "ingestWriteErrorDrops",
+                     "ingestAcceptedTotal", "ingestDroppedOversized",
+                     // What a request gave up on for want of room, how often one had to wait, an
+                     // event no tier can hold, and a WAL that refused an append.
+                     "ingestNotWritten", "ingestRoomWaits", "ingestRefusedTooLarge", "ingestWalAppendFailures",
+                     // The spill: its backlog on disk, and its traffic (whether ingest is in it, below).
+                     "logsSpillFilesPending", "logsSpillFilesOpened",
+                     "logsSpilledEvents", "logsDespilledEvents",
                      // Request bodies parked by IngestBufferPool, and the budget that caps them.
                      "ingestBufferPooledBytes", "ingestBufferBudgetBytes",
-                     // The payload arena's size and how far into it the buffer has ever reached.
-                     "ingestArenaBytes", "ingestArenaResidentBytes",
                      // Index build: merge rows written without their @x.* terms, and pooled build memory.
                      "indexMalformedExceptionPayloads", "indexBuildPooledBytes",
                      // The decoded-index cache: what it holds, what it may hold, and whether it is
@@ -237,14 +237,13 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
             Assert.True(json.TryGetProperty(field, out var value), $"missing '{field}'");
             Assert.True(value.GetInt64() >= 0, $"'{field}' should be a non-negative counter");
         }
-        Assert.True(json.GetProperty("ingestCapacity").GetInt64() > 0);
 
-        // Saturation is measured against the SLABS, which are what a burst runs out of —
-        // there are fewer of them than ring slots, so a full buffer must not read as idle.
-        Assert.True(json.GetProperty("ingestSlabCapacity").GetInt64() > 0);
-        Assert.True(json.GetProperty("ingestSlabCapacity").GetInt64() <= json.GetProperty("ingestCapacity").GetInt64());
-        Assert.True(json.TryGetProperty("ingestSaturationPercent", out var sat));
-        Assert.True(sat.GetDouble() >= 0);
+        // Whether ingest is spilling right now: a flag, and not on a server nothing is overloading.
+        Assert.False(json.GetProperty("logsSpilling").GetBoolean());
+
+        // The log ingest ring is gone, and so are the figures that described it.
+        foreach (var gone in new[] { "ingestPending", "ingestCapacity", "ingestSlabCapacity", "ingestDroppedNoSlab", "ingestArenaBytes" })
+            Assert.False(json.TryGetProperty(gone, out _), $"'{gone}' describes the removed ingest ring");
     }
 
     // ── The validation endpoint the browser falls back to ─────────────────────

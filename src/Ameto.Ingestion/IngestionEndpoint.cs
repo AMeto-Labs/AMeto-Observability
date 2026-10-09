@@ -10,8 +10,8 @@ namespace Ameto.Ingestion;
 
 /// <summary>
 /// Sink for the zero-alloc OTLP streaming parser: one already-msgpack-encoded record at a
-/// time, straight into the ring. Implemented by <see cref="IngestionEndpoint"/>; abstracted
-/// so the parser can be unit-tested against a capturing fake.
+/// time. Implemented by <see cref="LogIngestBatch"/>; abstracted so the parser can be
+/// unit-tested against a capturing fake.
 /// </summary>
 public interface IOtlpLogSink
 {
@@ -44,61 +44,142 @@ public interface IOtlpLogSink
         int serviceIdx)
         => TryIngestRaw(tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8);
 
+    /// <summary>Called once after a batch has been parsed. A sink that writes as it goes may ignore it.</summary>
     void NotifyBatchEnqueued();
 }
 
 /// <summary>
-/// Handles POST /api/events
+/// The log ingest path: decodes a request into a <see cref="LogIngestBatch"/>, writes the batch
+/// into the store with <see cref="StorageEngine.WriteBatchAsync"/>, and answers once it is there —
+/// in the hot tier and its WAL, or in a spill file. A 200 therefore means the events survive the
+/// death of this process (see <see cref="StorageEngine"/>, "The write path").
 ///
-/// Wire format: MessagePack array of CLEF maps.
-///   [ { "@t": "...", "@mt": "...", "@l": "...", "Prop": value, ... }, ... ]
+/// <para>Handles POST /api/events itself (<see cref="HandleAsync"/>); the OTLP receivers decode
+/// into a batch from <see cref="BeginBatch"/> and commit it the same way.</para>
 ///
-/// Processing:
-///   1. Read body into a buffer from <see cref="IngestBufferPool"/>.
-///   2. Deserialise each CLEF event using <see cref="LogEventSerializer"/>.
-///   3. Intern the message template via <see cref="StringInternPool"/>.
-///   4. Re-serialise the properties-only map and push to <see cref="IngestionRingBuffer"/>.
+/// <para>Wire format of /api/events: MessagePack array of CLEF maps.
+///   [ { "@t": "...", "@mt": "...", "@l": "...", "Prop": value, ... }, ... ]</para>
 ///
-/// Returns (every 200 and 400 is application/json with the counts):
+/// Returns (every 200, 400 and 503 is application/json with the counts):
 ///   200 OK          { "ingested": N, "dropped": M }
 ///   400 Bad Request { "ingested": N, "dropped": M, "failedAtElement": K }
 ///          The body stopped being a CLEF array at element K. The N events before it are
-///          ALREADY INGESTED and stay so. failedAtElement is omitted when the body failed
+///          INGESTED and stay so. failedAtElement is omitted when the body failed
 ///          before any element, at the array header (not an array, or empty).
 ///   400 Bad Request { "ingested": 0, "dropped": 0 }
 ///          The body ended short of its Content-Length on a stream that ends rather than
 ///          throws (see HandleAsync 1b). Kestrel fails that read itself.
 ///   413 Payload Too Large, no body, above <see cref="IngestionOptions.MaxBatchBytes"/>
-///   500 A fault in the server underneath (ring, intern pool, logger, shutdown
-///          mid-batch). It leaves the handler and hosting answers it; see IsMalformedPayload.
+///   503 Service Unavailable, Retry-After { "ingested": 0, "dropped": M }
+///          The store had no room for any of the batch within
+///          <see cref="IngestionOptions.BackPressureWait"/>, or is shutting down. Nothing was
+///          written, so a retry duplicates nothing.
+///   500 A fault in the server underneath (intern pool, logger). It leaves the handler and
+///          hosting answers it; see IsMalformedPayload.
 /// </summary>
-public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBatchSink
+public sealed class IngestionEndpoint
 {
-    private readonly IngestionRingBuffer     _ring;
-    private readonly StringInternPool        _pool;
-    private readonly IngestionDrainer        _drainer;
+    private readonly StorageEngine              _storage;
+    private readonly StringInternPool           _pool;
     private readonly ILogger<IngestionEndpoint> _logger;
 
     /// <summary>Max HTTP body bytes for one CLEF batch — 413 above this. From config.</summary>
     private readonly int _maxBatchBytes;
 
-    /// <summary>Max properties bytes per event — matches the ring slab size. From config.</summary>
+    /// <summary>
+    /// Max properties bytes per event: the configured limit, never above one hot-tier chunk — an
+    /// event larger than that no tier can hold, and it is better refused here, with its marker,
+    /// than counted as a store error.
+    /// </summary>
     private readonly int _maxEventPayloadBytes;
 
+    /// <summary>How long a batch waits for room in the store. From config.</summary>
+    private readonly TimeSpan _backPressureWait;
+
+    /// <summary>The seconds a 503 asks a client to wait before retrying.</summary>
+    internal const string RetryAfterSeconds = "1";
+
     public IngestionEndpoint(
-        IngestionRingBuffer ring,
+        StorageEngine storage,
         StringInternPool pool,
-        IngestionDrainer drainer,
         ServerOptions options,
         ILogger<IngestionEndpoint> logger)
     {
-        _ring    = ring;
-        _pool    = pool;
-        _drainer = drainer;
-        _logger  = logger;
+        _storage  = storage;
+        _pool     = pool;
+        _logger   = logger;
         _maxBatchBytes        = options.Ingestion.MaxBatchBytes;
-        _maxEventPayloadBytes = options.Ingestion.MaxEventPayloadBytes;
+        _maxEventPayloadBytes = (int)Math.Min(options.Ingestion.MaxEventPayloadBytes, HotTierSegment.ChunkPayloadBytes);
+        _backPressureWait     = options.Ingestion.BackPressureWait;
+
+        if (options.Ingestion.RingCapacity is not null || options.Ingestion.PayloadPoolBytes is not null)
+            _logger.LogWarning(
+                "Ingestion.RingCapacity and Ingestion.PayloadPoolBytes no longer have any effect: logs are written " +
+                "straight into the store by the request that carries them, and the ingest ring they sized is gone. " +
+                "Ingestion.BackPressureWait and HotTier.SpillEnabled are what decide what happens when the flush is behind.");
+        if (options.Ingestion.MaxEventPayloadBytes > HotTierSegment.ChunkPayloadBytes)
+            _logger.LogWarning(
+                "Ingestion.MaxEventPayloadBytes {Configured} B is more than one hot-tier chunk holds; events are refused " +
+                "above {Effective} B", options.Ingestion.MaxEventPayloadBytes, _maxEventPayloadBytes);
     }
+
+    /// <summary>The intern pool templates and services are interned into — the store's.</summary>
+    internal StringInternPool Pool => _pool;
+
+    /// <summary>A fresh batch for one request. Dispose it once the request is done with it.</summary>
+    /// <param name="payloadSizeHint">
+    /// The payload bytes the batch is likely to hold — the body's length is a good one — so its
+    /// buffer is rented once at that size rather than doubled up to it. 0: start small and grow.
+    /// </param>
+    public LogIngestBatch BeginBatch(int payloadSizeHint = 0) => new(this, payloadSizeHint);
+
+    // ── Counters (/api/diagnostics) ───────────────────────────────────────────
+
+    private long _acceptedTotal;
+    private long _droppedOversized;
+
+    /// <summary>Events written into the store since start, drop markers included.</summary>
+    public long AcceptedTotal => Interlocked.Read(ref _acceptedTotal);
+
+    /// <summary>Events refused at the door for a properties payload over the per-event limit.</summary>
+    public long DroppedOversized => Interlocked.Read(ref _droppedOversized);
+
+    internal void CountOversizedDrop() => Interlocked.Increment(ref _droppedOversized);
+
+    // ── Commit ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Writes a decoded batch into the store and says what became of it. Called by
+    /// <see cref="LogIngestBatch.CommitAsync"/>.
+    /// </summary>
+    internal async ValueTask<LogIngestResult> CommitAsync(LogIngestBatch batch, CancellationToken ct)
+    {
+        var staged = batch.Staged;
+        if (staged.Count == 0)
+            return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);
+
+        var r = await _storage.WriteBatchAsync(staged, _backPressureWait, ct).ConfigureAwait(false);
+        Interlocked.Add(ref _acceptedTotal, r.Written);
+
+        // Drop markers stand in for events refused at the door: they are written like any other
+        // event, but they are not what the client sent, and the client's counts are of its own.
+        // The batch was processed up to `processed`; what follows was not written.
+        int processed      = r.Written + r.Refused;
+        int markersWritten = batch.MarkersBefore(processed);
+        int markersUnsent  = batch.MarkerCount - markersWritten;
+        int ingested       = r.Written - markersWritten;
+        int dropped        = batch.DroppedAtDoor + r.Refused + (r.NotWritten - markersUnsent);
+
+        if (r.NotWritten > 0)
+            _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
+                r.NotWritten, staged.Count, _backPressureWait);
+
+        // Nothing written for want of room: the caller answers "retry later", which duplicates nothing.
+        bool busy = r.Written == 0 && r.NotWritten > 0;
+        return new LogIngestResult(ingested, dropped, busy);
+    }
+
+    // ── POST /api/events (CLEF) ───────────────────────────────────────────────
 
     public async Task HandleAsync(HttpContext ctx)
     {
@@ -121,9 +202,10 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // Content-Length, and RequestAborted cancels a read. Both used to fire before the try
         // opened, so the rented array was never returned. Every exit below, the 413 included,
         // returns it exactly once: in the finally.
-        byte[] bodyBuf = IngestBufferPool.Rent(
+        byte[]? bodyBuf = IngestBufferPool.Rent(
             contentLength.HasValue ? Math.Max((int)contentLength.Value, 1) : 64 * 1024);
-        int    bodyLen = 0;
+        int     bodyLen = 0;
+        LogIngestBatch? batch = null;
         try
         {
             if (contentLength.HasValue)
@@ -182,67 +264,80 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
                     "Truncated ingestion body: {Received} of {Expected} bytes — batch refused whole",
                     bodyLen, contentLength.Value);
                 // The same counts shape every other /api/events reply has: nothing landed.
-                ctx.Response.StatusCode  = StatusCodes.Status400BadRequest;
-                ctx.Response.ContentType = "application/json";
-                WriteCountsJson(ctx.Response.BodyWriter, ingested: 0, dropped: 0);
-                await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
+                await WriteCountsAsync(ctx, StatusCodes.Status400BadRequest, ingested: 0, dropped: 0);
                 return;
             }
 
-            // ── 2+3. Stream the MessagePack array straight into the ring ──────
-            // No LogEvent per event: the batch reader hands each event over as spans
-            // into bodyBuf, and TryIngestClef copies the property bytes into the ring
-            // slot. A body that is not a CLEF array is rejected before any event is
-            // seen; one that turns malformed part way through answers 400 with the
-            // intact prefix already ingested (see StreamBatch).
+            // ── 2+3. Decode the MessagePack array into the batch ──────────────
+            // No LogEvent per event: the batch reader hands each event over as spans into
+            // bodyBuf, and the batch copies the property bytes it keeps. A body that is not a
+            // CLEF array is rejected before any event is seen; one that turns malformed part way
+            // through answers 400 with the intact prefix written (see StreamBatch).
+            // Sized from the body: a CLEF event's properties are a part of its map, so the decoded
+            // payloads never outgrow the body that carried them, and the batch is one rent.
+            batch = BeginBatch(payloadSizeHint: bodyLen);
             var progress = default(LogEventSerializer.ClefBatchProgress);
+            Exception? malformed = null;
             try
             {
-                LogEventSerializer.StreamBatch(bodyBuf.AsMemory(0, bodyLen), this, ref progress);
+                LogEventSerializer.StreamBatch(bodyBuf.AsMemory(0, bodyLen), batch, ref progress);
             }
             // Classified by WHERE it was thrown, not by its type. This used to be
-            // catch(Exception), which also swallowed failures of the sink underneath — a ring or
-            // intern-pool fault, or the ObjectDisposedException a shutdown mid-batch raises —
-            // and reported them to the client as "malformed payload"; those surface as 500. A
-            // list of reader exception types was tried and was short on day one: a str32/bin32/
-            // ext32 length prefix of 2^31 or more throws OverflowException, and went out as 500.
+            // catch(Exception), which also swallowed failures of the sink underneath — an
+            // intern-pool fault, or the logger — and reported them to the client as "malformed
+            // payload"; those surface as 500. A list of reader exception types was tried and was
+            // short on day one: a str32/bin32/ext32 length prefix of 2^31 or more throws
+            // OverflowException, and went out as 500.
             catch (Exception ex) when (IsMalformedPayload(ex, progress.InSink))
             {
-                // The prefix is already in the ring. Wake the drainer for it, or it sits
-                // there until the drain loop's 1 s missed-signal timeout.
-                if (progress.Ingested > 0)
-                    _drainer.NotifyEnqueued();
+                malformed = ex;
+            }
 
-                // Warning, not Debug, and with the counts: "some of that batch landed and
-                // some of it did not" is an operator's problem, and the element index is
-                // what makes it findable in the sender. ElementIndex -1 is the array header itself
-                // (the reply then omits failedAtElement).
-                _logger.LogWarning(ex,
+            // The body is decoded into the batch: give it back before the write, which may wait.
+            IngestBufferPool.Return(bodyBuf);
+            bodyBuf = null;
+
+            // ── 4. Write, then answer ─────────────────────────────────────────
+            var result = await batch.CommitAsync(ctx.RequestAborted);
+
+            if (malformed is not null)
+            {
+                // Warning, not Debug, and with the counts: "some of that batch landed and some of
+                // it did not" is an operator's problem, and the element index is what makes it
+                // findable in the sender. ElementIndex -1 is the array header itself (the reply
+                // then omits failedAtElement).
+                _logger.LogWarning(malformed,
                     "Malformed ingestion payload at element {ElementIndex} (-1 = the array header) of {ElementCount}: "
                   + "{Ingested} event(s) already ingested, {Dropped} dropped — batch refused",
-                    progress.ElementIndex, progress.ElementCount, progress.Ingested, progress.Dropped);
+                    progress.ElementIndex, progress.ElementCount, result.Ingested, result.Dropped);
 
-                ctx.Response.StatusCode  = StatusCodes.Status400BadRequest;
-                ctx.Response.ContentType = "application/json";
-                WriteCountsJson(ctx.Response.BodyWriter, progress.Ingested, progress.Dropped,
-                                failedAtElement: progress.ElementIndex);
-                await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
+                await WriteCountsAsync(ctx, StatusCodes.Status400BadRequest, result.Ingested, result.Dropped,
+                                       failedAtElement: progress.ElementIndex);
                 return;
             }
 
-            if (progress.Ingested > 0)
-                _drainer.NotifyEnqueued();
+            if (result.Busy)
+            {
+                ctx.Response.Headers.RetryAfter = RetryAfterSeconds;
+                await WriteCountsAsync(ctx, StatusCodes.Status503ServiceUnavailable, result.Ingested, result.Dropped);
+                return;
+            }
 
-            // ── 4. Response ───────────────────────────────────────────────────
-            ctx.Response.StatusCode  = StatusCodes.Status200OK;
-            ctx.Response.ContentType = "application/json";
-            WriteCountsJson(ctx.Response.BodyWriter, progress.Ingested, progress.Dropped);
-            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
+            await WriteCountsAsync(ctx, StatusCodes.Status200OK, result.Ingested, result.Dropped);
         }
         finally
         {
-            IngestBufferPool.Return(bodyBuf);
+            if (bodyBuf is not null) IngestBufferPool.Return(bodyBuf);
+            batch?.Dispose();
         }
+    }
+
+    private static async Task WriteCountsAsync(HttpContext ctx, int status, int ingested, int dropped, int failedAtElement = -1)
+    {
+        ctx.Response.StatusCode  = status;
+        ctx.Response.ContentType = "application/json";
+        WriteCountsJson(ctx.Response.BodyWriter, ingested, dropped, failedAtElement);
+        await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
     }
 
     /// <summary>
@@ -250,8 +345,8 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
     /// by where it happened. <paramref name="inSink"/> is
     /// <see cref="LogEventSerializer.ClefBatchProgress.InSink"/> as the throw left it.
     ///
-    /// <para>Set: the fault came out of <see cref="TryIngestClef"/> — the ring, the intern
-    /// pool, the logger, a shutdown mid-batch — and is the server's, whatever its type.</para>
+    /// <para>Set: the fault came out of the sink — the intern pool, the logger — and is the
+    /// server's, whatever its type.</para>
     ///
     /// <para>Clear: the reader threw while walking the body, and the body is at fault whatever
     /// the TYPE. MessagePackReader throws MessagePackSerializationException for a code it cannot
@@ -301,43 +396,15 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         writer.Advance(pos);
     }
 
-    /// <summary>
-    /// Directly enqueue pre-decoded <see cref="LogEvent"/> objects into the ring buffer.
-    /// Used by the OTLP adapter to bypass HTTP parsing while reusing the same storage path.
-    /// Returns (ingested, dropped) counts.
-    /// </summary>
-    public (int Ingested, int Dropped) IngestEvents(IReadOnlyList<LogEvent> events)
-    {
-        int ingested = 0, dropped = 0;
-        for (int i = 0; i < events.Count; i++)
-            TryIngest(events[i], ref ingested, ref dropped);
-
-        if (ingested > 0)
-            _drainer.NotifyEnqueued();
-
-        return (ingested, dropped);
-    }
+    // ── Staging (called by LogIngestBatch) ────────────────────────────────────
 
     /// <summary>
-    /// Zero-alloc streaming ingest of one already-msgpack-encoded log record straight into
-    /// the ring — no <see cref="LogEvent"/> object. Interns template/service directly from
-    /// UTF-8 spans (no string allocation on a cache hit). Drives the OTLP JSON streaming
-    /// parser. Returns true if ingested, false if dropped (oversized or back-pressure).
-    /// Call <see cref="NotifyBatchEnqueued"/> once after a batch.
+    /// Stages one already-msgpack-encoded record — the OTLP parsers' road. Interns template and
+    /// service straight from UTF-8 (no string allocated on a cache hit). False when the record was
+    /// refused at the door (oversized: logged, and a marker staged in its place).
     /// </summary>
-    public bool TryIngestRaw(
-        long tsTicks, byte level,
-        ReadOnlySpan<byte> templateUtf8,
-        ReadOnlySpan<byte> msgpackProps,
-        ulong traceHi, ulong traceLo, ulong spanId,
-        ReadOnlySpan<byte> serviceUtf8)
-        => TryIngestRaw(tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8, serviceIdx: -1);
-
-    /// <inheritdoc/>
-    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _pool.Intern(serviceUtf8);
-
-    /// <inheritdoc/>
-    public bool TryIngestRaw(
+    internal bool StageRaw(
+        LogIngestBatch batch,
         long tsTicks, byte level,
         ReadOnlySpan<byte> templateUtf8,
         ReadOnlySpan<byte> msgpackProps,
@@ -365,11 +432,11 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
                             : serviceIdx >= 0      ? _pool.Get(serviceIdx)
                             : string.Empty;
-            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
+            CountOversizedDrop();
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 msgpackProps.Length, _maxEventPayloadBytes, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120));
-            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
+            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
             return false; // original counted as dropped by the caller
         }
 
@@ -383,21 +450,17 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // template attaches null — never "", which the tier would prefer over the pool.
         string? tmpl    = canonicalTmpl.Length != 0 ? canonicalTmpl : null;
 
-        return _ring.TryEnqueue(
-            tsTicks, level, tmplIdx, tmpl, exception: null,
-            msgpackProps, traceHi, traceLo, spanId, serviceIdx);
+        batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx);
+        return true;
     }
 
-    /// <summary>Wakes the drainer once after a streaming batch (see <see cref="TryIngestRaw"/>).</summary>
-    public void NotifyBatchEnqueued() => _drainer.NotifyEnqueued();
-
     /// <summary>
-    /// Streaming CLEF ingest — one event straight from the request body into the ring, with
-    /// no <see cref="LogEvent"/> in between. Same duties as <see cref="TryIngest"/>
-    /// (oversized warning + server drop marker, template/service interning, ring enqueue),
-    /// but everything arrives as spans over the pooled body buffer.
+    /// Stages one CLEF event straight from the request body, with no <see cref="LogEvent"/> in
+    /// between: the same duties as <see cref="StageRaw"/> (oversized warning + server drop marker,
+    /// template/service interning), with everything arriving as spans over the pooled body buffer.
     /// </summary>
-    public bool TryIngestClef(
+    internal bool StageClef(
+        LogIngestBatch batch,
         long tsTicks,
         byte level,
         ReadOnlySpan<byte> templateUtf8,
@@ -413,80 +476,26 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
 
-            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
+            CountOversizedDrop();
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 msgpackProps.Length, _maxEventPayloadBytes, svcStr ?? "(none)", Truncate(tmplStr, 120));
-            EnqueueServerDropMarker(
-                tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
+            StageServerDropMarker(
+                batch, tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
                 svcStr is not null ? _pool.Intern(svcStr) : -1);
             return false;
         }
 
         // Intern returns the pool's own instance, so the hot tier shares one string per
-        // template instead of retaining this event's copy (see TryIngest).
+        // template instead of retaining this event's copy (see StageRaw).
         int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical); // -1 when empty
-        string? tmpl     = canonical.Length != 0 ? canonical : null;   // see TryIngestRaw: kept past saturation, never ""
+        string? tmpl     = canonical.Length != 0 ? canonical : null;   // see StageRaw: kept past saturation, never ""
         int svcIdx  = _pool.Intern(serviceUtf8);                     // -1 when empty
 
-        return _ring.TryEnqueue(
-            tsTicks, level, tmplIdx, tmpl, exception,
-            msgpackProps, traceHi, traceLo, spanId, svcIdx);
+        batch.Add(tsTicks, level, tmplIdx, tmpl, exception, msgpackProps, traceHi, traceLo, spanId, svcIdx);
+        return true;
     }
 
-    /// <summary>
-    /// Interns strings and pushes one event onto the ring, tallying ingested/dropped.
-    /// An event whose properties blob exceeds <see cref="_maxEventPayloadBytes"/> is
-    /// rejected up-front WITH a warning (size + reason) — the ring would otherwise drop
-    /// it silently. Ring-full / pool-exhausted back-pressure is still counted as dropped
-    /// but not logged per event, since that path is high-volume under overload.
-    /// </summary>
-    private void TryIngest(LogEvent ev, ref int ingested, ref int dropped)
-    {
-        int payloadLen = ev.RawProperties.Length;
-        if (payloadLen > _maxEventPayloadBytes)
-        {
-            dropped++;
-            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
-            _logger.LogWarning(
-                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
-                payloadLen, _maxEventPayloadBytes, ev.ServiceName ?? "(none)", Truncate(ev.MessageTemplate, 120));
-            // Also record it in the stream as an Error marker so it surfaces on the
-            // Events page, not just in the server log.
-            EnqueueServerDropMarker(
-                ev.Timestamp.UtcTicks, (byte)ev.Level, ev.MessageTemplate ?? string.Empty,
-                payloadLen, ev.TraceIdHi, ev.TraceIdLo, ev.SpanId,
-                ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1);
-            return;
-        }
-
-        // The template that reaches the ring must be the POOL's instance, not this event's
-        // fresh one: the hot tier keeps it alive for the whole life of the tier, so a
-        // per-event duplicate is ~100 B/event of gen2-bound garbage (~60 MB on a 500k-event
-        // tier). Intern returns the canonical string, so the tier shares one per template.
-        int     tmplIdx = -1;
-        string? tmpl    = null;
-        if (!string.IsNullOrEmpty(ev.MessageTemplate))
-        {
-            tmplIdx = _pool.Intern(ev.MessageTemplate, out string canonical);
-            tmpl    = tmplIdx >= 0 ? canonical : ev.MessageTemplate;   // see TryIngestRaw: never ""
-        }
-        int svcIdx  = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
-
-        bool ok = _ring.TryEnqueue(
-            ev.Timestamp.UtcTicks,
-            (byte)ev.Level,
-            tmplIdx,
-            tmpl,
-            ev.Exception,
-            ev.RawProperties.Span,
-            ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
-
-        if (ok) ingested++;
-        else    dropped++;
-    }
-
-    /// <summary>Clamps a template for safe logging (cold path only — the substring alloc is fine).</summary>
     /// <summary>
     /// Serialised template of the server-side oversized-drop marker. The
     /// placeholders match the property keys below so the message renders with the
@@ -496,12 +505,13 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         "Ameto server dropped an oversized log event: properties {EventBodyBytes} B exceed limit {EventBodyLimitBytes} B ({OriginalTemplate})";
 
     /// <summary>
-    /// Enqueues a compact Error event standing in for a dropped oversized one,
+    /// Stages a compact Error event standing in for a dropped oversized one,
     /// preserving its timestamp / trace-span / service. The marker is tiny (the
     /// original template is truncated) so it can never itself be oversized, and it
     /// carries <c>DroppedBy=server</c> to set it apart from the client sink's marker.
     /// </summary>
-    private void EnqueueServerDropMarker(
+    private void StageServerDropMarker(
+        LogIngestBatch batch,
         long tsTicks, byte originalLevel, string originalTemplate,
         int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
     {
@@ -520,10 +530,8 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         w.Flush();
 
         int mtIdx = _pool.Intern(DropMarkerTemplate);
-        bool ok = _ring.TryEnqueue(
-            tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
-            exception: null, buf.WrittenSpan, traceHi, traceLo, spanId, serviceIdx);
-        if (ok) _drainer.NotifyEnqueued();
+        batch.AddMarker(tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
+                        buf.WrittenSpan, traceHi, traceLo, spanId, serviceIdx);
     }
 
     /// <summary>

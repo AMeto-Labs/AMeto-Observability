@@ -35,9 +35,9 @@ namespace Ameto.Core;
 /// a quarter in every container (96 MB instead of 128 MB at 512 MB) and shrank it on a big host
 /// that merely capped its managed heap.</para>
 ///
-/// <para>The trade on a tiny host is deliberate: fewer flush slots mean the ingest ring applies
-/// back-pressure earlier under a burst, so events are dropped at the door with a counted reason
-/// instead of the process being killed with everything in it.</para>
+/// <para>The trade on a tiny host is deliberate: fewer flush slots mean a burst spills to disk
+/// (or, with nowhere to spill, waits and is refused with a retryable 503) earlier, instead of the
+/// process being killed with everything in it.</para>
 /// </summary>
 public readonly struct MemoryBudgets
 {
@@ -82,13 +82,6 @@ public readonly struct MemoryBudgets
     /// ~2 x the largest array, so depth x 16 MB) allowed more than the whole container.</para>
     /// </summary>
     public const long IngestBufferCapBytes = 128L * 1024 * 1024;
-
-    /// <summary>
-    /// The ingest payload arena — <c>Ingestion.PayloadPoolBytes</c>'s default, which was a flat
-    /// 512 MB whatever the host had, and is still the ceiling on both terms of the default rule
-    /// (see <see cref="IngestArenaFraction"/>).
-    /// </summary>
-    public const long IngestArenaCapBytes = 512L * 1024 * 1024;
 
     /// <summary>
     /// The metric hot tier between flushes — <b>exactly today's threshold, restated in bytes</b>:
@@ -149,7 +142,7 @@ public readonly struct MemoryBudgets
     // path alone — 0.30 builds + 0.15 cache + 0.10 parked buffers = 0.55 — and then the metric
     // tier, the trace tier and the trace merge pass were appended beside them at 0.05 + 0.05 +
     // 0.06. Six shares of 0.71 leave a 384 MB heap 0.29 of itself for every query, every ASP.NET
-    // request, the drainer and the slack the GC needs to collect in at all, which is not a heap
+    // request and the slack the GC needs to collect in at all, which is not a heap
     // that can collect. The logs shares are now 0.25 + 0.12 + 0.05 and the six together claim
     // 0.58, leaving 42 % — clear of the 40 % the stand has to keep back.
     //
@@ -188,13 +181,13 @@ public readonly struct MemoryBudgets
     //
     // Native tiers take 25 % of the physical limit; the rest of the process's native memory is
     // the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained build),
-    // the ingest ring, the live hot tier and the WAL mapping — and the managed heap, which sits
-    // inside the same container. In a 512 MB container that is 96 + 46 MB managed and 128 MB
-    // native: 270 MB, 53 % of the container -- not counting the ingest arena, whose default is
-    // floored at 8 192 slabs rather than taken as a share and can reach 512 MB by itself (see
-    // IngestArenaFraction). Native is the largest single share because a frozen tier is bytes
-    // already written that cannot be given back until its cold segment is; the index cache is
-    // smaller because losing it costs latency, not correctness.
+    // the live hot tier and the WAL mappings — and the managed heap, which sits inside the same
+    // container. In a 512 MB container that is 96 + 46 MB managed and 128 MB native: 270 MB, 53 %
+    // of the container. Native is the largest single share because a frozen tier is bytes
+    // already written that cannot be given back until its cold segment is — and since logs stopped
+    // passing through an ingest ring, the frozen tiers ARE the buffer a flush that falls behind
+    // fills, with a spill to disk behind them; the index cache is smaller because losing it costs
+    // latency, not correctness.
 
     /// <summary>Share of the PHYSICAL limit the frozen-tier backlog may hold.</summary>
     public const double NativeTierFraction = 0.25;
@@ -255,13 +248,8 @@ public readonly struct MemoryBudgets
     /// <see cref="IndexCacheNativeCapBytes"/> exists to prevent.</para>
     ///
     /// <para>Twice the derived backstop, it holds the tiers' 25 % and these bits' 10 % to 35 % of
-    /// the physical limit in the worst case. That bounds these two, not the process's native
-    /// memory: the ingest arena is no longer a share beside them. Its default is floored at 8 192
-    /// slabs (see <see cref="IngestArenaFraction"/>), so at the 64 KB default slab its worst case
-    /// is 512 MB, the whole of a 512 MB container on its own: committed on Windows as soon as the
-    /// ring has been that deep, resident on Linux only if those events were near the maximum
-    /// size. It is a clamp and never a floor: it can only lower a scaled ceiling, never cut into
-    /// the backstop a host that configured nothing gets.</para>
+    /// the physical limit in the worst case. It is a clamp and never a floor: it can only lower a
+    /// scaled ceiling, never cut into the backstop a host that configured nothing gets.</para>
     /// </summary>
     public const double IndexCacheNativeMaxFraction = 0.10;
 
@@ -285,45 +273,6 @@ public readonly struct MemoryBudgets
     /// gets the set and nobody has to restate the bucket arithmetic to know it.</para>
     /// </summary>
     public const double IngestBufferFraction = 0.05;
-
-    /// <summary>
-    /// Share of the PHYSICAL limit the ingest payload arena may reserve — native, like the frozen
-    /// tiers, and not under the GC's hard limit. ONE of the two terms of the arena's default, not
-    /// the whole of it.
-    ///
-    /// <para><b>The rule</b> (applied by <c>IngestionOptions.DefaultPayloadPoolBytesFor</c>, which
-    /// knows the slab size this class does not): the default arena is the larger of this share,
-    /// <c>min(512 MB, 15 %)</c>, and a floor of 8 192 slabs of <c>MaxEventPayloadBytes</c> capped
-    /// at <see cref="IngestArenaCapBytes"/>. At the 64 KB default slab the floor is 512 MB, so this
-    /// share only sets the size for a lowered slab size on a host where 15 % is more than 8 192
-    /// slabs.</para>
-    ///
-    /// <para><b>Why the floor overrides the share.</b> The share alone gave a 512 MB container
-    /// ~76 MB, about 1 200 slabs. A pending event holds a slab whatever its size, and an
-    /// OpenTelemetry collector sends 8 192 records a batch by default, so ordinary batches dropped
-    /// part way through for want of slabs. That was a real drop at normal load, traded for a
-    /// theoretical residency bound.</para>
-    ///
-    /// <para><b>The residency trade, honestly, and it differs by platform.</b> What the arena
-    /// takes is never given back, so its high-water mark is a resting level, not a peak.</para>
-    /// <list type="bullet">
-    /// <item><b>Linux</b> pages it lazily, so the cost is per touched page, not per slab: a
-    /// typical 0.3-2 KB event touches one 4 KB page at the start of its 64 KB slab, and 8 192
-    /// slabs of small events rest at about 32 MB. The page stays 4 KB because the arena opts out
-    /// of transparent huge pages (<c>MADV_NOHUGEPAGE</c>); under <c>transparent_hugepage=always</c>
-    /// without that, each 2 MB range the burst touched could be resident whole, most of 512 MB.
-    /// Only events near the maximum size fill their slabs, and that worst case, 512 MB, is the one
-    /// the flat default always had.</item>
-    /// <item><b>Windows</b> commits it in 1 MB chunks up to the deepest slab ever handed out and
-    /// never decommits, whatever the events weigh: one batch that outruns the drainer by ~8 192
-    /// events commits ~512 MB even at 300 B an event. The ~32 MB figure is working set there, not
-    /// commit, and a job object's memory limit counts commit.</item>
-    /// </list>
-    /// <para>A host under a container or job memory limit, on either platform, or one that expects
-    /// large events, sets <c>Ingestion.PayloadPoolBytes</c> explicitly for a hard ceiling, which
-    /// always wins: the Linux ~32 MB is what small events cost, not a bound.</para>
-    /// </summary>
-    public const double IngestArenaFraction = 0.15;
 
     /// <summary>
     /// Share of the MANAGED-HEAP limit the metric hot tier may hold between flushes.
@@ -394,7 +343,6 @@ public readonly struct MemoryBudgets
     /// behind.</para>
     /// </summary>
     private const long MinIngestBufferBytes     = IngestBufferPool.FullBucketSetBytes;
-    private const long MinIngestArenaBytes      = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
 
     /// <summary>
     /// 4 MB is ~62 500 scalar points, and a tier that cannot hold a minute of a small exporter
@@ -407,7 +355,7 @@ public readonly struct MemoryBudgets
 
     private MemoryBudgets(
         long managedLimit, long physicalLimit, long managed, long native, long indexCache,
-        long indexCacheNative, long ingestBuffers, long ingestArena,
+        long indexCacheNative, long ingestBuffers,
         long metricHotTier, long traceHotTier, long traceMerge)
     {
         ManagedLimitBytes     = managedLimit;
@@ -417,7 +365,6 @@ public readonly struct MemoryBudgets
         IndexCacheBytes       = indexCache;
         IndexCacheNativeBytes = indexCacheNative;
         IngestBufferBytes     = ingestBuffers;
-        IngestArenaBytes      = ingestArena;
         MetricHotTierBytes    = metricHotTier;
         TraceHotTierBytes     = traceHotTier;
         TraceMergeBytes       = traceMerge;
@@ -454,19 +401,6 @@ public readonly struct MemoryBudgets
     public long IngestBufferBytes { get; }
 
     /// <summary>
-    /// The byte-share term of the ingest payload arena's default. The arena's actual default also
-    /// has a slab-count floor, applied where the slab size is known:
-    /// <c>IngestionOptions.DefaultPayloadPoolBytesFor</c>. See <see cref="IngestArenaFraction"/>.
-    ///
-    /// <para>This term decides the default only when the slab is smaller than 64 KB. It is at
-    /// most 512 MB, and the floor is 8 192 slabs capped at 512 MB, which is exactly 512 MB from a
-    /// 64 KB slab up; so at the default slab size, or above it, the floor wins on every host and
-    /// this figure is not the arena's size. Below 64 KB it wins only where 15 % of the physical
-    /// limit exceeds 8 192 slabs.</para>
-    /// </summary>
-    public long IngestArenaBytes { get; }
-
-    /// <summary>
     /// Ceiling on the metric hot tier between flushes — the budget
     /// <c>MetricsOptions.EffectiveHotTierBytes</c> spends. See
     /// <see cref="MetricHotTierFraction"/>.
@@ -495,9 +429,7 @@ public readonly struct MemoryBudgets
     /// with this one on every host that exists. It was one fraction change away from not, on a
     /// line whose reader is an operator asking why this install behaves unlike the last one.</para>
     ///
-    /// <para>The ingest buffer pool and the payload arena are deliberately still absent: the
-    /// arena's default is not this struct's figure at all (a slab-count floor usually decides
-    /// it — see <see cref="IngestArenaFraction"/>), and the pool bounds what is PARKED rather
+    /// <para>The ingest buffer pool is deliberately still absent: it bounds what is PARKED rather
     /// than any ceiling a flush runs into.</para>
     /// </summary>
     public bool IsConstrained =>
@@ -534,7 +466,6 @@ public readonly struct MemoryBudgets
             Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
             Share(physicalBase, IndexCacheNativeFraction, IndexCacheNativeCapBytes, MinIndexCacheNativeBytes),
             Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes),
-            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes),
             Share(managedBase,  MetricHotTierFraction, MetricHotTierCapBytes, MinMetricHotTierBytes),
             Share(managedBase,  TraceHotTierFraction,  TraceHotTierCapBytes,  MinTraceHotTierBytes),
             Share(managedBase,  TraceMergeFraction,    TraceMergeCapBytes,    MinTraceMergeBytes));

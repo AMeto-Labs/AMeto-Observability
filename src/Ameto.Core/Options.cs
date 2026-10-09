@@ -57,6 +57,25 @@ public sealed class HotTierOptions
     /// Tune down on memory-constrained hosts, up on many-core hosts chasing throughput.
     /// </summary>
     public int FlushConcurrency { get; init; } = 0;
+
+    /// <summary>
+    /// What ingest does when the hot tier is full and the frozen-tier budget has no room for
+    /// another tier — the flush is behind. True (the default): SPILL. Events go on being
+    /// acknowledged, into a WAL file of their own under <c>wal/</c> (<c>*.spill</c>) that holds
+    /// one tier's worth, and are written into segments once a flush slot is free again. They are
+    /// durable from the moment they are acknowledged, like every other event, but not searchable
+    /// until then. False: ingest waits for room (<see cref="IngestionOptions.BackPressureWait"/>)
+    /// and then answers 503, and the backlog stays in the clients.
+    /// </summary>
+    public bool SpillEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Free space a spill leaves on the volume holding the data directory. A spill file is opened
+    /// only while more than this plus one tier is free; below it ingest waits and then answers
+    /// 503, as with <see cref="SpillEnabled"/> off, so a long overload fills the disk no further
+    /// than this. Default: 1 GiB.
+    /// </summary>
+    public long SpillMinFreeDiskBytes { get; init; } = 1L * 1024 * 1024 * 1024;
 }
 
 /// <summary>
@@ -110,9 +129,10 @@ public sealed class IngestionOptions
     public int MaxBatchBytes { get; init; } = 4 * 1024 * 1024;
 
     /// <summary>
-    /// Max msgpack properties bytes for a single event — also the ring-buffer slab size.
-    /// An event whose serialised properties exceed this is dropped (logged with its size),
-    /// while the rest of the batch still ingests. Default: 64 KB.
+    /// Max msgpack properties bytes for a single event. An event whose serialised properties
+    /// exceed this is dropped (logged with its size, and an Error marker event left in its place),
+    /// while the rest of the batch still ingests. Never more than one hot-tier chunk holds (8 MB),
+    /// whatever is configured. Default: 64 KB.
     /// </summary>
     public int MaxEventPayloadBytes { get; init; } = 64 * 1024;
 
@@ -139,7 +159,7 @@ public sealed class IngestionOptions
     /// bucket count one byte and 24, so a batch inside the byte limit could decode to ~500 MiB, past a
     /// 512 MB container's whole 384 MiB heap. Its own decode then ran out of memory, which since #125
     /// is answered 503, and the exporter retried it, out of memory every time. Logs and traces are not
-    /// weighed: they stream into bounded rings and do not expand like this.</para>
+    /// weighed: they decode to about their own size and do not expand like this.</para>
     ///
     /// <para>Unset — or 0 or below, which mean the same — <see cref="DefaultMaxOtlpMetricPointsFor"/>:
     /// the request-body share of the heap (<c>MemoryBudgets.IngestBufferBytes</c>) at
@@ -168,91 +188,33 @@ public sealed class IngestionOptions
         (int)Math.Clamp(budgets.IngestBufferBytes / DecodedMetricPointBytes, MinOtlpMetricPoints, int.MaxValue);
 
     /// <summary>
-    /// Ring-buffer sequencing slots between the HTTP ingest endpoints and the storage
-    /// drainer. Rounded up to a power of two. This is the absorption window for hot-tier
-    /// flush stalls: at 100k events/s, 65536 slots ≈ 650 ms of headroom before events
-    /// drop. Slot memory is ~64 B each (payload slabs are pooled separately and do NOT
-    /// scale with this), so the default costs ~4 MB. Default: 65536.
+    /// How long a log ingest request waits for room in the store before it gives up on what it has
+    /// not written. A request is answered only once its events are in the hot tier and its WAL (or a
+    /// spilled block's WAL — see <see cref="HotTierOptions.SpillEnabled"/>), so when the store has no
+    /// room the request WAITS rather than having its events dropped on the spot, as the ingest ring
+    /// it replaced did the instant it was full. Past this wait, a request that wrote nothing is
+    /// answered 503 with <c>Retry-After</c> (gRPC: UNAVAILABLE), which every OTLP exporter and the
+    /// Seq clients retry; one that wrote part of its batch reports the rest as dropped. Room comes
+    /// back in milliseconds whenever a tier swap or a spill file is all it takes, so this binds only
+    /// when nothing can take events at all: spilling is off or the disk is at its floor, and every
+    /// flush slot is busy. Default: 2 s — under the 5 s an OpenTelemetry Collector exporter allows a
+    /// request, with room for the rest of it.
     /// </summary>
-    public int RingCapacity { get; init; } = 64 * 1024;
+    public TimeSpan BackPressureWait { get; init; } = TimeSpan.FromSeconds(2);
 
     /// <summary>
-    /// Payload slab arena budget for the ring: slabCount = min(RingCapacity, this /
-    /// MaxEventPayloadBytes). Slabs — not ring slots — are the true drop threshold when
-    /// the drainer stalls: a pending event holds one slab whatever its size.
-    ///
-    /// <para><b>The default, when unset, is the larger of two terms:</b></para>
-    /// <list type="bullet">
-    /// <item>a slab floor — <see cref="DefaultArenaMinSlabs"/> (8 192) slabs of
-    /// <see cref="MaxEventPayloadBytes"/>, capped at <see cref="MemoryBudgets.IngestArenaCapBytes"/>
-    /// (512 MB) so a raised slab size cannot balloon the reservation; and</item>
-    /// <item>the byte share — <c>min(512 MB, 15 % of the physical limit)</c>, see
-    /// <see cref="MemoryBudgets.IngestArenaFraction"/>.</item>
-    /// </list>
-    /// <para>At the 64 KB default slab the floor is exactly 512 MB, so every host, the 512 MB
-    /// container included, gets 8 192 slabs. The floor is there because an OpenTelemetry collector
-    /// sends batches of 8 192 records by default and the parser fills the ring faster than the
-    /// drainer empties it: the byte share alone gave a 512 MB container ~1 200 slabs, so one
-    /// ordinary batch could run out of slabs part way through (HTTP 200 with a non-zero
-    /// <c>dropped</c>, gRPC partial success). The byte share decides the size only when the slab
-    /// is small enough that 8 192 of them come to less than it.</para>
-    ///
-    /// <para><b>What that costs, which depends on the operating system.</b> The arena is reserved
-    /// virtual memory, and what it takes is never given back, so its high-water mark is a resting
-    /// level, not a peak.</para>
-    /// <list type="bullet">
-    /// <item><b>Linux</b>: the allocation is lazily paged, so residency is per touched PAGE, not
-    /// per slab. The arena opts out of transparent huge pages (<c>MADV_NOHUGEPAGE</c>), so that
-    /// page stays 4 KB even where <c>transparent_hugepage</c> is <c>always</c>, as on RHEL; without
-    /// it, the first write in each 2 MB range could make the whole 2 MB resident. A typical
-    /// 0.3-2 KB event touches one 4 KB page at the start of its slab, so a full default batch of
-    /// small events rests at about 32 MB. Only events near the maximum size fill their slabs, which
-    /// is the same 512 MB worst case the flat default always had. (If the opt-out fails, the server
-    /// logs it once at startup.)</item>
-    /// <item><b>Windows</b>: the range is reserved and COMMITTED, in 1 MB chunks, up to the
-    /// deepest slab ever handed out, whatever the events in it weigh, and never decommitted. One
-    /// batch that outruns the drainer by ~8 192 events therefore commits ~512 MB even at 300 B an
-    /// event. The working set still grows only by the pages written, but commit charge is what a
-    /// job object's memory limit counts, and what counts against the system commit limit. <b>Under a
-    /// Windows job or container memory limit, set this explicitly</b> to what that limit can
-    /// carry.</item>
-    /// </list>
-    /// <para>Under a container memory limit, on EITHER platform, set this explicitly for a hard
-    /// ceiling: the ~32 MB on Linux is what small events cost, not a bound, and large events still
-    /// fill their slabs. A host that expects large events, or needs a ceiling below 512 MB, likewise
-    /// sets it, and accepts that a burst then meets back-pressure earlier (counted as
-    /// <c>ingestDroppedNoSlab</c>). <c>/api/diagnostics</c> reports
-    /// <c>ingestArenaResidentBytes</c>: the deepest slab ever handed out times the slab size. On
-    /// Windows that is the commit charge (to within 1 MB); on Linux it is an upper bound on the
-    /// arena's resident memory, not a measurement of it. An explicit value always wins.</para>
+    /// IGNORED. The slot count of the ingest ring logs used to pass through on their way to the
+    /// store; there is no ring any more — a request writes its events itself. Kept so a config file
+    /// that sets it still binds; the server says once at startup that it has no effect.
+    /// </summary>
+    public int? RingCapacity { get; init; }
+
+    /// <summary>
+    /// IGNORED. The payload arena of the ingest ring logs used to pass through; there is no ring any
+    /// more. Kept so a config file that sets it still binds; the server says once at startup that it
+    /// has no effect.
     /// </summary>
     public long? PayloadPoolBytes { get; init; }
-
-    /// <summary>
-    /// Slabs the DEFAULT arena holds at least: one OpenTelemetry collector batch at its default
-    /// size (8 192 records), so an ordinary batch does not run out of slabs before the drainer
-    /// catches up. See <see cref="PayloadPoolBytes"/>.
-    /// </summary>
-    public const int DefaultArenaMinSlabs = 8192;
-
-    /// <summary>The configured arena budget, or the default rule applied to this host when unset.</summary>
-    public long EffectivePayloadPoolBytes =>
-        PayloadPoolBytes ?? DefaultPayloadPoolBytesFor(MemoryBudgets.Current(), MaxEventPayloadBytes);
-
-    /// <summary>
-    /// The default arena rule as a pure function of the host's budgets and the slab size, so it
-    /// can be checked at 512 MB and at 64 GB without a machine of each size — the shape
-    /// <see cref="MemoryBudgets.Derive(long, long)"/> uses. It lives here, not in
-    /// <see cref="MemoryBudgets"/>, because the slab size is an ingestion setting.
-    /// </summary>
-    public static long DefaultPayloadPoolBytesFor(in MemoryBudgets budgets, int maxEventPayloadBytes)
-    {
-        long slabFloor = Math.Min(
-            MemoryBudgets.IngestArenaCapBytes,
-            (long)DefaultArenaMinSlabs * Math.Max(1, maxEventPayloadBytes));
-
-        return Math.Max(slabFloor, budgets.IngestArenaBytes);
-    }
 }
 
 /// <summary>

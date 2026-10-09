@@ -45,6 +45,11 @@ public sealed class StorageEngineShutdownTests : IDisposable
     {
         dir = Path.Combine(_root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
+        return NewEngineAt(dir, logger);
+    }
+
+    private static StorageEngine NewEngineAt(string dir, Microsoft.Extensions.Logging.ILogger<StorageEngine>? logger = null)
+    {
         var opts = new ServerOptions
         {
             DataDirectory = dir,
@@ -208,16 +213,20 @@ public sealed class StorageEngineShutdownTests : IDisposable
     }
 
     /// <summary>
-    /// A write that passed the shutdown gate just before the write path closed has not captured its
-    /// tier yet. Only the tier's Freeze can stop it landing in memory that shutdown is about to free.
-    /// The write parks right after the gate and is released at the last seam before the free, and it
-    /// must be refused there. An engine that does not freeze accepts it into the live tier it then
-    /// frees. The write finishes before that free, so the failure shows as "accepted", not a crash.
+    /// A write that passed the shutdown gate holds the writer lock until it has finished — in the
+    /// tier AND its WAL — and everything that could free or freeze that tier under it (the final
+    /// flush's swap, shutdown's fence) takes that lock first. So shutdown waits the write out, the
+    /// write is accepted, and the event it acknowledged is not lost: it is in the tier the final
+    /// flush writes out, and in that tier's WAL until then.
+    ///
+    /// <para>The write parks right after the gate, holding the lock, and is released only when
+    /// shutdown has to wait for the lock — the seam a teardown that did not take it never reaches,
+    /// which leaves the write parked and fails the first assertion.</para>
     /// </summary>
     [Fact]
-    public async Task A_write_past_the_gate_when_the_write_path_closes_is_refused_by_the_frozen_tier()
+    public async Task A_write_past_the_gate_when_shutdown_starts_is_waited_out_and_kept()
     {
-        var engine = NewEngine();
+        var engine = NewEngine(out string dir);
         Write(engine, 100, LogLevel.Information);   // the final flush has something to do
 
         var parked  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -229,22 +238,25 @@ public sealed class StorageEngineShutdownTests : IDisposable
             parked.TrySetResult();
             release.Task.Wait(HangGuard);
         };
-        var write = Task.Run(() => TryWrite(engine, 100, LogLevel.Information));
-        await parked.Task.WaitAsync(HangGuard);   // past the gate before shutdown starts
-
-        bool finishedBeforeFree = false, acceptedIntoFreedTier = true;
-        engine._beforeTiersFreed = () =>
+        bool waitedForTheWriter = false;
+        engine._onWaitingForWriterLock = () =>
         {
+            waitedForTheWriter = true;
             release.TrySetResult();
-            finishedBeforeFree = write.Wait(HangGuard);
-            if (finishedBeforeFree) acceptedIntoFreedTier = write.Result;
         };
+        var write = Task.Run(() => TryWrite(engine, 100, LogLevel.Information));
+        await parked.Task.WaitAsync(HangGuard);   // past the gate, holding the lock, before shutdown starts
 
         await engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(60));
+        release.TrySetResult();                   // a teardown that never waited leaves it parked
 
-        Assert.True(finishedBeforeFree, "the write parked past the gate did not finish once released");
-        Assert.False(acceptedIntoFreedTier,
-            "a write that passed the gate before the write path closed was accepted into the live tier shutdown then freed");
+        Assert.True(waitedForTheWriter, "shutdown swapped or froze the live tier without waiting for the write holding it");
+        Assert.True(await write.WaitAsync(HangGuard), "the write that passed the gate was refused after it had been let through");
+
+        // Kept: the restarted engine serves all 101 events, the parked one among them.
+        await using var restarted = NewEngineAt(dir);
+        await restarted.CatalogLoaded;
+        Assert.Equal(101, restarted.ListSegments().Sum(static s => s.EventCount) + restarted.LiveHotTier.Count);
     }
 
     /// <summary>

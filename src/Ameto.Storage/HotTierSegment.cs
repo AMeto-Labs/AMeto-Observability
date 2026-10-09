@@ -200,7 +200,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     {
         // Unsynchronised fast reject. Purely an optimisation — a tier that is already
         // frozen or full says so without paying for the claim below, which matters because
-        // every rotation ends with the drainer retrying against a full tier. The
+        // every rotation ends with writers retrying against a full tier. The
         // authoritative check is the one inside the claim.
         if (_frozen || _count >= _maxEvents)
             return false;
@@ -211,7 +211,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         // each other. Without this the flush could freeze the tier and read Count while
         // this call — already past the check above — went on to publish one more event into
         // a tier that is about to be written out, unlisted and freed. TryWrite had returned
-        // true, the drainer had counted the event as stored and dropped it from the ring,
+        // true, the writer had counted the event as stored (then: dropped it from the ring),
         // and queries served it for the length of the flush before it disappeared for good;
         // the WAL copy went with it, since that WAL is deleted when the flush publishes.
         Interlocked.Exchange(ref _writeInProgress, 1);
@@ -559,5 +559,78 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         var arr = ArrayPool<T>.Shared.Rent(ChunkEventCapacity);
         Array.Clear(arr);
         return arr;
+    }
+}
+
+/// <summary>
+/// <see cref="HotTierSegment"/>'s admission rules, replayed on payload sizes alone: which events a
+/// fresh tier of the same limits would take, in this order, before it refused one.
+///
+/// <para>What a spilled block needs (see <c>StorageEngine</c>, "Spill"). Its events go to a WAL and
+/// to no tier, and the WAL is replayed into ONE tier later, flushed into the one level block the
+/// WAL reserved. A WAL holding more than a tier takes would replay into a tier that refuses its
+/// tail, and recovery used to count a refused event as simply not replayed. So the spill admits an
+/// event only when this says a tier would, and a refusal here is where the WAL is closed and the
+/// next one opened.</para>
+///
+/// <para>EXACT, not an estimate, and a copy rather than a shared helper so the tier's write path
+/// stays as it is: <c>HotTierAdmissionTests</c> drives a real tier and this side by side and holds
+/// every answer equal. Monotone in the limits: a sequence a tier of these limits takes whole, a
+/// tier of larger ones takes whole too — the chunk geometry is a constant, and the limits only ever
+/// refuse — which is what lets a replay size its tier from the WAL rather than from today's
+/// configuration.</para>
+/// </summary>
+internal struct HotTierAdmission
+{
+    private readonly int  _maxEvents;
+    private readonly long _maxPayloadBytes;
+    private readonly int  _maxChunks;
+
+    private int  _count;
+    private long _payloadBytes;
+    /// <summary>The highest chunk a tier would have allocated by now; chunk 0 is allocated by its constructor.</summary>
+    private int  _lastChunk;
+    /// <summary>Payload bytes in chunk <see cref="_lastChunk"/>, the only one still taking events.</summary>
+    private long _chunkTail;
+
+    /// <param name="maxEvents">The tier's event limit, as its constructor takes it.</param>
+    /// <param name="maxPayloadBytes">The tier's payload limit, as its constructor takes it.</param>
+    public HotTierAdmission(int maxEvents, long maxPayloadBytes)
+    {
+        _maxEvents       = maxEvents;
+        _maxPayloadBytes = maxPayloadBytes;
+        _maxChunks       = (int)Math.Ceiling((double)maxEvents / HotTierSegment.ChunkEventCapacity) + 1;
+    }
+
+    /// <summary>Events admitted so far.</summary>
+    public readonly int Count => _count;
+
+    /// <summary>Payload bytes admitted so far.</summary>
+    public readonly long PayloadBytes => _payloadBytes;
+
+    /// <summary>
+    /// True, and counted, when a tier would take an event of <paramref name="payloadLength"/>
+    /// bytes next; false, and nothing changes, when it would refuse it.
+    /// </summary>
+    public bool TryAdmit(int payloadLength)
+    {
+        if (_count >= _maxEvents) return false;
+
+        int ci = _count / HotTierSegment.ChunkEventCapacity;
+        if (ci > _lastChunk)
+        {
+            // The tier's lazy allocation: refused on the bytes written so far, or past its chunks.
+            if (_payloadBytes >= _maxPayloadBytes) return false;
+            if (ci >= _maxChunks) return false;
+            _lastChunk = ci;
+            _chunkTail = 0;
+        }
+
+        if (_chunkTail + payloadLength > HotTierSegment.ChunkPayloadBytes) return false;
+
+        _chunkTail    += payloadLength;
+        _payloadBytes += payloadLength;
+        _count++;
+        return true;
     }
 }

@@ -84,10 +84,9 @@ public static class OtlpLogStreamParser
         }
         finally
         {
-            // IN A FINALLY for the reason the protobuf parser states: this parser ingests as
-            // it walks, so a malformed tail throws out of the reader with the prefix already
-            // in the ring. The caller answers 400 and never returns here, leaving those events
-            // to wait out the drain loop's 1 s missed-signal timeout.
+            // IN A FINALLY for the reason the protobuf parser states: this parser hands records
+            // over as it walks, so a malformed tail throws out of the reader with the prefix
+            // already in the sink, and a sink that acts on the notification must hear it then too.
             if (ingested > 0) sink.NotifyBatchEnqueued();
 
             ArrayPool<byte>.Shared.Return(svc.Buf);

@@ -10,14 +10,18 @@ namespace Ameto.Storage;
 /// <summary>
 /// Write-Ahead Log backed by a memory-mapped file.
 ///
-/// Format (v5):
+/// Format (v6):
 ///   [WAL Header   — 32 bytes]
 ///   [Entry 0 …]
 ///     [Entry Header — 26 bytes: payloadLen uint32, timestamp int64, level byte, flags byte,
 ///      templateIndex uint16, exceptionLen uint32, serviceIndex uint16, crc32c uint32]
+///     [Trace context — 24 bytes, only with the Trace flag: traceIdHi uint64, traceIdLo uint64,
+///      spanId uint64]
 ///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
 ///   [Entry 1 …]
 ///   ...
+///
+/// The checksum covers header bytes [0, 22), the trace context, the payload and the exception.
 ///
 /// Flags (byte 13 of the entry header, inside the checksummed range):
 ///   bit 0 — Unpooled: the event's template was outside the template pool (the pool was full,
@@ -30,7 +34,15 @@ namespace Ameto.Storage;
 ///           file, written the first time this WAL logs the index. Without the bit the event has
 ///           no service and serviceIndex is 0 and meaningless: all 65 536 values are real pool
 ///           ids, so the index alone cannot say "none" — the same reason the template has a flag.
+///   bit 2 — Trace (v6): the 24-byte trace context follows the header. An event with no trace id
+///           and no span id is logged without it, so the field costs nothing where it is empty.
 ///   Other bits are reserved and written as zero.
+///
+/// <para>v6 exists because a WAL is no longer only a crash net. A log WAL that replays is how a
+/// spilled block (see <c>StorageEngine</c>, "Spill") reaches its segments in ordinary operation,
+/// and v5 kept no trace context: every replayed event came back with no TraceId and no SpanId,
+/// unlinked from its trace for good. That was a crash's price before; it would have been
+/// every overloaded minute's.</para>
 /// The byte was unwritten padding before the Unpooled flag existed, and the format stayed v4 for
 /// it: the build before never set it, and the engine opens every WAL as a fresh file named after
 /// a newly reserved segment block and extends it with SetLength, which zero-fills. Entries that
@@ -69,9 +81,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // v5: the entry carries the event's service — a 16-bit pool index ahead of the checksum,
     // and the Service flag — so a replayed event gets its @service back (#111). The header
     // grows 24 → 26 bytes; the checksum is still its last field and covers everything before it.
-    // v4 and v3 files remain READABLE in recovery (v3 without checksum validation, neither with
-    // a service); new files are v5.
-    private const ushort WalVersion        = 5;
+    // v6: an entry may carry the event's trace context — TraceIdHi, TraceIdLo, SpanId — in 24
+    // bytes after its header, said by the Trace flag. The header itself is v5's, byte for byte.
+    // v5, v4 and v3 files remain READABLE in recovery (v3 without checksum validation, v3 and v4
+    // without a service, none of them with trace context); new files are v6.
+    private const ushort WalVersion        = 6;
+    private const ushort WalVersionV5      = 5;
     private const ushort WalVersionV4      = 4;
     private const ushort WalVersionV3      = 3;
     private const int    FileHeaderSize    = 32;
@@ -80,10 +95,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private const int    EntryHeaderSizeV3 = 20;
     // Bytes of the entry header covered by the checksum (everything except the crc itself).
     private const int    ChecksummedHeaderBytes = EntryHeaderSize - 4;
+    // The trace context an entry with the Trace flag carries after its header (v6).
+    private const int    TraceContextSize  = 24;
     // WalEntryHeader.Flags (see the class doc): the event's template is outside the pool …
     private const byte   EntryFlagUnpooled = 0x01;
-    // … and the event has a service, named by ServiceIndex (v5).
+    // … the event has a service, named by ServiceIndex (v5) …
     private const byte   EntryFlagService  = 0x02;
+    // … and the entry carries the trace context (v6).
+    private const byte   EntryFlagTrace    = 0x04;
 
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -115,9 +134,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         public uint   Checksum;        // CRC32C over header[0..22) + payload + exception
     }
 
-    /// <summary>The entry layouts recovery reads: this format's and the two before it.</summary>
-    private enum EntryLayout : byte { V3, V4, V5 }
+    /// <summary>The entry layouts recovery reads: this format's and the three before it.</summary>
+    private enum EntryLayout : byte { V3, V4, V5, V6 }
 
+    /// <summary>The fixed header of an entry; a v6 entry's trace context, when it has one, follows it.</summary>
     private static int HeaderSizeOf(EntryLayout layout) => layout switch
     {
         EntryLayout.V3 => EntryHeaderSizeV3,
@@ -196,10 +216,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             if (hdr.Magic != MagicNumber || hdr.Version != WalVersion)
             {
-                // Unknown or older version: live appends need the v5 layout, and pre-v3
+                // Unknown or older version: live appends need the v6 layout, and pre-v3
                 // entries are unreplayable by construction — reinitialise in place.
-                // (Orphaned v4 and v3 files are still replayed by ReadForRecovery, which handles
-                // their strides; this path is a same-name reopen, which recovery precedes.)
+                // (Orphaned v5, v4 and v3 files are still replayed by ReadForRecovery, which
+                // handles their strides; this path is a same-name reopen, which recovery precedes.)
                 hdr.Magic       = MagicNumber;
                 hdr.Version     = WalVersion;
                 hdr.NodeId      = nodeId.Value;
@@ -258,8 +278,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// logs that index. Null or empty writes none; recovery then gives the event no service unless
     /// another of this WAL's events wrote the row.
     /// </param>
+    /// <param name="traceIdHi">The event's trace id, high half. With the other two all zero, no trace context is logged.</param>
+    /// <param name="traceIdLo">The event's trace id, low half.</param>
+    /// <param name="spanId">The event's span id.</param>
     public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload,
-                              ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null)
+                              ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null,
+                              ulong traceIdHi = 0, ulong traceIdLo = 0, ulong spanId = 0)
     {
         // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
         bool   pooled = (uint)templateIndex <= ushort.MaxValue;
@@ -282,7 +306,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             w.Flush();
             excBytes = buf.WrittenSpan;
         }
-        int entrySize = EntryHeaderSize + payload.Length + excBytes.Length;
+        bool hasTrace  = (traceIdHi | traceIdLo | spanId) != 0;
+        int  traceLen  = hasTrace ? TraceContextSize : 0;
+        int  entrySize = EntryHeaderSize + traceLen + payload.Length + excBytes.Length;
 
         lock (_writeLock)
         {
@@ -307,23 +333,35 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             eh.Level           = (byte)level;
             // Written explicitly, set or not, like ServiceIndex below: the bytes under a reset
             // write offset are not guaranteed zero, and the checksum below covers whatever is here.
-            eh.Flags           = (byte)((pooled ? 0 : EntryFlagUnpooled) | (hasService ? EntryFlagService : 0));
+            eh.Flags           = (byte)((pooled ? 0 : EntryFlagUnpooled)
+                                      | (hasService ? EntryFlagService : 0)
+                                      | (hasTrace ? EntryFlagTrace : 0));
             eh.TemplateIndex   = index;
             eh.ExceptionLength = (uint)excBytes.Length;
             eh.ServiceIndex    = svcIndex;
 
-            // Checksum the header bytes (crc field excluded — it is the last 4 bytes)
-            // plus both data spans, BEFORE copying them: same bytes, and the header part
-            // is already in place.
+            byte* trace = dest + EntryHeaderSize;
+            if (hasTrace)
+            {
+                Unsafe.WriteUnaligned(trace,      traceIdHi);
+                Unsafe.WriteUnaligned(trace + 8,  traceIdLo);
+                Unsafe.WriteUnaligned(trace + 16, spanId);
+            }
+
+            // Checksum the header bytes (crc field excluded — it is the last 4 bytes), the trace
+            // context and both data spans, BEFORE copying the spans: same bytes, and the header
+            // and trace parts are already in place.
             uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(dest, ChecksummedHeaderBytes));
+            crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(trace, traceLen));
             crc      = Crc32c.Append(crc, payload);
             crc      = Crc32c.Append(crc, excBytes);
             eh.Checksum = crc;
 
+            byte* body = trace + traceLen;
             if (payload.Length > 0)
-                payload.CopyTo(new Span<byte>(dest + EntryHeaderSize, payload.Length));
+                payload.CopyTo(new Span<byte>(body, payload.Length));
             if (excBytes.Length > 0)
-                excBytes.CopyTo(new Span<byte>(dest + EntryHeaderSize + payload.Length, excBytes.Length));
+                excBytes.CopyTo(new Span<byte>(body + payload.Length, excBytes.Length));
 
             _writeOffset += entrySize;
 
@@ -634,10 +672,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // Iterator bodies cannot touch pointers — this shim reads _ptr outside the iterator.
     private bool TryParseLiveEntry(long pos, long end, out WalEntry? entry, out long entrySize)
-        => TryParseEntry(_ptr, pos, end, EntryLayout.V5, out entry, out entrySize);
+        => TryParseEntry(_ptr, pos, end, EntryLayout.V6, out entry, out entrySize);
 
     /// <summary>
-    /// Parses one entry at <paramref name="pos"/>. Bounds are checked and (v4, v5) the CRC is
+    /// Parses one entry at <paramref name="pos"/>. Bounds are checked and (v4 on) the CRC is
     /// verified over the in-map spans BEFORE anything is allocated, so a garbage length
     /// field cannot OOM and a torn entry cannot materialise. Returns false at the first
     /// entry that does not verify — everything past it is by definition not durable.
@@ -653,10 +691,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         if (pos + headerSize > end) return false;
 
         byte* src = basePtr + FileHeaderSize + pos;
-        // Every layout shares the first 20 bytes; the struct is read past them only for v5.
+        // Every layout shares the first 20 bytes; the struct is read past them only for v5 on.
         ref var eh = ref Unsafe.AsRef<WalEntryHeader>(src);
 
-        long total = (long)headerSize + eh.PayloadLength + eh.ExceptionLength;
+        // Only v6 has the trace context; the bit was reserved, and written as zero, before it.
+        int traceLen = layout == EntryLayout.V6 && (eh.Flags & EntryFlagTrace) != 0 ? TraceContextSize : 0;
+
+        long total = (long)headerSize + traceLen + eh.PayloadLength + eh.ExceptionLength;
         if (pos + total > end)
             return false;
         // Span construction takes int — in a WAL past 2 GiB a garbage length in
@@ -666,16 +707,19 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         if (eh.PayloadLength > int.MaxValue || eh.ExceptionLength > int.MaxValue)
             return false;
 
-        var payloadSpan = new ReadOnlySpan<byte>(src + headerSize, (int)eh.PayloadLength);
-        var excSpan     = new ReadOnlySpan<byte>(src + headerSize + (int)eh.PayloadLength, (int)eh.ExceptionLength);
+        byte* trace     = src + headerSize;
+        var traceSpan   = new ReadOnlySpan<byte>(trace, traceLen);
+        var payloadSpan = new ReadOnlySpan<byte>(trace + traceLen, (int)eh.PayloadLength);
+        var excSpan     = new ReadOnlySpan<byte>(trace + traceLen + (int)eh.PayloadLength, (int)eh.ExceptionLength);
 
-        // v4 and v5 end their header with the checksum, over every header byte before it and both
-        // spans — v5's over the service index too, so a torn or rotted service fails the entry
-        // like any other field. v3 has none.
+        // v4 on end their header with the checksum, over every header byte before it, the trace
+        // context and both spans — v5's over the service index too, v6's over the trace context,
+        // so a torn or rotted field fails the entry like any other. v3 has none.
         if (layout != EntryLayout.V3)
         {
             int  covered = headerSize - 4;
             uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(src, covered));
+            crc      = Crc32c.Append(crc, traceSpan);
             crc      = Crc32c.Append(crc, payloadSpan);
             crc      = Crc32c.Append(crc, excSpan);
             if (crc != Unsafe.ReadUnaligned<uint>(src + covered))
@@ -705,9 +749,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             TemplateIndex  = eh.TemplateIndex,
             // v3 entries predate the flag and their byte 13 was never written: never unpooled.
             Unpooled       = layout != EntryLayout.V3 && (eh.Flags & EntryFlagUnpooled) != 0,
-            // Only v5 has the field. A v4 entry's bytes 20-23 are its checksum and its flag bits
+            // Only v5 on has the field. A v4 entry's bytes 20-23 are its checksum and its flag bits
             // past bit 0 were reserved, so it names no service whatever they hold.
-            ServiceIndex   = layout == EntryLayout.V5 && (eh.Flags & EntryFlagService) != 0 ? eh.ServiceIndex : -1,
+            ServiceIndex   = layout >= EntryLayout.V5 && (eh.Flags & EntryFlagService) != 0 ? eh.ServiceIndex : -1,
+            TraceIdHi      = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace)      : 0,
+            TraceIdLo      = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 8)  : 0,
+            SpanId         = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 16) : 0,
             Payload        = payload,
             Exception      = exception,
         };
@@ -867,12 +914,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             if (fh.Magic != MagicNumber) return (0, []);
             version              = fh.Version;
             headerRecordsEntries = fh.WriteOffset != FileHeaderSize;
-            // v5 = current. v4 = the releases before it: checksummed, no service. v3: replayable,
-            // no per-entry validation possible. Anything else is unreplayable by construction.
+            // v6 = current. v5 = the releases before it: no trace context. v4: checksummed, no
+            // service. v3: replayable, no per-entry validation possible. Anything else is
+            // unreplayable by construction.
             EntryLayout layout;
             switch (fh.Version)
             {
-                case WalVersion:   layout = EntryLayout.V5; break;
+                case WalVersion:   layout = EntryLayout.V6; break;
+                case WalVersionV5: layout = EntryLayout.V5; break;
                 case WalVersionV4: layout = EntryLayout.V4; break;
                 case WalVersionV3: layout = EntryLayout.V3; break;
                 default:           return (fh.SegmentId, []);
@@ -927,6 +976,15 @@ public sealed class WalEntry
     /// file; resolve it through <see cref="ServiceIndexIn"/>, not straight into a live pool.
     /// </summary>
     public int            ServiceIndex   { get; init; } = -1;
+
+    /// <summary>The event's trace id, high half; 0 when it had none or the entry predates format v6.</summary>
+    public ulong          TraceIdHi      { get; init; }
+
+    /// <summary>The event's trace id, low half; 0 when it had none or the entry predates format v6.</summary>
+    public ulong          TraceIdLo      { get; init; }
+
+    /// <summary>The event's span id; 0 when it had none or the entry predates format v6.</summary>
+    public ulong          SpanId         { get; init; }
 
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }

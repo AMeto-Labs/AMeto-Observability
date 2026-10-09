@@ -11,8 +11,8 @@ namespace Ameto.Integration.Tests;
 
 /// <summary>
 /// The catch around StreamBatch decides whose fault a failed batch was. A body the reader
-/// rejects is the client's: 400, with the counts. A throw out of the SINK underneath (the ring,
-/// the intern pool, the logger, or the ObjectDisposedException a shutdown mid-batch raises) is
+/// rejects is the client's: 400, with the counts. A throw out of the SINK underneath (the intern
+/// pool, or the logger) is
 /// the server's. It must leave the handler, so hosting answers 500 and logs it, rather than be
 /// reported to the client as a "malformed payload".
 ///
@@ -22,7 +22,7 @@ namespace Ameto.Integration.Tests;
 ///
 /// <para>The sink fault is a logger that throws on its first call, reached through the
 /// oversized-event path inside TryIngestClef. A logger is the one sink dependency that can be
-/// faulted safely: a disposed ring does not throw, it reads freed native memory.</para>
+/// faulted safely.</para>
 /// </summary>
 public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
 {
@@ -64,9 +64,8 @@ public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
     {
         var sp = _factory.Services;
         return new IngestionEndpoint(
-            sp.GetRequiredService<IngestionRingBuffer>(),
+            sp.GetRequiredService<StorageEngine>(),
             sp.GetRequiredService<StringInternPool>(),
-            sp.GetRequiredService<IngestionDrainer>(),
             sp.GetRequiredService<ServerOptions>(),
             logger);
     }
