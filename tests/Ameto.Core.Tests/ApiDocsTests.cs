@@ -84,7 +84,9 @@ public sealed class ApiDocsTests
                      "indexCacheBudgetBytes", "indexCacheIdleEvicted", "indexCacheNativeBytes",
                      "indexCacheNativeEvicted", "indexCacheStaleReplaced",
                      "indexBuildPooledBytes",
-                     "ingestBufferPooledBytes", "ingestArenaResidentBytes", "logsQuarantinedBytes",
+                     "ingestBufferPooledBytes", "logsQuarantinedBytes",
+                     // The log ingest path's own: what it gave up on, and the spill backlog on disk.
+                     "ingestNotWritten", "logsSpillFilesPending",
                  })
             Assert.Contains(field, doc, StringComparison.Ordinal);
     }

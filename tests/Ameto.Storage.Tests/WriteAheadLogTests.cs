@@ -9,15 +9,16 @@ namespace Ameto.Storage.Tests;
 /// WAL append → recovery round-trip: the exception path (exception bytes are serialised through a
 /// thread-reused scratch buffer, so consecutive appends with different exceptions must not bleed
 /// into each other, and exception-free entries in between must stay exception-free), the service
-/// a v5 entry carries, the checksum's stop at a torn or rotted entry, and the on-disk layout of
-/// every format recovery still reads, pinned byte by byte.
+/// a v5 entry carries, the trace context a v6 entry carries, the checksum's stop at a torn or rotted
+/// entry, and the on-disk layout of every format recovery still reads, pinned byte by byte.
 /// </summary>
 public sealed class WriteAheadLogTests
 {
     // The documented layout (WriteAheadLog's class doc). Spelled out here, not taken from the
     // class, so a change to the format has to change these lines too.
     private const int FileHeader    = 32;
-    private const int EntryHeader   = 26;   // v5
+    private const int EntryHeader   = 26;   // v5 and v6
+    private const int TraceContext  = 24;   // v6, with the Trace flag
     private const int EntryHeaderV4 = 24;
     private const int EntryHeaderV3 = 20;
     private const int WriteOffsetAt = 24;   // the file header's WriteOffset field
@@ -160,13 +161,15 @@ public sealed class WriteAheadLogTests
     // ── The layouts on disk ───────────────────────────────────────────────────
 
     /// <summary>
-    /// What Append writes is, byte for byte, the documented v5 layout: a 32-byte file header saying
-    /// version 5, then per entry payloadLen u32 | ticks i64 | level u8 | flags u8 (bit 0 Unpooled,
-    /// bit 1 Service) | templateIndex u16 | exceptionLen u32 | serviceIndex u16 | crc32c u32 over
-    /// [0, 22) + payload + exception, then the payload.
+    /// What Append writes is, byte for byte, the documented v6 layout: a 32-byte file header saying
+    /// version 6, then per entry payloadLen u32 | ticks i64 | level u8 | flags u8 (bit 0 Unpooled,
+    /// bit 1 Service, bit 2 Trace) | templateIndex u16 | exceptionLen u32 | serviceIndex u16 |
+    /// crc32c u32 over [0, 22) + trace context + payload + exception; with the Trace flag the trace
+    /// context, traceIdHi u64 | traceIdLo u64 | spanId u64, then the payload. An entry with no
+    /// trace context is a v5 entry byte for byte.
     /// </summary>
     [Fact]
-    public void Append_writes_the_documented_v5_layout()
+    public void Append_writes_the_documented_v6_layout()
     {
         string path = NewWalPath();
         try
@@ -175,21 +178,89 @@ public sealed class WriteAheadLogTests
             {
                 wal.Append(1_000, LogLevel.Warning,     5,  "tmpl", [0xA1, 0xA2], serviceIndex: 9, service: "Svc");
                 wal.Append(2_000, LogLevel.Information, -1, "unpooled text", [0xB1]);
+                wal.Append(3_000, LogLevel.Error,       5,  "tmpl", [0xC1], serviceIndex: 9, service: "Svc",
+                           traceIdHi: 0x0102030405060708UL, traceIdLo: 0x1112131415161718UL, spanId: 0x2122232425262728UL);
+                wal.Append(4_000, LogLevel.Debug,       5,  "tmpl", [0xD1], spanId: 7);   // a span id alone is context too
             }
 
             byte[] file = File.ReadAllBytes(path);
             Assert.Equal(0x52_44_57_41u, BinaryPrimitives.ReadUInt32LittleEndian(file));       // "RDWA"
-            Assert.Equal(5, BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(4)));           // v5
+            Assert.Equal(6, BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(4)));           // v6
             Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(file.AsSpan(16)));
 
-            byte[] first  = V5Entry(1_000, LogLevel.Warning,     flags: 0x02, templateIndex: 5, serviceIndex: 9, [0xA1, 0xA2]);
-            byte[] second = V5Entry(2_000, LogLevel.Information, flags: 0x01, templateIndex: 0, serviceIndex: 0, [0xB1]);
-            Assert.Equal(first,  file.AsSpan(FileHeader, first.Length).ToArray());
-            Assert.Equal(second, file.AsSpan(FileHeader + first.Length, second.Length).ToArray());
-            Assert.Equal(FileHeader + first.Length + second.Length,
-                         BinaryPrimitives.ReadInt64LittleEndian(file.AsSpan(WriteOffsetAt)));
+            byte[][] expected =
+            [
+                V5Entry(1_000, LogLevel.Warning,     flags: 0x02, templateIndex: 5, serviceIndex: 9, [0xA1, 0xA2]),
+                V5Entry(2_000, LogLevel.Information, flags: 0x01, templateIndex: 0, serviceIndex: 0, [0xB1]),
+                V6Entry(3_000, LogLevel.Error, flags: 0x06, templateIndex: 5, serviceIndex: 9,
+                        0x0102030405060708UL, 0x1112131415161718UL, 0x2122232425262728UL, [0xC1]),
+                V6Entry(4_000, LogLevel.Debug, flags: 0x04, templateIndex: 5, serviceIndex: 0, 0, 0, 7, [0xD1]),
+            ];
+            int pos = FileHeader;
+            foreach (var e in expected)
+            {
+                Assert.Equal(e, file.AsSpan(pos, e.Length).ToArray());
+                pos += e.Length;
+            }
+            Assert.Equal(pos, BinaryPrimitives.ReadInt64LittleEndian(file.AsSpan(WriteOffsetAt)));
+
+            // And it reads back: the context where there was one, zeros where there was none.
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal([0UL, 0UL, 0x0102030405060708UL, 0UL], entries.Select(e => e.TraceIdHi));
+            Assert.Equal([0UL, 0UL, 0x1112131415161718UL, 0UL], entries.Select(e => e.TraceIdLo));
+            Assert.Equal([0UL, 0UL, 0x2122232425262728UL, 7UL], entries.Select(e => e.SpanId));
+            Assert.Equal([0xC1], entries[2].Payload);
+            Assert.Equal(9, entries[2].ServiceIndex);
         }
         finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// A rotted byte in the trace context fails the entry like any other field: the checksum covers it.
+    /// </summary>
+    [Fact]
+    public void A_rotted_trace_context_stops_replay_at_its_entry()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 1, "t", [1], traceIdHi: 1, traceIdLo: 2, spanId: 3);
+                wal.Append(2_000, LogLevel.Information, 1, "t", [2], traceIdHi: 4, traceIdLo: 5, spanId: 6);
+            }
+            int first = EntryHeader + TraceContext + 1;
+            Corrupt(path, FileHeader + first + EntryHeader + 9);   // inside the second entry's trace id
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            var only = Assert.Single(entries);
+            Assert.Equal((1UL, 2UL, 3UL), (only.TraceIdHi, only.TraceIdLo, only.SpanId));
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// A v5 file, what every release before v6 wrote, still replays: with its services, and with no
+    /// trace context whatever its flag byte says. Bit 2 was reserved in v5, and a v5 entry has no
+    /// bytes for it to name.
+    /// </summary>
+    [Fact]
+    public void A_v5_file_replays_with_services_and_without_trace_context()
+    {
+        string path = NewWalPath();
+        try
+        {
+            WriteFile(path, version: 5,
+                V5Entry(100, LogLevel.Information, flags: 0x02, templateIndex: 1, serviceIndex: 4, [1, 2, 3]),
+                V5Entry(200, LogLevel.Warning,     flags: 0x06, templateIndex: 2, serviceIndex: 5, [4, 5]));   // + a bit v5 never had
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal([100L, 200L], entries.Select(e => e.TimestampTicks));
+            Assert.Equal([4, 5], entries.Select(e => e.ServiceIndex));
+            Assert.All(entries, e => Assert.Equal((0UL, 0UL, 0UL), (e.TraceIdHi, e.TraceIdLo, e.SpanId)));
+            Assert.Equal([4, 5], entries[1].Payload);
+        }
+        finally { File.Delete(path); }
     }
 
     /// <summary>
@@ -267,6 +338,28 @@ public sealed class WriteAheadLogTests
         crc      = Crc32c.Append(crc, payload);
         BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(22), crc);
         payload.CopyTo(e, EntryHeader);
+        return e;
+    }
+
+    private static byte[] V6Entry(long ticks, LogLevel level, byte flags, ushort templateIndex, ushort serviceIndex,
+                                  ulong traceHi, ulong traceLo, ulong spanId, byte[] payload)
+    {
+        var e = new byte[EntryHeader + TraceContext + payload.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(0),  (uint)payload.Length);
+        BinaryPrimitives.WriteInt64LittleEndian (e.AsSpan(4),  ticks);
+        e[12] = (byte)level;
+        e[13] = flags;
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(14), templateIndex);
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(16), 0);                  // no exception
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(20), serviceIndex);
+        BinaryPrimitives.WriteUInt64LittleEndian(e.AsSpan(EntryHeader),      traceHi);
+        BinaryPrimitives.WriteUInt64LittleEndian(e.AsSpan(EntryHeader + 8),  traceLo);
+        BinaryPrimitives.WriteUInt64LittleEndian(e.AsSpan(EntryHeader + 16), spanId);
+        uint crc = Crc32c.Append(0, e.AsSpan(0, 22));
+        crc      = Crc32c.Append(crc, e.AsSpan(EntryHeader, TraceContext));
+        crc      = Crc32c.Append(crc, payload);
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(22), crc);
+        payload.CopyTo(e, EntryHeader + TraceContext);
         return e;
     }
 

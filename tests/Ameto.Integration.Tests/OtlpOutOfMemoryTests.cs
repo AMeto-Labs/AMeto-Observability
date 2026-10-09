@@ -89,9 +89,8 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
                 services.AddSingleton<ISpanSink>(sp =>
                     new FailingSpanSink(this, sp.GetRequiredService<Ameto.Tracing.Ingestion.SpanIngestionEndpoint>()));
                 services.AddSingleton(sp => new IngestionEndpoint(
-                    sp.GetRequiredService<IngestionRingBuffer>(),
+                    sp.GetRequiredService<Ameto.Storage.StorageEngine>(),
                     sp.GetRequiredService<StringInternPool>(),
-                    sp.GetRequiredService<IngestionDrainer>(),
                     sp.GetRequiredService<ServerOptions>(),
                     _sinkLoggers.CreateLogger<IngestionEndpoint>()));
             });

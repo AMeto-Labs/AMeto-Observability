@@ -133,14 +133,12 @@ public static class OtlpLogProtoParser
         }
         finally
         {
-            // IN A FINALLY, because this parser ingests as it walks. A batch that turns
-            // hostile part way through — a value nested past MaxValueDepth, a malformed tail —
-            // throws with its intact prefix ALREADY in the ring, and the caller answers 400 /
-            // INVALID_ARGUMENT without coming back here. Those events would then wait out the
-            // drain loop's 1 s missed-signal timeout, invisible to queries and the live tail.
-            // The CLEF receiver wakes the drainer from inside its malformed-payload catch for
-            // exactly this reason (IngestionEndpoint); ParseState is a ref struct whose counts
-            // survive the unwind at this frame, so the same promise is kept here.
+            // IN A FINALLY, because this parser hands records over as it walks. A batch that
+            // turns hostile part way through — a value nested past MaxValueDepth, a malformed
+            // tail — throws with its intact prefix ALREADY in the sink, and a sink that acts on
+            // the notification must hear it then too. ParseState is a ref struct whose counts
+            // survive the unwind at this frame. (The log receivers' own sink, LogIngestBatch,
+            // writes when it is committed and ignores this.)
             if (st.Ingested > 0) sink.NotifyBatchEnqueued();
         }
 

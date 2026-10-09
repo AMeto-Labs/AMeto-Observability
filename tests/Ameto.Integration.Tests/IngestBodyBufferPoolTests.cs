@@ -97,9 +97,11 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
 
         Assert.Null(thrown);
         Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
-        Assert.Equal(1, ledger.Rents);                     // sized from Content-Length, never grown
+        // Two, neither grown: the body, sized from Content-Length, and the decoded batch's
+        // payloads, sized from the body (a CLEF event's properties are part of its map).
+        Assert.Equal(2, ledger.Rents);
         Assert.True(ledger.LargestRent >= body.Length);
-        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
+        ledger.AssertEveryBufferCameBackOnce(minRents: 2);
     }
 
     [Fact]
@@ -251,9 +253,8 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
     {
         var sp = _factory.Services;
         return new IngestionEndpoint(
-            sp.GetRequiredService<IngestionRingBuffer>(),
+            sp.GetRequiredService<StorageEngine>(),
             sp.GetRequiredService<StringInternPool>(),
-            sp.GetRequiredService<IngestionDrainer>(),
             options ?? sp.GetRequiredService<ServerOptions>(),
             logger ?? NullLogger<IngestionEndpoint>.Instance);
     }

@@ -18,7 +18,7 @@ namespace Ameto.Integration.Tests;
 /// whose service is given as <c>@service</c> or as <c>service.name</c> (the Serilog sink's
 /// spelling) or not at all, and OTLP/JSON records whose resource names it — interned once per
 /// resource block, the road that lost the service outright once #113 stopped keeping a copy of it
-/// in the properties. Every event goes ring → drainer → <see cref="StorageEngine.TryWrite"/> → WAL;
+/// in the properties. Every event goes request → batch → <see cref="StorageEngine.WriteBatchAsync"/> → WAL;
 /// the process is "killed" while the events are still only in the WAL, and the next start replays
 /// it. Each event must then answer an <c>@service</c> filter with its own service, as it would have
 /// had the flush written it.
@@ -62,29 +62,28 @@ public sealed class WalServiceRecoveryTests : IDisposable
         };
 
         var engine = NewEngine(opts);
-        int slab   = opts.Ingestion.MaxEventPayloadBytes;
-        var ring   = new IngestionRingBuffer(1024, slab, 16L * slab);
-        IngestionDrainer? drainer = null;
         try
         {
             int written = 0;
-            var all     = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            engine.EventWritten = (_, _) =>
+            engine.EventWritten = (_, _) => Interlocked.Increment(ref written);
+
+            var endpoint = new IngestionEndpoint(engine, engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+
+            using (var clef = endpoint.BeginBatch())
             {
-                if (Interlocked.Increment(ref written) == expected.Count) all.TrySetResult();
-            };
+                Assert.Equal(4, LogEventSerializer.StreamBatch(ClefBatch(At), clef, out int clefDropped));
+                Assert.Equal(0, clefDropped);
+                Assert.Equal(new LogIngestResult(4, 0, Busy: false), await clef.CommitAsync());
+            }
 
-            drainer      = new IngestionDrainer(ring, engine, opts, NullLogger<IngestionDrainer>.Instance);
-            var endpoint = new IngestionEndpoint(ring, engine.TemplatePool, drainer, opts, NullLogger<IngestionEndpoint>.Instance);
+            using (var otlp = endpoint.BeginBatch())
+            {
+                Assert.Equal((4, 0), OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJson(At)), otlp));
+                Assert.Equal(new LogIngestResult(4, 0, Busy: false), await otlp.CommitAsync());
+            }
 
-            Assert.Equal(4, LogEventSerializer.StreamBatch(ClefBatch(At), endpoint, out int clefDropped));
-            Assert.Equal(0, clefDropped);
-            drainer.NotifyEnqueued();
-
-            Assert.Equal((4, 0), OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJson(At)), endpoint));
-            endpoint.NotifyBatchEnqueued();
-
-            await all.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            // Answered means written: every event is in the tier and the WAL already.
+            Assert.Equal(expected.Count, Volatile.Read(ref written));
 
             // kill -9: the events are in the WAL (and the hot tier) only. Keep the WAL's bytes,
             // let the shutdown flush and unlink it, then undo that flush.
@@ -93,8 +92,6 @@ public sealed class WalServiceRecoveryTests : IDisposable
             File.Copy(wal, wal + ".crash", overwrite: true);
             File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
 
-            await drainer.DisposeAsync();
-            drainer = null;
             await engine.DisposeAsync();
             foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
             {
@@ -106,8 +103,6 @@ public sealed class WalServiceRecoveryTests : IDisposable
         }
         finally
         {
-            if (drainer is not null) await drainer.DisposeAsync();
-            ring.Dispose();
             await engine.DisposeAsync();
         }
 

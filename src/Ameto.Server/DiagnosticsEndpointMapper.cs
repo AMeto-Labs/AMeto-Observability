@@ -29,7 +29,7 @@ public static class DiagnosticsEndpointMapper
     {
         app.MapGet("/api/diagnostics", (
             StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
-            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer,
+            Ameto.Ingestion.IngestionEndpoint ingest,
             Ameto.Indexing.IndexingWiring indexing, Ameto.Indexing.SegmentIndexCache indexCache,
             HttpContext http) =>
         {
@@ -197,34 +197,33 @@ public static class DiagnosticsEndpointMapper
                 metricsAvailability  = metrics is null ? null : AvailabilityName(metrics.Availability),
                 tracesAvailability   = traces  is null ? null : AvailabilityName(traces.Availability),
 
-                // ── Ingest ─────────────────────────────────────────────────────
-                // Overload used to be invisible: a client that got a 200 with a "dropped"
-                // count had no server-side counterpart, so nobody could see that the ring
-                // was filling, let alone WHY. The three drop reasons are different
-                // problems — a payload larger than one slab is a misconfigured client, an
-                // exhausted arena is a burst the buffer could not absorb, a full ring is a
-                // drainer that fell behind — and they are counted apart for that reason.
-                ingestAcceptedTotal      = ring.AcceptedTotal,
-                ingestDrainedTotal       = ring.DrainedTotal,
-                ingestPending            = ring.ApproximateCount,
-                ingestCapacity           = ring.Capacity,
-                // The binding limit, and the one to watch: a pending event holds a payload
-                // slab until the drainer copies it out, and the arena holds far fewer slabs
-                // than the ring holds slots — so the slabs run out first, and pending
-                // against the SLOT capacity made a saturated buffer look almost idle.
-                ingestSlabCapacity       = ring.SlabCapacity,
-                ingestSaturationPercent  = ring.SlabCapacity > 0
-                                             ? Math.Round(100.0 * ring.ApproximateCount / ring.SlabCapacity, 1)
-                                             : 0,
-                ingestDroppedOversized   = ring.DroppedOversized,
-                ingestDroppedNoSlab      = ring.DroppedNoSlab,
-                ingestDroppedRingFull    = ring.DroppedRingFull,
-                // A free slab whose pages the OS would not commit: the host is out of commit
-                // charge. Not the buffer's limit, so not folded into NoSlab.
-                ingestDroppedNoCommit    = ring.DroppedNoCommit,
-                // Events the storage write path refused repeatedly and the drainer gave up
-                // on — a different failure from a full buffer, and previously silent.
-                ingestWriteErrorDrops    = drainer.ErrorDrops,
+                // ── Ingest (logs) ──────────────────────────────────────────────
+                // A request writes its events into the store itself and is answered once they are
+                // in a WAL; there is no ring between them any more. What can still go wrong is
+                // counted by cause, because each is a different problem: a payload over the
+                // per-event limit is a misconfigured client; a batch that found no room within
+                // Ingestion.BackPressureWait is a flush that is behind with nowhere left to spill;
+                // a WAL append that failed is a volume refusing writes.
+                ingestAcceptedTotal      = ingest.AcceptedTotal,
+                ingestDroppedOversized   = ingest.DroppedOversized,
+                // Events given up on for lack of room (or at shutdown). A request that wrote none
+                // of its batch was answered 503 and its client retries; one that wrote part of it
+                // reported the rest as dropped.
+                ingestNotWritten         = storage.IngestNotWritten,
+                // Batches that had to wait for room at all — a full tier between swaps, or a spill
+                // file rotating. Climbing steadily with ingestNotWritten at zero is the flush
+                // keeping up only just.
+                ingestRoomWaits          = storage.IngestRoomWaits,
+                ingestRefusedTooLarge    = storage.IngestRefusedTooLarge,
+                ingestWalAppendFailures  = storage.IngestWalAppendFailures,
+                // The spill (HotTier.SpillEnabled): events taken while every flush slot was busy,
+                // into WAL files of their own, written into segments as slots come free. Pending
+                // files are that backlog on disk; spilled events are not searchable until then.
+                logsSpilling             = storage.IsSpilling,
+                logsSpillFilesPending    = storage.SpillFilesPending,
+                logsSpillFilesOpened     = storage.SpillFilesOpened,
+                logsSpilledEvents        = storage.SpilledEvents,
+                logsDespilledEvents      = storage.DespilledEvents,
                 // Request bodies parked between requests by IngestBufferPool: CLEF, OTLP/HTTP,
                 // OTLP/gRPC and the gzip inflate target all read into it, so on a busy server
                 // this is the largest managed thing the ingest path holds. Bounded by
@@ -232,15 +231,6 @@ public static class DiagnosticsEndpointMapper
                 // reported here, no figure attributed those megabytes to anything.
                 ingestBufferPooledBytes  = IngestBufferPool.PooledBytes,
                 ingestBufferBudgetBytes  = IngestBufferPool.MaxPooledTotalBytes,
-                // The payload arena: what it may reserve, and how far into it the buffer has
-                // ever reached (deepest slab x slab size) -- never given back, and the largest
-                // single thing the ingest path holds. On Windows the second figure is the
-                // arena's commit charge; on Linux it is an upper bound on its resident pages,
-                // since a small event touches only the first page of its slab. It used to be
-                // reported nowhere: the ring's commit counter is Windows-only by design, so
-                // on the Linux container this matters most for, no figure existed at all.
-                ingestArenaBytes         = ring.ArenaCapacityBytes,
-                ingestArenaResidentBytes = ring.ArenaHighWaterBytes,
 
                 // ── Index build ────────────────────────────────────────────────
                 // Merge rows whose exception column is not a readable exception map: written,

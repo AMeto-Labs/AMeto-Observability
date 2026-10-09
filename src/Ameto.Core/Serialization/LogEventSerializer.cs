@@ -141,8 +141,8 @@ public static class LogEventSerializer
     /// <summary>
     /// How far a batch got. A struct passed by ref, so the counts SURVIVE the exception a
     /// malformed element throws — the caller needs them: events already handed to the sink
-    /// are in the ring and their drainer still has to be woken, and an operator reading the
-    /// 400 needs to know that some of the batch landed, and where it stopped.
+    /// are still written, and an operator reading the 400 needs to know that some of the batch
+    /// landed, and where it stopped.
     /// </summary>
     public struct ClefBatchProgress
     {

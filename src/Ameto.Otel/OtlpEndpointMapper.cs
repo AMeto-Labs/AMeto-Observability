@@ -231,34 +231,59 @@ public static class OtlpEndpointMapper
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
-            int ingested = 0, dropped = 0;
+            LogIngestBatch? batch = null;
             try
             {
-                var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
-                if (body is null) return;
-
+                bool malformed = false;
                 try
                 {
-                    bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                    var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
+                    if (body is null) return;
 
-                    // Both encodings stream straight into the ring — no OTLP object graph, no
-                    // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
-                    // exporters and the collector send, so it is the one that had to stop
-                    // decoding to a DOM first (see OtlpLogProtoParser).
-                    (ingested, dropped) = isProto
-                        ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), endpoint)
-                        : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
+                    try
+                    {
+                        batch = endpoint.BeginBatch(payloadSizeHint: bodyLen);
+                        bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+                        // Both encodings decode straight into the batch — no OTLP object graph, no
+                        // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
+                        // exporters and the collector send, so it is the one that had to stop
+                        // decoding to a DOM first (see OtlpLogProtoParser).
+                        _ = isProto
+                            ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), batch)
+                            : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), batch);
+                    }
+                    // A malformed tail: the prefix decoded before it is written below and the batch
+                    // answered 400, which OTLP defines as not retryable — as it always was.
+                    catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) { malformed = true; }
+                    // The batch holds its own copy of everything it keeps: the body and the inflate
+                    // slot go back before the write, which may wait for room.
+                    finally { IngestBufferPool.Return(body); slot?.Exit(); }
                 }
-                catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) { ctx.Response.StatusCode = 400; return; }
-                finally { IngestBufferPool.Return(body); slot?.Exit(); }
-            }
-            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
-            {
-                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
-                return;
-            }
+                catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
+                {
+                    // Nothing of the batch is written: the retry the 503 asks for stores it once.
+                    RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                    return;
+                }
 
-            await WriteJsonOk(ctx, ingested, dropped);
+                // Answered only once the events are in the store — the hot tier and its WAL, or a
+                // spill file — so a 200 survives the death of this process (IngestionEndpoint).
+                var result = await batch!.CommitAsync(ctx.RequestAborted);
+                if (malformed)
+                {
+                    ctx.Response.StatusCode = 400;
+                    return;
+                }
+                if (result.Busy)
+                {
+                    // Nothing written for want of room: the exporter retries, and duplicates nothing.
+                    WriteRetryLater(ctx, LogStoreBusyMessage);
+                    return;
+                }
+                await WriteJsonOk(ctx, result.Ingested, result.Dropped);
+            }
+            finally { batch?.Dispose(); }
         };
 
         // ── Routes ────────────────────────────────────────────────────────────
@@ -500,6 +525,13 @@ public static class OtlpEndpointMapper
 
     /// <summary>What a 503 says when anything else taking the batch in ran out of memory: the read, the parse, the store.</summary>
     internal static ReadOnlySpan<byte> IngestMemoryShortMessage => "the server ran short of memory taking in this batch; retry"u8;
+
+    /// <summary>
+    /// What a 503 says when the log store had no room for any of the batch within
+    /// <c>Ingestion.BackPressureWait</c>: the flush is behind and nothing could take the events.
+    /// Nothing was written, so the retry stores the batch once.
+    /// </summary>
+    internal static ReadOnlySpan<byte> LogStoreBusyMessage => "the log store is behind and had no room for this batch; retry"u8;
 
     /// <summary>
     /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and
