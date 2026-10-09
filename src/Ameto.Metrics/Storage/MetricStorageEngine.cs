@@ -1909,6 +1909,15 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                 finally { _snapshotLock.ExitWriteLock(); }
 
                 List<MetricSegmentInfo> infos;
+
+                // A SERIES NO FILE CAN HOLD IS LEFT OUT, NOT ALLOWED TO HOLD THE FLUSH BACK (#126 review
+                // NEW-0). One histogram point of more than 7.4 million buckets is larger than any block a
+                // reader opens; the writer threw on it, the catch below put every point back, and the
+                // next flush threw on the same point — no metric was written again until a restart's
+                // replay cut the point down to the log's 65 535 buckets, while the tier grew at the
+                // ingest rate. The writer now leaves such a series out and names it here; the rest of
+                // the snapshot is written and committed, and the Error below says what was lost.
+                var unwritable = new List<UnwritableSeries>(0);
                 try
                 {
                     // Test seam, INSIDE the try on purpose: it stands where the file write does, so
@@ -1924,7 +1933,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     // of the snapshot ended up in a complete .mts file AND back in the hot tier AND
                     // in a generation deliberately left replayable: served twice, replayed twice,
                     // every counter and sum over the window doubled. No crash needed.
-                    infos = MetricWriter.Write(_dataDir, snapshot, afterFileWritten: OnFileWrittenForTest);
+                    infos = MetricWriter.Write(_dataDir, snapshot, afterFileWritten: OnFileWrittenForTest,
+                                               unwritable: unwritable);
                 }
                 catch (Exception ex)
                 {
@@ -2011,6 +2021,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                         try { _coldSegments.AddRange(infos); }
                         finally { _coldLock.ExitWriteLock(); }
                     }
+
+                    // After the commit: the generation that held these points is gone, so they are.
+                    foreach (var dropped in unwritable)
+                        LogUnwritableSeriesDropped(_logger, dropped.Key.Name, dropped.Key.Labels.ToString(),
+                                                   dropped.Points, dropped.Why, MetricReader.MaxBlockBytes);
 
                     _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
                         snapshot.Count, infos.Count);
@@ -3230,6 +3245,16 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Information,
         Message = "{Work} succeeded for metric '{Metric}'{Window} after {Failures} failure(s) in a row")]
     private static partial void LogRewriteRecovered(ILogger logger, string work, string metric, string window, int failures);
+
+    /// <summary>
+    /// A series the hot-tier flush left out because no block a reader opens can hold it (#126 review
+    /// NEW-0), written once the rest of the flush is committed. One Error per such series, naming it.
+    /// </summary>
+    [LoggerMessage(Level = Microsoft.Extensions.Logging.LogLevel.Error,
+        Message = "Metric flush dropped the series '{Metric}'{Labels}: {Why}, and a block a reader opens holds at most "
+                + "{MaxBlockBytes} bytes. Its {Points} point(s) are lost; every other series of the flush was written")]
+    private static partial void LogUnwritableSeriesDropped(ILogger logger, string metric, string labels, int points, string why,
+                                                           int maxBlockBytes);
 
     // ── A source that will not decode is left out, not allowed to hold its metric back (#125) ──
 

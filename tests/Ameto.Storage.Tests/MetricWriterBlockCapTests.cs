@@ -1,6 +1,9 @@
 using System.Globalization;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
+using Microsoft.Extensions.Logging;
+using EventId  = Microsoft.Extensions.Logging.EventId;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Storage.Tests;
 
@@ -115,5 +118,121 @@ public sealed class MetricWriterBlockCapTests : IDisposable
         var files = MetricWriter.Write(_dir, items, MetricGranularity.Raw);
 
         Assert.Equal(new[] { 512, 512, 276 }, files.Select(f => MetricReader.ReadAllSync(f.FilePath).Count()));
+    }
+
+    /// <summary>
+    /// ONE POINT NO BLOCK CAN HOLD NO LONGER STOPS EVERY FLUSH (#126 review NEW-0). A histogram point of
+    /// 7 500 000 buckets, about 7 KB as a gzip upload, is larger than the 64 MiB block a reader opens.
+    /// The writer threw on it, the flush put every point back, and every later flush threw on the same
+    /// point: not one metric was written until a restart's replay cut the point down to the log's
+    /// 65 535 buckets, while the tier grew at the ingest rate. The flush now leaves that series out,
+    /// with one Error naming it, and writes and commits the rest.
+    /// </summary>
+    [Fact]
+    public async Task A_series_no_block_can_hold_is_dropped_by_the_flush_and_every_other_series_is_written()
+    {
+        var log = new CapturingLogger();
+        await using var engine = new MetricStorageEngine(_dir, log);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        // The point's size crosses the hot tier's threshold, so the ingest schedules a flush of its
+        // own; every flush is awaited, or the one below could find the tier drained and return while
+        // that one is still writing.
+        var flushes = new List<Task>();
+        engine.OnThresholdFlushScheduledForTest = t => { lock (flushes) flushes.Add(t); };
+        async Task FlushAll()
+        {
+            await engine.ScheduleThresholdFlushForTest();
+            Task[] scheduled;
+            lock (flushes) scheduled = [.. flushes];
+            await Task.WhenAll(scheduled);
+        }
+
+        Assert.Equal(0, engine.Ingest([Poison(now), Gauge(now, 42)]));
+        await FlushAll();
+
+        // The gauge has its file; nothing holds the poison series; the tier is empty, not wedged.
+        var series = Directory.GetFiles(_dir, "*.mts").SelectMany(f => MetricReader.ReadAllSync(f)).ToList();
+        var gauge  = Assert.Single(series);
+        Assert.Equal("cap.healthy", gauge.Name);
+        Assert.Equal(42, Assert.Single(gauge.Points).Value);
+        Assert.Equal(0, engine.HotPointCount);
+        Assert.DoesNotContain(log.Entries, e => e.Text.Contains("Failed to flush", StringComparison.Ordinal));
+
+        // One Error, naming the series and saying why.
+        var error = Assert.Single(log.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains("'cap.poison'{pod=\"a\"}", error.Text, StringComparison.Ordinal);
+        Assert.Contains("7,500,000 buckets", error.Text, StringComparison.Ordinal);
+        Assert.Contains("1 point(s) are lost", error.Text, StringComparison.Ordinal);
+
+        // And the next flush is an ordinary one.
+        engine.Ingest([Gauge(now + 1_000_000_000L, 43)]);
+        await FlushAll();
+        Assert.Equal(2, Directory.GetFiles(_dir, "*.mts").Length);
+        Assert.Single(log.Entries, e => e.Level == LogLevel.Error);
+
+        static MetricIngestItem Poison(long at) => new()
+        {
+            Name = "cap.poison", Kind = MetricKind.Histogram, Unit = "ms", Labels = new LabelSet([new("pod", "a")]),
+            TimestampUnixNano = at, HistogramCount = 1, HistogramSum = 1, BucketCounts = new long[7_500_000],
+        };
+
+        static MetricIngestItem Gauge(long at, double value) => new()
+        {
+            Name = "cap.healthy", Kind = MetricKind.Gauge, Unit = "1", Labels = new LabelSet([new("pod", "a")]),
+            TimestampUnixNano = at, ScalarValue = value,
+        };
+    }
+
+    /// <summary>
+    /// The writer's two answers to a series no block can hold — a point too large, or labels too large
+    /// with a single point: left out and named when the caller passes a list (the flush), a throw that
+    /// leaves no file when it does not (a rewrite, which backs off and keeps its sources).
+    /// </summary>
+    [Fact]
+    public void A_series_no_block_can_hold_is_named_and_left_out_or_throws_and_leaves_no_file()
+    {
+        MetricWriter.MaxSectionBytesForTest = 64 * 1024;
+
+        var items = new List<(SeriesKey, HotSeries)>
+        {
+            (new SeriesKey("cap.mixed", MetricKind.Gauge, "1", new LabelSet([new("pod", "fine")])),
+             new HotSeries([new MetricDataPoint { TimestampUnixNano = T0, Value = 1 }])),
+            (new SeriesKey("cap.mixed", MetricKind.Histogram, "ms", new LabelSet([new("pod", "wide")])),
+             new HotSeries([new MetricDataPoint { TimestampUnixNano = T0,     Count = 1, BucketCounts = new long[4] },
+                            new MetricDataPoint { TimestampUnixNano = T0 + S, Count = 1, BucketCounts = new long[10_000] }])),
+            (new SeriesKey("cap.mixed", MetricKind.Gauge, "1", new LabelSet([new("pod", new string('x', 30_000))])),
+             new HotSeries([new MetricDataPoint { TimestampUnixNano = T0, Value = 2 }])),
+            (new SeriesKey("cap.mixed", MetricKind.Gauge, "1", new LabelSet([new("pod", "also-fine")])),
+             new HotSeries([new MetricDataPoint { TimestampUnixNano = T0, Value = 3 }])),
+        };
+
+        // No list: the call throws, says why, and leaves no file behind.
+        var ex = Assert.Throws<InvalidDataException>(() => MetricWriter.Write(_dir, items, MetricGranularity.Raw));
+        Assert.Contains("10,000 buckets", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(_dir));
+
+        // A list: both series are named in it, and every other series is written.
+        var unwritable = new List<UnwritableSeries>();
+        var files = MetricWriter.Write(_dir, items, MetricGranularity.Raw, unwritable: unwritable);
+
+        Assert.Equal(["wide", new string('x', 30_000)], unwritable.Select(u => u.Key.Labels.ValueAt(0)));
+        Assert.Equal([2, 1], unwritable.Select(u => u.Points));
+        Assert.Contains("10,000 buckets", unwritable[0].Why, StringComparison.Ordinal);
+        Assert.Contains("labels", unwritable[1].Why, StringComparison.Ordinal);
+        Assert.Equal(["fine", "also-fine"],
+                     files.SelectMany(f => MetricReader.ReadAllSync(f.FilePath)).Select(s => s.Labels.ValueAt(0)));
+    }
+
+    private sealed class CapturingLogger : ILogger<MetricStorageEngine>
+    {
+        public readonly List<(LogLevel Level, string Text)> Entries = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries) Entries.Add((logLevel, formatter(state, exception)));
+        }
     }
 }

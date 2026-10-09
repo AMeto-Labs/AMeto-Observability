@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using K4os.Compression.LZ4;
@@ -126,13 +127,23 @@ internal static class MetricWriter
     /// rather than doubling up to it from 64 KB — a doubling holds the old and the new buffer at once,
     /// up to three times the section — and never above the block a reader opens. 0: no hint.
     /// </param>
+    /// <param name="unwritable">
+    /// Where a series goes that no block a reader opens can hold — one of its points, or its labels
+    /// and bounds with a single point, are larger than <see cref="MetricReader.MaxBlockBytes"/>
+    /// (#126 review NEW-0): it is added here with its point count and why, and left out of the files.
+    /// Null: such a series throws, which retracts the whole call. The hot-tier flush passes a list,
+    /// because a throw there is retried with the same snapshot for ever, and one poison series held
+    /// back every other metric's file (the #106 wedge); a rewrite does not, because its sources came
+    /// out of this writer, and a failed rewrite backs off and keeps them.
+    /// </param>
     public static List<MetricSegmentInfo> Write(
         string dataDir,
         IList<(SeriesKey Key, HotSeries Series)> series,
         MetricGranularity granularity = MetricGranularity.Raw,
         Action<string>? afterFileWritten = null,
         Action<string>? duringFileWrite  = null,
-        long sectionSizeHint = 0)
+        long sectionSizeHint = 0,
+        List<UnwritableSeries>? unwritable = null)
     {
         var result   = new List<MetricSegmentInfo>();
         var staged   = new List<string>();   // temp paths, index-aligned with result
@@ -190,6 +201,16 @@ internal static class MetricWriter
 
                     if (bound > maxSection)
                     {
+                        // A series no run can hold: one point, or the identity with one point, is
+                        // over the line by itself (#126 review NEW-0). Left out when the caller asks
+                        // for that — the flush does — and a throw otherwise.
+                        if (WhyUnwritable(key, hs.Bounds, pts, maxSection) is { } why)
+                        {
+                            if (unwritable is null) throw TooLargeForABlock(metricName, maxSection, why);
+                            unwritable.Add(new UnwritableSeries(key, pts.Length, why));
+                            continue;
+                        }
+
                         WriteInRuns(dataDir, metricName, namePart, granularity, key, hs.Bounds, pts, maxSection, raw,
                                     nonceChars, duringFileWrite, staged, result);
                         raw.Reset();
@@ -310,9 +331,9 @@ internal static class MetricWriter
     /// ONE SERIES WHOSE ENCODING MAY NOT FIT A BLOCK ON ITS OWN: its points go out in time order, as
     /// many runs as they need, each run a one-series file whose bound fits <paramref name="maxSection"/>.
     /// The points are already in timestamp order (<see cref="HotSeries.PointsForWrite"/>), so the runs
-    /// are disjoint in time and a reader merges them back like any two files of one series. Only a
-    /// single POINT larger than a block cannot be written — a histogram of millions of buckets, which
-    /// nothing ingests — and that throws, which retracts the whole call as any write failure does.
+    /// are disjoint in time and a reader merges them back like any two files of one series. A series
+    /// that no run can hold never gets here: <see cref="WhyUnwritable"/> has named it, and the call
+    /// left it out or threw.
     /// </summary>
     private static void WriteInRuns(
         string dataDir, string metricName, string namePart, MetricGranularity granularity,
@@ -321,13 +342,11 @@ internal static class MetricWriter
         List<string> staged, List<MetricSegmentInfo> result)
     {
         long identity = IdentityBound(key, bounds);
-        if (pts.Length == 0) throw TooLargeForABlock(metricName, maxSection);
 
         int from = 0;
         while (from < pts.Length)
         {
             long used = identity + PointBound(in pts[from]);
-            if (used > maxSection) throw TooLargeForABlock(metricName, maxSection);
             int  to   = from + 1;
             while (to < pts.Length)
             {
@@ -348,8 +367,32 @@ internal static class MetricWriter
         }
     }
 
-    private static InvalidDataException TooLargeForABlock(string metricName, int maxSection) =>
-        new($"A series of '{metricName}' cannot be written in a block of {maxSection:N0} bytes, the most a reader opens");
+    /// <summary>
+    /// Why no run of this series fits <paramref name="maxSection"/> — its labels and bounds with a
+    /// single point are over it, or one of its points is — or null when its points can go out in runs.
+    /// The case seen on the wire: one histogram point of more than 7.4 million buckets, about 7 KB as
+    /// a gzip upload (#126 review NEW-0).
+    /// </summary>
+    private static string? WhyUnwritable(SeriesKey key, double[]? bounds, ReadOnlySpan<MetricDataPoint> pts, int maxSection)
+    {
+        long identity = IdentityBound(key, bounds);
+        if (identity + BarePointBound > maxSection)
+            return string.Create(CultureInfo.InvariantCulture,
+                $"its labels and {(bounds?.Length ?? 0):N0} bucket bounds may take {identity:N0} bytes by themselves");
+
+        for (int i = 0; i < pts.Length; i++)
+        {
+            long used = identity + PointBound(in pts[i]);
+            if (used > maxSection)
+                return string.Create(CultureInfo.InvariantCulture,
+                    $"its point at {pts[i].TimestampUnixNano} holds {(pts[i].BucketCounts?.Length ?? 0):N0} buckets, up to {used:N0} bytes with the series' labels");
+        }
+        return null;
+    }
+
+    private static InvalidDataException TooLargeForABlock(string metricName, int maxSection, string why) =>
+        new(string.Create(CultureInfo.InvariantCulture,
+            $"A series of '{metricName}' cannot be written in a block of {maxSection:N0} bytes, the most a reader opens: {why}"));
 
     /// <summary>
     /// An upper bound on the bytes <see cref="WriteSeries"/> writes for this series: every string at
@@ -374,7 +417,10 @@ internal static class MetricWriter
     }
 
     /// <summary>A point at its widest: array header, delta, value, count, sum, and its bucket array.</summary>
-    private static long PointBound(in MetricDataPoint p) => 42 + 9L * (p.BucketCounts?.Length ?? 0);
+    private static long PointBound(in MetricDataPoint p) => BarePointBound + 9L * (p.BucketCounts?.Length ?? 0);
+
+    /// <summary>A point without buckets at its widest: array header, delta, value, count and sum.</summary>
+    private const long BarePointBound = 42;
 
     /// <summary>
     /// Test seam: the most a file's section may hold, in place of <see cref="MetricReader.MaxBlockBytes"/>,
@@ -793,3 +839,9 @@ internal static class MetricWriter
     /// </summary>
     [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
 }
+
+/// <summary>
+/// A series <see cref="MetricWriter.Write"/> left out because no block a reader opens can hold it
+/// (#126 review NEW-0): its key, how many points it carried, and why.
+/// </summary>
+internal readonly record struct UnwritableSeries(SeriesKey Key, int Points, string Why);
