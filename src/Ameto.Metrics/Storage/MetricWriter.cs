@@ -371,7 +371,9 @@ internal static class MetricWriter
     /// Why no run of this series fits <paramref name="maxSection"/> — its labels and bounds with a
     /// single point are over it, or one of its points is — or null when its points can go out in runs.
     /// The case seen on the wire: one histogram point of more than 7.4 million buckets, about 7 KB as
-    /// a gzip upload (#126 review NEW-0).
+    /// a gzip upload (#126 review NEW-0). The receivers now refuse a point past
+    /// <see cref="MetricIngestItem.MaxBucketCounts"/>, so this is what still holds for a caller that
+    /// does not.
     /// </summary>
     private static string? WhyUnwritable(SeriesKey key, double[]? bounds, ReadOnlySpan<MetricDataPoint> pts, int maxSection)
     {

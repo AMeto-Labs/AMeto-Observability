@@ -239,8 +239,12 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
-    /// <summary>Bucket counts per histogram point are capped so the 16-bit length field holds.</summary>
-    private const int MaxBucketCounts = ushort.MaxValue;
+    /// <summary>
+    /// Bucket counts per histogram point are capped so the 16-bit length field holds. The receivers
+    /// refuse a point past it (<see cref="MetricIngestItem.MaxBucketCounts"/>), so the cut here is
+    /// for a caller that does not.
+    /// </summary>
+    private const int MaxBucketCounts = MetricIngestItem.MaxBucketCounts;
 
     /// <summary>
     /// The file header. The first 32 bytes are v1's, byte for byte; the rest exists in v2 only,

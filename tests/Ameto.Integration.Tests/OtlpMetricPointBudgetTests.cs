@@ -126,7 +126,103 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Equal(1, gate.Available);
     }
 
+    // ── A histogram point of more than 65 535 buckets (#126 review NEW-0) ──────
+
+    /// <summary>
+    /// A histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets is refused
+    /// at decode and reported as dropped; the rest of its batch is ingested. One of 7.5 million buckets,
+    /// about 7 KB as a gzip upload, was answered <c>{"ingested":1}</c> and then stopped every metric
+    /// flush until a restart: no block a reader opens can hold it, and the metric WAL keeps only its
+    /// first 65 535 buckets. A point AT the cap is taken as before.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_histogram_point_of_more_than_65535_buckets_is_dropped_and_the_rest_of_its_batch_ingested(bool protobuf)
+    {
+        string tag = protobuf ? "proto" : "json";
+        string wide = "buckets.wide." + tag, beside = "buckets.beside." + tag;
+
+        using var refused = await PostAsync(HistogramBeside(wide, MetricIngestItem.MaxBucketCounts + 2, beside, protobuf), protobuf);
+
+        Assert.Equal(HttpStatusCode.OK, refused.StatusCode);
+        Assert.Equal("{\"ingested\":1,\"dropped\":1}", await refused.Content.ReadAsStringAsync());
+        Assert.Empty(QueryNames(wide));
+        Assert.Contains(beside, QueryNames(beside));
+
+        string atCap = "buckets.at-cap." + tag, beside2 = "buckets.beside2." + tag;
+        using var accepted = await PostAsync(HistogramBeside(atCap, MetricIngestItem.MaxBucketCounts, beside2, protobuf), protobuf);
+
+        Assert.Equal("{\"ingested\":2,\"dropped\":0}", await accepted.Content.ReadAsStringAsync());
+        Assert.Contains(atCap, QueryNames(atCap));
+    }
+
+    /// <summary>The same over gRPC: OK, with the point in <c>partial_success</c> and the reason.</summary>
+    [Fact]
+    public async Task A_grpc_histogram_point_of_more_than_65535_buckets_is_a_rejected_point_with_its_reason()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var noLog = new OtlpGzipTooLargeLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var noMemoryLog = new OtlpOutOfMemoryLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var call = GrpcCall(Frame(HistogramBeside("buckets.wide.grpc", MetricIngestItem.MaxBucketCounts + 2,
+                                                  "buckets.beside.grpc", protobuf: true)));
+
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, noLog, noMemoryLog,
+            (c, msg) => OtlpGrpcEndpointMapper.DecodeMetrics(c, msg.AsSpan(), Limit));
+
+        Assert.Equal("0", call.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(OtlpGrpcFraming.Frame(OtlpGrpcFraming.ExportResponse(1, "histogram points of more than 65535 buckets were refused")),
+                     ((MemoryStream)call.Response.Body).ToArray());
+        Assert.Empty(QueryNames("buckets.wide.grpc"));
+        Assert.Contains("buckets.beside.grpc", QueryNames("buckets.beside.grpc"));
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One batch: a histogram point of <paramref name="buckets"/> zero counts — packed varints, one byte
+    /// each, or JSON strings — and a gauge point beside it, both stamped a minute ago. The bucket
+    /// counts used here are never a multiple of 8 bytes, which the parser would read as fixed64.
+    /// </summary>
+    private static byte[] HistogramBeside(string histogram, int buckets, string gauge, bool protobuf)
+    {
+        Assert.NotEqual(0, buckets % 8);
+        long now = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60_000) * 1_000_000L;
+        string ts = now.ToString(CultureInfo.InvariantCulture);
+        if (!protobuf)
+        {
+            var sb = new StringBuilder("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"name\":\"")
+                .Append(histogram).Append("\",\"histogram\":{\"dataPoints\":[{\"timeUnixNano\":\"").Append(ts)
+                .Append("\",\"count\":\"1\",\"bucketCounts\":[");
+            for (int i = 0; i < buckets; i++) sb.Append(i == 0 ? "\"0\"" : ",\"0\"");
+            sb.Append("]}]}},{\"name\":\"").Append(gauge).Append("\",\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"")
+              .Append(ts).Append("\",\"asDouble\":1.5}]}}]}]}]}");
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        return Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm =>
+        {
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(histogram);
+                Sub(metric, 9, Msg(h => Sub(h, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteFixed64(1);
+                    Sub(dp, 6, new byte[buckets]);                              // packed varint zeros
+                }))));
+            }));
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(gauge);
+                Sub(metric, 5, Msg(g => Sub(g, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                }))));
+            }));
+        })))));
+    }
 
     private IEnumerable<string> QueryNames(string name) =>
         _factory.Services.GetRequiredService<IMetricQuery>().GetMetricNames(name);

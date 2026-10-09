@@ -48,6 +48,12 @@ public static class OtlpMetricProtoParser
         public readonly List<double> Bounds = new(32);
 
         /// <summary>
+        /// Histogram points refused for carrying more than <see cref="MetricIngestItem.MaxBucketCounts"/>
+        /// buckets (#126 review NEW-0) — reported to the sender as rejected, never built.
+        /// </summary>
+        public int Refused;
+
+        /// <summary>
         /// The bounds array of the previous histogram point in this batch. Every point of an
         /// instrument carries the same bounds and nothing downstream mutates them (the hot tier
         /// keeps its series' first array, the log and the writer only read), so a point whose
@@ -61,14 +67,29 @@ public static class OtlpMetricProtoParser
     }
 
     public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload) =>
-        Parse(payload, MetricLabelInterner.Shared);
+        Parse(payload, MetricLabelInterner.Shared, out _);
+
+    /// <summary>
+    /// <see cref="Parse(ReadOnlySpan{byte})"/>, and how many histogram points it refused for carrying
+    /// more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets — the count the receivers
+    /// report as rejected.
+    /// </summary>
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, out int refused) =>
+        Parse(payload, MetricLabelInterner.Shared, out refused);
 
     /// <summary>
     /// <see cref="Parse(ReadOnlySpan{byte})"/> against a given interner — the process-wide
     /// <see cref="MetricLabelInterner.Shared"/> in production; tests pass a small one to reach its
     /// bounds.
     /// </summary>
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner)
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner) =>
+        Parse(payload, interner, out _);
+
+    /// <summary>
+    /// The parse itself: the items, and the histogram points refused for carrying more than
+    /// <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126 review NEW-0).
+    /// </summary>
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner, out int refused)
     {
         var st = new ParseState(interner);
         var r  = new ProtoReader(payload);
@@ -78,6 +99,7 @@ public static class OtlpMetricProtoParser
             if (tag == 10) ReadResourceMetrics(r.ReadLengthDelimited(), st);   // field 1
             else r.SkipField(tag);
         }
+        refused = st.Refused;
         return st.Result;
     }
 
@@ -257,6 +279,13 @@ public static class OtlpMetricProtoParser
             bool haveCounts = false, haveBounds = false;
             List<MetricExemplar>? exemplars = null;
 
+            // A POINT OF MORE THAN MaxBucketCounts BUCKETS IS REFUSED, NOT BUILT (#126 review NEW-0):
+            // its counts stop being collected at the cap, and the point is counted as rejected
+            // instead of being added. The metric WAL holds no more than that per point, and one
+            // point of millions of buckets — a few kilobytes as a gzip upload — was larger than the
+            // block a reader opens and stopped every metric flush until a restart.
+            bool tooManyBuckets = false;
+
             var p = new ProtoReader(dp);
             uint t;
             while ((t = p.ReadTag()) != 0)
@@ -266,8 +295,8 @@ public static class OtlpMetricProtoParser
                     case 25: ts    = (long)p.ReadFixed64(); break;               // field 3: time_unix_nano
                     case 33: count = (long)p.ReadFixed64(); break;               // field 4: count (SDK emits fixed64)
                     case 41: sum   = p.ReadDouble();        break;               // field 5: sum
-                    case 48: haveCounts = true; counts.Add((long)p.ReadVarint());  break;  // field 6 unpacked varint
-                    case 49: haveCounts = true; counts.Add((long)p.ReadFixed64()); break;  // field 6 unpacked fixed64
+                    case 48: haveCounts = true; AddCount(counts, (long)p.ReadVarint(),  ref tooManyBuckets); break;  // field 6 unpacked varint
+                    case 49: haveCounts = true; AddCount(counts, (long)p.ReadFixed64(), ref tooManyBuckets); break;  // field 6 unpacked fixed64
                     case 50:                                                     // field 6 packed
                     {
                         var packed = p.ReadLengthDelimited();
@@ -276,7 +305,8 @@ public static class OtlpMetricProtoParser
                         // the same auto-detection the DOM decoder used.
                         bool asFixed = packed.Length % 8 == 0;
                         var pr = new ProtoReader(packed);
-                        while (!pr.End) counts.Add((long)(asFixed ? pr.ReadFixed64() : pr.ReadVarint()));
+                        while (!pr.End && !tooManyBuckets)
+                            AddCount(counts, (long)(asFixed ? pr.ReadFixed64() : pr.ReadVarint()), ref tooManyBuckets);
                         break;
                     }
                     case 57: haveBounds = true; bounds.Add(p.ReadDouble()); break;         // field 7 unpacked
@@ -298,6 +328,12 @@ public static class OtlpMetricProtoParser
                 }
             }
 
+            if (tooManyBuckets)
+            {
+                st.Refused++;
+                continue;
+            }
+
             st.Result.Add(new MetricIngestItem
             {
                 Name              = name,
@@ -312,6 +348,16 @@ public static class OtlpMetricProtoParser
                 Exemplars         = exemplars?.ToArray(),
             });
         }
+    }
+
+    /// <summary>
+    /// One bucket count into the point's scratch — or, the point already holding
+    /// <see cref="MetricIngestItem.MaxBucketCounts"/>, the flag that refuses it, and nothing added.
+    /// </summary>
+    private static void AddCount(List<long> counts, long value, ref bool tooManyBuckets)
+    {
+        if (counts.Count < MetricIngestItem.MaxBucketCounts) counts.Add(value);
+        else tooManyBuckets = true;
     }
 
     /// <summary>

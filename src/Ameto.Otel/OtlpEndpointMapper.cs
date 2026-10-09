@@ -161,6 +161,7 @@ public static class OtlpEndpointMapper
                 if (body is null) return;
 
                 List<Ameto.Metrics.MetricIngestItem> points;
+                int tooManyBuckets;   // histogram points refused at decode (#126 review NEW-0)
                 try
                 {
                     bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
@@ -182,14 +183,14 @@ public static class OtlpEndpointMapper
                         // Protobuf: parse straight to ingest items — no OTLP object graph, no
                         // parser object per nested message, no wire-int→string→int round trip
                         // (see OtlpMetricProtoParser). This is the encoding SDK exporters use.
-                        points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen));
+                        points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen), out tooManyBuckets);
                     }
                     else
                     {
                         var request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(
                             body.AsSpan(0, bodyLen), _jsonOptions);
                         if (request is null) { ctx.Response.StatusCode = 400; return; }
-                        points = OtlpMetricMapper.Map(request);
+                        points = OtlpMetricMapper.Map(request, out tooManyBuckets);
                     }
                     OnMetricsParsedForTest?.Invoke(points);
                 }
@@ -202,8 +203,9 @@ public static class OtlpEndpointMapper
                 // append, filing its points in memory, is in the log but only partly in memory, and
                 // the next flush commits the log without writing the unfiled points: the retry is
                 // what keeps them, and it stores the filed ones a second time — at least once.
-                refused  = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-                accepted = points.Count - refused;
+                int stale = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
+                accepted  = points.Count - stale;
+                refused   = stale + tooManyBuckets;
             }
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {

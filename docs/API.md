@@ -183,7 +183,7 @@ printf '%s' '{"resourceLogs":[…]}' | gzip \
       -H 'Content-Encoding: gzip' -H 'X-Seq-ApiKey: <key>' --data-binary @-
 ```
 
-**Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
+**Response `200 OK`:** `{ "ingested": N, "dropped": M }`. For metrics, `dropped` counts the points refused while the rest of the batch was taken: one stamped more than 24 h in the future, or a histogram point of more than 65 535 buckets, the most the metric WAL holds for one point (a point of several million buckets would not fit any block a reader opens).  
 `resource.attributes["service.name"]` becomes the event's `@service` (the first one, when it is a non-empty string — it is then not repeated among the event's properties); `traceId` / `spanId` are indexed for log↔trace correlation.
 
 **Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length`, proved it by arriving, or, gzip-compressed, **inflated** past it. The inflated size is decided on bytes already written, so a body that would inflate to gigabytes (deflate reaches ~1032:1) is stopped after at most one limit of output: no single buffer is ever rented past the limit, and the request holds at most the compressed body plus one and a half limits of inflate buffer — one limit when the gzip trailer states the size honestly, one and a half when it understates it and the buffer doubles its way up (about 20 MiB in all at the 8 MB default); that refusal is also logged as a warning (`OtlpGzipTooLarge`, shared with the gRPC receiver), since it is a misconfigured exporter or a probe — at most once a second, with the count since the last line and the latest sender: its API key as `GET /api/auth/keys` lists it (`keyPreview`, never the key) and its remote address. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
@@ -230,7 +230,7 @@ before its gzip trailer is `INVALID_ARGUMENT` (3), not a shorter message.
 
 | `grpc-status` | when |
 |---|---|
-| `0` OK | accepted; the response carries `partial_success.rejected_…` when the ingest buffer dropped records |
+| `0` OK | accepted; the response carries `partial_success.rejected_…` when the ingest buffer dropped records, or when metric points were refused (a timestamp more than 24 h ahead, a histogram point of more than 65 535 buckets), with a message saying which |
 | `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
 | `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes`, or a metrics batch over `Ingestion.MaxOtlpMetricPoints` data points |
 | `12` UNIMPLEMENTED | unsupported compression |

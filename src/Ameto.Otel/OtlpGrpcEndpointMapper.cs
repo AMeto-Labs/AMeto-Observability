@@ -86,18 +86,39 @@ public static class OtlpGrpcEndpointMapper
     /// The metrics Export's decode and store. The data points are counted before one is built
     /// (#126 review F2): a batch over <c>Ingestion.MaxOtlpMetricPoints</c> throws
     /// <see cref="OtlpMetricPointBudget.TooManyPointsException"/>, answered RESOURCE_EXHAUSTED — its
-    /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried.
+    /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried. A
+    /// histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets is refused
+    /// at decode and reported in the partial success beside the store's own refusals, each with its
+    /// reason (#126 review NEW-0).
     /// </summary>
     internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints)
     {
         int count = OtlpMetricPointBudget.CountProto(message);
         if (count > maxPoints) throw new OtlpMetricPointBudget.TooManyPointsException(count, maxPoints);
 
-        var points  = OtlpMetricProtoParser.Parse(message);
-        int refused = ctx.RequestServices.GetRequiredService<IMetricIngester>()
+        var points = OtlpMetricProtoParser.Parse(message, out int tooManyBuckets);
+        int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()
             .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-        return (true, refused, "points stamped more than 24 h in the future were refused");
+        return (true, tooManyBuckets + stale, (tooManyBuckets, stale) switch
+        {
+            ( > 0, > 0) => TooManyBucketsAndFutureReason,
+            ( > 0, _)   => TooManyBucketsReason,
+            _           => FutureReason,
+        });
     }
+
+    /// <summary>Why metric points were rejected: a timestamp more than 24 h ahead (the store's refusal).</summary>
+    internal const string FutureReason = "points stamped more than 24 h in the future were refused";
+
+    /// <summary>
+    /// Why metric points were rejected: a histogram point past <see cref="MetricIngestItem.MaxBucketCounts"/>
+    /// buckets, refused at decode (#126 review NEW-0).
+    /// </summary>
+    internal const string TooManyBucketsReason = "histogram points of more than 65535 buckets were refused";
+
+    /// <summary>Both of the above in one batch.</summary>
+    internal const string TooManyBucketsAndFutureReason =
+        "histogram points of more than 65535 buckets, and points stamped more than 24 h in the future, were refused";
 
     /// <summary>
     /// The trace Export's decode: the protobuf STREAMS into the raw span sink (TI#3) — no
