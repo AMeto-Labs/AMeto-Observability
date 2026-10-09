@@ -74,39 +74,69 @@ internal static class OtlpMetricPointBudget
     }
 
     /// <summary>
-    /// The data points of an <c>ExportMetricsServiceRequest</c> in OTLP/JSON: every object directly
-    /// inside an array named <c>dataPoints</c>, at any depth — the name the deserializer binds, read
-    /// with the same leniency (trailing commas). A malformed document throws as the parse would.
+    /// The data points of an <c>ExportMetricsServiceRequest</c> in OTLP/JSON, walked along the shape
+    /// the deserializer binds: <c>resourceMetrics</c> → <c>scopeMetrics</c> → <c>metrics</c> →
+    /// <c>gauge</c> / <c>sum</c> / <c>histogram</c> → <c>dataPoints</c>, the property names matched
+    /// exactly as it matches them (escapes undone), with the same leniency (trailing commas). Points of
+    /// a kind the model does not have — <c>exponentialHistogram</c>, <c>summary</c> — are skipped
+    /// unread, as the deserializer skips them (#126 review NEW-6). A property given twice is counted
+    /// twice: the deserializer builds both before the second replaces the first. A malformed document
+    /// throws as the parse would.
     /// </summary>
     internal static int CountJson(ReadOnlySpan<byte> json)
     {
         var reader = new Utf8JsonReader(json, new JsonReaderOptions { AllowTrailingCommas = true });
         long points = 0;
-        int  inside = -1;              // the depth of the dataPoints array being counted, or -1
-        bool named  = false;           // the property just read is dataPoints
-        while (reader.Read())
-        {
-            switch (reader.TokenType)
-            {
-                case JsonTokenType.PropertyName:
-                    named = inside < 0 && reader.ValueTextEquals("dataPoints"u8);
-                    break;
-                case JsonTokenType.StartArray:
-                    if (named) inside = reader.CurrentDepth;
-                    named = false;
-                    break;
-                case JsonTokenType.StartObject:
-                    if (inside >= 0 && reader.CurrentDepth == inside + 1) points++;
-                    named = false;
-                    break;
-                case JsonTokenType.EndArray:
-                    if (reader.CurrentDepth == inside) inside = -1;
-                    break;
-                default:
-                    named = false;
-                    break;
-            }
-        }
+        if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
+            JsonObject(ref reader, JsonLevel.Request, ref points);
         return (int)Math.Min(points, int.MaxValue);
+    }
+
+    /// <summary>The objects of the OTLP/JSON metrics request whose members the walk reads.</summary>
+    private enum JsonLevel { Request, ResourceMetrics, ScopeMetrics, Metric, PointSet }
+
+    /// <summary>
+    /// The members of one object, the reader on its <c>StartObject</c> and left on its <c>EndObject</c>:
+    /// the members that lead to data points are followed, every other value is skipped unread.
+    /// </summary>
+    private static void JsonObject(ref Utf8JsonReader reader, JsonLevel level, ref long points)
+    {
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            JsonLevel? into = level switch
+            {
+                JsonLevel.Request         when reader.ValueTextEquals("resourceMetrics"u8) => JsonLevel.ResourceMetrics,
+                JsonLevel.ResourceMetrics when reader.ValueTextEquals("scopeMetrics"u8)    => JsonLevel.ScopeMetrics,
+                JsonLevel.ScopeMetrics    when reader.ValueTextEquals("metrics"u8)         => JsonLevel.Metric,
+                JsonLevel.Metric          when reader.ValueTextEquals("gauge"u8)
+                                            || reader.ValueTextEquals("sum"u8)
+                                            || reader.ValueTextEquals("histogram"u8)       => JsonLevel.PointSet,
+                _ => null,
+            };
+            bool dataPoints = level == JsonLevel.PointSet && reader.ValueTextEquals("dataPoints"u8);
+
+            reader.Read();                                                     // the value
+            if (dataPoints && reader.TokenType == JsonTokenType.StartArray)
+            {
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    if (reader.TokenType == JsonTokenType.StartObject) points++;
+                    reader.Skip();
+                }
+            }
+            else if (into == JsonLevel.PointSet && reader.TokenType == JsonTokenType.StartObject)
+            {
+                JsonObject(ref reader, JsonLevel.PointSet, ref points);       // gauge, sum, histogram: one object
+            }
+            else if (into is { } child && reader.TokenType == JsonTokenType.StartArray)
+            {
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    if (reader.TokenType == JsonTokenType.StartObject) JsonObject(ref reader, child, ref points);
+                    else reader.Skip();
+                }
+            }
+            else reader.Skip();
+        }
     }
 }

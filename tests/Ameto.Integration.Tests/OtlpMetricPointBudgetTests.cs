@@ -84,6 +84,31 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Equal(18, OtlpMetricPointBudget.CountProto(message));
     }
 
+    /// <summary>
+    /// The JSON count is the points the model builds: those of a gauge, sum or histogram, where the
+    /// deserializer binds them. An exponential histogram's or a summary's points, which the model does
+    /// not have and the protobuf count skips too, are not counted, nor is a <c>dataPoints</c> array
+    /// anywhere else (#126 review NEW-6: 3 + 2 such points counted 5, and decoded 0).
+    /// </summary>
+    [Fact]
+    public void The_json_count_is_the_points_the_model_builds()
+    {
+        byte[] json = Encoding.UTF8.GetBytes("""
+            {"resourceMetrics":[{"resource":{"dataPoints":[{}]},"scopeMetrics":[{"metrics":[
+              {"name":"budget.exp","exponentialHistogram":{"dataPoints":[{},{},{}]}},
+              {"name":"budget.summary","summary":{"dataPoints":[{},{}]}},
+              {"name":"budget.gauge","gauge":{"dataPoints":[{"asDouble":1}]}},
+              {"name":"budget.sum","sum":{"dataPoints":[{"asDouble":1},{"asDouble":2},],"isMonotonic":true}},
+              {"name":"budget.histogram","histogram":{"dataPoints":[{"count":"1"}]},"dataPoints":[{}]}
+            ]}]}]}
+            """);
+
+        var request = JsonSerializer.Deserialize<Ameto.Otel.Models.ExportMetricsServiceRequest>(
+            json, new JsonSerializerOptions { AllowTrailingCommas = true });
+        Assert.Equal(4, OtlpMetricMapper.Map(request!).Count);
+        Assert.Equal(4, OtlpMetricPointBudget.CountJson(json));
+    }
+
     // ── OTLP/HTTP: 413 ────────────────────────────────────────────────────────
 
     [Theory]
