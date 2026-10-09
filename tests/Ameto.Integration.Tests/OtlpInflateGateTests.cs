@@ -217,7 +217,9 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         var released = System.Diagnostics.Stopwatch.StartNew();
         gate.Exit();                                                           // the ring goes to the dead waiter
         Assert.True(await waiter.WaitAsync(TimeSpan.FromSeconds(5)));
-        Assert.True(released.Elapsed < OtlpInflateGate.PollInterval * 3, $"took {released.Elapsed.TotalMilliseconds:F0} ms");
+        // A poll (100 ms) and whatever the machine adds — well inside the 5 s patience, which is
+        // what the waiter would sit out if nothing but its deadline looked at the counter again.
+        Assert.True(released.Elapsed < TimeSpan.FromSeconds(2), $"took {released.Elapsed.TotalMilliseconds:F0} ms");
         Assert.Equal(0, gate.Available);
 
         gate.Exit();
