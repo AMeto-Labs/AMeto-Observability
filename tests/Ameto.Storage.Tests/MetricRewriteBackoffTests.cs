@@ -325,9 +325,12 @@ public sealed class MetricRewriteBackoffTests : IDisposable
     /// blocking, compacting gen2 at the end of a pass was gated on the bytes of the files the pass
     /// LISTED. Since #125 a window's own outputs and carried files are no longer rewritten on every
     /// pass, so most passes list a metric's 1-hour files and rewrite nothing — and each still stopped
-    /// the world on the 5-minute cadence. Here a 1-hour file over the 8 MiB floor, alone in its 7-day
-    /// window 40 days back, is listed and left: no collection asked. Two raw files of the last hour,
-    /// over the floor between them, are compacted: asked, with exactly their bytes.
+    /// the world on the 5-minute cadence. Here three kinds of listed work are left alone, each over
+    /// the 8 MiB floor by itself, and none may count (#126 review NEW-8): a 1-hour file alone in its
+    /// 7-day window 40 days back; three 1-hour files in the next window, which a merge of four does
+    /// not yet want; and four 5-minute files of the last day whose merge failed on the pass before
+    /// and is backing off. No collection asked. Two raw files of the last hour, over the floor
+    /// between them, are compacted: asked, with exactly their bytes.
     /// </summary>
     [Fact]
     public async Task A_pass_asks_for_the_aggressive_collection_only_when_it_rewrote_enough()
@@ -338,16 +341,42 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         long window = 7 * 24 * Hour;
         long start  = (Now() - 40 * 24 * Hour) / window * window + Hour;
         var big = RandomGauges(idleDir, "idle.gauge", MetricGranularity.OneHour, 512, start, Min, 2_400, seed: 1);
+        var notDue = new List<MetricSegmentInfo>();
+        for (int i = 0; i < 3; i++)
+            notDue.AddRange(RandomGauges(idleDir, "notdue.gauge", MetricGranularity.OneHour, 512,
+                                         start + window + i * 24 * Hour, Min, 900, seed: 10 + i));
+        var backingOff = new List<MetricSegmentInfo>();
+        long recent = Now() / Min * Min - 23 * Hour;
+        for (int i = 0; i < 4; i++)
+            backingOff.AddRange(RandomGauges(idleDir, "backoff.gauge", MetricGranularity.FiveMin, 512,
+                                             recent + i * 5 * Hour, 30 * Sec, 600, seed: 20 + i));
         Assert.True(big.Sum(s => s.SizeBytes) >= floor, "setup: the 1-hour file must be over the floor");
+        Assert.True(notDue.Sum(s => s.SizeBytes) >= floor, "setup: the window not yet due must be over the floor");
+        Assert.True(backingOff.Sum(s => s.SizeBytes) >= floor, "setup: the merge backing off must be over the floor");
+        Assert.Equal(3, notDue.Count);
+        Assert.Equal(4, backingOff.Count);
+
         await using (var engine = new MetricStorageEngine(idleDir, new CapturingLogger()))
         {
             await engine.ColdLoadCompleted;
             long? asked = null;
             engine.OnAggressiveCollectRequestedForTest = bytes => asked = bytes;
+
+            // The pass before: the 5-minute merge is due, is handed its files, and fails — so it backs off.
+            engine.OnRewriteChunkWrittenForTest = _ => throw new IOException("injected failure");
+            await engine.PerformRollupForTest();
+            Assert.Equal(backingOff.Sum(s => s.SizeBytes), asked);
+            engine.OnRewriteChunkWrittenForTest = null;
+
+            asked = null;
             await engine.PerformRollupForTest();
             Assert.Null(asked);
             Assert.Equal(big.Select(s => s.FilePath).OrderBy(p => p, StringComparer.Ordinal),
                          Paths(engine, "idle.gauge", MetricGranularity.OneHour));                 // listed, and left alone
+            Assert.Equal(notDue.Select(s => s.FilePath).OrderBy(p => p, StringComparer.Ordinal),
+                         Paths(engine, "notdue.gauge", MetricGranularity.OneHour));
+            Assert.Equal(backingOff.Select(s => s.FilePath).OrderBy(p => p, StringComparer.Ordinal),
+                         Paths(engine, "backoff.gauge", MetricGranularity.FiveMin));
         }
 
         string busyDir = Path.Combine(_dir, "busy");
