@@ -227,7 +227,7 @@ not shown.
 ### Trace compaction: light spans are rewritten twice
 
 After the 50 000/s load A's compaction run merges the 120 flushed segments in pairs, 120 → 60,
-rewriting 6.0 M spans; B merges pairs of pairs, 120 → 31, rewriting 11.8 M, and spends a third more
+rewriting 6.0 M spans; B merges pairs of pairs, 120 → 31–32, rewriting 11.8 M, and spends a third more
 CPU on the run (51.9 against 38.7 core-seconds) while allocating 18 % less.
 
 B plans in bytes: a segment under half the 73 MB pass budget is a candidate, and a merged output
@@ -242,7 +242,7 @@ segments is what a trace lookup wants, so this may be the right trade, but it is
 
 > **Issue: Traces: on light spans the byte planner re-merges its own outputs — every span written
 > twice by one compaction run.** After 6 M k6 spans (6 attributes, ~124-byte blobs) `main` @
-> `d5ee138` compacts 120 segments into 31 by rewriting 11.8 M spans, where `0a7389d` made 60 by
+> `d5ee138` compacts 120 segments into 31–32 by rewriting 11.8 M spans, where `0a7389d` made 60 by
 > rewriting 6.0 M: +34 % CPU for the run (51.9 vs 38.7 core-s), 18 % less allocated. A merged
 > output is weighed as read (233 B + blob a span), so 100 000 light spans weigh under the 36.5 MB
 > candidate threshold and merge again; above a ~132-byte blob they do not. Decide whether a second rewrite is wanted (half the
