@@ -125,6 +125,49 @@ public sealed class IngestionOptions
     public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;
 
     /// <summary>
+    /// The most one OTLP METRICS batch may decode to, in data points. The batch is weighed before a
+    /// point is built, by a walk that allocates nothing: <see cref="DecodedMetricPointBytes"/> a data
+    /// point, and a histogram point's arrays at the most they can decode to — 24 B a bucket count,
+    /// 16 B a bound, 160 B an exemplar. An ordinary histogram decodes to a third or a quarter of its
+    /// weight (its points share their bounds, and the parser reuses its scratch), so a store of wide
+    /// histograms sent in large batches may need this raised. A batch weighing more than this many
+    /// points is refused 413 (gRPC: RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested
+    /// (#126 review F2, NEW-1).
+    ///
+    /// <para>Why a weight and not just <see cref="MaxOtlpBatchBytes"/>: a metric data point can be two
+    /// bytes on the wire and ~125 decoded (~200 from JSON) — measured, 62–67× — and a histogram's
+    /// bucket count one byte and 24, so a batch inside the byte limit could decode to ~500 MiB, past a
+    /// 512 MB container's whole 384 MiB heap. Its own decode then ran out of memory, which since #125
+    /// is answered 503, and the exporter retried it, out of memory every time. Logs and traces are not
+    /// weighed: they stream into bounded rings and do not expand like this.</para>
+    ///
+    /// <para>Unset — or 0 or below, which mean the same — <see cref="DefaultMaxOtlpMetricPointsFor"/>:
+    /// the request-body share of the heap (<c>MemoryBudgets.IngestBufferBytes</c>) at
+    /// <see cref="DecodedMetricPointBytes"/> a point: ~157 000 on a 512 MB container, ~1 048 000 where
+    /// the share's 128 MiB cap applies, and never below 131 040, because the share is itself floored
+    /// at 16 MiB − 4 KiB (#126 review NEW-7). A positive value always wins, below that or above.</para>
+    /// </summary>
+    public int? MaxOtlpMetricPoints { get; init; }
+
+    /// <summary>What one decoded metric data point costs, about: an item and its list slot (measured 125 B from protobuf).</summary>
+    public const int DecodedMetricPointBytes = 128;
+
+    /// <summary>
+    /// The floor of the derived limit: eight OpenTelemetry Collector batches at their default size. It
+    /// never binds on a host (#126 review NEW-7): the request-body share is floored at 16 MiB − 4 KiB,
+    /// so the derived limit is at least 131 040. It holds only for budgets that were never derived.
+    /// </summary>
+    public const int MinOtlpMetricPoints = 65_536;
+
+    /// <summary>The configured point limit when it is positive, or the default rule applied to this host.</summary>
+    public int EffectiveMaxOtlpMetricPoints =>
+        MaxOtlpMetricPoints is > 0 and int explicitPoints ? explicitPoints : DefaultMaxOtlpMetricPointsFor(MemoryBudgets.Current());
+
+    /// <summary>The default point limit as a pure function of the host's budgets. See <see cref="MaxOtlpMetricPoints"/>.</summary>
+    public static int DefaultMaxOtlpMetricPointsFor(in MemoryBudgets budgets) =>
+        (int)Math.Clamp(budgets.IngestBufferBytes / DecodedMetricPointBytes, MinOtlpMetricPoints, int.MaxValue);
+
+    /// <summary>
     /// Ring-buffer sequencing slots between the HTTP ingest endpoints and the storage
     /// drainer. Rounded up to a power of two. This is the absorption window for hot-tier
     /// flush stalls: at 100k events/s, 65536 slots ≈ 650 ms of headroom before events
@@ -602,6 +645,22 @@ public sealed class MetricsOptions
     public long? WalInitialBytes { get; init; }
 
     /// <summary>
+    /// What one chunk of a metric rewrite — a compaction, a same-granularity merge, a rollup — may
+    /// hold in memory: the points it decodes, their bucket arrays, and the section it writes them back
+    /// as. Unset: <see cref="MemoryBudgets.TraceMergeBytes"/>, the trace compaction pass's share
+    /// (24.2 MB in a 512 MB container, 73 MB with room, never below 16 MiB), taken IN TURN with the trace pass through
+    /// <see cref="BackgroundRewriteGate"/> rather than beside it, so at most one background rewrite
+    /// holds its working set at a time (#125).
+    ///
+    /// <para>A chunk used to be bounded by series count alone (512), so its weight was whatever those
+    /// series' histories weighed: on the 512 MB stand one FiveMin chunk of a histogram reached ~200 MB
+    /// at peak and the compaction failed with an OutOfMemoryException on every pass. A metric larger
+    /// than the budget is now rewritten in more, smaller chunks — more output files, the same points.
+    /// </para>
+    /// </summary>
+    public long? RewriteBudgetBytes { get; init; }
+
+    /// <summary>
     /// How long the tier may hold points before a flush becomes due regardless of size. Matches
     /// the rollup's own first cutoff, so nothing waits longer because of this. Default: 1 h.
     /// </summary>
@@ -724,6 +783,13 @@ public sealed class MetricsOptions
         WalInitialBytes is { } explicitBytes && explicitBytes > 0
             ? explicitBytes
             : Math.Clamp(HotTierBytesFor(in budgets), MinWalInitialBytes, WalInitialCapBytes);
+
+    /// <inheritdoc cref="RewriteBudgetBytes"/>
+    public long EffectiveRewriteBudgetBytes => RewriteBudgetBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="RewriteBudgetBytes"/>
+    public long RewriteBudgetBytesFor(in MemoryBudgets budgets) =>
+        RewriteBudgetBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceMergeBytes;
 
     /// <inheritdoc cref="ExemplarsPerMetric"/>
     public int EffectiveExemplarsPerMetric => ExemplarsPerMetricFor(MemoryBudgets.Current());

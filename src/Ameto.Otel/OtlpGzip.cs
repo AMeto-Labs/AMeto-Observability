@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using Ameto.Core;
@@ -278,30 +279,79 @@ internal static class OtlpGzip
 /// <para><b>Full</b> is a brief wait (<see cref="DefaultPatience"/>), then a refusal the receiver
 /// answers as HTTP 503 with <c>Retry-After</c> or gRPC <c>UNAVAILABLE</c> — the two answers OTLP
 /// exporters retry. The wait is asynchronous: a queued request holds its compressed body and its
-/// connection, not a thread. Uncontended, entering is <see cref="SemaphoreSlim"/>'s fast path — a
-/// cached completed task, no allocation.</para>
+/// connection, not a thread. Uncontended, entering is one compare-and-swap and a cached completed
+/// task, no allocation.</para>
+///
+/// <para><b>The counter is the only ledger</b> (#126 review F4). The gate was a
+/// <see cref="SemaphoreSlim"/>, whose timed wait queues its waiter and only then allocates the
+/// timeout's machinery; an OutOfMemoryException there — a heap peak is exactly when a gzip batch
+/// finds the gate full — left the waiter queued with nobody to collect it, and the next release
+/// handed it a slot no one would ever give back. On the stand's two slots, two such events and
+/// every compressed batch, the Collector's default, waited a second and got 503 until a restart.
+/// Here a slot is only ever taken by a compare-and-swap on the counter, by the caller that will
+/// give it back, and a wait that fails — memory, cancellation — leaves the count as it was.</para>
+///
+/// <para><b>A doorbell hands a freed slot over, in order</b> (#126 review NEW-3). A waiter used to
+/// poll the counter every 10 ms: <see cref="Exit"/> only incremented it, so a slot went to whoever
+/// looked first — a newcomer's fast path, 10 of 10 times ahead of a batch that had waited 50 ms —
+/// and reached a waiter a timer tick late (15.7 ms at the median on Windows), which under a burst
+/// turned more batches into 503 / UNAVAILABLE. Now a newcomer takes the fast path only while nobody
+/// waits; a waiter sleeps on a <see cref="SemaphoreSlim"/> used only as a doorbell, rung once by
+/// each <see cref="Exit"/> while anyone waits and answered in the order the waiters came; the woken
+/// one takes the slot from the counter. A ring that reaches nobody — a waiter that has just timed
+/// out, or one orphaned by an allocation failure inside the doorbell's own timed wait — costs a
+/// look, never a slot, and a waiter that misses its ring looks at the counter on its own every
+/// <see cref="PollInterval"/>.</para>
 /// </summary>
 internal sealed class OtlpInflateGate
 {
     /// <summary>How long a compressed batch waits for a slot before it is told to retry.</summary>
     internal static readonly TimeSpan DefaultPatience = TimeSpan.FromSeconds(1);
 
-    private readonly SemaphoreSlim _slots;
-    private readonly TimeSpan      _patience;
+    /// <summary>
+    /// How long a waiter sleeps on the doorbell before it looks at the counter on its own: the safety
+    /// net for a ring it missed. A freed slot reaches a waiter through the ring, at once; each look
+    /// costs the doorbell's timed wait, so this is long beside a hand-off and short beside the patience.
+    /// </summary>
+    internal static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
+
+    private readonly TimeSpan _patience;
+
+    /// <summary>Slots free; taken by compare-and-swap, given back by an increment. The only ledger.</summary>
+    private int _available;
+
+    /// <summary>Callers inside <see cref="WaitAsync"/>: while there are any, a newcomer queues behind them.</summary>
+    private int _waiting;
+
+    /// <summary>Rung by <see cref="Exit"/> while anyone waits; it carries no slot, only the news of one.</summary>
+    private readonly SemaphoreSlim _doorbell = new(0, int.MaxValue);
 
     public OtlpInflateGate(int capacity, TimeSpan patience)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
-        Capacity  = capacity;
-        _patience = patience;
-        _slots    = new SemaphoreSlim(capacity, capacity);
+        Capacity   = capacity;
+        _patience  = patience;
+        _available = capacity;
     }
 
     /// <summary>Slots in all.</summary>
     public int Capacity { get; }
 
     /// <summary>Slots free right now.</summary>
-    public int Available => _slots.CurrentCount;
+    public int Available => Volatile.Read(ref _available);
+
+    /// <summary>
+    /// Test seam: the wait on the doorbell between two looks at a full gate, in place of the
+    /// semaphore's timed wait — where an OutOfMemoryException allocating its timer would surface
+    /// (#126 review F4). Null in production.
+    /// </summary>
+    internal Func<TimeSpan, CancellationToken, Task<bool>>? WaitForTest;
+
+    /// <summary>
+    /// Test seam: a doorbell waiter nobody will ever collect — what an allocation failure inside the
+    /// semaphore's timed wait leaves queued. It takes the next ring meant for a real waiter.
+    /// </summary>
+    internal void ParkDeadDoorbellWaiterForTest() => _ = _doorbell.WaitAsync();
 
     /// <summary>The sizing rule, separated so it can be checked against the figures it is argued from.</summary>
     public static int CapacityFor(long ingestBufferBytes, int maxOtlpBatchBytes, int processorCount)
@@ -318,11 +368,80 @@ internal sealed class OtlpInflateGate
 
     /// <summary>
     /// Takes a slot, waiting at most the gate's patience. False: none came free — the caller
-    /// answers "retry" and must NOT call <see cref="Exit"/>. Throws only if
-    /// <paramref name="ct"/> (the request's abort) fires.
+    /// answers "retry" and must NOT call <see cref="Exit"/>. Throws if <paramref name="ct"/> (the
+    /// request's abort) fires, or if the wait itself cannot be had (out of memory for its timer);
+    /// either way no slot is taken and none is owed.
     /// </summary>
-    public Task<bool> TryEnterAsync(CancellationToken ct) => _slots.WaitAsync(_patience, ct);
+    public Task<bool> TryEnterAsync(CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return Task.FromCanceled<bool>(ct);
 
-    /// <summary>Gives back a slot <see cref="TryEnterAsync"/> granted — once, when the inflated buffer goes back.</summary>
-    public void Exit() => _slots.Release();
+        // The fast path only while nobody waits: a slot an Exit has just rung for belongs to the
+        // waiter it rang for, not to whoever arrives in between.
+        return Volatile.Read(ref _waiting) == 0 && TryTake() ? Task.FromResult(true) : WaitAsync(ct);
+    }
+
+    private async Task<bool> WaitAsync(CancellationToken ct)
+    {
+        long deadline = Stopwatch.GetTimestamp() + (long)(_patience.TotalSeconds * Stopwatch.Frequency);
+
+        // The first in line has nobody to pass, so it looks once more now: an Exit that found
+        // nobody waiting a moment ago rang no bell. Anyone behind it waits for a ring.
+        if (Interlocked.Increment(ref _waiting) == 1 && TryTake())
+        {
+            Interlocked.Decrement(ref _waiting);
+            return true;
+        }
+
+        try
+        {
+            while (true)
+            {
+                long remaining = deadline - Stopwatch.GetTimestamp();
+                if (remaining <= 0) return TryTake();
+                var pause = TimeSpan.FromSeconds(Math.Clamp((double)remaining / Stopwatch.Frequency, 0.001, PollInterval.TotalSeconds));
+                await (WaitForTest?.Invoke(pause, ct) ?? _doorbell.WaitAsync(pause, ct)).ConfigureAwait(false);
+                if (TryTake()) return true;
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _waiting);
+        }
+    }
+
+    private bool TryTake()
+    {
+        int free = Volatile.Read(ref _available);
+        while (free > 0)
+        {
+            int seen = Interlocked.CompareExchange(ref _available, free - 1, free);
+            if (seen == free) return true;
+            free = seen;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Gives back a slot <see cref="TryEnterAsync"/> granted — once, when the inflated buffer goes
+    /// back — and rings for the first waiter, if any. A second give-back is refused as the semaphore
+    /// refused it, rather than widening the gate.
+    /// </summary>
+    public void Exit()
+    {
+        if (Interlocked.Increment(ref _available) > Capacity)
+        {
+            Interlocked.Decrement(ref _available);
+            throw new SemaphoreFullException("an inflate slot was given back that the gate did not grant");
+        }
+
+        // After the slot is back, so the waiter the ring wakes finds it. A ring that cannot be made
+        // costs that waiter one PollInterval, never the slot — and is not worth turning a give-back,
+        // which runs in finally blocks, into a throw.
+        if (Volatile.Read(ref _waiting) > 0)
+        {
+            try { _doorbell.Release(); }
+            catch { /* the waiter looks on its own */ }
+        }
+    }
 }

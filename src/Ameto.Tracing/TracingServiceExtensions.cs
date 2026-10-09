@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -61,6 +62,8 @@ public static class TracingServiceExtensions
         // The span-name and service intern pools: one set per process, shared by the engine (which
         // resolves names into them and sheds the name pool at every flush) and the ingest side.
         services.AddSingleton(static _ => new SpanStringPools());
+        // The process's one rewrite gate, shared with the metric engine (#125): see AddAmetoMetrics.
+        services.TryAddSingleton<BackgroundRewriteGate>();
         services.AddSingleton(sp =>
             new TraceStorageEngine(
                 Path.Combine(dataDirectory, "traces"),
@@ -68,7 +71,8 @@ public static class TracingServiceExtensions
                 writeSegmentFormatV4,
                 indexEnabled,
                 TracesOptionsFrom(sp),
-                sp.GetRequiredService<SpanStringPools>()));
+                sp.GetRequiredService<SpanStringPools>(),
+                sp.GetRequiredService<BackgroundRewriteGate>()));
 
         // FIRST, SO IT STOPS LAST. Hosted services are stopped in reverse registration order, so
         // this one's StopAsync — the engine's teardown — runs after the drainer has handed over
