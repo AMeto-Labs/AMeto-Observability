@@ -225,6 +225,31 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         log.Note(ctx, new OutOfMemoryException("injected"));                  // AggregateException out of the logger, today
     }
 
+    /// <summary>
+    /// The test the receivers' <c>when</c> filters make allocates nothing (#126 review NEW-5): a throw
+    /// inside a filter is swallowed and reads as false, so an allocation there that itself ran out of
+    /// memory turned the 503 into a 500. A <c>foreach</c> over an AggregateException's inner
+    /// exceptions allocated an enumerator (56 B the first time, 32 B after).
+    /// </summary>
+    [Fact]
+    public void IsOutOfMemory_allocates_nothing()
+    {
+        var wrapped = new AggregateException(new InvalidOperationException("first"),
+                                             new AggregateException(new OutOfMemoryException("nested")));
+        var other   = new AggregateException(new InvalidOperationException("a"), new InvalidDataException("b"));
+        Assert.True(OtlpOutOfMemoryLog.IsOutOfMemory(wrapped));               // warm
+        Assert.False(OtlpOutOfMemoryLog.IsOutOfMemory(other));
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        bool yes = OtlpOutOfMemoryLog.IsOutOfMemory(wrapped);
+        bool no  = OtlpOutOfMemoryLog.IsOutOfMemory(other);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(yes);
+        Assert.False(no);
+        Assert.Equal(0, allocated);
+    }
+
     private sealed class ThrowingProvider : ILoggerProvider
     {
         public ILogger CreateLogger(string categoryName) => new Sink();

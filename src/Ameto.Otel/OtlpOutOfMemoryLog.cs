@@ -83,13 +83,22 @@ internal sealed class OtlpOutOfMemoryLog
     /// logger rethrows a provider's failure that way, so an OutOfMemoryException inside a log call a
     /// sink makes — the log ring's oversized-record warning, the span ring's ring-full warning —
     /// reaches the receivers wrapped, and was taken for a malformed payload.
+    ///
+    /// <para><b>It allocates nothing</b> (#126 review NEW-5). It runs in <c>when</c> filters, while
+    /// the batch's buffers are still held, and a throw inside a filter is swallowed and reads as
+    /// false — so an allocation here that itself ran out of memory turned the 503 into a 500 (HTTP)
+    /// or INVALID_ARGUMENT (gRPC). A <c>foreach</c> over the inner exceptions allocated an
+    /// enumerator; the collection is indexed instead.</para>
     /// </summary>
     internal static bool IsOutOfMemory(Exception ex)
     {
         if (ex is OutOfMemoryException) return true;
         if (ex is AggregateException aggregate)
-            foreach (var inner in aggregate.InnerExceptions)
-                if (IsOutOfMemory(inner)) return true;
+        {
+            var inner = aggregate.InnerExceptions;
+            for (int i = 0; i < inner.Count; i++)
+                if (IsOutOfMemory(inner[i])) return true;
+        }
         return false;
     }
 }
