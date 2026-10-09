@@ -1962,6 +1962,44 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         // What the wait costs is said, once: the five gone sources' events are served by nobody.
         Assert.Single(_log.Entries, e => e.Message.Contains(
             "5 of the 10 sources it lists are already gone, and their events are served by nobody", StringComparison.Ordinal));
+        // Yet the store is Available: what the disk holds for this release, as for any segment a newer
+        // build wrote (#119's rule), not a load left unfinished.
+        Assert.Equal(QueryAvailability.Available, _engine.Availability);
+    }
+
+    /// <summary>
+    /// A merge output nobody could read at the start, whose merge had committed and unlinked five of
+    /// its ten sources before it was interrupted: their events are in the output alone, and nobody
+    /// serves them until it is committed. The store said Available, and alert rules counted 300
+    /// events as the whole of 600. It is Degraded until the output is committed — what a scan that
+    /// leaves a segment unread for a reason that is not its bytes reports, seen from the other side,
+    /// since the sweep records such an output as deleted for the scan. The holder is the engine's
+    /// seam, so this runs on every platform.
+    /// </summary>
+    [Fact]
+    public async Task AWaitingOutputWhoseSourcesAreGone_LeavesTheStoreDegradedUntilItIsCommitted()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        await _engine.DisposeAsync();
+        Restore(snap, snap.Keys.Order(StringComparer.Ordinal).Take(5));   // killed after five of ten unlinks
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        Func<string, SegmentInfo> prove = null!;
+        await RestartWithSeamsAsync(e => { prove = e._proveMergeOutput; e._proveMergeOutput = p => throw Held(p); });
+        Assert.Equal(300, _engine.ListSegments().Sum(s => (long)s.EventCount));   // setup: the output waits
+        Assert.Equal(QueryAvailability.Degraded, _engine.Availability);           // Available: 300 counted as the whole
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);         // still unreadable
+        Assert.Equal(QueryAvailability.Degraded, _engine.Availability);
+
+        _engine._proveMergeOutput = prove;
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);         // read whole: committed
+        Assert.Equal(QueryAvailability.Available, _engine.Availability);
+        AssertSameEvents(before, ReadEverything());
     }
 
     /// <summary>

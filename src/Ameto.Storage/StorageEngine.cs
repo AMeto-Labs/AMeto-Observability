@@ -576,9 +576,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <para><see cref="QueryAvailability.Degraded"/> instead of Available after such a scan (#94):
     /// the task that did not complete successfully IS the record that the catalog is short, and it
     /// is final — nothing scans again before a restart. Degraded as well after a scan that left a
-    /// segment unread for a reason that is not its bytes (<see cref="_catalogScanShort"/>). A segment
-    /// set aside FOR its bytes (<c>.seg.corrupt</c>), or kept unread because a newer build wrote it,
-    /// does not make the store degraded: that is what the disk holds for this build, not a load left
+    /// segment unread for a reason that is not its bytes (<see cref="_catalogScanShort"/>), and while
+    /// a merge output nobody could read for such a reason holds the only copy of events a committed
+    /// merge unlinked the sources of (<see cref="_unservedMergeOutputCount"/>). A segment set aside
+    /// FOR its bytes (<c>.seg.corrupt</c>), or kept unread because a newer build wrote it, does not
+    /// make the store degraded: that is what the disk holds for this build, not a load left
     /// unfinished.</para>
     ///
     /// <para><see cref="QueryAvailability.Closed"/> from <see cref="_writesClosed"/>, the first
@@ -586,13 +588,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// until <see cref="_snapshotsClosed"/>, after which <see cref="SnapshotTiers"/> THROWS rather
     /// than answering — but past it nothing a caller acts on is worth reading.</para>
     ///
-    /// <para>Four volatile reads at most (the task's state is two), no lock, no allocation.</para>
+    /// <para>Five volatile reads at most (the task's state is two), no lock, no allocation.</para>
     /// </summary>
     public QueryAvailability Availability =>
         Volatile.Read(ref _writesClosed) != 0 ? QueryAvailability.Closed
       : !_catalogLoad.IsCompleted             ? QueryAvailability.Loading
       : !_catalogLoad.IsCompletedSuccessfully
-        || Volatile.Read(ref _catalogScanShort) != 0 ? QueryAvailability.Degraded
+        || Volatile.Read(ref _catalogScanShort) != 0
+        || Volatile.Read(ref _unservedMergeOutputCount) != 0 ? QueryAvailability.Degraded
       :                                         QueryAvailability.Available;
 
     /// <summary>
@@ -3953,7 +3956,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // counted (and the list set aside), so the sources it listed are free to merge.
         if (File.Exists(output) && new FileInfo(manifest).Length == 0)
         {
-            _undecidedMergeOutputs.TryRemove(output, out _);
+            LetGoOfMergeOutput(output);
             if (FirstMergeOutputWarning("torn", output))
                 _logger.LogWarning(
                     "Merge recovery: the manifest of {File} is empty — an earlier sweep found the output torn and could " +
@@ -3967,14 +3970,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         {
             case MergeOutputState.Absent:
                 // Never committed (or gone since): the sources are the only copy, free to merge.
-                _undecidedMergeOutputs.TryRemove(output, out _);
+                LetGoOfMergeOutput(output);
                 _deleteMergeManifest(manifest);
                 _outputsWithKeptManifest.TryRemove(output, out _);
                 ForgetMergeOutputWarnings(output);
                 return;
             case MergeOutputState.Torn:
                 RecoverTornMerge(manifest, output);
-                _undecidedMergeOutputs.TryRemove(output, out _);
+                LetGoOfMergeOutput(output);
                 return;
             case MergeOutputState.Unknown:
                 DeferMergeVerdict(manifest, output, unreadable!, newer: false);
@@ -3993,7 +3996,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                         "this release reads, and every source it lists is still on disk — the merge is rolled back: the " +
                         "sources stay in service and the output is set aside as .corrupt", Path.GetFileName(output));
                     RecoverTornMerge(manifest, output);
-                    _undecidedMergeOutputs.TryRemove(output, out _);
+                    LetGoOfMergeOutput(output);
                 }
                 else DeferMergeVerdict(manifest, output, unreadable!, newer: true);
                 return;
@@ -4096,7 +4099,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // The verdict carried out: every source the manifest lists is out of the catalog — taken out,
         // parked or gone; a different segment at a listed path is not one — so none of them can be
         // merged any more, and the span is let go.
-        _undecidedMergeOutputs.TryRemove(output, out _);
+        LetGoOfMergeOutput(output);
         if (committed)
         {
             if (displaced is not null && !IsTheSameSegment(displaced, proved!)) LogDisplacedLocalSegment(proved!, displaced);
@@ -4242,6 +4245,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private readonly ConcurrentDictionary<string, (long Min, long Max)> _undecidedMergeOutputs = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Waiting merge outputs that hold the only copy of some events: nobody could read the output
+    /// for a reason that is not its bytes, and the merge had committed and unlinked some of the
+    /// sources it lists before it was interrupted (L1's "served by nobody"). While one is here the
+    /// store is <see cref="QueryAvailability.Degraded"/> (<see cref="Availability"/>), as after a scan
+    /// that left a segment unread for such a reason — the same short catalog, which the scan never
+    /// sees because the sweep records the output as deleted for it. Not for an output in a newer
+    /// format, kept for a release that reads it: what the disk holds for this build (#119's rule).
+    /// Added by the sweep that defers the verdict, at a start before the scan's task completes, and
+    /// taken out with the pin when the verdict is carried out (<see cref="LetGoOfMergeOutput"/>).
+    /// <see cref="_unservedMergeOutputCount"/> is what <see cref="Availability"/> reads.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _unservedMergeOutputs = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The size of <see cref="_unservedMergeOutputs"/>, for <see cref="Availability"/>'s lock-free read.</summary>
+    private int _unservedMergeOutputCount;
+
+    /// <summary>Lets go of a merge output whose verdict is carried out: its pin, and its mark as unserved.</summary>
+    private void LetGoOfMergeOutput(string output)
+    {
+        _undecidedMergeOutputs.TryRemove(output, out _);
+        if (_unservedMergeOutputs.TryRemove(output, out _)) Interlocked.Decrement(ref _unservedMergeOutputCount);
+    }
+
+    /// <summary>
     /// Reads a merge manifest for the recovery sweep: File.ReadAllLines, except in a test that swaps
     /// in the refusal of a holder that shares nothing, which only Windows' share modes produce on
     /// disk. With <see cref="_deleteMergeManifest"/> and <see cref="_proveMergeOutput"/>, it lets
@@ -4269,7 +4296,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     ///
     /// <para>Said once at Warning, with what the wait costs: the events of a listed source already
     /// gone (the merge committed and unlinked it before it was interrupted) exist only in this output,
-    /// and nobody serves them until it is committed.</para>
+    /// and nobody serves them until it is committed. Unless the output is in a newer format, the store
+    /// is Degraded meanwhile (<see cref="_unservedMergeOutputs"/>).</para>
     /// </summary>
     private void DeferMergeVerdict(string manifest, string output, Exception unreadable, bool newer)
     {
@@ -4282,6 +4310,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
         string until = newer ? "a release that reads its format commits the merge" : "a sweep can read it";
         var (listed, missing) = CountListedSources(manifest, output);
+        if (missing > 0 && !newer && _unservedMergeOutputs.TryAdd(output, 0))
+            Interlocked.Increment(ref _unservedMergeOutputCount);   // Degraded until it is committed
         if (missing > 0)
             _logger.LogWarning(unreadable,
                 "Merge recovery: the output {File} of an interrupted merge cannot be read here; it stays out of service " +
