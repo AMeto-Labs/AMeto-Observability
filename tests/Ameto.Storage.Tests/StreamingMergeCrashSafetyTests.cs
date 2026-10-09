@@ -1900,7 +1900,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// while the manifest still lived (a local source held). The sweep took out whatever the
     /// catalog named at the listed path: its 30 events gone, and nothing said. Every source the
     /// merge read lies inside the time span its output's name carries; this one, 40 s past it, does
-    /// not. It stays in service, the manifest no longer waits for it, and an Error names it, once.
+    /// not. It stays in service, the manifest no longer waits for it, and an Error names it, once per
+    /// process — at a pass by its catalog entry, at a start (before the scan names anything) by its
+    /// own header.
     /// </summary>
     [Fact]
     public async Task ADifferentSegmentPushedUnderAMergedReplicasKey_StaysInService()
@@ -1930,6 +1932,14 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);    // the manifest still waits for the held source
         Assert.Single(_log.Entries, NamesIt);                             // said once
+
+        // A start while the manifest lives: its sweep runs before the scan, with nothing in the catalog
+        // to tell the stranger by, and used to unlink it as a source. Its own header tells it apart.
+        await RestartWithSeamsAsync(e => e._deleteSegmentFile = UnlinkRefusing(held));
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == stranger);   // unlinked by the start
+        Assert.Single(Manifests());
+        AssertSameEvents(before, ReadEverything());
+        Assert.Single(_log.Entries, NamesIt);
 
         _engine._deleteSegmentFile = File.Delete;                         // let go: the manifest goes without it
         Assert.Equal(0, _engine.RetryPendingSegmentDeletes());

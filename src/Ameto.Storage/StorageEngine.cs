@@ -3887,9 +3887,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// second node configured with one can push a new segment under it. Taken out, its events were
     /// gone without a word. Every source the merge read lies inside the time span its output's
     /// name carries, built from theirs, so an entry outside it is left in service, the manifest no
-    /// longer waits for it, and an Error names it (<see cref="LogForeignListedSegments"/>). One
-    /// written inside that span is still taken out: telling it apart would take each source's
-    /// header fields in the manifest.</para>
+    /// longer waits for it, and an Error names it (<see cref="LogForeignListedSegments"/>). A start's
+    /// sweep, which runs before its scan names anything, tests a listed file on disk by its own
+    /// header instead (<see cref="ListedFileOutsideSpan"/>). One written inside that span is still
+    /// taken out: telling it apart would take each source's header fields in the manifest.</para>
     ///
     /// <para>Deciding on the output alone holds only while the output stays where its manifest
     /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
@@ -4023,9 +4024,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         var keys    = new SegmentKey[sources.Count];
         var unlink  = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
         var guarded = new bool[sources.Count];
-        var foreign = new bool[sources.Count];      // a different segment served at a listed path: not this manifest's
+        var foreign = new bool[sources.Count];      // a different segment at a listed path: not this manifest's
         var span    = SpanOfMergeOutputName(output);
         for (int i = 0; i < keys.Length; i++) keys[i] = KeyOfSegmentFileName(sources[i]);
+
+        // A listed file on disk that the catalog does not name — every one, at a start, whose sweep
+        // runs before its scan — is tested by its own header, as a named one is by its entry below:
+        // a different segment registered under a merged replica's key in an earlier run was otherwise
+        // unlinked by the next start. Read before the locks, which an import waits on; a file the
+        // catalog names by the time they are taken is tested by its entry instead.
+        var outsideOnDisk = new bool[sources.Count];
+        for (int i = 0; i < sources.Count; i++)
+        {
+            if (_pendingSegmentDeletes.ContainsKey(sources[i])) continue;
+            if (_segments.TryGetValue(keys[i], out var named0)
+                && string.Equals(named0.FilePath, sources[i], StringComparison.OrdinalIgnoreCase)) continue;
+            outsideOnDisk[i] = ListedFileOutsideSpan(sources[i], span);
+        }
 
         SegmentInfo? displaced = null;
         bool         committed = false;
@@ -4060,6 +4075,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                     // sources, entry first (see RecoverInterruptedMerges). One still parked stays its
                     // park's to unlink, once no entry names it.
                     (named ??= []).Add((i, entry));
+                }
+                else if (outsideOnDisk[i])
+                {
+                    foreign[i] = true;
+                    continue;
                 }
                 if (!parked) unlink[i] = sources[i];
             }
@@ -4140,8 +4160,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
-    /// Says, once per output and at Error, which listed paths the catalog serves as a segment the
-    /// merge never read (see <see cref="RecoverInterruptedMerge"/>): two segments were written under
+    /// Whether the segment file at a listed path lies outside the time span of the merge that listed
+    /// it, read from its own header: a different segment under a source's name (see
+    /// <see cref="RecoverInterruptedMerge"/>). False when there is no span to test against, and when
+    /// the file is gone or cannot be read — a torn source still goes as a source did.
+    /// </summary>
+    private static bool ListedFileOutsideSpan(string path, (long Min, long Max) span)
+    {
+        if (span == (long.MinValue, long.MaxValue) || !File.Exists(path)) return false;
+        try
+        {
+            using var reader = SegmentReader.Open(path);
+            return reader.Info.MinTimestampTicks < span.Min || reader.Info.MaxTimestampTicks > span.Max;
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>
+    /// Says, once per output and at Error, which listed paths hold a segment the merge never read
+    /// (see <see cref="RecoverInterruptedMerge"/>): two segments were written under
     /// one node id and segment id, the deployment error <see cref="LogDisplacedLocalSegment"/> names
     /// for an import. A duplicate NodeId writing inside the merge's own time span is not told apart
     /// here: that would take each source's header fields in the manifest.
@@ -4153,9 +4190,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             if (foreign[i]) (names ??= []).Add(Path.GetFileName(sources[i]));
         if (names is null || !FirstMergeOutputWarning("foreign", output)) return;
         _logger.LogError(
-            "Merge recovery: the manifest of {Output} lists {Files}, and the catalog serves a different segment under " +
-            "that name — its time span lies outside the one the merge read. Two segments were written under one node " +
-            "id and segment id: a node reinstalled with its NodeId and its segment ids restarted, or two nodes " +
+            "Merge recovery: the manifest of {Output} lists {Files}, and a different segment is there under that " +
+            "name — its time span lies outside the one the merge read. Two segments were written under one node id " +
+            "and segment id: a node reinstalled with its NodeId and its segment ids restarted, or two nodes " +
             "configured with one NodeId. It is left in service, and the manifest no longer waits for it",
             Path.GetFileName(output), string.Join(", ", names));
     }
