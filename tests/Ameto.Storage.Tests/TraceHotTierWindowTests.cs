@@ -984,6 +984,80 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// THE WALK'S POOLED BUFFERS STAY OFF THE LARGE-OBJECT HEAP, HOWEVER MANY OUTLIERS (#128 review
+    /// F2). The walk used to keep each outlier as a one-span block of 32 bytes in the blocks' own
+    /// buffer, sized by every outlier the runs held: at one span in 25 skewed, 1 960 outliers, the
+    /// pool rounded it up to 4 096 entries, 128 KB, on the LOH — allocated there at every first rent
+    /// per pool slot and every rent after a trim. Blocks are 24 bytes again and their buffer the
+    /// tier's block count; the window's outliers have a buffer of 16-byte entries of their own.
+    /// </summary>
+    [Fact]
+    public void The_walks_pooled_buffers_stay_off_the_large_object_heap_however_many_outliers()
+    {
+        using var engine = NewEngine();
+        var items = TraceAggregateLockProbe.Corpus(0, 49_000);
+        for (int i = 12; i < items.Length; i += 25) items[i] = At(items[i], items[i].StartTimeUnixNano + 30_000_000_000L);
+        Write(engine, [.. items]);
+        long blockBytes = -1, outlierBytes = -1;
+        engine._hotSearchRentedForTest = (b, o) => { blockBytes = b; outlierBytes = o; };
+
+        var (n, sync, _) = SearchSynchronously(engine, null, null, limit: 2_000);
+
+        Assert.True(sync);
+        Assert.Equal(2_000, n);
+        Assert.Equal(1_960, engine.HotOutliersForTest);
+        _out.WriteLine($"rented: blocks {blockBytes:N0} B, outliers {outlierBytes:N0} B");
+        Assert.True(blockBytes < 85_000, $"the blocks' buffer is {blockBytes:N0} bytes, on the large-object heap");
+        Assert.True(outlierBytes < 85_000, $"the outliers' buffer is {outlierBytes:N0} bytes, on the large-object heap");
+    }
+
+    /// <summary>
+    /// ...AND WITH A FLUSH IN FLIGHT AND BOTH RUNS' LISTS AT THEIR CAPS. A page then has two lists'
+    /// outliers in its window, 8 192: in one buffer of 16-byte entries that is 128 KB, on the LOH; one
+    /// buffer per run keeps each at a list's cap, 64 KB.
+    /// </summary>
+    [Fact]
+    public void The_walks_pooled_buffers_stay_off_the_large_object_heap_with_both_runs_lists_full()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. SkewedOneIn(TraceAggregateLockProbe.Corpus(0, 45_000), 10)]);
+
+        using var parked  = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        engine._beforeSegmentWrite = () => { parked.Set(); release.Wait(HangGuard); };
+        engine.FlushIfDue();
+        Assert.True(parked.Wait(HangGuard), "the flush never reached its segment build");
+        try
+        {
+            Write(engine, [.. SkewedOneIn(TraceAggregateLockProbe.Corpus(45_000, 45_000), 10)]);
+            Assert.Equal(2 * SpanStartIndex.MaxOutliers, engine.HotOutliersForTest);
+            long blockBytes = -1, outlierBytes = -1;
+            engine._hotSearchRentedForTest = (b, o) => { blockBytes = b; outlierBytes = o; };
+
+            var (n, sync, _) = SearchSynchronously(engine, null, null, limit: 2_000);
+
+            Assert.True(sync);
+            Assert.Equal(2_000, n);
+            _out.WriteLine($"rented: blocks {blockBytes:N0} B, outliers {outlierBytes:N0} B a run");
+            Assert.True(blockBytes < 85_000, $"the blocks' buffer is {blockBytes:N0} bytes, on the large-object heap");
+            Assert.True(outlierBytes < 85_000, $"a run's outlier buffer is {outlierBytes:N0} bytes, on the large-object heap");
+        }
+        finally
+        {
+            release.Set();
+            engine.WaitForFlushForTest();
+            engine._beforeSegmentWrite = null;
+        }
+    }
+
+    /// <summary>One span in <paramref name="oneIn"/> 30 s ahead of its neighbours.</summary>
+    private static SpanIngestItem[] SkewedOneIn(SpanIngestItem[] items, int oneIn)
+    {
+        for (int i = oneIn / 2; i < items.Length; i += oneIn) items[i] = At(items[i], items[i].StartTimeUnixNano + 30_000_000_000L);
+        return items;
+    }
+
+    /// <summary>
     /// A LIST PAGE MAKES ROWS ONLY FOR WHAT IT RETURNS. 2 000 traces in three services, a page of 100:
     /// every trace is merged — the filters and the cold walk's cap need all of them — but the row (a
     /// TraceSummary, its services array) and the root's HTTP method and path (a walk of its attribute

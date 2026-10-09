@@ -134,8 +134,12 @@ public sealed class FileBoundsConventionTests
             "copies the open-run map already in memory; not a capacity",
         ["TraceStorageEngine.cs:var live = new HashSet<ulong>(_manifest.Segments.Keys)"] =
             "copies the catalog's key set already in memory; not a capacity",
-        ["TraceStorageEngine.HotTierReads.cs:var blocks = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, capacity))"] =
-            "capacity is the block count of the two in-memory unflushed runs, one line above (#94)",
+        ["TraceStorageEngine.HotTierReads.cs:var blocks      = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, BlockCount(flushing.Length, flushingStarts) + BlockCount(hot.Length, hotStarts)))"] =
+            "the block count of the two in-memory unflushed runs (#94)",
+        ["TraceStorageEngine.HotTierReads.cs:var flushingOut = ArrayPool<HotOutlier>.Shared.Rent(Math.Max(1, OutliersIn(flushingStarts, match.FromNano, match.ToNano)))"] =
+            "the in-window outliers of the snapshot's in-memory start index, never past its cap (#127)",
+        ["TraceStorageEngine.HotTierReads.cs:var hotOut      = ArrayPool<HotOutlier>.Shared.Rent(Math.Max(1, OutliersIn(hotStarts,      match.FromNano, match.ToNano)))"] =
+            "the in-window outliers of the live tier's in-memory start index, never past its cap (#127)",
         ["TraceStorageEngine.HotTierReads.cs:var grown = new PriorityQueue<SpanRecord, HotKey>(capacity)"] =
             "capacity is the hot pass's own heap size from NextHeapCapacity, never past the page's limit; no file (#122)",
     };
