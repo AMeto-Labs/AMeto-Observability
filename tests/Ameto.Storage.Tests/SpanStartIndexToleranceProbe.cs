@@ -29,15 +29,22 @@ namespace Ameto.Storage.Tests;
 /// </summary>
 public sealed class SpanStartIndexToleranceProbe : IDisposable
 {
+    // The suite runs this in Debug on every build: a tenth of the tier, and only the values the index
+    // ships with against none (#128 review F5). The numbers in the commit bodies are Release's.
 #if DEBUG
-    private const int Spans = 20_000;
+    private const int  Spans = 5_000;
+    private const long Deep  = 1_000_000_000L;    // the list page's depth below the newest on-time span
+    private static readonly long[] Tolerances = [SpanStartIndex.ToleranceNanos, long.MaxValue];
+    private static readonly int[]  Runs       = [SpanStartIndex.ShiftAfter, int.MaxValue];
 #else
-    private const int Spans = 49_000;
+    private const int  Spans = 49_000;
+    private const long Deep  = 10_000_000_000L;
+    private static readonly long[] Tolerances = [500_000_000L, 1_000_000_000L, 2_000_000_000L, 5_000_000_000L, 10_000_000_000L, long.MaxValue];   // the last: every span widens its block, as before #127
+    private static readonly int[]  Runs       = [2, 3, 4, 8, 16, int.MaxValue];
 #endif
     private static readonly DateTimeOffset Base = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset From = Base.AddMinutes(-1);
     private static readonly DateTimeOffset To   = Base.AddDays(1);
-    private static readonly long[] Tolerances = [500_000_000L, 1_000_000_000L, 2_000_000_000L, 5_000_000_000L, 10_000_000_000L, long.MaxValue];   // the last: every span widens its block, as before #127
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-tolerance-" + Guid.NewGuid().ToString("N"));
     private readonly ITestOutputHelper _out;
@@ -112,7 +119,7 @@ public sealed class SpanStartIndexToleranceProbe : IDisposable
         _out.WriteLine($"  {"arrival order",-26} {"run",5} {"outliers",9} {"traceql p0",11} {"p1-5 max",9} {"list",7} {"window",7}");
         foreach (var (name, items) in shapes)
         {
-            foreach (int run in (int[])[2, 3, 4, 8, 16, int.MaxValue])
+            foreach (int run in Runs)
             {
                 SpanStartIndex.ShapeForTest = (SpanStartIndex.ToleranceNanos, SpanStartIndex.MaxOutliers, run);
                 var (outliers, page0, deeper, list, window, _, _) = Measure(items);
@@ -161,8 +168,8 @@ public sealed class SpanStartIndexToleranceProbe : IDisposable
             cursor = got.Min(static s => s.StartTimeUnixNano);
         }
 
-        // Ten seconds below the newest on-time start, whatever runs ahead of it.
-        long ceiling = Base.ToUnixTimeMilliseconds() * 1_000_000L + (Spans - 1) * 1_000_000L - 10_000_000_000L;
+        // Deep below the newest on-time start (ten seconds in Release), whatever runs ahead of it.
+        long ceiling = Base.ToUnixTimeMilliseconds() * 1_000_000L + (Spans - 1) * 1_000_000L - Deep;
         engine.GetTraceListAsync(From, DateTimeOffset.FromUnixTimeMilliseconds(ceiling / 1_000_000L), null, null, null, null, null, 500)
               .GetAwaiter().GetResult();
         int window = items.Count(s => s.StartTimeUnixNano <= ceiling);
