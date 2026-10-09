@@ -1718,9 +1718,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // held any row. The hook still gets the attached text; the WAL never stores it.
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
+        // The service is logged the way the header holds it, by pool index, and its text goes into
+        // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
+        // flush resolves it, so a replayed event carries the service the flushed one would have.
+        string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception);
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception,
+                          h.ServiceNamePoolIndex, svcStr);
             _walFaulted = false;
         }
         catch (ObjectDisposedException)
@@ -5262,7 +5267,35 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private void ReplayOrphanedWal(string walFile)
     {
         string poolPath   = walFile + ".pool";
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
+        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version, out bool recordsEntries);
+
+        // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
+        // here. Cleaning it up as the branch below does with what it cannot read is what every
+        // release before log WAL v5 does to a v5 log, and it throws away every acknowledged event
+        // the log holds. Left in place, the release that wrote it replays it when it starts again.
+        // Its block is reserved all the same, so nothing written meanwhile takes the ids that
+        // replay will write into; and this runs again at every start for as long as it stays.
+        //
+        // Kept whether or not its header records entries — this release cannot read the rest of it —
+        // but only a log that may hold events is an Error. The other kind is what the most common
+        // rollback leaves: the empty log of a clean stop. Reported as holding events, it raised an
+        // Error at every start, for a preallocated file nobody could tell was empty.
+        if (version > WriteAheadLog.FormatVersion)
+        {
+            ReserveWalBlock(segId);
+            if (recordsEntries)
+                _logger.LogError(
+                    "WAL {File} is format v{Version}, newer than this release reads (v{Current}): left in place, not " +
+                    "replayed. Its events come back when the release that wrote it starts again; delete the file and " +
+                    "its .pool only to give them up.",
+                    walFile, version, WriteAheadLog.FormatVersion);
+            else
+                _logger.LogInformation(
+                    "WAL {File} is format v{Version}, newer than this release reads (v{Current}); its header records " +
+                    "no entries — the log a clean stop of that release leaves. Left in place for the release that wrote it.",
+                    walFile, version, WriteAheadLog.FormatVersion);
+            return;
+        }
 
         // Empty or corrupt WAL — clean up
         if (segId == 0 || entries.Count == 0)
@@ -5342,16 +5375,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
                 MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
-                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
-                // the only honest value — but the field is a plain int on a struct, and its
-                // default of 0 is a VALID pool index, not the sentinel every reader tests for
-                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
-                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
-                // ordinarily this WAL's first template: every recovered event was stamped with
-                // it, and the flush below wrote that string permanently into the recovery
-                // segment's @svc column, where it answers @service queries and skews
-                // per-service counts.
-                ServiceNamePoolIndex     = -1,
+                // The service the event was logged with (WAL v5): its pool index, whose text
+                // is one of the rows force-interned above — templates and services share the
+                // pool — so the flush below resolves it to the string a normal flush would
+                // have written, in the @svc column every @service filter, index bucket and
+                // event JSON reads. -1 when there is none to give back: the event had no
+                // service, the entry is older than v5, or this WAL's pool file lost the row
+                // (then the slot holds whatever the live pool has there, so it is not read).
+                //
+                // Never left unset: the field is a plain int on a struct, and its default of 0
+                // is a VALID pool index, not the sentinel every reader tests for
+                // (`ServiceNamePoolIndex >= 0`). Slot 0 is ordinarily this WAL's first
+                // template, and that is what every recovered event was once stamped with,
+                // permanently, in its segment's @svc column.
+                ServiceNamePoolIndex     = entry.ServiceIndexIn(pool),
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.

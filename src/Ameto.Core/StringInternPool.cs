@@ -363,9 +363,27 @@ public sealed class StringInternPool
         }
     }
 
-    /// <summary>Restores a known index→template mapping during WAL recovery.</summary>
+    /// <summary>
+    /// Restores a known index→string mapping during WAL recovery — a template's or a service's.
+    ///
+    /// <para>The slot may already hold ANOTHER string: two orphaned WALs left by different
+    /// processes number their strings independently, and the replay restores one after the other.
+    /// That string's reverse entry would still name this index, and the next Intern of it — a live
+    /// event — would be handed an index that now resolves to <paramref name="template"/>. For a
+    /// service, which travels as the index alone, that files every such event under the other
+    /// WAL's service until the process restarts. So the stale entry goes, and a later Intern of the
+    /// string claims a fresh index. (Only the replay calls this, before ingest starts, and it
+    /// flushes each WAL's events before the next WAL's rows arrive: nothing still holds the index
+    /// for the old string.)</para>
+    /// </summary>
     public void ForceIntern(int index, string template)
     {
+        var slots = _indexToString;
+        if ((uint)index < (uint)slots.Length
+            && slots[index] is { } previous
+            && !string.Equals(previous, template, StringComparison.Ordinal))
+            _stringToIndex.TryRemove(new KeyValuePair<string, int>(previous, index));   // only while it still names this slot
+
         // The array is bounded by the cap; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
         _stringToIndex[template] = index;

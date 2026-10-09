@@ -10,11 +10,11 @@ namespace Ameto.Storage;
 /// <summary>
 /// Write-Ahead Log backed by a memory-mapped file.
 ///
-/// Format:
+/// Format (v5):
 ///   [WAL Header   — 32 bytes]
 ///   [Entry 0 …]
-///     [Entry Header — 24 bytes: payloadLen uint32, timestamp int64, level byte, flags byte,
-///      templateIndex uint16, exceptionLen uint32, crc32c uint32]
+///     [Entry Header — 26 bytes: payloadLen uint32, timestamp int64, level byte, flags byte,
+///      templateIndex uint16, exceptionLen uint32, serviceIndex uint16, crc32c uint32]
 ///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
 ///   [Entry 1 …]
 ///   ...
@@ -25,13 +25,25 @@ namespace Ameto.Storage;
 ///           no pool row was written, and the template TEXT is not in the WAL at all, so
 ///           recovery yields the event with no template. Without the bit, a replay whose pool
 ///           file held any row resolved index 0 and gave the event index 0's template.
+///   bit 1 — Service (v5): serviceIndex is the event's <c>@service</c>, an index into the same
+///           intern pool the template's is, and the index's text is a row of the companion pool
+///           file, written the first time this WAL logs the index. Without the bit the event has
+///           no service and serviceIndex is 0 and meaningless: all 65 536 values are real pool
+///           ids, so the index alone cannot say "none" — the same reason the template has a flag.
 ///   Other bits are reserved and written as zero.
-/// The byte was unwritten padding before this flag existed, and the format is still v4: the
-/// previous build never set it, and the engine opens every WAL as a fresh file named after a
-/// newly reserved segment block and extends it with SetLength, which zero-fills. Entries that
+/// The byte was unwritten padding before the Unpooled flag existed, and the format stayed v4 for
+/// it: the build before never set it, and the engine opens every WAL as a fresh file named after
+/// a newly reserved segment block and extends it with SetLength, which zero-fills. Entries that
 /// build wrote therefore read back with no flag and replay exactly as they did. (Only a
 /// same-name reopen that reset the write offset over older entries could leave a stale byte
-/// there, and the engine never reuses a WAL name.) Append now writes the byte explicitly.
+/// there, and the engine never reuses a WAL name.) Append writes the byte explicitly.
+///
+/// The service needed a FIELD, not only a bit, so it is a new format (see WalVersion). Before it,
+/// an event's service lived in its header alone — the hot tier's, and the segment's once flushed —
+/// and an event replayed out of a WAL came back with none: an OTLP event's resource service.name,
+/// a CLEF event's @service. A v4 file still replays, its events without a service, as they always
+/// did; the previous releases cannot read a v5 file (docs/CONFIGURATION.md, Upgrading and rolling
+/// back).
 ///
 /// The WAL is append-only. On crash recovery, the storage layer replays complete entries
 /// and rebuilds the hot-tier up to the last entry whose checksum verifies.
@@ -54,16 +66,24 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // in arbitrary order, so after power loss the header's WriteOffset can cover pages
     // that never made it — which parse as garbage (or, worse, as endless zero-length
     // entries). The checksum turns that into a clean stop at the last durable entry.
-    // v3 files remain READABLE in recovery (no checksum validation); new files are v4.
-    private const ushort WalVersion       = 4;
-    private const ushort WalVersionV3     = 3;
-    private const int    FileHeaderSize   = 32;
-    private const int    EntryHeaderSize  = 24;
+    // v5: the entry carries the event's service — a 16-bit pool index ahead of the checksum,
+    // and the Service flag — so a replayed event gets its @service back (#111). The header
+    // grows 24 → 26 bytes; the checksum is still its last field and covers everything before it.
+    // v4 and v3 files remain READABLE in recovery (v3 without checksum validation, neither with
+    // a service); new files are v5.
+    private const ushort WalVersion        = 5;
+    private const ushort WalVersionV4      = 4;
+    private const ushort WalVersionV3      = 3;
+    private const int    FileHeaderSize    = 32;
+    private const int    EntryHeaderSize   = 26;
+    private const int    EntryHeaderSizeV4 = 24;
     private const int    EntryHeaderSizeV3 = 20;
     // Bytes of the entry header covered by the checksum (everything except the crc itself).
     private const int    ChecksummedHeaderBytes = EntryHeaderSize - 4;
-    // WalEntryHeader.Flags: the event's template is outside the pool (see the class doc).
+    // WalEntryHeader.Flags (see the class doc): the event's template is outside the pool …
     private const byte   EntryFlagUnpooled = 0x01;
+    // … and the event has a service, named by ServiceIndex (v5).
+    private const byte   EntryFlagService  = 0x02;
 
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -79,7 +99,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // Pack = 1 is essential: without it TimestampTicks aligns to 8, pushing
     // ExceptionLength past the intended stride and straight into the payload area
     // (the v2 corruption described at WalVersion). Packed, the fields occupy exactly
-    // 4+8+1+1+2+4+4 = 24 bytes, with Checksum LAST so the checksum covers [0, 20).
+    // 4+8+1+1+2+4+2+4 = 26 bytes, with Checksum LAST so the checksum covers [0, 22).
+    // v4 and v3 share the first 20 bytes; v4 kept its checksum at [20, 24), where v5 has the
+    // service index, and v3 had none — so the parser reads the checksum by offset, not by field.
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = EntryHeaderSize)]
     private struct WalEntryHeader
     {
@@ -89,8 +111,19 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         public byte   Flags;           // EntryFlag* bits; was never-written padding (see the class doc)
         public ushort TemplateIndex;   // index into companion .pool file; 0 and meaningless when Unpooled
         public uint   ExceptionLength; // bytes of msgpack ExceptionInfo appended after payload
-        public uint   Checksum;        // CRC32C over header[0..20) + payload + exception (v4+)
+        public ushort ServiceIndex;    // v5: @service's index into the same pool; 0 and meaningless without the Service flag
+        public uint   Checksum;        // CRC32C over header[0..22) + payload + exception
     }
+
+    /// <summary>The entry layouts recovery reads: this format's and the two before it.</summary>
+    private enum EntryLayout : byte { V3, V4, V5 }
+
+    private static int HeaderSizeOf(EntryLayout layout) => layout switch
+    {
+        EntryLayout.V3 => EntryHeaderSizeV3,
+        EntryLayout.V4 => EntryHeaderSizeV4,
+        _              => EntryHeaderSize,
+    };
 
     // ── State ────────────────────────────────────────────────────────────────
     private readonly string              _filePath;
@@ -112,7 +145,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private readonly object              _writeLock = new();
     private          FileStream?          _poolStream;
     private          bool                 _poolDirty;
-    private readonly bool[]               _savedTemplateIndices = new bool[65536];
+    // Pool indices this WAL has written a row for — template or service: they share one intern
+    // pool, so an index names one string whichever of the two it is, and one row serves both.
+    private readonly bool[]               _savedPoolRows = new bool[65536];
     private readonly object               _poolLock = new();
 
     public string PoolPath => _filePath + ".pool";
@@ -161,10 +196,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             if (hdr.Magic != MagicNumber || hdr.Version != WalVersion)
             {
-                // Unknown or older version: live appends need the v4 layout, and pre-v3
+                // Unknown or older version: live appends need the v5 layout, and pre-v3
                 // entries are unreplayable by construction — reinitialise in place.
-                // (Orphaned v3 files are still replayed by ReadForRecovery, which handles
-                // the old stride; this path is a same-name reopen, which recovery precedes.)
+                // (Orphaned v4 and v3 files are still replayed by ReadForRecovery, which handles
+                // their strides; this path is a same-name reopen, which recovery precedes.)
                 hdr.Magic       = MagicNumber;
                 hdr.Version     = WalVersion;
                 hdr.NodeId      = nodeId.Value;
@@ -213,12 +248,29 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// flag with index 0, and <paramref name="template"/> is ignored, so no pool row is written
     /// for it. Recovery then yields that event with no template.
     /// </param>
-    public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
+    /// <param name="serviceIndex">
+    /// The event's <c>@service</c>, as <see cref="LogEventHeader.ServiceNamePoolIndex"/> holds it:
+    /// an index into the same pool. -1, or anything else outside <c>[0, 65 535]</c>, logs the event
+    /// with no service — the hot tier has nothing else to resolve a service from either.
+    /// </param>
+    /// <param name="service">
+    /// The text at <paramref name="serviceIndex"/>, written as a pool row the first time this WAL
+    /// logs that index. Null or empty writes none; recovery then gives the event no service unless
+    /// another of this WAL's events wrote the row.
+    /// </param>
+    public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload,
+                              ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null)
     {
         // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
         bool   pooled = (uint)templateIndex <= ushort.MaxValue;
         ushort index  = pooled ? (ushort)templateIndex : (ushort)0;
-        if (pooled) EnsureTemplateInPool(index, template);
+        if (pooled) EnsurePoolRow(index, template);
+
+        // The same compare for the service, whose "outside the pool" is simply "none": a full pool
+        // answers -1 at ingest and the header keeps no text for it, unlike the template.
+        bool   hasService = (uint)serviceIndex <= ushort.MaxValue;
+        ushort svcIndex   = hasService ? (ushort)serviceIndex : (ushort)0;
+        if (hasService) EnsurePoolRow(svcIndex, service);
 
         ReadOnlySpan<byte> excBytes = default;
         if (exception is not null)
@@ -253,11 +305,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             eh.PayloadLength   = (uint)payload.Length;
             eh.TimestampTicks  = timestampTicks;
             eh.Level           = (byte)level;
-            // Written explicitly, set or not: the bytes under a reset write offset are not
-            // guaranteed zero, and the checksum below covers whatever is here.
-            eh.Flags           = pooled ? (byte)0 : EntryFlagUnpooled;
+            // Written explicitly, set or not, like ServiceIndex below: the bytes under a reset
+            // write offset are not guaranteed zero, and the checksum below covers whatever is here.
+            eh.Flags           = (byte)((pooled ? 0 : EntryFlagUnpooled) | (hasService ? EntryFlagService : 0));
             eh.TemplateIndex   = index;
             eh.ExceptionLength = (uint)excBytes.Length;
+            eh.ServiceIndex    = svcIndex;
 
             // Checksum the header bytes (crc field excluded — it is the last 4 bytes)
             // plus both data spans, BEFORE copying them: same bytes, and the header part
@@ -280,15 +333,21 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         }
     }
 
-    private void EnsureTemplateInPool(ushort index, string template)
+    /// <summary>
+    /// Writes the pool row <paramref name="index"/> → <paramref name="text"/> unless this WAL already
+    /// has. The row is in the OS before the entry that needs it is in the mapping, so a process kill
+    /// leaves no entry without its row; only the periodic fsync (<see cref="FlushPool"/>) makes it
+    /// survive a power loss.
+    /// </summary>
+    private void EnsurePoolRow(ushort index, string? text)
     {
-        if (string.IsNullOrEmpty(template) || _savedTemplateIndices[index]) return;
+        if (string.IsNullOrEmpty(text) || _savedPoolRows[index]) return;
         lock (_poolLock)
         {
-            if (_savedTemplateIndices[index]) return;
-            _savedTemplateIndices[index] = true;
+            if (_savedPoolRows[index]) return;
+            _savedPoolRows[index] = true;
             if (_poolStream is null) return;
-            var bytes = Encoding.UTF8.GetBytes(template);
+            var bytes = Encoding.UTF8.GetBytes(text);
             var len   = Math.Min(bytes.Length, ushort.MaxValue);
             Span<byte> hdr = stackalloc byte[4];
             BinaryPrimitives.WriteUInt16LittleEndian(hdr, index);
@@ -575,26 +634,27 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // Iterator bodies cannot touch pointers — this shim reads _ptr outside the iterator.
     private bool TryParseLiveEntry(long pos, long end, out WalEntry? entry, out long entrySize)
-        => TryParseEntry(_ptr, pos, end, validateChecksum: true, v3Layout: false, out entry, out entrySize);
+        => TryParseEntry(_ptr, pos, end, EntryLayout.V5, out entry, out entrySize);
 
     /// <summary>
-    /// Parses one entry at <paramref name="pos"/>. Bounds are checked and (v4) the CRC is
+    /// Parses one entry at <paramref name="pos"/>. Bounds are checked and (v4, v5) the CRC is
     /// verified over the in-map spans BEFORE anything is allocated, so a garbage length
     /// field cannot OOM and a torn entry cannot materialise. Returns false at the first
     /// entry that does not verify — everything past it is by definition not durable.
     /// </summary>
     private static unsafe bool TryParseEntry(
-        byte* basePtr, long pos, long end, bool validateChecksum, bool v3Layout,
+        byte* basePtr, long pos, long end, EntryLayout layout,
         out WalEntry? entry, out long entrySize)
     {
         entry     = null;
         entrySize = 0;
 
-        int headerSize = v3Layout ? EntryHeaderSizeV3 : EntryHeaderSize;
+        int headerSize = HeaderSizeOf(layout);
         if (pos + headerSize > end) return false;
 
         byte* src = basePtr + FileHeaderSize + pos;
-        ref var eh = ref Unsafe.AsRef<WalEntryHeader>(src); // v3 shares the first 20 bytes
+        // Every layout shares the first 20 bytes; the struct is read past them only for v5.
+        ref var eh = ref Unsafe.AsRef<WalEntryHeader>(src);
 
         long total = (long)headerSize + eh.PayloadLength + eh.ExceptionLength;
         if (pos + total > end)
@@ -609,12 +669,16 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         var payloadSpan = new ReadOnlySpan<byte>(src + headerSize, (int)eh.PayloadLength);
         var excSpan     = new ReadOnlySpan<byte>(src + headerSize + (int)eh.PayloadLength, (int)eh.ExceptionLength);
 
-        if (validateChecksum && !v3Layout)
+        // v4 and v5 end their header with the checksum, over every header byte before it and both
+        // spans — v5's over the service index too, so a torn or rotted service fails the entry
+        // like any other field. v3 has none.
+        if (layout != EntryLayout.V3)
         {
-            uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(src, ChecksummedHeaderBytes));
+            int  covered = headerSize - 4;
+            uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(src, covered));
             crc      = Crc32c.Append(crc, payloadSpan);
             crc      = Crc32c.Append(crc, excSpan);
-            if (crc != eh.Checksum)
+            if (crc != Unsafe.ReadUnaligned<uint>(src + covered))
                 return false;
         }
 
@@ -640,7 +704,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             Level          = (LogLevel)eh.Level,
             TemplateIndex  = eh.TemplateIndex,
             // v3 entries predate the flag and their byte 13 was never written: never unpooled.
-            Unpooled       = !v3Layout && (eh.Flags & EntryFlagUnpooled) != 0,
+            Unpooled       = layout != EntryLayout.V3 && (eh.Flags & EntryFlagUnpooled) != 0,
+            // Only v5 has the field. A v4 entry's bytes 20-23 are its checksum and its flag bits
+            // past bit 0 were reserved, so it names no service whatever they hold.
+            ServiceIndex   = layout == EntryLayout.V5 && (eh.Flags & EntryFlagService) != 0 ? eh.ServiceIndex : -1,
             Payload        = payload,
             Exception      = exception,
         };
@@ -764,8 +831,28 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         return dict;
     }
 
-    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath)
+    /// <summary>The format this build writes, and the newest it reads (see WalVersion).</summary>
+    public const ushort FormatVersion = WalVersion;
+
+    public static (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath) =>
+        ReadForRecovery(walPath, out _, out _);
+
+    /// <param name="version">
+    /// The format the file's header claims, or 0 when the file is not one of these logs. A version
+    /// above <see cref="FormatVersion"/> comes back with no entries: a later release wrote the file,
+    /// and only it can read it.
+    /// </param>
+    /// <param name="headerRecordsEntries">
+    /// False only when the header's WriteOffset is exactly where the first entry would begin: the
+    /// log every clean stop leaves, which no version so far has written anything past. Read before
+    /// the version is looked at, so a later release's file can be told empty too; any other value
+    /// says "may hold entries", which is also what a later format that moved the field would read as.
+    /// </param>
+    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(
+        string walPath, out ushort version, out bool headerRecordsEntries)
     {
+        version              = 0;
+        headerRecordsEntries = false;
         if (!File.Exists(walPath)) return (0, []);
         long fileSize = new FileInfo(walPath).Length;
         if (fileSize < FileHeaderSize) return (0, []);
@@ -778,10 +865,18 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
             if (fh.Magic != MagicNumber) return (0, []);
-            // v4 = current (checksummed). v3 = previous release: replayable, no per-entry
-            // validation possible. Anything else is unreplayable by construction.
-            bool v3 = fh.Version == WalVersionV3;
-            if (fh.Version != WalVersion && !v3) return (fh.SegmentId, []);
+            version              = fh.Version;
+            headerRecordsEntries = fh.WriteOffset != FileHeaderSize;
+            // v5 = current. v4 = the releases before it: checksummed, no service. v3: replayable,
+            // no per-entry validation possible. Anything else is unreplayable by construction.
+            EntryLayout layout;
+            switch (fh.Version)
+            {
+                case WalVersion:   layout = EntryLayout.V5; break;
+                case WalVersionV4: layout = EntryLayout.V4; break;
+                case WalVersionV3: layout = EntryLayout.V3; break;
+                default:           return (fh.SegmentId, []);
+            }
             ulong segId       = fh.SegmentId;
             long  writeOffset = fh.WriteOffset - FileHeaderSize;
             if (writeOffset <= 0) return (segId, []);
@@ -793,13 +888,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             long maxData = fileSize - FileHeaderSize;
             if (writeOffset > maxData) writeOffset = maxData;
 
-            int headerSize = v3 ? EntryHeaderSizeV3 : EntryHeaderSize;
+            int headerSize = HeaderSizeOf(layout);
             var  entries = new List<WalEntry>();
             long pos     = 0;
             long end     = writeOffset;
             while (pos + headerSize <= end)
             {
-                if (!TryParseEntry(ptr, pos, end, validateChecksum: true, v3Layout: v3, out var entry, out long entrySize))
+                if (!TryParseEntry(ptr, pos, end, layout, out var entry, out long entrySize))
                     break;
                 entries.Add(entry!);
                 pos += entrySize;
@@ -826,6 +921,27 @@ public sealed class WalEntry
     /// </summary>
     public bool           Unpooled       { get; init; }
 
+    /// <summary>
+    /// The event's <c>@service</c> as an index into the intern pool, or -1: the event had none, or
+    /// the entry predates format v5 and could not say. The index's text is a row of the WAL's pool
+    /// file; resolve it through <see cref="ServiceIndexIn"/>, not straight into a live pool.
+    /// </summary>
+    public int            ServiceIndex   { get; init; } = -1;
+
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }
+
+    /// <summary>
+    /// <see cref="ServiceIndex"/> when <paramref name="poolRows"/> — the rows of this entry's own pool
+    /// file, as <see cref="WriteAheadLog.LoadPool"/> read them — hold its text; otherwise -1, no
+    /// service.
+    ///
+    /// <para>The row is written before the entry, but the two files reach the platter on their own:
+    /// a power loss can keep the entry and lose the row. The index then names nothing this WAL can
+    /// vouch for. Resolved anyway, it would read whatever the restarted process's pool holds at that
+    /// slot — empty, or a string another WAL's replay put there, which is how a stale row becomes a
+    /// wrong service in a segment for good.</para>
+    /// </summary>
+    public int ServiceIndexIn(IReadOnlyDictionary<ushort, string> poolRows) =>
+        ServiceIndex >= 0 && poolRows.ContainsKey((ushort)ServiceIndex) ? ServiceIndex : -1;
 }
