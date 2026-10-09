@@ -75,8 +75,9 @@ public static class OtlpGrpcEndpointMapper
             // Built once, here: it carries the point limit, and a capturing lambda inside the route
             // handler would be a new closure per call.
             int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
+            OtlpMetricBudgetLog metricBudgetLog = app.Services.GetRequiredService<OtlpMetricBudgetLog>();
             Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decodeMetrics = (c, msg) =>
-                DecodeMetrics(c, msg.AsSpan(), maxMetricPoints);
+                DecodeMetrics(c, msg.AsSpan(), maxMetricPoints, metricBudgetLog);
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, outOfMemoryLog, decodeMetrics));
         }
@@ -92,10 +93,17 @@ public static class OtlpGrpcEndpointMapper
     /// at decode and reported in the partial success beside the store's own refusals, each with its
     /// reason (#126 review NEW-0).
     /// </summary>
-    internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints)
+    internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints,
+                                                                       OtlpMetricBudgetLog? budgetLog = null)
     {
         var weight = OtlpMetricPointBudget.WeighProto(message);
-        if (!OtlpMetricPointBudget.Fits(weight, maxPoints)) throw new OtlpMetricPointBudget.TooManyPointsException(weight, maxPoints);
+        if (!OtlpMetricPointBudget.Fits(weight, maxPoints))
+        {
+            // Logged as well as answered (#126 review NEW-2): RESOURCE_EXHAUSTED without RetryInfo is
+            // not retried, so this line is the server's only record of the lost batch.
+            budgetLog?.Note(ctx, weight, maxPoints);
+            throw new OtlpMetricPointBudget.TooManyPointsException(weight, maxPoints);
+        }
 
         var points = OtlpMetricProtoParser.Parse(message, out int tooManyBuckets);
         int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()

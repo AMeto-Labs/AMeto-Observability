@@ -46,10 +46,11 @@ public static class OtlpEndpointMapper
     /// <summary>
     /// What the OTLP receivers — HTTP and gRPC — share across requests: the gate that bounds how
     /// many gzip bodies are held inflated at once (<see cref="OtlpInflateGate"/>), the throttled
-    /// warning for one that inflated past the limit (<see cref="OtlpGzipTooLargeLog"/>), and the
+    /// warning for one that inflated past the limit (<see cref="OtlpGzipTooLargeLog"/>), the
     /// throttled error for a batch the server ran out of memory taking in
-    /// (<see cref="OtlpOutOfMemoryLog"/>). TryAdd, so a host that already registered any of them —
-    /// a test with a smaller gate or a clock of its own — keeps it.
+    /// (<see cref="OtlpOutOfMemoryLog"/>), and the throttled warning for a metrics batch refused for
+    /// decoding past its limit (<see cref="OtlpMetricBudgetLog"/>). TryAdd, so a host that already
+    /// registered any of them — a test with a smaller gate or a clock of its own — keeps it.
     /// </summary>
     public static IServiceCollection AddOtlpReceivers(this IServiceCollection services)
     {
@@ -58,6 +59,8 @@ public static class OtlpEndpointMapper
         services.TryAddSingleton(static sp => new OtlpGzipTooLargeLog(
             sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
         services.TryAddSingleton(static sp => new OtlpOutOfMemoryLog(
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
+        services.TryAddSingleton(static sp => new OtlpMetricBudgetLog(
             sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), TimeProvider.System));
         return services;
     }
@@ -91,8 +94,10 @@ public static class OtlpEndpointMapper
         // And the throttled error for a batch the server ran out of memory taking in.
         OtlpOutOfMemoryLog outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
-        // The most one metrics batch may decode to, in data points (Ingestion.MaxOtlpMetricPoints), read once.
+        // The most one metrics batch may decode to, in data points (Ingestion.MaxOtlpMetricPoints), read
+        // once — and the throttled warning for a batch refused for it, shared with the gRPC receiver.
         int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
+        OtlpMetricBudgetLog metricBudgetLog = app.Services.GetRequiredService<OtlpMetricBudgetLog>();
 
         // OUT OF MEMORY IS THE SERVER'S FAILURE, NOT THE BATCH'S (#125). Each handler below takes
         // its batch in — reads, inflates, parses, stores — inside one try whose catch answers an
@@ -175,6 +180,9 @@ public static class OtlpEndpointMapper
                                          : OtlpMetricPointBudget.WeighJson(body.AsSpan(0, bodyLen));
                     if (!OtlpMetricPointBudget.Fits(weight, maxMetricPoints))
                     {
+                        // Logged as well as answered (#126 review NEW-2): the exporter does not retry
+                        // a 413, so this line is the server's only record of the lost batch.
+                        metricBudgetLog.Note(ctx, weight, maxMetricPoints);
                         WriteTooManyPoints(ctx, isProto);
                         return;
                     }

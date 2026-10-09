@@ -11,6 +11,8 @@ using Ameto.Otel;
 using Google.Protobuf;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Integration.Tests;
 
@@ -36,6 +38,23 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
     public sealed class Factory : AmetoWebAppFactory
     {
         protected override IngestionOptions ConfiguredIngestion => new() { MaxOtlpMetricPoints = Limit };
+
+        /// <summary>What the host logs — for the refusal's warning (#126 review NEW-2).</summary>
+        public OtlpHttpGzipTests.CapturedLog Log { get; } = new();
+
+        /// <summary>The clock the refusal's warning is throttled by: it moves only when a test says so.</summary>
+        internal Ameto.Testing.ManualTimeProvider Clock { get; } = new();
+
+        protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(services =>
+            {
+                services.AddSingleton<ILoggerProvider>(Log);
+                services.AddSingleton(sp => new OtlpMetricBudgetLog(
+                    sp.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel"), Clock));
+            });
+        }
     }
 
     private readonly Factory    _factory;
@@ -152,6 +171,81 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Empty(QueryNames("budget.grpc"));
         Assert.Equal(1, gate.Available);
     }
+
+    // ── A refusal is logged, not only answered (#126 review NEW-2) ───────────
+
+    /// <summary>
+    /// The 413 is logged: the Collector's exporter does not retry it and does not split the batch, so
+    /// without a line only the exporter's own log said a batch was lost. At most one Warning a second,
+    /// with the count since the last, the latest batch's points and decoded size, the limit, and the
+    /// sender — the shape of the gzip over-limit warning.
+    /// </summary>
+    [Fact]
+    public async Task A_refused_batch_is_a_warning_once_a_second_with_the_count_the_points_and_the_limit()
+    {
+        byte[] over = EmptyPoints("budget.warned", 200_000, protobuf: true);
+        const string Event = "OtlpMetricsOverBudget";
+
+        // A new second: the first refusal is written at once (with whatever earlier tests left pending).
+        _factory.Clock.Advance(OtlpMetricBudgetLog.Interval);
+        int warned = _factory.Log.Count(Event, LogLevel.Warning);
+        using (var first = await PostAsync(over, protobuf: true))
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, first.StatusCode);
+        Assert.Equal(warned + 1, _factory.Log.Count(Event, LogLevel.Warning));
+
+        // A second in the same second: refused and counted, not written.
+        using (var second = await PostAsync(over, protobuf: true))
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, second.StatusCode);
+        Assert.Equal(warned + 1, _factory.Log.Count(Event, LogLevel.Warning));
+
+        // The next second: one line, for it and the one that trips it.
+        _factory.Clock.Advance(OtlpMetricBudgetLog.Interval);
+        using (var third = await PostAsync(over, protobuf: true))
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, third.StatusCode);
+        Assert.Equal(warned + 2, _factory.Log.Count(Event, LogLevel.Warning));
+
+        var line = _factory.Log.Last(Event);
+        Assert.Equal(2L, line["Count"]);
+        Assert.Equal(200_000L, line["Points"]);
+        Assert.Equal(Limit, line["Limit"]);
+        Assert.Equal(200_000L * OtlpMetricPointBudget.PointBytes, line["DecodedBytes"]);
+        Assert.Equal(KeyListPreview(AmetoWebAppFactory.TestApiKey), line["KeyPreview"]);
+    }
+
+    /// <summary>The same warning from the gRPC receiver, with the caller's address.</summary>
+    [Fact]
+    public async Task A_grpc_refusal_is_the_same_warning()
+    {
+        var clock     = new Ameto.Testing.ManualTimeProvider();
+        var log       = new OtlpHttpGzipTests.CapturedLog();
+        var budgetLog = new OtlpMetricBudgetLog(log.CreateLogger("Ameto.Otel"), clock);
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var noLog = new OtlpGzipTooLargeLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var noMemoryLog = new OtlpOutOfMemoryLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        byte[] frame = Frame(EmptyPoints("budget.grpc.warned", 200_000, protobuf: true));
+
+        for (int i = 0; i < 3; i++)
+        {
+            if (i == 2) clock.Advance(OtlpMetricBudgetLog.Interval);
+            var call = GrpcCall(frame);
+            call.Connection.RemoteIpAddress = IPAddress.Parse("203.0.113.9");
+            await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, noLog, noMemoryLog,
+                (c, msg) => OtlpGrpcEndpointMapper.DecodeMetrics(c, msg.AsSpan(), Limit, budgetLog));
+            Assert.Equal("8", call.Response.Headers["grpc-status"].ToString());
+        }
+
+        Assert.Equal(2, log.Count("OtlpMetricsOverBudget", LogLevel.Warning));     // the first at once, then one for two
+        var line = log.Last("OtlpMetricsOverBudget");
+        Assert.Equal(2L, line["Count"]);
+        Assert.Equal(200_000L, line["Points"]);
+        Assert.Equal(Limit, line["Limit"]);
+        Assert.Equal(KeyListPreview(AmetoWebAppFactory.TestApiKey), line["KeyPreview"]);
+        Assert.Equal("203.0.113.9", line["RemoteAddress"]);
+    }
+
+    /// <summary>What <c>GET /api/auth/keys</c> shows for a key: <c>KeyHash[..8]</c>, the hash being AuthStore's.</summary>
+    private static string KeyListPreview(string key)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant()[..8];
 
     // ── A histogram point's arrays are weighed too (#126 review NEW-1) ────────
 
