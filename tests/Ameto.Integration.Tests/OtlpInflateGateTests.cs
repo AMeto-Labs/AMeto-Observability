@@ -99,8 +99,8 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
     /// timeout's machinery: an OutOfMemoryException there left the waiter queued with nobody to
     /// collect it, and the next release handed it a slot that was never given back — on the stand's
     /// two slots, two such events made every compressed batch wait and get 503 until a restart (from
-    /// the runtime's source: the fault needs an allocation failure inside the runtime). The gate now
-    /// polls a counter; here the wait between two looks fails, the call fails, and once the holders
+    /// the runtime's source: the fault needs an allocation failure inside the runtime). The counter is
+    /// now the only ledger; here the wait between two looks fails, the call fails, and once the holders
     /// leave every slot is free and usable.
     /// </summary>
     [Fact]
@@ -110,9 +110,9 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.True(await gate.TryEnterAsync(default));
         Assert.True(await gate.TryEnterAsync(default));
 
-        gate.DelayForTest = static (_, _) => throw new OutOfMemoryException("injected: the wait's timer");
+        gate.WaitForTest = static (_, _) => throw new OutOfMemoryException("injected: the wait's timer");
         await Assert.ThrowsAsync<OutOfMemoryException>(() => gate.TryEnterAsync(default));
-        gate.DelayForTest = null;
+        gate.WaitForTest = null;
 
         gate.Exit();
         gate.Exit();
@@ -137,6 +137,90 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         gate.Exit();
         Assert.Throws<SemaphoreFullException>(gate.Exit);              // never wider than its capacity
+        Assert.Equal(1, gate.Available);
+    }
+
+    /// <summary>
+    /// A FREED SLOT GOES TO THE BATCH THAT WAITED FOR IT (#126 review NEW-3). With the polled gate a
+    /// newcomer arriving just after a release took the slot ahead of a batch that had waited 50 ms,
+    /// 10 times in 10: <c>Exit</c> only incremented the counter, and the newcomer's fast path looked
+    /// before the waiter's next poll. Ten rounds of H holding the only slot, A waiting, H leaving and
+    /// C arriving: A has the slot every time, and C gets it only when A gives it back.
+    /// </summary>
+    [Fact]
+    public async Task A_newcomer_does_not_take_the_slot_a_waiter_was_woken_for()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        for (int round = 0; round < 10; round++)
+        {
+            Assert.True(await gate.TryEnterAsync(default));                     // H
+            Task<bool> a = gate.TryEnterAsync(default);
+            await Task.Delay(50);
+            Assert.False(a.IsCompleted, "a full gate let a waiter in");
+
+            gate.Exit();                                                       // H leaves...
+            Task<bool> c = gate.TryEnterAsync(default);                        // ...and C arrives
+
+            Assert.True(await a.WaitAsync(TimeSpan.FromSeconds(5)), $"round {round}: the waiter did not get the slot");
+            Assert.False(c.IsCompleted, $"round {round}: the newcomer got in beside the waiter");
+
+            gate.Exit();                                                       // A leaves
+            Assert.True(await c.WaitAsync(TimeSpan.FromSeconds(5)));
+            gate.Exit();                                                       // C leaves
+            Assert.Equal(1, gate.Available);
+        }
+    }
+
+    /// <summary>
+    /// A freed slot reaches a waiter at once: the release rings, it does not wait for the waiter's
+    /// next look. The polled gate handed it over a timer tick late — 15.7 ms at the median on
+    /// Windows, against 0.03 ms for a semaphore. Median over 40 rounds under 2 ms.
+    /// </summary>
+    [Fact]
+    public async Task A_freed_slot_reaches_a_waiter_at_once()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        var handOffs = new List<double>();
+        for (int round = 0; round < 40; round++)
+        {
+            Assert.True(await gate.TryEnterAsync(default));
+            Task<bool> waiter = gate.TryEnterAsync(default);
+            await Task.Delay(5);                                               // parked
+
+            long released = System.Diagnostics.Stopwatch.GetTimestamp();
+            gate.Exit();
+            Assert.True(await waiter.WaitAsync(TimeSpan.FromSeconds(5)));
+            handOffs.Add(System.Diagnostics.Stopwatch.GetElapsedTime(released).TotalMilliseconds);
+            gate.Exit();
+        }
+
+        handOffs.Sort();
+        double median = handOffs[handOffs.Count / 2];
+        Assert.True(median < 2, $"hand-off median {median:F2} ms (max {handOffs[^1]:F2} ms)");
+    }
+
+    /// <summary>
+    /// A ring that reaches a dead waiter costs a look, never a slot. An allocation failure inside the
+    /// doorbell's own timed wait leaves its waiter queued in the doorbell with nobody to collect it; the
+    /// next release's ring goes to it. The real waiter behind it finds the slot on its own look, within
+    /// <see cref="OtlpInflateGate.PollInterval"/>, and the counter never owes anything.
+    /// </summary>
+    [Fact]
+    public async Task A_ring_that_reaches_a_dead_waiter_costs_a_poll_not_a_slot()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+        gate.ParkDeadDoorbellWaiterForTest();
+        Task<bool> waiter = gate.TryEnterAsync(default);
+        await Task.Delay(20);
+
+        var released = System.Diagnostics.Stopwatch.StartNew();
+        gate.Exit();                                                           // the ring goes to the dead waiter
+        Assert.True(await waiter.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(released.Elapsed < OtlpInflateGate.PollInterval * 3, $"took {released.Elapsed.TotalMilliseconds:F0} ms");
+        Assert.Equal(0, gate.Available);
+
+        gate.Exit();
         Assert.Equal(1, gate.Available);
     }
 
