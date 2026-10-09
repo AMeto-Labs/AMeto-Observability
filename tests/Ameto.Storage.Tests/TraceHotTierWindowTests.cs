@@ -984,6 +984,43 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// ...AND ONE THAT STARTS BEFORE THE WINDOW IS NOT MERGED AT ALL (#128 review F1). A skipped
+    /// block's outliers are below its range — the block lies wholly above the page's ceiling — so the
+    /// one check standing between such a span and the page is the window's LOWER bound. Block A is a
+    /// batch from a clock 30 s ahead; one span in it started two minutes before Base, below the window
+    /// every page here shares. A page five seconds deep skips A and must not return that span's trace.
+    /// </summary>
+    [Fact]
+    public async Task A_skipped_blocks_outlier_below_the_window_is_not_merged()
+    {
+        using var engine = NewEngine();
+        long t0    = Nano(Base);
+        var  trace = new TraceId(0xDEAD, 1);
+        var  items = new List<SpanIngestItem>();
+        for (int i = 0; i < 2 * SpanStartIndex.BlockSize; i++)
+        {
+            items.Add(new SpanIngestItem
+            {
+                TraceId           = new TraceId(0xF00D, (ulong)i + 1),
+                SpanId            = new SpanId((ulong)i + 1),
+                StartTimeUnixNano = (i < SpanStartIndex.BlockSize ? t0 + 30_000_000_000L : t0 + 2_000_000_000L) + i * 1_000L,
+                DurationNanos     = 1_000_000L, Name = "op", ServiceName = "other", Kind = SpanKind.Internal,
+            });
+        }
+        items[64] = new SpanIngestItem
+        {
+            TraceId = trace, SpanId = new SpanId(0xB0001), StartTimeUnixNano = t0 - 120_000_000_000L,   // below From = Base − 1 min
+            DurationNanos = 1_000_000L, Name = "root", ServiceName = "early", Kind = SpanKind.Server,
+        };
+        Write(engine, items);
+
+        var page = await engine.GetTraceListAsync(From, Base.AddSeconds(5), null, null, null, null, null, 500);
+
+        Assert.DoesNotContain(page.Rows, r => r.TraceId.Equals(trace));
+        Assert.Equal(SpanStartIndex.BlockSize, page.Rows.Count);
+    }
+
+    /// <summary>
     /// THE WALK'S POOLED BUFFERS STAY OFF THE LARGE-OBJECT HEAP, HOWEVER MANY OUTLIERS (#128 review
     /// F2). The walk used to keep each outlier as a one-span block of 32 bytes in the blocks' own
     /// buffer, sized by every outlier the runs held: at one span in 25 skewed, 1 960 outliers, the
@@ -1497,11 +1534,21 @@ public sealed class TraceHotTierWindowTests : IDisposable
             $"seed {seed}: late {late}, dupes {dupes}, no-id {noId}, future {future}, orphans {orphans}, "
             + $"two roots {twoRoots}, root after a child {rootLater}, straddling {straddle}, billing spellings {billings}");
 
-        // AND IT PUTS SPANS OUTSIDE THEIR BLOCK'S RANGE (#127), so the oracles check the outlier paths
-        // too: the walk's one-span blocks, the list's merge of a skipped block's outliers.
+        // AND IT PUTS SPANS OUTSIDE THEIR BLOCK'S RANGE ON BOTH SIDES (#127, #128 review F1), so the
+        // oracles check every outlier path: ABOVE it for the walk's one-span blocks, BELOW it for the
+        // list's merge of a skipped block's outliers — which only spans below a block can reach.
         var index = new SpanStartIndex([]);
         foreach (var s in corpus) index.Append(s.StartTimeUnixNano);
-        Assert.True(index.Outliers > 10, $"seed {seed}: only {index.Outliers} outliers in the corpus's start index");
+        var view  = index.View(index.Count);
+        int below = 0, before = 0;
+        for (int k = 0; k < view.Outliers; k++)
+        {
+            if (view.OutlierStart(k) < view.MinOf(view.OutlierPosition(k) >> SpanStartIndex.BlockShift)) below++;
+            if (view.OutlierStart(k) < Nano(From)) before++;
+        }
+        Assert.True(index.Outliers - below > 10 && below > 10 && before > 0,
+            $"seed {seed}: {index.Outliers} outliers in the corpus's start index, {below} of them below their "
+            + $"block's range and {before} before the window");
         // TWO DIFFERENT SPANS NEVER SHARE A START, so every oracle's order is total. (A re-sent span
         // shares its original's start, and a re-sent span with no id is two records the engine must
         // not fold together — but either way the two are the same span.)
@@ -1648,6 +1695,23 @@ public sealed class TraceHotTierWindowTests : IDisposable
             var item = arrival[from];
             arrival.RemoveAt(from);
             arrival.Insert(Math.Min(arrival.Count, from + rnd.Next(100, 3_000)), item);
+        }
+
+        // STAMPED EARLY: about one span in a hundred starts 2 to 20 s before its neighbours — a clock
+        // running behind, a long span reported when it ends — and three start before the window every
+        // page shares (From, a minute before Base). Each arrives where its trace does, so it lies BELOW
+        // its block's range: an outlier a list page skipping that block must still merge, or leave out
+        // (#128 review F1). The late arrivals above move spans under a second, inside the tolerance.
+        int early = arrival.Count / 100;
+        for (int n = 0; n < early; n++)
+        {
+            int at = rnd.Next(arrival.Count);
+            arrival[at] = At(arrival[at], UniqueStart(arrival[at].StartTimeUnixNano - rnd.NextInt64(2_000_000_000L, 20_000_000_000L)));
+        }
+        for (int n = 0; n < 3; n++)
+        {
+            int at = rnd.Next(arrival.Count);
+            arrival[at] = At(arrival[at], UniqueStart(Nano(From) - rnd.NextInt64(1_000_000_000L, 60_000_000_000L)));
         }
 
         // DUPLICATES: one span in a hundred sent again, later — an exporter's retry, a WAL replay.
