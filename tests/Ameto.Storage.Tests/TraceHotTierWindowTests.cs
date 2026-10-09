@@ -1021,6 +1021,35 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// THE FLOOR SEARCH SKIPS AN OUTLIER THE WALK ALREADY KEPT (#128 review F3). An index block's
+    /// outliers are read on their own, as outliers; when the walk stops early and the floor search
+    /// reads the rest, it must skip them too. Re-read, a kept outlier with no span id cannot be told
+    /// from a match turned away — an id-less span is never deduplicated — and the page reports itself
+    /// capped with nothing turned away. Here the 100 matches are 99 errors at the end of the tier and
+    /// one id-less error 30 s ahead, which sits in block 0 — the block the floor search reads last.
+    /// </summary>
+    [Fact]
+    public void The_floor_search_skips_a_kept_outlier_with_no_span_id()
+    {
+        using var engine = NewEngine();
+        var items = TraceAggregateLockProbe.Corpus(0, 2_000);
+        for (int i = items.Length - 99; i < items.Length; i++) items[i] = Status(items[i], SpanStatusCode.Error);
+        var s = items[5];
+        items[5] = new SpanIngestItem
+        {
+            TraceId = s.TraceId, SpanId = default, ParentSpanId = s.ParentSpanId,
+            StartTimeUnixNano = items[^1].StartTimeUnixNano + 30_000_000_000L, DurationNanos = s.DurationNanos, Name = s.Name,
+            ServiceName = s.ServiceName, Kind = s.Kind, Status = SpanStatusCode.Error, AttributesBytes = s.AttributesBytes,
+        };
+        Write(engine, [.. items]);
+
+        var got = engine.HotMatchesForTest(From, Base.AddMinutes(5), SpanStatusCode.Error, 100, out bool evicted);
+
+        Assert.Equal(100, got.Count);
+        Assert.False(evicted, "the floor search re-read the kept id-less outlier as a match turned away");
+    }
+
+    /// <summary>
     /// THE WALK'S POOLED BUFFERS STAY OFF THE LARGE-OBJECT HEAP, HOWEVER MANY OUTLIERS (#128 review
     /// F2). The walk used to keep each outlier as a one-span block of 32 bytes in the blocks' own
     /// buffer, sized by every outlier the runs held: at one span in 25 skewed, 1 960 outliers, the
