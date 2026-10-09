@@ -959,9 +959,11 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// A source held open (an in-flight query's mapped view) cannot be deleted on Windows. The
     /// merge must still publish and must still serve each event exactly once — the source is out
     /// of the catalog the moment the merged file is in it, whether or not the file is gone — and
-    /// the manifest has to survive so the sweep finishes the deletion later.
+    /// the manifest has to survive so the sweep finishes the deletion later. Windows only:
+    /// elsewhere the held file unlinks (the unlink seam stages the refusal on every platform, see
+    /// <see cref="ASourceThatCannotBeDeletedAtStart_IsParked_NotServedBesideTheOutput"/>).
     /// </summary>
-    [Fact]
+    [WindowsFact]
     public async Task SourceHeldOpen_PublishesWithoutDuplicates_AndFinishesLater()
     {
         for (int round = 0; round < 10; round++)
