@@ -1058,6 +1058,32 @@ public sealed class TraceHotTierWindowTests : IDisposable
     }
 
     /// <summary>
+    /// A NEW TIER'S FIRST SPAN IS JUDGED AGAINST THE TIER BEFORE IT (#128 review F6). A flush hands
+    /// new spans to a new list with a new start index, whose first span used to be judged against
+    /// nothing: one 30 s ahead became its block's range, the on-time spans after it were outliers until
+    /// four of them made a new level, and the block ended 30 s wide, as before #127. The new index now
+    /// continues where the detached one left off, so that span is listed and its block stays tight.
+    /// </summary>
+    [Fact]
+    public void A_new_tiers_first_span_is_judged_against_the_tier_before_it()
+    {
+        using var engine = NewEngine();
+        Write(engine, [.. TraceAggregateLockProbe.Corpus(0, 2_000)]);
+        engine.FlushHotTier();
+        var next = TraceAggregateLockProbe.Corpus(2_000, 300);
+        next[0] = At(next[0], next[0].StartTimeUnixNano + 30_000_000_000L);
+        Write(engine, [.. next]);
+
+        var view = engine.HotStartsForTest;
+
+        Assert.Equal(300, view.Spans);
+        Assert.Equal(1, view.Outliers);
+        Assert.Equal(0, view.OutlierPosition(0));
+        Assert.True(view.MaxOf(0) - view.MinOf(0) < 1_000_000_000L,
+            $"the new tier's first block spans {(view.MaxOf(0) - view.MinOf(0)) / 1e9:0.###} s: its skewed first span widened it");
+    }
+
+    /// <summary>
     /// A LIST PAGE MAKES ROWS ONLY FOR WHAT IT RETURNS. 2 000 traces in three services, a page of 100:
     /// every trace is merged — the filters and the cold walk's cap need all of them — but the row (a
     /// TraceSummary, its services array) and the root's HTTP method and path (a walk of its attribute

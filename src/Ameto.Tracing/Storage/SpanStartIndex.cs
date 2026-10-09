@@ -135,6 +135,21 @@ internal sealed class SpanStartIndex
         _shiftAfter  = shape?.ShiftAfter     ?? ShiftAfter;
     }
 
+    /// <summary>
+    /// An index for the list that takes over from <paramref name="previous"/>'s — the next tier, built
+    /// under the write-lock hold that detaches the previous one (#128 review F6). Its first span is
+    /// judged as the previous index would have judged its next: against the range of the last block
+    /// that took a regular span, and as the next of a run of outliers. Judged against nothing, a new
+    /// tier's skewed first span became its block's range, and the block was as wide as before #127.
+    /// </summary>
+    internal SpanStartIndex(List<SpanRecord> owner, SpanStartIndex previous) : this(owner)
+    {
+        _refMin    = previous._refMin;
+        _refMax    = previous._refMax;
+        _lastStart = previous._lastStart;
+        _streak    = previous._streak;
+    }
+
     /// <summary>The list whose spans this index bounds. A reader that does not find this list beside it reads unindexed.</summary>
     internal List<SpanRecord> Owner { get; }
 
