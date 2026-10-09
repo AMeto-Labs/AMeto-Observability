@@ -1371,7 +1371,47 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         // The start that takes the verdict from the marker says so, once (the earlier process said it
         // when it left the marker).
         Assert.Single(_log.Entries, e => e.Message.Contains(
-            "is empty — an earlier sweep found the output torn", StringComparison.Ordinal));
+            "is empty — an earlier sweep decided the output is not to be served", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A start that takes the verdict from an emptied manifest while the output still cannot be moved
+    /// aside says so in ONE Warning, and that Warning carries why the move failed. The marker line
+    /// used to take the once-per-output Warning without an exception, leaving the move's failure to
+    /// Debug: why the output stayed was visible to nobody at Warning. The words are neutral, since a
+    /// newer-format merge rolled back leaves the same marker beside an output that is not torn. The
+    /// move fails here because a directory holds the name it moves to, which every platform refuses.
+    /// </summary>
+    [Fact]
+    public async Task AnEmptiedManifestWhoseOutputStillCannotMove_SaysWhyInOneWarning()
+    {
+        for (int round = 0; round < 10; round++) await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await _engine.DisposeAsync();
+        await LoseTheFirstBlockPayloadAsync(output);
+        await File.WriteAllBytesAsync(output + ".mergemanifest", []);     // the verdict an earlier sweep recorded
+        Directory.CreateDirectory(output + ".corrupt");                   // nothing moves to that name
+
+        await RestartAsync();
+        bool AboutIt((string Message, Exception? Error, MelLogLevel Level) e) =>
+            e.Level == MelLogLevel.Warning && e.Message.Contains(Path.GetFileName(output), StringComparison.Ordinal);
+        var said = Assert.Single(_log.Entries, AboutIt);
+        Assert.NotNull(said.Error);                                       // why it cannot be moved
+        Assert.Contains("decided the output is not to be served (torn, or a newer format rolled back)", said.Message, StringComparison.Ordinal);
+        Assert.Equal(10, _engine.ListSegments().Count);                   // the output out, the sources in
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);    // still cannot move: Debug only
+        Assert.Single(_log.Entries, AboutIt);
+
+        Directory.Delete(output + ".corrupt");
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.True(File.Exists(output + ".corrupt"), "the output was not set aside");
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
     }
 
     /// <summary>

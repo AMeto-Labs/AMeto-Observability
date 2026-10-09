@@ -3956,19 +3956,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         string output = manifest[..^".mergemanifest".Length];
         _undecidedMergeOutputs.TryAdd(output, SpanOfMergeOutputName(output));
 
-        // A torn verdict holds. The manifest RecoverTornMerge emptied when it could not move the output
-        // aside is never decided by a read again: a holder that lets nothing read the file answers any
-        // read with a failure that says nothing about the bytes. Recorded with what it costs already
-        // counted (and the list set aside), so the sources it listed are free to merge.
+        // A verdict not to serve the output holds. The manifest RecoverTornMerge emptied when it could
+        // not move the output aside — torn, or a newer format rolled back — is never decided by a read
+        // again: a holder that lets nothing read the file answers any read with a failure that says
+        // nothing about the bytes. Recorded with what it costs already counted (and the list set
+        // aside), so the sources it listed are free to merge.
         if (File.Exists(output) && new FileInfo(manifest).Length == 0)
         {
             LetGoOfMergeOutput(output);
-            if (FirstMergeOutputWarning("torn", output))
-                _logger.LogWarning(
-                    "Merge recovery: the manifest of {File} is empty — an earlier sweep found the output torn and could " +
-                    "not set it aside; it stays out of service until it can be moved aside, and the sources still on " +
-                    "disk stay in service", Path.GetFileName(output));
-            RecoverTornMerge(manifest, output);
+            RecoverTornMerge(manifest, output, SetAsideReason.EarlierVerdict);
             return;
         }
 
@@ -3982,7 +3978,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 ForgetMergeOutputWarnings(output);
                 return;
             case MergeOutputState.Torn:
-                RecoverTornMerge(manifest, output);
+                RecoverTornMerge(manifest, output, SetAsideReason.Torn);
                 LetGoOfMergeOutput(output);
                 return;
             case MergeOutputState.Unknown:
@@ -4001,7 +3997,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                         "Merge recovery: the output {File} of an interrupted merge is in a segment format newer than " +
                         "this release reads, and every source it lists is still on disk — the merge is rolled back: the " +
                         "sources stay in service and the output is set aside as .corrupt", Path.GetFileName(output));
-                    RecoverTornMerge(manifest, output);
+                    RecoverTornMerge(manifest, output, SetAsideReason.NewerRolledBack);
                     LetGoOfMergeOutput(output);
                 }
                 else DeferMergeVerdict(manifest, output, unreadable!, newer: true);
@@ -4420,9 +4416,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// only retries the move (<see cref="RecoverInterruptedMerge"/>). Proved again, the output
     /// would be read by whoever holds it last: one held without sharing failed the read, and that
     /// failure was taken for "committed" — the marker dropped, and the next start served the torn
-    /// output beside what its sources had been merged into, 1 200 events for 600.</para>
+    /// output beside what its sources had been merged into, 1 200 events for 600. A newer-format
+    /// output whose merge is rolled back comes here too, and leaves the same marker, so a sweep that
+    /// takes the verdict from one says only that the output is not to be served
+    /// (<see cref="SetAsideReason.EarlierVerdict"/>). Whichever sweep fails the move first says why,
+    /// once, at Warning; the repeats go to Debug.</para>
     /// </summary>
-    private void RecoverTornMerge(string manifest, string output)
+    private void RecoverTornMerge(string manifest, string output, SetAsideReason reason)
     {
         lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(output);
 
@@ -4449,17 +4449,51 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         catch (Exception ex)
         {
             if (listed != 0) File.WriteAllBytes(manifest, []);
+            // One Warning per output, with why the move failed, whichever sweep says it first.
             if (FirstMergeOutputWarning("torn", output))
-                _logger.LogWarning(ex,
-                    "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and the " +
-                    "manifest kept until a sweep moves it", Path.GetFileName(output));
+                _logger.LogWarning(ex, reason switch
+                {
+                    SetAsideReason.Torn =>
+                        "Merge recovery: the torn output {File} could not be moved aside — kept out of the catalog, and " +
+                        "the manifest kept until a sweep moves it",
+                    SetAsideReason.NewerRolledBack =>
+                        "Merge recovery: the newer-format output {File} of the rolled-back merge could not be moved " +
+                        "aside — kept out of the catalog, and the manifest kept until a sweep moves it",
+                    _ =>
+                        "Merge recovery: the manifest of {File} is empty — an earlier sweep decided the output is not to " +
+                        "be served (torn, or a newer format rolled back) and could not set it aside; it still cannot be " +
+                        "moved, so it stays out of the catalog until it can, and the sources still on disk stay in service",
+                }, Path.GetFileName(output));
             else
-                _logger.LogDebug(ex, "Merge recovery: the torn output {File} still cannot be moved aside", Path.GetFileName(output));
+                _logger.LogDebug(ex, "Merge recovery: the output {File} still cannot be moved aside", Path.GetFileName(output));
             return;
+        }
+        if (reason == SetAsideReason.EarlierVerdict)
+        {
+            // An emptied manifest taken as the verdict says so once, at Warning, unless this process
+            // already said why it could not set the output aside.
+            if (FirstMergeOutputWarning("torn", output))
+                _logger.LogWarning(
+                    "Merge recovery: the manifest of {File} is empty — an earlier sweep decided the output is not to be " +
+                    "served (torn, or a newer format rolled back) and could not set it aside; it is set aside now as " +
+                    ".corrupt, and the sources still on disk stay in service", Path.GetFileName(output));
+            else
+                _logger.LogInformation("Merge recovery: the output {File} is set aside now as .corrupt", Path.GetFileName(output));
         }
         _deleteMergeManifest(manifest);
         _outputsWithKeptManifest.TryRemove(output, out _);
         ForgetMergeOutputWarnings(output);
+    }
+
+    /// <summary>Why <see cref="RecoverTornMerge"/> sets a merge output aside, for what it says.</summary>
+    private enum SetAsideReason : byte
+    {
+        /// <summary>This sweep proved it torn.</summary>
+        Torn,
+        /// <summary>A newer segment format, its merge rolled back while every source is on disk.</summary>
+        NewerRolledBack,
+        /// <summary>An emptied manifest: either of the two, decided by an earlier sweep that could not move it.</summary>
+        EarlierVerdict,
     }
 
     /// <summary>
