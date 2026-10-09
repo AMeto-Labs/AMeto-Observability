@@ -116,29 +116,33 @@ public sealed class SpanStartIndexTests
     /// <summary>
     /// A VIEW OUTLIVES THE APPENDS AFTER IT. A reader captures the view under the read lock and
     /// reads it after the lock is gone, while the drainer keeps appending — into the partial block
-    /// the view ends in, into new blocks, past the bound arrays' first size and the outlier list's,
-    /// which swap them. Every span the view covers must still be inside its block's range or among
-    /// the view's outliers, and the view's outliers may not take in one that came after it.
+    /// the view ends in, into new blocks, and past BOTH sets of arrays' sizes, which swaps them: the
+    /// outlier list's first 64 entries and the bounds' 65 536 spans (#128 review F4). With one span in
+    /// a thousand 30 s ahead, the view is captured just after the 64th outlier, and both grow after
+    /// it. Every span the view covers must still be inside its block's range or among the view's
+    /// outliers, and the view's outliers may not take in one that came after it.
     /// </summary>
     [Fact]
-    public void A_view_still_accounts_for_what_it_captured_after_appends_and_a_growth()
+    public void A_view_still_accounts_for_what_it_captured_after_appends_and_both_growths()
     {
         int initial = SpanStartIndex.InitialBlocks * SpanStartIndex.BlockSize;
-        var starts  = Arrivals(7, initial + 3 * SpanStartIndex.BlockSize);
+        var starts  = InOrder(1_785_000_000_000_000_000L, initial + 3 * SpanStartIndex.BlockSize);
+        for (int i = 500; i < starts.Count; i += 1_000) starts[i] += 30 * Second;
         var index   = new SpanStartIndex(Spans(starts));
 
-        int captured = initial - 50;                      // ends inside a block
-        for (int i = 0; i < captured; i++) index.Append(starts[i]);
+        int captured = 0;
+        while (index.Outliers < 64) index.Append(starts[captured++]);
         var view = index.View(captured);
-        int listed = view.Outliers;
 
-        // The rest: into the same block first, then over the arrays' capacity.
+        // The rest: into the same block first, then past both sets of arrays' sizes.
         for (int i = captured; i < starts.Count; i++) index.Append(starts[i]);
 
-        Assert.Equal(listed, view.Outliers);
+        Assert.True(index.Outliers > 64, $"the outlier list did not grow after the capture ({index.Outliers})");
+        Assert.True(captured < initial, $"the bound arrays did not grow after the capture (captured at {captured})");
+        Assert.Equal(64, view.Outliers);
         AssertAccountedFor(view, starts, captured);
 
-        // And the index itself, past the growth, is exact.
+        // And the index itself, past both growths, is exact.
         var all = index.View(starts.Count);
         AssertTight(all, starts, AssertAccountedFor(all, starts, starts.Count));
     }
