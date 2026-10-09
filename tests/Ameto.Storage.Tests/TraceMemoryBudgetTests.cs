@@ -49,6 +49,15 @@ public sealed class TraceMemoryBudgetTests : IDisposable
     /// <summary>The ordinary span every figure in the plan is quoted against: eight attributes, a 375-byte blob.</summary>
     private const int OrdinaryBlob = 375;
 
+    /// <summary>
+    /// THE MATERIALISING MERGE, for the facts about its loader: how it weighs, quarantines and keeps
+    /// to its byte budget. Streaming compaction is the default now and takes every v3 segment it can
+    /// carry over; the loader still merges what it cannot (v2 files, sidecars that will not read),
+    /// and is the rollback (<see cref="TracesOptions.StreamingCompaction"/> off). The streamed
+    /// merge's own versions of these facts are in <c>StreamingCompactionTests</c>.
+    /// </summary>
+    private static TracesOptions Materialising => new() { StreamingCompaction = false };
+
     private string Dir(string name)
     {
         string d = Path.Combine(_root, name);
@@ -246,7 +255,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
         // A restart: the segments come back from disk with no weight, so the plan is the estimate's.
         long budget = budgetMb * MB;
         using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance,
-                                             options: new TracesOptions { MergeBudgetBytes = budget });
+                                             options: new TracesOptions { MergeBudgetBytes = budget, StreamingCompaction = false });
         e.LoadColdSegments();
         Assert.Equal(3, e.ColdSegmentCountForTest);
         Assert.All(e.ColdSegmentsForTest, static s => Assert.Equal(0, s.WeightBytes));
@@ -296,7 +305,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
 
         // The restart: every segment comes back unweighed.
         using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance,
-                                             options: new TracesOptions { MergeBudgetBytes = 2 * MB });
+                                             options: new TracesOptions { MergeBudgetBytes = 2 * MB, StreamingCompaction = false });
         e.LoadColdSegments();
         Assert.All(e.ColdSegmentsForTest, static s => Assert.Equal(0, s.WeightBytes));
         var plan = TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest, 2 * MB);
@@ -347,7 +356,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
             fs.Write(BitConverter.GetBytes(27UL));
         }
 
-        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance, options: Materialising);
         e.LoadColdSegments();
         Assert.Equal(2, e.ColdSegmentCountForTest);
         Assert.All(e.ColdSegmentsForTest, static s => Assert.Empty(SpanReader.ReadAll(s.FilePath)));
@@ -409,7 +418,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
             SpanWriter.Write(dir, spans);
         }
 
-        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance, options: Materialising);
         e.LoadColdSegments();
         Assert.Equal(4, e.ColdSegmentCountForTest);
         var first = TraceStorageEngine.SelectCompactionBatch(e.ColdSegmentsForTest);
@@ -479,7 +488,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
             SpanWriter.Write(dir, spans);
         }
 
-        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance, options: Materialising);
         e.LoadColdSegments();
         Assert.Equal(4, e.ColdSegmentCountForTest);
         Assert.Throws<InvalidDataException>(() => SpanReader.ReadAll(damaged!));
@@ -526,7 +535,7 @@ public sealed class TraceMemoryBudgetTests : IDisposable
             first ??= info.FilePath;
         }
 
-        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance, options: Materialising);
         e.LoadColdSegments();
         Assert.Equal(2, e.ColdSegmentCountForTest);
 

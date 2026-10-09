@@ -552,6 +552,39 @@ public sealed class TracesOptions
         (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
             (uint)Math.Clamp(RingCapacity is { } slots && slots > 0 ? slots : DefaultRingCapacity,
                              MinRingCapacity, MaxRingCapacity));
+
+    // ── Compaction ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Whether cold segments are merged by STREAMING them — a k-way merge that holds a block per
+    /// source rather than every span of every source. On by default. With it, what a merge holds no
+    /// longer grows with what it merges, so <see cref="MergeBudgetBytes"/> bounds the merge's side
+    /// state and its read side instead of the merged spans, and full flushes merge on a small host
+    /// too. <c>false</c> is the rollback: every merge then materialises its spans as it always did,
+    /// and full flushes stay unmerged wherever the budget cannot hold two of them.
+    /// </summary>
+    public bool StreamingCompaction { get; init; } = true;
+
+    /// <summary>
+    /// How old a cold segment's newest span must be before a streaming merge takes it. Unset:
+    /// <see cref="DefaultCompactionMinAge"/>; <c>00:00:00</c> merges as soon as there is something to
+    /// merge.
+    ///
+    /// <para><b>WHY THERE IS AN AGE AT ALL.</b> Per-service latency, the error rate and every trace
+    /// alert rule are answered from each segment's <c>.stats</c> sidecar, which describes the WHOLE
+    /// segment: a window that touches a segment counts all of it. A flush covers a few minutes, so a
+    /// five-minute alert window is answered to within a flush; a merged segment covers up to an hour
+    /// or more, and a window touching it would count the hour. Leaving the newest hour as flushes keeps
+    /// every recent window — the ones alerts and the default page ask about — as exact as it was.</para>
+    /// </summary>
+    public TimeSpan? CompactionMinAge { get; init; }
+
+    /// <summary>What <see cref="CompactionMinAge"/> is when nothing is configured: one hour.</summary>
+    public static readonly TimeSpan DefaultCompactionMinAge = TimeSpan.FromHours(1);
+
+    /// <inheritdoc cref="CompactionMinAge"/>
+    public TimeSpan EffectiveCompactionMinAge =>
+        CompactionMinAge is { } age && age >= TimeSpan.Zero ? age : DefaultCompactionMinAge;
 }
 
 /// <summary>

@@ -50,6 +50,22 @@ Ameto:
     # every segment was read before the index existed; the only difference is speed. An
     # unrecognised value falls back to Idle rather than failing the start.
     IndexBackfill: Idle
+    #
+    # Cold segments are merged by STREAMING them: a k-way merge that holds a block per source,
+    # not every span of every source, so even a 512 MB container merges full flushes (~4 into
+    # one segment at its derived 24 MB pass budget). false = the old materialising merge.
+    # StreamingCompaction: true
+    #
+    # What one merge may hold in memory. Unset = min(73 MB, 6% of the managed-heap limit),
+    # ~24 MB in a 512 MB container. A streaming merge spends it on side state, not on the
+    # spans it merges, so raising it buys LARGER merged segments (fewer files), not a bigger
+    # read: ~14 full flushes per merged segment at 48 MB, against ~4 at the derived 24 MB.
+    # MergeBudgetBytes: 48000000
+    #
+    # Segments whose newest span is younger than this are left as they were flushed. Latency,
+    # error-rate and trace alert windows are answered from each segment's whole-segment stats,
+    # so the newest hour stays flush-sized and those windows stay as exact as they were.
+    # CompactionMinAge: "01:00:00"
 
   # ── Metrics ──────────────────────────────────────────────────────────────────
   # Every ceiling here is a quantity of BYTES or of objects, and the ones left unset derive
