@@ -91,7 +91,7 @@ public static class OtlpEndpointMapper
         // And the throttled error for a batch the server ran out of memory taking in.
         OtlpOutOfMemoryLog outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
-        // The most data points one metrics batch may carry (Ingestion.MaxOtlpMetricPoints), read once.
+        // The most one metrics batch may decode to, in data points (Ingestion.MaxOtlpMetricPoints), read once.
         int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
 
         // OUT OF MEMORY IS THE SERVER'S FAILURE, NOT THE BATCH'S (#125). Each handler below takes
@@ -166,13 +166,14 @@ public static class OtlpEndpointMapper
                 {
                     bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
 
-                    // THE POINTS ARE COUNTED BEFORE ONE IS BUILT (#126 review F2): a data point can
-                    // be two bytes on the wire and ~125 decoded, so a batch inside the byte limit
-                    // could decode past the heap — and its own out-of-memory failure, answered 503,
-                    // was retried for minutes. Over the limit it is refused as what it is: too large.
-                    int count = isProto ? OtlpMetricPointBudget.CountProto(body.AsSpan(0, bodyLen))
-                                        : OtlpMetricPointBudget.CountJson(body.AsSpan(0, bodyLen));
-                    if (count > maxMetricPoints)
+                    // THE BATCH IS WEIGHED BEFORE A POINT IS BUILT (#126 review F2, NEW-1): a data
+                    // point can be two bytes on the wire and ~125 decoded, a histogram bucket one
+                    // byte and 24, so a batch inside the byte limit could decode past the heap — and
+                    // its own out-of-memory failure, answered 503, was retried for minutes. Over the
+                    // limit it is refused as what it is: too large.
+                    var weight = isProto ? OtlpMetricPointBudget.WeighProto(body.AsSpan(0, bodyLen))
+                                         : OtlpMetricPointBudget.WeighJson(body.AsSpan(0, bodyLen));
+                    if (!OtlpMetricPointBudget.Fits(weight, maxMetricPoints))
                     {
                         WriteTooManyPoints(ctx, isProto);
                         return;
@@ -542,7 +543,8 @@ public static class OtlpEndpointMapper
     }
 
     /// <summary>
-    /// The refusal of a metrics batch over <c>Ingestion.MaxOtlpMetricPoints</c> (#126 review F2): 413,
+    /// The refusal of a metrics batch that would decode past <c>Ingestion.MaxOtlpMetricPoints</c>
+    /// points' worth (<see cref="OtlpMetricPointBudget"/>; #126 review F2, NEW-1): 413,
     /// as for a batch over the byte limit — one remedy, split it — with the OTLP failure shape saying
     /// so, encoded like the request. Not retryable, and nothing of the batch was decoded or ingested.
     /// </summary>

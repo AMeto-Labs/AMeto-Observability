@@ -15,21 +15,23 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Ameto.Integration.Tests;
 
 /// <summary>
-/// A METRICS BATCH IS COUNTED BEFORE IT IS DECODED (#126 review F2).
+/// A METRICS BATCH IS WEIGHED BEFORE IT IS DECODED (#126 review F2, NEW-1).
 ///
 /// <para>A metric data point can be two bytes on the wire and ~125 decoded (~200 from JSON): 200 000
 /// empty gauge points — a 400 KB protobuf body, 1.8 KB gzipped — allocated 25 MB to decode, 62.5×.
 /// At the 8 MiB body limit that is ~500 MiB, past the 512 MB stand's whole heap: the decode ran out
 /// of memory, which since #125 is answered 503, and the exporter retried the same batch for minutes.
-/// Now the points are counted by a walk that allocates nothing, and a batch over
-/// <c>Ingestion.MaxOtlpMetricPoints</c> is refused 413 (gRPC: RESOURCE_EXHAUSTED) before one is
-/// built. This host runs at 100 000.</para>
+/// A histogram bucket count is one byte on the wire and 24 decoded. Now the batch is weighed by a
+/// walk that allocates nothing — its points, and its histogram points' buckets, bounds and
+/// exemplars — and one that would decode past <c>Ingestion.MaxOtlpMetricPoints</c> points' worth is
+/// refused 413 (gRPC: RESOURCE_EXHAUSTED) before a point is built. This host runs at 100 000 points,
+/// 12.8 MB.</para>
 /// </summary>
 public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBudgetTests.Factory>
 {
     private const int Limit = 100_000;
 
-    private const string Refusal = "the batch holds more data points than this server decodes in one request; split it";
+    private const string Refusal = "the batch decodes to more data points and buckets than this server takes in one request; split it";
 
     public sealed class Factory : AmetoWebAppFactory
     {
@@ -151,6 +153,158 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Equal(1, gate.Available);
     }
 
+    // ── A histogram point's arrays are weighed too (#126 review NEW-1) ────────
+
+    /// <summary>
+    /// The protobuf weight of a histogram point's arrays is what the parser builds from them, in every
+    /// encoding the parser reads: packed varint and packed fixed64 counts, unpacked varint and fixed64
+    /// counts, packed and unpacked bounds, and exemplars.
+    /// </summary>
+    [Fact]
+    public void The_proto_weight_counts_a_histogram_points_arrays_as_the_parser_reads_them()
+    {
+        byte[] message = Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm =>
+        {
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString("weight.histogram");
+                Sub(metric, 9, Msg(h =>
+                {
+                    Sub(h, 1, Msg(dp =>                                         // packed varints (13 B), packed bounds, exemplars
+                    {
+                        Sub(dp, 6, Enumerable.Range(1, 13).Select(i => (byte)i).ToArray());
+                        Sub(dp, 7, Doubles(12));
+                        Sub(dp, 8, Exemplar());
+                        Sub(dp, 8, Exemplar());
+                    }));
+                    Sub(h, 1, Msg(dp =>                                         // packed fixed64 (32 B), unpacked bounds
+                    {
+                        Sub(dp, 6, Doubles(4));
+                        for (int i = 0; i < 3; i++) { dp.WriteTag(7, WireFormat.WireType.Fixed64); dp.WriteDouble(i); }
+                    }));
+                    Sub(h, 1, Msg(dp =>                                         // unpacked varint and fixed64 counts
+                    {
+                        for (int i = 0; i < 3; i++) { dp.WriteTag(6, WireFormat.WireType.Varint);  dp.WriteUInt64(5); }
+                        for (int i = 0; i < 2; i++) { dp.WriteTag(6, WireFormat.WireType.Fixed64); dp.WriteFixed64(7); }
+                    }));
+                }));
+            }));
+            Sub(sm, 2, Metric("weight.gauge", 5, points: 2, histogram: false));
+        })))));
+
+        var items  = OtlpMetricProtoParser.Parse(message);
+        var weight = OtlpMetricPointBudget.WeighProto(message);
+
+        Assert.Equal(items.Count, weight.Points);
+        Assert.Equal(items.Sum(i => i.BucketCounts?.Length ?? 0), weight.Buckets);
+        Assert.Equal(items.Sum(i => i.BucketBounds?.Length ?? 0), weight.Bounds);
+        Assert.Equal(items.Sum(i => i.Exemplars?.Length ?? 0), weight.Exemplars);
+        Assert.Equal((5, 22, 15, 2), (weight.Points, weight.Buckets, weight.Bounds, weight.Exemplars));
+
+        static byte[] Doubles(int n) => Msg(o => { for (int i = 0; i < n; i++) o.WriteDouble(i + 0.5); });
+        static byte[] Exemplar() => Msg(e =>
+        {
+            e.WriteTag(3, WireFormat.WireType.Fixed64); e.WriteDouble(1.5);
+            e.WriteTag(5, WireFormat.WireType.LengthDelimited); e.WriteBytes(ByteString.CopyFrom(new byte[16] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }));
+        });
+    }
+
+    /// <summary>The JSON weight is what the mapper builds: bucket counts, bounds and exemplars of histogram points only.</summary>
+    [Fact]
+    public void The_json_weight_counts_a_histogram_points_arrays_as_the_model_binds_them()
+    {
+        byte[] json = Encoding.UTF8.GetBytes("""
+            {"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+              {"name":"weight.histogram","histogram":{"dataPoints":[
+                {"count":"3","bucketCounts":["1","1","1"],"explicitBounds":[1,2],
+                 "exemplars":[{"asDouble":1.5,"traceId":"0102030405060708090a0b0c0d0e0f10"}]},
+                {"count":"1","bucketCounts":["1"],"explicitBounds":[]}
+              ]}},
+              {"name":"weight.gauge","gauge":{"dataPoints":[{"asDouble":1,"bucketCounts":["9","9"],"exemplars":[{}]}]}}
+            ]}]}]}
+            """);
+
+        var items  = OtlpMetricMapper.Map(JsonSerializer.Deserialize<Ameto.Otel.Models.ExportMetricsServiceRequest>(json)!);
+        var weight = OtlpMetricPointBudget.WeighJson(json);
+
+        Assert.Equal(items.Count, weight.Points);
+        Assert.Equal(items.Sum(i => i.BucketCounts?.Length ?? 0), weight.Buckets);
+        Assert.Equal(items.Sum(i => i.BucketBounds?.Length ?? 0), weight.Bounds);
+        Assert.Equal(items.Sum(i => i.Exemplars?.Length ?? 0), weight.Exemplars);
+        Assert.Equal((3, 4, 2, 1), (weight.Points, weight.Buckets, weight.Bounds, weight.Exemplars));
+    }
+
+    /// <summary>
+    /// ONE POINT OF 8 300 001 PACKED BUCKETS IS 413, AND NEVER PARSED. An 8.3 MB body inside the byte
+    /// limit, counted as one point, allocated 200 MB to parse and kept a 66 MB array; two of them at
+    /// once, about 8 KB each as gzip uploads, would have passed the 512 MB stand's heap. Weighed, it is
+    /// refused by a walk that allocates nothing, over HTTP and over gRPC.
+    /// </summary>
+    [Fact]
+    public async Task One_point_of_8_300_001_packed_buckets_is_refused_by_a_walk_that_allocates_nothing()
+    {
+        byte[] body = HistogramBeside("weight.wide", 8_300_001, "weight.wide.beside", protobuf: true);
+        Assert.True(body.Length < 8 * 1024 * 1024, "setup: inside the byte limit");
+
+        OtlpMetricPointBudget.WeighProto(body);                                // warm
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var weight  = OtlpMetricPointBudget.WeighProto(body);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(8_300_001, weight.Buckets);
+        Assert.True(allocated < 1024, $"weighing allocated {allocated:N0} B");
+
+        using var refused = await PostAsync(body, protobuf: true);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
+        Assert.Equal(Refusal, StatusMessage(await refused.Content.ReadAsByteArrayAsync(), protobuf: true));
+
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var noLog = new OtlpGzipTooLargeLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var noMemoryLog = new OtlpOutOfMemoryLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var call = GrpcCall(Frame(body));
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, noLog, noMemoryLog,
+            (c, msg) => OtlpGrpcEndpointMapper.DecodeMetrics(c, msg.AsSpan(), Limit));
+        Assert.Equal("8", call.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(Refusal, call.Response.Headers["grpc-message"].ToString());
+
+        Assert.Empty(QueryNames("weight.wide"));                               // neither the point nor the gauge beside it
+    }
+
+    /// <summary>JSON's bucket counts are weighed the same: 600 000 of them, a 2.4 MB body, are 413.</summary>
+    [Fact]
+    public async Task A_json_point_of_600_000_bucket_counts_is_413()
+    {
+        using var refused = await PostAsync(HistogramBeside("weight.json.wide", 600_001, "weight.json.beside", protobuf: false),
+                                            protobuf: false);
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
+        Assert.Equal(Refusal, StatusMessage(await refused.Content.ReadAsByteArrayAsync(), protobuf: false));
+        Assert.Empty(QueryNames("weight.json"));
+    }
+
+    /// <summary>
+    /// What an exporter sends is still taken: 8 192 points — one OpenTelemetry Collector batch at its
+    /// default size — of 16 buckets and 15 bounds each weigh 6.2 MB, inside this host's 12.8 MB and
+    /// inside even the 8.4 MB of the default rule's 65 536-point floor.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_batch_of_8192_histogram_points_of_16_buckets_is_taken(bool protobuf)
+    {
+        string name = "weight.batch." + (protobuf ? "proto" : "json");
+        byte[] body = HistogramPoints(name, points: 8_192, buckets: 16, protobuf);
+
+        var weight = protobuf ? OtlpMetricPointBudget.WeighProto(body) : OtlpMetricPointBudget.WeighJson(body);
+        Assert.Equal((8_192, 8_192 * 16, 8_192 * 15), (weight.Points, weight.Buckets, weight.Bounds));
+        Assert.True(OtlpMetricPointBudget.Fits(weight, IngestionOptions.DefaultMaxOtlpMetricPointsFor(default)),
+                    "the smallest derived limit refuses a Collector batch");
+
+        using var accepted = await PostAsync(body, protobuf);
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.Equal("{\"ingested\":8192,\"dropped\":0}", await accepted.Content.ReadAsStringAsync());
+        Assert.Contains(name, QueryNames(name));
+    }
+
     // ── A histogram point of more than 65 535 buckets (#126 review NEW-0) ──────
 
     /// <summary>
@@ -247,6 +401,51 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
                 }))));
             }));
         })))));
+    }
+
+    /// <summary>
+    /// One histogram of <paramref name="points"/> points as an exporter sends them: stamped a minute
+    /// ago and a millisecond apart, <paramref name="buckets"/> counts as packed fixed64 (the type the
+    /// .proto declares) and one bound fewer as packed doubles; in JSON, counts as strings.
+    /// </summary>
+    private static byte[] HistogramPoints(string name, int points, int buckets, bool protobuf)
+    {
+        long now = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60_000) * 1_000_000L;
+        if (!protobuf)
+        {
+            var sb = new StringBuilder("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"name\":\"")
+                .Append(name).Append("\",\"histogram\":{\"dataPoints\":[");
+            for (int i = 0; i < points; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"timeUnixNano\":\"").Append((now + i * 1_000_000L).ToString(CultureInfo.InvariantCulture))
+                  .Append("\",\"count\":\"").Append(buckets).Append("\",\"sum\":1.5,\"bucketCounts\":[");
+                for (int b = 0; b < buckets; b++) sb.Append(b == 0 ? "\"1\"" : ",\"1\"");
+                sb.Append("],\"explicitBounds\":[");
+                for (int b = 0; b < buckets - 1; b++) sb.Append(b == 0 ? "" : ",").Append(b + 1);
+                sb.Append("]}");
+            }
+            return Encoding.UTF8.GetBytes(sb.Append("]}}]}]}]}").ToString());
+        }
+
+        byte[] counts = Msg(o => { for (int b = 0; b < buckets; b++) o.WriteFixed64(1); });
+        byte[] bounds = Msg(o => { for (int b = 0; b < buckets - 1; b++) o.WriteDouble(b + 1); });
+        return Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm => Sub(sm, 2, Msg(metric =>
+        {
+            metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(name);
+            Sub(metric, 9, Msg(h =>
+            {
+                for (int i = 0; i < points; i++)
+                    Sub(h, 1, Msg(dp =>
+                    {
+                        dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)(now + i * 1_000_000L));
+                        dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)buckets);
+                        dp.WriteTag(5, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                        Sub(dp, 6, counts);
+                        Sub(dp, 7, bounds);
+                    }));
+            }));
+        })))))));
     }
 
     private IEnumerable<string> QueryNames(string name) =>

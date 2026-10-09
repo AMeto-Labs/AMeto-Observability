@@ -195,8 +195,10 @@ Ameto:
     MaxEventPayloadBytes: 65536   # 64 KB — max properties per event (larger events dropped + logged)
     MaxOtlpBatchBytes: 8388608    # 8 MB  — max OTLP /otlp/v1/* body (larger → 413)
     # MaxOtlpMetricPoints:        # unset = max(65536, request-body share / 128 B): ~157 000 data points
-    #                             # in a 512 MB container. A metrics batch with more → 413 (gRPC
-    #                             # RESOURCE_EXHAUSTED), counted before a point is decoded.
+    #                             # in a 512 MB container. A metrics batch that would decode past that
+    #                             # many points (128 B a point, 24 B a histogram bucket, 16 B a bound,
+    #                             # 160 B an exemplar) → 413 (gRPC RESOURCE_EXHAUSTED), weighed before
+    #                             # a point is decoded.
 
     # Payload slab arena — the absorption window when the drainer stalls (slabs, not ring
     # slots, are what a burst runs out of; a pending event holds one slab whatever its size).

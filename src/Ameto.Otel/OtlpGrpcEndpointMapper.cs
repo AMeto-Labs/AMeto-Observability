@@ -83,8 +83,9 @@ public static class OtlpGrpcEndpointMapper
     }
 
     /// <summary>
-    /// The metrics Export's decode and store. The data points are counted before one is built
-    /// (#126 review F2): a batch over <c>Ingestion.MaxOtlpMetricPoints</c> throws
+    /// The metrics Export's decode and store. The batch is weighed before a point is built — its
+    /// points, and a histogram point's buckets, bounds and exemplars (#126 review F2, NEW-1): one that
+    /// would decode past <c>Ingestion.MaxOtlpMetricPoints</c> points' worth throws
     /// <see cref="OtlpMetricPointBudget.TooManyPointsException"/>, answered RESOURCE_EXHAUSTED — its
     /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried. A
     /// histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets is refused
@@ -93,8 +94,8 @@ public static class OtlpGrpcEndpointMapper
     /// </summary>
     internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints)
     {
-        int count = OtlpMetricPointBudget.CountProto(message);
-        if (count > maxPoints) throw new OtlpMetricPointBudget.TooManyPointsException(count, maxPoints);
+        var weight = OtlpMetricPointBudget.WeighProto(message);
+        if (!OtlpMetricPointBudget.Fits(weight, maxPoints)) throw new OtlpMetricPointBudget.TooManyPointsException(weight, maxPoints);
 
         var points = OtlpMetricProtoParser.Parse(message, out int tooManyBuckets);
         int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()
@@ -274,8 +275,8 @@ public static class OtlpGrpcEndpointMapper
             }
             catch (OtlpMetricPointBudget.TooManyPointsException)
             {
-                // More data points than the server decodes in one request, refused before one was
-                // built (#126 review F2): the "batch too large" answer, as for one over the byte limit.
+                // More than the server decodes in one request, refused before a point was built
+                // (#126 review F2, NEW-1): the "batch too large" answer, as for one over the byte limit.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
                 return;

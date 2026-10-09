@@ -125,16 +125,18 @@ public sealed class IngestionOptions
     public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;
 
     /// <summary>
-    /// The most data points one OTLP METRICS batch may carry. Counted before a point is built, by a
-    /// walk of the batch that allocates nothing; a batch over it is refused 413 (gRPC:
-    /// RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested (#126 review F2).
+    /// The most one OTLP METRICS batch may decode to, in data points. The batch is weighed before a
+    /// point is built, by a walk that allocates nothing: <see cref="DecodedMetricPointBytes"/> a data
+    /// point, and a histogram point's arrays at what they decode to — 24 B a bucket count, 16 B a
+    /// bound, 160 B an exemplar. A batch weighing more than this many points is refused 413 (gRPC:
+    /// RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested (#126 review F2, NEW-1).
     ///
-    /// <para>Why a count and not just <see cref="MaxOtlpBatchBytes"/>: a metric data point can be two
-    /// bytes on the wire and ~125 decoded (~200 from JSON) — measured, 62–67× — so a batch inside the
-    /// byte limit could decode to ~500 MiB, past a 512 MB container's whole 384 MiB heap. Its own
-    /// decode then ran out of memory, which since #125 is answered 503, and the exporter retried it,
-    /// out of memory every time. Logs and traces are not counted: they stream into bounded rings and
-    /// do not expand like this.</para>
+    /// <para>Why a weight and not just <see cref="MaxOtlpBatchBytes"/>: a metric data point can be two
+    /// bytes on the wire and ~125 decoded (~200 from JSON) — measured, 62–67× — and a histogram's
+    /// bucket count one byte and 24, so a batch inside the byte limit could decode to ~500 MiB, past a
+    /// 512 MB container's whole 384 MiB heap. Its own decode then ran out of memory, which since #125
+    /// is answered 503, and the exporter retried it, out of memory every time. Logs and traces are not
+    /// weighed: they stream into bounded rings and do not expand like this.</para>
     ///
     /// <para>Unset: <see cref="DefaultMaxOtlpMetricPointsFor"/> — the request-body share of the heap
     /// (<c>MemoryBudgets.IngestBufferBytes</c>) at <see cref="DecodedMetricPointBytes"/> a point,
