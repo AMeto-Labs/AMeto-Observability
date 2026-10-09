@@ -3873,10 +3873,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// and recorded for a running scan under both locks, the file parked and unlinked, the entry
     /// first so no entry is left naming a file that is gone. A replica name used to be left in
     /// service as "pushed again" and the manifest dropped: that kept its events counted twice for
-    /// good, 660 for 600 whichever way it had come back. The one file wrongly taken out this way is
-    /// a DIFFERENT segment pushed under the same node id and segment id: two nodes configured with
-    /// one NodeId, the deployment error <see cref="ImportSegment(string, string)"/> cannot resolve
-    /// either.</para>
+    /// good, 660 for 600 whichever way it had come back.</para>
+    ///
+    /// <para>A DIFFERENT segment can be served at a listed path too: a merge that takes a replica
+    /// frees its key, and a peer reinstalled with the same NodeId (its segment ids restarted) or a
+    /// second node configured with one can push a new segment under it. Taken out, its events were
+    /// gone without a word. Every source the merge read lies inside the time span its output's
+    /// name carries, built from theirs, so an entry outside it is left in service, the manifest no
+    /// longer waits for it, and an Error names it (<see cref="LogForeignListedSegments"/>). One
+    /// written inside that span is still taken out: telling it apart would take each source's
+    /// header fields in the manifest.</para>
     ///
     /// <para>Deciding on the output alone holds only while the output stays where its manifest
     /// expects it, so the output of a manifest this sweep meets committed is kept out of the merge
@@ -4008,6 +4014,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         var keys    = new SegmentKey[sources.Count];
         var unlink  = new string?[sources.Count];   // what this sweep parks; what settling leaves was not unlinked
         var guarded = new bool[sources.Count];
+        var foreign = new bool[sources.Count];      // a different segment served at a listed path: not this manifest's
+        var span    = SpanOfMergeOutputName(output);
         for (int i = 0; i < keys.Length; i++) keys[i] = KeyOfSegmentFileName(sources[i]);
 
         SegmentInfo? displaced = null;
@@ -4022,6 +4030,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 if (_segments.TryGetValue(keys[i], out var entry)
                     && string.Equals(entry.FilePath, sources[i], StringComparison.OrdinalIgnoreCase))
                 {
+                    // Not the segment the merge read: every source it took lies inside the span its
+                    // output's name carries, built from theirs. A merge that takes a replica frees its
+                    // key, and a peer reinstalled with the same NodeId (its segment ids restarted) or a
+                    // second node configured with one can push a different segment under it. That one
+                    // stays in service, and the manifest no longer waits for it (see
+                    // RecoverInterruptedMerges).
+                    if (entry.MinTimestampTicks < span.Min || entry.MaxTimestampTicks > span.Max)
+                    {
+                        foreign[i] = true;
+                        continue;
+                    }
                     // In the catalog beside its output: a catalog scan registered it because no sweep
                     // before it could settle this manifest, or its peer pushed a replica again. Either
                     // way its events are the output's, and it is taken out as a commit takes out its
@@ -4066,7 +4085,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             ParkMergeSourceGuards(keys, unlink, guarded);
         }
         // The verdict carried out: every source the manifest lists is out of the catalog — taken out,
-        // parked or gone — so none of them can be merged any more, and the span is let go.
+        // parked or gone; a different segment at a listed path is not one — so none of them can be
+        // merged any more, and the span is let go.
         _undecidedMergeOutputs.TryRemove(output, out _);
         if (committed)
         {
@@ -4075,14 +4095,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 "Merge recovery: the output {File} of an interrupted merge, unread until now, is whole — committed: in " +
                 "service, and the sources it lists out", Path.GetFileName(output));
         }
+        LogForeignListedSegments(output, sources, foreign);
         try     { SettleMergedSources(keys, unlink, guarded); }
         finally { ReleaseUntriedMergeGuards(guarded); }
 
         // The manifest goes once nothing it lists is left to it: no source parked, none on disk.
-        // File.Exists, the merge's own test for the same decision.
+        // File.Exists, the merge's own test for the same decision. A different segment served at a
+        // listed path is not the merge's to wait for.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
-            anyLeft = _pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]);
+            anyLeft = !foreign[i] && (_pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]));
         if (!anyLeft)
         {
             _deleteMergeManifest(manifest);
@@ -4101,6 +4123,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 "Merge recovery: {Count} source file(s) of {File} could not be deleted yet — kept out of the catalog and " +
                 "retried; the manifest stays until they are gone",
                 held, Path.GetFileName(output));
+    }
+
+    /// <summary>
+    /// Says, once per output and at Error, which listed paths the catalog serves as a segment the
+    /// merge never read (see <see cref="RecoverInterruptedMerge"/>): two segments were written under
+    /// one node id and segment id, the deployment error <see cref="LogDisplacedLocalSegment"/> names
+    /// for an import. A duplicate NodeId writing inside the merge's own time span is not told apart
+    /// here: that would take each source's header fields in the manifest.
+    /// </summary>
+    private void LogForeignListedSegments(string output, List<string> sources, bool[] foreign)
+    {
+        List<string>? names = null;
+        for (int i = 0; i < foreign.Length; i++)
+            if (foreign[i]) (names ??= []).Add(Path.GetFileName(sources[i]));
+        if (names is null || !FirstMergeOutputWarning("foreign", output)) return;
+        _logger.LogError(
+            "Merge recovery: the manifest of {Output} lists {Files}, and the catalog serves a different segment under " +
+            "that name — its time span lies outside the one the merge read. Two segments were written under one node " +
+            "id and segment id: a node reinstalled with its NodeId and its segment ids restarted, or two nodes " +
+            "configured with one NodeId. It is left in service, and the manifest no longer waits for it",
+            Path.GetFileName(output), string.Join(", ", names));
     }
 
     /// <summary>What a sweep finds at a manifest's output name (<see cref="ReadMergeOutput"/>).</summary>
@@ -4264,8 +4307,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
-    /// What a sweep has said at Warning about a merge output, by kind and path: that its verdict
-    /// waits, that it is torn and cannot be set aside. A held file is met by every pass while it is
+    /// What a sweep has said at Warning or Error about a merge output, by kind and path: that its
+    /// verdict waits, that it is torn and cannot be set aside, that a listed path serves a different
+    /// segment. A held file is met by every pass while it is
     /// held, and the same Warning from each was noise; the repeats go to Debug. The pin used to tell
     /// the first sweep from the rest, being added only by it; every sweep that meets a manifest pins
     /// its span now. Cleared for an output when its manifest goes.
@@ -4280,6 +4324,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     {
         _mergeOutputWarnings.TryRemove("wait|" + output, out _);
         _mergeOutputWarnings.TryRemove("torn|" + output, out _);
+        _mergeOutputWarnings.TryRemove("foreign|" + output, out _);
     }
 
     /// <summary>

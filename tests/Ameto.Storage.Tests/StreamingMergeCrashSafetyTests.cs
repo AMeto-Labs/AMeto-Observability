@@ -3,6 +3,7 @@ using MessagePack;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
+using MelLogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Storage.Tests;
 
@@ -620,14 +621,15 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
     /// <summary>
     /// A replicated segment shaped like this fixture's own flushes — <paramref name="count"/> events of
-    /// round <paramref name="round"/>, now — so the planner takes it into a merge beside them.
+    /// round <paramref name="round"/>, from <paramref name="baseTicks"/> or now — so the planner takes
+    /// it into a merge beside them.
     /// </summary>
-    private string WritePeerSegment(ulong segId, int round, int count)
+    private string WritePeerSegment(ulong segId, int round, int count, long? baseTicks = null)
     {
         var peer = new NodeId(7);
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(count * 2, 1L << 22);
-        long now = DateTime.UtcNow.Ticks;
+        long now = baseTicks ?? DateTime.UtcNow.Ticks;
         for (int i = 0; i < count; i++)
         {
             int n = round * 1000 + i;
@@ -1775,9 +1777,8 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// A replica its peer pushes AGAIN while the manifest of the merge that took it still lives (another
     /// source held): the same segment, whose events the output holds, so it is taken out like any
     /// source the manifest lists. It used to be left in service as "in service again" and the double
-    /// count kept for good; the one segment that would be wrongly taken out is a DIFFERENT one pushed
-    /// under the same node id and segment id, a duplicate NodeId — the deployment error no key can
-    /// resolve.
+    /// count kept for good. A DIFFERENT segment pushed under the same node id and segment id is left
+    /// in service (the next test).
     /// </summary>
     [Fact]
     public async Task AReplicaPushedAgainWhileItsManifestLives_IsTakenOut()
@@ -1802,6 +1803,54 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
         Assert.DoesNotContain(_engine.ListSegments(), s => s.FilePath == replica);
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// A DIFFERENT segment pushed under a merged replica's key is not the merge's to take out. The
+    /// merge took replica 7-904, which freed its key; a peer reinstalled with the same NodeId (its
+    /// segment ids restarted from 1) or a second node configured with it then pushed a new 7-904
+    /// while the manifest still lived (a local source held). The sweep took out whatever the
+    /// catalog named at the listed path: its 30 events gone, and nothing said. Every source the
+    /// merge read lies inside the time span its output's name carries; this one, 40 s past it, does
+    /// not. It stays in service, the manifest no longer waits for it, and an Error names it, once.
+    /// </summary>
+    [Fact]
+    public async Task ADifferentSegmentPushedUnderAMergedReplicasKey_StaysInService()
+    {
+        await _engine.CatalogLoaded;
+        for (int round = 0; round < 9; round++) await WriteSegmentAsync(round, 60);
+        var held    = _engine.ListSegments().Select(s => s.FilePath).Order(StringComparer.Ordinal).First();
+        var replica = WritePeerSegment(904, 9, 60);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(replica));
+        _engine._deleteSegmentFile = UnlinkRefusing(held);              // keeps the manifest alive
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments());
+        Assert.False(File.Exists(replica), "setup: the replica was not a source");
+        Assert.Single(Manifests());
+
+        var stranger = WritePeerSegment(904, 50, 30, baseTicks: output.MaxTimestampTicks + 40 * TimeSpan.TicksPerSecond);
+        Assert.Equal(stranger, replica);                                  // setup: the same name, 7-904.seg
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(stranger));
+        var before = ReadEverything();                                    // the merge's 600 and the stranger's 30
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == stranger);   // taken out with the manifest's sources
+        AssertSameEvents(before, ReadEverything());
+        bool NamesIt((string Message, Exception? Error, MelLogLevel Level) e) =>
+            e.Level == MelLogLevel.Error && e.Message.Contains(Path.GetFileName(stranger), StringComparison.Ordinal);
+        Assert.Single(_log.Entries, NamesIt);
+
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);    // the manifest still waits for the held source
+        Assert.Single(_log.Entries, NamesIt);                             // said once
+
+        _engine._deleteSegmentFile = File.Delete;                         // let go: the manifest goes without it
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+
+        await RestartAsync();
         AssertSameEvents(before, ReadEverything());
     }
 
