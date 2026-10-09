@@ -808,6 +808,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         var budgets = MemoryBudgets.Current();
         _hotTierBudgetBytes = options.HotTierMaxBytesFor(budgets);
         _mergeBudgetBytes   = options.MergeBudgetBytesFor(budgets);
+        _streamingCompaction = options.StreamingCompaction;
+        _compactionMinAge    = options.EffectiveCompactionMinAge;
 
         _segmentVersion = writeSegmentFormatV4 ? SpanWriter.NewestVersion : SpanWriter.DefaultVersion;
         _indexEnabled   = indexEnabled;
@@ -3693,9 +3695,16 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         try
         {
             _inCompactionRunForTest?.Invoke();   // test seam: parks a run inside its heavy phase
+            lock (_skipThisRun) _skipThisRun.Clear();
             const int MaxPasses = 500;   // safety valve, ~10k merged segments per run
             int passes = 0;
-            while (CompactOnePass() && ++passes < MaxPasses) { }
+            // A TEARDOWN THAT BEGINS BETWEEN TWO PASSES ENDS THE RUN THERE. A run used to go on to the
+            // valve whatever happened around it, and the teardown waited for the whole of it — harmless
+            // while the stand's full flushes never merged, but a streamed backlog is hundreds of passes
+            // of about a second each, and a stop in the middle of one would spend the shutdown budget
+            // and leave the engine frozen. The pass in flight still finishes: it is what the heavy
+            // phase protects.
+            while (Volatile.Read(ref _writesClosed) == 0 && CompactOnePass() && ++passes < MaxPasses) { }
             LastCompactionPassesForTest = passes;
             if (passes > 0)
                 _logger.LogInformation("Compaction run finished: {Passes} pass(es), {Count} cold segments remain",
@@ -3742,14 +3751,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
     /// <param name="quarantined">Paths never to plan — segments a pass read back empty (see
     /// <see cref="QuarantineFromCompaction"/>). Null when there are none.</param>
+    /// <param name="rewrite">Segments to plan as a v2 file is planned — a candidate whatever it weighs,
+    /// and rewritten even alone — or null. See <see cref="NeedsSidecarRebuild"/>.</param>
     internal static List<SpanSegmentInfo> SelectCompactionBatch(
-        SpanSegmentInfo[] segments, long mergeBudgetBytes, HashSet<string>? quarantined)
+        SpanSegmentInfo[] segments, long mergeBudgetBytes, HashSet<string>? quarantined,
+        Func<SpanSegmentInfo, bool>? rewrite = null)
     {
         const long MaxSpanNanos = 24L * 3600 * 1_000_000_000; // 24 h
 
         long thresholdBytes = CompactionThresholdBytesFor(mergeBudgetBytes);
         var candidates = segments
-            .Where(s => (EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
+            .Where(s => (EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3 || rewrite?.Invoke(s) == true)
                      && (quarantined is null || !quarantined.Contains(s.FilePath)))
             .OrderBy(s => s.MinStartNano)
             .ToList();
@@ -3793,9 +3805,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             }
 
             if (batch.Count >= 2) return batch;
-            // A lone legacy file has no peer to wait for — it is rewritten to migrate it,
+            // A lone legacy file has no peer to wait for — it is rewritten to migrate it (and a
+            // lone segment whose sidecars a streaming merge refused, to rebuild them),
             // not to merge it, so the tier rule does not apply.
-            if (seed.FormatVersion < 3) return [seed];
+            if (seed.FormatVersion < 3 || rewrite?.Invoke(seed) == true) return [seed];
         }
         return [];
     }
@@ -3920,7 +3933,49 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal IReadOnlyCollection<string> CatalogPathsForTest =>
         _manifest.Segments.Values.Select(static s => s.FilePath).ToList();
 
+    /// <summary>
+    /// One pass: a streaming merge when one is due, else a materialising one. True when the run should
+    /// plan again — something merged, or a pass learned something that changes the plan.
+    /// </summary>
     private bool CompactOnePass()
+    {
+        if (_streamingCompaction)
+        {
+            var quarantine = CompactionQuarantineSnapshot();
+            var batch = SelectStreamingBatch(_coldSegments, _mergeBudgetBytes, CompactionNowNano(),
+                                             Math.Min(_compactionMinAge.Ticks, long.MaxValue / 100) * 100L,
+                                             // Priced FIRST: pricing is where a segment with no
+                                             // sidecars at all is found out and handed over.
+                                             s => SummaryRowsOf(s) >= 0 && StreamEligible(s, quarantine) && !SkippedThisRun(s),
+                                             SummaryRowsOf);
+            if (batch.Count > 0) return CompactStreamingPass(batch);
+        }
+
+        // THE MATERIALISING MERGE, for what a stream cannot take: legacy v2 files (migrated to v3, and
+        // shrunk, by being rewritten), a segment whose header range is implausible, and one whose
+        // sidecars will not read. With streaming off it is every merge, as it always was.
+        var pool = _streamingCompaction
+            ? Array.FindAll(_coldSegments, s => !StreamEligible(s, quarantined: null))
+            : _coldSegments;
+        return CompactMaterialisedPass(pool, _streamingCompaction ? NeedsSidecarRebuild : null);
+    }
+
+    /// <summary>
+    /// A v3+ segment a streaming merge refused because a sidecar cannot be carried over. It is
+    /// rewritten even ALONE — as a v2 file is migrated — because the rewrite is what repairs it: the
+    /// materialising writer rebuilds every sidecar from the spans, and the file it writes is one a
+    /// streaming merge takes. Without this, such a segment with no refused peer stayed as it was for
+    /// good. A segment with an implausible header range is NOT one: rewriting it alone would give it
+    /// the same range, and it would be refused again after the next restart, every restart.
+    /// </summary>
+    private bool NeedsSidecarRebuild(SpanSegmentInfo s)
+    {
+        if (s.FormatVersion < 3 || s.HeaderRangeSuspect) return false;
+        lock (_streamIneligible) return _streamIneligible.Contains(s.FilePath);
+    }
+
+    /// <param name="rewrite">Segments to rewrite even alone (see <see cref="NeedsSidecarRebuild"/>), or null.</param>
+    private bool CompactMaterialisedPass(SpanSegmentInfo[] pool, Func<SpanSegmentInfo, bool>? rewrite)
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
         // into memory. Compaction used to merge ALL small segments at once, which on a
@@ -3928,7 +3983,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         // left the segments un-compacted — so they piled up and every pass failed worse.
         // Legacy-v2 files are selected regardless of size so old data migrates to the
         // v3 format (and shrinks) in the background.
-        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes, CompactionQuarantineSnapshot());
+        var small = SelectCompactionBatch(pool, _mergeBudgetBytes, CompactionQuarantineSnapshot(), rewrite);
         if (small.Count == 0) return false;
 
         var  allSpans    = new List<SpanRecord>();
@@ -4009,7 +4064,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         }
 
         // A single v3 file needs no rewrite; a single v2 file still migrates.
-        if (allSpans.Count == 0 || (processed.Count < 2 && processed.All(s => s.FormatVersion >= 3)))
+        if (allSpans.Count == 0 || (processed.Count < 2 && processed.All(s => s.FormatVersion >= 3 && rewrite?.Invoke(s) != true)))
         {
             // F1: THE PASS THAT MERGED NOTHING MUST STILL LEAVE WHAT IT MEASURED BEHIND. Before, it
             // returned false with the weights thrown away: the oldest candidate, underpriced, seeded
@@ -4035,106 +4090,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
-            _compactionStageForTest?.Invoke(CompactionStage.Merged);
-
-            // THE SOURCES ARE KNOWN BY PATH FROM HERE ON, NOT BY THE REFERENCES THE PLAN HELD. The
-            // index worker's adoption (AdoptUnnamedSegments) runs beside this pass and REPLACES the
-            // snapshot entry of a segment it names; matched by reference, the swap below then kept
-            // that entry while its files were deleted, and the catalog went on naming the adopted id,
-            // because the plan had seen id 0. Claimed now, so adoption leaves these paths alone until
-            // the files are gone; the ids are resolved AFTER the claim, so one adoption finished
-            // before it is retired too. See _adoptionGate.
-            var processedPaths = new HashSet<string>(processed.Count, StringComparer.Ordinal);
-            foreach (var s in processed) processedPaths.Add(s.FilePath);
-            // Recorded BEFORE the union: a union that throws part-way (the set grows) must still be
-            // undone by the finally, or the paths it did add stay claimed for the life of the process
-            // and adoption skips them forever. ExceptWith of the whole set is safe either way.
-            claimed = processedPaths;
-            lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
-            _compactionStageForTest?.Invoke(CompactionStage.Claimed);
-
-            // Swap the snapshot first (readers stop picking the old files up),
-            // delete the merged-away files after. An in-flight reader that still
-            // holds the old snapshot skips the deleted file gracefully.
-            // The catalog moves in ONE generation: the sources leave, the merged file arrives.
-            // Done before the snapshot swap for the same reason the flush does it — a reader must
-            // never see a segment the catalog has not heard of — and it takes the sources' coverage
-            // with them, because an index vouching for a file that is about to be unlinked is the
-            // silent-loss shape this whole design exists to prevent.
-            TraceIndexRun? run = null;
-            bool mergedUnnamed = false;
-            try
-            {
-                _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
-                ulong mergedId = _manifest.AllocateSegmentId();
-                run = WriteIndexRun(merged, mergedId, mergedTraceIndex);
-
-                // Opened before it is claimed — same reason as the flush path. ReplaceSegments with
-                // a run is what makes the coverage claim, and a claim whose run will not open omits
-                // the merged segment's spans until the next restart.
-                if (run is { } fresh && !_index.Add(fresh)) run = null;
-
-                var orphaned = _manifest.ReplaceSegments(
-                    CatalogIdsOfSources(processed, processedPaths),
-                    new TraceSegmentEntry(mergedId, merged.FilePath,
-                                          merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
-                    run);
-
-                // The sources' runs close here and their files are deleted below with the rest of
-                // the sidecars. After the merged run is open, so a reader never finds the key in
-                // neither. Any MERGED run whose last segment left with this batch goes too — it has
-                // no segment to derive its path from, so the catalog is the only thing that knows.
-                _index.Remove(processed.Select(static s => IndexPathFor(s.FilePath)));
-                RetireDroppedRuns(orphaned);
-
-                merged = merged.WithSegmentId(mergedId);
-            }
-            catch (Exception ex)
-            {
-                // THE SAME TWO REPAIRS CompactIndexOnce GOT, ON THE PATH THAT NEEDED THEM MORE.
-                //
-                // Rollback first. ReplaceSegments ends in a File.Move over the live manifest, and
-                // by the time it can throw the merged run is already OPEN. Leaving it open leaks a
-                // bloom in native memory behind a file no manifest names — and worse, the two lines
-                // that close the SOURCES' runs are skipped, so their readers stay open while
-                // DeleteSegmentFiles below unlinks the .tix underneath them. The merged run's path
-                // is spans-*.tix, which the startup sweep does not touch (it takes tix-L* only),
-                // so nothing would ever collect it either.
-                if (run is { } stranded) _index.Remove([stranded.FilePath], deleteFiles: true);
-
-                // And the queue, because the log line below used to be a promise this engine had
-                // stopped keeping. "Adopted on the next start" was literal: BackfillNextSegment
-                // skips id 0, and ReconcileCatalog runs once per process. The cost here is higher
-                // than on the flush path — this file holds the spans of every source, the sources
-                // are already gone, and every GET /api/traces/{id} would scan the largest file in
-                // the directory until somebody restarted. Queued AFTER the swap below (#94):
-                // adoption drops a path it cannot find in the snapshot, so one landing between a
-                // queueing here and the swap threw the merged file away for the process's life.
-                mergedUnnamed = true;
-
-                _logger.LogWarning(ex,
-                    "Could not record the merged segment {File} in the trace catalog — it is "
-                  + "published and queryable, and is queued for adoption by the background worker",
-                    merged.FilePath);
-            }
-
-            mergedTraceIndex?.Release();   // the writer's refs: the merged run (if any) holds its own copies now
-            _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
-            _lock.EnterWriteLock();
-            try
-            {
-                var next = new List<SpanSegmentInfo>(_coldSegments.Length);
-                foreach (var s in _coldSegments)   // by path: see the claim above
-                    if (!processedPaths.Contains(s.FilePath)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
-                next.Add(merged);
-                _coldSegments = SortedByMaxStartDesc(next);
-            }
-            finally { _lock.ExitWriteLock(); }
-
-            if (mergedUnnamed) lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
-
-            foreach (var seg in processed)   // delete only the segments we actually merged
-                DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
+            PublishMerged(merged, mergedTraceIndex, processed, weighed, ref claimed);
             return true;
         }
         catch (Exception ex)
@@ -4146,6 +4102,451 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             // After the unlink, not before: an adoption let in between would still find the file on
             // disk, and would register a path the next instant makes a dangling one.
+            if (claimed is not null) lock (_adoptionGate) _mergingPaths.ExceptWith(claimed);
+        }
+    }
+
+    /// <summary>
+    /// Everything a merge does once its output is on disk — the same for a materialising and a
+    /// streaming merge: claim the sources from adoption, name the output in the catalog with its
+    /// index run in ONE generation that retires the sources, swap the snapshot, and unlink the sources.
+    /// </summary>
+    /// <param name="mergedTraceIndex">The writer's refs, released here once the run is written.</param>
+    /// <param name="weighed">Weights a materialising pass measured for segments it put back, or null.</param>
+    /// <param name="claimed">Set to the claimed paths as soon as they are claimed — the caller's
+    /// <c>finally</c> releases them, however this method leaves.</param>
+    private void PublishMerged(SpanSegmentInfo merged, TraceIndexPairs? mergedTraceIndex,
+                               List<SpanSegmentInfo> processed,
+                               List<(SpanSegmentInfo Seg, long Weight)>? weighed,
+                               ref HashSet<string>? claimed)
+    {
+        _compactionStageForTest?.Invoke(CompactionStage.Merged);
+
+        // THE SOURCES ARE KNOWN BY PATH FROM HERE ON, NOT BY THE REFERENCES THE PLAN HELD. The
+        // index worker's adoption (AdoptUnnamedSegments) runs beside this pass and REPLACES the
+        // snapshot entry of a segment it names; matched by reference, the swap below then kept
+        // that entry while its files were deleted, and the catalog went on naming the adopted id,
+        // because the plan had seen id 0. Claimed now, so adoption leaves these paths alone until
+        // the files are gone; the ids are resolved AFTER the claim, so one adoption finished
+        // before it is retired too. See _adoptionGate.
+        var processedPaths = new HashSet<string>(processed.Count, StringComparer.Ordinal);
+        foreach (var s in processed) processedPaths.Add(s.FilePath);
+        // Recorded BEFORE the union: a union that throws part-way (the set grows) must still be
+        // undone by the finally, or the paths it did add stay claimed for the life of the process
+        // and adoption skips them forever. ExceptWith of the whole set is safe either way.
+        claimed = processedPaths;
+        lock (_adoptionGate) _mergingPaths.UnionWith(processedPaths);
+        _compactionStageForTest?.Invoke(CompactionStage.Claimed);
+
+        // Swap the snapshot first (readers stop picking the old files up),
+        // delete the merged-away files after. An in-flight reader that still
+        // holds the old snapshot skips the deleted file gracefully.
+        // The catalog moves in ONE generation: the sources leave, the merged file arrives.
+        // Done before the snapshot swap for the same reason the flush does it — a reader must
+        // never see a segment the catalog has not heard of — and it takes the sources' coverage
+        // with them, because an index vouching for a file that is about to be unlinked is the
+        // silent-loss shape this whole design exists to prevent.
+        TraceIndexRun? run = null;
+        bool mergedUnnamed = false;
+        try
+        {
+            _beforeCatalogRegistrationForTest?.Invoke();   // test seam: a manifest write that fails
+            ulong mergedId = _manifest.AllocateSegmentId();
+            run = WriteIndexRun(merged, mergedId, mergedTraceIndex);
+
+            // Opened before it is claimed — same reason as the flush path. ReplaceSegments with
+            // a run is what makes the coverage claim, and a claim whose run will not open omits
+            // the merged segment's spans until the next restart.
+            if (run is { } fresh && !_index.Add(fresh)) run = null;
+
+            var orphaned = _manifest.ReplaceSegments(
+                CatalogIdsOfSources(processed, processedPaths),
+                new TraceSegmentEntry(mergedId, merged.FilePath,
+                                      merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
+                run);
+
+            // The sources' runs close here and their files are deleted below with the rest of
+            // the sidecars. After the merged run is open, so a reader never finds the key in
+            // neither. Any MERGED run whose last segment left with this batch goes too — it has
+            // no segment to derive its path from, so the catalog is the only thing that knows.
+            _index.Remove(processed.Select(static s => IndexPathFor(s.FilePath)));
+            RetireDroppedRuns(orphaned);
+
+            merged = merged.WithSegmentId(mergedId);
+        }
+        catch (Exception ex)
+        {
+            // THE SAME TWO REPAIRS CompactIndexOnce GOT, ON THE PATH THAT NEEDED THEM MORE.
+            //
+            // Rollback first. ReplaceSegments ends in a File.Move over the live manifest, and
+            // by the time it can throw the merged run is already OPEN. Leaving it open leaks a
+            // bloom in native memory behind a file no manifest names — and worse, the two lines
+            // that close the SOURCES' runs are skipped, so their readers stay open while
+            // DeleteSegmentFiles below unlinks the .tix underneath them. The merged run's path
+            // is spans-*.tix, which the startup sweep does not touch (it takes tix-L* only),
+            // so nothing would ever collect it either.
+            if (run is { } stranded) _index.Remove([stranded.FilePath], deleteFiles: true);
+
+            // And the queue, because the log line below used to be a promise this engine had
+            // stopped keeping. "Adopted on the next start" was literal: BackfillNextSegment
+            // skips id 0, and ReconcileCatalog runs once per process. The cost here is higher
+            // than on the flush path — this file holds the spans of every source, the sources
+            // are already gone, and every GET /api/traces/{id} would scan the largest file in
+            // the directory until somebody restarted. Queued AFTER the swap below (#94):
+            // adoption drops a path it cannot find in the snapshot, so one landing between a
+            // queueing here and the swap threw the merged file away for the process's life.
+            mergedUnnamed = true;
+
+            _logger.LogWarning(ex,
+                "Could not record the merged segment {File} in the trace catalog — it is "
+              + "published and queryable, and is queued for adoption by the background worker",
+                merged.FilePath);
+        }
+
+        mergedTraceIndex?.Release();   // the writer's refs: the merged run (if any) holds its own copies now
+        _compactionStageForTest?.Invoke(CompactionStage.Catalogued);
+        _lock.EnterWriteLock();
+        try
+        {
+            var next = new List<SpanSegmentInfo>(_coldSegments.Length);
+            foreach (var s in _coldSegments)   // by path: see the claim above
+                if (!processedPaths.Contains(s.FilePath)) next.Add(WeighedAs(s, weighed));   // a segment put back keeps what it weighed
+            next.Add(merged);
+            _coldSegments = SortedByMaxStartDesc(next);
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        if (mergedUnnamed) lock (_unnamedSegments) _unnamedSegments.Add(merged.FilePath);
+
+        foreach (var seg in processed)   // delete only the segments we actually merged
+            DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
+        lock (_summaryRows)
+            foreach (var seg in processed) _summaryRows.Remove(seg.FilePath);
+    }
+
+    // ── Streaming compaction ──────────────────────────────────────────────────
+    //
+    // THE MERGE THAT DOES NOT HOLD WHAT IT MERGES. A materialising pass reads every span of every
+    // source into one list (~607 B each) and hands it to the writer, so the largest thing it can make
+    // is what the budget can hold at once: 73 MB of spans on a host with room, 24 MB on the 512 MB
+    // stand — where a full flush (~22 MB read back) was therefore NEVER a candidate, and a production
+    // install sat at 2.6k flush-sized segments, each one opened by every wide query, every alert
+    // window over it, every restart. SpanWriter.WriteMerged k-way merges the sources block by block;
+    // what it holds is a block per source it is reading, the block it is writing, and per-span side
+    // state of tens of bytes. The budget now bounds THAT, and an output can be many budgets' worth
+    // of spans.
+
+    /// <summary>Whether merges stream (<see cref="TracesOptions.StreamingCompaction"/>).</summary>
+    private readonly bool _streamingCompaction;
+
+    /// <summary>How old a segment's newest span must be before a streaming merge takes it (<see cref="TracesOptions.CompactionMinAge"/>).</summary>
+    private readonly TimeSpan _compactionMinAge;
+
+    /// <summary>Test seam: the clock the streaming planner's age rule reads. Null: the wall clock.</summary>
+    internal Func<DateTimeOffset>? _compactionClockForTest;
+
+    private long CompactionNowNano() =>
+        (_compactionClockForTest?.Invoke() ?? DateTimeOffset.UtcNow).ToUnixTimeMilliseconds() * 1_000_000L;
+
+    /// <summary>
+    /// The most spans one streaming merge writes into one segment. Not a memory bound — the merge's
+    /// memory does not grow with its output — but the reader's: every read path of a <c>.trc</c> is
+    /// bounded at a million spans (<see cref="SpanReader.ReadAll"/>'s total), and the materialising
+    /// merge must still be able to read anything this one writes.
+    /// </summary>
+    internal const int MaxSpansPerStreamedSegment = 1_000_000;
+
+    /// <summary>The most sources one streaming merge reads — file handles, not memory: they open lazily.</summary>
+    internal const int MaxSourcesPerStreamedMerge = 64;
+
+    /// <summary>
+    /// What one span of the OUTPUT costs a streaming merge while it runs: its trace-index ref (24 B,
+    /// held until the run is written), its share of the v3 in-file index (4 B) and of the run's entry
+    /// (4 B), with slack. The block it travels in is the read side's, priced separately.
+    /// </summary>
+    internal const int StreamedSpanStateBytes = 36;
+
+    /// <summary>
+    /// What one <c>.tracesum</c> row of the output costs while the merge runs: the row in the body
+    /// buffer (~70-100 B with its strings), its compressed copy, the run's per-trace entry (~60 B) and
+    /// the v3 index's per-trace header (20 B).
+    /// </summary>
+    internal const int StreamedRowStateBytes = 200;
+
+    /// <summary>
+    /// What a pass holds whatever its sources: the raw block the writer is building and its compressed
+    /// copy (~2.5 MB for ordinary spans), the bloom set, the LZ4-HC tables, and the read buffers a
+    /// cursor rents per block. The rented ones go back to <c>ArrayPool.Shared</c> and stay live there,
+    /// often in more than one bucket (the <c>.tracesum</c> body grows by doubling) — measured, a pass
+    /// over the stand's flushes peaked 2-5 MB above an estimate that left them out, so they are in it.
+    /// </summary>
+    internal const long StreamedWriterFixedBytes = 7L * 1024 * 1024;
+
+    /// <summary>How far apart two spans may start and still be paired by the merge's sidecars — see <see cref="SpanWriter.MergeLimits"/>.</summary>
+    internal static readonly long StreamedWindowNanos = TimeSpan.FromMinutes(5).Ticks * 100L;
+
+    /// <summary>
+    /// The sidecar windows' share of a pass budget: an eighth, split between the open traces of the
+    /// <c>.tracesum</c> builder (~240 B each) and the span ids of the <c>.svcgraph</c> builder (~64 B
+    /// each, with their queue entries). On the stand's 24 MB that is ~6 000 traces and ~23 000 spans —
+    /// five minutes of its traffic; with room, ~19 000 and ~71 000.
+    /// </summary>
+    internal static SpanWriter.MergeLimits MergeLimitsFor(long mergeBudgetBytes)
+    {
+        long share = mergeBudgetBytes / 16;   // half of the eighth each
+        return new SpanWriter.MergeLimits(
+            StreamedWindowNanos,
+            MaxActiveTraces: (int)Math.Clamp(share / 240, 1_024, 1_000_000),
+            MaxWindowSpans:  (int)Math.Clamp(share / 64,  4_096, 4_000_000));
+    }
+
+    /// <summary>What a streaming pass holds whatever it merges: the writer's buffers and the sidecar windows.</summary>
+    internal static long StreamedFixedBytes(long mergeBudgetBytes) => StreamedWriterFixedBytes + mergeBudgetBytes / 8;
+
+    /// <summary>
+    /// One decoded block of <paramref name="s"/> — what reading it costs a streaming merge while the
+    /// merge is inside its range. Priced at the segment's own per-span read-back weight
+    /// (<see cref="EstimatedSegmentBytes"/>), so a segment of heavy spans costs what its blocks weigh.
+    /// </summary>
+    internal static long StreamedBlockBytes(SpanSegmentInfo s)
+    {
+        int  spans   = Math.Max(1, s.SpanCount);
+        long perSpan = Math.Max(ReadBackSpanOverheadBytes, EstimatedSegmentBytes(s) / spans);
+        return Math.Min(spans, SpanWriter.BlockSize) * perSpan;
+    }
+
+    /// <summary>What <paramref name="s"/>'s spans and rows add to a streaming merge's output-side state.</summary>
+    internal static long StreamedStateBytes(SpanSegmentInfo s, long rows) =>
+        (long)Math.Max(0, s.SpanCount) * StreamedSpanStateBytes + Math.Max(0, rows) * StreamedRowStateBytes;
+
+    /// <summary>
+    /// Plans the next streaming merge: the oldest run of consecutive candidates that one pass can take.
+    ///
+    /// <para><b>A CANDIDATE</b> is a v3+ segment the caller calls eligible, whose newest span is at
+    /// least <paramref name="minAgeNanos"/> old, and whose own cost — its block and its output-side
+    /// state — is under half of what a pass may spend on them. So an output of more than half a pass
+    /// is never merged again: segments settle between half a pass and a full one, and a span is
+    /// rewritten about once, not once per merge level.</para>
+    ///
+    /// <para><b>A BATCH</b> grows, oldest first, while: it spans at most 24 h (retention deletes a file
+    /// by its NEWEST span, so a wider one keeps old spans past their TTL); it is at most
+    /// <see cref="MaxSourcesPerStreamedMerge"/> sources and <see cref="MaxSpansPerStreamedSegment"/>
+    /// spans; and its cost fits the budget. The cost is the fixed part, plus the read side — the
+    /// deepest overlap of its sources' time ranges times its heaviest block, because sources open
+    /// lazily and close at their last span, so only the overlapping ones are read at once — plus the
+    /// output side, the sum of the sources' state.</para>
+    /// </summary>
+    /// <param name="rowsOf">The <c>.tracesum</c> rows a segment holds; null prices every span as a row.</param>
+    internal static List<SpanSegmentInfo> SelectStreamingBatch(
+        SpanSegmentInfo[] segments, long mergeBudgetBytes, long nowNano, long minAgeNanos,
+        Func<SpanSegmentInfo, bool>? eligible = null, Func<SpanSegmentInfo, long>? rowsOf = null)
+    {
+        const long MaxSpanNanos = 24L * 3600 * 1_000_000_000;
+
+        long available = mergeBudgetBytes - StreamedFixedBytes(mergeBudgetBytes);
+        if (available <= 0) return [];
+        long ageCutoff = nowNano - Math.Max(0, minAgeNanos);
+
+        var candidates = new List<(SpanSegmentInfo Seg, long Block, long State)>();
+        foreach (var s in segments)
+        {
+            if (s.FormatVersion < 3 || s.SpanCount <= 0) continue;
+            if (s.MaxStartNano > ageCutoff) continue;
+            if (eligible is not null && !eligible(s)) continue;
+            long block = StreamedBlockBytes(s);
+            long state = StreamedStateBytes(s, rowsOf?.Invoke(s) ?? s.SpanCount);
+            if (block + state >= available / 2) continue;      // settled: more than half a pass by itself
+            candidates.Add((s, block, state));
+        }
+        candidates.Sort(static (a, b) => a.Seg.MinStartNano.CompareTo(b.Seg.MinStartNano));
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            var  seed        = candidates[i];
+            long windowStart = seed.Seg.MinStartNano;
+            var  batch       = new List<SpanSegmentInfo>(8) { seed.Seg };
+            long state       = seed.State;
+            long maxBlock    = seed.Block;
+            long spans       = seed.Seg.SpanCount;
+            int  depth       = 1;
+
+            for (int j = i + 1; j < candidates.Count && batch.Count < MaxSourcesPerStreamedMerge; j++)
+            {
+                var c = candidates[j];
+                if (c.Seg.MinStartNano - windowStart > MaxSpanNanos) break;
+                // MaxStartNano is not monotonic in MinStartNano order: one wide candidate says nothing
+                // about the ones behind it, so it is passed over rather than ending the batch.
+                if (c.Seg.MaxStartNano - windowStart > MaxSpanNanos) continue;
+                if (spans + c.Seg.SpanCount > MaxSpansPerStreamedSegment) break;
+
+                // Sources open when the merge reaches their first span and close at their last, so
+                // the ones read at once are the ones whose ranges overlap there.
+                int overlap = 1;
+                foreach (var b in batch) if (b.MaxStartNano >= c.Seg.MinStartNano) overlap++;
+                int  nextDepth = Math.Max(depth, overlap);
+                long nextBlock = Math.Max(maxBlock, c.Block);
+                long cost      = (long)(nextDepth + 1) * nextBlock + state + c.State;   // +1: the block being written
+                if (cost > available) break;
+
+                batch.Add(c.Seg);
+                state    += c.State;
+                maxBlock  = nextBlock;
+                depth     = nextDepth;
+                spans    += c.Seg.SpanCount;
+            }
+
+            if (batch.Count >= 2) return batch;
+        }
+        return [];
+    }
+
+    /// <summary>
+    /// Whether a streaming merge may take <paramref name="s"/>: v3 or later (a cursor reads nothing
+    /// older), a header range a merge can trust (its lazy open starts a source at its header's
+    /// minimum), sidecars that read, and not quarantined.
+    /// </summary>
+    private bool StreamEligible(SpanSegmentInfo s, HashSet<string>? quarantined)
+    {
+        if (s.FormatVersion < 3 || s.HeaderRangeSuspect) return false;
+        if (quarantined is not null && quarantined.Contains(s.FilePath)) return false;
+        lock (_streamIneligible) return !_streamIneligible.Contains(s.FilePath);
+    }
+
+    /// <summary>
+    /// Files a streaming pass could not read for a reason of the MACHINE, sitting out the rest of the
+    /// current run (see <see cref="CompactStreamingPass"/>). Emptied when a run starts.
+    /// </summary>
+    private readonly HashSet<string> _skipThisRun = new(StringComparer.Ordinal);
+
+    private bool SkippedThisRun(SpanSegmentInfo s)
+    {
+        lock (_skipThisRun) return _skipThisRun.Contains(s.FilePath);
+    }
+
+    /// <summary>
+    /// Segments a streaming merge refused for something it cannot carry over — a sidecar that will not
+    /// read, a <c>.tracesum</c> that is not there — by path. They go to the materialising merge, which
+    /// rebuilds every sidecar from the spans. Like the quarantine, process-lifetime and a few dozen
+    /// bytes a file.
+    /// </summary>
+    private readonly HashSet<string> _streamIneligible = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Rows in each segment's <c>.tracesum</c>, by path, as its volume header counts them — the
+    /// planner's price for the output's per-trace state. Read once per segment and kept; a segment
+    /// with no readable summary is priced at a row a span and handed to the materialising merge.
+    /// </summary>
+    private readonly Dictionary<string, long> _summaryRows = new(StringComparer.Ordinal);
+
+    private long SummaryRowsOf(SpanSegmentInfo s)
+    {
+        lock (_summaryRows)
+            if (_summaryRows.TryGetValue(s.FilePath, out long known)) return known;
+
+        long rows;
+        var volume = TraceSummarySidecar.ReadVolume(s.FilePath);
+        if (volume is null)
+        {
+            // Priced at a row a span — the most it could be. A streaming merge builds the output's
+            // rows from the spans, so a missing or unreadable .tracesum costs it nothing; what it
+            // DOES carry over is the source's .svcgraph, and a segment with neither sidecar was
+            // written before either existed — its edges are in no file, and only the materialising
+            // merge, which derives edges from the spans, would keep them.
+            if (!File.Exists(Path.ChangeExtension(s.FilePath, ".tracesum"))
+             && !File.Exists(Path.ChangeExtension(s.FilePath, ".svcgraph")))
+                lock (_streamIneligible) _streamIneligible.Add(s.FilePath);
+            rows = s.SpanCount;
+        }
+        else
+        {
+            rows = 0;
+            foreach (var b in volume.Buckets) rows += b.TraceCount;
+        }
+        lock (_summaryRows) _summaryRows[s.FilePath] = rows;
+        return rows;
+    }
+
+    /// <summary>Test hook: the last streaming merge's result, or null when none has run.</summary>
+    internal SpanWriter.MergeResult? LastStreamedMergeForTest { get; private set; }
+
+    private bool CompactStreamingPass(List<SpanSegmentInfo> batch)
+    {
+        HashSet<string>? claimed = null;
+        try
+        {
+            TraceIndexPairs? mergedTraceIndex = null;
+            SpanWriter.MergeResult result;
+            try
+            {
+                result = SpanWriter.WriteMerged(_dataDir, batch, MergeLimitsFor(_mergeBudgetBytes),
+                    onTraceIndex:     _indexEnabled ? pairs => mergedTraceIndex = pairs : null,
+                    version:          _segmentVersion,
+                    scratch:          _writeScratch,
+                    beforeSourceRead: _beforeCompactionReadForTest);
+            }
+            catch (MergeSidecarException ex)
+            {
+                // Its sidecar cannot be carried over; the materialising merge rebuilds it from spans.
+                lock (_streamIneligible) _streamIneligible.Add(ex.FilePath);
+                _logger.LogWarning(ex,
+                    "Compaction: {File} will be merged by rebuilding its sidecars from its spans", ex.FilePath);
+                return true;
+            }
+            catch (MergeSourceException ex) when (SegmentOrderException.Is(ex.InnerException))
+            {
+                // Out of start order: damage a rewrite repairs, since the materialising merge sorts
+                // what it reads. Handed to it, not quarantined.
+                lock (_streamIneligible) _streamIneligible.Add(ex.FilePath);
+                _logger.LogWarning(ex.InnerException,
+                    "Compaction: {File} is not in start order and will be rewritten in order", ex.FilePath);
+                return true;
+            }
+            catch (MergeSourceException ex) when (FileBounds.DescribesContent(ex.InnerException!)
+                                               && ex.InnerException!.InnerException is not OutOfMemoryException)
+            {
+                // The same rule the materialising loader keeps: a read that fails on the file's
+                // content fails the same way every pass, so the file leaves planning — and stays on
+                // disk, for retention or a repair. Running out of memory is the machine, not the file.
+                var seg = batch.Find(s => string.Equals(s.FilePath, ex.FilePath, StringComparison.Ordinal));
+                if (seg is not null) QuarantineFromCompaction(seg, ex.InnerException);
+                return true;
+            }
+            catch (MergeSourceException ex) when (ex.InnerException is OutOfMemoryException
+                                               || ex.InnerException?.InnerException is OutOfMemoryException)
+            {
+                // The heap is short: another merge now would meet the same. The next run tries again,
+                // and nothing is quarantined — a healthy segment read while queries held the heap.
+                _logger.LogWarning(ex.InnerException, "Compaction: ran out of memory reading {File}; the next run retries", ex.FilePath);
+                return false;
+            }
+            catch (MergeSourceException ex)
+            {
+                // A fault of the machine around ONE file — a lock, a mount blip. The materialising loader
+                // read past such a file and merged the rest; this pass cannot (a merge is one stream), so
+                // the file sits out the rest of THIS run and the run plans again without it. Each such
+                // failure takes one more file out, so the run cannot spin on it; the next run retries it.
+                lock (_skipThisRun) _skipThisRun.Add(ex.FilePath);
+                _logger.LogWarning(ex.InnerException, "Compaction: failed to read {File}; it sits out this run", ex.FilePath);
+                return true;
+            }
+
+            LastStreamedMergeForTest = result;
+            var merged = result.Info;
+            _logger.LogInformation(
+                "Compacted {Count} segments by streaming → {File} ({Spans} spans, {Rows} summary rows, "
+              + "{Calls} cross-source calls, {Open} sources read at once)",
+                batch.Count, Path.GetFileName(merged.FilePath), merged.SpanCount, result.SummaryRows,
+                result.CrossSourceCalls, result.MaxOpenSources);
+            PublishMerged(merged, mergedTraceIndex, batch, weighed: null, ref claimed);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Compaction: failed to write the streamed merge of {Count} segments", batch.Count);
+            return false;
+        }
+        finally
+        {
             if (claimed is not null) lock (_adoptionGate) _mergingPaths.ExceptWith(claimed);
         }
     }

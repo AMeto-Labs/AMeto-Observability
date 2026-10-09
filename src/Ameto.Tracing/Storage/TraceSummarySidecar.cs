@@ -57,7 +57,7 @@ public sealed class TraceVolumeSegment
 ///       traceCount   uint32 | per trace: fixed prefix + name/method/path + service indices
 /// </code>
 /// </summary>
-internal static class TraceSummarySidecar
+internal static partial class TraceSummarySidecar
 {
     private const uint   Magic     = 0x52_44_54_56; // "RDTV"
     private const ushort Version   = 1;

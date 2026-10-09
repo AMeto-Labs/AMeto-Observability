@@ -18,7 +18,7 @@ namespace Ameto.Tracing.Storage;
 ///     6   SpanCount    : uint32
 ///    10   MinStartNano : int64
 ///    18   MaxStartNano : int64
-///    26   Flags        : byte
+///    26   Flags        : byte   bit 0 = spans in start order across blocks (SortedByStartFlag)
 ///
 ///   [Span Blocks]
 ///     N × { uncompSize uint32 | compSize uint32 | LZ4-HC msgpack bytes }
@@ -99,7 +99,19 @@ internal static class SpanWriter
 
     /// <summary>The newest format this writer can produce — see <see cref="DefaultVersion"/>.</summary>
     internal const ushort NewestVersion  = 4;
-    private const int    BlockSize   = 4096;
+
+    /// <summary>
+    /// Header flag (byte 26), bit 0: every span in the file is in start order ACROSS blocks, checked
+    /// span by span by the writer that set it. Only the streaming merge sets it (<see cref="WriteMerged"/>
+    /// refuses to publish a file it could not keep in order); a flush writes 0, byte for byte as before.
+    /// A reader that sees it may skip the blocks before a time window and stop after it
+    /// (<c>SpanReader.StreamMatchingSpans</c>). Every reader that predates it reads the byte and
+    /// ignores it, so the flag changes no file for them.
+    /// </summary>
+    internal const byte SortedByStartFlag = 0x01;
+
+    /// <summary>Spans per block: every block but a file's last holds exactly this many.</summary>
+    internal const int BlockSize = 4096;
 
     /// <param name="recoverable">
     /// True for a hot-tier flush, whose temp file the engine constructor may rename into
@@ -287,7 +299,7 @@ internal static class SpanWriter
                 {
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
-                    var block      = WriteBlock(in spans, written, batchCount, blockBuf, blockIdx,
+                    var block      = WriteBlock(in spans, written, batchCount, written, blockBuf, blockIdx,
                                                 traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
@@ -342,45 +354,7 @@ internal static class SpanWriter
                     bw.Write(compressed);
                 }
 
-                // ── Service index ──────────────────────────────────────────────
-                long svcIdxOffset = fs.Position;
-                bw.Write((uint)svcBlockMap.Count);
-                foreach (var (svcName, blocks) in svcBlockMap)
-                {
-                    var nameBytes = Encoding.UTF8.GetBytes(svcName);
-                    bw.Write((ushort)nameBytes.Length);
-                    bw.Write(nameBytes);
-                    bw.Write((uint)blocks.Count);
-                    foreach (var b in blocks) bw.Write(b);
-                }
-
-                // ── Bloom index ────────────────────────────────────────────────
-                //
-                // THE LEGACY SLOTS FIRST, EVERY ONE EMPTY, AND THEN THE REAL BLOOMS BEHIND A MARKER.
-                // The bits below are hashed the canonical way (SpanBloom, #86), and a binary that
-                // predates it would probe them with the old culture-formatted hash — a
-                // false-negative source on exactly the values #86 is about, and builds before
-                // 36c0c81 do not even check that the section ends at the footer. An empty slot is
-                // "no bloom, never skip" to every reader that has ever existed, so an older binary
-                // reads this segment in full: slower, and complete. This build sees the marker and
-                // probes the canonical blooms, trusting a value probe only if the fold table that
-                // built them (the fingerprint) is its own. Cost: four bytes a block, twelve per file.
-                long bloomIdxOffset = fs.Position;
-                bw.Write((uint)blooms.Count);
-                for (int b = 0; b < blooms.Count; b++) bw.Write(0u);
-                bw.Write(SpanBloom.CanonicalMarker);
-                bw.Write(SpanBloomFold.Fingerprint);
-                foreach (var b in blooms)
-                {
-                    bw.Write((uint)b.Length);
-                    bw.Write(b);
-                }
-
-                // ── Footer (28 bytes) ──────────────────────────────────────────
-                bw.Write((ulong)traceIdxOffset);
-                bw.Write((ulong)svcIdxOffset);
-                bw.Write((ulong)bloomIdxOffset);
-                bw.Write(FooterMagic);
+                WriteTail(bw, fs, traceIdxOffset, svcBlockMap, blooms);
 
                 bw.Flush();
                 // To the platter, not the page cache: the caller resets the WAL on our
@@ -445,9 +419,420 @@ internal static class SpanWriter
     }
 
     /// <summary>
-    /// Renames <c>{finalPath}.tmp</c> into place when the sidecar actually wrote one.
-    /// Returns true when a file was published (so the caller can roll it back).
+    /// Everything after the trace-index block — the service index, the bloom index and the footer —
+    /// written the same way by a flush and by a merge.
     /// </summary>
+    private static void WriteTail(BinaryWriter bw, FileStream fs, long traceIdxOffset,
+                                  Dictionary<string, List<uint>> svcBlockMap, List<byte[]> blooms)
+    {
+        // ── Service index ──────────────────────────────────────────────
+        long svcIdxOffset = fs.Position;
+        bw.Write((uint)svcBlockMap.Count);
+        foreach (var (svcName, blocks) in svcBlockMap)
+        {
+            var nameBytes = Encoding.UTF8.GetBytes(svcName);
+            bw.Write((ushort)nameBytes.Length);
+            bw.Write(nameBytes);
+            bw.Write((uint)blocks.Count);
+            foreach (var b in blocks) bw.Write(b);
+        }
+
+        // ── Bloom index ────────────────────────────────────────────────
+        //
+        // THE LEGACY SLOTS FIRST, EVERY ONE EMPTY, AND THEN THE REAL BLOOMS BEHIND A MARKER.
+        // The bits below are hashed the canonical way (SpanBloom, #86), and a binary that
+        // predates it would probe them with the old culture-formatted hash — a
+        // false-negative source on exactly the values #86 is about, and builds before
+        // 36c0c81 do not even check that the section ends at the footer. An empty slot is
+        // "no bloom, never skip" to every reader that has ever existed, so an older binary
+        // reads this segment in full: slower, and complete. This build sees the marker and
+        // probes the canonical blooms, trusting a value probe only if the fold table that
+        // built them (the fingerprint) is its own. Cost: four bytes a block, twelve per file.
+        long bloomIdxOffset = fs.Position;
+        bw.Write((uint)blooms.Count);
+        for (int b = 0; b < blooms.Count; b++) bw.Write(0u);
+        bw.Write(SpanBloom.CanonicalMarker);
+        bw.Write(SpanBloomFold.Fingerprint);
+        foreach (var b in blooms)
+        {
+            bw.Write((uint)b.Length);
+            bw.Write(b);
+        }
+
+        // ── Footer (28 bytes) ──────────────────────────────────────────
+        bw.Write((ulong)traceIdxOffset);
+        bw.Write((ulong)svcIdxOffset);
+        bw.Write((ulong)bloomIdxOffset);
+        bw.Write(FooterMagic);
+    }
+
+    // ── Streaming merge ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The bounds a streaming merge keeps its side state within — see <see cref="WriteMerged"/>.
+    /// </summary>
+    /// <param name="WindowNanos">How far apart in start time two spans may be and still be put
+    /// together by the merge's sidecars (one trace's row, one cross-source edge).</param>
+    /// <param name="MaxActiveTraces">Traces the <c>.tracesum</c> builder holds open at once.</param>
+    /// <param name="MaxWindowSpans">Span ids the <c>.svcgraph</c> builder holds for pairing.</param>
+    internal readonly record struct MergeLimits(long WindowNanos, int MaxActiveTraces, int MaxWindowSpans);
+
+    /// <summary>What a streaming merge wrote, and what it took to write it.</summary>
+    /// <param name="Info">The merged segment, published and weighed.</param>
+    /// <param name="SummaryRows">Rows in its <c>.tracesum</c>.</param>
+    /// <param name="CrossSourceCalls">Service-graph calls found between spans of different sources.</param>
+    /// <param name="MaxOpenSources">The most sources the merge read at once — the size of its read side.</param>
+    internal readonly record struct MergeResult(SpanSegmentInfo Info, uint SummaryRows, int CrossSourceCalls, int MaxOpenSources);
+
+    /// <summary>
+    /// MERGES SEGMENTS WITHOUT HOLDING THEM: a k-way merge of the sources by start time, written block
+    /// by block, so what a merge holds is a block per source it is reading and a block being written —
+    /// not the spans of every source, which is all <see cref="Write"/> can take and why a compaction
+    /// pass could only ever be as large as the heap allowed.
+    ///
+    /// <para><b>THE SOURCES ARE OPENED LAZILY.</b> Each starts in the queue at its header's
+    /// <c>MinStartNano</c> and is opened only when the merge reaches it; a source is closed the moment
+    /// its last span is written. Flushes follow one another in time, so the read side is the handful of
+    /// sources whose ranges overlap at any one instant, not the batch. A source whose first span sits
+    /// below its header's minimum would break that order, and is refused.</para>
+    ///
+    /// <para><b>THE SAME FILE A FLUSH WOULD WRITE</b> for these spans, block for block: the same
+    /// positional rows, bloom, service index, trace index (v3 in the file, the refs for the caller's
+    /// <c>.tix</c> either way) and <c>.stats</c>, each derived from the spans as they pass. Two sidecars
+    /// differ in how they are derived, because deriving them the flush's way means a map of the whole
+    /// output: <c>.tracesum</c> rows are built over a bounded window (see
+    /// <see cref="TraceSummarySidecar.MergeBuilder"/>) and <c>.svcgraph</c> is the sources' own edges
+    /// plus the cross-source pairs a window finds (see <see cref="ServiceGraphSidecar.MergeEdges"/>).
+    /// Ties in start time are broken by source order and then by file order, so the output is stable
+    /// where <see cref="Write"/>'s sort is not.</para>
+    ///
+    /// <para><b>THE PUBLISH IS THE FLUSH'S.</b> Everything is built at temp names — the <c>.trc</c> at a
+    /// merge temp (<c>.mrg.tmp</c>), which the engine sweeps and never resurrects, because the sources
+    /// are still on disk until the caller retires them — fsynced, and renamed sidecars first, the
+    /// <c>.trc</c> last. A failure anywhere leaves the directory as it was found.</para>
+    /// </summary>
+    /// <param name="sources">The segments to merge — v3 or later, with readable sidecars.</param>
+    /// <param name="beforeSourceRead">Test seam: called as each source is opened.</param>
+    /// <exception cref="MergeSourceException">A source could not be read; names it, wraps the cause.</exception>
+    /// <exception cref="MergeSidecarException">A source's sidecar exists and will not read.</exception>
+    public static MergeResult WriteMerged(string dataDir, IReadOnlyList<SpanSegmentInfo> sources, MergeLimits limits,
+                                          Action<TraceIndexPairs>? onTraceIndex = null,
+                                          ushort version = DefaultVersion,
+                                          SpanWriteScratch? scratch = null,
+                                          Action<SpanSegmentInfo>? beforeSourceRead = null)
+    {
+        int n = sources.Count;
+        if (n == 0) throw new InvalidOperationException("Cannot merge an empty set of segments.");
+
+        // A source's edges are summed as they are, so a sidecar that will not read stops the merge
+        // here — before a byte is written — rather than costing that source's edges for good.
+        var edges = new ServiceGraphSidecar.MergeEdges(limits.WindowNanos, limits.MaxWindowSpans);
+        var seedServices = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        long planned = 0;
+        for (int i = 0; i < n; i++)
+        {
+            List<ServiceEdgeRecord> recorded;
+            bool readable;
+            try { readable = ServiceGraphSidecar.TryReadEdges(sources[i].FilePath, out recorded); }
+            catch (Exception ex) { throw new MergeSourceException(sources[i].FilePath, ex); }   // a lock, a vanished file
+            if (!readable) throw new MergeSidecarException(sources[i].FilePath, ".svcgraph");
+            edges.AddRecorded(recorded);
+            foreach (var svc in sources[i].Services) if (seen.Add(svc)) seedServices.Add(svc);
+            planned += Math.Max(0, sources[i].SpanCount);
+        }
+
+        bool wantTraceIndex = version < 4 || onTraceIndex is not null;
+        int  refsCapacity   = (int)Math.Clamp(planned, 1, int.MaxValue);
+        TraceSpanRef[]? traceRefs = wantTraceIndex
+            ? scratch?.RentPairs(refsCapacity) ?? ArrayPool<TraceSpanRef>.Shared.Rent(refsCapacity)
+            : null;
+
+        string nonce  = Guid.NewGuid().ToString("N").Substring(0, 8);
+        string trcTmp = Path.Combine(dataDir, $"spans-merge-{nonce}.trc.mrg.tmp");
+        string? statsFinal = null, svcgraphFinal = null, tracesumFinal = null;
+        var published = new List<string>(3);
+
+        var cursors = new SpanReader.BlockCursor?[n];
+        var opened  = new bool[n];
+        var queue   = new PriorityQueue<int, (long Start, int Source)>(n);
+        for (int i = 0; i < n; i++) queue.Enqueue(i, (sources[i].MinStartNano, i));
+
+        var svcBlockMap = new Dictionary<string, List<uint>>(StringComparer.Ordinal);
+        var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
+        var blooms      = new List<byte[]>();
+        var bloomHashes = new HashSet<ulong>();
+        var blockBuf    = new ArrayBufferWriter<byte>(1024 * 1024);
+        var block       = new List<SpanRecord>(BlockSize);
+
+        int  count = 0, traceCount = 0, open = 0, maxOpen = 0;
+        long minNano = 0, maxNano = long.MinValue, weight = 0;
+        uint summaryRows = 0;
+        string trcPath = string.Empty;
+
+        using var summary = new TraceSummarySidecar.MergeBuilder(seedServices, limits.WindowNanos,
+                                                                 limits.MaxActiveTraces, scratch);
+        try
+        {
+            using (var fs = new FileStream(trcTmp, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
+            using (var bw = new BinaryWriter(fs))
+            {
+                // ── Header — count and range are patched in once the merge knows them ──
+                bw.Write(Magic);
+                bw.Write(version);
+                bw.Write(0u);
+                bw.Write(0L);
+                bw.Write(0L);
+                bw.Write(SortedByStartFlag);   // flags: the merge keeps every span in order, and checks it
+
+                // ── The k-way merge ────────────────────────────────────────────
+                while (queue.TryDequeue(out int i, out _))
+                {
+                    var src = sources[i];
+                    if (!opened[i])
+                    {
+                        opened[i] = true;
+                        var c = cursors[i] = OpenSource(src, beforeSourceRead);
+                        maxOpen = Math.Max(maxOpen, ++open);
+                        if (!AdvanceSource(c, src))
+                        {
+                            // A source that claims spans and yields none has a damaged footer; merging
+                            // it away would delete whatever a repair could still recover.
+                            if (src.SpanCount > 0)
+                                throw new MergeSourceException(src.FilePath,
+                                    new InvalidDataException($"{src.FilePath} claims {src.SpanCount} spans and reads back none"));
+                            CloseSource(cursors, i, ref open);
+                            continue;
+                        }
+                        if (c.Current.StartTimeUnixNano < src.MinStartNano)
+                            throw new MergeSourceException(src.FilePath, SegmentOrderException.OutOfStartOrder(
+                                $"{src.FilePath} holds a span at {c.Current.StartTimeUnixNano}, before the {src.MinStartNano} its header starts at"));
+                        queue.Enqueue(i, (c.Current.StartTimeUnixNano, i));
+                        continue;
+                    }
+
+                    var cur = cursors[i]!;
+                    var s   = cur.Current;
+                    if (s.StartTimeUnixNano < maxNano)
+                        throw new InvalidDataException(
+                            $"Merge order broken at {s.StartTimeUnixNano} after {maxNano} — nothing was published");
+                    if (count == 0) minNano = s.StartTimeUnixNano;
+                    maxNano = s.StartTimeUnixNano;
+
+                    block.Add(s);
+                    summary.Add(s);
+                    edges.Add(s, i);
+                    weight += TraceStorageEngine.ReadBackSpanBytes(s.AttributesBytes.Length);
+                    count++;
+                    if (block.Count == BlockSize) WriteMergedBlock(bw);
+
+                    if (AdvanceSource(cur, src)) queue.Enqueue(i, (cur.Current.StartTimeUnixNano, i));
+                    else                         CloseSource(cursors, i, ref open);
+                }
+                if (block.Count > 0) WriteMergedBlock(bw);
+                if (count == 0) throw new InvalidOperationException("The segments to merge hold no spans.");
+
+                // ── Trace index ────────────────────────────────────────────────
+                if (traceRefs is not null)
+                {
+                    var refs = traceRefs.AsSpan(0, count);
+                    refs.Sort(new ByTraceThenOffset());
+                    traceCount = CountTraces(refs);
+                }
+
+                long traceIdxOffset = fs.Position;
+                {
+                    var idxBuf = new MemoryStream(version >= 4 ? 8 : traceCount * 24 + count * 4 + 8);
+                    var idxBw  = new BinaryWriter(idxBuf);
+                    if (version >= 4) idxBw.Write(0u);
+                    else
+                    {
+                        idxBw.Write((uint)traceCount);
+                        WriteV3TraceIndexFromRefs(idxBw, traceRefs.AsSpan(0, count), traceCount);
+                    }
+                    var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
+                    var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+                    bw.Write((uint)raw.Length);
+                    bw.Write((uint)compressed.Length);
+                    bw.Write(compressed);
+                }
+
+                WriteTail(bw, fs, traceIdxOffset, svcBlockMap, blooms);
+
+                // ── The header, now that the merge knows what it holds ─────────
+                bw.Flush();
+                fs.Seek(6, SeekOrigin.Begin);
+                bw.Write((uint)count);
+                bw.Write(minNano);
+                bw.Write(maxNano);
+                bw.Flush();
+                fs.Flush(flushToDisk: true);
+            }
+
+            // ── Sidecars, at temp names beside the final one ───────────────────
+            string baseName = $"spans-{minNano}-{maxNano}-{count}-{nonce}";
+            trcPath       = Path.Combine(dataDir, baseName + ".trc");
+            statsFinal    = Path.Combine(dataDir, baseName + ".stats");
+            svcgraphFinal = Path.ChangeExtension(trcPath, ".svcgraph");
+            tracesumFinal = Path.ChangeExtension(trcPath, ".tracesum");
+
+            WriteStatsSidecar(statsFinal + ".tmp", svcStats);
+            edges.Write(svcgraphFinal + ".tmp");
+            summary.Write(tracesumFinal + ".tmp");
+            summaryRows = summary.Rows;
+
+            // ── Publish: sidecars first, the .trc last ─────────────────────────
+            if (MoveIntoPlaceIfWritten(statsFinal))    published.Add(statsFinal);
+            if (MoveIntoPlaceIfWritten(svcgraphFinal)) published.Add(svcgraphFinal);
+            if (MoveIntoPlaceIfWritten(tracesumFinal)) published.Add(tracesumFinal);
+            File.Move(trcTmp, trcPath);
+        }
+        catch
+        {
+            foreach (var f in published) TryDelete(f);
+            TryDelete(trcTmp);
+            if (statsFinal    is not null) TryDelete(statsFinal + ".tmp");
+            if (svcgraphFinal is not null) TryDelete(svcgraphFinal + ".tmp");
+            if (tracesumFinal is not null) TryDelete(tracesumFinal + ".tmp");
+            if (traceRefs is not null) new TraceIndexPairs(traceRefs, 0, 0, scratch).Release();
+            throw;
+        }
+        finally
+        {
+            for (int i = 0; i < n; i++) cursors[i]?.Dispose();
+        }
+
+        if (traceRefs is not null)
+        {
+            var pairs = new TraceIndexPairs(traceRefs, count, traceCount, scratch);
+            if (onTraceIndex is not null) onTraceIndex(pairs);
+            else                          pairs.Release();
+        }
+
+        var services = new string[svcBlockMap.Count];
+        svcBlockMap.Keys.CopyTo(services, 0);
+        var info = new SpanSegmentInfo
+        {
+            FilePath      = trcPath,
+            MinStartNano  = minNano,
+            MaxStartNano  = maxNano,
+            SpanCount     = count,
+            Services      = services,
+            FormatVersion = version,
+            LastWriteNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L,
+        }.WithWeight(weight);
+        return new MergeResult(info, summaryRows, edges.CrossSourceCalls, maxOpen);
+
+        // One output block: the spans gathered since the last, at their global offsets.
+        void WriteMergedBlock(BinaryWriter bw)
+        {
+            if (traceRefs is not null && count > traceRefs.Length)
+                traceRefs = GrowRefs(traceRefs, count, scratch);
+            int  first    = count - block.Count;
+            uint blockIdx = (uint)(first / BlockSize);
+            var  batch    = new OrderedSpans(block);
+            var  written  = WriteBlock(in batch, 0, block.Count, first, blockBuf, blockIdx,
+                                       traceRefs, svcBlockMap, spanSvc: null, bloomHashes, svcStats, blooms);
+            bw.Write((uint)written.UncompressedSize);
+            bw.Write((uint)written.CompressedBytes.Length);
+            bw.Write(written.CompressedBytes);
+            block.Clear();
+            _afterMergedBlockForTest?.Invoke(count);
+        }
+    }
+
+    /// <summary>
+    /// Test seam: called after each block a streaming merge writes, with the spans written so far —
+    /// the one place a test can sample what the merge holds WHILE it runs. Process-wide, like
+    /// <c>SpanReader._afterTraceBlockForTest</c>, and sound for the same reason (the storage suite
+    /// does not run classes in parallel). Never assigned in production.
+    /// </summary>
+    internal static Action<int>? _afterMergedBlockForTest;
+
+    /// <summary>
+    /// A rental of at least <paramref name="needed"/> refs with every ref of <paramref name="refs"/>
+    /// carried over; the old one goes back. Reached only when a source holds more spans than its
+    /// header counts, since the first rental is the sources' total.
+    /// </summary>
+    private static TraceSpanRef[] GrowRefs(TraceSpanRef[] refs, int needed, SpanWriteScratch? scratch)
+    {
+        var next = ArrayPool<TraceSpanRef>.Shared.Rent(Math.Max(needed, refs.Length * 2));
+        refs.AsSpan().CopyTo(next);
+        if (scratch is not null) scratch.Return(refs);
+        else                     ArrayPool<TraceSpanRef>.Shared.Return(refs);
+        return next;
+    }
+
+    /// <summary>Opens a merge source, naming it in whatever its open throws.</summary>
+    private static SpanReader.BlockCursor OpenSource(SpanSegmentInfo src, Action<SpanSegmentInfo>? beforeSourceRead)
+    {
+        try
+        {
+            beforeSourceRead?.Invoke(src);
+            return new SpanReader.BlockCursor(src.FilePath);
+        }
+        catch (Exception ex) when (ex is not MergeSourceException)
+        {
+            throw new MergeSourceException(src.FilePath, ex);
+        }
+    }
+
+    /// <summary>Advances a merge source, naming it in whatever its read throws.</summary>
+    private static bool AdvanceSource(SpanReader.BlockCursor cursor, SpanSegmentInfo src)
+    {
+        try { return cursor.MoveNext(); }
+        catch (Exception ex) { throw new MergeSourceException(src.FilePath, ex); }
+    }
+
+    private static void CloseSource(SpanReader.BlockCursor?[] cursors, int i, ref int open)
+    {
+        cursors[i]?.Dispose();
+        cursors[i] = null;
+        open--;
+    }
+
+    /// <summary>
+    /// The v3 trace-index payload after its count, from the refs alone — for a merge, which no longer
+    /// has the spans to walk. Each trace's run, in FIRST-SEEN order: the order of each run's first
+    /// offset, which is the span order <see cref="WriteV3TraceIndex"/> walks, so the payload is the
+    /// one that method would write for the same spans.
+    /// </summary>
+    private static void WriteV3TraceIndexFromRefs(BinaryWriter w, ReadOnlySpan<TraceSpanRef> sorted, int traceCount)
+    {
+        int[]  starts = ArrayPool<int>.Shared.Rent(Math.Max(1, traceCount));
+        uint[] firsts = ArrayPool<uint>.Shared.Rent(Math.Max(1, traceCount));
+        try
+        {
+            int k = 0;
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                if (i != 0 && sorted[i].TraceId.Equals(sorted[i - 1].TraceId)) continue;
+                starts[k] = i;
+                firsts[k] = sorted[i].Offset;          // ascending within the run: its first is its smallest
+                k++;
+            }
+            Array.Sort(firsts, starts, 0, k);           // offsets are unique, so the order is total
+
+            Span<byte> idBuf = stackalloc byte[16];
+            for (int r = 0; r < k; r++)
+            {
+                int start = starts[r];
+                var id    = sorted[start].TraceId;
+                int end   = start + 1;
+                while (end < sorted.Length && sorted[end].TraceId.Equals(id)) end++;
+
+                id.WriteTo(idBuf);
+                w.Write(idBuf);
+                w.Write((uint)(end - start));
+                for (int j = start; j < end; j++) w.Write(sorted[j].Offset);
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(starts);
+            ArrayPool<uint>.Shared.Return(firsts);
+        }
+    }
     private static bool MoveIntoPlaceIfWritten(string finalPath)
     {
         string tmp = finalPath + ".tmp";
@@ -515,15 +900,22 @@ internal static class SpanWriter
 
     // ── Block serialisation ────────────────────────────────────────────────────
 
+    /// <param name="offset">Where in <paramref name="spans"/> this block's spans begin.</param>
+    /// <param name="globalFirst">The segment-wide offset of this block's first span — the trace
+    /// index's unit. Equal to <paramref name="offset"/> for a flush, which hands over the whole batch;
+    /// a merge hands over one block at a time.</param>
+    /// <param name="spanSvc">span → service for <c>.svcgraph</c>, or null when the caller derives its
+    /// edges another way (the merge — see <see cref="ServiceGraphSidecar.MergeEdges"/>).</param>
     private static (byte[] CompressedBytes, int UncompressedSize) WriteBlock(
         in OrderedSpans                          spans,
         int                                      offset,
         int                                      count,
+        int                                      globalFirst,
         ArrayBufferWriter<byte>                  bufWriter,
         uint                                     blockIdx,
         TraceSpanRef[]?                          traceRefs,
         Dictionary<string, List<uint>>           svcBlockMap,
-        Dictionary<SpanId, string>               spanSvc,
+        Dictionary<SpanId, string>?              spanSvc,
         HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms)
@@ -547,7 +939,7 @@ internal static class SpanWriter
         for (int i = 0; i < count; i++)
         {
             var s = spans[offset + i];
-            uint globalOffset = (uint)(offset + i);
+            uint globalOffset = (uint)(globalFirst + i);
 
             // ── TraceId index ────────────────────────────────────────────────
             if (traceRefs is not null) traceRefs[globalOffset] = new TraceSpanRef(s.TraceId, globalOffset);   // sorted after the blocks
@@ -562,7 +954,7 @@ internal static class SpanWriter
             if (blocks.Count == 0 || blocks[^1] != blockIdx) blocks.Add(blockIdx);
 
             // ── span → service, for .svcgraph ────────────────────────────────
-            spanSvc[s.SpanId] = s.ServiceName;
+            if (spanSvc is not null) spanSvc[s.SpanId] = s.ServiceName;
 
             // ── Per-service stats ────────────────────────────────────────────
             if (!svcStats.TryGetValue(s.ServiceName, out var st))
@@ -717,6 +1109,28 @@ internal static class SpanWriter
         public long   MaxDuration = long.MinValue;
         public uint[] Buckets    = new uint[HistogramBuckets.Count];
     }
+}
+
+/// <summary>
+/// A streaming merge could not read one of its sources. <see cref="FilePath"/> names it; the inner
+/// exception is what the read threw, so a caller can still tell a damaged file
+/// (<c>FileBounds.DescribesContent</c>) from a machine that ran out of memory or a locked file.
+/// </summary>
+internal sealed class MergeSourceException(string filePath, Exception inner)
+    : Exception($"Merge source {filePath} could not be read: {inner.Message}", inner)
+{
+    public string FilePath { get; } = filePath;
+}
+
+/// <summary>
+/// A streaming merge refused a source whose <paramref name="sidecar"/> exists and will not read: its
+/// contents would be summed into the output, and the source deleted after it. Thrown before anything
+/// is written; the source belongs to the merge that rebuilds sidecars from spans.
+/// </summary>
+internal sealed class MergeSidecarException(string filePath, string sidecar)
+    : Exception($"The {sidecar} sidecar of {filePath} will not read")
+{
+    public string FilePath { get; } = filePath;
 }
 
 /// <summary>

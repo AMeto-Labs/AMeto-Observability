@@ -23,7 +23,7 @@ public sealed class ServiceEdgeRecord
 ///             callCount uint32 | errorCount uint32 | buckets uint32[19]
 /// </code>
 /// </summary>
-internal static class ServiceGraphSidecar
+internal static partial class ServiceGraphSidecar
 {
     private const uint   GraphMagic = 0x52_44_54_47; // "RDTG"
     private const ushort Version    = 1;

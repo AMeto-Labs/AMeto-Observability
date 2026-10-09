@@ -610,6 +610,12 @@ internal static class SpanReader
         private readonly long?           _minDurationNanos;
         private readonly long?           _maxDurationNanos;
 
+        /// <summary>The window's lower bound, inclusive.</summary>
+        public long FromNano => _fromNano;
+
+        /// <summary>The window's upper bound, inclusive.</summary>
+        public long ToNano => _toNano;
+
         public SpanFilter(
             long fromNano, long toNano, string? serviceName, string? spanName,
             SpanStatusCode? status, short? httpStatusCode,
@@ -882,6 +888,149 @@ internal static class SpanReader
         return result;
     }
 
+    // ── Block cursor (streaming merge) ─────────────────────────────────────────
+
+    /// <summary>
+    /// ONE SEGMENT'S SPANS, ONE BLOCK AT A TIME, in file order — what a streaming merge reads from
+    /// each of its sources (<see cref="SpanWriter.WriteMerged"/>).
+    ///
+    /// <para><see cref="ReadAll"/> is the shape this replaces on the merge path: every span of every
+    /// source in one list, ~607 B each, so a pass could only ever be as large as the heap it was
+    /// allowed — on the 512 MB stand that was 1.2 hot tiers, and a full flush was never merged at all.
+    /// A cursor holds one decoded block (≤ 4 096 records) and the file handle, whatever the segment's
+    /// size, so what a merge holds no longer grows with what it merges.</para>
+    ///
+    /// <para>THE SAME BOUNDS AS <see cref="ReadAll"/>, block for block: the compressed length against
+    /// the bytes left in the file and the merge's own <see cref="MergeBlockBytes"/>, the uncompressed
+    /// one against the same, the size inside the LZ4 payload against <see cref="MaxBlockBytes"/>, and
+    /// the per-block span count. A merge rewrites whole files, so a block a search would stream past is
+    /// one a merge refuses rather than buffers — exactly as before. Running out of memory is reported
+    /// the way <see cref="ReadAll"/> reports it (<see cref="OutOfMemoryReading"/>), so the caller can
+    /// still tell the machine from the file.</para>
+    ///
+    /// <para><b>ORDER IS CHECKED, NOT ASSUMED.</b> A merge emits the smallest head of its sources, so a
+    /// source whose spans go backwards would put the merged file out of order — and every reader that
+    /// walks a segment as sorted (the start index, the Δts chain, the newest-first heaps) would then be
+    /// wrong about it. The writer sorts every segment it writes, so this never fires on a file this
+    /// engine produced; when it does, the cursor throws <see cref="InvalidDataException"/> and the pass
+    /// is abandoned with nothing published.</para>
+    /// </summary>
+    internal sealed class BlockCursor : IDisposable
+    {
+        private readonly FileStream       _fs;
+        private readonly BinaryReader     _br;
+        private readonly ushort           _version;
+        private readonly long             _blocksEnd;
+        private readonly List<SpanRecord> _block = new(V3BlockSpans);
+        private int  _pos = -1;
+        private uint _blockIdx;
+        private long _lastStart = long.MinValue;
+
+        public BlockCursor(string filePath)
+        {
+            FilePath = filePath;
+            _fs = OpenRead(filePath);
+            try
+            {
+                _br = new BinaryReader(_fs);
+                if (_br.ReadUInt32() != Magic) throw new InvalidDataException($"Invalid .trc magic in {filePath}");
+                _version = _br.ReadUInt16();
+                if (_version > MaxKnownVersion) throw new NewerSpanFormatException(filePath, _version);
+                if (_version < 3)
+                    throw new InvalidDataException($".trc v{_version} in {filePath} is read by the materialising merge, not a cursor");
+                _br.ReadUInt32();   // spanCount — nothing here is sized by it
+                _br.ReadInt64();    // minNano
+                _br.ReadInt64();    // maxNano
+                _br.ReadByte();     // flags
+
+                (_blocksEnd, _, _) = ReadFooter(_fs, _br, _version);
+                if (_blocksEnd < 27 || _blocksEnd > _fs.Length)
+                    throw new InvalidDataException($"Trace-index offset {_blocksEnd} lies outside {filePath}");
+                _fs.Seek(27, SeekOrigin.Begin);
+            }
+            catch
+            {
+                _fs.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>The segment this cursor reads.</summary>
+        public string FilePath { get; }
+
+        /// <summary>Spans this cursor has handed out so far.</summary>
+        public long Yielded { get; private set; }
+
+        /// <summary>The span the last successful <see cref="MoveNext"/> landed on.</summary>
+        public SpanRecord Current => _block[_pos];
+
+        /// <summary>
+        /// Advances to the next span, decoding the next block when this one is spent. False once the
+        /// span blocks end. Throws on content the merge must not copy — see the class remarks.
+        /// </summary>
+        public bool MoveNext()
+        {
+            while (++_pos >= _block.Count)
+            {
+                if (!ReadNextBlock()) { _pos = _block.Count; return false; }
+            }
+
+            var s = _block[_pos];
+            if (s.StartTimeUnixNano < _lastStart)
+                throw SegmentOrderException.OutOfStartOrder(
+                    $"{FilePath} is not sorted by start time: a span at {s.StartTimeUnixNano} follows one at {_lastStart}");
+            _lastStart = s.StartTimeUnixNano;
+            Yielded++;
+            return true;
+        }
+
+        private bool ReadNextBlock()
+        {
+            _block.Clear();
+            _pos = -1;
+            if (_fs.Position >= _blocksEnd) return false;
+
+            uint uncompSize = _br.ReadUInt32();
+            uint compSize   = _br.ReadUInt32();
+            FileBounds.RequireLengthFits(compSize, Math.Min(_blocksEnd - _fs.Position, MergeBlockBytes),
+                                         $"Block {_blockIdx}", FilePath);
+            FileBounds.RequireLengthFits(uncompSize, MergeBlockBytes, $"Block {_blockIdx} uncompressed", FilePath);
+
+            byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+            byte[]? rawBuf = null;
+            try
+            {
+                _fs.ReadExactly(comp, 0, (int)compSize);
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                if (rawLen is < 0 or > MaxBlockBytes)
+                    throw new InvalidDataException($"A block decompresses to {rawLen} bytes in {FilePath}");
+                rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+                DecodeBlockInto(rawBuf.AsMemory(0, rawLen), _version, SpanFilter.MatchAll, _block);
+            }
+            catch (OutOfMemoryException ex)
+            {
+                throw OutOfMemoryReading(_blockIdx, compSize, ex);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(comp);
+                if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
+            }
+
+            _blockIdx++;
+            // An empty block is legal on disk (a zero-count array); the loop in MoveNext reads past it.
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _block.Clear();
+            _br.Dispose();
+            _fs.Dispose();
+        }
+    }
+
     // ── Streaming block reader (search path) ───────────────────────────────────
 
     /// <summary>
@@ -914,18 +1063,31 @@ internal static class SpanReader
         br.ReadUInt32(); // magic
         ushort version = br.ReadUInt16();
         br.ReadUInt32(); // spanCount — deliberately unused: nothing here is sized by it any more
-        br.ReadInt64();  // minNano
+        long minNano = br.ReadInt64();
         br.ReadInt64();  // maxNano
-        br.ReadByte();   // flags
+        byte flags = br.ReadByte();
 
         var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
-        fs.Seek(27, SeekOrigin.Begin); // reset to after header
+
+        // A WINDOW NEED NOT READ THE WHOLE FILE — WHEN THE FILE SAYS ITS ORDER CAN BE TRUSTED.
+        // Spans are written in start order, so the blocks of a segment cover ascending, abutting
+        // ranges, and a window that starts inside the file has nothing to find in the blocks before
+        // the one it starts in, nor in any block after one that already ran past its end. That is
+        // worth nothing on a four-minute flush and most of the read on a merged segment of an hour
+        // or more, which is what streaming compaction makes. ONLY ON THE FLAG: the streaming merge
+        // checks the order of every span it writes and sets SortedByStartFlag; no other writer
+        // vouches for its files, so every other segment is read whole, exactly as before.
+        bool sorted = version >= 3 && (flags & SpanWriter.SortedByStartFlag) != 0;
+        long firstOffset = 27;   // right after the header
+        uint blockIdx    = 0;
+        if (sorted && filter.FromNano > minNano)
+            (firstOffset, blockIdx) = FirstBlockReaching(fs, filePath, traceIdxOffset, filter.FromNano);
+        fs.Seek(firstOffset, SeekOrigin.Begin);
 
         // The one buffer this walk keeps. Cleared — not reallocated — per block, so its
         // backing array settles at the largest single block's match count and stays there.
         var batch = new List<SpanRecord>(1024);
 
-        uint blockIdx = 0;
         while (fs.Position < traceIdxOffset)
         {
             ct.ThrowIfCancellationRequested();
@@ -969,6 +1131,7 @@ internal static class SpanReader
             // copied out by the span deserialisers, so nothing outlives the loop turn.
             byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
             byte[]? rawBuf = null;
+            long    lastTs;
             try
             {
                 fs.ReadExactly(comp, 0, (int)compSize);
@@ -979,7 +1142,8 @@ internal static class SpanReader
 
                 rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
-                DecodeBlockInto(rawBuf.AsMemory(0, rawLen), version, filter, batch);
+                lastTs = DecodeBlockInto(rawBuf.AsMemory(0, rawLen), version, filter, batch);
+                _searchBlockDecodedForTest?.Invoke(blockIdx);
             }
             finally
             {
@@ -997,6 +1161,90 @@ internal static class SpanReader
             }
 
             blockIdx++;
+
+            // Past the window's end: every later block starts at or after this one's last span.
+            if (sorted && lastTs > filter.ToNano) yield break;
+        }
+    }
+
+    /// <summary>
+    /// Test seam: called with the index of every block a search DECODES (not the ones it seeks past).
+    /// Process-wide, like the other reader seams; never assigned in production.
+    /// </summary>
+    internal static Action<uint>? _searchBlockDecodedForTest;
+
+    /// <summary>
+    /// Where a window that starts at <paramref name="fromNano"/> has to start reading a segment whose
+    /// spans are in start order across blocks (see <see cref="SpanWriter.SortedByStartFlag"/>): the
+    /// LAST block whose first span starts strictly before <paramref name="fromNano"/>. Strictly,
+    /// because spans with equal starts can straddle a block boundary: the block before one that starts
+    /// exactly AT the window may end with spans at that instant too.
+    ///
+    /// <para>The block headers are walked with positional reads (eight bytes each, no buffer churn),
+    /// then a binary search decompresses at most ⌈log₂ blocks⌉ of them to read one timestamp each —
+    /// six blocks for a quarter-million-span segment, against all sixty-two.</para>
+    /// </summary>
+    private static (long Offset, uint Block) FirstBlockReaching(FileStream fs, string filePath, long blocksEnd, long fromNano)
+    {
+        var handle = fs.SafeFileHandle;
+        Span<byte> head = stackalloc byte[8];
+        var offsets = new List<long>(64);
+        long pos = 27;
+        while (pos < blocksEnd)
+        {
+            if (RandomAccess.Read(handle, head, pos) != head.Length)
+                throw new EndOfStreamException($"Block {offsets.Count} header is cut short in {filePath}");
+            uint comp = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
+            FileBounds.RequireLengthFits(comp, blocksEnd - pos - head.Length, $"Block {offsets.Count}", filePath);
+            offsets.Add(pos);
+            pos += head.Length + comp;
+        }
+        if (offsets.Count <= 2) return (27, 0);
+
+        // Block 0 starts at the header's minimum, which the caller has already found below the window.
+        int lo = 0, hi = offsets.Count - 1;
+        while (lo < hi)
+        {
+            int mid = (int)(((uint)lo + (uint)hi + 1) >> 1);
+            if (FirstStartOf(handle, offsets[mid], filePath) < fromNano) lo = mid;
+            else                                                         hi = mid - 1;
+        }
+        return (offsets[lo], (uint)lo);
+    }
+
+    /// <summary>The start time of a block's first span — its one absolute timestamp.</summary>
+    private static long FirstStartOf(Microsoft.Win32.SafeHandles.SafeFileHandle handle, long offset, string filePath)
+    {
+        Span<byte> head = stackalloc byte[8];
+        if (RandomAccess.Read(handle, head, offset) != head.Length)
+            throw new EndOfStreamException($"A block header is cut short in {filePath}");
+        uint compSize = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
+        FileBounds.RequireLengthFits(compSize, MaxBlockBytes, "Block", filePath);
+
+        byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+        byte[]? rawBuf = null;
+        try
+        {
+            if (RandomAccess.Read(handle, comp.AsSpan(0, (int)compSize), offset + head.Length) != compSize)
+                throw new EndOfStreamException($"A block is cut short in {filePath}");
+            int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+            if (rawLen is < 0 or > MaxBlockBytes)
+                throw new InvalidDataException($"A block decompresses to {rawLen} bytes in {filePath}");
+            rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+            LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+
+            var r = new MessagePackReader(rawBuf.AsMemory(0, rawLen));
+            if (r.ReadArrayHeader() == 0) return long.MaxValue;   // an empty block holds nothing to start before anything
+            r.ReadArrayHeader();
+            r.Skip();                                              // trace id
+            r.Skip();                                              // span id
+            r.Skip();                                              // parent id or nil
+            return r.ReadInt64();                                  // the block's first Δts is absolute
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(comp);
+            if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
         }
     }
 
@@ -1005,7 +1253,9 @@ internal static class SpanReader
     /// to <paramref name="into"/>. Rejected spans are still fully CONSUMED — the Δts chain and
     /// the msgpack cursor both run through them — they are just never built.
     /// </summary>
-    private static void DecodeBlockInto(
+    /// <returns>The start time of the block's last span (v3+), or <see cref="long.MinValue"/> when it
+    /// has none or the format does not chain timestamps.</returns>
+    private static long DecodeBlockInto(
         ReadOnlyMemory<byte> raw, ushort version, in SpanFilter filter, List<SpanRecord> into)
     {
         var reader = new MessagePackReader(raw);
@@ -1021,6 +1271,7 @@ internal static class SpanReader
                 : DeserializeSpan(ref reader, filter);
             if (rec is not null) into.Add(rec);
         }
+        return version >= 3 && cnt > 0 ? prevTs : long.MinValue;
     }
 
     // ── Index readers ──────────────────────────────────────────────────────────
@@ -1882,6 +2133,23 @@ internal static class SpanReader
 
     private static FileStream OpenRead(string path) =>
         new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+}
+
+/// <summary>
+/// The MARK on a <c>.trc</c> whose spans are not in the start order a streaming merge reads them in —
+/// out of order inside the file, or starting before its header's minimum. Damage of a kind a REWRITE
+/// repairs: the materialising merge sorts what it reads, so such a file is handed to it rather than
+/// quarantined. Never thrown on its own: it rides as the inner exception of the
+/// <see cref="InvalidDataException"/> <see cref="OutOfStartOrder"/> builds (that type is sealed), so
+/// every classifier that knows nothing of it still reads the fault as content.
+/// </summary>
+internal sealed class SegmentOrderException(string message) : Exception(message)
+{
+    /// <summary>The content fault a reader throws for a file out of start order.</summary>
+    public static InvalidDataException OutOfStartOrder(string message) => new(message, new SegmentOrderException(message));
+
+    /// <summary>Whether <paramref name="ex"/> is that fault.</summary>
+    public static bool Is(Exception? ex) => ex is InvalidDataException { InnerException: SegmentOrderException };
 }
 
 /// <summary>
