@@ -2548,7 +2548,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private List<SpanRecord> TakeSnapshotLocked()
     {
         var nextTier   = new List<SpanRecord>();
-        var nextStarts = new SpanStartIndex(nextTier);
+        var nextStarts = new SpanStartIndex(nextTier, _hotStarts);   // continues where this tier's left off
         var nextNames  = _pools.CreateNamePool();
 
         // The log opens its window only now, and first of the two: if BeginFlush throws, the tier
@@ -2624,7 +2624,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         {
             var snapshot   = _hotSpans;
             var nextTier   = new List<SpanRecord>();
-            var nextStarts = new SpanStartIndex(nextTier);
+            var nextStarts = new SpanStartIndex(nextTier, _hotStarts);   // continues where this tier's left off
             var nextNames  = _pools.CreateNamePool();
             var flush      = new Task(() =>
             {
@@ -4224,6 +4224,28 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>Test hook: runs captured without a start index they could prove was theirs. Zero in a healthy engine.</summary>
     internal long UnindexedCapturesForTest => Interlocked.Read(ref _unindexedCaptures);
+
+    /// <summary>Test hook: the live tier's start index, captured as a reader captures it.</summary>
+    internal SpanStartView HotStartsForTest
+    {
+        get
+        {
+            _lock.EnterReadLock();
+            try     { return _hotStarts.View(_hotSpans.Count); }
+            finally { _lock.ExitReadLock(); }
+        }
+    }
+
+    /// <summary>Test hook: the unflushed spans the start indexes keep out of their blocks' ranges (#127).</summary>
+    internal int HotOutliersForTest
+    {
+        get
+        {
+            _lock.EnterReadLock();
+            try     { return _hotStarts.Outliers + (_flushingStarts?.Outliers ?? 0); }
+            finally { _lock.ExitReadLock(); }
+        }
+    }
 
     /// <summary>
     /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:

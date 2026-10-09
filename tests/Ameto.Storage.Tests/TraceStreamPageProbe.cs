@@ -34,8 +34,10 @@ namespace Ameto.Storage.Tests;
 /// <para>TWO TIERS, because the index prunes by ARRIVAL order (#122 review L1). The first arrives in
 /// start order; the second is the same spans arriving as an imperfect fleet sends them — one in a
 /// hundred from a clock 30 s ahead, one in fifty a long span reported 10 s after it started. A
-/// block's bounds cover all of its spans, so those few keep most blocks in every page's walk: the
-/// "read" column is where the pruning goes, and the bytes and rows are what stays.</para>
+/// block's bounds used to cover all of its spans, so those few kept most blocks in every page's
+/// walk; since #127 the index lists them apart and the readers take each on its own, so the "read"
+/// column of the disordered tier is about the ordered one's, plus the listed spans in the
+/// window.</para>
 /// </summary>
 public sealed class TraceStreamPageProbe : IDisposable
 {

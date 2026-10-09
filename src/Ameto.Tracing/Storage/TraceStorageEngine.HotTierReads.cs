@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 
 namespace Ameto.Tracing.Storage;
 
@@ -75,13 +76,35 @@ public sealed partial class TraceStorageEngine
     /// One block of a run the walk may have to read: the largest start in it — the key the walk
     /// orders blocks by and stops on — and its span range. The smallest start is consulted once,
     /// to leave out a block that misses the window, and is not carried.
+    ///
+    /// <para>An index block's OUTLIERS (#127) are not in its range: each is a <see cref="HotOutlier"/>
+    /// of its own, and <see cref="OutFrom"/> is the first of the run's outliers at or after
+    /// <see cref="From"/> — positions ascend, so reading the block skips them without needing to know
+    /// where they end. Every span is read through exactly one of the two. 24 bytes, as before #127:
+    /// the walk's pooled buffer of these stays the size of the tier's block count.</para>
     /// </summary>
     private struct HotBlock
     {
         public long Max;
-        public int  Run;    // 0 = the detached flush snapshot, 1 = the live tier
-        public int  From;   // first span, inclusive
-        public int  To;     // last span, exclusive
+        public int  Run;      // 0 = the detached flush snapshot, 1 = the live tier
+        public int  From;     // first span, inclusive
+        public int  To;       // last span, exclusive
+        public int  OutFrom;  // the run's first outlier at or after From: read as a HotOutlier
+    }
+
+    /// <summary>
+    /// One outlier of a run (#127): a block of one span whose largest start is its exact start.
+    /// Kept apart from the <see cref="HotBlock"/>s, in a buffer per run of that run's outliers in the
+    /// WINDOW, 16 bytes each (#128 review F2). A run lists at most its cap, 4 096, so no buffer passes
+    /// 64 KB, under the large-object threshold: as one-span <see cref="HotBlock"/>s of 32 bytes in the
+    /// blocks' own buffer, sized by every outlier the runs held, 1 960 of them rented 128 KB, a list at
+    /// its cap 256 KB, and both runs at theirs 512 KB.
+    /// </summary>
+    private struct HotOutlier
+    {
+        public long Start;
+        public int  Run;
+        public int  Position;
     }
 
     /// <summary>
@@ -92,6 +115,12 @@ public sealed partial class TraceStorageEngine
 
     /// <summary>Test seam: how many unflushed spans the TraceQL hot pass read, reported once per pass.</summary>
     internal Action<int>? _hotSearchVisitedForTest;
+
+    /// <summary>
+    /// Test seam: the bytes of the two pooled buffers the TraceQL hot pass rented — its blocks', its
+    /// outliers' — reported once per pass (#128 review F2).
+    /// </summary>
+    internal Action<long, long>? _hotSearchRentedForTest;
 
     /// <summary>
     /// Test seam: the node count the TraceQL hot pass's heap was grown to, reported once per pass —
@@ -138,15 +167,17 @@ public sealed partial class TraceStorageEngine
     /// can make the cut. With spans arriving roughly in start order a page therefore reads the top of
     /// its window — about <c>limit</c> matches and one block more — instead of the tier.</para>
     ///
-    /// <para><b>A CLOCK RUNNING AHEAD TAKES THAT BACK</b> (#122 review L1). A block's largest start
-    /// covers all 128 of its spans, so one span from a clock running ahead lifts its whole block above
-    /// everything kept: the block is always read, and the walk never stops at it. Interleaved with the
-    /// rest of the traffic such spans poison many blocks — at one span in a hundred, 30 s ahead, nearly
-    /// every block holds one, and a page reads most of the tier again (the review measured 20 000,
-    /// 18 304, 16 256 and 14 208 of 20 000 on pages 0-3; <c>TraceStreamPageProbe</c> prints it).
-    /// Never more than before this walk existed, and still after the lock. Keeping such outliers out
-    /// of the block bounds — as one-span blocks of their own — is the follow-up that would restore
-    /// the bound.</para>
+    /// <para><b>AND A CLOCK RUNNING AHEAD NO LONGER TAKES THAT BACK</b> (#127). A block's largest
+    /// start used to cover all 128 of its spans, so one span from a clock running ahead lifted its
+    /// whole block above everything kept: the block was always read, and the walk never stopped at it.
+    /// At one span in a hundred 30 s ahead nearly every block held one, and a page read most of the
+    /// tier again (the review measured 20 000, 18 304, 16 256 and 14 208 of 20 000 on pages 0-3). The
+    /// start index now keeps such a span out of its block's range and lists it with its exact start
+    /// (see <see cref="SpanStartIndex"/>), and <see cref="AddOutliers"/> makes it a block of one span
+    /// (a <see cref="HotOutlier"/>), read when the walk reaches its own start: that page now reads
+    /// 2 006. What still widens a
+    /// block — a skew within the index's one-second tolerance, a skewed producer's run long enough to
+    /// be a new level, anything past the list's cap — costs what it did before.</para>
     ///
     /// <para><b>THE FLOOR STILL HAS TO BE HONEST.</b> "A match was turned away" is what tells the
     /// pager the page did not read its window out, and stopping early must not lose it: if nothing
@@ -177,7 +208,7 @@ public sealed partial class TraceStorageEngine
 
         _hotSearchPassForTest?.Invoke();
         var kept = NewestMatches(runs.Flushing, runs.FlushingStarts, runs.Hot, runs.HotStarts,
-                                 match, limit, out evicted, out int visited, out int heapCapacity);
+                                 match, limit, out evicted, out int visited, out int heapCapacity, _hotSearchRentedForTest);
         _hotSearchVisitedForTest?.Invoke(visited);
         _hotHeapCapacityForTest?.Invoke(heapCapacity);
         return kept;
@@ -186,73 +217,97 @@ public sealed partial class TraceStorageEngine
     private static List<SpanRecord> NewestMatches(
         ReadOnlySpan<SpanRecord> flushing, SpanStartView flushingStarts,
         ReadOnlySpan<SpanRecord> hot,      SpanStartView hotStarts,
-        in SpanMatch match, int limit, out bool evicted, out int visited, out int heapCapacity)
+        in SpanMatch match, int limit, out bool evicted, out int visited, out int heapCapacity,
+        Action<long, long>? rented = null)
     {
-        int capacity = BlockCount(flushing.Length, flushingStarts) + BlockCount(hot.Length, hotStarts);
-        var blocks = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, capacity));
+        // Three pooled buffers: the blocks, and each run's outliers in the window — one per run, so
+        // neither holds more than a list's cap, 4 096, and none reaches the large-object heap.
+        var blocks      = ArrayPool<HotBlock>.Shared.Rent(Math.Max(1, BlockCount(flushing.Length, flushingStarts) + BlockCount(hot.Length, hotStarts)));
+        var flushingOut = ArrayPool<HotOutlier>.Shared.Rent(Math.Max(1, OutliersIn(flushingStarts, match.FromNano, match.ToNano)));
+        var hotOut      = ArrayPool<HotOutlier>.Shared.Rent(Math.Max(1, OutliersIn(hotStarts,      match.FromNano, match.ToNano)));
         try
         {
-            int n = AddBlocks(blocks, 0, run: 0, flushing.Length, flushingStarts, match.FromNano, match.ToNano);
-            n     = AddBlocks(blocks, n, run: 1, hot.Length,      hotStarts,      match.FromNano, match.ToNano);
+            rented?.Invoke((long)blocks.Length * Unsafe.SizeOf<HotBlock>(),
+                           (long)Math.Max(flushingOut.Length, hotOut.Length) * Unsafe.SizeOf<HotOutlier>());
 
-            // Newest block first. The tie-break only makes the visiting order reproducible — the
+            // `candidates` is the span count of the blocks the window overlaps — an index block's
+            // without its outliers — and of the window's outliers: an upper bound on its matches.
+            int candidates = 0;
+            int n  = AddBlocks(blocks, 0, run: 0, flushing.Length, flushingStarts, match.FromNano, match.ToNano, ref candidates);
+            n      = AddBlocks(blocks, n, run: 1, hot.Length,      hotStarts,      match.FromNano, match.ToNano, ref candidates);
+            int m0 = AddOutliers(flushingOut, run: 0, flushingStarts, match.FromNano, match.ToNano);
+            int m1 = AddOutliers(hotOut,      run: 1, hotStarts,      match.FromNano, match.ToNano);
+            candidates += m0 + m1;
+
+            // Newest first, each. The tie-breaks only make the visiting order reproducible — the
             // result does not depend on it, because HotKey is a total order.
             blocks.AsSpan(0, n).Sort(static (a, b) =>
                 a.Max != b.Max ? b.Max.CompareTo(a.Max)
               : a.Run != b.Run ? b.Run.CompareTo(a.Run)
               :                  b.From.CompareTo(a.From));
+            flushingOut.AsSpan(0, m0).Sort(NewestOutlierFirst);
+            hotOut.AsSpan(0, m1).Sort(NewestOutlierFirst);
 
             // SIZED FOR WHAT THE PAGE FINDS, AHEAD OF IT — see NextHeapCapacity. The heap and its id
             // set grow together, before the heap is full, to sizes this method chooses: left to
             // themselves, the id set of a 2 000-span page ends at 2 729 entries — 87 KB, one array
             // over the large-object threshold, every page — and the heap re-copies itself nine
-            // times on the way. `candidates` is the span count of the blocks the window overlaps, an
-            // upper bound on its matches.
-            int candidates = 0;
-            for (int k = 0; k < n; k++) candidates += blocks[k].To - blocks[k].From;
+            // times on the way.
             int finalSize = Math.Min(limit, candidates);
 
-            var top      = new PriorityQueue<SpanRecord, HotKey>();
-            var present  = new HashSet<(TraceId Trace, ulong Span)>();
-            int sizedFor = 0;
-            int inWindow = 0;   // spans read that could match at all — the match rate's denominator
-            evicted = false;
-            visited = 0;
+            var  window     = match;   // a local the reader below can use; `in` parameters cannot be captured
+            var  top        = new PriorityQueue<SpanRecord, HotKey>();
+            var  present    = new HashSet<(TraceId Trace, ulong Span)>();
+            int  sizedFor   = 0;
+            int  inWindow   = 0;   // spans read that could match at all — the match rate's denominator
+            int  read       = 0;
+            bool turnedAway = false;
 
-            int next = 0;
-            for (; next < n; next++)
+            // THE NEWEST-FIRST SEQUENCES, WALKED AS ONE: the blocks, and each run's outliers in the
+            // window as blocks of one span. Whichever starts newer is read next; a tie goes the way
+            // one sorted list of them all used to order it, so the walk meets every span in the order
+            // it did.
+            int nb = 0, n0 = 0, n1 = 0;
+            while (nb < n || n0 < m0 || n1 < m1)
             {
-                ref readonly var block = ref blocks[next];
+                bool live   = n1 < m1 && (n0 == m0 || hotOut[n1].Start >= flushingOut[n0].Start);   // the live tier's at a tie
+                bool one    = (live || n0 < m0) && (nb == n || ComesFirst(live ? hotOut[n1] : flushingOut[n0], blocks[nb]));
+                long newest = !one ? blocks[nb].Max : live ? hotOut[n1].Start : flushingOut[n0].Start;
 
                 // Full, and this block — like every block after it — starts below the oldest span
                 // kept: nothing left can make the cut.
-                if (top.Count >= limit && top.TryPeek(out _, out var oldest) && block.Max < oldest.Start) break;
+                if (top.Count >= limit && top.TryPeek(out _, out var oldest) && newest < oldest.Start) break;
 
+                if (one)
+                {
+                    if (live) { int p = hotOut[n1++].Position;      Read(hot[p], flushing.Length + p); }
+                    else      { int p = flushingOut[n0++].Position; Read(flushing[p], p); }
+                    continue;
+                }
+
+                ref readonly var block = ref blocks[nb++];
                 var run      = block.Run == 0 ? flushing : hot;
+                var starts   = block.Run == 0 ? flushingStarts : hotStarts;
                 int position = block.Run == 0 ? 0 : flushing.Length;
+                int skip     = block.OutFrom;
+                int skipAt   = skip < starts.Outliers ? starts.OutlierPosition(skip) : int.MaxValue;
                 for (int i = block.From; i < block.To; i++)
                 {
-                    var s = run[i];
-                    visited++;
-                    if (s.StartTimeUnixNano < match.FromNano || s.StartTimeUnixNano > match.ToNano) continue;
-                    inWindow++;
-                    if (!match.Matches(s)) continue;
-                    if (top.Count == sizedFor && sizedFor < finalSize)
+                    if (i == skipAt)   // an outlier: read as a HotOutlier, if its start is in the window
                     {
-                        // Over the in-window spans read and every span not read yet: the spans read
-                        // OUTSIDE the window are candidates no longer (see NextHeapCapacity).
-                        int size = NextHeapCapacity(sizedFor, inWindow, inWindow + (candidates - visited), finalSize);
-                        top      = GrownTo(top, sizedFor, size);
-                        present.EnsureCapacity(size + 1);   // + the copy AdmitHot adds before it decides
-                        sizedFor = size;
+                        skipAt = ++skip < starts.Outliers ? starts.OutlierPosition(skip) : int.MaxValue;
+                        continue;
                     }
-                    evicted |= AdmitHot(top, present, s, new HotKey(s.StartTimeUnixNano, position + i), limit);
+                    Read(run[i], position + i);
                 }
             }
 
-            if (next < n && !evicted)
-                evicted = AnyMatchNotKept(blocks.AsSpan(next, n - next), flushing, hot, match, present, ref visited);
+            if ((nb < n || n0 < m0 || n1 < m1) && !turnedAway)
+                turnedAway = AnyMatchNotKept(blocks.AsSpan(nb, n - nb), flushingOut.AsSpan(n0, m0 - n0), hotOut.AsSpan(n1, m1 - n1),
+                                             flushing, flushingStarts, hot, hotStarts, match, present, ref read);
 
+            evicted      = turnedAway;
+            visited      = read;
             heapCapacity = top.EnsureCapacity(0);   // its node array's length; grows nothing
 
             // The heap drains oldest-first; the caller wants newest-first.
@@ -260,12 +315,46 @@ public sealed partial class TraceStorageEngine
             while (top.TryDequeue(out var s, out _)) kept.Add(s);
             kept.Reverse();
             return kept;
+
+            // One span offered to the heap, at its position in tier order.
+            void Read(SpanRecord s, int at)
+            {
+                read++;
+                if (s.StartTimeUnixNano < window.FromNano || s.StartTimeUnixNano > window.ToNano) return;
+                inWindow++;
+                if (!window.Matches(s)) return;
+                if (top.Count == sizedFor && sizedFor < finalSize)
+                {
+                    // Over the in-window spans read and every span not read yet: the spans read
+                    // OUTSIDE the window are candidates no longer (see NextHeapCapacity).
+                    int size = NextHeapCapacity(sizedFor, inWindow, inWindow + (candidates - read), finalSize);
+                    top      = GrownTo(top, sizedFor, size);
+                    present.EnsureCapacity(size + 1);   // + the copy AdmitHot adds before it decides
+                    sizedFor = size;
+                }
+                turnedAway |= AdmitHot(top, present, s, new HotKey(s.StartTimeUnixNano, at), limit);
+            }
         }
         finally
         {
             ArrayPool<HotBlock>.Shared.Return(blocks);
+            ArrayPool<HotOutlier>.Shared.Return(flushingOut);
+            ArrayPool<HotOutlier>.Shared.Return(hotOut);
         }
     }
+
+    /// <summary>One run's outliers newest first; a run's positions are unique, so the order is total.</summary>
+    private static readonly Comparison<HotOutlier> NewestOutlierFirst = static (a, b) =>
+        a.Start != b.Start ? b.Start.CompareTo(a.Start) : b.Position.CompareTo(a.Position);
+
+    /// <summary>
+    /// The outlier comes before the block in the newest-first walk: the order one list sorted by
+    /// largest start, then run, then first position, gave the two when it held both.
+    /// </summary>
+    private static bool ComesFirst(in HotOutlier o, in HotBlock b) =>
+        o.Start != b.Max ? o.Start > b.Max
+      : o.Run   != b.Run ? o.Run > b.Run
+      :                    o.Position > b.From;
 
     /// <summary>The heap size at which a hot pass stops doubling and sizes by its match rate.</summary>
     private const int SizeHeapAt = 256;
@@ -295,9 +384,13 @@ public sealed partial class TraceStorageEngine
     /// page's window overlaps every block a late span reaches back from, most of whose spans lie
     /// above its ceiling, and the walk reads those blocks first, their largest starts being the
     /// highest. The last page of a selective stream down a disordered tier was then sized for its
-    /// limit: 301 matches, 176 KB, against 84 for the same page of the tier in order — and now 83,
-    /// main's being 76. The count is never above the old one and drops only by spans that cannot
-    /// match, so the rate projects no fewer matches than the window can still hold at it.</para>
+    /// limit: 301 matches, 176 KB, against 84 for the same page of the tier in order — 83 with this
+    /// count, main's being 76. The count is never above the old one and drops only by spans that
+    /// cannot match, so the rate projects no fewer matches than the window can still hold at it.
+    /// Since #127 a late span past the index's tolerance leaves its block's range alone, so the walk
+    /// no longer reads those blocks at all, and that page's estimate lands within 4 % of the in-order
+    /// page's: a heap of 633 for its 301 matches against 606 in order. 89 KB, most of the six above
+    /// 83 the id set's next prime size (761 entries, not 631).</para>
     ///
     /// <para><b>AND NEVER JUST SHORT OF THE LIMIT</b> (#122 review, round 3): a size within a
     /// sixteenth of <paramref name="finalSize"/> is the limit. The count above moved some full pages
@@ -358,28 +451,60 @@ public sealed partial class TraceStorageEngine
         spans == 0 ? 0 : starts.IsIndexed ? starts.Blocks : 1;
 
     /// <summary>
-    /// Appends the blocks of one run whose start range meets <c>[fromNano, toNano]</c>. An
-    /// unindexed run is one block that may hold anything — read whole, and never the reason the
-    /// walk stops.
+    /// Appends the blocks of one run whose start range meets <c>[fromNano, toNano]</c>, and adds to
+    /// <paramref name="candidates"/> the spans in them that are not outliers. An unindexed run is one
+    /// block that may hold anything — read whole, and never the reason the walk stops.
     /// </summary>
     private static int AddBlocks(HotBlock[] blocks, int n, int run, int spans, SpanStartView starts,
-                                 long fromNano, long toNano)
+                                 long fromNano, long toNano, ref int candidates)
     {
         if (spans == 0) return n;
         if (!starts.IsIndexed)
         {
             blocks[n++] = new HotBlock { Max = long.MaxValue, Run = run, From = 0, To = spans };
+            candidates += spans;
             return n;
         }
+
+        int k = 0, outliers = starts.Outliers;
         for (int b = 0, from = 0; from < spans; b++, from += SpanStartIndex.BlockSize)
         {
+            int to = Math.Min(from + SpanStartIndex.BlockSize, spans), outFrom = k;
+            while (k < outliers && starts.OutlierPosition(k) < to) k++;
             if (!starts.Overlaps(b, fromNano, toNano)) continue;
-            blocks[n++] = new HotBlock
-            {
-                Max = starts.MaxOf(b), Run = run, From = from, To = Math.Min(from + SpanStartIndex.BlockSize, spans),
-            };
+            blocks[n++] = new HotBlock { Max = starts.MaxOf(b), Run = run, From = from, To = to, OutFrom = outFrom };
+            candidates += to - from - (k - outFrom);
         }
         return n;
+    }
+
+    /// <summary>How many of one run's outliers start inside <c>[fromNano, toNano]</c>.</summary>
+    private static int OutliersIn(SpanStartView starts, long fromNano, long toNano)
+    {
+        int count = 0;
+        for (int k = 0; k < starts.Outliers; k++)
+        {
+            long start = starts.OutlierStart(k);
+            if (start >= fromNano && start <= toNano) count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Fills <paramref name="outliers"/> with one run's outliers that start inside <c>[fromNano, toNano]</c> (#127), each with its
+    /// exact start: one from a clock running ahead is read when the walk reaches ITS start, not its
+    /// block's.
+    /// </summary>
+    private static int AddOutliers(HotOutlier[] outliers, int run, SpanStartView starts, long fromNano, long toNano)
+    {
+        int m = 0;
+        for (int k = 0; k < starts.Outliers; k++)
+        {
+            long start = starts.OutlierStart(k);
+            if (start < fromNano || start > toNano) continue;
+            outliers[m++] = new HotOutlier { Start = start, Run = run, Position = starts.OutlierPosition(k) };
+        }
+        return m;
     }
 
     /// <summary>
@@ -433,11 +558,14 @@ public sealed partial class TraceStorageEngine
     /// What it can skip is a block NOTHING of which is in the window: a page deep in a stream has
     /// its ceiling far below the newest blocks, and those cost no record reads at all.</para>
     ///
-    /// <para><b>WHEN SPANS ARRIVE IN ORDER</b> (#122 review L1). One long span, reported when it
-    /// ends, lowers its block's smallest start by its whole duration, and that block can then not be
-    /// skipped by any page whose ceiling lies within that duration. The review measured a page five
-    /// seconds deep at 5 120 spans read in order, 6 400 with one span in 1 000 reported 10 s late,
-    /// and 14 976 with one in 50; <c>TraceStreamPageProbe</c> prints it.</para>
+    /// <para><b>AND WHEN THEY DO NOT</b> (#127). One long span, reported when it ends, used to lower
+    /// its block's smallest start by its whole duration, and no page whose ceiling lay within that
+    /// duration could skip the block: a page five seconds deep read 5 120 spans in order, 6 400 with
+    /// one span in 1 000 reported 10 s late, and 14 976 with one in 50 (#122 review L1). Such a span
+    /// is now an outlier of its block (see <see cref="SpanStartIndex"/>). A block the page skips is
+    /// skipped but for its outliers that start inside the window, which are merged one by one in their
+    /// positions' order — so the page is still made of every in-window span, in tier order — and a
+    /// block it reads is read whole, its outliers with it. That page now reads 5 130 and 5 318.</para>
     /// </summary>
     private static int MergeRunInto(Dictionary<TraceId, MergedTrace> merged, ReadOnlySpan<SpanRecord> run,
                                     SpanStartView starts, long fromNano, long toNano)
@@ -449,39 +577,74 @@ public sealed partial class TraceStorageEngine
             return run.Length;
         }
 
-        int read = 0;
+        int read = 0, k = 0, outliers = starts.Outliers;
         for (int b = 0, from = 0; from < run.Length; b++, from += SpanStartIndex.BlockSize)
         {
-            if (!starts.Overlaps(b, fromNano, toNano)) continue;
-            var block = run.Slice(from, Math.Min(SpanStartIndex.BlockSize, run.Length - from));
-            read += block.Length;
-            foreach (var s in block)
-                if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+            int to = Math.Min(from + SpanStartIndex.BlockSize, run.Length);
+            if (starts.Overlaps(b, fromNano, toNano))
+            {
+                // The block whole, its outliers with it, in tier order.
+                var block = run[from..to];
+                read += block.Length;
+                foreach (var s in block)
+                    if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+                while (k < outliers && starts.OutlierPosition(k) < to) k++;
+                continue;
+            }
+
+            // Skipped: only its outliers (#127) can still start inside the window — merged here, in
+            // their positions' order, so the tier order the page is made of is the block's own.
+            for (; k < outliers && starts.OutlierPosition(k) < to; k++)
+            {
+                long start = starts.OutlierStart(k);
+                if (start < fromNano || start > toNano) continue;
+                read++;
+                MergeSpanInto(merged, run[starts.OutlierPosition(k)]);
+            }
         }
         return read;
     }
 
     /// <summary>
-    /// Whether the blocks the walk stopped before hold a match the full walk would have turned
-    /// away: any match that is not a copy of a span the heap kept. Nothing in them could have
-    /// entered the heap, so the heap — and with it <paramref name="present"/> — is exactly what
-    /// the full walk would have ended with.
+    /// Whether the blocks and outliers the walk stopped before hold a match the full walk would have
+    /// turned away: any match that is not a copy of a span the heap kept. Nothing in them could have
+    /// entered the heap, so the heap — and with it <paramref name="present"/> — is exactly what the
+    /// full walk would have ended with.
     /// </summary>
-    private static bool AnyMatchNotKept(ReadOnlySpan<HotBlock> rest, ReadOnlySpan<SpanRecord> flushing,
-                                        ReadOnlySpan<SpanRecord> hot, in SpanMatch match,
-                                        HashSet<(TraceId Trace, ulong Span)> present, ref int visited)
+    private static bool AnyMatchNotKept(ReadOnlySpan<HotBlock> blocks,
+                                        ReadOnlySpan<HotOutlier> flushingOutliers, ReadOnlySpan<HotOutlier> hotOutliers,
+                                        ReadOnlySpan<SpanRecord> flushing, SpanStartView flushingStarts,
+                                        ReadOnlySpan<SpanRecord> hot,      SpanStartView hotStarts,
+                                        in SpanMatch match, HashSet<(TraceId Trace, ulong Span)> present,
+                                        ref int visited)
     {
-        foreach (ref readonly var block in rest)
+        foreach (ref readonly var o in flushingOutliers)
+            if (NotKept(flushing[o.Position], match, present, ref visited)) return true;
+        foreach (ref readonly var o in hotOutliers)
+            if (NotKept(hot[o.Position], match, present, ref visited)) return true;
+
+        foreach (ref readonly var block in blocks)
         {
-            var run = block.Run == 0 ? flushing : hot;
+            var run    = block.Run == 0 ? flushing : hot;
+            var starts = block.Run == 0 ? flushingStarts : hotStarts;
+            int skip   = block.OutFrom;
+            int skipAt = skip < starts.Outliers ? starts.OutlierPosition(skip) : int.MaxValue;
             for (int i = block.From; i < block.To; i++)
             {
-                var s = run[i];
-                visited++;
-                if (!match.Matches(s)) continue;
-                if (s.SpanId.IsEmpty || !present.Contains((s.TraceId, s.SpanId.RawValue))) return true;
+                if (i == skipAt)   // an outlier: in `outliers` if it starts in the window and is still unread
+                {
+                    skipAt = ++skip < starts.Outliers ? starts.OutlierPosition(skip) : int.MaxValue;
+                    continue;
+                }
+                if (NotKept(run[i], match, present, ref visited)) return true;
             }
         }
         return false;
+
+        static bool NotKept(SpanRecord s, in SpanMatch match, HashSet<(TraceId Trace, ulong Span)> present, ref int visited)
+        {
+            visited++;
+            return match.Matches(s) && (s.SpanId.IsEmpty || !present.Contains((s.TraceId, s.SpanId.RawValue)));
+        }
     }
 }
