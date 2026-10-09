@@ -239,8 +239,12 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
-    /// <summary>Bucket counts per histogram point are capped so the 16-bit length field holds.</summary>
-    private const int MaxBucketCounts = ushort.MaxValue;
+    /// <summary>
+    /// Bucket counts per histogram point are capped so the 16-bit length field holds. The receivers
+    /// refuse a point past it (<see cref="MetricIngestItem.MaxBucketCounts"/>), so the cut here is
+    /// for a caller that does not.
+    /// </summary>
+    private const int MaxBucketCounts = MetricIngestItem.MaxBucketCounts;
 
     /// <summary>
     /// The file header. The first 32 bytes are v1's, byte for byte; the rest exists in v2 only,
@@ -1529,16 +1533,34 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         }
     }
 
-    /// <summary>Assigns (and persists, once) the pool index for a series. Caller holds the lock.</summary>
+    /// <summary>
+    /// Assigns (and persists, once) the pool index for a series. Caller holds the lock.
+    ///
+    /// <para><b>The record before the registry entry</b> (#126 review F1). The registry's indexer
+    /// links the new key and only then grows its table, so an OutOfMemoryException from
+    /// <c>GrowTable</c> — the 512 MB stand's stack, <c>GrowTable ← AppendCore ← Ingest</c> — left the
+    /// key registered with its record never written. The OTLP receiver answers that batch 503; the
+    /// retry found the index and logged the batch under it, and so did every later batch of the
+    /// series until a commit emptied the log, and a restart in between replayed them all as
+    /// unresolved — lost. Now a failure here leaves either nothing registered (the record is an
+    /// orphan with an index gap: harmless) or the key with its record.</para>
+    /// </summary>
     private uint RegisterSeriesLocked(SeriesKey key, double[]? bounds)
     {
         if (_seriesIndex.TryGetValue(key, out uint existing)) return existing;
 
         uint index = _nextSeriesIndex++;
-        _seriesIndex[key] = index;
         WritePoolRecord(index, key, bounds);
+        _seriesIndex[key] = index;
+        OnSeriesRegisteredForTest?.Invoke();
         return index;
     }
+
+    /// <summary>
+    /// Test seam fired right after a new series is published in the registry — where the
+    /// registry's own <c>GrowTable</c> throws when the heap is out (#126 review F1). Null in production.
+    /// </summary>
+    internal Action? OnSeriesRegisteredForTest;
 
     /// <summary>
     /// The top byte of a v2 pool record's length field. A v1 length never reaches it — records

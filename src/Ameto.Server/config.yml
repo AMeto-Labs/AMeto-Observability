@@ -58,7 +58,7 @@ Ameto:
   # hard limit is 384 MB, and the managed shares are taken of THAT. An explicit value always
   # wins. The effective figures are printed at startup (the "Metric budgets:" line) and in
   # GET /api/diagnostics (metricsHotTierBudgetBytes, metricsMinFlushBytes, metricsWalInitialBytes,
-  # metricsExemplarsPerMetric, metricsMaxExemplarMetrics).
+  # metricsExemplarsPerMetric, metricsMaxExemplarMetrics, metricsRewriteBudgetBytes).
   Metrics:
     # Bytes the hot tier may hold before a flush is forced. Unset = min(32 MB, 5% of the
     # managed-heap limit), so ~19 MB in a 512 MB container. Points are not the unit: a
@@ -75,6 +75,12 @@ Ameto:
     # Initial capacity of metrics.wal. Unset = the tier budget capped at the 8 MB this has
     # always been, so it can only make the file smaller, never larger. Set it to pre-size the log.
     # WalInitialBytes: 8388608
+    #
+    # What one chunk of a background rewrite (compaction, merge, rollup) may hold. Unset = the
+    # trace compaction pass's share, min(73 MB, 6% of the managed-heap limit), never below 16 MiB —
+    # 24.2 MB in a 512 MB container — taken IN TURN with the trace pass, never beside it. A metric heavier than
+    # this is rewritten in more, smaller chunks: more files, the same points.
+    # RewriteBudgetBytes: 24159191
     #
     # Flush a non-empty tier at least this often whatever its size. Matches the rollup's own
     # first cutoff, so nothing waits longer because of it.
@@ -188,6 +194,12 @@ Ameto:
     MaxBatchBytes: 4194304        # 4 MB  — max POST /api/events body (larger → 413)
     MaxEventPayloadBytes: 65536   # 64 KB — max properties per event (larger events dropped + logged)
     MaxOtlpBatchBytes: 8388608    # 8 MB  — max OTLP /otlp/v1/* body (larger → 413)
+    # MaxOtlpMetricPoints:        # unset (or 0 or below) = request-body share / 128 B: ~157 000 data
+    #                             # points in a 512 MB container, never below 131 040 (the share is
+    #                             # floored at 16 MiB - 4 KiB; the rule's own floor, 65 536, never binds).
+    #                             # A metrics batch that would decode past that many points (128 B a
+    #                             # point, 24 B a histogram bucket, 16 B a bound, 160 B an exemplar)
+    #                             # → 413 (gRPC RESOURCE_EXHAUSTED), weighed before a point is decoded.
 
     # Payload slab arena — the absorption window when the drainer stalls (slabs, not ring
     # slots, are what a burst runs out of; a pending event holds one slab whatever its size).

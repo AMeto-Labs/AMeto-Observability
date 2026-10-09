@@ -798,11 +798,18 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// The span-name and service intern pools, shared with the ingest ring when the container
     /// builds both. Null: the engine keeps its own.
     /// </param>
+    /// <param name="rewriteGate">
+    /// The turn a compaction pass takes with the metric engine's rewrite chunks (#125): the two are
+    /// bounded by the same share of the heap, and taking turns is what keeps them inside it. The
+    /// process's one instance, from DI. Null: the engine's own, shared with nothing.
+    /// </param>
     internal TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
                                 bool writeSegmentFormatV4, bool indexEnabled,
-                                TracesOptions? options, SpanStringPools? pools)
+                                TracesOptions? options, SpanStringPools? pools,
+                                BackgroundRewriteGate? rewriteGate = null)
     {
-        _hotStarts = new SpanStartIndex(_hotSpans);
+        _hotStarts   = new SpanStartIndex(_hotSpans);
+        _rewriteGate = rewriteGate ?? new BackgroundRewriteGate();
         _pools = pools ?? new SpanStringPools();
         options ??= new TracesOptions();
         var budgets = MemoryBudgets.Current();
@@ -3920,7 +3927,25 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal IReadOnlyCollection<string> CatalogPathsForTest =>
         _manifest.Segments.Values.Select(static s => s.FilePath).ToList();
 
+    /// <summary>The turn a compaction pass takes with the metric engine's rewrite chunks (#125).</summary>
+    private readonly BackgroundRewriteGate _rewriteGate;
+
+    /// <summary>Test hook: the gate this engine's compaction passes take their turn through.</summary>
+    internal BackgroundRewriteGate RewriteGateForTest => _rewriteGate;
+
+    /// <summary>
+    /// One pass, in its turn: a pass holds up to <see cref="MergeBudgetBytes"/> of spans read back, and
+    /// by default a metric rewrite chunk is bounded by the same share — taking turns through
+    /// <see cref="_rewriteGate"/> is what keeps the two from holding both at once (#125). Held for the
+    /// pass, not the run, so the metric side's chunks interleave between passes.
+    /// </summary>
     private bool CompactOnePass()
+    {
+        using var turn = _rewriteGate.Enter();
+        return CompactOnePassInTurn();
+    }
+
+    private bool CompactOnePassInTurn()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
         // into memory. Compaction used to merge ALL small segments at once, which on a

@@ -314,6 +314,24 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
+    /// A METRIC REWRITE CHUNK SPENDS THE TRACE MERGE PASS'S SHARE, IN TURN WITH IT (#125) — not a
+    /// seventh share: the six managed shares stay at the 0.58 the test above holds, and the two
+    /// background rewrites take turns through <c>BackgroundRewriteGate</c>, so one figure bounds both.
+    /// An explicit value wins; 0 or less means derive it, as for every other byte knob.
+    /// </summary>
+    [Fact]
+    public void A_rewrite_chunk_spends_the_trace_merge_share_unless_one_is_set()
+    {
+        Assert.Equal(Stand.TraceMergeBytes, new MetricsOptions().RewriteBudgetBytesFor(Stand));
+        Assert.Equal(24_159_191L,           new MetricsOptions().RewriteBudgetBytesFor(Stand));   // 6 % of 384 MiB
+        Assert.Equal(MemoryBudgets.TraceMergeCapBytes, new MetricsOptions().RewriteBudgetBytesFor(Large));
+
+        Assert.Equal(1_234_567L,            new MetricsOptions { RewriteBudgetBytes = 1_234_567 }.RewriteBudgetBytesFor(Stand));
+        Assert.Equal(Stand.TraceMergeBytes, new MetricsOptions { RewriteBudgetBytes = 0 }.RewriteBudgetBytesFor(Stand));
+        Assert.Equal(Stand.TraceMergeBytes, new MetricsOptions { RewriteBudgetBytes = -1 }.RewriteBudgetBytesFor(Stand));
+    }
+
+    /// <summary>
     /// A TRACE CEILING IS A SPAN COUNT TIMES A SPAN'S WEIGHT, AND THE WEIGHT MOVED UNDER IT.
     ///
     /// <para>64 MB and 128 MB were cut against 1 117 B a span in the hot tier and 1 740 B a span

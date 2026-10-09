@@ -261,6 +261,9 @@ public static class DiagnosticsEndpointMapper
                 metricsWalInitialBytes          = metrics?.WalInitialBytes,
                 metricsExemplarsPerMetric       = metrics?.ExemplarsPerMetric,
                 metricsMaxExemplarMetrics       = metrics?.MaxExemplarMetrics,
+                // What one chunk of a metric rewrite may hold (#125) — by default the trace merge
+                // pass's share, taken in turn with it.
+                metricsRewriteBudgetBytes       = metrics?.RewriteBudgetBytes,
                 // Exemplars dropped because MaxExemplarMetrics names already own a ring. A hint,
                 // never data — this counter is the only place the refusal shows.
                 metricsExemplarMetricsRefused   = metrics?.ExemplarMetricsRefused,

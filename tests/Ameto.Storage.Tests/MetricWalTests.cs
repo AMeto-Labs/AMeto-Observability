@@ -232,6 +232,36 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(1_700_000_000_000_000_000L + 19 * 1_000_000L, replayed[19].Point.TimestampUnixNano);
     }
 
+    /// <summary>
+    /// A SERIES WHOSE REGISTRATION RAN OUT OF MEMORY STILL REPLAYS AFTER THE RETRY (#126 review F1).
+    /// The registry's indexer links the new key and only then grows its table, so the 512 MB stand's
+    /// failure — <c>GrowTable ← AppendCore ← Ingest</c> — left a series registered with no pool
+    /// record. The OTLP receiver answers that batch 503 and the exporter retries it: the retry found
+    /// the index and logged the batch under it, and so did every later batch of the series, until a
+    /// restart replayed them all as unresolved and they were lost. The record is written first now.
+    /// </summary>
+    [Fact]
+    public void A_series_whose_registration_ran_out_of_memory_still_replays_after_the_retry()
+    {
+        var item = Scalar("oom.registered", 1_700_000_000_000_000_000L, 1.5, Labels(("service", "stand")));
+
+        var wal = OpenWal();
+        int faults = 1;
+        wal.OnSeriesRegisteredForTest = () => { if (faults-- > 0) throw new OutOfMemoryException("injected: GrowTable"); };
+        Assert.Throws<OutOfMemoryException>(() => Append(wal, item));
+        Append(wal, item);                                   // the exporter's retry
+        wal.Dispose();
+
+        var reopened = OpenWal();
+        var replayed = reopened.ReadAll(out int unresolved);
+        reopened.Dispose();
+
+        Assert.Equal(0, unresolved);
+        var point = Assert.Single(replayed);
+        Assert.Equal("oom.registered", point.Name);
+        Assert.Equal(1.5, point.Point.Value);
+    }
+
     [Fact]
     public void Replays_histogram_points_with_bounds_and_bucket_counts()
     {

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Ameto.Core;
@@ -27,12 +28,18 @@ public static class MetricsServiceExtensions
         // block exists — ServerOptions is bound from the whole Ameto section and registered as a
         // singleton there. A host that registers no ServerOptions (tests, an embedded use) gets
         // the derived defaults, which is what it would have got anyway.
+        //
+        // The rewrite gate is the process's ONE instance, whichever of AddAmetoMetrics and
+        // AddAmetoTracing registers it first (#125): a metric rewrite chunk and a trace compaction
+        // pass are bounded by the same share of the heap and take turns through it.
+        services.TryAddSingleton<BackgroundRewriteGate>();
         services.AddSingleton(sp =>
             new MetricStorageEngine(
                 Path.Combine(dataDirectory, "metrics"),
                 sp.GetRequiredService<ILogger<MetricStorageEngine>>(),
                 sp.GetService<ServerOptions>()?.Metrics,
-                sp.GetService<TimeProvider>())
+                sp.GetService<TimeProvider>(),
+                sp.GetRequiredService<BackgroundRewriteGate>())
             .RegisterForMemoryPressure());
 
         services.AddSingleton<IMetricIngester>(sp => sp.GetRequiredService<MetricStorageEngine>());

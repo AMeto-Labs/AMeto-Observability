@@ -45,6 +45,10 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
     private static readonly OtlpGzipTooLargeLog NoLog =
         new(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
 
+    /// <summary>The out-of-memory error, discarded likewise.</summary>
+    private static readonly OtlpOutOfMemoryLog NoMemoryLog =
+        new(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+
     private readonly Factory    _factory;
     private readonly HttpClient _client;
 
@@ -87,6 +91,139 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         gate.Exit();
         Assert.True(await gate.TryEnterAsync(default));
+    }
+
+    /// <summary>
+    /// A WAIT THAT CANNOT BE HAD LEAVES NO SLOT OWED (#126 review F4). The gate was a
+    /// <see cref="SemaphoreSlim"/>, whose timed wait queues its waiter and only then allocates the
+    /// timeout's machinery: an OutOfMemoryException there left the waiter queued with nobody to
+    /// collect it, and the next release handed it a slot that was never given back — on the stand's
+    /// two slots, two such events made every compressed batch wait and get 503 until a restart (from
+    /// the runtime's source: the fault needs an allocation failure inside the runtime). The counter is
+    /// now the only ledger; here the wait between two looks fails, the call fails, and once the holders
+    /// leave every slot is free and usable.
+    /// </summary>
+    [Fact]
+    public async Task A_wait_that_runs_out_of_memory_leaves_no_slot_owed()
+    {
+        var gate = new OtlpInflateGate(2, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        gate.WaitForTest = static (_, _) => throw new OutOfMemoryException("injected: the wait's timer");
+        await Assert.ThrowsAsync<OutOfMemoryException>(() => gate.TryEnterAsync(default));
+        gate.WaitForTest = null;
+
+        gate.Exit();
+        gate.Exit();
+        Assert.Equal(gate.Capacity, gate.Available);
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.True(await gate.TryEnterAsync(default));
+        Assert.Equal(0, gate.Available);
+    }
+
+    [Fact]
+    public async Task A_waiter_takes_a_slot_freed_within_its_patience_and_a_second_give_back_is_refused()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(10));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        Task<bool> waiting = gate.TryEnterAsync(default);
+        await Task.Delay(50);
+        Assert.False(waiting.IsCompleted, "a full gate let a waiter in");
+        gate.Exit();
+        Assert.True(await waiting.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, gate.Available);
+
+        gate.Exit();
+        Assert.Throws<SemaphoreFullException>(gate.Exit);              // never wider than its capacity
+        Assert.Equal(1, gate.Available);
+    }
+
+    /// <summary>
+    /// A FREED SLOT GOES TO THE BATCH THAT WAITED FOR IT (#126 review NEW-3). With the polled gate a
+    /// newcomer arriving just after a release took the slot ahead of a batch that had waited 50 ms,
+    /// 10 times in 10: <c>Exit</c> only incremented the counter, and the newcomer's fast path looked
+    /// before the waiter's next poll. Ten rounds of H holding the only slot, A waiting, H leaving and
+    /// C arriving: A has the slot every time, and C gets it only when A gives it back.
+    /// </summary>
+    [Fact]
+    public async Task A_newcomer_does_not_take_the_slot_a_waiter_was_woken_for()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        for (int round = 0; round < 10; round++)
+        {
+            Assert.True(await gate.TryEnterAsync(default));                     // H
+            Task<bool> a = gate.TryEnterAsync(default);
+            await Task.Delay(50);
+            Assert.False(a.IsCompleted, "a full gate let a waiter in");
+
+            gate.Exit();                                                       // H leaves...
+            Task<bool> c = gate.TryEnterAsync(default);                        // ...and C arrives
+
+            Assert.True(await a.WaitAsync(TimeSpan.FromSeconds(5)), $"round {round}: the waiter did not get the slot");
+            Assert.False(c.IsCompleted, $"round {round}: the newcomer got in beside the waiter");
+
+            gate.Exit();                                                       // A leaves
+            Assert.True(await c.WaitAsync(TimeSpan.FromSeconds(5)));
+            gate.Exit();                                                       // C leaves
+            Assert.Equal(1, gate.Available);
+        }
+    }
+
+    /// <summary>
+    /// A freed slot reaches a waiter at once: the release rings, it does not wait for the waiter's
+    /// next look. The polled gate handed it over a timer tick late — 15.7 ms at the median on
+    /// Windows, against 0.03 ms for a semaphore. Median over 40 rounds under 2 ms.
+    /// </summary>
+    [Fact]
+    public async Task A_freed_slot_reaches_a_waiter_at_once()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        var handOffs = new List<double>();
+        for (int round = 0; round < 40; round++)
+        {
+            Assert.True(await gate.TryEnterAsync(default));
+            Task<bool> waiter = gate.TryEnterAsync(default);
+            await Task.Delay(5);                                               // parked
+
+            long released = System.Diagnostics.Stopwatch.GetTimestamp();
+            gate.Exit();
+            Assert.True(await waiter.WaitAsync(TimeSpan.FromSeconds(5)));
+            handOffs.Add(System.Diagnostics.Stopwatch.GetElapsedTime(released).TotalMilliseconds);
+            gate.Exit();
+        }
+
+        handOffs.Sort();
+        double median = handOffs[handOffs.Count / 2];
+        Assert.True(median < 2, $"hand-off median {median:F2} ms (max {handOffs[^1]:F2} ms)");
+    }
+
+    /// <summary>
+    /// A ring that reaches a dead waiter costs a look, never a slot. An allocation failure inside the
+    /// doorbell's own timed wait leaves its waiter queued in the doorbell with nobody to collect it; the
+    /// next release's ring goes to it. The real waiter behind it finds the slot on its own look, within
+    /// <see cref="OtlpInflateGate.PollInterval"/>, and the counter never owes anything.
+    /// </summary>
+    [Fact]
+    public async Task A_ring_that_reaches_a_dead_waiter_costs_a_poll_not_a_slot()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+        gate.ParkDeadDoorbellWaiterForTest();
+        Task<bool> waiter = gate.TryEnterAsync(default);
+        await Task.Delay(20);
+
+        var released = System.Diagnostics.Stopwatch.StartNew();
+        gate.Exit();                                                           // the ring goes to the dead waiter
+        Assert.True(await waiter.WaitAsync(TimeSpan.FromSeconds(5)));
+        // A poll (100 ms) and whatever the machine adds — well inside the 5 s patience, which is
+        // what the waiter would sit out if nothing but its deadline looked at the counter again.
+        Assert.True(released.Elapsed < TimeSpan.FromSeconds(2), $"took {released.Elapsed.TotalMilliseconds:F0} ms");
+        Assert.Equal(0, gate.Available);
+
+        gate.Exit();
+        Assert.Equal(1, gate.Available);
     }
 
     // ── OTLP/HTTP: 503 + Retry-After ──────────────────────────────────────────
@@ -198,7 +335,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         Assert.True(await gate.TryEnterAsync(default));
         var full = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(full, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
 
         Assert.Equal("14", full.Response.Headers["grpc-status"].ToString());
         Assert.Equal(OtlpGrpcEndpointMapper.GateFullMessage, full.Response.Headers["grpc-message"].ToString());
@@ -206,13 +343,13 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal(0, gate.Available);                                       // released nothing it did not take
 
         var identity = GrpcCall(Frame(message, compressed: false));
-        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(identity, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
         Assert.Equal("0", identity.Response.Headers["grpc-status"].ToString());
         Assert.Equal(1, decoded);
 
         gate.Exit();
         var freed = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
-        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, NoLog, decode);
+        await OtlpGrpcEndpointMapper.HandleAsync(freed, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog, decode);
         Assert.Equal("0", freed.Response.Headers["grpc-status"].ToString());
         Assert.Equal(2, decoded);
         Assert.Equal(1, gate.Available);                                       // and the slot came back
@@ -229,7 +366,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         using var ledger = IngestBufferPoolLedger.Open();
         ledger.FailRent(2, new OutOfMemoryException());
-        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate, NoLog,
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
             static (_, _) => throw new InvalidOperationException("nothing should reach the decoder"));
 
         Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
@@ -255,7 +392,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
         var first = GrpcCall(Frame(gz, compressed: true));
         first.Response.Body = stalled;
-        Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog,
+        Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
             static (_, _) => (true, 0, null));
 
         await stalled.Writing.Task.WaitAsync(TimeSpan.FromSeconds(15));   // decoded; the response is stuck
@@ -264,7 +401,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
             Assert.Equal(gate.Capacity, gate.Available);
 
             var second = GrpcCall(Frame(gz, compressed: true));
-            await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog,
+            await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
                 static (_, _) => (true, 0, null));
             Assert.Equal("0", second.Response.Headers["grpc-status"].ToString());
         }

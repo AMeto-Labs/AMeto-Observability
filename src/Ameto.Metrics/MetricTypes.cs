@@ -671,6 +671,16 @@ public sealed class MetricLabelInterner
 /// </summary>
 public sealed class MetricIngestItem
 {
+    /// <summary>
+    /// The most buckets one histogram point may carry: what the metric WAL's record holds (its
+    /// bucket count is 16 bits). The OTLP receivers refuse a point with more, as a rejected point
+    /// (#126 review NEW-0): the log kept only the first 65 535, so after a restart the point was
+    /// not the one served before it, and a point of more than ~7.46 million buckets does not fit
+    /// the block a reader opens — one such point, about 7 KB as a gzip upload, stopped every
+    /// metric flush until a restart.
+    /// </summary>
+    public const int MaxBucketCounts = ushort.MaxValue;
+
     /// <summary>Metric name (e.g. "http.server.request.duration").</summary>
     public string     Name              { get; init; } = string.Empty;
 

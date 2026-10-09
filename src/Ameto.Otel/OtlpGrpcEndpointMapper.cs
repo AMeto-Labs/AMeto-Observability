@@ -46,15 +46,19 @@ public static class OtlpGrpcEndpointMapper
     /// <summary>What UNAVAILABLE says when the inflate ran out of memory.</summary>
     internal const string MemoryShortMessage = "the server ran short of memory inflating this batch; retry";
 
+    /// <summary>What UNAVAILABLE says when anything else taking the batch in ran out of memory: the read, the decode, the store.</summary>
+    internal const string IngestMemoryShortMessage = "the server ran short of memory taking in this batch; retry";
+
     public static void MapOtlpGrpcEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
     {
         // The SAME gate the HTTP receivers inflate under — one bound on inflated buffers for the
-        // process, whichever port a compressed batch arrived on.
-        OtlpInflateGate     inflateGate = app.Services.GetRequiredService<OtlpInflateGate>();
-        OtlpGzipTooLargeLog tooLargeLog = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
+        // process, whichever port a compressed batch arrived on. And the same two throttled lines.
+        OtlpInflateGate     inflateGate    = app.Services.GetRequiredService<OtlpInflateGate>();
+        OtlpGzipTooLargeLog tooLargeLog    = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
+        OtlpOutOfMemoryLog  outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, static (c, msg) =>
+            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog, static (c, msg) =>
             {
                 var (_, dropped) = OtlpLogProtoParser.Parse(
                     msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
@@ -63,19 +67,67 @@ public static class OtlpGrpcEndpointMapper
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, tooLargeLog, static (c, msg) =>
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, inflateGate, tooLargeLog, outOfMemoryLog, static (c, msg) =>
                     IngestTraces(msg.AsSpan(), c.RequestServices.GetRequiredService<ISpanSink>())));
 
         if (enableMetrics)
+        {
+            // Built once, here: it carries the point limit, and a capturing lambda inside the route
+            // handler would be a new closure per call.
+            int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
+            OtlpMetricBudgetLog metricBudgetLog = app.Services.GetRequiredService<OtlpMetricBudgetLog>();
+            Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decodeMetrics = (c, msg) =>
+                DecodeMetrics(c, msg.AsSpan(), maxMetricPoints, metricBudgetLog);
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, static (c, msg) =>
-                {
-                    var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
-                    int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
-                     .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-                    return (true, refused, "points stamped more than 24 h in the future were refused");
-                }));
+                (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, outOfMemoryLog, decodeMetrics));
+        }
     }
+
+    /// <summary>
+    /// The metrics Export's decode and store. The batch is weighed before a point is built — its
+    /// points, and a histogram point's buckets, bounds and exemplars (#126 review F2, NEW-1): one that
+    /// would decode past <c>Ingestion.MaxOtlpMetricPoints</c> points' worth throws
+    /// <see cref="OtlpMetricPointBudget.TooManyPointsException"/>, answered RESOURCE_EXHAUSTED — its
+    /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried. A
+    /// histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets is refused
+    /// at decode and reported in the partial success beside the store's own refusals, each with its
+    /// reason (#126 review NEW-0).
+    /// </summary>
+    internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints,
+                                                                       OtlpMetricBudgetLog? budgetLog = null)
+    {
+        var weight = OtlpMetricPointBudget.WeighProto(message);
+        if (!OtlpMetricPointBudget.Fits(weight, maxPoints))
+        {
+            // Logged as well as answered (#126 review NEW-2): RESOURCE_EXHAUSTED without RetryInfo is
+            // not retried, so this line is the server's only record of the lost batch.
+            budgetLog?.Note(ctx, weight, maxPoints);
+            throw new OtlpMetricPointBudget.TooManyPointsException(weight, maxPoints);
+        }
+
+        var points = OtlpMetricProtoParser.Parse(message, out int tooManyBuckets);
+        int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()
+            .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
+        return (true, tooManyBuckets + stale, (tooManyBuckets, stale) switch
+        {
+            ( > 0, > 0) => TooManyBucketsAndFutureReason,
+            ( > 0, _)   => TooManyBucketsReason,
+            _           => FutureReason,
+        });
+    }
+
+    /// <summary>Why metric points were rejected: a timestamp more than 24 h ahead (the store's refusal).</summary>
+    internal const string FutureReason = "points stamped more than 24 h in the future were refused";
+
+    /// <summary>
+    /// Why metric points were rejected: a histogram point past <see cref="MetricIngestItem.MaxBucketCounts"/>
+    /// buckets, refused at decode (#126 review NEW-0).
+    /// </summary>
+    internal const string TooManyBucketsReason = "histogram points of more than 65535 buckets were refused";
+
+    /// <summary>Both of the above in one batch.</summary>
+    internal const string TooManyBucketsAndFutureReason =
+        "histogram points of more than 65535 buckets, and points stamped more than 24 h in the future, were refused";
 
     /// <summary>
     /// The trace Export's decode: the protobuf STREAMS into the raw span sink (TI#3) — no
@@ -107,6 +159,7 @@ public static class OtlpGrpcEndpointMapper
         ApiKeyPermissions required,
         OtlpInflateGate inflateGate,
         OtlpGzipTooLargeLog tooLargeLog,
+        OtlpOutOfMemoryLog outOfMemoryLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
@@ -139,7 +192,21 @@ public static class OtlpGrpcEndpointMapper
             return;
         }
 
-        var (body, bodyLen) = await ReadBodyAsync(ctx);
+        // OUT OF MEMORY IS THE SERVER'S FAILURE, NOT THE BATCH'S (#125) — here, and in the decode
+        // below, which parses AND stores: UNAVAILABLE, which exporters retry. A failed read has
+        // given its buffer back (OtlpBodyReader). Escaping, it was answered by hosting as HTTP
+        // 500, which a gRPC client reads as UNKNOWN and an exporter never retries.
+        byte[]? body;
+        int bodyLen;
+        try
+        {
+            (body, bodyLen) = await ReadBodyAsync(ctx);
+        }
+        catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+        {
+            await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+            return;
+        }
         if (body is null)
         {
             // A batch past Ingestion.MaxOtlpBatchBytes. RESOURCE_EXHAUSTED is the code a
@@ -163,7 +230,21 @@ public static class OtlpGrpcEndpointMapper
             // it any more, and always BEFORE a response is written (see ReleaseInflate).
             if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
             {
-                if (!await inflateGate.TryEnterAsync(ctx.RequestAborted))
+                bool entered;
+                try
+                {
+                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted);
+                }
+                catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                {
+                    // The wait itself ran out — its timer, the doorbell's queue node (#126 review
+                    // NEW-4): the server's failure, answered as the read's is, UNAVAILABLE. It used to
+                    // leave the handler, which hosting answered 500 and a client reads as UNKNOWN,
+                    // never retried. No slot was taken; the body goes back in the finally below.
+                    await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+                    return;
+                }
+                if (!entered)
                 {
                     await FinishAsync(ctx, StatusUnavailable, GateFullMessage);
                     return;
@@ -213,6 +294,24 @@ public static class OtlpGrpcEndpointMapper
             try
             {
                 (ok, rejected, why) = decode(ctx, segment);
+            }
+            catch (OtlpMetricPointBudget.TooManyPointsException)
+            {
+                // More than the server decodes in one request, refused before a point was built
+                // (#126 review F2, NEW-1): the "batch too large" answer, as for one over the byte limit.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
+                return;
+            }
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+            {
+                // It used to be the INVALID_ARGUMENT below, and an exporter drops a batch it is told
+                // is invalid. The metric decode's store is the WAL append the 512 MB stand ran out
+                // in; a sink's own log call that ran out arrives wrapped in an AggregateException
+                // (#126 review F3). The buffer and the slot go back before the answer, as below.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+                return;
             }
             catch (Exception ex)
             {
@@ -298,6 +397,18 @@ public static class OtlpGrpcEndpointMapper
     private static async Task WriteMessageAsync(HttpContext ctx, byte[] message)
     {
         await ctx.Response.Body.WriteAsync(OtlpGrpcFraming.Frame(message), ctx.RequestAborted);
+    }
+
+    /// <summary>
+    /// The answer to a batch the server ran out of memory taking in (#125): UNAVAILABLE, then the
+    /// throttled error line the HTTP receivers write too (<see cref="OtlpOutOfMemoryLog"/>). Here the
+    /// status is already complete when the line is written, and the line never throws anyway. What
+    /// a decode had stored before it ran out stays stored, and the retry stores it again.
+    /// </summary>
+    private static async Task RefuseOutOfMemoryAsync(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
+    {
+        await FinishAsync(ctx, StatusUnavailable, IngestMemoryShortMessage);
+        log.Note(ctx, ex);
     }
 
     /// <summary>

@@ -16,8 +16,76 @@ namespace Ameto.Metrics.Storage;
 internal static class MetricReader
 {
     /// <summary>Largest block this reader will decompress. The same ceiling SpanReader uses, and
-    /// for the same reason: nothing on disk bounds what an LZ4 payload claims to expand to.</summary>
-    private const int MaxBlockBytes = 64 * 1024 * 1024;
+    /// for the same reason: nothing on disk bounds what an LZ4 payload claims to expand to. The
+    /// writer keeps every section it writes at or under it (<c>MetricWriter</c>).</summary>
+    internal const int MaxBlockBytes = 64 * 1024 * 1024;
+
+    /// <summary>
+    /// THE LARGEST BLOCK BUFFER A READ TAKES FROM, AND GIVES BACK TO, THE SHARED POOL: 8 MiB, the
+    /// largest array this process already parks on a routine I/O path (<c>IngestBufferPool</c>'s top
+    /// bucket). Above it a buffer is allocated for the read and dropped with it (#125).
+    ///
+    /// <para>There was no line at all: a block — a WHOLE file's series section, up to
+    /// <see cref="MaxBlockBytes"/> — was rented at any size, the pool rounds it up to a power of two
+    /// and keeps what it is handed, and on the 512 MB stand a 58 MiB block parked two 64 MiB arrays
+    /// there. Why not the writer's megabyte (<see cref="MetricWriter.MaxPooledBytes"/>): the writer's
+    /// buffer lives for one flush, a read happens per QUERY — the alert evaluator runs one per rule
+    /// every 15 s — and at a megabyte an ordinary 512-series file's block was allocated by every cold
+    /// query that met it: <c>MetricQueryAllocProbe</c> measured 93.9 B a stored point against its
+    /// 64 B guard. What lies above 8 MiB is a day of a busy histogram's five-minute points or a
+    /// legacy file that carried its history forward — read rarely enough to allocate, large enough
+    /// that parking it costs the stand real heap.</para>
+    /// </summary>
+    internal const int MaxPooledBytes = 8 * 1024 * 1024;
+
+    /// <summary>
+    /// THE BLOCK BUFFERS ONE REWRITE'S READS SHARE (#125). A rewrite reads its sources once to plan
+    /// and again for every chunk, and each read inflates the source's WHOLE block — up to 64 MiB, and
+    /// its compressed copy beside it. Allocated afresh per read, a carried-history FiveMin file of
+    /// 58 MiB made ~100 MiB of large-object garbage per chunk; under the stand's 384 MiB hard limit
+    /// the collector could not hand that back as fast as the next chunk asked for it, and the rewrite
+    /// failed with an OutOfMemoryException with its own chunk well inside the budget. With one scratch
+    /// the rewrite holds the largest source's two buffers for its whole length — a fixed cost, outside
+    /// the chunk budget as a trace pass's read buffers are outside its own — and churns nothing.
+    /// Never pooled, never shared between rewrites; grown, never shrunk; dropped with the rewrite.
+    /// </summary>
+    internal sealed class ReadScratch
+    {
+        private byte[]? _compressed, _inflated;
+
+        /// <summary>The compressed block's buffer, at least <paramref name="size"/> bytes.</summary>
+        public byte[] Compressed(int size) => Fit(ref _compressed, size);
+
+        /// <summary>The inflated block's buffer, at least <paramref name="size"/> bytes.</summary>
+        public byte[] Inflated(int size) => Fit(ref _inflated, size);
+
+        private static byte[] Fit(ref byte[]? buffer, int size)
+        {
+            if (buffer is not null && buffer.Length >= size) return buffer;
+            buffer = null;                                  // the smaller one is garbage before the larger is asked for
+            return buffer = GC.AllocateUninitializedArray<byte>(size);
+        }
+    }
+
+    /// <summary>A block buffer back to the shared pool when it came from there — 8 MiB or less; left to the collector above.</summary>
+    private static void Give(byte[] buffer)
+    {
+        if (buffer.Length > MaxPooledBytes) return;
+        ArrayPool<byte>.Shared.Return(buffer);
+        ReturnedToPoolForTest?.Invoke(buffer.Length);
+    }
+
+    /// <summary>
+    /// Test seam: the length of every block buffer this reader hands back to the shared pool, on the
+    /// reading thread (a read is synchronous on the thread that enumerates it). Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<int>? ReturnedToPoolForTest;
+
+    /// <summary>
+    /// Test seam: a v3 read's compressed block at the moment the read lets go of it, before the first
+    /// series is walked — pooled or not (#126 review L1). On the reading thread. Null in production.
+    /// </summary>
+    [ThreadStatic] internal static Action<byte[]>? CompressedReleasedForTest;
 
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
@@ -93,6 +161,20 @@ internal static class MetricReader
         {
             if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
         }
+    }
+
+    /// <summary>
+    /// A v3 file's series count and the size its series section inflates to, from its header alone
+    /// (offsets 7 and 28) — what a rewrite decides, before it reads a point, whether a metric fits
+    /// one chunk by (#125). A claim, like every header field: the rewrite only ever uses it to choose
+    /// the single-pass path, whose reads are bounded like any other.
+    /// </summary>
+    internal static (int SeriesCount, long SectionBytes) ReadSectionSize(string filePath)
+    {
+        using var handle = File.OpenHandle(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Span<byte> head = stackalloc byte[36];
+        if (ReadAt(handle, head, 0) < 36) throw new EndOfStreamException($"{filePath} is shorter than a v3 header");
+        return ((int)BinaryPrimitives.ReadUInt32LittleEndian(head[7..]), BinaryPrimitives.ReadUInt32LittleEndian(head[28..]));
     }
 
     /// <summary>Fills <paramref name="buffer"/> from <paramref name="offset"/> until it is full or the file ends; the bytes read.</summary>
@@ -178,29 +260,74 @@ internal static class MetricReader
     // ── The rewrite's reads (RewriteMetricInChunks) ───────────────────────────
 
     /// <summary>
-    /// The rewrite's first pass over one source: every series in file order, each with its
-    /// POSITION (where <see cref="ReadAt"/> finds it again) and its key index from
-    /// <paramref name="keyOf"/>, which numbers keys as they are met. Only a series whose key index
-    /// is below <paramref name="pointsBelow"/> has its points decoded — the rewrite's first chunk,
-    /// gathered in the same pass; every other series is decoded up to its identity and bucket
-    /// bounds, and its points are walked past.
+    /// The rewrite's single pass over one source when the whole metric fits one chunk: every series in
+    /// file order, each with its POSITION (where <see cref="ReadAt"/> finds it again) and its key
+    /// index from <paramref name="keyOf"/>, which numbers keys as they are met. Only a series whose key
+    /// index is below <paramref name="pointsBelow"/> has its points decoded; every other series is
+    /// decoded up to its identity and bucket bounds, and its points are walked past. Points before
+    /// <paramref name="fromNano"/> — past the retention cutoff — are walked and never decoded (#125).
     /// </summary>
-    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadForRewrite(
-        string filePath, Func<SeriesKey, int> keyOf, int pointsBelow) =>
+    internal static IEnumerable<ReadItem> ReadForRewrite(
+        string filePath, Func<SeriesKey, int> keyOf, int pointsBelow, long fromNano = long.MinValue,
+        ReadScratch? scratch = null, CancellationToken ct = default) =>
         ReadCore(filePath, metricName: null,
-                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow),
-                 at: null, CancellationToken.None);
+                 new ReadWindow(fromNano, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow),
+                 at: null, ct, scratch);
 
     /// <summary>
-    /// The series at <paramref name="positions"/> (as <see cref="ReadForRewrite"/> reported them,
-    /// ascending), in that order, with their points and bucket bounds — and NOT their labels or
-    /// unit, which the rewrite already holds from its first pass. A v3 file is inflated once and
-    /// each series decoded where it starts; a v2 file's other series are not even inflated.
+    /// The rewrite's PLANNING pass over one source (#125): every series in file order with its
+    /// position, its encoded length, its key index, its bucket bounds — and, instead of its points,
+    /// their <see cref="ReadItem.Stats"/>: how many there are, how many lie at or after
+    /// <paramref name="fromNano"/>, what the bucket arrays a decode of those would build weigh, and
+    /// when the first and last of them fall. The points are walked, with every check a decode makes,
+    /// and nothing is built: the rewrite plans its chunks by this before it holds a single point.
     /// </summary>
-    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadAt(string filePath, List<long> positions) =>
+    internal static IEnumerable<ReadItem> PlanForRewrite(string filePath, Func<SeriesKey, int> keyOf, long fromNano = long.MinValue,
+                                                         ReadScratch? scratch = null, CancellationToken ct = default) =>
         ReadCore(filePath, metricName: null,
-                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: false),
-                 at: positions, CancellationToken.None);
+                 new ReadWindow(fromNano, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow: 0, stats: true),
+                 at: null, ct, scratch);
+
+    /// <summary>
+    /// The series at <paramref name="positions"/> (as <see cref="PlanForRewrite"/> or
+    /// <see cref="ReadForRewrite"/> reported them, ascending), in that order, with their points in
+    /// <c>[fromNano, toNano]</c> and their bucket bounds — and NOT their labels or unit, which the
+    /// rewrite already holds from its first pass. A v3 file is inflated once and each series decoded
+    /// where it starts; a v2 file's other series are not even inflated.
+    /// </summary>
+    internal static IEnumerable<ReadItem> ReadAt(string filePath, List<long> positions,
+                                                  long fromNano = long.MinValue, long toNano = long.MaxValue,
+                                                  ReadScratch? scratch = null, CancellationToken ct = default) =>
+        ReadCore(filePath, metricName: null,
+                 new ReadWindow(fromNano, toNano, null, buckets: true, labels: false),
+                 at: positions, ct, scratch);
+
+    /// <summary>
+    /// One series as a rewrite read meets it: where it sits (for v3 its offset in the inflated block,
+    /// for v2 its block's offset in the file), how many bytes it is encoded in, its key index (-1
+    /// outside a rewrite), the series itself, and — from <see cref="PlanForRewrite"/> — what its
+    /// points would weigh decoded.
+    /// </summary>
+    internal readonly record struct ReadItem(long Position, int Length, int Key, MetricSeries Series, PointStats Stats);
+
+    /// <summary>
+    /// What a series' points come to without being built (<see cref="PlanForRewrite"/>). Every read
+    /// fills <see cref="Walked"/>; the rest only a planning read.
+    /// </summary>
+    internal struct PointStats
+    {
+        /// <summary>Every point the series holds in this file.</summary>
+        public int  Walked;
+
+        /// <summary>The points inside the read's window.</summary>
+        public int  Kept;
+
+        /// <summary>The bucket arrays a decode of the kept points builds: 24 + 8 × length bytes each.</summary>
+        public long BucketBytes;
+
+        /// <summary>The first and last kept timestamp; <see cref="long.MaxValue"/> / <see cref="long.MinValue"/> when none is kept.</summary>
+        public long MinKept, MaxKept;
+    }
 
     /// <summary>
     /// What a read keeps: points in <c>[FromNano, ToNano]</c> (inclusive, as the range test always
@@ -209,12 +336,15 @@ internal static class MetricReader
     internal readonly struct ReadWindow(
         long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets,
         bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue,
-        MetricLabelInterner? interner = null, bool identities = false)
+        MetricLabelInterner? interner = null, bool identities = false, bool stats = false)
     {
         public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
 
         /// <summary>Only kind, unit and labels are decoded; bounds and points are skipped (<see cref="ReadIdentities"/>).</summary>
         public bool Identities { get; } = identities;
+
+        /// <summary>Points are walked into <see cref="PointStats"/> and not decoded (<see cref="PlanForRewrite"/>).</summary>
+        public bool Stats { get; } = stats;
 
         public long FromNano { get; } = fromNano;
         public long ToNano   { get; } = toNano;
@@ -258,18 +388,19 @@ internal static class MetricReader
 
     private static IEnumerable<MetricSeries> Read(string filePath, string? metricName, ReadWindow window, CancellationToken ct)
     {
-        foreach (var (_, _, series) in ReadCore(filePath, metricName, window, at: null, ct))
-            yield return series;
+        foreach (var item in ReadCore(filePath, metricName, window, at: null, ct))
+            yield return item.Series;
     }
 
     /// <summary>
     /// The one reading loop: every series of the file in order (<paramref name="at"/> null), or the
     /// series at the given positions — for v3 an offset in the inflated block, for v2 the file
-    /// offset of the series' own block. Each series comes with its position and its rewrite key
-    /// index (-1 outside a rewrite read).
+    /// offset of the series' own block. Each series comes as a <see cref="ReadItem"/>: its position,
+    /// its encoded length, its rewrite key index (-1 outside a rewrite read) and its point stats.
     /// </summary>
-    private static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadCore(
-        string filePath, string? metricName, ReadWindow window, List<long>? at, CancellationToken ct)
+    private static IEnumerable<ReadItem> ReadCore(
+        string filePath, string? metricName, ReadWindow window, List<long>? at, CancellationToken ct,
+        ReadScratch? scratch = null)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -318,7 +449,16 @@ internal static class MetricReader
             uint compSize = br.ReadUInt32();
             FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, "Series block", filePath);
 
-            byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+            // POOLED UP TO 8 MiB AND NO FURTHER (#125, see MaxPooledBytes). A block is a WHOLE file's
+            // series section, up to MaxBlockBytes, and ArrayPool rounds it up to a power of two: a
+            // 58 MiB block took two 64 MiB arrays from the shared pool, and the pool kept both after
+            // the read — 128 MiB of gen2 parked for a caller that may never come, on a box whose whole
+            // heap is 384 MiB. A block above the line is allocated for the read and left to the collector.
+            // A rewrite brings its own buffers instead (ReadScratch), which this read neither pools nor drops.
+            byte[]? comp = scratch is not null
+                ? scratch.Compressed((int)compSize)
+                : compSize <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent((int)compSize) : GC.AllocateUninitializedArray<byte>((int)compSize);
+            bool    compHeld = scratch is null;
             byte[]? raw  = null;
             try
             {
@@ -328,8 +468,24 @@ internal static class MetricReader
                 // for gigabytes.
                 int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
                 FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, "Series block uncompressed", filePath);
-                raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                raw = scratch is not null
+                    ? scratch.Inflated(rawLen)
+                    : rawLen <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent(rawLen) : GC.AllocateUninitializedArray<byte>(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+
+                // The compressed copy has done its work: given back BEFORE the series are walked, so
+                // a read holds one block and not two for as long as its caller takes over the series
+                // (a rewrite decodes and accumulates a whole chunk while this iterator is suspended).
+                // And the reference DROPPED (#126 review L1): a block over the line is not pooled, so
+                // giving it back hands nothing anywhere, and this iterator kept it reachable for the
+                // whole walk — a query over a 58 MiB block held its ~43 MiB compressed copy beside it.
+                if (compHeld)
+                {
+                    Give(comp);
+                    compHeld = false;
+                }
+                CompressedReleasedForTest?.Invoke(comp);
+                comp = null;
 
                 if (at is null)
                 {
@@ -338,8 +494,9 @@ internal static class MetricReader
                     {
                         ct.ThrowIfCancellationRequested();
                         int start  = offset;
-                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, share, out offset, out int key);
-                        if (series is not null) yield return (start, key, series);
+                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, share,
+                                                     out offset, out int key, out PointStats stats);
+                        if (series is not null) yield return new ReadItem(start, offset - start, key, series, stats);
                     }
                 }
                 else
@@ -349,15 +506,16 @@ internal static class MetricReader
                         ct.ThrowIfCancellationRequested();
                         if (position < 0 || position >= rawLen)
                             throw new InvalidDataException($"Series position {position} is outside the block of {filePath}");
-                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, share, out _, out int key);
-                        if (series is not null) yield return (position, key, series);
+                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, share,
+                                                     out int next, out int key, out PointStats stats);
+                        if (series is not null) yield return new ReadItem(position, next - (int)position, key, series, stats);
                     }
                 }
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(comp);
-                if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+                if (compHeld) Give(comp!);
+                if (raw is not null && scratch is null) Give(raw);
             }
         }
         else
@@ -385,26 +543,35 @@ internal static class MetricReader
                 uint compSize = br.ReadUInt32();
                 FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
 
-                byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+                // Pooled up to 8 MiB, allocated above, or the rewrite's own — see the v3 block above.
+                byte[] comp = scratch is not null
+                    ? scratch.Compressed((int)compSize)
+                    : compSize <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent((int)compSize) : GC.AllocateUninitializedArray<byte>((int)compSize);
                 byte[]? raw = null;
                 MetricSeries? series;
-                int key;
+                int key, length;
+                PointStats stats;
                 try
                 {
                     fs.ReadExactly(comp, 0, (int)compSize);
                     int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
-                    raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                    raw = scratch is not null
+                        ? scratch.Inflated(rawLen)
+                        : rawLen <= MaxPooledBytes ? ArrayPool<byte>.Shared.Rent(rawLen) : GC.AllocateUninitializedArray<byte>(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, share, out _, out key);
+                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, share, out length, out key, out stats);
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(comp);
-                    if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+                    if (scratch is null)
+                    {
+                        Give(comp);
+                        if (raw is not null) Give(raw);
+                    }
                 }
 
-                if (series is not null) yield return (position, key, series);
+                if (series is not null) yield return new ReadItem(position, length, key, series, stats);
             }
         }
     }
@@ -420,16 +587,17 @@ internal static class MetricReader
     /// </summary>
     private static MetricSeries? DeserializeNext(
         string metricName, byte[] raw, int offset, int length, bool deltaMs,
-        in ReadWindow window, double share, out int next, out int key)
+        in ReadWindow window, double share, out int next, out int key, out PointStats stats)
     {
         var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
-        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, share, out key);
+        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, share, out key, out stats);
         next = offset + (int)r.Consumed;
         return series;
     }
 
     private static MetricSeries? DeserializeSeries(
-        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, double share, out int keyIndex)
+        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, double share,
+        out int keyIndex, out PointStats stats)
     {
         int fields = r.ReadMapHeader();
 
@@ -439,6 +607,7 @@ internal static class MetricReader
         double[]?  bounds  = null;
         List<MetricDataPoint>? points = null;
         keyIndex = -1;
+        stats    = new PointStats { MinKept = long.MaxValue, MaxKept = long.MinValue };
 
         // The rewrite's key can be taken once kind, unit and labels are in hand — which, in the
         // order the writer emits a series (k, u, lbs, bnds, pts, cnt), is before its points. A map
@@ -489,9 +658,17 @@ internal static class MetricReader
                 if (window.KeyOf is { } keyOf && (have & HaveIdentity) == HaveIdentity)
                 {
                     keyIndex = keyOf(new SeriesKey(metricName, kind, unit, labels));
-                    if (keyIndex >= window.PointsBelow) { r.Skip(); continue; }   // not this pass's
+                    if (!window.Stats && keyIndex >= window.PointsBelow) { r.Skip(); continue; }   // not this pass's
                 }
-                points = deltaMs ? ReadPointsV3(ref r, in window, share) : ReadPointsV2(ref r, in window, share);
+                if (window.Stats)
+                {
+                    if (deltaMs) StatPointsV3(ref r, in window, ref stats);
+                    else         StatPointsV2(ref r, in window, ref stats);
+                    continue;
+                }
+                points = deltaMs ? ReadPointsV3(ref r, in window, share, out stats.Walked)
+                                 : ReadPointsV2(ref r, in window, share, out stats.Walked);
+                stats.Kept = points.Count;
             }
             else r.Skip();
         }
@@ -662,7 +839,7 @@ internal static class MetricReader
     /// array per full point as they always did, and a point nobody asked for costs no
     /// allocation.</para>
     /// </summary>
-    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, double share)
+    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, double share, out int walked)
     {
         // A MessagePack array header is a number out of the file like any other: the block it
         // lives in is bounded, but the header can still claim far more points than the block
@@ -672,6 +849,7 @@ internal static class MetricReader
         // keeps a third of the file reserving for all of it wastes two thirds, while reserving
         // nothing pays the list's doubling copies instead.
         int count  = r.ReadArrayHeader();
+        walked     = count;
         var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         long ms    = 0;
         long    cnt = 0;
@@ -726,10 +904,93 @@ internal static class MetricReader
         return pts;
     }
 
-    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields. Only the window's are stored.</summary>
-    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, double share)
+    /// <summary>
+    /// <see cref="ReadPointsV3"/>'s walk with nothing built (#125): the same reads, the same checks
+    /// on every field and bucket array — so a series a decode would fail on fails here too — and the
+    /// same rule for which bucket arrays a decode of the window's points would BUILD: one per full
+    /// point in the window, and one more when a point in the window inherits the state of a full
+    /// point outside it (the decode's pending array). The rewrite plans its chunks by what this adds up.
+    /// </summary>
+    private static void StatPointsV3(ref MessagePackReader r, in ReadWindow window, ref PointStats stats)
+    {
+        int  count      = r.ReadArrayHeader();
+        long ms         = 0;
+        int  stateLen   = -1;      // the state's bucket array length; -1: the state has none
+        bool stateBuilt = false;   // whether a decode has built the state's array already
+        stats.Walked = count;
+        for (int i = 0; i < count; i++)
+        {
+            int n = r.ReadArrayHeader(); // 2 = slim (state unchanged), 5 = full
+            ms = i == 0 ? r.ReadInt64() : ms + r.ReadInt64();
+            long ts   = ms * 1_000_000;
+            bool keep = window.Keeps(ts);
+
+            r.ReadDouble();
+            if (n >= 5)
+            {
+                r.ReadInt64();
+                r.ReadDouble();
+                stateBuilt = false;
+                if (r.TryReadNil()) stateLen = -1;
+                else
+                {
+                    stateLen = WalkBuckets(ref r);
+                    if (keep && window.Buckets) { stats.BucketBytes += 24 + 8L * stateLen; stateBuilt = true; }
+                }
+            }
+            if (!keep) continue;
+
+            if (stateLen >= 0 && !stateBuilt && window.Buckets)
+            {
+                stats.BucketBytes += 24 + 8L * stateLen;
+                stateBuilt = true;
+            }
+            stats.Kept++;
+            if (ts < stats.MinKept) stats.MinKept = ts;
+            if (ts > stats.MaxKept) stats.MaxKept = ts;
+        }
+    }
+
+    /// <summary><see cref="ReadPointsV2"/>'s walk with nothing built: every kept point with buckets builds its own array.</summary>
+    private static void StatPointsV2(ref MessagePackReader r, in ReadWindow window, ref PointStats stats)
     {
         int count = r.ReadArrayHeader();
+        stats.Walked = count;
+        for (int i = 0; i < count; i++)
+        {
+            int n = r.ReadArrayHeader();
+            long ts = r.ReadInt64();
+            r.ReadDouble();
+            r.ReadInt64();
+            r.ReadDouble();
+            bool keep = window.Keeps(ts);
+            if (n >= 5 && !r.TryReadNil())
+            {
+                int bn = WalkBuckets(ref r);
+                if (keep && window.Buckets) stats.BucketBytes += 24 + 8L * bn;
+            }
+            if (!keep) continue;
+            stats.Kept++;
+            if (ts < stats.MinKept) stats.MinKept = ts;
+            if (ts > stats.MaxKept) stats.MaxKept = ts;
+        }
+    }
+
+    /// <summary>A bucket array walked as <see cref="SkipBuckets"/> walks it; its length.</summary>
+    private static int WalkBuckets(ref MessagePackReader r)
+    {
+        int bn = r.ReadArrayHeader();
+        FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Histogram buckets", "the series block");
+        for (int j = 0; j < bn; j++) r.ReadInt64();
+        return bn;
+    }
+
+    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields. Only the window's are stored.</summary>
+    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, double share, out int walked)
+    {
+        int count = r.ReadArrayHeader();
+        walked    = count;
         var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         for (int i = 0; i < count; i++)
         {
