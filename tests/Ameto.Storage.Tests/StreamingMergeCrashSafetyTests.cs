@@ -420,6 +420,9 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
 
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);
         Assert.Single(_engine.ListSegments());                            // 10: the sources kept out of merges
+        // The pin went before the delete failed, so the failure does not say the span is kept out.
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("kept out of merges", StringComparison.Ordinal));
+        Assert.Contains(_log.Entries, e => e.Message.Contains("the next sweep tries it again", StringComparison.Ordinal));
         _engine._deleteMergeManifest = delete;
 
         await _engine.RunColdMaintenancePassAsync(CancellationToken.None);

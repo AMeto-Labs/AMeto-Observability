@@ -3923,9 +3923,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             try { RecoverInterruptedMerge(manifest); }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex,
-                    "Merge recovery failed for {Manifest}; the segments in its span are kept out of merges until a " +
-                    "sweep finishes it", manifest);
+                // Said by whether the pin still holds: a throw after the verdict let it go (the delete
+                // of a manifest whose output never landed, a torn verdict's move, a commit's unlinks)
+                // keeps nothing out of merges.
+                if (_undecidedMergeOutputs.ContainsKey(manifest[..^".mergemanifest".Length]))
+                    _logger.LogWarning(ex,
+                        "Merge recovery failed for {Manifest}; the segments in its span are kept out of merges until a " +
+                        "sweep finishes it", manifest);
+                else
+                    _logger.LogWarning(ex, "Merge recovery failed for {Manifest}; the next sweep tries it again", manifest);
             }
         }
     }
