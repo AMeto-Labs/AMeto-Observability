@@ -150,8 +150,9 @@ jobs:
   # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
   # madvise(MADV_DONTNEED) on Linux — see the second step), and the span bloom under invariant
   # globalization, the Docker image's mode (the third step), and the WALs' durable upgrade rename and
-  # the span WAL's relocation record (the fourth). The whole suite already runs above; this job
-  # exists for the code that only does anything on Linux, or only in production's mode.
+  # the span WAL's relocation record (the fourth), and log-merge recovery (the fifth). The whole
+  # suite already runs above; this job exists for the code that only does anything on Linux, or only
+  # in production's mode, or whose tests were written on Windows' share modes.
   #
   # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
   # to read — and the skip guard above explains why that is invisible: an early return is reported
@@ -280,6 +281,36 @@ jobs:
                    SpanWalV3Tests.The_open_that_finishes_a_relocation_forces_it_to_disk; do
             if ! grep -q "Passed Ameto.Storage.Tests.$t" wal-output.txt; then
               echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # LOG-MERGE RECOVERY, ON LINUX. The recovery sweep's verdicts and the pin that keeps a waiting
+      # merge's sources out of new merges (#98, #120, #129) are logic that does not depend on the
+      # platform, but the roads to them were opened, in their first tests, by Windows share modes
+      # (a holder that lets nothing read, move or delete a file), so production's platform ran none
+      # of them. The engine's seams (_readMergeManifest, _deleteMergeManifest, _proveMergeOutput,
+      # _deleteSegmentFile) stage those refusals on every platform; the facts that still need a real
+      # holder are [WindowsFact] and reported skipped here. Same guard as above: each named fact must
+      # appear as Passed.
+      - name: Test log-merge recovery (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~StreamingMergeCrashSafetyTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee merge-output.txt
+
+          for t in APassThatCannotReadTheManifest_KeepsTheWaitingOutputsSourcesOutOfMerges \
+                   AManifestTheStartCannotRead_KeepsTheSourcesTheScanRegisteredOutOfMerges \
+                   ATornWaitingOutput_DoesNotReportItsMergedSourcesAsLost \
+                   ANewerFormatWaitingOutputWhoseRollbackFails_KeepsItsSourcesOutOfMerges \
+                   AReplicaSourceTheWaitKeptInService_IsTakenOutByTheCommit \
+                   AReplicaPushedAgainWhileItsUnlinkIsParked_IsNotMergedASecondTime \
+                   ADifferentSegmentPushedUnderAMergedReplicasKey_StaysInService \
+                   AWaitingOutputWhoseSourcesAreGone_LeavesTheStoreDegradedUntilItIsCommitted; do
+            if ! grep -q "Passed Ameto.Storage.Tests.StreamingMergeCrashSafetyTests.$t" merge-output.txt; then
+              echo "::error::StreamingMergeCrashSafetyTests.$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1
             fi
           done
