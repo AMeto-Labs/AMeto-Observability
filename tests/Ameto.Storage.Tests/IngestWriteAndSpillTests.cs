@@ -375,6 +375,58 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The swap that ends a spill is asked for once, by the flush that frees a slot, and a swap lock
+    /// held at that instant used to drop the request. Here the swap that opens the spill is still in
+    /// its floor check, holding the lock, when tier A's flush frees the only slot. While spilling
+    /// every write succeeds, so no writer asks again, and the engine went on spilling beside an idle
+    /// slot (reproduced in review: still spilling 12 s later). The request is asked again when the
+    /// lock is released. The writer's re-check is lengthened so that no re-poll of its own can stand
+    /// in for the request.
+    /// </summary>
+    [Fact]
+    public async Task A_slot_freed_while_the_swap_lock_is_held_still_ends_the_spill()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        using var inFloorCheck    = new ManualResetEventSlim(false);
+        using var leaveFloorCheck = new ManualResetEventSlim(false);
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            engine._roomRecheckMs = (int)HangGuard.TotalMilliseconds;
+            // The swap that opens the spill parks in its floor check, holding the swap lock.
+            engine._spillFreeDiskForTest = () =>
+            {
+                inFloorCheck.Set();
+                leaveFloorCheck.Wait(HangGuard);
+                return long.MaxValue;
+            };
+            using var b = Batch(engine, TierEvents, TierEvents + 100);
+            var writing = engine.WriteBatchAsync(b, HangGuard).AsTask();
+            Assert.True(inFloorCheck.Wait(HangGuard), "tier B's swap never reached the spill's floor check");
+
+            // A's flush frees the only slot, and the swap it asks for meets the held lock.
+            gate.Set();
+            WaitFor(() => engine.HeavyPhasesInFlight == 0 && engine.InFlightFlushTasks().Count(t => !t.IsCompleted) == 1,
+                    "A's flush to end, and the swap it asked for to find the lock held");
+
+            leaveFloorCheck.Set();
+            Assert.Equal(new LogBatchWriteResult(TierEvents + 100, 0, 0), await writing.WaitAsync(HangGuard));
+            WaitFor(() => !engine.IsSpilling, "the spill to end, the only slot being free", ShortGuard);
+        }
+        finally
+        {
+            gate.Set();
+            leaveFloorCheck.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A WAL that refuses an append ──────────────────────────────────────────
 
     /// <summary>
@@ -473,19 +525,27 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
-    /// <summary>A batch waiting for room goes on the moment a slot frees: it is woken, not left to time out.</summary>
+    /// <summary>
+    /// A batch waiting for room goes on the moment a slot frees: the freed slot asks for the swap,
+    /// and the swap wakes the writer. Its own re-check is lengthened past the test's patience, so
+    /// that a lost request (the slot release's) or a lost wake-up (the swap's) fails the test
+    /// instead of being covered by a re-poll; and the slot is freed only once tier B has refused
+    /// the writer — with tier A merely waiting for its ordinary swap, the slot was never contended.
+    /// </summary>
     [Fact]
     public async Task A_batch_waiting_for_room_goes_on_as_soon_as_a_slot_frees()
     {
         string dir    = NewDir();
         var    engine = OneSlotEngine(Options(dir, spill: false));
         var    gate   = HoldFirstFlush(engine);
+        engine._roomRecheckMs = (int)HangGuard.TotalMilliseconds;
         try
         {
             using var batch = Batch(engine, 0, 2 * TierEvents + 10);
             var writing = engine.WriteBatchAsync(batch, HangGuard).AsTask();
 
-            WaitFor(() => engine.IngestRoomWaits > 0 && engine.LiveHotTier.Count == TierEvents, "the batch to fill both tiers and wait");
+            WaitFor(() => engine.HeavyPhasesInFlight == 1 && engine.LiveHotTier.Count == TierEvents && engine.LiveHotTierRefused,
+                    "tier A to be held in its flush and tier B to refuse the writer");
             Assert.False(writing.IsCompleted);
 
             gate.Set();

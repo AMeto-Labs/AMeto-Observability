@@ -478,7 +478,7 @@ public sealed partial class StorageEngine
                 counted = true;
                 lock (_frozenLock) _frozenHot.Add((tier, file.SegId));
             }
-            finally { _flushLock.Release(); }
+            finally { ReleaseFlushLock(); }
 
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             List<SegmentInfo> written;

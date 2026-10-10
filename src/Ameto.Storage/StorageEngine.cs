@@ -149,7 +149,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         public readonly ulong WalSegId = walSegId;
     }
     // Serialises only the fast hot-tier/WAL *swap* — NOT the heavy cold-segment write.
-    // WaitAsync(0) drops a redundant trigger: whoever holds it swaps the whole tier.
+    // WaitAsync(0) drops a trigger that finds it held; a write's trigger is asked again when the
+    // holder releases it (ReleaseFlushLock), since the holder may be a merge or a despill, or a
+    // swap that has already made its decision.
     private readonly SemaphoreSlim                        _flushLock  = new(1, 1);
     // Bounds how many cold-segment builds (index + compress + write) run concurrently.
     // The swap hands off to this so multiple segments persist in parallel on idle cores
@@ -259,6 +261,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>Test hook: the live hot tier.</summary>
     internal HotTierSegment LiveHotTier => _write.Hot;
+
+    /// <summary>Test hook: the live tier has refused a write — a writer is waiting for the swap (or the spill) it asked for.</summary>
+    internal bool LiveHotTierRefused { get { var w = _write; return Volatile.Read(ref w.HotRefused); } }
 
     /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
     internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
@@ -2250,13 +2255,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Fire-and-forget a parallel flush, tracked so shutdown can await it.</summary>
+    /// <summary>
+    /// Fire-and-forget a parallel flush, tracked so shutdown can await it — the swap a write asks
+    /// for: it swaps only while its reason still holds (<see cref="SwapWanted"/>), and a request
+    /// that finds the swap lock held is asked again when the lock is released
+    /// (<see cref="ReleaseFlushLock"/>).
+    /// </summary>
     private void ScheduleFlush()
     {
         // After shutdown shut the write path there is nothing a new flush may swap.
         if (Volatile.Read(ref _writesClosed) != 0) return;
 
-        var t = Task.Run(() => TryFlushAsync());
+        var t = Task.Run(() => TryFlushAsync(onlyIfStillWanted: true));
         _inFlightFlushes[t] = 0;
         _ = t.ContinueWith(
             static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
@@ -2270,7 +2280,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// both until this <see cref="Environment.TickCount64"/> deadline — dropping out there left
     /// the live tier unflushed whenever a racing flush held the lock.
     /// </param>
-    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0)
+    /// <param name="onlyIfStillWanted">
+    /// True for the swap a write asked for (<see cref="ScheduleFlush"/>): it swaps only while the
+    /// reason it was asked for still holds, read under the lock (<see cref="SwapWanted"/>). False —
+    /// the age loop, <see cref="FlushHotTierAsync"/>, the final flush — swaps any non-empty tier.
+    /// </param>
+    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0, bool onlyIfStillWanted = false)
     {
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
         //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
@@ -2284,10 +2299,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         bool finalFlush = waitDeadline != 0;
         if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return; // shutdown owns the tiers now
 
+        // Said BEFORE trying the lock, so a holder that is releasing it sees the request and asks
+        // again (ReleaseFlushLock): dropping it was safe only for a writer that re-checks, and the
+        // swap that ends a spill — asked for once, by the flush that freed a slot — was lost to
+        // whichever swap, merge or despill held the lock at that instant, leaving the engine
+        // spilling beside an idle slot until the spill file filled or MaxAge came round.
+        if (onlyIfStillWanted) Volatile.Write(ref _swapRequested, 1);
         if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
-            return; // a swap is already in progress
+            return; // a swap is already in progress — and its release asks again for this one
         try
         {
+            // Every request made before this line is answered by the state read below.
+            Volatile.Write(ref _swapRequested, 0);
+
             // Again under the lock: shutdown takes this lock after closing, so a flush that got
             // here first either sees the close or swaps before shutdown counts what is running.
             if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
@@ -2295,6 +2319,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             _beforeSwap?.Invoke();
 
             var oldState = _write;
+
+            // A write's request is answered by the swap it asked for or by one before it, and a
+            // request answered already is stale: acted on, it swapped the FRESH tier — a segment
+            // of a few events, for nothing, whenever a second slot was free.
+            if (onlyIfStillWanted && !SwapWanted(oldState)) return;
+
             if (oldState.Hot.Count == 0)
             {
                 // Nothing to freeze. A spill is entered only past a tier that refused a write, so
@@ -2381,7 +2411,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 }
             }
         }
-        finally { _flushLock.Release(); }
+        finally { ReleaseFlushLock(); }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
 
@@ -2435,6 +2465,38 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             }
         }
     }
+
+    /// <summary>
+    /// 1 while a swap a write asked for (<see cref="ScheduleFlush"/>) may be waiting on
+    /// <see cref="_flushLock"/>'s holder: set by the request before it tries the lock, cleared by
+    /// the swap that takes the lock, and turned into a fresh request by
+    /// <see cref="ReleaseFlushLock"/> when it is still set there.
+    /// </summary>
+    private int _swapRequested;
+
+    /// <summary>
+    /// Releases <see cref="_flushLock"/> and, if a write's request for a swap found it held in the
+    /// meantime, asks again — so that request is answered by the next holder, not dropped. Every
+    /// holder but shutdown's (which keeps the lock) releases through here: the swap, a merge
+    /// reserving its id, a despill registering its tier. Never throws: it runs in finally blocks
+    /// whose callers own a flush slot or a heavy phase.
+    /// </summary>
+    private void ReleaseFlushLock()
+    {
+        _flushLock.Release();
+        if (Interlocked.Exchange(ref _swapRequested, 0) == 0) return;
+        try { ScheduleFlush(); }
+        catch (Exception) { Volatile.Write(ref _swapRequested, 1); /* the next release asks again */ }
+    }
+
+    /// <summary>
+    /// Whether the swap a write asked for still has its reason: a spill is installed (its block is
+    /// full, or a slot has come free to end it), the tier has refused a write (full, wedged on a
+    /// chunk, its WAL faulted) or has reached its limit. What every <see cref="ScheduleFlush"/>
+    /// caller asks from; read under <see cref="_flushLock"/>.
+    /// </summary>
+    private static bool SwapWanted(WriteState s) =>
+        s.Spill is not null || Volatile.Read(ref s.HotRefused) || s.Hot.IsFull;
 
     /// <summary>Ends one counted heavy phase and wakes shutdown if it was the last.</summary>
     private void EndHeavyPhase()
@@ -3315,7 +3377,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             throw;
         }
         try { reserved = AllocateSegmentId(); }
-        finally { _flushLock.Release(); }
+        finally { ReleaseFlushLock(); }
 
         var  segId        = new SegmentId(reserved);
         long expectEvents = 0, minTs = long.MaxValue, maxTs = long.MinValue;

@@ -64,8 +64,12 @@ public sealed partial class StorageEngine
     /// </summary>
     private const int WriteRunEvents = 256;
 
-    /// <summary>How long a writer waiting for room waits on the signal before it writes again.</summary>
-    private const int RoomRecheckMs = 100;
+    /// <summary>
+    /// How long a writer waiting for room waits on the signal before it writes again — the safety
+    /// net under the wake-ups (<see cref="SignalRoom"/>, and the swap requests that lead to them).
+    /// Internal so a test can lengthen it until only a real wake-up gets a writer going.
+    /// </summary>
+    internal int _roomRecheckMs = 100;
 
     /// <summary>
     /// Writes one event — the single-event form of <see cref="WriteBatchAsync"/>, for callers with
@@ -135,11 +139,10 @@ public sealed partial class StorageEngine
             try
             {
                 // In slices: a slice that ends without a signal goes round and writes again, and the
-                // write that finds no room asks for the swap again. A request for a swap can be
-                // dropped — ScheduleFlush gives way to a swap lock already held, and the holder may be
-                // doing something else with it (a despill registering) — and without the retry a
-                // writer would sit out its whole wait on a request nobody acted on.
-                await room.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(left, RoomRecheckMs)), ct).ConfigureAwait(false);
+                // write that finds no room asks for the swap again. A request is no longer dropped
+                // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
+                // the wake-ups, not what they rest on.
+                await room.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(left, _roomRecheckMs)), ct).ConfigureAwait(false);
             }
             catch (TimeoutException) { /* write again */ }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
@@ -281,7 +284,7 @@ public sealed partial class StorageEngine
     ///
     /// <para>Never throws. It runs after a state change has been made, and a swap's caller takes a
     /// throw for "nothing was swapped" (see <see cref="InstallSwap"/>). A wake-up lost to an
-    /// out-of-memory costs a waiting writer one <see cref="RoomRecheckMs"/> slice, no more: it then
+    /// out-of-memory costs a waiting writer one <see cref="_roomRecheckMs"/> slice, no more: it then
     /// writes again whatever the signal did.</para>
     /// </summary>
     /// <param name="next">The signal to install in its place, allocated by a caller that cannot
