@@ -255,7 +255,11 @@ public static class OtlpEndpointMapper
                     }
                     // A malformed tail: the prefix decoded before it is written below and the batch
                     // answered 400, which OTLP defines as not retryable — as it always was.
-                    catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) { malformed = true; }
+                    catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                    {
+                        malformed = true;
+                        batch?.MarkMalformed();
+                    }
                     // The batch holds its own copy of everything it keeps: the body and the inflate
                     // slot go back before the write, which may wait for room.
                     finally { IngestBufferPool.Return(body); slot?.Exit(); }

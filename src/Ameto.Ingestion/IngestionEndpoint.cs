@@ -71,9 +71,10 @@ public interface IOtlpLogSink
 ///          throws (see HandleAsync 1b). Kestrel fails that read itself.
 ///   413 Payload Too Large, no body, above <see cref="IngestionOptions.MaxBatchBytes"/>
 ///   503 Service Unavailable, Retry-After { "ingested": 0, "dropped": M }
-///          The store had no room for any of the batch within
-///          <see cref="IngestionOptions.BackPressureWait"/>, or is shutting down. Nothing was
-///          written, so a retry duplicates nothing.
+///          The store had no room for any of the client's events within
+///          <see cref="IngestionOptions.BackPressureWait"/>, or is shutting down. None of them
+///          was written, so a retry duplicates none (a drop marker standing in for an event over
+///          the size limit may have been, and the retry writes it again).
 ///   500 A fault in the server underneath (intern pool, logger). It leaves the handler and
 ///          hosting answers it; see IsMalformedPayload.
 /// </summary>
@@ -141,10 +142,11 @@ public sealed class IngestionEndpoint
     /// <summary>Events written into the store since start, drop markers included.</summary>
     public long AcceptedTotal => Interlocked.Read(ref _acceptedTotal);
 
-    /// <summary>Events refused at the door for a properties payload over the per-event limit.</summary>
+    /// <summary>
+    /// Events refused at the door for a properties payload over the per-event limit — counted by
+    /// the answer that ends their request, so a batch answered 503 is counted by its retry, once.
+    /// </summary>
     public long DroppedOversized => Interlocked.Read(ref _droppedOversized);
-
-    internal void CountOversizedDrop() => Interlocked.Increment(ref _droppedOversized);
 
     // ── Commit ────────────────────────────────────────────────────────────────
 
@@ -156,7 +158,7 @@ public sealed class IngestionEndpoint
     {
         var staged = batch.Staged;
         if (staged.Count == 0)
-            return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);
+            return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
 
         var r = await _storage.WriteBatchAsync(staged, _backPressureWait, ct).ConfigureAwait(false);
         Interlocked.Add(ref _acceptedTotal, r.Written);
@@ -174,8 +176,21 @@ public sealed class IngestionEndpoint
             _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
                 r.NotWritten, staged.Count, _backPressureWait);
 
-        // Nothing written for want of room: the caller answers "retry later", which duplicates nothing.
-        bool busy = r.Written == 0 && r.NotWritten > 0;
+        // None of the CLIENT's events written for want of room: the caller answers "retry later",
+        // which duplicates none of them. Asked of `ingested`, not of r.Written: a batch whose first
+        // event was refused at the door had its drop marker written and then found no room, and
+        // r.Written == 1 answered that 200 with every one of the client's records dropped, a
+        // partial success no client retries. A marker written here is written again by the retry
+        // — a second breadcrumb for the same refusal, against the client's records lost.
+        bool busy = ingested == 0 && r.NotWritten > 0;
+
+        // Events refused at the door are COUNTED by the answer that ends the request: a 503 is
+        // staged again by its retry, and one oversized event in a batch retried each second for
+        // three minutes read as ~180 drops. A 400 (malformed) is final whatever the store did.
+        // (Their Warning stays where it is, logged as each attempt is decoded: a log call that runs
+        // out of memory there is the server's failure, answered 503 before anything is written —
+        // #126's F3 — where one after the write would make a written batch a 500.)
+        if (!busy || batch.Malformed) Interlocked.Add(ref _droppedOversized, batch.DroppedAtDoor);
         return new LogIngestResult(ingested, dropped, busy);
     }
 
@@ -290,7 +305,8 @@ public sealed class IngestionEndpoint
             // OverflowException, and went out as 500.
             catch (Exception ex) when (IsMalformedPayload(ex, progress.InSink))
             {
-                malformed = ex;
+                malformed       = ex;
+                batch.MarkMalformed();   // answered 400 below, whatever the store does
             }
 
             // The body is decoded into the batch: give it back before the write, which may wait.
@@ -427,12 +443,12 @@ public sealed class IngestionEndpoint
             // Cold path, one per dropped event: the strings are worth their cost. The log line
             // is the one that names the producer, as TryIngest and TryIngestClef do. The service
             // comes from the span when the caller passed one, else from the pool: a parser that
-            // interned the block's service.name once may hand over only the index.
+            // interned the block's service.name once may hand over only the index. The drop is
+            // COUNTED when the batch is answered (CommitAsync), once, not per attempt.
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
                             : serviceIdx >= 0      ? _pool.Get(serviceIdx)
                             : string.Empty;
-            CountOversizedDrop();
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 msgpackProps.Length, _maxEventPayloadBytes, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120));
@@ -472,11 +488,11 @@ public sealed class IngestionEndpoint
         if (msgpackProps.Length > _maxEventPayloadBytes)
         {
             // Cold path: the strings here are worth their cost — this is one log line and
-            // one marker event per dropped event, not per event.
+            // one marker event per dropped event, not per event. The drop is COUNTED when the
+            // batch is answered (CommitAsync), once, not per attempt.
             string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
 
-            CountOversizedDrop();
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 msgpackProps.Length, _maxEventPayloadBytes, svcStr ?? "(none)", Truncate(tmplStr, 120));

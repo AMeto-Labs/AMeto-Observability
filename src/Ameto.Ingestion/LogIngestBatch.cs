@@ -34,6 +34,16 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>Events refused at the door (over the per-event size limit); a marker stands in for each.</summary>
     public int DroppedAtDoor { get; private set; }
 
+    /// <summary>
+    /// The body this batch was decoded from turned out malformed part way: the request is answered
+    /// 400 (INVALID_ARGUMENT) whatever the store did with the prefix — an answer the client does not
+    /// retry, so its refusals are final. See <see cref="MarkMalformed"/>.
+    /// </summary>
+    public bool Malformed { get; private set; }
+
+    /// <summary>Said by the receiver that caught the decode fault, before it commits the prefix.</summary>
+    public void MarkMalformed() => Malformed = true;
+
     /// <summary>Client events staged so far, drop markers not counted.</summary>
     public int StagedEvents => _staged.Count - MarkerCount;
 
@@ -131,7 +141,9 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 /// <param name="Ingested">The client's events now in the store.</param>
 /// <param name="Dropped">The client's events that are not: refused at the door, or given up on for lack of room.</param>
 /// <param name="Busy">
-/// Nothing was written, for lack of room or because the store is shutting down: the request is
-/// answered "retry later" (503, gRPC UNAVAILABLE), which duplicates nothing.
+/// None of the client's events was written, for lack of room or because the store is shutting
+/// down, and some were waiting: the request is answered "retry later" (503, gRPC UNAVAILABLE),
+/// which duplicates none of them. A drop marker — the server's own event standing in for one over
+/// the size limit — may have been written; the retry then writes it again.
 /// </param>
 public readonly record struct LogIngestResult(int Ingested, int Dropped, bool Busy);

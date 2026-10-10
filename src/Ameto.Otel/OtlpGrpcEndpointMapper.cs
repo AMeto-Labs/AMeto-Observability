@@ -356,7 +356,11 @@ public static class OtlpGrpcEndpointMapper
                    .LogWarning(ex, "OTLP/gRPC: failed to decode {Bytes} bytes", segment.Count);
                 // The records decoded before the fault are written, as they always were: OTLP
                 // defines INVALID_ARGUMENT as not retryable, so they would not come again.
-                if (batch is not null) await batch.CommitAsync(ctx.RequestAborted);
+                if (batch is not null)
+                {
+                    batch.MarkMalformed();
+                    await batch.CommitAsync(ctx.RequestAborted);
+                }
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
             }
