@@ -110,6 +110,18 @@ public sealed partial class StorageEngine
     /// <summary>The spill floor was hit and said so; cleared when a spill file opens again. Under <c>_flushLock</c>.</summary>
     private bool _spillFloorReported;
 
+    /// <summary>An open of a spill file failed and said so; cleared when one opens again. Under <c>_flushLock</c>.</summary>
+    private bool _spillOpenFailureReported;
+
+    /// <summary><see cref="Environment.TickCount64"/> before which no spill file is opened, after an open failed; 0 when none has. Under <c>_flushLock</c>.</summary>
+    private long _spillOpenRetryAt;
+
+    /// <summary>How long a failed spill open is left before the next attempt.</summary>
+    private static readonly TimeSpan SpillOpenRetryDelay = TimeSpan.FromSeconds(1);
+
+    /// <summary>Test hook: called as a spill file is about to be opened; throwing from it is an open that failed.</summary>
+    internal Action? _beforeSpillOpenForTest;
+
     /// <summary>A spill episode is running and has been announced. Under <c>_flushLock</c>.</summary>
     private bool _spillAnnounced;
 
@@ -218,6 +230,14 @@ public sealed partial class StorageEngine
         bool enter  = state.Spill is null && Volatile.Read(ref state.HotRefused);
         if (!rotate && !enter) return;
 
+        // An open that failed a moment ago is left alone until SpillOpenRetryDelay has passed: the
+        // writers wait meanwhile, as at the floor. Every swap attempt used to try again — and with
+        // the slots busy, each waiting writer re-asks ten times a second — so a volume the floor
+        // check cannot see (a UNC path, where DriveInfo throws; a mount folder or junction, where it
+        // measures the root volume) turned a full disk into hundreds of failing opens a second,
+        // each a Warning with its stack, each burning a block of segment ids.
+        if (_spillOpenRetryAt != 0 && Environment.TickCount64 < _spillOpenRetryAt) return;
+
         if (!HasSpillRoom(out long free))
         {
             if (!_spillFloorReported)
@@ -236,10 +256,19 @@ public sealed partial class StorageEngine
         try { next = OpenSpillTarget(); }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Could not open a spill file — ingest waits for a flush slot instead");
+            _spillOpenRetryAt = Environment.TickCount64 + (long)SpillOpenRetryDelay.TotalMilliseconds;
+            if (!_spillOpenFailureReported)
+            {
+                _spillOpenFailureReported = true;
+                _logger.LogWarning(ex,
+                    "Could not open a spill file — ingest waits for a flush slot instead. Another is tried at most every " +
+                    "{Delay}s, and a failure is reported again only once a spill file has opened", SpillOpenRetryDelay.TotalSeconds);
+            }
             return;
         }
-        _spillFloorReported = false;
+        _spillFloorReported       = false;
+        _spillOpenFailureReported = false;
+        _spillOpenRetryAt         = 0;
 
         // Same tier, same WAL: what is known about them comes along.
         var nextState = new WriteState(state.Hot, state.Wal, state.WalSegId, next) { HotRefused = true, WalFaulted = state.WalFaulted };
@@ -306,6 +335,7 @@ public sealed partial class StorageEngine
     {
         ulong segId = AllocateSegmentIdBlock();
         string path = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId}{SpillExtension}");
+        _beforeSpillOpenForTest?.Invoke();
         // spill: never grows past its capacity, the space HasSpillRoom counted, and is trimmed when closed.
         var    wal  = WriteAheadLog.Open(path, _options.NodeId, new SegmentId(segId), SpillFileCapacityBytes, spill: true);
         Interlocked.Increment(ref _spillFilesOpened);

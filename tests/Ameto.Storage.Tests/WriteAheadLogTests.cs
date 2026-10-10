@@ -248,6 +248,24 @@ public sealed class WriteAheadLogTests
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
 
+    /// <summary>
+    /// A log that cannot be opened — here its pre-size is more than any disk has — leaves nothing
+    /// behind. It used to leave a 0-byte file, its FileStream open until finalisation: on a full
+    /// disk, one per attempt to open a spill file or the next live WAL.
+    /// </summary>
+    [Fact]
+    public void A_log_that_cannot_be_opened_leaves_no_file_behind()
+    {
+        string path = NewWalPath();
+        try
+        {
+            Assert.ThrowsAny<Exception>(() => WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1L << 50));
+            Assert.False(File.Exists(path), "the log's file was left behind");
+            Assert.False(File.Exists(path + ".pool"), "the log's pool file was left behind");
+        }
+        finally { try { File.Delete(path); File.Delete(path + ".pool"); } catch { /* the assertion says what is wrong */ } }
+    }
+
     /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
     [Fact]
     public void A_rotted_inline_template_stops_replay_at_its_entry()

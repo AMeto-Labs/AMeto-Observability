@@ -68,6 +68,24 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// <summary>How long a test waits for something the fix makes happen at once, so a regression fails in seconds, not a minute.</summary>
     private static readonly TimeSpan ShortGuard = TimeSpan.FromSeconds(15);
 
+    /// <summary>Counts the lines a predicate picks.</summary>
+    private sealed class CountingLogger(Func<string, bool> counts) : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private int _count;
+
+        public int Count => Volatile.Read(ref _count);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (counts(formatter(state, exception))) Interlocked.Increment(ref _count);
+        }
+    }
+
     /// <summary>
     /// A logger that throws an <see cref="OutOfMemoryException"/> from the lines a predicate picks —
     /// the deterministic stand-in for a log call that runs out of memory at a chosen point.
@@ -345,6 +363,46 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
         finally
         {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A spill file that cannot be opened — a full volume the floor check cannot see (a UNC path, a
+    /// mount folder, a junction) — is reported once and tried again at most once a second. Every
+    /// swap attempt used to try again, each waiting writer asking ten times a second, and each
+    /// failure was a Warning with its stack.
+    /// </summary>
+    [Fact]
+    public async Task A_spill_open_that_fails_is_reported_once_and_tried_again_at_most_once_a_second()
+    {
+        string dir    = NewDir();
+        var    lines  = new CountingLogger(line => line.StartsWith("Could not open a spill file", StringComparison.Ordinal));
+        var    engine = OneSlotEngine(Options(dir), lines);
+        var    gate   = HoldFirstFlush(engine);
+        int    opens  = 0;
+        engine._beforeSpillOpenForTest = () =>
+        {
+            Interlocked.Increment(ref opens);
+            throw new IOException("test: there is not enough space on the disk");
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            engine._roomRecheckMs = 10;   // the waiting writer asks for the swap again a hundred times a second
+            using (var b = Batch(engine, TierEvents, TierEvents + 10))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 10), await engine.WriteBatchAsync(b, TimeSpan.FromMilliseconds(500)));
+
+            Assert.Equal(1, lines.Count);
+            Assert.True(Volatile.Read(ref opens) <= 2, $"{opens} attempts to open a spill file in half a second");
+        }
+        finally
+        {
+            engine._beforeSpillOpenForTest = null;
             gate.Set();
             await engine.DisposeAsync();
         }
