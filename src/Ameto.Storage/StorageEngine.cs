@@ -2548,7 +2548,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// (then both are released and the tier's WAL replays it on the next start). Tracked in
     /// <see cref="_inFlightFlushes"/> as well, so DisposeAsync awaits it after cancelling.
     /// </summary>
-    private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    /// <param name="onPublished">
+    /// Called with the segments once the retry has published the tier — how a despill's retry
+    /// counts its events and takes its block out of the spill queue. It used to do neither.
+    /// </param>
+    private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                    Action<List<SegmentInfo>>? onPublished = null)
     {
         var t = Task.Run(async () =>
         {
@@ -2576,6 +2581,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
                         PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
                         _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId);
+                        try { onPublished?.Invoke(written); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Bookkeeping after the retry of block {Block} failed", reservedSegId); }
                         return;
                     }
                     catch (OperationCanceledException) { throw; }

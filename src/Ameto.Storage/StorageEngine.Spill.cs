@@ -62,9 +62,30 @@ public sealed partial class StorageEngine
     /// <summary>A spill file waiting for its despill: its block and its WAL's path.</summary>
     private readonly record struct SpillFile(ulong SegId, string Path);
 
-    /// <summary>Spilled blocks waiting to be despilled, oldest block first. Under <see cref="_spillQueueLock"/>.</summary>
-    private readonly SortedDictionary<ulong, string> _spillQueue = new();
-    private readonly System.Threading.Lock           _spillQueueLock = new();
+    /// <summary>
+    /// A spilled block not yet in segments. It stays in <see cref="_spillQueue"/> — and in
+    /// <see cref="SpillFilesPending"/> — until its despill SETTLES it: published, found already
+    /// published, or left for a later release. A block used to leave the queue when the loop took
+    /// it, so the one being replayed, or waiting on a flush retry, read as nothing pending, and one
+    /// whose read failed was never tried again in this process.
+    /// </summary>
+    private sealed class QueuedSpill(string path)
+    {
+        public readonly string Path = path;
+
+        /// <summary>Taken by the despill loop: being despilled, or with its flush retry. Under <see cref="_spillQueueLock"/>.</summary>
+        public bool InFlight;
+
+        /// <summary><see cref="Environment.TickCount64"/> before which a despill that failed is not tried again. Under <see cref="_spillQueueLock"/>.</summary>
+        public long NotBefore;
+    }
+
+    /// <summary>Spilled blocks not yet in segments, oldest block first. Under <see cref="_spillQueueLock"/>.</summary>
+    private readonly SortedDictionary<ulong, QueuedSpill> _spillQueue = new();
+    private readonly System.Threading.Lock                _spillQueueLock = new();
+
+    /// <summary>How long a despill that failed before its flush waits before it is tried again. Internal so a test can shorten it.</summary>
+    internal TimeSpan _despillRetryDelay = FlushRetryDelay;
 
     /// <summary>Wakes the despill loop: a block was queued, a slot came free, the spill ended.</summary>
     private readonly SemaphoreSlim _despillSignal = new(0, 1);
@@ -100,7 +121,11 @@ public sealed partial class StorageEngine
     /// <summary>Spill files opened since start.</summary>
     public long SpillFilesOpened => Interlocked.Read(ref _spillFilesOpened);
 
-    /// <summary>Spilled blocks closed and waiting for a flush slot — the backlog on disk.</summary>
+    /// <summary>
+    /// Spilled blocks closed and not yet in segments — waiting for a flush slot, being despilled,
+    /// or waiting to be tried again: the backlog on disk. Zero means every spilled event this run
+    /// knows of is in segments.
+    /// </summary>
     public int SpillFilesPending { get { lock (_spillQueueLock) return _spillQueue.Count; } }
 
     /// <summary>
@@ -321,8 +346,26 @@ public sealed partial class StorageEngine
 
     private void EnqueueSpill(SpillFile file)
     {
-        lock (_spillQueueLock) _spillQueue[file.SegId] = file.Path;
+        lock (_spillQueueLock) _spillQueue[file.SegId] = new QueuedSpill(file.Path);
         WakeDespill();
+    }
+
+    /// <summary>The block's despill is over — published, found already published, or not this release's to read.</summary>
+    private void SettleSpill(ulong segId)
+    {
+        lock (_spillQueueLock) _spillQueue.Remove(segId);
+    }
+
+    /// <summary>The block's despill failed before its flush: it stays queued, and is tried again after <see cref="_despillRetryDelay"/>.</summary>
+    private void RetrySpillLater(ulong segId)
+    {
+        lock (_spillQueueLock)
+        {
+            if (!_spillQueue.TryGetValue(segId, out var q)) return;
+            q.InFlight  = false;
+            q.NotBefore = Environment.TickCount64 + (long)_despillRetryDelay.TotalMilliseconds;
+        }
+        WakeDespill();   // the loop recomputes its wait from the new retry time
     }
 
     private void WakeDespill()
@@ -364,7 +407,7 @@ public sealed partial class StorageEngine
                 continue;
             }
             ReserveWalBlock(segId);
-            lock (_spillQueueLock) _spillQueue[segId] = file;
+            lock (_spillQueueLock) _spillQueue[segId] = new QueuedSpill(file);
             found++;
         }
         if (found > 0)
@@ -406,8 +449,8 @@ public sealed partial class StorageEngine
         while (!ct.IsCancellationRequested)
         {
             // The timeout is a safety net, not the cadence: every event that can make work possible
-            // wakes the signal.
-            try { await _despillSignal.WaitAsync(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false); }
+            // wakes the signal — save a failed despill's retry time, which the wait is cut to.
+            try { await _despillSignal.WaitAsync(DespillWaitTimeout(), ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
 
             while (!ct.IsCancellationRequested && Volatile.Read(ref _writesClosed) == 0)
@@ -425,27 +468,45 @@ public sealed partial class StorageEngine
                 SpillFile next = default;
                 lock (_spillQueueLock)
                 {
-                    foreach (var (segId, path) in _spillQueue)
+                    long now = Environment.TickCount64;
+                    foreach (var (segId, q) in _spillQueue)
                     {
-                        next = new SpillFile(segId, path);
+                        if (q.InFlight || q.NotBefore > now) continue;
+                        next = new SpillFile(segId, q.Path);
                         break;
                     }
                 }
                 if (next.Path is null) break;
 
                 if (!_flushSlots.Wait(0)) break;   // released by the despill, or by its retry
-                lock (_spillQueueLock) _spillQueue.Remove(next.SegId);
+                lock (_spillQueueLock)
+                    if (_spillQueue.TryGetValue(next.SegId, out var taken)) taken.InFlight = true;
 
                 try { await DespillAsync(next, ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
                 catch (Exception ex)
                 {
-                    // DespillAsync handles its own failures; this is the loop's own guard. The file
-                    // stays on disk and the next start finds it.
-                    _logger.LogError(ex, "Despill of {File} failed — left on disk for the next start", next.Path);
+                    // A despill that failed before its flush — the block could not be read (out of
+                    // memory materialising it, the file held by a scanner), or not be listed. It is
+                    // still queued (DespillAsync's finally) and tried again after a delay; it used to
+                    // be dropped from the queue, its acknowledged events unsearchable — and counted
+                    // nowhere — until the process restarted.
+                    _logger.LogError(ex, "Despill of {File} failed — tried again in {Delay}s; the file stays on disk meanwhile",
+                        next.Path, _despillRetryDelay.TotalSeconds);
                 }
             }
         }
+    }
+
+    /// <summary>How long the loop may sleep: until the earliest retry time of a failed despill, and never past the safety net.</summary>
+    private TimeSpan DespillWaitTimeout()
+    {
+        const long SafetyNetMs = 5000;
+        long now = Environment.TickCount64, soonest = long.MaxValue;
+        lock (_spillQueueLock)
+            foreach (var q in _spillQueue.Values)
+                if (!q.InFlight && q.NotBefore > now && q.NotBefore < soonest) soonest = q.NotBefore;
+        return TimeSpan.FromMilliseconds(soonest == long.MaxValue ? SafetyNetMs : Math.Clamp(soonest - now, 1, SafetyNetMs));
     }
 
     /// <summary>Test hook: the despills that have completed, including those that found nothing to write.</summary>
@@ -467,32 +528,43 @@ public sealed partial class StorageEngine
     {
         bool slotTransferred = false;
         bool counted         = false;
+        bool settled         = false;   // published, found published already, or not this release's to read
+        HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
         try
         {
             // Flushed in full by an earlier life, which stopped before the unlink.
             if (File.Exists(FlushMarkerPath(file.SegId)))
             {
                 DeleteSpillFiles(file);
+                settled = true;
                 return;
             }
 
             _beforeLoadSpillForTest?.Invoke(file.SegId);
             var tier = LoadSpill(file);
-            if (tier is null) return;
+            if (tier is null)
+            {
+                settled = true;
+                return;
+            }
+            unlisted = tier;
 
             // Counted and listed under the swap lock, as a swap counts its tier: shutdown takes this
-            // lock after closing the write path, and from then on the count may only fall.
+            // lock after closing the write path, and from then on the count may only fall. A
+            // shutdown that cancels this wait used to leave the tier — up to a tier's native memory —
+            // unfreed: it is still `unlisted`, and the finally frees it.
             await _flushLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                if (Volatile.Read(ref _writesClosed) != 0)
+                if (Volatile.Read(ref _writesClosed) != 0) return;   // never listed; the file is the next start's
+                lock (_frozenLock)
                 {
-                    tier.Dispose();   // never listed: nothing can be reading it. The file is the next start's.
-                    return;
+                    _frozenHot.EnsureCapacity(_frozenHot.Count + 1);   // what can fail, before the count
+                    Interlocked.Increment(ref _heavyPhases);
+                    counted = true;
+                    _frozenHot.Add((tier, file.SegId));
                 }
-                Interlocked.Increment(ref _heavyPhases);
-                counted = true;
-                lock (_frozenLock) _frozenHot.Add((tier, file.SegId));
+                unlisted = null;
             }
             finally { ReleaseFlushLock(); }
 
@@ -508,29 +580,43 @@ public sealed partial class StorageEngine
                 _logger.LogError(ex,
                     "Despill of {File} failed — its tier stays frozen and queryable; retrying in background every {Delay}s",
                     file.Path, FlushRetryDelay.TotalSeconds);
-                ScheduleFlushRetry(tier, file.Path, file.SegId);   // owns the slot and the count from here
+                // Owns the slot and the count from here; the block stays queued, in flight, until the
+                // retry publishes it — or shutdown leaves it for the next start.
+                ScheduleFlushRetry(tier, file.Path, file.SegId,
+                                   onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true));
                 slotTransferred = true;
                 return;
             }
             finally { _flushConcurrency.Release(); }
 
-            long events = 0;
-            foreach (var w in written) events += w.EventCount;
             PublishFlushedTier(written, tier, file.Path, file.SegId);
-            Interlocked.Add(ref _despilledEvents, events);
-            _logger.LogInformation("Despilled block {Block}: {Events} event(s) into {Segments} segment(s)",
-                file.SegId, events, written.Count);
+            DespillPublished(file.SegId, written, afterRetry: false);
+            settled = true;
         }
         finally
         {
+            unlisted?.Dispose();
             if (!slotTransferred)
             {
+                // Before the slot goes back, so the loop that takes it sees this block as not ready.
+                if (!settled) RetrySpillLater(file.SegId);
                 _flushSlots.Release();
                 if (counted) EndHeavyPhase();
                 OnFlushSlotReleased();
             }
             Interlocked.Increment(ref _despillsCompleted);
         }
+    }
+
+    /// <summary>A despilled block is in segments: counted, out of the queue, and said so.</summary>
+    private void DespillPublished(ulong segId, List<SegmentInfo> written, bool afterRetry)
+    {
+        long events = 0;
+        foreach (var w in written) events += w.EventCount;
+        Interlocked.Add(ref _despilledEvents, events);
+        SettleSpill(segId);
+        _logger.LogInformation("Despilled block {Block}: {Events} event(s) into {Segments} segment(s){Retried}",
+            segId, events, written.Count, afterRetry ? ", after a retry" : "");
     }
 
     /// <summary>

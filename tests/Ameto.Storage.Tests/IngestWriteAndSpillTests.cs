@@ -486,6 +486,86 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A despill whose read of the spilled block fails — out of memory materialising it, the file
+    /// held by a scanner — is tried again, and its block counts as pending meanwhile. The loop used
+    /// to take the block off the queue before reading it, so a failed read left the block in no
+    /// queue: its acknowledged events unsearchable, and counted nowhere, until the next start.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_read_fails_is_tried_again_and_stays_pending_meanwhile()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        engine._despillRetryDelay = TimeSpan.FromSeconds(1);
+        int reads = 0;
+        engine._beforeLoadSpillForTest = _ =>
+        {
+            if (Interlocked.Increment(ref reads) == 1) throw new OutOfMemoryException("test: no memory to materialise the block");
+        };
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling);
+
+            gate.Set();
+            WaitFor(() => Volatile.Read(ref reads) >= 1, "the first despill to fail its read");
+            Assert.Equal(1, engine.SpillFilesPending);   // still on the books while it waits to be tried again
+
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the block to be despilled on its second try", ShortGuard);
+            Assert.Equal(2, Volatile.Read(ref reads));
+
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the flushes to end");
+            await engine.FlushHotTierAsync();
+            Assert.Equal(Total, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A block being despilled is still pending: logsSpillFilesPending is what the rollback note
+    /// tells an operator to wait out, and it read 0 while the last block was still being replayed
+    /// and flushed, because the loop took the block off the queue before reading it.
+    /// </summary>
+    [Fact]
+    public async Task A_block_being_despilled_is_still_counted_as_pending()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        using var inDespill = new ManualResetEventSlim(false);
+        using var release   = new ManualResetEventSlim(false);
+        engine._beforeLoadSpillForTest = _ => { inDespill.Set(); release.Wait(HangGuard); };
+        const int Total = 2 * TierEvents + 1_000;
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+
+            gate.Set();
+            Assert.True(inDespill.Wait(HangGuard), "the despill never started");
+            Assert.Equal(1, engine.SpillFilesPending);
+
+            release.Set();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the block to be despilled");
+        }
+        finally
+        {
+            gate.Set();
+            release.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A write that throws ───────────────────────────────────────────────────
 
     /// <summary>
