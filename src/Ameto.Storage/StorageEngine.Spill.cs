@@ -444,8 +444,14 @@ public sealed partial class StorageEngine
     /// slot that comes free then goes to the swap, so new events are searchable again first and the
     /// backlog drains behind them.
     /// </summary>
-    private async Task RunDespillLoopAsync(CancellationToken ct)
+    private async Task RunDespillLoopAsync(Task? heldUntil, CancellationToken ct)
     {
+        if (heldUntil is not null)
+        {
+            try { await heldUntil.WaitAsync(ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+
         while (!ct.IsCancellationRequested)
         {
             // The timeout is a safety net, not the cadence: every event that can make work possible
@@ -508,6 +514,15 @@ public sealed partial class StorageEngine
                 if (!q.InFlight && q.NotBefore > now && q.NotBefore < soonest) soonest = q.NotBefore;
         return TimeSpan.FromMilliseconds(soonest == long.MaxValue ? SafetyNetMs : Math.Clamp(soonest - now, 1, SafetyNetMs));
     }
+
+    /// <summary>
+    /// Test seam: an engine constructed while this holds a task starts despilling only once that
+    /// task completes — how a test sets its hooks before the despill of a block an earlier run left,
+    /// which otherwise begins as soon as the engine exists. An <see cref="AsyncLocal{T}"/>, as
+    /// <see cref="HoldCatalogScanForTest"/> is, so it reaches only the engines the setting test
+    /// constructs. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Task?> HoldDespillForTest = new();
 
     /// <summary>Test hook: the despills that have completed, including those that found nothing to write.</summary>
     internal int DespillsCompletedForTest => Volatile.Read(ref _despillsCompleted);

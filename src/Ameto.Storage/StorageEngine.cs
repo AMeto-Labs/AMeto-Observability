@@ -943,8 +943,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         _walFlushLoop = RunWalFlushLoopAsync(_cts.Token);
         // Cold-tier maintenance: interrupted-merge recovery + small-segment merges
         _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
-        // Spilled blocks into segments, as flush slots come free
-        _despillLoop = RunDespillLoopAsync(_cts.Token);
+        // Spilled blocks into segments, as flush slots come free. Started OFF the constructor: the
+        // loop's first pass reads and registers a whole block (a tier's worth) before its first
+        // real await, and called inline it did that here, delaying the engine — and always before
+        // the indexing layer had wired IndexSinkFactory, so that block's segments were written
+        // without index sections. On the pool it usually starts after the wiring; the window is
+        // narrowed to the hosted services' start, not closed.
+        var despillHeld = HoldDespillForTest.Value;
+        _despillLoop = Task.Run(() => RunDespillLoopAsync(despillHeld, _cts.Token));
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
