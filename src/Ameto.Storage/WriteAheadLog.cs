@@ -381,7 +381,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 // spill rotates instead. An empty one takes any entry, or one larger than a whole
                 // file would be refused by every file in turn.
                 if (_spill && _writeOffset > 0) return false;
-                Grow();
+                Grow(_writeOffset + entrySize);
             }
 
             byte* dest = _ptr + FileHeaderSize + _writeOffset;
@@ -859,7 +859,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // ── Grow ─────────────────────────────────────────────────────────────────
 
-    private unsafe void Grow()
+    /// <param name="required">The capacity the entry being appended needs. The log doubles, or grows
+    /// to this if doubling is not enough: one doubling used to be assumed to be, and an entry larger
+    /// than twice the capacity — reachable in a spill log, as small as 1 MB, whose first entry is
+    /// taken whatever its size — was copied past the end of the mapping.</param>
+    private unsafe void Grow(long required)
     {
         // Release current mapping, extend file, re-map. Runs under _writeLock (called
         // from Append). If extension or re-map fails (disk full is the typical cause —
@@ -869,7 +873,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // for this first.
         long oldCapacity = _capacity;
         long oldFileSize = FileHeaderSize + oldCapacity;
-        long newCapacity = oldCapacity * 2;
+        long newCapacity = Math.Max(oldCapacity * 2, required);
         long newFileSize = FileHeaderSize + newCapacity;
 
         Unmap();

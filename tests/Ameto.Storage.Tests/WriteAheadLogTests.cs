@@ -266,6 +266,32 @@ public sealed class WriteAheadLogTests
         finally { try { File.Delete(path); File.Delete(path + ".pool"); } catch { /* the assertion says what is wrong */ } }
     }
 
+    /// <summary>
+    /// An entry larger than twice the log's capacity grows the log to fit it. Grow doubled once and
+    /// assumed that was enough, so such an entry was copied past the end of the mapping — reachable
+    /// in a spill log, which can be as small as 1 MB and takes its first entry whatever its size.
+    /// (Not run against the old code: it writes past the mapping, which takes the test host down.)
+    /// </summary>
+    [Fact]
+    public void An_entry_larger_than_twice_the_capacity_grows_the_log_to_fit()
+    {
+        string path    = NewWalPath();
+        byte[] payload = new byte[3 * 1024 * 1024];
+        Random.Shared.NextBytes(payload);
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024, spill: true))
+            {
+                Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", payload));
+                Assert.False(wal.Append(2_000, LogLevel.Information, 1, "t", payload));   // a spill log grows for its first entry only
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(payload, Assert.Single(entries).Payload);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
     /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
     [Fact]
     public void A_rotted_inline_template_stops_replay_at_its_entry()
