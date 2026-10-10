@@ -125,6 +125,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         /// not send the events after it to a block nobody can search yet.
         /// </summary>
         public bool HotRefused;
+
+        /// <summary>
+        /// Set, under the writer lock, once an append to <see cref="Wal"/> has failed. From then on
+        /// <see cref="Hot"/> takes no more events (and <see cref="HotRefused"/> is set with it): an
+        /// event written into the tier now would be acknowledged as durable while it is in memory
+        /// only. Cleared by replacement — the swap installs a state with a fresh WAL.
+        /// </summary>
+        public bool WalFaulted;
         /// <summary>
         /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will
         /// occupy once they are flushed. The WAL file is named from it, and startup uses
@@ -332,8 +340,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal int MergedAwaySegmentCap = 8 * MergeMaxSources;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
-    /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
-    private bool _walFaulted;
     /// <summary>EventWritten subscriber faults, for throttled logging (writer thread only).</summary>
     private long _hookFaults;
     private readonly CancellationTokenSource               _cts        = new();
@@ -400,6 +406,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal Action<SegmentInfo>? _beforeUnreadableSegmentWarned;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _write.WalSegId;
+    /// <summary>Test hook: the live tier's WAL, which a test disposes to make the next append fail.</summary>
+    internal WriteAheadLog? LiveWalForTest => _write.Wal;
     /// <summary>
     /// Test hook: scales the merged-file target. What determines how many files a bucket ends
     /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor

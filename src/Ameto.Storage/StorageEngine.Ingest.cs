@@ -172,6 +172,16 @@ public sealed partial class StorageEngine
         if (w.Spill is { } spill)
             return SpillLocked(spill, header, payload, template, exception);
 
+        // The live WAL refused an append (below): until a swap replaces it, the tier takes nothing
+        // more. An event written into it now would be acknowledged as durable and be in memory
+        // only. The writer waits like one that found the tier full, and asks for the swap again —
+        // so a request that a held swap lock dropped is made again on every re-check.
+        if (w.WalFaulted)
+        {
+            ScheduleFlush();
+            return WriteOutcome.NoRoom;
+        }
+
         // Assign time-sortable, monotonic event id.
         // Time component is derived from the event's own @t (TimestampUtcTicks), not
         // server ingest time, so sorting by Id matches the timestamp shown in the UI.
@@ -209,24 +219,25 @@ public sealed partial class StorageEngine
         {
             w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
                           h.ServiceNamePoolIndex, svcStr, h.TraceIdHi, h.TraceIdLo, h.SpanId);
-            _walFaulted = false;
         }
         catch (Exception ex)
         {
             // Disk full growing the WAL, a wedged mapping after a failed grow, a pool-file write
-            // error. The event is in the tier and the flush persists it regardless — but until the
-            // WAL rotates it is not crash-durable, which the acknowledgement promises. Counted,
-            // rotation forced, and said once per episode (the age loop keeps re-attempting the
-            // swap until the disk recovers).
+            // error. THIS event is in the tier, and its flush persists it, but it is not
+            // crash-durable until then: the one event per fault that its acknowledgement
+            // over-promises. No later one is: the state is marked, the tier refuses from the next
+            // write on (above), and the swap that replaces tier and WAL is asked for — and asked
+            // again by every writer that finds the tier refusing. It used to be asked for once per
+            // episode, a request a held swap lock or a busy slot could drop, and every write after
+            // it was answered 200 from memory alone until the tier filled or MaxAge came round.
+            // HotRefused is what lets a swap that finds no flush slot spill instead.
             Interlocked.Increment(ref _ingestWalAppendFailures);
-            if (!_walFaulted)
-            {
-                _walFaulted = true;
-                _logger.LogError(ex,
-                    "WAL append failed — events acknowledged until the WAL rotates are in memory only, " +
-                    "not crash-durable; rotation forced");
-                ScheduleFlush();
-            }
+            w.WalFaulted = true;
+            w.HotRefused = true;
+            _logger.LogError(ex,
+                "WAL append failed — the event is in the hot tier but not crash-durable until it is flushed; " +
+                "further writes wait for the WAL to be replaced");
+            ScheduleFlush();
         }
 
         NotifyEventWritten(in h, tmplStr);
@@ -374,7 +385,8 @@ public sealed partial class StorageEngine
 
     /// <summary>
     /// Events written to the live tier whose WAL append failed: acknowledged, persisted by their
-    /// flush, but not crash-durable until it. Non-zero means the WAL volume refused writes.
+    /// flush, but not crash-durable until it. Non-zero means the WAL volume refused writes. At most
+    /// one per WAL: after it, writes wait for the swap that replaces the WAL (or spill).
     /// </summary>
     public long IngestWalAppendFailures => Interlocked.Read(ref _ingestWalAppendFailures);
 }

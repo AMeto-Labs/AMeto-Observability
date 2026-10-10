@@ -195,7 +195,8 @@ public sealed partial class StorageEngine
         }
         _spillFloorReported = false;
 
-        var nextState = new WriteState(state.Hot, state.Wal, state.WalSegId, next) { HotRefused = true };
+        // Same tier, same WAL: what is known about them comes along.
+        var nextState = new WriteState(state.Hot, state.Wal, state.WalSegId, next) { HotRefused = true, WalFaulted = state.WalFaulted };
         InstallWriteState(nextState);
 
         if (enter && !_spillAnnounced)

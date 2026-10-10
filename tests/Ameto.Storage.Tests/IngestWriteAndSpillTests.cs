@@ -375,6 +375,70 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── A WAL that refuses an append ──────────────────────────────────────────
+
+    /// <summary>
+    /// An append to the live WAL fails: that event is in the tier, durable only once flushed. Every
+    /// later one used to be too — the swap that replaces the WAL was asked for once, the busy slot
+    /// dropped the request, and each write after it was answered as written from memory alone until
+    /// the tier filled or MaxAge came round. Now the faulted tier takes nothing more: with the only
+    /// slot busy the batch waits (spilling off) or spills (on), and the swap that frees the slot
+    /// gives the next tier a fresh WAL.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task After_a_wal_append_fails_no_later_event_is_acknowledged_from_memory_alone(bool spill)
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: spill));
+        var    gate   = HoldFirstFlush(engine);
+        try
+        {
+            // Tier A full and swapped, its flush holding the only slot; B is live.
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            engine.LiveWalForTest!.Dispose();   // B's next append throws
+
+            using (var b = Batch(engine, TierEvents, 10))
+            {
+                var r = await engine.WriteBatchAsync(b, spill ? HangGuard : TimeSpan.FromMilliseconds(300));
+                Assert.Equal(1, engine.IngestWalAppendFailures);   // the first event only: in the tier, not its WAL
+                Assert.Equal(1, engine.LiveHotTier.Count);
+                if (spill)
+                {
+                    Assert.Equal(new LogBatchWriteResult(10, 0, 0), r);
+                    Assert.Equal(9, engine.SpilledEvents);           // the rest went to a WAL of their own
+                }
+                else
+                    Assert.Equal(new LogBatchWriteResult(1, 0, 9), r);   // the rest waited, and were not written
+            }
+
+            gate.Set();
+            if (!spill)
+            {
+                using var rest = Batch(engine, TierEvents + 1, 9);
+                Assert.Equal(new LogBatchWriteResult(9, 0, 0), await engine.WriteBatchAsync(rest, HangGuard));
+            }
+            else
+                WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == 9,
+                        "the spill to end and its block to be despilled");
+
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "tier B's flush to give the only slot back");
+            await engine.FlushHotTierAsync();
+            var events = ReadAll(engine);
+            Assert.Equal(TierEvents + 10, events.Count);
+            foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── No room at all ────────────────────────────────────────────────────────
 
     /// <summary>
