@@ -167,8 +167,18 @@ public sealed partial class StorageEngine
         string? svcStr  = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
         try
         {
-            spill.Wal.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
-                             h.ServiceNamePoolIndex, svcStr, h.TraceIdHi, h.TraceIdLo, h.SpanId);
+            if (!spill.Wal.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
+                                  h.ServiceNamePoolIndex, svcStr, h.TraceIdHi, h.TraceIdLo, h.SpanId))
+            {
+                // The file is as full as the floor check counted it — large exceptions, which the
+                // admission does not weigh, fill it before a tier's worth of events. Closed here
+                // like a block the admission refused: the swap rotates it, and checks the floor
+                // before it opens the next. The admission counted this event; that only closes the
+                // block an event early.
+                spill.Full = true;
+                ScheduleFlush();
+                return WriteOutcome.NoRoom;
+            }
             _spillAppendFaulted = false;
         }
         catch (Exception ex)
@@ -279,21 +289,25 @@ public sealed partial class StorageEngine
             // is the same wait as the floor.
             return true;
         }
-        return free >= _options.HotTier.SpillMinFreeDiskBytes + SpillFileBudgetBytes;
+        return free >= _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes;
     }
 
-    /// <summary>What one spill file can come to: a tier's payload plus a header and trace context an event.</summary>
-    private long SpillFileBudgetBytes =>
-        _options.HotTier.MaxSizeBytes
-        + (long)HotTierSegment.EventCapacityFor(_options.HotTier.MaxSizeBytes) * 50;
+    /// <summary>
+    /// What one spill file is, and — since it never grows (see <see cref="WriteAheadLog.Open"/>) —
+    /// the most it can come to: a tier's payload plus a header and trace context an event, and at
+    /// least 1 MB. A block whose entries weigh more (large exceptions, long inline templates) is
+    /// closed when its file is full, and the next one is checked against the floor before it opens.
+    /// </summary>
+    internal long SpillFileCapacityBytes => Math.Max(1L << 20,
+        _options.HotTier.MaxSizeBytes + (long)HotTierSegment.EventCapacityFor(_options.HotTier.MaxSizeBytes) * 50);
 
     /// <summary>Opens the next spill target, reserving its level block as a WAL does.</summary>
     private SpillTarget OpenSpillTarget()
     {
         ulong segId = AllocateSegmentIdBlock();
         string path = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId}{SpillExtension}");
-        long   cap  = Math.Max(1L << 20, SpillFileBudgetBytes);
-        var    wal  = WriteAheadLog.Open(path, _options.NodeId, new SegmentId(segId), cap);
+        // spill: never grows past its capacity, the space HasSpillRoom counted, and is trimmed when closed.
+        var    wal  = WriteAheadLog.Open(path, _options.NodeId, new SegmentId(segId), SpillFileCapacityBytes, spill: true);
         Interlocked.Increment(ref _spillFilesOpened);
         long tier = _options.HotTier.MaxSizeBytes;
         return new SpillTarget(wal, segId, new HotTierAdmission(HotTierSegment.EventCapacityFor(tier), tier));

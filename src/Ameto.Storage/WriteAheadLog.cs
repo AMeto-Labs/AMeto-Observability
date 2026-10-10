@@ -186,14 +186,46 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // ── Construction ─────────────────────────────────────────────────────────
 
-    public static WriteAheadLog Open(string filePath, NodeId nodeId, SegmentId segmentId, long initialCapacity = 64 * 1024 * 1024)
+    /// <param name="spill">
+    /// A spill target's log (see <c>StorageEngine</c>, "Spill"). It never grows past
+    /// <paramref name="initialCapacity"/> — <see cref="Append"/> refuses an entry that does not
+    /// fit, and the spill rotates to a new file, which the spill's free-space floor is checked
+    /// against first; only an empty log takes an entry whatever its size — and when it is closed
+    /// the file is cut to what it holds. A growing spill file used to double past the space its
+    /// floor check had counted (a storm of large exceptions took one block from ~74 MB to over
+    /// 2 GB), and a closed one kept its whole pre-size on NTFS, which allocates it.
+    /// </param>
+    public static WriteAheadLog Open(string filePath, NodeId nodeId, SegmentId segmentId, long initialCapacity = 64 * 1024 * 1024,
+                                     bool spill = false)
     {
-        var wal = new WriteAheadLog(filePath);
-        wal.OpenOrCreate(nodeId, segmentId, initialCapacity);
+        bool fileExisted = File.Exists(filePath);
+        bool poolExisted = File.Exists(filePath + ".pool");
+        var  wal         = new WriteAheadLog(filePath, spill);
+        try
+        {
+            wal.OpenOrCreate(nodeId, segmentId, initialCapacity);
+        }
+        catch
+        {
+            // Nothing is left behind by a log that could not be opened: its handles closed, and the
+            // files it created removed. It used to leave a 0-byte file whose FileStream stayed open
+            // until finalisation — on a full disk, one per attempt to open one.
+            try { wal.Dispose(); } catch { /* the original exception is the one that matters */ }
+            if (!fileExisted) try { File.Delete(filePath); } catch { /* best-effort */ }
+            if (!poolExisted) try { File.Delete(filePath + ".pool"); } catch { /* best-effort */ }
+            throw;
+        }
         return wal;
     }
 
-    private WriteAheadLog(string filePath) => _filePath = filePath;
+    private WriteAheadLog(string filePath, bool spill)
+    {
+        _filePath = filePath;
+        _spill    = spill;
+    }
+
+    /// <summary>A spill target's log: fixed capacity, trimmed when closed (see <see cref="Open"/>).</summary>
+    private readonly bool _spill;
 
     private unsafe void OpenOrCreate(NodeId nodeId, SegmentId segmentId, long initialCapacity)
     {
@@ -294,7 +326,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// <param name="traceIdHi">The event's trace id, high half. With the other two all zero, no trace context is logged.</param>
     /// <param name="traceIdLo">The event's trace id, low half.</param>
     /// <param name="spanId">The event's span id.</param>
-    public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload,
+    /// <returns>True once the entry is in the log. False only for a spill target's log (see <see cref="Open"/>) that has no room left for it: nothing was written, and the spill rotates.</returns>
+    public unsafe bool Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload,
                               ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null,
                               ulong traceIdHi = 0, ulong traceIdLo = 0, ulong spanId = 0)
     {
@@ -343,7 +376,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 throw new IOException("WAL is unmapped after a failed grow — appends unavailable until rotation");
 
             if (_writeOffset + entrySize > _capacity)
+            {
+                // A spill target's log is as large as its floor check counted, and no larger: the
+                // spill rotates instead. An empty one takes any entry, or one larger than a whole
+                // file would be refused by every file in turn.
+                if (_spill && _writeOffset > 0) return false;
                 Grow();
+            }
 
             byte* dest = _ptr + FileHeaderSize + _writeOffset;
 
@@ -398,6 +437,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             fh.WriteOffset = FileHeaderSize + _writeOffset;
         }
+        return true;
     }
 
     /// <summary>
@@ -887,6 +927,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             if (_disposed) return;
             _disposed = true;
             Unmap(); // the view flushes dirty pages on dispose
+            // A spill file is cut to what it holds once nothing maps it (a mapped file cannot
+            // shrink on Windows). It closes long before its pre-size is used — a block closes at the
+            // tier's first refusal, ~9 MB of 600 B events in a ~74 MB file — and NTFS allocates the
+            // whole pre-size, so the closed files of one long spill held 2 to 8 times the disk their
+            // data needed, and reached the spill floor that much sooner. Recovery reads the length
+            // and clamps the header's write offset to it; nothing past the offset is lost.
+            if (_spill && _fileStream is not null)
+                try { _fileStream.SetLength(FileHeaderSize + _writeOffset); } catch { /* keeps its size; still valid */ }
             try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
             try { _fileStream?.Dispose(); } catch { }
             _fileStream = null;

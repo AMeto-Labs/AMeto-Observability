@@ -299,6 +299,98 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A spill file is never larger than the space its floor check counted: when its entries weigh
+    /// more than the tier's admission does — large exceptions, which it does not weigh — the file
+    /// fills first, and the spill rotates to a new one, checked against the floor before it opens.
+    /// It used to grow by doubling with no check on the way: a storm of large stack traces took one
+    /// block far past the space the floor had allowed for it.
+    /// </summary>
+    [Fact]
+    public async Task A_spill_file_rotates_rather_than_grow_past_the_space_its_floor_check_counted()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        long   cap    = engine.SpillFileCapacityBytes;
+        const int First = 2 * TierEvents, Heavy = 150;        // ~100 KB each: ~15 MB, against a ~9 MB file
+        var    trace  = new ExceptionInfo { Type = "System.InvalidOperationException", StackTrace = new string('x', 100_000) };
+        try
+        {
+            using (var tiers = Batch(engine, 0, First))
+                Assert.Equal(new LogBatchWriteResult(First, 0, 0), await engine.WriteBatchAsync(tiers, HangGuard));
+            using (var heavy = new LogWriteBatch())
+            {
+                int tmpl = engine.TemplatePool.Intern("event {n}");
+                for (int i = First; i < First + Heavy; i++)
+                    heavy.Add(new LogEventHeader
+                    {
+                        TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Error,
+                        MessageTemplatePoolIndex = tmpl, ServiceNamePoolIndex = -1,
+                    }, Props(i), "event {n}", trace);
+                Assert.Equal(new LogBatchWriteResult(Heavy, 0, 0), await engine.WriteBatchAsync(heavy, HangGuard));
+            }
+
+            Assert.True(engine.SpillFilesOpened >= 2, $"{engine.SpillFilesOpened} spill file(s) for ~15 MB of entries in ~{cap >> 20} MB files");
+            foreach (var f in Directory.GetFiles(Path.Combine(dir, "wal"), "*" + StorageEngine.SpillExtension))
+                Assert.True(new FileInfo(f).Length <= 32 + cap, $"{Path.GetFileName(f)} grew to {new FileInfo(f).Length:N0} B past its {cap:N0} B");
+
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == Heavy,
+                    "the spill to end and its blocks to be despilled");
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the flushes to end");
+            await engine.FlushHotTierAsync();
+            var events = ReadAll(engine);
+            Assert.Equal(First + Heavy, events.Count);
+            Assert.Equal(trace.StackTrace, events[First + Heavy - 1].Exception?.StackTrace);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A closed spill file is cut to what it holds. It is pre-sized to a tier's worth and closed far
+    /// earlier — here at the admission's cap of small events, ~1 MB in a ~9 MB file — and NTFS
+    /// allocates the whole pre-size: the closed files of one long spill held several times the disk
+    /// their data needed, and reached the spill floor that much sooner.
+    /// </summary>
+    [Fact]
+    public async Task A_closed_spill_file_is_cut_to_what_it_holds()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        long   cap    = engine.SpillFileCapacityBytes;
+        const int Total = 3 * TierEvents + 100;               // A, B in tiers; one block closed; a second open
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            WaitFor(() => engine.SpillFilesPending == 1, "the first spill block to be closed and queued");
+
+            var lengths = Directory.GetFiles(Path.Combine(dir, "wal"), "*" + StorageEngine.SpillExtension)
+                                   .Select(f => new FileInfo(f).Length).Order().ToArray();
+            Assert.Equal(2, lengths.Length);
+            Assert.True(lengths[0] < cap / 4, $"the closed spill file kept {lengths[0]:N0} B of its {cap:N0} B pre-size");
+            Assert.Equal(32 + cap, lengths[1]);                // the open one is still pre-sized
+
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the trimmed blocks to be despilled");
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the flushes to end");
+            await engine.FlushHotTierAsync();
+            Assert.Equal(Total, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A spilled event's only copy is its spill file, so its template has to be in it — also one
     /// with no pool row: outside a saturated pool (index -1, its text attached, as the receivers
     /// stage it), or longer than a row's 65 535 bytes. Those used to be despilled with an empty
