@@ -91,14 +91,22 @@ public sealed partial class StorageEngine
     /// answering 503 for a batch that wrote nothing knows that a retry duplicates nothing. An event
     /// no tier can hold is skipped and counted apart (see <see cref="LogBatchWriteResult"/>).</para>
     /// </summary>
-    /// <param name="maxWait">How long the batch may wait, in all, for room.</param>
+    /// <param name="maxWait">
+    /// How long the batch may wait, in all, for room: the time actually spent waiting, summed over
+    /// its waits. It used to be a deadline from the call's start, so writing a long batch and
+    /// queueing for the writer lock behind other requests spent it too: a 40 000-event batch
+    /// interleaved with a burst of others could be past it when the next tier filled, and gave up
+    /// at that routine swap — milliseconds from room — without waiting at all, its tail reported
+    /// as dropped in a 200 no client retries.
+    /// </param>
     /// <param name="ct">The request's: a client that has gone stops the wait, and nothing after the
     /// events already written is written.</param>
     public async ValueTask<LogBatchWriteResult> WriteBatchAsync(LogWriteBatch batch, TimeSpan maxWait, CancellationToken ct = default)
     {
         int  next     = 0, written = 0, refused = 0;
         bool waited   = false;
-        long deadline = Environment.TickCount64 + (long)Math.Max(0, maxWait.TotalMilliseconds);
+        long budgetMs = (long)Math.Max(0, maxWait.TotalMilliseconds);
+        long waitedMs = 0;
 
         while (next < batch.Count)
         {
@@ -129,13 +137,14 @@ public sealed partial class StorageEngine
 
             if (!ReferenceEquals(_write, full)) continue;
 
-            long left = deadline - Environment.TickCount64;
+            long left = budgetMs - waitedMs;
             if (left <= 0) break;
             if (!waited)
             {
                 waited = true;
                 Interlocked.Increment(ref _ingestRoomWaits);
             }
+            long began = Environment.TickCount64;
             try
             {
                 // In slices: a slice that ends without a signal goes round and writes again, and the
@@ -146,6 +155,7 @@ public sealed partial class StorageEngine
             }
             catch (TimeoutException) { /* write again */ }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            waitedMs += Environment.TickCount64 - began;
         }
 
         int notWritten = batch.Count - next;

@@ -197,8 +197,10 @@ public sealed class IngestionOptions
     /// Seq clients retry; one that wrote part of its batch reports the rest as dropped. Room comes
     /// back in milliseconds whenever a tier swap or a spill file is all it takes, so this binds only
     /// when nothing can take events at all: spilling is off or the disk is at its floor, and every
-    /// flush slot is busy. Default: 2 s — under the 5 s an OpenTelemetry Collector exporter allows a
-    /// request, with room for the rest of it.
+    /// flush slot is busy. It is the time the request actually spends WAITING, summed over its waits:
+    /// writing a long batch, and queueing behind other requests to write, does not use it up.
+    /// Default: 2 s — under the 5 s an OpenTelemetry Collector exporter allows a request, with room
+    /// for the rest of it.
     /// </summary>
     public TimeSpan BackPressureWait { get; init; } = TimeSpan.FromSeconds(2);
 

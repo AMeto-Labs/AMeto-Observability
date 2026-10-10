@@ -497,6 +497,11 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// Spilling off and the one slot busy: there is nowhere for the events after the full tier to go.
     /// The batch waits out its wait and then reports them as not written — a prefix written, the
     /// rest not, nothing skipped — and they are written once the slot is free.
+    ///
+    /// <para>Tier A is filled and swapped before the timed batch starts, so its 300 ms covers the
+    /// wait for a slot and nothing else: writing 16 384 events in a Debug build and tier A's own
+    /// swap (a Task.Run that creates a WAL) used to come out of the same budget, and a swap started
+    /// late under a loaded test run would have stopped the batch at tier A.</para>
     /// </summary>
     [Fact]
     public async Task With_spilling_off_and_no_slot_a_batch_waits_then_reports_what_it_could_not_write()
@@ -506,10 +511,14 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         var    gate   = HoldFirstFlush(engine);
         try
         {
-            using (var batch = Batch(engine, 0, 2 * TierEvents + 10))
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            using (var batch = Batch(engine, TierEvents, TierEvents + 10))
             {
                 var r = await engine.WriteBatchAsync(batch, TimeSpan.FromMilliseconds(300));
-                Assert.Equal(new LogBatchWriteResult(2 * TierEvents, 0, 10), r);
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 10), r);
             }
             Assert.False(engine.IsSpilling);
             Assert.Equal(10, engine.IngestNotWritten);
@@ -517,6 +526,45 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             gate.Set();
             using (var rest = Batch(engine, 2 * TierEvents, 10))
                 Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(rest, HangGuard));
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The wait is for room, and only the time spent waiting for it counts. A batch whose writing
+    /// had already taken longer than its whole wait — here its first write is held up past it, as a
+    /// long batch interleaved with others, or a long queue for the writer lock, would be — used to
+    /// give up at the first full tier without waiting at all. Now it waits its full wait there.
+    /// </summary>
+    [Fact]
+    public async Task Time_spent_writing_does_not_use_up_the_wait_for_room()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        var    gate   = HoldFirstFlush(engine);
+        var    wait   = TimeSpan.FromMilliseconds(200);
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+            Assert.Equal(0, engine.IngestRoomWaits);
+
+            int first = 1;
+            engine._afterWriteGate = () => { if (Interlocked.Exchange(ref first, 0) == 1) Thread.Sleep(wait * 2); };
+
+            using var b = Batch(engine, TierEvents, TierEvents + 10);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var r  = await engine.WriteBatchAsync(b, wait);
+            sw.Stop();
+
+            Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 10), r);   // B full, no slot, no spill
+            Assert.Equal(1, engine.IngestRoomWaits);                        // ... and it waited for room first
+            Assert.True(sw.Elapsed >= wait * 2 + wait * 0.8, $"gave up after {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
         finally
         {
