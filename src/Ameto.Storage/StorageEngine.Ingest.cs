@@ -55,6 +55,13 @@ public sealed partial class StorageEngine
         Closed,
         /// <summary>No tier can ever hold it: a payload larger than one hot-tier chunk.</summary>
         TooLarge,
+        /// <summary>
+        /// The write threw — out of memory allocating a tier chunk or its template slots, a swap
+        /// request that could not be queued — and wrote nothing: <see cref="WriteLocked"/> commits
+        /// last and nothing after its commit can throw. Waited out and tried again like
+        /// <see cref="NoRoom"/>.
+        /// </summary>
+        Faulted,
     }
 
     /// <summary>
@@ -74,7 +81,8 @@ public sealed partial class StorageEngine
     /// <summary>
     /// Writes one event — the single-event form of <see cref="WriteBatchAsync"/>, for callers with
     /// one event and no wish to wait. False when it was not written: no room right now (a swap has
-    /// been asked for), the write path is closed, or no tier can hold an event that large.
+    /// been asked for), the write path is closed, or no tier can hold an event that large. A throw
+    /// (out of memory in the tier) also means nothing was written.
     /// </summary>
     public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
     {
@@ -90,6 +98,13 @@ public sealed partial class StorageEngine
     /// shutdown): what follows it is reported as not written, never skipped over, so a caller
     /// answering 503 for a batch that wrote nothing knows that a retry duplicates nothing. An event
     /// no tier can hold is skipped and counted apart (see <see cref="LogBatchWriteResult"/>).</para>
+    ///
+    /// <para>NEVER THROWS for a write that fails. A write that throws — out of memory allocating a
+    /// tier chunk, say — wrote nothing (<see cref="WriteLocked"/> commits last), and is waited out
+    /// and tried again like one that found no room, then reported as not written with everything
+    /// after it. It used to escape: the request was answered 500 (gRPC UNKNOWN), which no OTLP
+    /// exporter retries, the count of what was already written was lost, and a Seq client, which
+    /// does retry a 500, wrote the batch's prefix a second time.</para>
     /// </summary>
     /// <param name="maxWait">
     /// How long the batch may wait, in all, for room: the time actually spent waiting, summed over
@@ -110,15 +125,23 @@ public sealed partial class StorageEngine
 
         while (next < batch.Count)
         {
-            WriteState full;
-            Task       room;
+            WriteState   full;
+            Task         room;
+            WriteOutcome outcome = WriteOutcome.Written;
             lock (_writerLock)
             {
                 int end = Math.Min(batch.Count, next + WriteRunEvents);
-                var outcome = WriteOutcome.Written;
                 while (next < end)
                 {
-                    outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next));
+                    try
+                    {
+                        outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next));
+                    }
+                    catch (Exception ex)
+                    {
+                        outcome = WriteOutcome.Faulted;   // nothing of the event was written: see WriteLocked
+                        NoteWriteFaultLocked(ex);
+                    }
                     if (outcome == WriteOutcome.Written)       written++;
                     else if (outcome == WriteOutcome.TooLarge) { refused++; Interlocked.Increment(ref _ingestRefusedTooLarge); }
                     else break;
@@ -127,10 +150,10 @@ public sealed partial class StorageEngine
                 if (outcome is WriteOutcome.Written or WriteOutcome.TooLarge) continue;   // the run is done; let others in
                 if (outcome == WriteOutcome.Closed) break;
 
-                // No room. Captured under the lock, in this order, so the wake-up cannot be lost: a
-                // state change stores _write BEFORE it swaps the signal (SignalRoom), so either the
-                // signal read here is the one about to complete, or _write has already moved on and
-                // the check below sees it.
+                // No room, or a fault. Captured under the lock, in this order, so the wake-up cannot
+                // be lost: a state change stores _write BEFORE it swaps the signal (SignalRoom), so
+                // either the signal read here is the one about to complete, or _write has already
+                // moved on and the check below sees it.
                 full = _write;
                 room = Volatile.Read(ref _roomSignal).Task;
             }
@@ -139,7 +162,7 @@ public sealed partial class StorageEngine
 
             long left = budgetMs - waitedMs;
             if (left <= 0) break;
-            if (!waited)
+            if (!waited && outcome == WriteOutcome.NoRoom)
             {
                 waited = true;
                 Interlocked.Increment(ref _ingestRoomWaits);
@@ -214,52 +237,90 @@ public sealed partial class StorageEngine
         }
 
         // ── The event is COMMITTED from here on. Nothing below may throw out of this method: the
-        //    caller would take the event for not written and write it again, a second copy.
-        // The WAL entry's index is 16 bits and all 65 536 values are real pool ids, so an event
-        // outside the pool (-1 once it is full, or a claim at/past 65 536) is passed through
-        // as-is and Append logs it with the Unpooled flag instead of an index. It writes NO
-        // pool row for it: a row 0 carrying the unpooled text would be force-interned by
-        // recovery and become every genuine index-0 event's template. And without the flag,
-        // recovery gave the unpooled event itself index 0's template whenever the pool file
-        // held any row. The hook still gets the attached text; the WAL never stores it.
-        string tmplStr = template
-                         ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
-        // The service is logged the way the header holds it, by pool index, and its text goes into
-        // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
-        // flush resolves it, so a replayed event carries the service the flushed one would have.
-        string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
+        //    caller takes a throw for "nothing written" (WriteBatchAsync) and would write the event
+        //    again, a second copy. What can fail below is bookkeeping that a later write repeats —
+        //    a log line, a swap request (a faulted or full tier refuses the next write, and every
+        //    refused write asks again) — so the whole of it is guarded, and a failure swallowed.
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
-                          h.ServiceNamePoolIndex, svcStr, h.TraceIdHi, h.TraceIdLo, h.SpanId);
-        }
-        catch (Exception ex)
-        {
-            // Disk full growing the WAL, a wedged mapping after a failed grow, a pool-file write
-            // error. THIS event is in the tier, and its flush persists it, but it is not
-            // crash-durable until then: the one event per fault that its acknowledgement
-            // over-promises. No later one is: the state is marked, the tier refuses from the next
-            // write on (above), and the swap that replaces tier and WAL is asked for — and asked
-            // again by every writer that finds the tier refusing. It used to be asked for once per
-            // episode, a request a held swap lock or a busy slot could drop, and every write after
-            // it was answered 200 from memory alone until the tier filled or MaxAge came round.
-            // HotRefused is what lets a swap that finds no flush slot spill instead.
-            Interlocked.Increment(ref _ingestWalAppendFailures);
-            w.WalFaulted = true;
-            w.HotRefused = true;
-            _logger.LogError(ex,
-                "WAL append failed — the event is in the hot tier but not crash-durable until it is flushed; " +
-                "further writes wait for the WAL to be replaced");
-            ScheduleFlush();
-        }
+            // The WAL entry's index is 16 bits and all 65 536 values are real pool ids, so an event
+            // outside the pool (-1 once it is full, or a claim at/past 65 536) is passed through
+            // as-is and Append logs it with the Unpooled flag instead of an index. It writes NO
+            // pool row for it: a row 0 carrying the unpooled text would be force-interned by
+            // recovery and become every genuine index-0 event's template. And without the flag,
+            // recovery gave the unpooled event itself index 0's template whenever the pool file
+            // held any row. The hook still gets the attached text; the WAL never stores it.
+            string tmplStr = template
+                             ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
+            // The service is logged the way the header holds it, by pool index, and its text goes into
+            // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
+            // flush resolves it, so a replayed event carries the service the flushed one would have.
+            string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
+            try
+            {
+                w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
+                              h.ServiceNamePoolIndex, svcStr, h.TraceIdHi, h.TraceIdLo, h.SpanId);
+            }
+            catch (Exception ex)
+            {
+                // Disk full growing the WAL, a wedged mapping after a failed grow, a pool-file write
+                // error. THIS event is in the tier, and its flush persists it, but it is not
+                // crash-durable until then: the one event per fault that its acknowledgement
+                // over-promises. No later one is: the state is marked, the tier refuses from the next
+                // write on (above), and the swap that replaces tier and WAL is asked for — and asked
+                // again by every writer that finds the tier refusing. It used to be asked for once per
+                // episode, a request a held swap lock or a busy slot could drop, and every write after
+                // it was answered 200 from memory alone until the tier filled or MaxAge came round.
+                // HotRefused is what lets a swap that finds no flush slot spill instead. Marked
+                // before anything that can throw.
+                Interlocked.Increment(ref _ingestWalAppendFailures);
+                w.WalFaulted = true;
+                w.HotRefused = true;
+                _logger.LogError(ex,
+                    "WAL append failed — the event is in the hot tier but not crash-durable until it is flushed; " +
+                    "further writes wait for the WAL to be replaced");
+                ScheduleFlush();
+            }
 
-        NotifyEventWritten(in h, tmplStr);
+            NotifyEventWritten(in h, tmplStr);
 
-        // Check size threshold
-        if (w.Hot.IsFull)
-            ScheduleFlush();
+            // Check size threshold
+            if (w.Hot.IsFull)
+                ScheduleFlush();
+        }
+        catch (Exception) { /* see above: the event is written, and says so */ }
 
         return WriteOutcome.Written;
+    }
+
+    // ── Write faults ──────────────────────────────────────────────────────────
+
+    private long _ingestWriteFaults;
+    /// <summary>When the last write-fault line was logged (<see cref="Environment.TickCount64"/>); under <see cref="_writerLock"/>.</summary>
+    private long _writeFaultLoggedAt;
+    /// <summary><see cref="_ingestWriteFaults"/> as that line reported it; under <see cref="_writerLock"/>.</summary>
+    private long _writeFaultsLogged;
+
+    /// <summary>
+    /// A write threw (and wrote nothing). Counted, and logged at most once a second with the count
+    /// since the last line: a store out of memory fails every waiting writer's every re-check, and
+    /// a line apiece would bury the one that says why. The caller holds <see cref="_writerLock"/>.
+    /// </summary>
+    private void NoteWriteFaultLocked(Exception ex)
+    {
+        long n   = Interlocked.Increment(ref _ingestWriteFaults);
+        long now = Environment.TickCount64;
+        if (_writeFaultLoggedAt != 0 && now - _writeFaultLoggedAt < 1000) return;
+        long since = n - _writeFaultsLogged;
+        _writeFaultLoggedAt = now;
+        _writeFaultsLogged  = n;
+        try
+        {
+            _logger.LogError(ex,
+                "Writing a log event into the store failed ({Count} time(s) since the last report) — nothing of it " +
+                "was written; its batch waits and tries again, up to Ingestion.BackPressureWait", since);
+        }
+        catch (Exception) { /* counted; the line is lost */ }
     }
 
     /// <summary>
@@ -390,7 +451,10 @@ public sealed partial class StorageEngine
     /// <summary>Times a writer found no room and waited for it.</summary>
     public long IngestRoomWaits => Interlocked.Read(ref _ingestRoomWaits);
 
-    /// <summary>Events a batch gave up on: no room within <c>Ingestion.BackPressureWait</c>, or shutdown.</summary>
+    /// <summary>
+    /// Events a batch gave up on: no room within <c>Ingestion.BackPressureWait</c> (or writes that
+    /// kept failing for that long — <see cref="IngestWriteFaults"/>), or shutdown.
+    /// </summary>
     public long IngestNotWritten => Interlocked.Read(ref _ingestNotWritten);
 
     /// <summary>Events refused because no tier can hold them (a payload over one hot-tier chunk).</summary>
@@ -402,4 +466,11 @@ public sealed partial class StorageEngine
     /// one per WAL: after it, writes wait for the swap that replaces the WAL (or spill).
     /// </summary>
     public long IngestWalAppendFailures => Interlocked.Read(ref _ingestWalAppendFailures);
+
+    /// <summary>
+    /// Writes that threw — out of memory in the tier, most likely — and wrote nothing; each was
+    /// waited out and tried again, and what had still not been written when the wait ran out is in
+    /// <see cref="IngestNotWritten"/>. The log says why, at most once a second.
+    /// </summary>
+    public long IngestWriteFaults => Interlocked.Read(ref _ingestWriteFaults);
 }

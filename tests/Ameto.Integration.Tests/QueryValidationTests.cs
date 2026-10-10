@@ -208,6 +208,7 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      // What a request gave up on for want of room, how often one had to wait, an
                      // event no tier can hold, and a WAL that refused an append.
                      "ingestNotWritten", "ingestRoomWaits", "ingestRefusedTooLarge", "ingestWalAppendFailures",
+                     "ingestWriteFaults",
                      // The spill: its backlog on disk, and its traffic (whether ingest is in it, below).
                      "logsSpillFilesPending", "logsSpillFilesOpened",
                      "logsSpilledEvents", "logsDespilledEvents",

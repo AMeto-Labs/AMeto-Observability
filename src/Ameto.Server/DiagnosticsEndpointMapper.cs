@@ -206,10 +206,13 @@ public static class DiagnosticsEndpointMapper
                 // a WAL append that failed is a volume refusing writes.
                 ingestAcceptedTotal      = ingest.AcceptedTotal,
                 ingestDroppedOversized   = ingest.DroppedOversized,
-                // Events given up on for lack of room (or at shutdown). A request that wrote none
-                // of its batch was answered 503 and its client retries; one that wrote part of it
-                // reported the rest as dropped.
+                // Events given up on for lack of room (or at shutdown, or after writes that kept
+                // failing). A request that wrote none of its batch was answered 503 and its client
+                // retries; one that wrote part of it reported the rest as dropped.
                 ingestNotWritten         = storage.IngestNotWritten,
+                // Writes that threw (out of memory in the tier) and wrote nothing: each was waited
+                // out and tried again; the log says why.
+                ingestWriteFaults        = storage.IngestWriteFaults,
                 // Batches that had to wait for room at all — a full tier between swaps, or a spill
                 // file rotating. Climbing steadily with ingestNotWritten at zero is the flush
                 // keeping up only just.

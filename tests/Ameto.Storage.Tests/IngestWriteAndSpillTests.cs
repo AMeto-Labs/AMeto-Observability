@@ -427,6 +427,96 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── A write that throws ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// A write that throws — the tier out of memory for a chunk — wrote nothing, and is waited out
+    /// and tried again within the wait. It used to escape WriteBatchAsync: the request was answered
+    /// 500 (gRPC UNKNOWN), which no exporter retries, and the count of what had been written was
+    /// lost. The throw here is the write gate's, before anything is written.
+    /// </summary>
+    [Fact]
+    public async Task A_write_that_throws_wrote_nothing_and_is_tried_again_within_the_wait()
+    {
+        var engine = Engine(Options(NewDir()));
+        try
+        {
+            int calls = 0;
+            engine._afterWriteGate = () =>
+            {
+                if (Interlocked.Increment(ref calls) == 4) throw new OutOfMemoryException("test: no memory for a tier chunk");
+            };
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            engine._afterWriteGate = null;
+            Assert.Equal(1, engine.IngestWriteFaults);
+            Assert.Equal(0, engine.IngestNotWritten);
+
+            await engine.FlushHotTierAsync();
+            Assert.Equal(10, ReadAll(engine).Count);   // each once
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A write that keeps throwing stops its batch there once the wait has run out: the prefix is
+    /// reported written and the rest not written — counted, never thrown — so a request that wrote
+    /// nothing is answered 503 and its retry duplicates nothing, and one that wrote a prefix does
+    /// not have it written twice by a client retrying a 500.
+    /// </summary>
+    [Fact]
+    public async Task A_write_that_keeps_throwing_stops_its_batch_there_and_reports_the_rest_not_written()
+    {
+        var engine = Engine(Options(NewDir()));
+        try
+        {
+            int calls = 0;
+            engine._afterWriteGate = () =>
+            {
+                if (Interlocked.Increment(ref calls) >= 4) throw new OutOfMemoryException("test: no memory for a tier chunk");
+            };
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(3, 0, 7), await engine.WriteBatchAsync(batch, TimeSpan.FromMilliseconds(300)));
+            Assert.True(engine.IngestWriteFaults >= 2, $"tried {engine.IngestWriteFaults} time(s); it should be tried again within the wait");
+            Assert.Equal(7, engine.IngestNotWritten);
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Once an event is in the tier it is written, whatever its bookkeeping does next: a throw
+    /// after the commit (here the log line of a failed WAL append) must not be taken for "nothing
+    /// written", or the event would be written a second time.
+    /// </summary>
+    [Fact]
+    public async Task A_throw_after_the_commit_is_not_taken_for_a_write_that_failed()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("WAL append failed", StringComparison.Ordinal));
+        var    engine = OneSlotEngine(Options(dir), logger);
+        try
+        {
+            engine.LiveWalForTest!.Dispose();   // the next append fails, and the line that says so throws
+            using (var batch = Batch(engine, 0, 5))
+                Assert.Equal(new LogBatchWriteResult(5, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.Equal(1, logger.Thrown);
+            Assert.Equal(0, engine.IngestWriteFaults);
+
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the faulted tier's flush");
+            await engine.FlushHotTierAsync();
+            Assert.Equal(5, ReadAll(engine).Count);   // ReadAll fails on an event written twice
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
     // ── A WAL that refuses an append ──────────────────────────────────────────
 
     /// <summary>
