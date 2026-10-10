@@ -598,8 +598,10 @@ public sealed partial class StorageEngine
             unlisted?.Dispose();
             if (!slotTransferred)
             {
-                // Before the slot goes back, so the loop that takes it sees this block as not ready.
-                if (!settled) RetrySpillLater(file.SegId);
+                // Before the slot goes back, so the loop that takes it sees this block as gone, or
+                // as not ready yet.
+                if (settled) SettleSpill(file.SegId);
+                else         RetrySpillLater(file.SegId);
                 _flushSlots.Release();
                 if (counted) EndHeavyPhase();
                 OnFlushSlotReleased();
