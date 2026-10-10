@@ -396,9 +396,10 @@ public sealed partial class StorageEngine
     // ── Despill ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Despills queued blocks, oldest first, one per free flush slot — and none while the engine is
-    /// spilling: a slot that comes free then goes to the swap that ends the spill, so new events are
-    /// searchable again first and the backlog drains behind them.
+    /// Despills queued blocks, oldest first, one per free flush slot — and none while the live tier
+    /// needs the slot: while the engine is spilling, or while the live tier is refusing writes. A
+    /// slot that comes free then goes to the swap, so new events are searchable again first and the
+    /// backlog drains behind them.
     /// </summary>
     private async Task RunDespillLoopAsync(CancellationToken ct)
     {
@@ -411,7 +412,15 @@ public sealed partial class StorageEngine
 
             while (!ct.IsCancellationRequested && Volatile.Read(ref _writesClosed) == 0)
             {
-                if (_write.Spill is not null) break;
+                // The live tier comes first: a spill in progress, or a tier refusing writes — full
+                // with spilling off or the disk at its floor, or in the moment before a spill is
+                // installed — is waiting for exactly the slot this would take. It used to yield
+                // only to an installed spill, and after each despill it took the next slot inline,
+                // ahead of the swap the release had queued with Task.Run: with spilling off and a
+                // backlog of spill files left by an earlier run, every slot that came free went to
+                // the next despill while requests waited out BackPressureWait and were answered 503.
+                var live = _write;
+                if (live.Spill is not null || Volatile.Read(ref live.HotRefused)) break;
 
                 SpillFile next = default;
                 lock (_spillQueueLock)
@@ -444,6 +453,12 @@ public sealed partial class StorageEngine
     private int _despillsCompleted;
 
     /// <summary>
+    /// Test hook: called with the block's id as a despill that holds its flush slot is about to read
+    /// the spill file. Blocking it holds the slot; throwing from it is a read that failed.
+    /// </summary>
+    internal Action<ulong>? _beforeLoadSpillForTest;
+
+    /// <summary>
     /// Replays one spilled block into a tier and flushes it into the block, exactly as a frozen tier
     /// is flushed: listed as frozen (so queries see it) for its heavy phase, published with the same
     /// completion marker, its WAL deleted against it. Owns the flush slot the caller took.
@@ -461,6 +476,7 @@ public sealed partial class StorageEngine
                 return;
             }
 
+            _beforeLoadSpillForTest?.Invoke(file.SegId);
             var tier = LoadSpill(file);
             if (tier is null) return;
 

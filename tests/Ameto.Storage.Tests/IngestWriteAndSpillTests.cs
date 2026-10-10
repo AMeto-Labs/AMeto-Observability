@@ -427,6 +427,65 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A slot a despill gives back goes to the live tier when the live tier is refusing writes and
+    /// cannot spill (here: the disk at the spill floor). The despill loop used to yield only to an
+    /// installed spill, and after each despill it took the next slot inline, ahead of the swap the
+    /// release had queued: the waiting batch sat behind the whole backlog. The swap is slowed a
+    /// little here so that the loop, if it does not yield, certainly gets there first.
+    /// </summary>
+    [Fact]
+    public async Task A_slot_a_despill_frees_goes_to_a_live_tier_that_is_refusing_writes()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        using var firstDespill = new ManualResetEventSlim(false);
+        using var laterDespills = new ManualResetEventSlim(false);
+        using var despillHeld  = new ManualResetEventSlim(false);
+        engine._roomRecheckMs = (int)HangGuard.TotalMilliseconds;   // only a real swap gets the writer going
+        try
+        {
+            // A held in its flush; B full; one spill block closed and queued, a second one open.
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+            using (var b = Batch(engine, TierEvents, 2 * TierEvents + 100))
+                Assert.Equal(new LogBatchWriteResult(2 * TierEvents + 100, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            WaitFor(() => engine.SpillFilesPending == 1, "the first spill block to be closed and queued");
+
+            int despills = 0;
+            engine._beforeLoadSpillForTest = _ =>
+            {
+                despillHeld.Set();
+                (Interlocked.Increment(ref despills) == 1 ? firstDespill : laterDespills).Wait(HangGuard);
+            };
+            engine._spillFreeDiskForTest = () => 0;   // at the floor from here: no new spill file
+
+            // The slot frees: the swap ends the spill (B frozen), B's flush ends, and the first despill
+            // takes the slot and holds it.
+            gate.Set();
+            Assert.True(despillHeld.Wait(HangGuard), "the first despill never started");
+
+            // C fills and refuses: no slot, no spill. The writer waits.
+            using var c = Batch(engine, 3 * TierEvents + 100, TierEvents + 10);
+            var writing = engine.WriteBatchAsync(c, HangGuard).AsTask();
+            WaitFor(() => engine.LiveHotTierRefused && engine.LiveHotTier.Count == TierEvents, "tier C to refuse the writer");
+
+            engine._beforeSwap = () => Thread.Sleep(100);
+            firstDespill.Set();   // its slot comes free: the swap must get it, not the next despill
+
+            Assert.Equal(new LogBatchWriteResult(TierEvents + 10, 0, 0), await writing.WaitAsync(ShortGuard));
+        }
+        finally
+        {
+            gate.Set();
+            firstDespill.Set();
+            laterDespills.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A write that throws ───────────────────────────────────────────────────
 
     /// <summary>
