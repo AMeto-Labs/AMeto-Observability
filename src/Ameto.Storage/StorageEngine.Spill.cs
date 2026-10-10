@@ -719,7 +719,11 @@ public sealed partial class StorageEngine
         {
             foreach (var e in entries)
             {
-                string? tmpl = !e.Unpooled && rows.TryGetValue(e.TemplateIndex, out var t) && t.Length != 0 ? t : null;
+                // A template with no pool row — outside a saturated pool, or longer than a row holds
+                // — is in the entry itself (v6); the spill file is the event's only copy, and such a
+                // template used to come back empty, or cut at 65 535 bytes.
+                string? tmpl = e.Template
+                               ?? (!e.Unpooled && rows.TryGetValue(e.TemplateIndex, out var t) && t.Length != 0 ? t : null);
                 int tmplIdx  = tmpl is null ? -1 : TemplatePool.Intern(tmpl, out tmpl);
                 int svcAt    = e.ServiceIndexIn(rows);
                 int svcIdx   = svcAt >= 0 ? TemplatePool.Intern(rows[(ushort)svcAt]) : -1;

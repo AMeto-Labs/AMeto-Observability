@@ -299,6 +299,58 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A spilled event's only copy is its spill file, so its template has to be in it — also one
+    /// with no pool row: outside a saturated pool (index -1, its text attached, as the receivers
+    /// stage it), or longer than a row's 65 535 bytes. Those used to be despilled with an empty
+    /// template, or one cut at 65 535 bytes, while the same events that reached the live tier kept
+    /// theirs — for OTLP, whose log body is the template, the whole message lost.
+    /// </summary>
+    [Fact]
+    public async Task A_spilled_event_keeps_a_template_that_has_no_pool_row()
+    {
+        string dir      = NewDir();
+        var    engine   = OneSlotEngine(Options(dir));
+        var    gate     = HoldFirstFlush(engine);
+        string unpooled = "user 4711 logged in from 10.0.0.7";
+        string longTmpl = new string('é', 40_000) + " {n}";   // 80 004 UTF-8 bytes: more than a pool row holds
+        int    longIdx  = engine.TemplatePool.Intern(longTmpl);
+        const int First = 2 * TierEvents;                      // after A and B, in the tiers
+        try
+        {
+            using (var tiers = Batch(engine, 0, First))
+                Assert.Equal(new LogBatchWriteResult(First, 0, 0), await engine.WriteBatchAsync(tiers, HangGuard));
+            using (var spilled = new LogWriteBatch())
+            {
+                spilled.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + First * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                }, Props(First), unpooled, exception: null);
+                spilled.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + (First + 1) * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = longIdx, ServiceNamePoolIndex = -1,
+                }, Props(First + 1), longTmpl, exception: null);
+                Assert.Equal(new LogBatchWriteResult(2, 0, 0), await engine.WriteBatchAsync(spilled, HangGuard));
+            }
+            Assert.Equal(2, engine.SpilledEvents);
+
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == 2,
+                    "the spill to end and its block to be despilled");
+
+            var events = ReadAll(engine);
+            Assert.Equal(unpooled, events[First].Template);
+            Assert.Equal(longTmpl, events[First + 1].Template);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A spill file the process died with is despilled by the next start, in the background, and a
     /// block an earlier life had already written out in full (its completion marker on disk) is
     /// deleted rather than written twice.

@@ -163,10 +163,11 @@ public sealed class WriteAheadLogTests
     /// <summary>
     /// What Append writes is, byte for byte, the documented v6 layout: a 32-byte file header saying
     /// version 6, then per entry payloadLen u32 | ticks i64 | level u8 | flags u8 (bit 0 Unpooled,
-    /// bit 1 Service, bit 2 Trace) | templateIndex u16 | exceptionLen u32 | serviceIndex u16 |
-    /// crc32c u32 over [0, 22) + trace context + payload + exception; with the Trace flag the trace
-    /// context, traceIdHi u64 | traceIdLo u64 | spanId u64, then the payload. An entry with no
-    /// trace context is a v5 entry byte for byte.
+    /// bit 1 Service, bit 2 Trace, bit 3 InlineTemplate) | templateIndex u16 | exceptionLen u32 |
+    /// serviceIndex u16 | crc32c u32 over [0, 22) + trace context + inline template + payload +
+    /// exception; with the Trace flag the trace context, traceIdHi u64 | traceIdLo u64 | spanId
+    /// u64; with the InlineTemplate flag the template's byte length u32 and its UTF-8 text; then
+    /// the payload. An entry with neither is a v5 entry byte for byte.
     /// </summary>
     [Fact]
     public void Append_writes_the_documented_v6_layout()
@@ -191,7 +192,7 @@ public sealed class WriteAheadLogTests
             byte[][] expected =
             [
                 V5Entry(1_000, LogLevel.Warning,     flags: 0x02, templateIndex: 5, serviceIndex: 9, [0xA1, 0xA2]),
-                V5Entry(2_000, LogLevel.Information, flags: 0x01, templateIndex: 0, serviceIndex: 0, [0xB1]),
+                V6InlineEntry(2_000, LogLevel.Information, flags: 0x09, "unpooled text", [0xB1]),
                 V6Entry(3_000, LogLevel.Error, flags: 0x06, templateIndex: 5, serviceIndex: 9,
                         0x0102030405060708UL, 0x1112131415161718UL, 0x2122232425262728UL, [0xC1]),
                 V6Entry(4_000, LogLevel.Debug, flags: 0x04, templateIndex: 5, serviceIndex: 0, 0, 0, 7, [0xD1]),
@@ -211,6 +212,59 @@ public sealed class WriteAheadLogTests
             Assert.Equal([0UL, 0UL, 0x2122232425262728UL, 7UL], entries.Select(e => e.SpanId));
             Assert.Equal([0xC1], entries[2].Payload);
             Assert.Equal(9, entries[2].ServiceIndex);
+            // The unpooled template's text, from the entry itself; none for the pooled ones.
+            Assert.Equal([null, "unpooled text", null, null], entries.Select(e => e.Template));
+            Assert.Equal([0xB1], entries[1].Payload);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// A template no pool row can hold whole — a row's length is 16 bits — travels in its entry, and
+    /// comes back whole: a row used to keep it cut at 65 535 bytes (or at a U+FFFD, the cut falling
+    /// inside a character). No row is written for it, so its index cannot resolve to the cut text.
+    /// </summary>
+    [Fact]
+    public void A_template_longer_than_a_pool_row_comes_back_whole()
+    {
+        string path = NewWalPath();
+        string longTemplate = new string('é', 40_000) + " {n}";   // 80 004 UTF-8 bytes, 40 004 UTF-16 units
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 7, longTemplate, [0xA1]);
+                wal.Append(2_000, LogLevel.Information, 8, "short {n}",  [0xB1]);
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(2, entries.Count);
+            Assert.True(entries[0].Unpooled);
+            Assert.Equal(longTemplate, entries[0].Template);
+            Assert.False(entries[1].Unpooled);
+            Assert.Null(entries[1].Template);
+            Assert.Equal("short {n}", Assert.Single(WriteAheadLog.LoadPool(path + ".pool")).Value);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
+    [Fact]
+    public void A_rotted_inline_template_stops_replay_at_its_entry()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, -1, "first", [1]);
+                wal.Append(2_000, LogLevel.Information, -1, "second", [2]);
+            }
+            int first = EntryHeader + 4 + "first".Length + 1;
+            Corrupt(path, FileHeader + first + EntryHeader + 4 + 2);   // inside the second entry's text
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal("first", Assert.Single(entries).Template);
         }
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
@@ -360,6 +414,28 @@ public sealed class WriteAheadLogTests
         crc      = Crc32c.Append(crc, payload);
         BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(22), crc);
         payload.CopyTo(e, EntryHeader + TraceContext);
+        return e;
+    }
+
+    /// <summary>A v6 entry with no trace context that carries its template's text: header, length u32, UTF-8 text, payload.</summary>
+    private static byte[] V6InlineEntry(long ticks, LogLevel level, byte flags, string template, byte[] payload)
+    {
+        byte[] text = System.Text.Encoding.UTF8.GetBytes(template);
+        var e = new byte[EntryHeader + 4 + text.Length + payload.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(0),  (uint)payload.Length);
+        BinaryPrimitives.WriteInt64LittleEndian (e.AsSpan(4),  ticks);
+        e[12] = (byte)level;
+        e[13] = flags;
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(14), 0);                  // unpooled: no index
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(16), 0);                  // no exception
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(20), 0);                  // no service
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(EntryHeader), (uint)text.Length);
+        text.CopyTo(e, EntryHeader + 4);
+        uint crc = Crc32c.Append(0, e.AsSpan(0, 22));
+        crc      = Crc32c.Append(crc, e.AsSpan(EntryHeader, 4 + text.Length));
+        crc      = Crc32c.Append(crc, payload);
+        BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(22), crc);
+        payload.CopyTo(e, EntryHeader + 4 + text.Length);
         return e;
     }
 

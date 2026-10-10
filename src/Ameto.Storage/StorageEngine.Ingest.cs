@@ -249,7 +249,8 @@ public sealed partial class StorageEngine
             // pool row for it: a row 0 carrying the unpooled text would be force-interned by
             // recovery and become every genuine index-0 event's template. And without the flag,
             // recovery gave the unpooled event itself index 0's template whenever the pool file
-            // held any row. The hook still gets the attached text; the WAL never stores it.
+            // held any row. The text goes into the entry itself instead (v6 InlineTemplate), as
+            // does a template longer than a pool row holds, so the replay gets it back.
             string tmplStr = template
                              ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
             // The service is logged the way the header holds it, by pool index, and its text goes into

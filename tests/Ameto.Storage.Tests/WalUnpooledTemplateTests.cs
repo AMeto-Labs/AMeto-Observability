@@ -22,8 +22,9 @@ namespace Ameto.Storage.Tests;
 /// <para>Writing no pool row fixed that side and moved the bug to the other one. The unpooled
 /// event was still logged as index 0, so a replay whose pool file held any row resolved it and
 /// gave the unpooled event index 0's template. The entry now carries an Unpooled flag in the
-/// header byte that used to be padding, and recovery gives a flagged event no template: its
-/// text was never stored.</para>
+/// header byte that used to be padding, and recovery does not resolve a flagged event's index.
+/// Since v6 the entry also carries the unpooled text itself (InlineTemplate), so the event comes
+/// back with its own template; before that it came back with none.</para>
 /// </summary>
 public sealed class WalUnpooledTemplateTests : IAsyncLifetime
 {
@@ -132,10 +133,10 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
         // The genuine index-0 event keeps its template: the unpooled event wrote no row 0.
         Assert.Equal(IndexZeroTemplate, events[pooledTicks].Template);
 
-        // The unpooled event gets NO template: the WAL never stored its text, and its logged
-        // index of 0 must not be resolved against the pool rows that did survive.
-        Assert.True(string.IsNullOrEmpty(events[unpooledTicks].Template),
-            $"the unpooled event was recovered with template '{events[unpooledTicks].Template}'");
+        // The unpooled event gets ITS OWN template — the text its v6 entry carries — and never the
+        // one its logged index of 0 would resolve to among the pool rows that did survive. (Before
+        // v6 carried the text it came back with none: the WAL had never stored it.)
+        Assert.Equal(UnpooledTemplate, events[unpooledTicks].Template);
     }
 
     /// <summary>

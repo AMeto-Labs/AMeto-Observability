@@ -5424,9 +5424,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         int replayed = 0;
         foreach (var entry in entries)
         {
-            // Unpooled: the event was outside a saturated pool when it was logged. Its index
-            // field is 0 and names nothing, and its template text was never stored, so it
-            // replays with no template. Resolving the 0 attached index 0's template to it.
+            // Unpooled: the event's template had no pool row when it was logged. Its index field
+            // is 0 and names nothing — resolving the 0 attached index 0's template to it. A v6
+            // entry carries the text itself (InlineTemplate), attached here with no pool index —
+            // claiming one could take a slot a later WAL's rows are force-interned into — and an
+            // older entry never stored it, so that event replays with no template.
             bool noTemplate = poolMissing || entry.Unpooled;
             var header = new LogEventHeader
             {
@@ -5459,7 +5461,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
+            string tmpl = entry.Template ?? (noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex));
             if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
                 replayed++;
         }
