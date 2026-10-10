@@ -8,7 +8,7 @@ using Ameto.Ingestion;
 namespace Ameto.Otel;
 
 /// <summary>
-/// Parses OTLP/protobuf <c>ExportLogsServiceRequest</c> straight into the ingestion ring —
+/// Parses OTLP/protobuf <c>ExportLogsServiceRequest</c> straight into a log batch (<see cref="IOtlpLogSink"/>) —
 /// the protobuf counterpart of <see cref="OtlpLogStreamParser"/>, and the encoding SDK
 /// exporters and the collector actually send.
 ///
@@ -49,7 +49,7 @@ namespace Ameto.Otel;
 ///   the metric path. (The trace path still decodes through <c>CodedInputStream</c> and still
 ///   throws — <c>OtlpGrpcMessageSegmentTests</c> relies on exactly that.)</item>
 ///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
-///   already in the ring when the caller answers 400. The DOM path decoded the whole request
+///   already staged — and the receiver writes them — when it answers 400. The DOM path decoded the whole request
 ///   before ingesting any of it. This matches the JSON path, which has always behaved this
 ///   way, and a client that gets a 400 is expected to resend the batch.</item>
 /// </list>
@@ -207,7 +207,7 @@ public static class OtlpLogProtoParser
         }
     }
 
-    // ── one LogRecord → one ring entry ─────────────────────────────────────────
+    // ── one LogRecord → one staged event ───────────────────────────────────────
 
     private static void ReadLogRecord(ReadOnlySpan<byte> bytes, ref ParseState st)
     {

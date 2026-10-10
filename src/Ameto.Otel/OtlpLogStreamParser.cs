@@ -10,8 +10,8 @@ namespace Ameto.Otel;
 /// <summary>
 /// Zero-alloc streaming parser for OTLP <c>ExportLogsServiceRequest</c> JSON. Walks the body
 /// with a forward-only <see cref="Utf8JsonReader"/> and writes each log record (header +
-/// msgpack properties) straight into the ingestion ring via
-/// <see cref="IngestionEndpoint.TryIngestRaw"/> — never materialising the OTLP object graph,
+/// msgpack properties) straight into a log batch via
+/// <see cref="IOtlpLogSink.TryIngestRaw(long, byte, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ulong, ulong, ulong, ReadOnlySpan{byte})"/> — never materialising the OTLP object graph,
 /// per-record <c>LogEvent</c>s, or per-attribute strings. Replaces the reflection-based
 /// <c>JsonSerializer.Deserialize&lt;ExportLogsServiceRequest&gt;</c> + <c>OtlpLogMapper.Map</c>
 /// path that dominated GC pressure above ~60k events/s.
@@ -205,7 +205,7 @@ public static class OtlpLogStreamParser
         }
     }
 
-    // ── one logRecord → one ring entry ─────────────────────────────────────────
+    // ── one logRecord → one staged event ───────────────────────────────────────
     private static bool ParseLogRecord(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
         ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen, int svcIdx,
