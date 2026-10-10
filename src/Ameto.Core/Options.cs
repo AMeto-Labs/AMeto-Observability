@@ -159,7 +159,11 @@ public sealed class IngestionOptions
     /// bucket count one byte and 24, so a batch inside the byte limit could decode to ~500 MiB, past a
     /// 512 MB container's whole 384 MiB heap. Its own decode then ran out of memory, which since #125
     /// is answered 503, and the exporter retried it, out of memory every time. Logs and traces are not
-    /// weighed: they decode to about their own size and do not expand like this.</para>
+    /// weighed. Traces pass through their bounded ingest ring. Logs DO expand like this, and nothing
+    /// bounds a log batch yet beyond the byte limit: it is decoded whole before it is written, at ~80 B
+    /// a record plus its properties, and OTLP copies a resource's attributes into each of its records,
+    /// so a body of many tiny records decodes to many times its size — held, when the store has no
+    /// room, for up to <see cref="BackPressureWait"/>.</para>
     ///
     /// <para>Unset — or 0 or below, which mean the same — <see cref="DefaultMaxOtlpMetricPointsFor"/>:
     /// the request-body share of the heap (<c>MemoryBudgets.IngestBufferBytes</c>) at

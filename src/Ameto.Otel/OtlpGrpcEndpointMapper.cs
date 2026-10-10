@@ -70,8 +70,7 @@ public static class OtlpGrpcEndpointMapper
         // Logs decode into a batch that is written — and the call answered — only once its records
         // are in the store (see HandleCoreAsync), so OK means they survive the death of this process.
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleCoreAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog,
-                                                 decode: null, logs: true));
+            (HttpContext ctx) => HandleLogsAsync(ctx, inflateGate, tooLargeLog, outOfMemoryLog));
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
@@ -170,6 +169,14 @@ public static class OtlpGrpcEndpointMapper
         OtlpOutOfMemoryLog outOfMemoryLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
         => HandleCoreAsync(ctx, required, inflateGate, tooLargeLog, outOfMemoryLog, decode, logs: false);
+
+    /// <summary>
+    /// The logs Export, as the route serves it (see <see cref="HandleCoreAsync"/>). Internal so a test
+    /// can drive it over a plain context, as <see cref="HandleAsync"/> is.
+    /// </summary>
+    internal static Task HandleLogsAsync(
+        HttpContext ctx, OtlpInflateGate inflateGate, OtlpGzipTooLargeLog tooLargeLog, OtlpOutOfMemoryLog outOfMemoryLog)
+        => HandleCoreAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog, decode: null, logs: true);
 
     /// <summary>
     /// <see cref="HandleAsync"/>, and the logs Export: with <paramref name="logs"/> the message is
@@ -359,6 +366,8 @@ public static class OtlpGrpcEndpointMapper
                 if (batch is not null)
                 {
                     batch.MarkMalformed();
+                    IngestBufferPool.Return(body);   // before the write, which may wait (see below)
+                    body = null;
                     await batch.CommitAsync(ctx.RequestAborted);
                 }
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
@@ -384,7 +393,12 @@ public static class OtlpGrpcEndpointMapper
             if (batch is not null)
             {
                 // Logs: answered once the records are in the store — the hot tier and its WAL, or a
-                // spill file. After the inflate slot went back (above), since this may wait for room.
+                // spill file. After the inflate slot went back (above), since this may wait for room;
+                // and after the request body, which for an identity frame IS the message: the batch
+                // holds its own copy of all it keeps, and a request waiting out BackPressureWait used
+                // to hold its message twice, the body until the outer finally.
+                IngestBufferPool.Return(body);
+                body = null;
                 var result = await batch.CommitAsync(ctx.RequestAborted);
                 if (result.Busy)
                 {
@@ -405,7 +419,7 @@ public static class OtlpGrpcEndpointMapper
         }
         finally
         {
-            IngestBufferPool.Return(body);
+            if (body is not null) IngestBufferPool.Return(body);         // a logs batch gave it back before its write
             ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
             batch?.Dispose();
         }

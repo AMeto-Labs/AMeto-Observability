@@ -447,6 +447,9 @@ internal sealed class IngestBufferPoolLedger : IDisposable
 
     public int Rents           { get { lock (_gate) return _rents; } }
     public int PeakOutstanding { get { lock (_gate) return _peak; } }
+
+    /// <summary>Buffers this flow holds from the pool right now.</summary>
+    public int Outstanding     { get { lock (_gate) return _out.Count; } }
     public int LargestRent     { get { lock (_gate) return _largest; } }
 
     /// <summary>
