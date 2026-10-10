@@ -449,7 +449,10 @@ public sealed partial class StorageEngine
     private long _ingestRefusedTooLarge;
     private long _ingestWalAppendFailures;
 
-    /// <summary>Times a writer found no room and waited for it.</summary>
+    /// <summary>
+    /// Batches that found no room and waited for it, once per batch. Every tier swap makes the
+    /// batches writing at that moment wait for it, so this climbs with ordinary traffic.
+    /// </summary>
     public long IngestRoomWaits => Interlocked.Read(ref _ingestRoomWaits);
 
     /// <summary>

@@ -214,8 +214,9 @@ public static class DiagnosticsEndpointMapper
                 // out and tried again; the log says why.
                 ingestWriteFaults        = storage.IngestWriteFaults,
                 // Batches that had to wait for room at all — a full tier between swaps, or a spill
-                // file rotating. Climbing steadily with ingestNotWritten at zero is the flush
-                // keeping up only just.
+                // file rotating. Every swap makes the batches writing at that moment wait for it,
+                // so this climbs with ordinary traffic; it says the flush is behind only when it
+                // climbs together with logsSpilling or ingestNotWritten.
                 ingestRoomWaits          = storage.IngestRoomWaits,
                 ingestRefusedTooLarge    = storage.IngestRefusedTooLarge,
                 ingestWalAppendFailures  = storage.IngestWalAppendFailures,

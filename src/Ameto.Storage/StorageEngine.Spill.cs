@@ -526,7 +526,7 @@ public sealed partial class StorageEngine
     // ── Despill ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Despills queued blocks, oldest first, one per free flush slot — and none while the live tier
+    /// Despills queued blocks, oldest first, one at a time, each in a free flush slot — and none while the live tier
     /// needs the slot: while the engine is spilling, or while the live tier is refusing writes. A
     /// slot that comes free then goes to the swap, so new events are searchable again first and the
     /// backlog drains behind them.
