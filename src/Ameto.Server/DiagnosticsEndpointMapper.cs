@@ -221,7 +221,9 @@ public static class DiagnosticsEndpointMapper
                 ingestWalAppendFailures  = storage.IngestWalAppendFailures,
                 // The spill (HotTier.SpillEnabled): events taken while every flush slot was busy,
                 // into WAL files of their own, written into segments as slots come free. Pending
-                // files are that backlog on disk; spilled events are not searchable until then.
+                // files are that backlog on disk — a block counts until it is in segments, the one
+                // being despilled included, so 0 is what a rollback waits for; spilled events are
+                // not searchable until then.
                 logsSpilling             = storage.IsSpilling,
                 logsSpillFilesPending    = storage.SpillFilesPending,
                 logsSpillFilesOpened     = storage.SpillFilesOpened,
