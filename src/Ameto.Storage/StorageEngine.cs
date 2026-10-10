@@ -345,6 +345,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal int MergedAwaySegmentCap = 8 * MergeMaxSources;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
+    /// <summary>The pause a frozen tier's flush retry waits between attempts: <see cref="FlushRetryDelay"/>, but for a test that shortens it.</summary>
+    internal TimeSpan _flushRetryDelay = FlushRetryDelay;
     /// <summary>EventWritten subscriber faults, for throttled logging (writer thread only).</summary>
     private long _hookFaults;
     private readonly CancellationTokenSource               _cts        = new();
@@ -2558,8 +2560,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// Called with the segments once the retry has published the tier — how a despill's retry
     /// counts its events and takes its block out of the spill queue. It used to do neither.
     /// </param>
+    /// <param name="publishedLevels">
+    /// A despill's levels an earlier run published (see <c>FlushTierByLevelAsync</c>): kept on disk
+    /// and not written again. The retry used to unlink them as leftovers and rewrite every level.
+    /// </param>
     private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
-                                    Action<List<SegmentInfo>>? onPublished = null)
+                                    Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0)
     {
         var t = Task.Run(async () =>
         {
@@ -2567,7 +2573,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             {
                 while (true)
                 {
-                    await Task.Delay(FlushRetryDelay, _cts.Token).ConfigureAwait(false);
+                    await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
                     try
                     {
                         await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
@@ -2579,9 +2585,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                             // query, merge or replication can hold them). Delete the
                             // leftovers and rewrite the whole block — simpler to prove
                             // correct than resuming, and the block's ids are reserved to
-                            // this WAL so nothing else can have produced these files.
-                            DeleteUnpublishedLevelFiles(reservedSegId);
-                            written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token);
+                            // this WAL so nothing else can have produced these files. Save
+                            // a despill's levels an EARLIER run published: those are
+                            // registered segments, and are kept and not rewritten.
+                            DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
+                            written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
                         }
                         finally { _flushConcurrency.Release(); }
 
@@ -2621,10 +2629,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// Removes level files of a reserved block that were moved into place by a flush attempt that
     /// failed before publishing. internal so a test can run it under the boot scan.
     /// </summary>
-    internal void DeleteUnpublishedLevelFiles(ulong firstSegId)
+    /// <param name="keepLevels">
+    /// Levels an EARLIER run published (a despill's; see <c>FlushTierByLevelAsync</c>): the boot
+    /// scan registered their files as ordinary segments, and unlinking them left the catalog naming
+    /// files that were gone, for a merge or a query to trip over.
+    /// </param>
+    internal void DeleteUnpublishedLevelFiles(ulong firstSegId, byte keepLevels = 0)
     {
         for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
         {
+            if ((keepLevels & (1 << (int)s)) != 0) continue;
             foreach (var f in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{firstSegId + s}-*.seg"))
             {
                 // Recorded for a running catalog scan before the unlink, as every other delete of a
@@ -4664,8 +4678,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// a data directory written by the previous build (complete flush, no marker anywhere) be
     /// replayed without producing a single duplicate.
     /// </param>
+    /// <param name="publishedLevels">
+    /// A despill's: the levels of the block an earlier run published, as found when this run
+    /// STARTED (bit <c>1 &lt;&lt; level</c>; see <c>DiscoverSpillFiles</c>). Skipped whether or not
+    /// their file is still there — a merge or retention pass may have taken it since, and asking
+    /// the disk now would write those events a second time.
+    /// </param>
     private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
-        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false)
+        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false, byte publishedLevels = 0)
     {
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
@@ -4682,6 +4702,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 if (n == 0) continue;
 
                 var segId = new SegmentId(firstSegId + (ulong)lvl);
+                if ((publishedLevels & (1 << lvl)) != 0)
+                {
+                    _logger.LogInformation(
+                        "Despill: level {Level} of block {Block} was published by an earlier run — {Count} event(s) not rewritten",
+                        (Ameto.Core.LogLevel)lvl, firstSegId, n);
+                    continue;
+                }
                 if (skipPublishedLevels && SegmentFileExists(segId.Value))
                 {
                     _logger.LogInformation(

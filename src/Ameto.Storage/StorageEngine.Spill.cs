@@ -22,8 +22,8 @@ namespace Ameto.Storage;
 // block exactly as a WAL does (OpenWalCore), holds at most what one tier admits (HotTierAdmission),
 // and is flushed into that block under the same completion marker; despill deletes it against the
 // marker as PublishFlushedTier deletes a WAL. A process that dies with spill files on disk finds them
-// at the next start and despills them then, with skipPublishedLevels, so a block half-written before
-// the crash is finished, not duplicated.
+// at the next start and despills them then, skipping the levels the start found already published,
+// so a block half-written before the crash is finished, not duplicated (see DiscoverSpillFiles).
 //
 // What it costs: spilled events show up in queries late (after their despill), and get their event
 // ids then — ids order by timestamp, so they sort where they belong. The disk is the limit:
@@ -59,8 +59,11 @@ public sealed partial class StorageEngine
         public string Path => Wal.FilePath;
     }
 
-    /// <summary>A spill file waiting for its despill: its block and its WAL's path.</summary>
-    private readonly record struct SpillFile(ulong SegId, string Path);
+    /// <summary>
+    /// A spill file waiting for its despill: its block, its WAL's path, and the levels of the block
+    /// an earlier run published (see <see cref="QueuedSpill.PublishedLevels"/>).
+    /// </summary>
+    private readonly record struct SpillFile(ulong SegId, string Path, byte PublishedLevels = 0);
 
     /// <summary>
     /// A spilled block not yet in segments. It stays in <see cref="_spillQueue"/> — and in
@@ -69,9 +72,17 @@ public sealed partial class StorageEngine
     /// it, so the one being replayed, or waiting on a flush retry, read as nothing pending, and one
     /// whose read failed was never tried again in this process.
     /// </summary>
-    private sealed class QueuedSpill(string path)
+    private sealed class QueuedSpill(string path, byte publishedLevels = 0)
     {
         public readonly string Path = path;
+
+        /// <summary>
+        /// The levels of the block an EARLIER run had already published (bit <c>1 &lt;&lt; level</c>;
+        /// a level is one whole file at block + level), as found when this run started — before
+        /// any merge or retention pass could take one away. The despill skips exactly these; 0 for
+        /// a block spilled in this run. See <see cref="DiscoverSpillFiles"/>.
+        /// </summary>
+        public readonly byte PublishedLevels = publishedLevels;
 
         /// <summary>Taken by the despill loop: being despilled, or with its flush retry. Under <see cref="_spillQueueLock"/>.</summary>
         public bool InFlight;
@@ -394,10 +405,20 @@ public sealed partial class StorageEngine
     /// closed — for the despill loop, and reserves their blocks so nothing written meanwhile takes an
     /// id they will flush into. Called by the constructor after WAL recovery and before the first
     /// WAL is opened.
+    ///
+    /// <para>And it notes, for each block, which of its levels an earlier run had already
+    /// published — a despill the process died in moves one whole file per level. That is decided
+    /// HERE, from the disk as this run finds it, and not by the despill: the boot catalog scan
+    /// registers those files as ordinary segments, nothing keeps a merge or a retention pass off
+    /// them while the despill waits in the background (behind other blocks, or a new spill), and
+    /// the despill used to ask the disk only when it ran — finding a level a merge had taken into
+    /// another segment gone, and writing its events a second time, for good. The maintenance loop
+    /// does not start before this has run (it is the constructor's).</para>
     /// </summary>
     private void DiscoverSpillFiles()
     {
         int found = 0;
+        HashSet<ulong>? onDisk = null;
         foreach (var file in Directory.EnumerateFiles(_walDir, "*" + SpillExtension + "*"))
         {
             if (!file.EndsWith(SpillExtension, StringComparison.OrdinalIgnoreCase)) continue;   // its .pool
@@ -407,7 +428,11 @@ public sealed partial class StorageEngine
                 continue;
             }
             ReserveWalBlock(segId);
-            lock (_spillQueueLock) _spillQueue[segId] = new QueuedSpill(file);
+            onDisk ??= LocalSegmentIdsOnDisk();
+            byte published = 0;
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (onDisk.Contains(segId + (ulong)lvl)) published |= (byte)(1 << lvl);
+            lock (_spillQueueLock) _spillQueue[segId] = new QueuedSpill(file, published);
             found++;
         }
         if (found > 0)
@@ -417,6 +442,24 @@ public sealed partial class StorageEngine
                 found, _walDir);
             WakeDespill();
         }
+    }
+
+    /// <summary>The ids of this node's segment files on disk, read off their names (<c>{node}-{id}-{min}-{max}.seg</c>) in one listing.</summary>
+    private HashSet<ulong> LocalSegmentIdsOnDisk()
+    {
+        var    ids    = new HashSet<ulong>();
+        string prefix = $"{_options.NodeId.Value}-";
+        foreach (var path in Directory.EnumerateFiles(_segDir, prefix + "*.seg"))
+        {
+            var name = Path.GetFileName(path.AsSpan());
+            if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            var rest = name[prefix.Length..];
+            int dash = rest.IndexOf('-');
+            if (dash > 0 && ulong.TryParse(rest[..dash], System.Globalization.NumberStyles.None,
+                                           System.Globalization.CultureInfo.InvariantCulture, out ulong id))
+                ids.Add(id);
+        }
+        return ids;
     }
 
     /// <summary><c>{node}-{block}.spill</c> → the block.</summary>
@@ -478,7 +521,7 @@ public sealed partial class StorageEngine
                     foreach (var (segId, q) in _spillQueue)
                     {
                         if (q.InFlight || q.NotBefore > now) continue;
-                        next = new SpillFile(segId, q.Path);
+                        next = new SpillFile(segId, q.Path, q.PublishedLevels);
                         break;
                     }
                 }
@@ -587,8 +630,11 @@ public sealed partial class StorageEngine
             List<SegmentInfo> written;
             try
             {
-                // skipPublishedLevels: a block a crash left half-written keeps the levels it got out.
-                written = await FlushTierByLevelAsync(tier, file.SegId, ct, skipPublishedLevels: true).ConfigureAwait(false);
+                // A block a crash left half-written keeps the levels it got out — the ones found on
+                // disk when this run STARTED, not now: the boot scan registers them as ordinary
+                // segments, and a merge or retention pass may have taken one since. Asking the disk
+                // here found it gone and wrote its events a second time.
+                written = await FlushTierByLevelAsync(tier, file.SegId, ct, publishedLevels: file.PublishedLevels).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -598,7 +644,8 @@ public sealed partial class StorageEngine
                 // Owns the slot and the count from here; the block stays queued, in flight, until the
                 // retry publishes it — or shutdown leaves it for the next start.
                 ScheduleFlushRetry(tier, file.Path, file.SegId,
-                                   onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true));
+                                   onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
+                                   publishedLevels: file.PublishedLevels);
                 slotTransferred = true;
                 return;
             }
