@@ -2336,20 +2336,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 reservedSegId = oldState.WalSegId;
 
                 // Freeze, count, list as frozen and install the successor in one hold of the
-                // writer lock (see InstallSwap for why each of those is where it is). Nothing
-                // between the count and the try that decrements it can throw.
+                // writer lock (see InstallSwap for why each of those is where it is). It throws
+                // only before the freeze, and it is the LAST step of this try: the catch below
+                // means "nothing was swapped", and is wrong about anything that runs after it.
                 InstallSwap(newState, oldState.Hot, reservedSegId);
-
-                oldHot     = oldState.Hot;
-                oldWal     = oldState.Wal;
-                oldWalPath = oldWal?.FilePath;
-
-                // A spill ends with the swap that had a slot for a fresh tier: the full tier it
-                // spilled beside is the one just frozen, and its block goes to the despill. And a
-                // swap that had a slot is the end of any episode at the spill floor too, so the
-                // next one is reported.
-                if (oldState.Spill is { } last) SpillEnded(last);
-                _spillFloorReported = false;
             }
             catch
             {
@@ -2357,6 +2347,30 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // the tier): nothing was swapped, so the slot must not stay consumed.
                 _flushSlots.Release();
                 throw;
+            }
+
+            // ── SWAPPED. The heavy phase below owns the slot and the count from here, and nothing
+            //    may stand between them and it. Ending a spill used to sit inside the try above —
+            //    a Task.Run, a dictionary insert, a log line — so an out-of-memory there gave the
+            //    slot back and left the frozen tier unflushed, unfreed and counted, with shutdown
+            //    waiting its whole budget for a heavy phase that would never end.
+            oldHot     = oldState.Hot;
+            oldWal     = oldState.Wal;
+            oldWalPath = oldWal?.FilePath;
+            _spillFloorReported = false;   // a swap that had a slot ends any episode at the floor too
+
+            // A spill ends with the swap that had a slot for a fresh tier: the full tier it
+            // spilled beside is the one just frozen, and its block goes to the despill.
+            if (oldState.Spill is { } last)
+            {
+                try { SpillEnded(last); }
+                catch (Exception ex)
+                {
+                    // CloseSpill closes the block inline when it cannot queue the close, so what is
+                    // lost here is at most the line that says the spill ended.
+                    try { _logger.LogError(ex, "Ending the spill into {File} failed after the swap", last.Path); }
+                    catch { /* the swap stands; the heavy phase below must still run */ }
+                }
             }
         }
         finally { _flushLock.Release(); }

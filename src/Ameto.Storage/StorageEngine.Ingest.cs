@@ -265,11 +265,25 @@ public sealed partial class StorageEngine
     /// </summary>
     private TaskCompletionSource _roomSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Wakes every writer waiting for room. Call AFTER storing the new <see cref="_write"/>.</summary>
-    private void SignalRoom()
+    /// <summary>
+    /// Wakes every writer waiting for room. Call AFTER storing the new <see cref="_write"/>.
+    ///
+    /// <para>Never throws. It runs after a state change has been made, and a swap's caller takes a
+    /// throw for "nothing was swapped" (see <see cref="InstallSwap"/>). A wake-up lost to an
+    /// out-of-memory costs a waiting writer one <see cref="RoomRecheckMs"/> slice, no more: it then
+    /// writes again whatever the signal did.</para>
+    /// </summary>
+    /// <param name="next">The signal to install in its place, allocated by a caller that cannot
+    /// afford to fail after its change; null allocates one here.</param>
+    private void SignalRoom(TaskCompletionSource? next = null)
     {
-        var old = Interlocked.Exchange(ref _roomSignal, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
-        old.TrySetResult();
+        try
+        {
+            var old = Interlocked.Exchange(ref _roomSignal,
+                next ?? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+            old.TrySetResult();
+        }
+        catch (Exception) { /* see above: the writers' own re-check covers a lost wake-up */ }
     }
 
     /// <summary>
@@ -302,22 +316,30 @@ public sealed partial class StorageEngine
     /// skips its reserved cold segment ids. A tier flushes to ONE SEGMENT PER LEVEL, and the block
     /// of ids for exactly that was reserved when its WAL was opened — the level's segment is always
     /// <c>firstId + (byte)level</c>; levels absent from the tier never become files.</para>
+    ///
+    /// <para>THROWS ONLY BEFORE THE FREEZE. The caller's catch takes a throw for "nothing was
+    /// swapped" and gives the flush slot back, so a throw after the count would orphan the frozen
+    /// tier: never flushed, never freed, and a heavy phase shutdown waits its whole budget for. So
+    /// what can fail is done first — the signal the writers are woken with is allocated, and the
+    /// frozen list is given room for the entry — and from the freeze on nothing allocates.</para>
     /// </summary>
     private void InstallSwap(WriteState next, HotTierSegment frozen, ulong frozenSegId)
     {
+        var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         EnterWriterLock();
         try
         {
-            frozen.Freeze();
-            Interlocked.Increment(ref _heavyPhases);
             lock (_frozenLock)
             {
+                _frozenHot.EnsureCapacity(_frozenHot.Count + 1);
+                frozen.Freeze();
+                Interlocked.Increment(ref _heavyPhases);
                 _frozenHot.Add((frozen, frozenSegId));
                 _write = next;
             }
         }
         finally { _writerLock.Exit(); }
-        SignalRoom();
+        SignalRoom(signal);
     }
 
     /// <summary>

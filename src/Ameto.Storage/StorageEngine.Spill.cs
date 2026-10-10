@@ -267,6 +267,10 @@ public sealed partial class StorageEngine
     /// <see cref="_writerLock"/>) and queues it for its despill. Off the swap: disposing a mapping
     /// writes its dirty pages back, which is the stall the WAL's own rotation keeps off the lock.
     /// During shutdown it is done inline, so nothing is left running past the teardown.
+    ///
+    /// <para>Runs after a swap has been installed, so it must not leave the block in limbo when
+    /// memory is short: a close that cannot even be queued is done here, inline, and a block that
+    /// cannot be queued for its despill says so — the next start finds the file and despills it.</para>
     /// </summary>
     private void CloseSpill(SpillTarget spill)
     {
@@ -276,12 +280,22 @@ public sealed partial class StorageEngine
             return;
         }
 
-        var t = Task.Run(() => Close(spill));
-        _spillCloses[t] = 0;
-        _ = t.ContinueWith(
-            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-            _spillCloses, CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        Task t;
+        try { t = Task.Run(() => Close(spill)); }
+        catch (Exception)
+        {
+            Close(spill);   // slower, on the swap, but closed and queued
+            return;
+        }
+        try
+        {
+            _spillCloses[t] = 0;
+            _ = t.ContinueWith(
+                static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+                _spillCloses, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+        catch (Exception) { /* only shutdown's wait for this close is lost; the close itself is running */ }
 
         void Close(SpillTarget s)
         {
@@ -294,8 +308,13 @@ public sealed partial class StorageEngine
             }
             try { s.Wal.Dispose(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Closing the spill file {File} failed", s.Path); }
-            if (Volatile.Read(ref _writesClosed) == 0)
-                EnqueueSpill(new SpillFile(s.SegId, s.Path));
+            if (Volatile.Read(ref _writesClosed) != 0) return;
+            try { EnqueueSpill(new SpillFile(s.SegId, s.Path)); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Spilled block {File} could not be queued for its despill — it is written into " +
+                                     "segments at the next start", s.Path);
+            }
         }
     }
 

@@ -54,15 +54,41 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     };
 
     /// <summary>An engine with exactly one flush slot: a 64 MB host's 16 MB native floor holds one 9 MB tier.</summary>
-    private static StorageEngine OneSlotEngine(ServerOptions opts)
+    private static StorageEngine OneSlotEngine(ServerOptions opts, Microsoft.Extensions.Logging.ILogger<StorageEngine>? logger = null)
     {
         var engine = new StorageEngine(
             Microsoft.Extensions.Options.Options.Create(opts),
             new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance,
+            logger ?? NullLogger<StorageEngine>.Instance,
             MemoryBudgets.Derive(managedLimitBytes: 64 * MB, physicalLimitBytes: 64 * MB));
         Assert.Equal(1, engine.FlushSlots);
         return engine;
+    }
+
+    /// <summary>How long a test waits for something the fix makes happen at once, so a regression fails in seconds, not a minute.</summary>
+    private static readonly TimeSpan ShortGuard = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// A logger that throws an <see cref="OutOfMemoryException"/> from the lines a predicate picks —
+    /// the deterministic stand-in for a log call that runs out of memory at a chosen point.
+    /// </summary>
+    private sealed class ThrowingLogger(Func<string, bool> throwOn) : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private int _thrown;
+
+        public int Thrown => Volatile.Read(ref _thrown);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (!throwOn(formatter(state, exception))) return;
+            Interlocked.Increment(ref _thrown);
+            throw new OutOfMemoryException("test: this log line ran out of memory");
+        }
     }
 
     private static StorageEngine Engine(ServerOptions opts) => new(
@@ -143,9 +169,9 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         Assert.Equal((ulong)n * 13 + 1, ev.SpanId);
     }
 
-    private static void WaitFor(Func<bool> condition, string what)
+    private static void WaitFor(Func<bool> condition, string what, TimeSpan? within = null)
     {
-        Assert.True(SpinWait.SpinUntil(condition, HangGuard), $"timed out waiting for {what}");
+        Assert.True(SpinWait.SpinUntil(condition, within ?? HangGuard), $"timed out waiting for {what}");
     }
 
     // ── Acknowledged means durable ────────────────────────────────────────────
@@ -309,6 +335,44 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         var events = ReadAll(engine);
         Assert.Equal(300, events.Count);
         foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+    }
+
+    /// <summary>
+    /// The swap that ends a spill commits the frozen tier to its heavy phase: once the tier is
+    /// frozen, counted and listed, the flush owns the slot and the count. Ending the spill used to
+    /// run inside the try whose catch means "nothing was swapped", so a throw there — the close's
+    /// Task.Run out of memory, or the line that says the spill ended — gave the slot back and left
+    /// the frozen tier counted, unflushed and unfreed for good. The throw is a logger's here.
+    /// </summary>
+    [Fact]
+    public async Task A_throw_while_ending_a_spill_does_not_orphan_the_tier_the_swap_froze()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("Spill ended", StringComparison.Ordinal));
+        var    engine = OneSlotEngine(Options(dir), logger);
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(5);   // a regression must not hold the test for 30 s
+        var    gate   = HoldFirstFlush(engine);
+        const int Total = 2 * TierEvents + 1_000;              // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling, "the batch was written without the engine spilling");
+
+            gate.Set();
+            WaitFor(() => logger.Thrown > 0, "the swap that ends the spill to reach the line that throws");
+            WaitFor(() => engine.HeavyPhasesInFlight == 0 && !engine.IsSpilling && engine.SpillFilesPending == 0
+                       && engine.DespilledEvents == engine.SpilledEvents,
+                    "the tier the swap froze to be flushed and the spilled block despilled", ShortGuard);
+
+            await engine.FlushHotTierAsync();
+            Assert.Equal(Total, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
     }
 
     // ── No room at all ────────────────────────────────────────────────────────
