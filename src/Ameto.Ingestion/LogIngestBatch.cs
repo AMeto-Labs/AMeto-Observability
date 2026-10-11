@@ -157,6 +157,26 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     public ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default) => _owner.CommitAsync(this, ct);
 
     /// <summary>
+    /// For a receiver whose await of <paramref name="commit"/> threw where it suspends — its own
+    /// state machine's box, out of memory, at its first real suspension, which is the commit when the
+    /// body was read without suspending — while the commit runs on: waits it out, allocating nothing,
+    /// and gives its result. False when it is not done within the longest a commit can take (its own
+    /// wait-out included): the failure then goes up, as it did. Either way the receiver gives the
+    /// batch back itself, not in a finally — every finally of its method is skipped from that failure
+    /// on (the compiler guards them with the state the suspension had set).
+    /// </summary>
+    public bool TryWaitOutCommit(ValueTask<LogIngestResult> commit, out LogIngestResult result)
+    {
+        if (!IngestionEndpoint.WaitOut(commit, _owner.ReceiverWaitOut))
+        {
+            result = default;
+            return false;
+        }
+        result = commit.Result;
+        return true;
+    }
+
+    /// <summary>
     /// Gives the batch's arrays back, and its reservation with them — when the write that holds the
     /// batch ends, if one does (<see cref="LogWriteBatch.Dispose"/>).
     /// </summary>

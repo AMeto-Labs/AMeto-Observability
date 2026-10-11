@@ -226,7 +226,7 @@ public static class OtlpEndpointMapper
         };
 
         // ── Logs ──────────────────────────────────────────────────────────────
-        var logs = async (HttpContext ctx) =>
+        var logs = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
@@ -330,7 +330,25 @@ public static class OtlpEndpointMapper
 
                 // Answered only once the events are in the store — the hot tier and its WAL, or a
                 // spill file — so a 200 survives the death of this process (IngestionEndpoint).
-                var result = await batch!.CommitAsync(ctx.RequestAborted);
+                // Guarded, and the batch given back right after, not in the finally: this handler's first real
+                // suspension can be this await (a body read whole without suspending), where its state machine
+                // is boxed — and a box that cannot be allocated threw here while the commit ran on (a 500 for a
+                // batch the store went on to write), skipping every finally of the handler, the batch's
+                // dispose among them (its reservation held for good). See IngestionEndpoint.HandleAsync.
+                var commit = batch!.CommitAsync(ctx.RequestAborted);
+                LogIngestResult result;
+                try { result = await commit; }
+                catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
+                {
+                    if (!batch.TryWaitOutCommit(commit, out result))
+                    {
+                        batch.Dispose();   // deferred to the end of the write that holds it
+                        batch = null;
+                        throw;
+                    }
+                }
+                batch.Dispose();
+                batch = null;
                 if (malformed)
                 {
                     ctx.Response.StatusCode = 400;

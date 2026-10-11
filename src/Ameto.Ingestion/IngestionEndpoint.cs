@@ -346,13 +346,6 @@ public sealed class IngestionEndpoint
     /// </summary>
     internal Action? BeforeStageForTest { get; set; }
 
-    /// <summary>
-    /// Test seam: runs when a commit's write has not completed at once and the commit is about to
-    /// await it — its first suspension, where its state machine is boxed; throwing from it is that
-    /// allocation running out of memory, after the write began. Null in production.
-    /// </summary>
-    internal Action? BeforeCommitSuspendsForTest { get; set; }
-
     /// <summary>The <see cref="Clock"/> timestamp from which the next Warning may be written.</summary>
     private long _oversizedWarnFrom = long.MinValue;
 
@@ -399,6 +392,7 @@ public sealed class IngestionEndpoint
     /// Writes a decoded batch into the store and says what became of it. Called by
     /// <see cref="LogIngestBatch.CommitAsync"/>.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
     internal async ValueTask<LogIngestResult> CommitAsync(LogIngestBatch batch, CancellationToken ct)
     {
         // Decoded: for the wait for room, the batch keeps reserved what it holds and no more.
@@ -409,14 +403,22 @@ public sealed class IngestionEndpoint
         // the room kept for them as they were staged — this grows nothing, so it cannot run out of
         // memory here, outside the receivers' decode.
         var staged = batch.Seal();
-        if (staged.Count == 0)
-            return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
+
+        // What the answer is made of, read BEFORE the write: the write's lease ends inside it, and a
+        // dispose asked meanwhile (deferred to that end) zeroes the batch — read after, the client's
+        // event count was 0 and every marker counted as written.
+        int stagedCount   = staged.Count;
+        int clientEvents  = batch.StagedEvents;
+        int markerCount   = batch.MarkerCount;
+        int droppedAtDoor = batch.DroppedAtDoor;
+        bool malformed    = batch.Malformed;
+        if (stagedCount == 0)
+            return new LogIngestResult(0, droppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
 
         var pending = _storage.WriteBatchAsync(staged, _backPressureWait, ct);
         LogBatchWriteResult r;
         try
         {
-            if (!pending.IsCompleted) BeforeCommitSuspendsForTest?.Invoke();
             r = await pending.ConfigureAwait(false);
         }
         // The await could not suspend: this method's state machine is boxed at its first suspension,
@@ -427,9 +429,10 @@ public sealed class IngestionEndpoint
         // nothing to allocate (a blocked thread, but only on a heap that cannot box a state machine)
         // and the request answered from what it did. A write still going after that is left to end
         // on its own — it holds the batch (LogWriteBatch.Lease) — and the failure goes up as it did.
+        // Nothing below relies on a finally, which that failure would skip.
         catch (OutOfMemoryException) when (!pending.IsCompleted || pending.IsCompletedSuccessfully)
         {
-            if (!WaitOutWrite(pending, _backPressureWait)) throw;
+            if (!WaitOut(pending, _backPressureWait + CommitWaitOutGrace)) throw;
             r = pending.Result;
         }
         Interlocked.Add(ref _acceptedTotal, r.Written);
@@ -438,11 +441,11 @@ public sealed class IngestionEndpoint
         // event, but they are not what the client sent, and the client's counts are of its own.
         // The batch was processed up to `processed`; what follows was not written.
         int processed      = r.Written + r.Refused;
-        int markersWritten = batch.MarkersBefore(processed);
-        int markersUnsent  = batch.MarkerCount - markersWritten;
+        int markersWritten = Math.Clamp(processed - clientEvents, 0, markerCount);
+        int markersUnsent  = markerCount - markersWritten;
         int ingested       = r.Written - markersWritten;
         int clientUnsent   = r.NotWritten - markersUnsent;
-        int dropped        = batch.DroppedAtDoor + r.Refused + clientUnsent;
+        int dropped        = droppedAtDoor + r.Refused + clientUnsent;
 
         // Best-effort, and never the request's failure: this runs after the write, and a log call that
         // ran out of memory here (its arguments box) made a batch the store had partly written a 500,
@@ -452,7 +455,7 @@ public sealed class IngestionEndpoint
             try
             {
                 _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
-                    r.NotWritten, staged.Count, _backPressureWait);
+                    r.NotWritten, stagedCount, _backPressureWait);
             }
             catch (Exception) { /* the line is lost; the answer is not */ }
         }
@@ -473,23 +476,23 @@ public sealed class IngestionEndpoint
         // decoded, a retried batch wrote one per attempt, and the count of drops in the next line
         // counted attempts (~170 for 20 drops). Guarded: a line that runs out of memory after the
         // write must not make a written batch a 500.
-        if (!busy || batch.Malformed)
+        if (!busy || malformed)
         {
-            Interlocked.Add(ref _droppedOversized, batch.DroppedAtDoor);
-            if (batch.MarkerCount > 0) LogOversizedDrops(batch, markersWritten);
+            Interlocked.Add(ref _droppedOversized, droppedAtDoor);
+            if (markerCount > 0) LogOversizedDrops(batch, markersWritten);
         }
         return new LogIngestResult(ingested, dropped, busy);
     }
 
     /// <summary>
     /// Blocks until <paramref name="pending"/> has completed, allocating nothing: false when it has
-    /// not within <paramref name="wait"/> (the write's own wait for room) and
-    /// <see cref="CommitWaitOutGraceMs"/> more — a write that long is queued behind other writers,
-    /// or its continuation is starved of a thread, and is not waited for any longer.
+    /// not within <paramref name="wait"/> — it is then not waited for any longer (a write queued
+    /// behind other writers for that long, or a continuation starved of a thread). For an await that
+    /// could not suspend (the awaiting method's box, out of memory): see <see cref="CommitAsync"/>.
     /// </summary>
-    private static bool WaitOutWrite(ValueTask<LogBatchWriteResult> pending, TimeSpan wait)
+    internal static bool WaitOut<T>(ValueTask<T> pending, TimeSpan wait)
     {
-        long deadline = Environment.TickCount64 + Math.Max(0, (long)wait.TotalMilliseconds) + CommitWaitOutGraceMs;
+        long deadline = Environment.TickCount64 + Math.Max(0, (long)wait.TotalMilliseconds);
         while (!pending.IsCompleted)
         {
             if (Environment.TickCount64 >= deadline) return false;
@@ -498,40 +501,68 @@ public sealed class IngestionEndpoint
         return true;
     }
 
-    /// <summary>How long past the write's own wait <see cref="WaitOutWrite"/> waits for it.</summary>
-    private const int CommitWaitOutGraceMs = 1000;
+    /// <summary>How long past the write's own wait (BackPressureWait) a commit waits its write out.</summary>
+    internal static readonly TimeSpan CommitWaitOutGrace = TimeSpan.FromSeconds(1);
 
-    /// <summary>How often <see cref="WaitOutWrite"/> looks at the write.</summary>
+    /// <summary>How often <see cref="WaitOut{T}"/> looks at what it waits for.</summary>
     private const int CommitWaitOutPollMs = 5;
+
+    /// <summary>The longest a receiver waits a commit out (<see cref="LogIngestBatch.TryWaitOutCommit"/>): the commit's own wait-out, and a second.</summary>
+    internal TimeSpan ReceiverWaitOut => _backPressureWait + CommitWaitOutGrace + _backPressureWait + CommitWaitOutGrace;
+
+    /// <summary>
+    /// The unwritten-marker Warnings a request writes on its own before the rest are summed up in one
+    /// line: they are written whatever the once-a-second limit says (each is the only record of its
+    /// drop), and a body of 8 MiB at a 1 KiB limit holds ~8 000 — a flood of the bounded file-log queue
+    /// and the Event Log.
+    /// </summary>
+    internal const int UnwrittenMarkerWarningsPerRequest = 20;
 
     /// <summary>
     /// Names the events a finally answered request dropped at the door. A drop whose marker was
     /// written is named at most once a second (its marker names it on the Events page); one whose
     /// marker the store had no room for, after the client's own events, is ALWAYS named — this line
-    /// is the only record of it, and suppressing it with the rest left a drop no one could find.
-    /// Never throws.
+    /// is the only record of it, and suppressing it with the rest left a drop no one could find. A
+    /// request names the first <see cref="UnwrittenMarkerWarningsPerRequest"/> of those, and the rest
+    /// in one line with their count and their total size. Never throws.
     /// </summary>
     private void LogOversizedDrops(LogIngestBatch batch, int markersWritten)
     {
         try
         {
+            int  unnamed = 0;
+            long unnamedBytes = 0;
             for (int i = 0; i < batch.MarkerCount; i++)
             {
                 var drop = batch.DropAt(i);
                 if (i >= markersWritten)
+                {
+                    if (i - markersWritten >= UnwrittenMarkerWarningsPerRequest)
+                    {
+                        unnamed++;
+                        unnamedBytes += drop.PayloadBytes;
+                        continue;
+                    }
                     _logger.LogWarning(
                         "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\"); " +
                         "the store had no room for its marker after the batch's own events, so this line is the only record of it",
                         drop.PayloadBytes, _maxEventPayloadBytes, drop.Service, drop.Template);
+                }
                 else if (TakeOversizedWarning(out int skipped))
                     LogOversizedDrop(drop.PayloadBytes, drop.Service, drop.Template, skipped);
             }
+            if (unnamed > 0)
+                _logger.LogWarning(
+                    "Dropped {Count} more oversized log event(s) of the same request ({Bytes} B of properties, each over {LimitBytes} B), " +
+                    "whose markers the store had no room for: this line is the only record of them",
+                    unnamed, unnamedBytes, _maxEventPayloadBytes);
         }
         catch (Exception) { /* the lines are lost; the answer is not */ }
     }
 
     // ── POST /api/events (CLEF) ───────────────────────────────────────────────
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     public async Task HandleAsync(HttpContext ctx)
     {
         // ── 1. Read body into a pooled buffer ─────────────────────────────────
@@ -688,7 +719,25 @@ public sealed class IngestionEndpoint
             bodyBuf = null;
 
             // ── 4. Write, then answer ─────────────────────────────────────────
-            var result = await batch.CommitAsync(ctx.RequestAborted);
+            // Guarded, and the batch given back right after, not in the finally: this method's first
+            // real suspension can be this await (a body read whole without suspending), where its state
+            // machine is boxed. A box that cannot be allocated threw here while the commit ran on — a 500
+            // for a batch the store went on to write (a Seq client's retry wrote it twice) — and skipped
+            // every finally of the method, the batch's dispose among them: its reservation held for good.
+            var commit = batch.CommitAsync(ctx.RequestAborted);
+            LogIngestResult result;
+            try { result = await commit; }
+            catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
+            {
+                if (!batch.TryWaitOutCommit(commit, out result))
+                {
+                    batch.Dispose();   // deferred to the end of the write that holds it
+                    batch = null;
+                    throw;
+                }
+            }
+            batch.Dispose();
+            batch = null;
 
             if (malformed is not null)
             {

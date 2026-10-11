@@ -231,16 +231,13 @@ public sealed class IngestStoreBusyTests : IDisposable
             if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
         };
         var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
-        endpoint.BeforeCommitSuspendsForTest = () =>
-        {
-            Volatile.Write(ref failing, 0);   // the write's next attempt lands
-            throw new OutOfMemoryException("test: the commit's state machine box");
-        };
         try
         {
             var ctx = Post(Clef(3));
 
-            await endpoint.HandleAsync(ctx);
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<CommitAsync>", () => Volatile.Write(ref failing, 0));   // the write's next attempt lands
+            try { await endpoint.HandleAsync(ctx); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
 
             Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
             Assert.Equal((3, 0), Counts(ctx));
@@ -271,12 +268,13 @@ public sealed class IngestStoreBusyTests : IDisposable
             if (n == 2) release.Wait(TimeSpan.FromSeconds(30));   // the retry lands only when the test says
         };
         var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
-        endpoint.BeforeCommitSuspendsForTest = () => throw new OutOfMemoryException("test: the commit's state machine box");
         try
         {
             var ctx = Post(Clef(3));
             var sw  = System.Diagnostics.Stopwatch.StartNew();
-            await Assert.ThrowsAsync<OutOfMemoryException>(() => endpoint.HandleAsync(ctx));
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<CommitAsync>");
+            try { await Assert.ThrowsAsync<OutOfMemoryException>(() => endpoint.HandleAsync(ctx)); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
             sw.Stop();
             Assert.InRange(sw.ElapsedMilliseconds, 1_000, 10_000);   // the wait plus a second: waited for, then given up
 
@@ -295,6 +293,149 @@ public sealed class IngestStoreBusyTests : IDisposable
         {
             release.Set();
             storage._afterWriteGate = null;
+        }
+    }
+
+    /// <summary>
+    /// OwnerAsync's seam, armed for one first suspension of the method whose state machine's name
+    /// carries <paramref name="method"/> (as "&lt;CommitAsync&gt;"): it throws there as a box that cannot
+    /// be allocated does, every finally of the method skipped. <paramref name="onFail"/> runs as it fires.
+    /// </summary>
+    private static Func<Type, bool> FirstSuspensionFailsOnce(string method, Action? onFail = null)
+    {
+        int armed = 1;
+        return t =>
+        {
+            if (!t.Name.Contains(method, StringComparison.Ordinal) || Interlocked.Exchange(ref armed, 0) == 0) return false;
+            onFail?.Invoke();
+            return true;
+        };
+    }
+
+    /// <summary>
+    /// Round-4 review L4. The frame above the commit — the receiver's handler — first suspends at the
+    /// same await when its body was read without suspending (here, from memory), and its box failing
+    /// there was the 500 da665b7 left: the counts lost while the store wrote the batch, and every
+    /// finally of the handler skipped, the batch's dispose among them, its reservation held for good.
+    /// The handler waits the commit out too now, answers from it, and gives the batch back itself.
+    /// </summary>
+    [Fact]
+    public async Task A_receiver_whose_await_of_the_commit_cannot_suspend_answers_what_was_written_and_gives_the_batch_back()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromSeconds(5));
+        await using var storage = Engine(opts);
+        var written = CaptureWrites(storage);
+        int failing = 1;
+        storage._afterWriteGate = () =>
+        {
+            if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
+        };
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        try
+        {
+            var ctx = Post(Clef(3));
+
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<HandleAsync>", () => Volatile.Write(ref failing, 0));
+            try { await endpoint.HandleAsync(ctx); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+            Assert.Equal((3, 0), Counts(ctx));
+            Assert.Equal(3, written.Count);
+            Assert.Equal(0, endpoint.DecodedBytesInFlight);   // the batch was given back, its reservation with it
+        }
+        finally { storage._afterWriteGate = null; }
+    }
+
+    /// <summary>
+    /// Round-4 review L3. The commit read the batch AFTER its write — the marker accounting from its
+    /// event count — while the write's lease ends inside the write, where a dispose asked meanwhile
+    /// (deferred to that end) zeroes it: the client's events read as none, every marker as written, the
+    /// answer's counts wrong. It reads what it needs before the write now.
+    /// </summary>
+    [Fact]
+    public async Task A_batch_disposed_while_its_write_waits_is_still_answered_with_the_right_counts()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(500));
+        await using var storage = Engine(opts);
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        var batch    = endpoint.BeginBatch();
+        for (int i = 0; i < 3; i++)
+            Assert.True(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "client {N}"u8, [0x80], 0, 0, 0, "svc"u8));
+        Assert.False(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "big {N}"u8, new byte[100], 0, 0, 0, "svc"u8));
+
+        // The first attempt faults (so the write waits, and the dispose is asked meanwhile); the three
+        // client events then go in; the marker after them finds no room until the wait runs out.
+        int calls = 0;
+        storage._afterWriteGate = () =>
+        {
+            int n = Interlocked.Increment(ref calls);
+            if (n == 1 || n > 4) throw new OutOfMemoryException("test: no room");
+        };
+        storage._beforeRoomWaitForTest = () => batch.Dispose();   // asked while the write holds it: deferred to its end
+        try
+        {
+            var result = await batch.CommitAsync();
+            Assert.Equal(new LogIngestResult(3, 1, Busy: false), result);   // three in; the oversized one dropped, its marker not written
+        }
+        finally
+        {
+            storage._afterWriteGate        = null;
+            storage._beforeRoomWaitForTest = null;
+            batch.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L5. A drop whose marker the store had no room for is named whatever the
+    /// once-a-second limit says — and a body of thousands of them wrote thousands of Warnings, a flood
+    /// of the bounded file-log queue and the Event Log. A request names its first twenty, then one line
+    /// with the rest's count.
+    /// </summary>
+    [Fact]
+    public async Task A_request_names_its_first_unwritten_markers_and_sums_up_the_rest_in_one_line()
+    {
+        var opts   = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var logger = new CountingLogger();
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, logger);
+        using var batch = endpoint.BeginBatch();
+        Assert.True(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "client {N}"u8, [0x80], 0, 0, 0, "svc"u8));
+        for (int i = 0; i < 100; i++)
+            Assert.False(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "big {N}"u8, new byte[100], 0, 0, 0, "svc"u8));
+
+        int writes = 0;
+        storage._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref writes) > 1) throw new OutOfMemoryException("test: no room after the client's event");
+        };
+        try
+        {
+            var result = await batch.CommitAsync();
+            Assert.Equal(new LogIngestResult(1, 100, Busy: false), result);
+        }
+        finally { storage._afterWriteGate = null; }
+
+        Assert.Equal(IngestionEndpoint.UnwrittenMarkerWarningsPerRequest + 1, logger.Warnings);
+        Assert.Contains("80 more oversized", logger.Last);
+    }
+
+    /// <summary>Counts the Warnings written, and keeps the last one.</summary>
+    private sealed class CountingLogger : Microsoft.Extensions.Logging.ILogger<IngestionEndpoint>
+    {
+        public int     Warnings;
+        public string? Last;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel != Microsoft.Extensions.Logging.LogLevel.Warning) return;
+            Interlocked.Increment(ref Warnings);
+            Last = formatter(state, exception);
         }
     }
 

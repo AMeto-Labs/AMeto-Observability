@@ -186,6 +186,7 @@ public static class OtlpGrpcEndpointMapper
     /// the store had no room for any of them — and so wrote nothing of the batch, whose drop markers
     /// go in after its records — so the retry duplicates nothing.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private static async Task HandleCoreAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
@@ -397,7 +398,20 @@ public static class OtlpGrpcEndpointMapper
                     batch.MarkMalformed();
                     IngestBufferPool.Return(body);   // before the write, which may wait (see below)
                     body = null;
-                    await batch.CommitAsync(ctx.RequestAborted);
+                    // Guarded, and the batch given back right after (see the commit below).
+                    var prefix = batch.CommitAsync(ctx.RequestAborted);
+                    try { await prefix; }
+                    catch (OutOfMemoryException) when (!prefix.IsCompleted || prefix.IsCompletedSuccessfully)
+                    {
+                        if (!batch.TryWaitOutCommit(prefix, out _))
+                        {
+                            batch.Dispose();   // deferred to the end of the write that holds it
+                            batch = null;
+                            throw;
+                        }
+                    }
+                    batch.Dispose();
+                    batch = null;
                 }
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
@@ -428,7 +442,25 @@ public static class OtlpGrpcEndpointMapper
                 // to hold its message twice, the body until the outer finally.
                 IngestBufferPool.Return(body);
                 body = null;
-                var result = await batch.CommitAsync(ctx.RequestAborted);
+                // Guarded, and the batch given back right after, not in the finally: this handler's first real
+                // suspension can be this await (a message read whole without suspending), where its state
+                // machine is boxed — and a box that cannot be allocated threw here while the commit ran on
+                // (UNKNOWN for a batch the store went on to write), skipping every finally of the handler, the
+                // batch's dispose among them (its reservation held for good). See IngestionEndpoint.HandleAsync.
+                var commit = batch.CommitAsync(ctx.RequestAborted);
+                LogIngestResult result;
+                try { result = await commit; }
+                catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
+                {
+                    if (!batch.TryWaitOutCommit(commit, out result))
+                    {
+                        batch.Dispose();   // deferred to the end of the write that holds it
+                        batch = null;
+                        throw;
+                    }
+                }
+                batch.Dispose();
+                batch = null;
                 if (result.Busy)
                 {
                     await FinishAsync(ctx, StatusUnavailable, LogStoreBusyMessage);
