@@ -524,19 +524,47 @@ public sealed partial class StorageEngine
     /// <summary>The ids of this node's segment files on disk, read off their names (<c>{node}-{id}-{min}-{max}.seg</c>) in one listing.</summary>
     private HashSet<ulong> LocalSegmentIdsOnDisk()
     {
-        var    ids    = new HashSet<ulong>();
-        string prefix = $"{_options.NodeId.Value}-";
-        foreach (var path in Directory.EnumerateFiles(_segDir, prefix + "*.seg"))
-        {
-            var name = Path.GetFileName(path.AsSpan());
-            if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
-            var rest = name[prefix.Length..];
-            int dash = rest.IndexOf('-');
-            if (dash > 0 && ulong.TryParse(rest[..dash], System.Globalization.NumberStyles.None,
-                                           System.Globalization.CultureInfo.InvariantCulture, out ulong id))
-                ids.Add(id);
-        }
+        var ids = new HashSet<ulong>();
+        foreach (var path in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-*.seg"))
+            if (TryParseLocalSegmentId(path, out ulong id)) ids.Add(id);
         return ids;
+    }
+
+    /// <summary><c>{node}-{id}-{min}-{max}.seg</c> of THIS node → the id.</summary>
+    private bool TryParseLocalSegmentId(string path, out ulong id)
+    {
+        id = 0;
+        string prefix = $"{_options.NodeId.Value}-";
+        var    name   = Path.GetFileName(path.AsSpan());
+        if (!name.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var rest = name[prefix.Length..];
+        int dash = rest.IndexOf('-');
+        return dash > 0 && ulong.TryParse(rest[..dash], System.Globalization.NumberStyles.None,
+                                          System.Globalization.CultureInfo.InvariantCulture, out id);
+    }
+
+    /// <summary>
+    /// This node's segment ids whose file the boot catalog scan set aside as torn (<c>.seg.corrupt</c>).
+    /// Written by the scan, read once it has completed (<see cref="_catalogLoad"/>). Under its own lock.
+    /// </summary>
+    private readonly HashSet<ulong> _bootQuarantined = [];
+
+    /// <summary>
+    /// The levels of a block an earlier run published that the despill keeps — the ones the boot
+    /// scan ACCEPTED. The mask is taken before the scan has run (see <see cref="DiscoverSpillFiles"/>),
+    /// and the scan may find one of those files torn and set it aside: kept in the mask, that level
+    /// was skipped, and its events were left in a <c>.seg.corrupt</c> file, served by nobody. Called
+    /// once the scan has completed.
+    /// </summary>
+    private byte LevelsTheScanKept(ulong segId, byte published)
+    {
+        lock (_bootQuarantined)
+        {
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if ((published & (1 << lvl)) != 0 && _bootQuarantined.Contains(segId + (ulong)lvl))
+                    published &= (byte)~(1 << lvl);
+        }
+        return published;
     }
 
     /// <summary><c>{node}-{block}.spill</c> or <c>{node}-{block}.wal</c> → the block: a log is named after the block it flushes into.</summary>
@@ -597,12 +625,16 @@ public sealed partial class StorageEngine
                 if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
 
                 SpillFile next = default;
+                bool scanned = _catalogLoad.IsCompleted;
                 lock (_spillQueueLock)
                 {
                     long now = Environment.TickCount64;
                     foreach (var (segId, q) in _spillQueue)
                     {
                         if (q.InFlight || q.NotBefore > now) continue;
+                        // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
+                        // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes this.
+                        if (q.PublishedLevels != 0 && !scanned) continue;
                         next = new SpillFile(segId, q.Path, q.PublishedLevels);
                         break;
                     }
@@ -695,6 +727,10 @@ public sealed partial class StorageEngine
                 settled = true;
                 return;
             }
+
+            // Of the levels an earlier run published, the ones the boot scan accepted (the loop takes
+            // such a block only once the scan has completed).
+            if (file.PublishedLevels != 0) file = file with { PublishedLevels = LevelsTheScanKept(file.SegId, file.PublishedLevels) };
 
             _beforeLoadSpillForTest?.Invoke(file.SegId);
             var tier = LoadSpill(file);

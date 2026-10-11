@@ -90,6 +90,45 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
     }
 
     /// <summary>
+    /// A level the earlier run published that the boot scan finds torn, and sets aside as
+    /// <c>.seg.corrupt</c>, is written again by the despill. The levels to keep were noted before the
+    /// scan ran, so the despill skipped it — once at once, before the scan, and once after it, alike —
+    /// and its events were left in a file served by nobody. The despill of such a block now waits
+    /// for the scan, and keeps only the levels the scan accepted.
+    /// </summary>
+    [Fact]
+    public async Task A_level_the_boot_scan_sets_aside_as_torn_is_written_again_by_the_despill()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);   // too short for its footer: the scan sets it aside
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        try
+        {
+            // A despill that did not wait for the scan would be done well within this.
+            SpinWait.SpinUntil(() => run2.SpillFilesPending == 0, TimeSpan.FromSeconds(1));
+
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            Assert.True(File.Exists(infoLevel + ".corrupt"), "setup: the scan did not set the torn level aside");
+
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+            AssertEveryEventOnce(run2, 150);
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Writes the spilled block — events 0..99 at Information, 100..149 at Error — and runs an engine
     /// whose despill moves the Information level into place and then "dies": the throw stands in for
     /// the kill, and the shutdown cancels the retry it schedules. Returns the spill file, still on

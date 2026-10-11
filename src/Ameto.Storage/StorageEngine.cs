@@ -931,6 +931,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // and #95's AsyncLocal for one that gets it from the container (the host's DI).
         var heldUntil = bootScanHeldUntil ?? HoldCatalogScanForTest.Value;
         _catalogLoad  = heldUntil is null ? Task.Run(LoadSegmentCatalog) : LoadSegmentCatalogOnceReleasedAsync(heldUntil);
+        // A block an earlier run half-despilled waits for the scan (RunDespillLoopAsync): wake the loop when it ends.
+        _catalogLoad.ContinueWith(static (_, s) => ((StorageEngine)s!).WakeDespill(), this,
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         ReplayOrphanedWals();
         // After the replay, before the first WAL opens: their blocks must be reserved before
         // anything new is handed one. They are despilled in the background, not here — a long
@@ -5303,6 +5306,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     string aside = file + ".corrupt";
                     if (File.Exists(aside)) File.Delete(aside);   // keep one generation of quarantine
                     File.Move(file, aside);
+                    // A level of a half-despilled block among them is written again by its despill
+                    // (LevelsTheScanKept), which waits for this scan before it decides.
+                    if (TryParseLocalSegmentId(file, out ulong torn))
+                        lock (_bootQuarantined) _bootQuarantined.Add(torn);
                 }
                 catch (Exception mvEx) { _logger.LogWarning(mvEx, "Failed to quarantine corrupt segment {File}", file); }
             }
