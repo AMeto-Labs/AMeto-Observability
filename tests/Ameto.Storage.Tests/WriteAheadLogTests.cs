@@ -292,6 +292,87 @@ public sealed class WriteAheadLogTests
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
 
+    /// <summary>
+    /// A POOLED template longer than a pool row is written once per log, into the first entry that
+    /// uses its index, and every later entry of that index gets it back — the same string. It used to
+    /// be carried by every entry: 1 000 events of one 70 KB template made a 70 MB log, and a replay
+    /// that built a 70 KB string per event (~17 GiB for a full tier of them), ran out of memory, and
+    /// left the log unreplayed at every start.
+    /// </summary>
+    [Fact]
+    public void A_long_pooled_template_is_written_once_per_log_and_every_entry_of_its_index_gets_it_back()
+    {
+        string path         = NewWalPath();
+        string longTemplate = new string('x', 70_000) + " {n}";   // 70 004 bytes: more than a row holds
+        try
+        {
+            long written;
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                for (int i = 0; i < 1_000; i++)
+                    wal.Append(1_000 + i, LogLevel.Information, 7, longTemplate, [(byte)i]);
+                wal.Append(5_000, LogLevel.Information, 8, "short {n}", [0xB1]);
+                wal.Append(6_000, LogLevel.Information, -1, "unpooled {n}", [0xC1]);
+                written = wal.WrittenBytes;
+            }
+
+            Assert.True(written < 2 * longTemplate.Length, $"{written:N0} B logged for 1 000 events of one template");
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(1_002, entries.Count);
+            for (int i = 0; i < 1_000; i++)
+            {
+                Assert.True(entries[i].Unpooled);                          // no row to resolve: the text is attached
+                Assert.Same(entries[0].Template, entries[i].Template);     // one string, not one per entry
+                Assert.Equal((byte)i, Assert.Single(entries[i].Payload));
+            }
+            Assert.Equal(longTemplate, entries[0].Template);
+            Assert.False(entries[1_000].Unpooled);
+            Assert.Null(entries[1_000].Template);
+            Assert.Equal("unpooled {n}", entries[1_001].Template);
+            Assert.Equal("short {n}", Assert.Single(WriteAheadLog.LoadPool(path + ".pool")).Value);   // no row for the long one
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// A long pooled template counts as carried only once an entry that carries it is in the log: an
+    /// append refused for want of room (a spill log) leaves the next one to carry it, so no entry can
+    /// name the index ahead of the text. And each log carries it for itself — the one a spill rotates
+    /// to carries it again.
+    /// </summary>
+    [Fact]
+    public void A_long_pooled_template_is_carried_by_each_log_and_not_counted_carried_by_a_refused_append()
+    {
+        string spill = NewWalPath(), next = NewWalPath();
+        string longTemplate = new string('y', 70_000);
+        try
+        {
+            using (var wal = WriteAheadLog.Open(spill, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024, spill: true))
+            {
+                Assert.True(wal.Append(1_000, LogLevel.Information, 0, "first {n}", [0]));
+                Assert.False(wal.Append(2_000, LogLevel.Information, 7, longTemplate, [1]));   // refused: it does not fit
+                // Still the carrier, so still refused. An entry naming the index without the text
+                // would fit, and would replay with no template.
+                Assert.False(wal.Append(3_000, LogLevel.Information, 7, longTemplate, [2]));
+            }
+            using (var wal = WriteAheadLog.Open(next, new NodeId(3), new SegmentId(48UL), initialCapacity: 1024 * 1024))
+            {
+                Assert.True(wal.Append(2_000, LogLevel.Information, 7, longTemplate, [1]));
+                Assert.True(wal.Append(3_000, LogLevel.Information, 7, longTemplate, [2]));
+            }
+
+            Assert.Null(Assert.Single(WriteAheadLog.ReadForRecovery(spill).Entries).Template);   // the pooled first event: a row
+            var (_, entries) = WriteAheadLog.ReadForRecovery(next);
+            Assert.Equal(2, entries.Count);
+            Assert.All(entries, e => Assert.Equal(longTemplate, e.Template));
+        }
+        finally
+        {
+            foreach (var p in new[] { spill, next }) { File.Delete(p); File.Delete(p + ".pool"); }
+        }
+    }
+
     /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
     [Fact]
     public void A_rotted_inline_template_stops_replay_at_its_entry()

@@ -140,6 +140,52 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A pooled template longer than a pool row, used by several events of one log, comes back
+    /// whole on every one of them after a crash: the log holds the text once, in the first entry of
+    /// its index, and the replay resolves the others through that entry.
+    /// </summary>
+    [Fact]
+    public async Task Every_event_of_a_long_pooled_template_recovers_it_from_the_one_entry_that_carries_it()
+    {
+        string longTemplate = new string('é', 40_000) + " {n}";   // 80 004 UTF-8 bytes: more than a row holds
+        int    longIdx      = _engine.TemplatePool.Intern(longTemplate);
+        int    shortIdx     = _engine.TemplatePool.Intern("short {n}");
+        long   t            = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < 3; i++)
+            Write(t + i * TimeSpan.TicksPerSecond, longIdx, longTemplate, i);
+        Write(t + 3 * TimeSpan.TicksPerSecond, shortIdx, "short {n}", 3);
+
+        await CrashAndRestartAsync();
+
+        var events = ReadAllByTicks();
+        Assert.Equal(4, events.Count);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(longTemplate, events[t + i * TimeSpan.TicksPerSecond].Template);
+        Assert.Equal("short {n}", events[t + 3 * TimeSpan.TicksPerSecond].Template);
+    }
+
+    /// <summary>kill -9: keep the live WAL's bytes, let shutdown flush and unlink them, undo that flush, and start again.</summary>
+    private async Task CrashAndRestartAsync()
+    {
+        ulong  walId = _engine.LiveWalSegmentId;
+        string wal   = Directory.GetFiles(WalDir, "*.wal").Single();
+        File.Copy(wal, wal + ".crash", overwrite: true);
+        File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+
+        await _engine.DisposeAsync();
+        foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
+        {
+            var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+        }
+        File.Move(wal + ".crash", wal, overwrite: true);
+        File.Move(wal + ".pool.crash", wal + ".pool", overwrite: true);
+
+        _engine = NewEngine();
+        await _engine.CatalogLoaded;
+    }
+
+    /// <summary>
     /// A WAL written by the build before the Unpooled flag. Byte 13 of every entry header was
     /// padding that build never wrote, so it is zero in its files. Assembled here by hand from
     /// the documented v4 layout rather than through Append, so the test pins the bytes on disk

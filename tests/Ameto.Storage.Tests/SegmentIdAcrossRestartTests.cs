@@ -63,6 +63,67 @@ public sealed class SegmentIdAcrossRestartTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A log the startup replay fails to read keeps its block — and so its file and its events — for
+    /// the next start. The block used to be reserved only once the read had worked, from the header:
+    /// after a failed read the first log the run opened was handed that same block, and with it the
+    /// same file name. It reopened the file, appended after the entries no replay had read, and its
+    /// own flush deleted them: acknowledged events lost.
+    /// </summary>
+    [Fact]
+    public async Task A_log_the_replay_fails_to_read_keeps_its_block_and_its_events_for_the_next_start()
+    {
+        string dir    = Dir("unread");
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        // An orphaned log of the block a fresh store hands out first, holding three events.
+        string orphan = Path.Combine(walDir, "0-1.wal");
+        long   t      = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(orphan, new NodeId(0), new SegmentId(1), initialCapacity: 1 << 20))
+            for (int i = 0; i < 3; i++)
+                wal.Append(t + i, LogLevel.Information, -1, "orphan {n}", Props(i));
+
+        StorageEngine.BeforeWalReplayReadForTest.Value = path =>
+        {
+            if (Path.GetFileName(path) == "0-1.wal") throw new OutOfMemoryException("test: the replay could not read it");
+        };
+        try
+        {
+            await using var first = NewEngine(dir);
+            Assert.True(first.LiveWalSegmentId >= 1 + Slots,
+                $"the run opened block {first.LiveWalSegmentId} — the unread log's own");
+            Write(first, t + TimeSpan.TicksPerSecond, 1);
+        }
+        finally { StorageEngine.BeforeWalReplayReadForTest.Value = null; }
+        Assert.True(File.Exists(orphan), "the unread log is gone");
+
+        await using var next = NewEngine(dir);
+        await next.CatalogLoaded;
+        int events = 0, orphans = 0;
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seg in next.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                events++;
+                if (ev.Template == "orphan {n}") orphans++;
+            }
+        }
+        Assert.Equal(3, orphans);   // replayed by the start that could read it
+        Assert.Equal(4, events);    // and the one event the run between took
+    }
+
+    private static byte[] Props(int n)
+    {
+        var buf = new ArrayBufferWriter<byte>(32);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write("n"); w.Write((long)n);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
     /// <summary>A run that took no event: its boot log is the whole record of how far it got.</summary>
     [Fact]
     public async Task A_clean_stop_that_took_no_event_does_not_hand_its_block_out_again()

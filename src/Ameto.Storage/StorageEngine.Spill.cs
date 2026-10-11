@@ -466,7 +466,7 @@ public sealed partial class StorageEngine
         foreach (var file in Directory.EnumerateFiles(_walDir, "*" + SpillExtension + "*"))
         {
             if (!file.EndsWith(SpillExtension, StringComparison.OrdinalIgnoreCase)) continue;   // its .pool
-            if (!TryParseSpillBlock(file, out ulong segId))
+            if (!TryParseBlockId(file, out ulong segId))
             {
                 _logger.LogWarning("Spill file {File} does not carry a block id in its name — left where it is", file);
                 continue;
@@ -506,8 +506,8 @@ public sealed partial class StorageEngine
         return ids;
     }
 
-    /// <summary><c>{node}-{block}.spill</c> → the block.</summary>
-    private static bool TryParseSpillBlock(string file, out ulong segId)
+    /// <summary><c>{node}-{block}.spill</c> or <c>{node}-{block}.wal</c> → the block: a log is named after the block it flushes into.</summary>
+    private static bool TryParseBlockId(string file, out ulong segId)
     {
         segId = 0;
         var stem = Path.GetFileNameWithoutExtension(file);

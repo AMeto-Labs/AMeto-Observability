@@ -40,10 +40,15 @@ namespace Ameto.Storage;
 ///   bit 2 — Trace (v6): the 24-byte trace context follows the header. An event with no trace id
 ///           and no span id is logged without it, so the field costs nothing where it is empty.
 ///   bit 3 — InlineTemplate (v6): the event's template TEXT follows the trace context, because no
-///           pool row can carry it — the template is outside the pool, or longer than a row's
-///           65 535 bytes. Always with Unpooled. Without it such an event replayed with no template,
-///           or a truncated one; for a spilled event, whose only copy is its spill file, that was
-///           every such event of every overload, despilled with its message gone for good.
+///           pool row can carry it. With Unpooled, the template is outside the pool, and every
+///           such entry carries its own. Without Unpooled, the template is pooled but longer than a
+///           row's 65 535 bytes, and the entry is the FIRST of this log to use its index: the later
+///           ones carry the index alone, and recovery resolves it through this entry — a log holds
+///           such a template once, as it holds a row once. (Carried by every entry, one 70 KB
+///           template made a 70 MB log of 1 000 events, and its replay one string per entry.)
+///           Without the bit such an event replayed with no template, or a truncated one; for a
+///           spilled event, whose only copy is its spill file, that was every such event of every
+///           overload, despilled with its message gone for good.
 ///   Other bits are reserved and written as zero.
 ///
 /// <para>v6 exists because a WAL is no longer only a crash net. A log WAL that replays is how a
@@ -181,6 +186,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // pool, so an index names one string whichever of the two it is, and one row serves both.
     private readonly bool[]               _savedPoolRows = new bool[65536];
     private readonly object               _poolLock = new();
+    // Pool indices whose template is too long for a row (see InlineTemplate in the class doc):
+    // LongTemplateUnlogged once measured, LongTemplateLogged once an entry of this log carries it.
+    private readonly byte[]               _longTemplates = new byte[65536];
+    private const byte                    LongTemplateUnlogged = 1;
+    private const byte                    LongTemplateLogged   = 2;
 
     public string PoolPath => _filePath + ".pool";
 
@@ -310,8 +320,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// The event's template-pool index. Anything outside <c>[0, 65 535]</c> (-1 once the pool
     /// is full, or a claim past its cap) is logged as UNPOOLED: the entry carries the Unpooled
     /// flag with index 0, no pool row is written for it, and <paramref name="template"/>'s text
-    /// goes into the entry itself (InlineTemplate). So does a pooled template longer than a pool
-    /// row holds, which a row used to keep cut at 65 535 bytes.
+    /// goes into the entry itself (InlineTemplate). A pooled template longer than a pool row
+    /// holds, which a row used to keep cut at 65 535 bytes, goes into the first entry of this log
+    /// that uses its index, and only that one.
     /// </param>
     /// <param name="serviceIndex">
     /// The event's <c>@service</c>, as <see cref="LogEventHeader.ServiceNamePoolIndex"/> holds it:
@@ -331,15 +342,38 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                               ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null,
                               ulong traceIdHi = 0, ulong traceIdLo = 0, ulong spanId = 0)
     {
-        // One unsigned compare covers both -1 and anything past the pool's 65 536 ids; and a text
-        // no row can hold whole goes inline instead.
-        bool   pooled = (uint)templateIndex <= ushort.MaxValue && FitsPoolRow(template);
+        // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
+        bool   pooled = (uint)templateIndex <= ushort.MaxValue;
         ushort index  = pooled ? (ushort)templateIndex : (ushort)0;
-        if (pooled) EnsurePoolRow(index, template);
 
-        // The text an unpooled event's entry carries (v6). Counted without allocating, and copied
-        // into the mapping below, under the lock, with no byte[] in between.
-        bool inlineTemplate = !pooled && !string.IsNullOrEmpty(template);
+        // The text the entry carries (v6, InlineTemplate). An unpooled template's, in every entry:
+        // nothing else names it, and each such event may have its own. A pooled template's only
+        // when no row can hold it, and then once per log, in the first entry that uses its index
+        // (see the class doc): it used to be marked unpooled and carried by every entry. A row
+        // already written says the text fits, and a template measured too long is remembered, so
+        // a long one is measured once per log, not once per event.
+        bool inlineTemplate;
+        if (!pooled)                     inlineTemplate = !string.IsNullOrEmpty(template);
+        else if (_savedPoolRows[index])  inlineTemplate = false;
+        else
+        {
+            byte state = Volatile.Read(ref _longTemplates[index]);
+            if (state == 0 && FitsPoolRow(template))
+            {
+                EnsurePoolRow(index, template);
+                inlineTemplate = false;
+            }
+            else
+            {
+                if (state == 0) Volatile.Write(ref _longTemplates[index], LongTemplateUnlogged);
+                // Two first uses at once both carry it, which is harmless; one after an entry that
+                // carries it takes the write lock after that entry did, so it lands after it.
+                inlineTemplate = state != LongTemplateLogged;
+            }
+        }
+
+        // Counted without allocating, and copied into the mapping below, under the lock, with no
+        // byte[] in between.
         int  templateBytes  = inlineTemplate ? Encoding.UTF8.GetByteCount(template) : 0;
         int  inlineLen      = inlineTemplate ? 4 + templateBytes : 0;
 
@@ -436,6 +470,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             // Update offset in file header (in-place, no flush)
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             fh.WriteOffset = FileHeaderSize + _writeOffset;
+
+            // A long pooled template is in the log from here on: the entries after this one name it
+            // by index alone. Set only once the entry is in place — a refused or failed append
+            // leaves the next one to carry it.
+            if (pooled && inlineTemplate) Volatile.Write(ref _longTemplates[index], LongTemplateLogged);
         }
         return true;
     }
@@ -736,10 +775,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     {
         long pos = 0;
         long end = _writeOffset;
+        var  longTemplates = new Dictionary<ushort, string>();
 
         while (pos + EntryHeaderSize <= end)
         {
-            if (!TryParseLiveEntry(pos, end, out var entry, out long entrySize))
+            if (!TryParseLiveEntry(pos, end, longTemplates, out var entry, out long entrySize))
                 yield break;
 
             yield return entry!;
@@ -748,8 +788,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     }
 
     // Iterator bodies cannot touch pointers — this shim reads _ptr outside the iterator.
-    private bool TryParseLiveEntry(long pos, long end, out WalEntry? entry, out long entrySize)
-        => TryParseEntry(_ptr, pos, end, EntryLayout.V6, out entry, out entrySize);
+    private bool TryParseLiveEntry(long pos, long end, Dictionary<ushort, string> longTemplates, out WalEntry? entry, out long entrySize)
+        => TryParseEntry(_ptr, pos, end, EntryLayout.V6, longTemplates, out entry, out entrySize);
 
     /// <summary>
     /// Parses one entry at <paramref name="pos"/>. Bounds are checked and (v4 on) the CRC is
@@ -757,8 +797,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// field cannot OOM and a torn entry cannot materialise. Returns false at the first
     /// entry that does not verify — everything past it is by definition not durable.
     /// </summary>
+    /// <param name="longTemplates">
+    /// The long pooled templates met so far in this log, by index (see InlineTemplate in the class
+    /// doc): an entry that carries one adds it, and a later entry naming its index gets that same
+    /// string. The caller passes one dictionary for the whole walk, in log order.
+    /// </param>
     private static unsafe bool TryParseEntry(
-        byte* basePtr, long pos, long end, EntryLayout layout,
+        byte* basePtr, long pos, long end, EntryLayout layout, Dictionary<ushort, string> longTemplates,
         out WalEntry? entry, out long entrySize)
     {
         entry     = null;
@@ -836,20 +881,39 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             catch { return false; }
         }
 
+        // v3 entries predate the flag and their byte 13 was never written: never unpooled.
+        bool    unpooled = layout != EntryLayout.V3 && (eh.Flags & EntryFlagUnpooled) != 0;
+        string? template = inlineLen != 0 ? Encoding.UTF8.GetString(inlineSpan[4..]) : null;
+        if (layout == EntryLayout.V6 && !unpooled)
+        {
+            // A pooled template too long for a row: the first entry of the log that uses the index
+            // carries it, and every later one gets the same string. Either way the event has no row
+            // to resolve, and is handed on as an unpooled one with its text attached.
+            if (template is not null)
+            {
+                longTemplates[eh.TemplateIndex] = template;
+                unpooled = true;
+            }
+            else if (longTemplates.Count != 0 && longTemplates.TryGetValue(eh.TemplateIndex, out var known))
+            {
+                template = known;
+                unpooled = true;
+            }
+        }
+
         entry = new WalEntry
         {
             TimestampTicks = eh.TimestampTicks,
             Level          = (LogLevel)eh.Level,
             TemplateIndex  = eh.TemplateIndex,
-            // v3 entries predate the flag and their byte 13 was never written: never unpooled.
-            Unpooled       = layout != EntryLayout.V3 && (eh.Flags & EntryFlagUnpooled) != 0,
+            Unpooled       = unpooled,
             // Only v5 on has the field. A v4 entry's bytes 20-23 are its checksum and its flag bits
             // past bit 0 were reserved, so it names no service whatever they hold.
             ServiceIndex   = layout >= EntryLayout.V5 && (eh.Flags & EntryFlagService) != 0 ? eh.ServiceIndex : -1,
             TraceIdHi      = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace)      : 0,
             TraceIdLo      = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 8)  : 0,
             SpanId         = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 16) : 0,
-            Template       = inlineLen != 0 ? Encoding.UTF8.GetString(inlineSpan[4..]) : null,
+            Template       = template,
             Payload        = payload,
             Exception      = exception,
         };
@@ -1046,11 +1110,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
             int headerSize = HeaderSizeOf(layout);
             var  entries = new List<WalEntry>();
+            var  longTemplates = new Dictionary<ushort, string>();
             long pos     = 0;
             long end     = writeOffset;
             while (pos + headerSize <= end)
             {
-                if (!TryParseEntry(ptr, pos, end, layout, out var entry, out long entrySize))
+                if (!TryParseEntry(ptr, pos, end, layout, longTemplates, out var entry, out long entrySize))
                     break;
                 entries.Add(entry!);
                 pos += entrySize;
@@ -1071,10 +1136,10 @@ public sealed class WalEntry
     public ushort         TemplateIndex  { get; init; }
 
     /// <summary>
-    /// The event's template has no pool row: it was outside the template pool when it was logged
-    /// (or, v6, longer than a row holds). <see cref="TemplateIndex"/> is then 0 and names nothing.
-    /// A v6 entry carries the text in <see cref="Template"/>; an older one never stored it, and the
-    /// event is recovered with no template.
+    /// The event's template has no pool row to resolve: it was outside the template pool when it was
+    /// logged, or (v6) longer than a row holds. <see cref="TemplateIndex"/> then names nothing to
+    /// resolve. A v6 log gives the text in <see cref="Template"/>; an older one never stored it, and
+    /// the event is recovered with no template.
     /// </summary>
     public bool           Unpooled       { get; init; }
 
@@ -1095,9 +1160,10 @@ public sealed class WalEntry
     public ulong          SpanId         { get; init; }
 
     /// <summary>
-    /// The event's template text, carried in the entry itself (v6, InlineTemplate) because no pool
-    /// row could carry it — the template was outside the pool, or longer than a row holds. Null
-    /// otherwise: the template, if any, is <see cref="TemplateIndex"/>'s pool row.
+    /// The event's template text where no pool row could carry it (v6, InlineTemplate): one outside
+    /// the pool, from the entry itself; one longer than a row holds, from the first entry of the log
+    /// to use its index — every entry of that index gets the same string. Null otherwise: the
+    /// template, if any, is <see cref="TemplateIndex"/>'s pool row.
     /// </summary>
     public string?        Template       { get; init; }
 

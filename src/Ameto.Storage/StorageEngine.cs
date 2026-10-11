@@ -5298,6 +5298,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// or an exception on one level, between the first move and the last was silent, total loss
     /// of the rest of the tier.</para>
     /// </summary>
+    /// <summary>
+    /// Test seam: called with each orphaned WAL's path just before the startup replay reads it —
+    /// throwing from it is a read that failed. An <see cref="AsyncLocal{T}"/>, as
+    /// <see cref="HoldCatalogScanForTest"/> is: the replay runs in the constructor, before a test
+    /// could set anything on the instance. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> BeforeWalReplayReadForTest = new();
+
     private void ReplayOrphanedWals()
     {
         foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
@@ -5322,6 +5330,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     private void ReplayOrphanedWal(string walFile)
     {
+        // The block the file is NAMED after is spent before a byte of it is read. It used to be
+        // reserved only once a read had worked (from the header, below — still done), so a read that
+        // failed — out of memory, the file held by a scanner — left it free: the first WAL this run
+        // opened could be handed that block, and with it the same file name. It reopened the file,
+        // appended after the entries no replay had read, and its own flush deleted them:
+        // acknowledged events lost. The file is now left for the next start whatever happens here.
+        if (TryParseBlockId(walFile, out ulong namedBlock)) ReserveWalBlock(namedBlock);
+        BeforeWalReplayReadForTest.Value?.Invoke(walFile);
+
         string poolPath   = walFile + ".pool";
         var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version, out bool recordsEntries);
 

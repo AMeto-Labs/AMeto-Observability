@@ -481,17 +481,25 @@ public sealed class IngestWriteAndSpillTests : IDisposable
                     TimestampUtcTicks = T0 + (First + 1) * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
                     MessageTemplatePoolIndex = longIdx, ServiceNamePoolIndex = -1,
                 }, Props(First + 1), longTmpl, exception: null);
-                Assert.Equal(new LogBatchWriteResult(2, 0, 0), await engine.WriteBatchAsync(spilled, HangGuard));
+                // The same long template again: the spill file holds it once, in the entry above, and
+                // this one's entry names its index alone.
+                spilled.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + (First + 2) * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = longIdx, ServiceNamePoolIndex = -1,
+                }, Props(First + 2), longTmpl, exception: null);
+                Assert.Equal(new LogBatchWriteResult(3, 0, 0), await engine.WriteBatchAsync(spilled, HangGuard));
             }
-            Assert.Equal(2, engine.SpilledEvents);
+            Assert.Equal(3, engine.SpilledEvents);
 
             gate.Set();
-            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == 2,
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == 3,
                     "the spill to end and its block to be despilled");
 
             var events = ReadAll(engine);
             Assert.Equal(unpooled, events[First].Template);
             Assert.Equal(longTmpl, events[First + 1].Template);
+            Assert.Equal(longTmpl, events[First + 2].Template);
         }
         finally
         {
