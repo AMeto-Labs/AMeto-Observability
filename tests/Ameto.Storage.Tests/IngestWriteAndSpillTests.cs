@@ -696,6 +696,44 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A wait for room that cannot even be set up — WaitAsync allocates, and a heap at its limit
+    /// refuses that too — does not escape the write. It used to, after the batch's prefix was
+    /// written: the request was answered 500 and the count of what was written lost. It counts as
+    /// a slice waited, so the batch still ends within its wait, and says what it did not write.
+    /// </summary>
+    [Fact]
+    public async Task A_wait_for_room_that_cannot_be_set_up_does_not_escape_the_write()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        var    gate   = HoldFirstFlush(engine);
+        int    waits  = 0;
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            engine._beforeRoomWaitForTest = () =>
+            {
+                Interlocked.Increment(ref waits);
+                throw new OutOfMemoryException("test: no memory to set up the wait");
+            };
+            using var b = Batch(engine, TierEvents, TierEvents + 10);   // B takes a tier's worth, then has no room
+            var result = await engine.WriteBatchAsync(b, TimeSpan.FromMilliseconds(500)).AsTask().WaitAsync(ShortGuard);
+
+            Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 10), result);
+            Assert.InRange(Volatile.Read(ref waits), 1, 10);   // a slice counted for each, so the 500 ms ran out
+        }
+        finally
+        {
+            engine._beforeRoomWaitForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A swap that fails ─────────────────────────────────────────────────────
 
     /// <summary>One event outside every batch here, for a write that only has to be refused.</summary>

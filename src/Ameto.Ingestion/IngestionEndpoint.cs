@@ -231,9 +231,18 @@ public sealed class IngestionEndpoint
         int clientUnsent   = r.NotWritten - markersUnsent;
         int dropped        = batch.DroppedAtDoor + r.Refused + clientUnsent;
 
-        if (r.NotWritten > 0)
-            _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
-                r.NotWritten, staged.Count, _backPressureWait);
+        // Best-effort, and never the request's failure: this runs after the write, and a log call that
+        // ran out of memory here (its arguments box) made a batch the store had partly written a 500,
+        // with the count of what it wrote lost and a Seq client's retry writing that part twice.
+        if (r.NotWritten > 0 && _logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            try
+            {
+                _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
+                    r.NotWritten, staged.Count, _backPressureWait);
+            }
+            catch (Exception) { /* the line is lost; the answer is not */ }
+        }
 
         // Nothing written, and some of the client's events were waiting: the caller answers "retry
         // later", and the retry duplicates nothing. Nothing at all, markers included: they come

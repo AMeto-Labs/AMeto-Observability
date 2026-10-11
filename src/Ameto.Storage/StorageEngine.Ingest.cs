@@ -193,18 +193,31 @@ public sealed partial class StorageEngine
             long slice = outcome == WriteOutcome.Faulted
                 ? (long)_roomRecheckMs << Math.Min(faults - 1, 6)
                 : _roomRecheckMs;
-            long began = Environment.TickCount64;
+            long began     = Environment.TickCount64;
+            long thisSlice = Math.Min(left, slice);
+            bool waitFailed = false;
             try
             {
                 // In slices: a slice that ends without a signal goes round and writes again, and the
                 // write that finds no room asks for the swap again. A request is no longer dropped
                 // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
                 // the wake-ups, not what they rest on.
-                await room.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(left, slice)), ct).ConfigureAwait(false);
+                _beforeRoomWaitForTest?.Invoke();
+                await room.WaitAsync(TimeSpan.FromMilliseconds(thisSlice), ct).ConfigureAwait(false);
             }
             catch (TimeoutException) { /* write again */ }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            waitedMs += Environment.TickCount64 - began;
+            catch (Exception)
+            {
+                // The wait itself could not be set up — WaitAsync allocates, and a heap at its limit
+                // refuses that too. It used to escape here, after events may already have been
+                // written: the request was answered 500 and the count of what was written lost. It is
+                // counted as a slice waited, so a store that cannot even wait still ends within its
+                // budget, and the batch goes round and writes again.
+                waitFailed = true;
+            }
+            long elapsed = Environment.TickCount64 - began;
+            waitedMs += waitFailed ? Math.Max(elapsed, thisSlice) : elapsed;
         }
 
         int notWritten = batch.Count - next;
@@ -467,6 +480,9 @@ public sealed partial class StorageEngine
 
     /// <summary>Test hook: a swap or shutdown found <see cref="_writerLock"/> held and is about to wait for it.</summary>
     internal Action? _onWaitingForWriterLock;
+
+    /// <summary>Test hook: a writer with no room is about to wait for it; throwing from it is a wait that could not be set up.</summary>
+    internal Action? _beforeRoomWaitForTest;
 
     // ── Ingest counters (/api/diagnostics) ────────────────────────────────────
 

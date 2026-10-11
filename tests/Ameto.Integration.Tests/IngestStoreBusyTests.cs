@@ -189,6 +189,43 @@ public sealed class IngestStoreBusyTests : IDisposable
         Assert.Equal(1, accepting.DroppedOversized);
     }
 
+    /// <summary>
+    /// The Debug line that says what the store did not write runs after the write, and is no reason
+    /// to fail the request: one that ran out of memory there (its arguments box) made the answer a
+    /// 500 — for a batch the store had partly written, with the count of that part lost, and a Seq
+    /// client's retry writing it twice. Here the store takes nothing, so the answer is the 503.
+    /// </summary>
+    [Fact]
+    public async Task A_log_line_that_runs_out_of_memory_after_the_write_does_not_cost_the_answer()
+    {
+        var opts    = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        var storage = Engine(opts);
+        await storage.DisposeAsync();   // takes nothing
+
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, new OutOfMemoryOnDebug());
+        var ctx      = Post(Clef(3));
+
+        await endpoint.HandleAsync(ctx);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, ctx.Response.StatusCode);
+        Assert.Equal((0, 3), Counts(ctx));
+    }
+
+    /// <summary>Throws an <see cref="OutOfMemoryException"/> from every Debug line.</summary>
+    private sealed class OutOfMemoryOnDebug : Microsoft.Extensions.Logging.ILogger<IngestionEndpoint>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Debug)
+                throw new OutOfMemoryException("test: the Debug line ran out of memory");
+        }
+    }
+
     private ServerOptions Options(TimeSpan backPressureWait)
     {
         Directory.CreateDirectory(_dir);
