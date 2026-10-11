@@ -863,13 +863,8 @@ public sealed partial class StorageEngine
         return tier;
     }
 
-    private void DeleteSpillFiles(SpillFile file)
-    {
-        try { File.Delete(file.Path); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete spill file {File}", file.Path); }
-        try { File.Delete(file.Path + ".pool"); } catch { /* best-effort */ }
-        try { File.Delete(FlushMarkerPath(file.SegId)); } catch { /* swept at startup */ }
-    }
+    /// <summary>The spill file, its pool and — once the file is gone, not before (see <see cref="DeleteLogAndMarker"/>) — its marker.</summary>
+    private void DeleteSpillFiles(SpillFile file) => DeleteLogAndMarker(file.Path, file.SegId);
 
     /// <summary>
     /// A tier that holds <paramref name="events"/> events of <paramref name="payloadBytes"/> payload

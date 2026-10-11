@@ -548,6 +548,92 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A flushed tier's WAL that cannot be deleted — held by a scanner, on Windows — keeps its
+    /// completion marker beside it. The marker used to go regardless, and the next start found the
+    /// WAL with none: it replayed the block and wrote again whatever level a merge had since taken
+    /// into another segment — the same events twice, for good. With the marker, that start only
+    /// deletes the WAL.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_that_cannot_be_deleted_after_its_flush_keeps_its_marker_for_the_next_start()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        var    engine = Engine(opts);
+        string wal, marker;
+        try
+        {
+            using (var a = Batch(engine, 0, 100))
+                Assert.Equal(new LogBatchWriteResult(100, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            ulong block = engine.LiveWalSegmentId;
+            wal    = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.wal");
+            marker = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.flushed");
+            engine._deleteWalFile = p =>
+            {
+                if (p == wal) throw new IOException("test: the file is held by a scanner");
+                File.Delete(p);
+            };
+
+            await engine.FlushHotTierAsync();
+
+            Assert.True(File.Exists(wal), "the WAL was deleted after all");
+            Assert.True(File.Exists(marker), "the marker went though its WAL stayed");
+        }
+        finally
+        {
+            engine._deleteWalFile = File.Delete;
+            await engine.DisposeAsync();
+        }
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        Assert.False(File.Exists(wal));
+        Assert.False(File.Exists(marker));
+        Assert.Equal(100, ReadAll(next).Count);
+    }
+
+    /// <summary>The same for a despilled block whose spill file cannot be deleted.</summary>
+    [Fact]
+    public async Task A_spill_file_that_cannot_be_deleted_after_its_despill_keeps_its_marker_for_the_next_start()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        var    engine = OneSlotEngine(opts);
+        var    gate   = HoldFirstFlush(engine);
+        engine._deleteWalFile = p =>
+        {
+            if (p.EndsWith(StorageEngine.SpillExtension, StringComparison.Ordinal)) throw new IOException("test: the file is held by a scanner");
+            File.Delete(p);
+        };
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the spilled block to be despilled");
+
+            string spill = Assert.Single(Directory.GetFiles(Path.Combine(dir, "wal"), "*" + StorageEngine.SpillExtension));
+            Assert.True(File.Exists(Path.ChangeExtension(spill, ".flushed")), "the marker went though its spill file stayed");
+        }
+        finally
+        {
+            gate.Set();
+            engine._deleteWalFile = File.Delete;
+            await engine.DisposeAsync();
+        }
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        WaitFor(() => Directory.GetFiles(Path.Combine(dir, "wal"), "*" + StorageEngine.SpillExtension).Length == 0,
+                "the next start to delete the spill file against its marker");
+        Assert.Equal(0, next.DespilledEvents);    // deleted, not despilled again
+        Assert.Equal(Total, ReadAll(next).Count); // and no event twice
+    }
+
+    /// <summary>
     /// The swap that ends a spill commits the frozen tier to its heavy phase: once the tier is
     /// frozen, counted and listed, the flush owns the slot and the count. Ending the spill used to
     /// run inside the try whose catch means "nothing was swapped", so a throw there — the close's

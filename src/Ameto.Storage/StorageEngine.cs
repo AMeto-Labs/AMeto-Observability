@@ -2632,20 +2632,40 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         foreach (var w in written) SegmentFlushed?.Invoke(w);
 
-        if (oldWalPath is not null)
-        {
-            try { File.Delete(oldWalPath); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
-            try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
-            // The marker is what AUTHORISES the delete above, so it outlives it: dropping
-            // it first would leave a WAL that recovery has to replay to find out its
-            // levels are all published. A crash in between leaves a marker with no WAL,
-            // which the startup sweep clears.
-            try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
-        }
+        if (oldWalPath is not null) DeleteLogAndMarker(oldWalPath, reservedSegId);
 
         RetireHotTier(oldHot);
     }
+
+    /// <summary>
+    /// Deletes a flushed block's log — a WAL, or a spill file — with its pool, and then its
+    /// completion marker, but only once the log is gone.
+    ///
+    /// <para>The marker is what AUTHORISES the delete, so it outlives it: dropping it first would
+    /// leave a log that recovery has to replay to find out its levels are all published. A crash in
+    /// between leaves a marker with no log, which the startup sweep clears. And it outlives a delete
+    /// that FAILED — a scanner holding the file on Windows, say: the marker used to go regardless,
+    /// and the next start then found the log with no marker and wrote its block again, where a merge
+    /// may since have taken a level into another segment — the same events twice, for good. With
+    /// the marker kept, that start finds the block published and only deletes the log.</para>
+    /// </summary>
+    private void DeleteLogAndMarker(string logPath, ulong segId)
+    {
+        bool gone = true;
+        try { _deleteWalFile(logPath); }
+        catch (Exception ex)
+        {
+            gone = !File.Exists(logPath);
+            if (!gone)
+                _logger.LogWarning(ex, "Failed to delete {Path} — its completion marker is kept, and the next start deletes both", logPath);
+        }
+        try { _deleteWalFile(logPath + ".pool"); } catch { /* best-effort */ }
+        if (gone)
+            try { File.Delete(FlushMarkerPath(segId)); } catch { /* swept at startup */ }
+    }
+
+    /// <summary>Test seam: deletes a flushed block's log file and its pool. <see cref="File.Delete"/> in production.</summary>
+    internal Action<string> _deleteWalFile = File.Delete;
 
     /// <summary>
     /// Background retry for a frozen tier whose flush failed. Owns the tier's back-pressure
@@ -5494,9 +5514,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (File.Exists(marker))
         {
             _logger.LogInformation("WAL {File} already flushed — removing", walFile);
-            try { File.Delete(walFile); } catch { }
-            try { File.Delete(poolPath); } catch { }
-            try { File.Delete(marker); } catch { }
+            DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
             return;
         }
 
@@ -5611,9 +5629,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
         // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
 
-        try { File.Delete(walFile); } catch { }
-        try { File.Delete(poolPath); } catch { }
-        try { File.Delete(FlushMarkerPath(segId)); } catch { }
+        DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
     }
 
     // ── Segment-id allocator ──────────────────────────────────────────────────
