@@ -717,20 +717,31 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// </param>
     private void FlushPool(bool walFailed)
     {
+        // The fsync runs OFF _poolLock: an append that needs a new row takes that lock with the
+        // engine's writer lock held, and it used to wait out the tick's fsync there — every writer
+        // with it. Under the lock only the claim: every row so far is in the OS (EnsurePoolRow
+        // flushes the stream's buffer under this lock, and the handle's getter flushes it again), so
+        // the fsync of the handle makes them durable; a row written meanwhile dirties the pool again
+        // for the next tick, and a failed fsync gives the claim back.
+        Microsoft.Win32.SafeHandles.SafeFileHandle handle;
         lock (_poolLock)
         {
             if (!_poolDirty || _poolStream is null) return;
-            try
-            {
-                if (PoolFlushHookForTest is { } hook) hook(_poolStream);
-                else _poolStream.Flush(flushToDisk: true);
-                // Cleared only on success. Rows are written under this same lock, so nothing
-                // can dirty the pool between the fsync returning and this line.
-                _poolDirty = false;
-                Interlocked.Increment(ref _poolFlushCount);
-            }
-            catch (IOException) { /* retried next interval */ }
-            catch when (walFailed) { /* retried next interval; the WAL's exception is the one reported */ }
+            handle     = _poolStream.SafeFileHandle;
+            _poolDirty = false;
+        }
+        try
+        {
+            if (PoolFlushHookForTest is { } hook) hook(handle);
+            else RandomAccess.FlushToDisk(handle);
+            Interlocked.Increment(ref _poolFlushCount);
+        }
+        catch (ObjectDisposedException) { /* disposed meanwhile: Dispose fsyncs the pool itself */ }
+        catch (Exception ex)
+        {
+            lock (_poolLock) _poolDirty = true;
+            if (ex is IOException || walFailed) return;   // retried next interval; a WAL failure is the one reported
+            throw;
         }
     }
 
@@ -829,11 +840,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     internal long PoolFlushCount => Interlocked.Read(ref _poolFlushCount);
 
     /// <summary>
-    /// Test seam: when set, <see cref="Flush"/> calls this instead of the pool's
-    /// <c>Flush(flushToDisk: true)</c>, so a test can watch or fail the pool fsync.
-    /// Never set in production.
+    /// Test seam: when set, <see cref="Flush"/> calls this with the pool file's handle instead of
+    /// fsyncing it (<see cref="RandomAccess.FlushToDisk"/>), off <see cref="_poolLock"/>, so a test
+    /// can watch, hold or fail the pool fsync. Never set in production.
     /// </summary>
-    internal Action<FileStream>? PoolFlushHookForTest;
+    internal Action<Microsoft.Win32.SafeHandles.SafeFileHandle>? PoolFlushHookForTest;
 
     /// <summary>
     /// Absolute file offset up to which this WAL is durable: msynced AND its file handle
@@ -1057,7 +1068,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _mapLock.EnterWriteLock();
         try
         {
-            Unmap();
+            // Without writing the old view back: that is a write-back of the whole view, which held the
+            // appender (and every writer behind it) 4-30 ms here and far longer on a slow disk. Its
+            // pages are the file's — the next view maps the same ones — and the next tick writes back
+            // the range from its watermark, from the new view, and fsyncs the file, as it always does.
+            Unmap(writeBack: false);
             try
             {
                 _fileStream!.SetLength(newFileSize);
@@ -1102,11 +1117,19 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _ptr);
     }
 
-    private void Unmap()
+    /// <param name="writeBack">
+    /// Whether to write the view back as it goes — what disposing the accessor does (FlushViewOfFile,
+    /// msync), for the whole view. False unmaps it as it is, its dirty pages left to the file's cache.
+    /// </param>
+    private void Unmap(bool writeBack = true)
     {
         if (_accessor is not null)
         {
             _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+            if (writeBack) UnmapWriteBackForTest?.Invoke();
+            // Closing the view's handle first unmaps it with no write-back: the accessor's dispose
+            // writes a view back only while it is still open.
+            else _accessor.SafeMemoryMappedViewHandle.Dispose();
             _accessor.Dispose();
         }
         _mmf?.Dispose();
@@ -1114,6 +1137,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _mmf      = null;
         _ptr      = null;
     }
+
+    /// <summary>Test seam: runs as an unmap writes the whole view back (a dispose's, not a grow's). Null in production.</summary>
+    internal Action? UnmapWriteBackForTest;
 
     // ── Dispose ──────────────────────────────────────────────────────────────
 

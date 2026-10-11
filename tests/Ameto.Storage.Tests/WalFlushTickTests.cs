@@ -116,6 +116,7 @@ public sealed class WalFlushTickTests : IDisposable
     {
         var wal = Open();
         wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1 });
+        long claimed = wal.WrittenBytes + 32;   // what the tick below claims: the file offset written before it
         using var inWriteBack = new ManualResetEventSlim(false);
         using var release     = new ManualResetEventSlim(false);
         if (TicksWriteTheViewBack)
@@ -261,7 +262,7 @@ public sealed class WalFlushTickTests : IDisposable
             // quietly), so the idle second tick has to reach the pool again past a handle flush
             // that throws again.
             if (++poolAttempts == 1) throw new IOException("simulated pool fsync failure");
-            h.Flush(flushToDisk: true);
+            RandomAccess.FlushToDisk(h);
         };
 
         wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl-a", new byte[] { 1, 2, 3 });
@@ -311,7 +312,7 @@ public sealed class WalFlushTickTests : IDisposable
         wal.PoolFlushHookForTest = h =>
         {
             if (failing) throw new UnauthorizedAccessException("simulated pool fsync failure");
-            h.Flush(flushToDisk: true);
+            RandomAccess.FlushToDisk(h);
         };
 
         wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
@@ -342,7 +343,7 @@ public sealed class WalFlushTickTests : IDisposable
         wal.PoolFlushHookForTest = h =>
         {
             if (failPool) { failPool = false; throw new UnauthorizedAccessException("simulated pool fsync failure"); }
-            h.Flush(flushToDisk: true);
+            RandomAccess.FlushToDisk(h);
         };
 
         wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
