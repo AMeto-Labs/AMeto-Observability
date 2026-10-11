@@ -285,6 +285,37 @@ jobs:
             fi
           done
 
+      # THE LOG WAL'S FLUSH TICK, ON LINUX. A tick writes the appended tail back OFF the appender's
+      # lock, and how differs by platform: on Linux it issues no msync at all — a shared mapping's
+      # pages are the file's page cache, and the fsync that already ran outside the lock writes them —
+      # while the backend job above runs Windows' FlushViewOfFile outside the lock, under the view's
+      # read lock that a grow and a dispose wait for. The Linux road is production's (the Docker
+      # image, the stands), and no CI run took it. Same guard as above: each named fact must appear
+      # as Passed.
+      - name: Test the log WAL's flush tick (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~WalFlushTickTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee walflush-output.txt
+
+          for t in CleanTick_DoesNoIoAtAll \
+                   DirtyTick_FlushesTheWrittenRange_NotTheWholeMapping \
+                   TickAfterMoreAppends_FlushesAgain_AndOnlyTheNewTail \
+                   An_append_goes_through_while_a_tick_writes_the_mapping_back \
+                   A_grow_waits_out_a_tick_writing_the_old_view_back \
+                   A_dispose_waits_out_a_tick_writing_the_view_back \
+                   FailedHandleFlush_IsRetriedByTheNextIdleTick \
+                   FlushedEntriesSurviveAndReplay \
+                   ReopenedWal_DoesNotReflushWhatIsAlreadyOnDisk \
+                   FlushAcrossAGrow_StillReplaysEverything; do
+            if ! grep -q "Passed Ameto.Storage.Tests.WalFlushTickTests.$t" walflush-output.txt; then
+              echo "::error::WalFlushTickTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
       # LOG-MERGE RECOVERY, ON LINUX. The recovery sweep's verdicts and the pin that keeps a waiting
       # merge's sources out of new merges (#98, #120, #129) are logic that does not depend on the
       # platform, but the roads to them were opened, in their first tests, by Windows share modes

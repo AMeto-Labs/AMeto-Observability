@@ -73,8 +73,9 @@ namespace Ameto.Storage;
 /// The WAL is append-only. On crash recovery, the storage layer replays complete entries
 /// and rebuilds the hot-tier up to the last entry whose checksum verifies.
 ///
-/// Durability: appends land in the OS page cache; <see cref="Flush"/> msyncs the mapping
-/// (StorageEngine drives it on a timer) and rotation/dispose flush the view. Per-entry
+/// Durability: appends land in the OS page cache; <see cref="Flush"/> writes the mapping back and
+/// flushes the file handle, both off the appender's lock (StorageEngine drives it on a timer), and
+/// rotation/dispose flush the view. Per-entry
 /// CRC32C means a crash mid-write-back — pages reaching disk in any order — truncates
 /// replay at the first torn entry instead of manufacturing garbage events.
 /// </summary>
@@ -531,17 +532,18 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // ── Durability ───────────────────────────────────────────────────────────
 
     /// <summary>
-    /// msyncs the bytes appended since the previous tick and fsyncs the template pool if it
-    /// grew. Called on a timer by the storage engine: acknowledged events are durable within
-    /// one interval of power loss instead of "whenever the OS writes back" (up to the tier's
-    /// whole life).
+    /// Writes back the bytes appended since the previous tick, fsyncs the file, and fsyncs the
+    /// template pool if it grew. Called on a timer by the storage engine: acknowledged events are
+    /// durable within one interval of power loss instead of "whenever the OS writes back" (up to
+    /// the tier's whole life).
     ///
     /// <para>Three things this does NOT do any more. It does not msync the WHOLE mapping —
     /// <c>MemoryMappedViewAccessor.Flush</c> hands FlushViewOfFile/msync the entire 64 MB+
     /// view, and that cost scales with the mapping, not with what was written, so a tick that
     /// appended 40 KB walked 64 MB of page tables. It does not hold <see cref="_writeLock"/>
-    /// across the file-handle flush, which is the part that waits out the drive cache and the
-    /// part the single appender was stalled behind. And it does no I/O at all on a tick where
+    /// across the write-back or the file-handle flush, which are what wait for the disk and what
+    /// the single appender was stalled behind (see <see cref="FlushTail"/>; on Linux the tick
+    /// issues no msync at all — the fsync writes the mapping's pages). And it does no I/O at all on a tick where
     /// nothing was appended since the last SUCCESSFUL flush — the idle case, which used to
     /// msync and fsync regardless. A tick whose handle flush threw is not a success: the
     /// following tick repeats it even if nothing new arrived.</para>
@@ -575,43 +577,69 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         }
     }
 
-    /// <summary>The WAL half of <see cref="Flush"/>: msync the un-synced tail, then flush the file handle.</summary>
+    /// <summary>
+    /// The WAL half of <see cref="Flush"/>: write the un-synced tail of the mapping back, then flush
+    /// the file handle — both OUTSIDE <see cref="_writeLock"/>, which only fixes the range.
+    ///
+    /// <para>The view's write-back used to run under the lock, and the appender waited it out: on
+    /// Linux that was msync(MS_SYNC), which waits for the I/O itself. On Linux it is not issued at
+    /// all now — a shared mapping's pages are the file's page cache, and the fsync below writes
+    /// them, header page included. Elsewhere (FlushViewOfFile only queues the pages to the file
+    /// system; the handle flush then waits for the drive) it runs under the read side of
+    /// <see cref="_mapLock"/>, which <see cref="Grow"/> and <see cref="Dispose"/> take for writing
+    /// before they unmap: a write-back never runs on a view being torn down, and they wait one out.
+    /// An append landing meanwhile is safe to race: the watermark claims only the range fixed under
+    /// the lock, whose entries were complete, and a page caught half-written past it is written
+    /// again by the next tick — or, after a power loss, cut at its entry's checksum.</para>
+    /// </summary>
     private void FlushTail()
     {
-        FileStream? handle   = null;
-        long        writeEnd = 0;
+        FileStream? handle;
+        long        from, writeEnd;
         lock (_writeLock)
         {
             if (_disposed || _accessor is null) return;
 
             writeEnd = FileHeaderSize + _writeOffset;
-            if (writeEnd > _lastFlushedOffset)
-            {
-                if (!TryFlushRange(_lastFlushedOffset, writeEnd))
-                {
-                    // Correct, just slower — and silent, which is the trap: a platform where
-                    // the range call always fails would msync the whole mapping every tick
-                    // for ever and look exactly like a working one. The counter records it,
-                    // but only tests read it today. The WAL has no logger and no diagnostics
-                    // surface exposes the counter, so on a live host this is still invisible.
-                    // Surfacing it (a log once, or a StorageEngine diagnostic) is follow-up work.
-                    Interlocked.Increment(ref _rangeFlushFailures);
-                    _accessor.Flush();     // fallback: whole view, as before
-                }
+            if (writeEnd <= _lastFlushedOffset) return;
 
-                // The watermark is NOT advanced here. It means "durable up to", and nothing is
-                // durable until the handle flush below returns. Advancing it first made a failed
-                // FlushFileBuffers permanent while the WAL sat idle: the next tick saw
-                // writeEnd == watermark and did nothing, so the acknowledged tail stayed in the
-                // drive cache until another event arrived or the WAL rotated.
-                handle = _fileStream;
+            // The watermark is NOT advanced here. It means "durable up to", and nothing is
+            // durable until the handle flush below returns. Advancing it first made a failed
+            // FlushFileBuffers permanent while the WAL sat idle: the next tick saw
+            // writeEnd == watermark and did nothing, so the acknowledged tail stayed in the
+            // drive cache until another event arrived or the WAL rotated.
+            from   = _lastFlushedOffset;
+            handle = _fileStream;
+        }
+
+        if (!OperatingSystem.IsLinux())
+        {
+            _mapLock.EnterReadLock();
+            try
+            {
+                if (_ptr is not null)   // unmapped since: by Dispose, which writes it back itself, or a failed grow
+                {
+                    ViewFlushHookForTest?.Invoke();
+                    if (!TryFlushRange(from, writeEnd))
+                    {
+                        // Correct, just slower — and silent, which is the trap: a platform where
+                        // the range call always fails would msync the whole mapping every tick
+                        // for ever and look exactly like a working one. The counter records it,
+                        // but only tests read it today. The WAL has no logger and no diagnostics
+                        // surface exposes the counter, so on a live host this is still invisible.
+                        // Surfacing it (a log once, or a StorageEngine diagnostic) is follow-up work.
+                        Interlocked.Increment(ref _rangeFlushFailures);
+                        _accessor?.Flush();     // fallback: whole view, as before
+                    }
+                }
             }
+            finally { _mapLock.ExitReadLock(); }
         }
 
         // Outside the lock on purpose: FlushViewOfFile only queues the pages to the
         // filesystem, FlushFileBuffers is what waits for the drive — milliseconds on a
-        // spinning disk, and the appender has no reason to wait with it. On Linux the
-        // msync above is already MS_SYNC and this fsync is cheap.
+        // spinning disk, and the appender has no reason to wait with it. On Linux this fsync
+        // is the whole write-back: it writes the mapping's dirty pages and waits for them.
         if (handle is not null)
         {
             // Dispose may have closed the handle between the lock and here (rotation runs
@@ -958,23 +986,46 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         long newCapacity = _spill ? required : Math.Max(oldCapacity * 2, required);
         long newFileSize = FileHeaderSize + newCapacity;
 
-        Unmap();
+        // Waits out a tick writing the old view back (FlushTail, off the write lock) before the view
+        // goes: the write-back must not run on an unmapped range.
+        _mapLock.EnterWriteLock();
         try
         {
-            _fileStream!.SetLength(newFileSize);
-            Map(newFileSize);
-            _capacity = newCapacity;
+            Unmap();
+            try
+            {
+                _fileStream!.SetLength(newFileSize);
+                Map(newFileSize);
+                _capacity = newCapacity;
+            }
+            catch
+            {
+                // Undo the extension if it landed, then restore the old mapping. If even
+                // that fails, _ptr stays null and Append's guard throws instead of faulting.
+                try { if (_fileStream!.Length != oldFileSize) _fileStream.SetLength(oldFileSize); }
+                catch { /* keep the original exception */ }
+                Map(oldFileSize);
+                throw;
+            }
         }
-        catch
-        {
-            // Undo the extension if it landed, then restore the old mapping. If even
-            // that fails, _ptr stays null and Append's guard throws instead of faulting.
-            try { if (_fileStream!.Length != oldFileSize) _fileStream.SetLength(oldFileSize); }
-            catch { /* keep the original exception */ }
-            Map(oldFileSize);
-            throw;
-        }
+        finally { _mapLock.ExitWriteLock(); }
     }
+
+    /// <summary>
+    /// The view, as the ticks' write-back reads it (FlushTail, off <see cref="_writeLock"/>) against
+    /// <see cref="Grow"/> and <see cref="Dispose"/>, which unmap it: they take it for writing, under
+    /// the write lock, and the write-back for reading, outside it — so neither ever waits on the
+    /// other while holding what the other needs. Never disposed: a tick that raced a dispose to it
+    /// would meet an ObjectDisposedException, and it holds no handle until a wait creates one.
+    /// </summary>
+    private readonly ReaderWriterLockSlim _mapLock = new(LockRecursionPolicy.NoRecursion);
+
+    /// <summary>
+    /// Test seam: called by a tick inside the view's write-back, outside <see cref="_writeLock"/> and
+    /// under the read side of <see cref="_mapLock"/> — blocking it holds a write-back in flight. Not
+    /// reached on Linux, where the tick issues none. Never set in production.
+    /// </summary>
+    internal Action? ViewFlushHookForTest;
 
     private void Map(long fileSize)
     {
@@ -1012,7 +1063,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            Unmap(); // the view flushes dirty pages on dispose
+            // A tick writing the view back off the write lock is waited out first (see _mapLock).
+            _mapLock.EnterWriteLock();
+            try { Unmap(); } // the view flushes dirty pages on dispose
+            finally { _mapLock.ExitWriteLock(); }
             // A spill file is cut to what it holds once nothing maps it (a mapped file cannot
             // shrink on Windows). It closes long before its pre-size is used — a block closes at the
             // tier's first refusal, ~9 MB of 600 B events in a ~74 MB file — and NTFS allocates the
