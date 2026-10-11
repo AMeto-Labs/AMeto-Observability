@@ -315,9 +315,11 @@ jobs:
               exit 1
             fi
           done
-          # The appender's path (round-3 R3-1): the pool's fsync off its lock, and a grow's unmap
-          # without the view's write-back (munmap here, UnmapViewOfFile on Windows).
+          # The appender's path (round-3 R3-1): the pool's fsync off its lock (and a dispose closing the
+          # pool under it), and a grow's unmap without the view's write-back (munmap here,
+          # UnmapViewOfFile on Windows).
           for t in An_append_that_needs_a_new_pool_row_goes_through_while_a_tick_fsyncs_the_pool \
+                   A_dispose_while_a_tick_fsyncs_the_pool_is_not_the_ticks_error \
                    A_grow_unmaps_the_old_view_without_writing_it_back; do
             if ! grep -q "Passed Ameto.Storage.Tests.WalWriterPathTests.$t" walflush-output.txt; then
               echo "::error::WalWriterPathTests.$t did not run and pass on Linux; the filter no longer reaches it."

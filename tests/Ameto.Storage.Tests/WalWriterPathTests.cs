@@ -60,6 +60,38 @@ public sealed class WalWriterPathTests : IDisposable
     }
 
     /// <summary>
+    /// The new path the pool fsync off its lock adds: a dispose can now close the pool while a tick's
+    /// fsync of it is in flight (it used to wait for the lock the fsync held). The dispose fsyncs the
+    /// pool itself, so the tick's fsync finding the handle closed is not an error — the flush loop
+    /// would log it as one at every shutdown — and the row is in the file.
+    /// </summary>
+    [Fact]
+    public void A_dispose_while_a_tick_fsyncs_the_pool_is_not_the_ticks_error()
+    {
+        var wal = WriteAheadLog.Open(_path, new NodeId(0), new SegmentId(1UL), initialCapacity: 1024 * 1024);
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl-a", new byte[] { 1 });   // a row: the pool is dirty
+
+        using var inFsync  = new ManualResetEventSlim(false);
+        using var disposed = new ManualResetEventSlim(false);
+        wal.PoolFlushHookForTest = h =>
+        {
+            inFsync.Set();
+            disposed.Wait(HangGuard);       // the dispose closes the pool under the fsync's claim
+            RandomAccess.FlushToDisk(h);
+        };
+        var tick = Task.Run(wal.Flush);
+        try
+        {
+            Assert.True(inFsync.Wait(HangGuard), "the tick never reached the pool's fsync");
+            wal.Dispose();
+        }
+        finally { disposed.Set(); }
+
+        tick.Wait(HangGuard);   // a closed pool is not the tick's failure
+        Assert.Single(WriteAheadLog.LoadPool(_path + ".pool"));
+    }
+
+    /// <summary>
     /// A grow unmaps the old view without writing it back: that write-back covered the whole view,
     /// under the write lock the appender holds. Its pages are the file's, the new view maps the same
     /// ones, and the next tick writes back the range from its watermark and fsyncs, as it always does:
