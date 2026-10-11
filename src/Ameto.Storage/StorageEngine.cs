@@ -5970,9 +5970,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// handed out, and refusing the whole span costs nothing a correct deployment can notice: a
     /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
     /// deployment error the 409 exists to report.</para>
+    ///
+    /// <para>An id past <see cref="MaxUsableBlockId"/> is claimed with no raise: the allocator
+    /// never reaches it, so the two stay disjoint without one — and the raise, <c>id + 1</c>, wrapped
+    /// the floor past zero for an id at the end of the id space (the blocks handed out next were
+    /// ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>).</para>
     /// </summary>
     private bool TryClaimLocalSegmentId(ulong id)
     {
+        if (!IsUsableBlockId(id)) return true;
         lock (_segIdLock)
         {
             if (id < _nextSegmentId) return false;

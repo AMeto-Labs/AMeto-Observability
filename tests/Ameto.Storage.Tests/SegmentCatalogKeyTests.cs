@@ -427,6 +427,32 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-3 review R2-2, the import's own-identity road. A segment wearing THIS node's id claims
+    /// its id from the allocator, which set the floor to id + 1 unchecked: an id near the end of
+    /// the id space put the floor there, and the blocks handed out next wrapped past zero onto ids
+    /// already used. Past the last usable block id the allocator never reaches it, so the import
+    /// takes it with no raise, and the next blocks follow the ones before.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_wearing_our_identity_with_an_id_past_the_last_usable_one_wraps_nothing()
+    {
+        const ulong Past = ulong.MaxValue - 2;
+        long  now  = DateTime.UtcNow.Ticks;
+        ulong prev = _engine.LiveWalSegmentId;
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(WritePeerSegment(NodeId.Local, Past, now)));
+
+        for (int swap = 0; swap < 2; swap++)
+        {
+            Write(5, now);
+            await _engine.FlushHotTierAsync();   // the next WAL takes the next block
+            ulong next = _engine.LiveWalSegmentId;
+            Assert.InRange(next, prev + 1, Past - 1);
+            prev = next;
+        }
+    }
+
+    /// <summary>
     /// The one ambiguity the key cannot resolve — two nodes CONFIGURED with the same NodeId — and
     /// therefore the last place in the engine where registering a segment could still remove one.
     /// The import used to log a warning saying, correctly, that "one of the two files will not be
