@@ -6516,6 +6516,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try { await _despillLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            // A loop that died anyway (it survives its own failures now) must not stop the teardown here,
+            // before the final flush: its blocks are on disk for the next start.
+            try { _logger.LogError(ex, "The despill loop had failed; shutdown goes on"); } catch { /* the line is lost */ }
+        }
         // Deferred segment deletes: cancellation ends the retry loop's delay at once, so this
         // waits out at most one pass in progress, never a backoff. Then one last attempt each;
         // what is still held stays on disk and the next start's retention pass expires it again.

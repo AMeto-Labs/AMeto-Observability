@@ -616,90 +616,126 @@ public sealed partial class StorageEngine
         {
             try { await _indexSinkWired.Task.WaitAsync(_indexSinkWait, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
-            catch (TimeoutException)
+            catch (Exception ex)
             {
-                _logger.LogWarning(
-                    "The index sink was not wired within {Wait}s of startup — spilled blocks are written into segments " +
-                    "without index sections until it is (their searches scan; a merge rebuilds the index)",
-                    _indexSinkWait.TotalSeconds);
+                // Timed out — or the wait could not even be set up (out of memory): either way the loop
+                // goes on without the sink rather than end, and says so (guarded: the line allocates).
+                try
+                {
+                    _logger.LogWarning(ex is TimeoutException ? null : ex,
+                        "The index sink was not wired within {Wait}s of startup — spilled blocks are written into segments " +
+                        "without index sections until it is (their searches scan; a merge rebuilds the index)",
+                        _indexSinkWait.TotalSeconds);
+                }
+                catch (Exception) { /* the line is lost; the loop is not */ }
             }
         }
 
         while (!ct.IsCancellationRequested)
         {
-            // The timeout is a safety net, not the cadence: every event that can make work possible
-            // wakes the signal — save a failed despill's retry time, which the wait is cut to.
-            try { await _despillSignal.WaitAsync(DespillWaitTimeout(), ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { return; }
-
-            while (!ct.IsCancellationRequested && Volatile.Read(ref _writesClosed) == 0)
+            try
             {
-                // The live tier comes first: a spill in progress, or a tier refusing writes — full
-                // with spilling off or the disk at its floor, or in the moment before a spill is
-                // installed — is waiting for exactly the slot this would take. It used to yield
-                // only to an installed spill, and after each despill it took the next slot inline,
-                // ahead of the swap the release had queued with Task.Run: with spilling off and a
-                // backlog of spill files left by an earlier run, every slot that came free went to
-                // the next despill while requests waited out BackPressureWait and were answered 503.
-                // But not to a swap that cannot install: one that has failed since the last slot
-                // came free (a disk too full for the next WAL, say) would leave the slot idle, and
-                // the backlog — whose despill is what frees that disk — unwritten for as long as
-                // it went on failing.
-                var live = _write;
-                if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
+                _despillLoopIterationForTest?.Invoke();
+                // The timeout is a safety net, not the cadence: every event that can make work possible
+                // wakes the signal — save a failed despill's retry time, which the wait is cut to.
+                try { await _despillSignal.WaitAsync(DespillWaitTimeout(), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
 
-                SpillFile next = default;
-                bool scanned = _catalogLoad.IsCompleted;
-                lock (_spillQueueLock)
+                while (!ct.IsCancellationRequested && Volatile.Read(ref _writesClosed) == 0)
                 {
-                    long now = Environment.TickCount64;
-                    foreach (var (segId, q) in _spillQueue)
+                    // The live tier comes first: a spill in progress, or a tier refusing writes — full
+                    // with spilling off or the disk at its floor, or in the moment before a spill is
+                    // installed — is waiting for exactly the slot this would take. It used to yield
+                    // only to an installed spill, and after each despill it took the next slot inline,
+                    // ahead of the swap the release had queued with Task.Run: with spilling off and a
+                    // backlog of spill files left by an earlier run, every slot that came free went to
+                    // the next despill while requests waited out BackPressureWait and were answered 503.
+                    // But not to a swap that cannot install: one that has failed since the last slot
+                    // came free (a disk too full for the next WAL, say) would leave the slot idle, and
+                    // the backlog — whose despill is what frees that disk — unwritten for as long as
+                    // it went on failing.
+                    var live = _write;
+                    if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
+
+                    SpillFile next = default;
+                    bool scanned = _catalogLoad.IsCompleted;
+                    lock (_spillQueueLock)
                     {
-                        if (q.InFlight || q.NotBefore > now) continue;
-                        // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
-                        // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes this.
-                        if (q.PublishedLevels != 0 && !scanned) continue;
-                        next = new SpillFile(segId, q.Path, q.PublishedLevels);
-                        break;
+                        long now = Environment.TickCount64;
+                        foreach (var (segId, q) in _spillQueue)
+                        {
+                            if (q.InFlight || q.NotBefore > now) continue;
+                            // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
+                            // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes this.
+                            if (q.PublishedLevels != 0 && !scanned) continue;
+                            next = new SpillFile(segId, q.Path, q.PublishedLevels);
+                            break;
+                        }
+                    }
+                    if (next.Path is null) break;
+
+                    if (!_flushSlots.Wait(0)) break;   // released by the despill, or by its retry
+                    lock (_spillQueueLock)
+                        if (_spillQueue.TryGetValue(next.SegId, out var taken)) taken.InFlight = true;
+
+                    try { await DespillAsync(next, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                    catch (Exception ex)
+                    {
+                        // A despill that failed before its flush — the block could not be read (out of
+                        // memory materialising it, the file held by a scanner), or not be listed. It is
+                        // still queued (DespillAsync's finally) and tried again after a delay; it used to
+                        // be dropped from the queue, its acknowledged events unsearchable — and counted
+                        // nowhere — until the process restarted. The delay doubles with each failure in
+                        // a row, and only the first of them is an Error with its stack: a block that
+                        // cannot be read now usually cannot be read in 15 s either, and the same Error
+                        // every 15 s, for ever, buried the line that said why.
+                        int failures;
+                        lock (_spillQueueLock) failures = _spillQueue.TryGetValue(next.SegId, out var q) ? q.Failures : 0;
+                        try
+                        {
+                            if (failures <= 1)
+                                _logger.LogError(ex,
+                                    "Despill of {File} failed — tried again in {Delay}s, then less and less often while it keeps " +
+                                    "failing (at least once every {Cap}s), each failure after this one logged at Debug; the file stays on disk meanwhile",
+                                    next.Path, DespillRetryDelayAfter(1).TotalSeconds, _despillRetryCap.TotalSeconds);
+                            else
+                                _logger.LogDebug(
+                                    "Despill of {File} failed again ({Failures} times in a row): {Error} — tried again in {Delay}s",
+                                    next.Path, failures, ex.Message, DespillRetryDelayAfter(failures).TotalSeconds);
+                        }
+                        catch (Exception) { /* the block is queued for its retry either way */ }
                     }
                 }
-                if (next.Path is null) break;
-
-                if (!_flushSlots.Wait(0)) break;   // released by the despill, or by its retry
-                lock (_spillQueueLock)
-                    if (_spillQueue.TryGetValue(next.SegId, out var taken)) taken.InFlight = true;
-
-                try { await DespillAsync(next, ct).ConfigureAwait(false); }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex)
+            {
+                // The loop itself failed, outside any one block's despill: out of memory setting up its
+                // wait or walking its queue, a log line. It used to end there: no block was despilled
+                // again in this process, and shutdown's await of the loop threw before its final flush.
+                // A pause, then round again; with nothing to allocate a timer with, a blocked thread.
+                try { _logger.LogError(ex, "The despill loop failed outside any one block's despill; it goes on in a second"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                try
+                {
+                    _despillLoopPauseForTest?.Invoke();
+                    await Task.Delay(DespillLoopFaultPause, ct).ConfigureAwait(false);
+                }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-                catch (Exception ex)
-                {
-                    // A despill that failed before its flush — the block could not be read (out of
-                    // memory materialising it, the file held by a scanner), or not be listed. It is
-                    // still queued (DespillAsync's finally) and tried again after a delay; it used to
-                    // be dropped from the queue, its acknowledged events unsearchable — and counted
-                    // nowhere — until the process restarted. The delay doubles with each failure in
-                    // a row, and only the first of them is an Error with its stack: a block that
-                    // cannot be read now usually cannot be read in 15 s either, and the same Error
-                    // every 15 s, for ever, buried the line that said why.
-                    int failures;
-                    lock (_spillQueueLock) failures = _spillQueue.TryGetValue(next.SegId, out var q) ? q.Failures : 0;
-                    try
-                    {
-                        if (failures <= 1)
-                            _logger.LogError(ex,
-                                "Despill of {File} failed — tried again in {Delay}s, then less and less often while it keeps " +
-                                "failing (at least once every {Cap}s), each failure after this one logged at Debug; the file stays on disk meanwhile",
-                                next.Path, DespillRetryDelayAfter(1).TotalSeconds, _despillRetryCap.TotalSeconds);
-                        else
-                            _logger.LogDebug(
-                                "Despill of {File} failed again ({Failures} times in a row): {Error} — tried again in {Delay}s",
-                                next.Path, failures, ex.Message, DespillRetryDelayAfter(failures).TotalSeconds);
-                    }
-                    catch (Exception) { /* the block is queued for its retry either way */ }
-                }
+                catch (Exception) { Thread.Sleep(DespillLoopFaultPause); }
             }
         }
     }
+
+    /// <summary>The pause after the despill loop itself failed (see <see cref="RunDespillLoopAsync"/>).</summary>
+    private static readonly TimeSpan DespillLoopFaultPause = TimeSpan.FromSeconds(1);
+
+    /// <summary>Test seam: runs at the top of each round of the despill loop; throwing from it is the loop itself failing. Null in production.</summary>
+    internal Action? _despillLoopIterationForTest;
+
+    /// <summary>Test seam: runs as the loop sets up its pause after failing; throwing from it is a pause that cannot be set up. Null in production.</summary>
+    internal Action? _despillLoopPauseForTest;
 
     /// <summary>How long the loop may sleep: until the earliest retry time of a failed despill, and never past the safety net.</summary>
     private TimeSpan DespillWaitTimeout()

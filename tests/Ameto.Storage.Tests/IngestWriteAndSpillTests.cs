@@ -2251,6 +2251,52 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── The despill loop survives its own failures ────────────────────────────
+
+    /// <summary>
+    /// R4-4. The despill loop caught only cancellation around its own steps: an out-of-memory setting
+    /// up its wait, walking its queue or writing a line ended it, and no block was despilled again in
+    /// this process — and shutdown's await of the dead loop threw before its final flush. It goes on
+    /// after a pause now, and after a pause it cannot even set up (a blocked thread instead).
+    /// </summary>
+    [Fact]
+    public async Task The_despill_loop_survives_a_failure_of_its_own_and_despills_the_block_after_it()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(9_000), 1 << 20))
+            for (int i = 0; i < 10; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "spill.svc",
+                           traceIdHi: 0xA000_0000_0000_0000UL | (uint)i, traceIdLo: (ulong)i * 7 + 1, spanId: (ulong)i * 13 + 1);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        int rounds = 0, pauses = 0;
+        engine._despillLoopIterationForTest = () =>
+        {
+            if (Interlocked.Increment(ref rounds) == 1) throw new OutOfMemoryException("test: the loop's own round ran out");
+        };
+        engine._despillLoopPauseForTest = () =>
+        {
+            if (Interlocked.Increment(ref pauses) == 1) throw new OutOfMemoryException("test: no memory for the pause's timer");
+        };
+        await using (engine)
+        {
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 10, "the block to be despilled after the loop's failure", ShortGuard);
+            Assert.True(Volatile.Read(ref rounds) >= 2);
+            Assert.Equal(10, ReadAll(engine).Count);
+        }
+    }
+
     // ── A block id past the last usable one ───────────────────────────────────
 
     /// <summary>
