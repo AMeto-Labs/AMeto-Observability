@@ -129,6 +129,83 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
     }
 
     /// <summary>
+    /// R4-2. The same torn level, which the boot scan rejects but cannot move aside — held by another
+    /// process, on Windows. The scan recorded a level only once its move had worked: this one stayed
+    /// in the mask, the despill skipped it, and its 100 events were in no segment anyone serves. It is
+    /// recorded as rejected before the move is tried; the despill writes it again (once the file can
+    /// be replaced, by its retry).
+    /// </summary>
+    [Fact]
+    public async Task A_torn_level_the_boot_scan_cannot_move_aside_is_still_written_again_by_the_despill()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        run2._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        run2._beforeQuarantineMoveForTest = _ => throw new IOException("test: the torn level is held by another process");
+        try
+        {
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            Assert.False(File.Exists(infoLevel + ".corrupt"), "setup: the torn level was moved aside");
+
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+            AssertEveryEventOnce(run2, 150);
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R4-2, the replay. A WAL whose flush a crash cut short — one level moved into place — has the
+    /// same race: the replay runs in the constructor while the boot scan runs in the background, and
+    /// it skipped every level whose file was there. A torn one, which the scan then set aside, was
+    /// skipped: its events were in no segment anyone serves, and the WAL that held them was deleted.
+    /// Such a WAL is despilled now, after the scan, keeping only the levels the scan accepted.
+    /// </summary>
+    [Fact]
+    public async Task A_torn_level_of_a_wal_the_crash_cut_short_is_written_again_after_the_boot_scan()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        string wal = Path.ChangeExtension(spill, ".wal");   // the same log, as a crash leaves a live WAL
+        File.Move(spill, wal);
+        File.Move(spill + ".pool", wal + ".pool");
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        try
+        {
+            bool keptForTheScan = File.Exists(wal);
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(wal), "the WAL to be written after the scan");
+            AssertEveryEventOnce(run2, 150);
+            Assert.True(keptForTheScan, "the WAL was replayed before the scan had read its levels");
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Writes the spilled block — events 0..99 at Information, 100..149 at Error — and runs an engine
     /// whose despill moves the Information level into place and then "dies": the throw stands in for
     /// the kill, and the shutdown cancels the retry it schedules. Returns the spill file, still on

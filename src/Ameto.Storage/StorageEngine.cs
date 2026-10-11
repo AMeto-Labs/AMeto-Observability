@@ -1958,6 +1958,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     internal Action<string>? _beforeScanOpensSegment;
 
+    /// <summary>Test seam: runs as the boot scan moves a torn segment aside; throwing from it is a move that failed (the file held by another process). Null in production.</summary>
+    internal Action<string>? _beforeQuarantineMoveForTest;
+
     /// <summary>
     /// Test hook: called by <see cref="LoadSegmentCatalog"/> before the scan begins, inside its
     /// failure handling — a throw from it is the scan failing as a whole, the case #94's Error line
@@ -5464,16 +5467,21 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // the next start. Error, not Warning: an operator must decide what a
                 // .seg.corrupt file is worth, and nothing else will ever mention it again --
                 // the catalog scan, the merge planner and retention all enumerate *.seg.
+                // A level of a half-flushed block among them — a spill file's, or a WAL's a crash cut
+                // short (ReplayOrphanedWal) — is written again by its despill (LevelsTheScanKept),
+                // which waits for this scan before it decides. Recorded as REJECTED, before the
+                // rename is tried: it used to be recorded only once the rename had worked, and a
+                // torn level the rename could not move (held by another process, on Windows) stayed
+                // in the mask, was skipped, and its events were in no segment anyone serves.
+                if (TryParseLocalSegmentId(file, out ulong torn))
+                    lock (_bootQuarantined) _bootQuarantined.Add(torn);
                 _logger.LogError(ex, "Quarantining unreadable segment {File} as .corrupt — kept on disk, served by nobody", file);
                 try
                 {
                     string aside = file + ".corrupt";
                     if (File.Exists(aside)) File.Delete(aside);   // keep one generation of quarantine
+                    _beforeQuarantineMoveForTest?.Invoke(file);
                     File.Move(file, aside);
-                    // A level of a half-despilled block among them is written again by its despill
-                    // (LevelsTheScanKept), which waits for this scan before it decides.
-                    if (TryParseLocalSegmentId(file, out ulong torn))
-                        lock (_bootQuarantined) _bootQuarantined.Add(torn);
                 }
                 catch (Exception mvEx) { _logger.LogWarning(mvEx, "Failed to quarantine corrupt segment {File}", file); }
             }
@@ -5714,6 +5722,25 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             reader.Dispose();
             _logger.LogInformation("WAL {File} already flushed — removing", walFile);
             DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
+            return;
+        }
+
+        // Some of the block's levels reached disk before the crash cut the flush short. Which of them
+        // are whole is the boot scan's to say, and it runs in the background: trusting their presence,
+        // the replay skipped a level the scan then set aside as torn, and its events were in no
+        // segment anyone serves. Such a WAL is despilled instead, as a half-written spill file an
+        // earlier run left is: once the scan has run, keeping only the levels it accepted, its
+        // strings interned by their text (the live pool is in use by then).
+        byte published = 0;
+        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+            if (SegmentFileExists(segId + (ulong)lvl)) published |= (byte)(1 << lvl);
+        if (published != 0)
+        {
+            reader.Dispose();
+            lock (_spillQueueLock) _spillQueue[segId] = new QueuedSpill(walFile, published);
+            _logger.LogInformation(
+                "WAL {File}: its flush got some levels out before the process stopped; the rest are written by the " +
+                "despill once the boot scan has read the ones on disk", walFile);
             return;
         }
 
