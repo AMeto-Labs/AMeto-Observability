@@ -911,6 +911,76 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A despill whose read keeps failing is tried less and less often — the delay doubles with each
+    /// failure in a row, up to a cap — and says so with one Error, not one per attempt. Every attempt
+    /// reads the whole block again, and a block that cannot fit the heap is an out-of-memory for the
+    /// whole process each time: it came every 15 s for ever (the review's probe: 28 attempts in 3 s
+    /// at a 100 ms delay), each an Error with its stack. Once the read works the block is despilled,
+    /// and the line that says so counts the failures.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_read_keeps_failing_backs_off_and_logs_one_error()
+    {
+        string dir    = NewDir();
+        var    log    = new RecordingLogger();
+        var    engine = OneSlotEngine(Options(dir), log);
+        var    gate   = HoldFirstFlush(engine);
+        engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+        engine._despillRetryCap   = TimeSpan.FromMilliseconds(400);
+        int reads = 0, failing = 1;
+        engine._beforeLoadSpillForTest = _ =>
+        {
+            Interlocked.Increment(ref reads);
+            if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: the block does not fit the heap");
+        };
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling);
+
+            gate.Set();
+            WaitFor(() => Volatile.Read(ref reads) >= 1, "the first despill to fail its read");
+            await Task.Delay(TimeSpan.FromSeconds(2));
+
+            // Two seconds at a fixed 50 ms is some forty attempts; doubling from 50 ms to 400 ms is about eight.
+            Assert.InRange(Volatile.Read(ref reads), 2, 12);
+            Assert.Single(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && l.Line.StartsWith("Despill of", StringComparison.Ordinal));
+            Assert.Equal(1, engine.SpillFilesPending);
+
+            Volatile.Write(ref failing, 0);
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the block to be despilled once its read works", ShortGuard);
+            Assert.Contains(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Information
+                                            && l.Line.StartsWith("Despilled block", StringComparison.Ordinal)
+                                            && l.Line.Contains("failed attempt(s)", StringComparison.Ordinal));
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>Every line, with its level.</summary>
+    private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<(Microsoft.Extensions.Logging.LogLevel Level, string Line)> _lines = new();
+
+        public IReadOnlyList<(Microsoft.Extensions.Logging.LogLevel Level, string Line)> Lines => _lines.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => _lines.Enqueue((logLevel, formatter(state, exception)));
+    }
+
+    /// <summary>
     /// A block being despilled is still pending: logsSpillFilesPending is what the rollback note
     /// tells an operator to wait out, and it read 0 while the last block was still being replayed
     /// and flushed, because the loop took the block off the queue before reading it.

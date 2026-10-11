@@ -89,14 +89,29 @@ public sealed partial class StorageEngine
 
         /// <summary><see cref="Environment.TickCount64"/> before which a despill that failed is not tried again. Under <see cref="_spillQueueLock"/>.</summary>
         public long NotBefore;
+
+        /// <summary>Despills of the block that failed in a row: each doubles the wait before the next. Under <see cref="_spillQueueLock"/>.</summary>
+        public int Failures;
     }
 
     /// <summary>Spilled blocks not yet in segments, oldest block first. Under <see cref="_spillQueueLock"/>.</summary>
     private readonly SortedDictionary<ulong, QueuedSpill> _spillQueue = new();
     private readonly System.Threading.Lock                _spillQueueLock = new();
 
-    /// <summary>How long a despill that failed before its flush waits before it is tried again. Internal so a test can shorten it.</summary>
+    /// <summary>
+    /// How long a despill that failed before its flush waits before it is tried again — the first
+    /// time: each failure in a row doubles it, up to <see cref="_despillRetryCap"/>. Internal so a
+    /// test can shorten it.
+    /// </summary>
     internal TimeSpan _despillRetryDelay = FlushRetryDelay;
+
+    /// <summary>
+    /// The longest a block whose despill keeps failing waits between attempts. Every attempt reads
+    /// the whole block again — a block that cannot fit the heap (written under a larger tier, or
+    /// heavy with exceptions) is an out-of-memory for the whole process each time — and the attempts
+    /// used to come every 15 s for ever. Internal so a test can shorten it.
+    /// </summary>
+    internal TimeSpan _despillRetryCap = TimeSpan.FromMinutes(10);
 
     /// <summary>Wakes the despill loop: a block was queued, a slot came free, the spill ended.</summary>
     private readonly SemaphoreSlim _despillSignal = new(0, 1);
@@ -411,16 +426,28 @@ public sealed partial class StorageEngine
         lock (_spillQueueLock) _spillQueue.Remove(segId);
     }
 
-    /// <summary>The block's despill failed before its flush: it stays queued, and is tried again after <see cref="_despillRetryDelay"/>.</summary>
+    /// <summary>
+    /// The block's despill failed before its flush: it stays queued, and is tried again after
+    /// <see cref="_despillRetryDelay"/>, doubled for each failure in a row and at most
+    /// <see cref="_despillRetryCap"/>.
+    /// </summary>
     private void RetrySpillLater(ulong segId)
     {
         lock (_spillQueueLock)
         {
             if (!_spillQueue.TryGetValue(segId, out var q)) return;
             q.InFlight  = false;
-            q.NotBefore = Environment.TickCount64 + (long)_despillRetryDelay.TotalMilliseconds;
+            q.Failures++;
+            q.NotBefore = Environment.TickCount64 + (long)DespillRetryDelayAfter(q.Failures).TotalMilliseconds;
         }
         WakeDespill();   // the loop recomputes its wait from the new retry time
+    }
+
+    /// <summary>The wait after the <paramref name="failures"/>-th failure in a row: the first delay, doubled each time, capped.</summary>
+    private TimeSpan DespillRetryDelayAfter(int failures)
+    {
+        double ms = _despillRetryDelay.TotalMilliseconds * Math.Pow(2, Math.Clamp(failures - 1, 0, 30));
+        return TimeSpan.FromMilliseconds(Math.Min(ms, Math.Max(_despillRetryCap.TotalMilliseconds, _despillRetryDelay.TotalMilliseconds)));
     }
 
     private void WakeDespill()
@@ -594,9 +621,25 @@ public sealed partial class StorageEngine
                     // memory materialising it, the file held by a scanner), or not be listed. It is
                     // still queued (DespillAsync's finally) and tried again after a delay; it used to
                     // be dropped from the queue, its acknowledged events unsearchable — and counted
-                    // nowhere — until the process restarted.
-                    _logger.LogError(ex, "Despill of {File} failed — tried again in {Delay}s; the file stays on disk meanwhile",
-                        next.Path, _despillRetryDelay.TotalSeconds);
+                    // nowhere — until the process restarted. The delay doubles with each failure in
+                    // a row, and only the first of them is an Error with its stack: a block that
+                    // cannot be read now usually cannot be read in 15 s either, and the same Error
+                    // every 15 s, for ever, buried the line that said why.
+                    int failures;
+                    lock (_spillQueueLock) failures = _spillQueue.TryGetValue(next.SegId, out var q) ? q.Failures : 0;
+                    try
+                    {
+                        if (failures <= 1)
+                            _logger.LogError(ex,
+                                "Despill of {File} failed — tried again in {Delay}s, then less and less often while it keeps " +
+                                "failing (at least once every {Cap}s), each failure after this one logged at Debug; the file stays on disk meanwhile",
+                                next.Path, DespillRetryDelayAfter(1).TotalSeconds, _despillRetryCap.TotalSeconds);
+                        else
+                            _logger.LogDebug(
+                                "Despill of {File} failed again ({Failures} times in a row): {Error} — tried again in {Delay}s",
+                                next.Path, failures, ex.Message, DespillRetryDelayAfter(failures).TotalSeconds);
+                    }
+                    catch (Exception) { /* the block is queued for its retry either way */ }
                 }
             }
         }
@@ -733,9 +776,14 @@ public sealed partial class StorageEngine
         long events = 0;
         foreach (var w in written) events += w.EventCount;
         Interlocked.Add(ref _despilledEvents, events);
+        int failures;
+        lock (_spillQueueLock) failures = _spillQueue.TryGetValue(segId, out var q) ? q.Failures : 0;
         SettleSpill(segId);
+        // The end of an episode of failed despills says so: the failures after its first were at Debug.
+        string retried = afterRetry ? ", after a retry" : "";
+        if (failures > 0) retried += $", after {failures} failed attempt(s)";
         _logger.LogInformation("Despilled block {Block}: {Events} event(s) into {Segments} segment(s){Retried}",
-            segId, events, written.Count, afterRetry ? ", after a retry" : "");
+            segId, events, written.Count, retried);
     }
 
     /// <summary>
