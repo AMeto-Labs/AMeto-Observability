@@ -136,6 +136,16 @@ public sealed class WalFlushTickTests : IDisposable
 
         Assert.Equal(1, wal.HandleFlushCount);
         if (!TicksWriteTheViewBack) Assert.Equal(0, wal.RangeFlushCount);   // no msync on Linux
+
+        // R3-2. The tick's watermark is the range it claimed, not where the log had got to when it
+        // finished: the racing append is past it, and is the next tick's to write back and fsync. A
+        // watermark moved to the live offset would call that append durable when nothing had flushed it.
+        Assert.Equal(claimed, wal.LastFlushedOffset);
+        wal.ViewFlushHookForTest   = null;
+        wal.HandleFlushHookForTest = null;
+        wal.Flush();
+        Assert.Equal(wal.WrittenBytes + 32, wal.LastFlushedOffset);
+        Assert.Equal(2, wal.HandleFlushCount);
         wal.Dispose();
         Assert.Equal(new long[] { 100, 200 }, WriteAheadLog.ReadForRecovery(_path).Entries.Select(e => e.TimestampTicks));
     }
