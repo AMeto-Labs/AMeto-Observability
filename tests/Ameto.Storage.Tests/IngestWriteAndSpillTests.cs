@@ -1119,10 +1119,14 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         engine._roomRecheckMs  = (int)HangGuard.TotalMilliseconds;   // no retry of the swap's own: only a freed slot asks
         engine._swapRetryDelay = HangGuard;
         var order   = new System.Collections.Concurrent.ConcurrentQueue<string>();
-        int failing = 1;
+        int failing = 1, failures = 0;
         engine._beforeSwap = () =>
         {
-            if (Volatile.Read(ref failing) == 1) throw new IOException("test: a failure creating the next WAL");
+            if (Volatile.Read(ref failing) == 1)
+            {
+                Interlocked.Increment(ref failures);
+                throw new IOException("test: a failure creating the next WAL");
+            }
             Thread.Sleep(300);   // the swap is slow to reach the slot: a despill loop that did not yield would take it
         };
         engine._beforeFrozenListGrowForTest = () => order.Enqueue("swap");   // installing: it has the slot
@@ -1132,7 +1136,10 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             using (var a = Batch(engine, 0, TierEvents))
                 Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
             Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
-            WaitFor(() => engine.LiveHotTierRefused, "the full tier to refuse a write");
+            // The swap that refusal asked for has failed — not merely been asked for: cleared before it
+            // ran, it installed at its first go and there was no failure to clear (13 of 15 runs on two
+            // cores).
+            WaitFor(() => engine.LiveHotTierRefused && Volatile.Read(ref failures) >= 1, "the full tier's swap to fail");
 
             Volatile.Write(ref failing, 0);
             hold.SetResult();
@@ -2527,6 +2534,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
 
         Assert.NotEmpty(Directory.GetFiles(Path.Combine(dir, "segments"), "*.seg"));   // the final flush ran
         await using var reopened = Engine(opts);
+        await reopened.CatalogLoaded;   // the boot scan registers the segment, in the background
         Assert.Equal(10, ReadAll(reopened).Count);
     }
 
