@@ -387,6 +387,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// between two <c>File.Move</c>s without needing a second process.
     /// </summary>
     internal Action<int>? _afterLevelPublished;
+
+    /// <summary>Test seam: runs as a flush is about to write a level (its argument); throwing from it is that write failing.</summary>
+    internal Action<int>? _beforeLevelWriteForTest;
+
     /// <summary>
     /// Test hook: called with the manifest on disk and the sources owned but not yet streamed —
     /// the window in which a merge can be cancelled or fail transiently. Cancelling a token from
@@ -2529,52 +2533,61 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // tier to a retry then would flush it twice, and freeing it would free it under the flush.
             catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
-                // A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no
-                // retry for the life of the process, while its back-pressure slot was
-                // released — so under a full disk the engine leaked one native tier per
-                // interval, unboundedly, precisely when a log store must ride the pressure
-                // out. Now the slot's ownership moves to a background retry task (bounded
-                // RAM: slot exhaustion skips further swaps → spill, or ingest waits) that
-                // re-attempts until the disk recovers or the engine shuts down — in which
-                // case the tier's WAL replays it on the next start.
-                //
-                // Nothing in here may throw past the hand-over (as in the despill's catch): the line
-                // below used to be unguarded, and a throw from it left the tier listed and never
-                // flushed while the finally gave its slot and heavy phase back.
-                try
-                {
-                    _logger.LogError(ex,
-                        "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
-                        FlushRetryDelay.TotalSeconds);
-                }
-                catch (Exception) { /* the line is lost; the hand-over below is not */ }
-                slotTransferred = TryScheduleFlushRetry(oldHot, oldWalPath, reservedSegId);
-                if (!slotTransferred)
-                {
-                    // No retry could be started (out of memory): the tier stays listed, and queries go
-                    // on serving it, until shutdown frees it; its WAL stays on disk and the next start
-                    // replays it, skipping the levels the failed attempt got out. Its slot and heavy
-                    // phase go back below — holding them for a tier nothing will flush would wedge
-                    // ingest behind it.
-                    try
-                    {
-                        _logger.LogError(
-                            "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
-                            "until shutdown, and its WAL replays it at the next start", reservedSegId);
-                    }
-                    catch (Exception) { /* the line is lost */ }
-                }
+                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);
                 return;
             }
             finally { ReleaseHeavyPermit(); }
 
-            PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
+            // Published all or nothing (PublishFlushedTier): one that failed registered nothing, and its
+            // tier goes to a retry as a failed flush's does. Left to the finally, the tier stayed listed
+            // until shutdown beside whatever the failed registration had got in.
+            try { PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId); }
+            catch (Exception ex) { slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId); }
         }
         finally
         {
             if (!slotTransferred)
                 GiveBackSlot(endHeavyPhase: true);
         }
+    }
+
+    /// <summary>
+    /// A swapped tier whose flush — or whose publishing — failed goes to a background retry, which
+    /// takes its slot and heavy-phase count over. True when it did; false when no retry could be
+    /// started, and the caller still owns all three. Never throws.
+    ///
+    /// <para>A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no retry for the
+    /// life of the process, while its back-pressure slot was released — so under a full disk the
+    /// engine leaked one native tier per interval, unboundedly, precisely when a log store must ride
+    /// the pressure out. The retry (bounded RAM: slot exhaustion skips further swaps → spill, or
+    /// ingest waits) re-attempts until the disk recovers or the engine shuts down — in which case the
+    /// tier's WAL replays it on the next start. Nothing in here may throw past the hand-over: the line
+    /// below used to be unguarded, and a throw from it left the tier listed and never flushed while
+    /// the caller gave its slot and heavy phase back.</para>
+    /// </summary>
+    private bool HandFailedFlushToRetry(Exception ex, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    {
+        try
+        {
+            _logger.LogError(ex,
+                "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
+                FlushRetryDelay.TotalSeconds);
+        }
+        catch (Exception) { /* the line is lost; the hand-over below is not */ }
+        if (TryScheduleFlushRetry(oldHot, oldWalPath, reservedSegId)) return true;
+
+        // No retry could be started (out of memory): the tier stays listed, and queries go on serving
+        // it, until shutdown frees it; its WAL stays on disk and the next start replays it, skipping
+        // the levels the failed attempt got out. Its slot and heavy phase go back — holding them for a
+        // tier nothing will flush would wedge ingest behind it.
+        try
+        {
+            _logger.LogError(
+                "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
+                "until shutdown, and its WAL replays it at the next start", reservedSegId);
+        }
+        catch (Exception) { /* the line is lost */ }
+        return false;
     }
 
     /// <summary>
@@ -2752,11 +2765,32 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private void PublishFlushedTier(List<SegmentInfo> written, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
     {
-        // Register the cold segments AND drop oldHot from the frozen list atomically. A loop, not
-        // RemoveAll(lambda): the lambda was allocated after the segments were registered.
+        // Register the cold segments AND drop oldHot from the frozen list atomically — under the lock,
+        // and all or nothing. A registration that ran out of memory part way (a dictionary node, the
+        // displaced-segment line) left the levels before it registered while its caller took the
+        // throw for "not published": the flush retry's next attempt then unlinked their files as
+        // leftovers — registered segments, gone from disk under the catalog. What a failed attempt
+        // registered is taken back now, allocating nothing, so the throw means what its caller takes
+        // it for; the entries each registration displaced (null for none) are kept here first, for
+        // that. A loop, not RemoveAll(lambda): the lambda was allocated after the segments were
+        // registered.
+        var displaced = new SegmentInfo?[written.Count];
         lock (_frozenLock)
         {
-            foreach (var w in written) PublishLocalSegment(w);
+            int registered = 0;
+            try
+            {
+                for (; registered < written.Count; registered++)
+                {
+                    _beforeSegmentPublishForTest?.Invoke(written[registered]);
+                    displaced[registered] = PublishLocalSegment(written[registered]);
+                }
+            }
+            catch
+            {
+                for (int i = registered - 1; i >= 0; i--) UnpublishLocalSegment(written[i], displaced[i]);
+                throw;
+            }
             for (int i = _frozenHot.Count - 1; i >= 0; i--)
                 if (ReferenceEquals(_frozenHot[i].Tier, oldHot)) _frozenHot.RemoveAt(i);
         }
@@ -5153,6 +5187,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     continue;
                 }
 
+                _beforeLevelWriteForTest?.Invoke(lvl);
+
                 // A RENTED array is longer than its level's event count, so every consumer
                 // below is told how much of it is real. The writer would otherwise stage the
                 // rent's tail — stale tier indices from a previous flush — as events.
@@ -6509,13 +6545,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// renumber either of them — so it is logged with both paths, and the file itself is left
     /// alone: its owner still holds it and can push it again once the ids are fixed.</para>
     /// </summary>
-    private void PublishLocalSegment(SegmentInfo written)
+    /// <returns>The entry it displaced under the key, or null when it added one (see <see cref="UnpublishLocalSegment"/>).</returns>
+    private SegmentInfo? PublishLocalSegment(SegmentInfo written)
     {
         var key = SegmentKey.Of(written);
 
         while (true)
         {
-            if (_segments.TryAdd(key, written)) return;
+            if (_segments.TryAdd(key, written)) return null;
 
             // TryAdd lost, so somebody holds the key — read WHO, and exchange against that exact
             // reference. A plain store would decide on a value another writer can replace in
@@ -6525,9 +6562,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             if (!IsTheSameSegment(existing, written))
                 LogDisplacedLocalSegment(written, existing);
 
-            if (_segments.TryUpdate(key, written, existing)) return;
+            if (_segments.TryUpdate(key, written, existing)) return existing;
         }
     }
+
+    /// <summary>
+    /// Takes back what <see cref="PublishLocalSegment"/> registered — the entry it displaced put back,
+    /// or its own removed — while it is still the one under the key. Allocates nothing: a reference
+    /// value is updated in place, and a removal unlinks a node.
+    /// </summary>
+    private void UnpublishLocalSegment(SegmentInfo written, SegmentInfo? displaced)
+    {
+        var key = SegmentKey.Of(written);
+        if (displaced is not null) _segments.TryUpdate(key, displaced, written);
+        else                       _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, written));
+    }
+
+    /// <summary>Test seam: runs as a flushed tier's segment is about to be registered; throwing from it is that registration failing.</summary>
+    internal Action<SegmentInfo>? _beforeSegmentPublishForTest;
 
     /// <summary>
     /// Says, at Error, that registering a segment this node wrote displaced a different one under

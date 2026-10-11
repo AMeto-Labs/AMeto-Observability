@@ -145,7 +145,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// millisecond, each carrying its number, a trace context derived from it and one service —
     /// and <paramref name="pad"/> bytes of padding in its properties (<see cref="Props"/>).
     /// </summary>
-    private static LogWriteBatch Batch(StorageEngine engine, int from, int count, int pad = 0)
+    private static LogWriteBatch Batch(StorageEngine engine, int from, int count, int pad = 0, LogLevel level = LogLevel.Information)
     {
         var batch = new LogWriteBatch();
         int tmpl  = engine.TemplatePool.Intern("event {n}");
@@ -154,7 +154,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             batch.Add(new LogEventHeader
             {
                 TimestampUtcTicks        = T0 + i * TimeSpan.TicksPerMillisecond,
-                Level                    = LogLevel.Information,
+                Level                    = level,
                 MessageTemplatePoolIndex = tmpl,
                 ServiceNamePoolIndex     = svc,
                 TraceIdHi                = 0xA000_0000_0000_0000UL | (uint)i,
@@ -2908,6 +2908,124 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 50, "the block to be despilled", ShortGuard);
             Assert.Equal(50, ReadAll(engine).Count);
             Assert.Equal(0, engine.HeavyPhasesInFlight);
+        }
+    }
+
+    // ── Publishing a flushed tier is all or nothing ───────────────────────────
+
+    /// <summary>A tier of two levels: 300 Information events, then 200 Error ones.</summary>
+    private static async Task WriteTwoLevelsAsync(StorageEngine engine)
+    {
+        using (var info = Batch(engine, 0, 300))
+            Assert.Equal(new LogBatchWriteResult(300, 0, 0), await engine.WriteBatchAsync(info, HangGuard));
+        using (var error = Batch(engine, 300, 200, level: LogLevel.Error))
+            Assert.Equal(new LogBatchWriteResult(200, 0, 0), await engine.WriteBatchAsync(error, HangGuard));
+    }
+
+    /// <summary>
+    /// Round-4 review L23. PublishFlushedTier registers a flushed tier's levels under the frozen lock,
+    /// one dictionary node each: one that ran out of memory part way left the levels before it
+    /// registered, while the retry took the throw for "not published" — and its next attempt unlinked
+    /// their files as leftovers: registered segments, gone from disk under the catalog until the rewrite
+    /// put them back. What a failed registration got in is taken back now, so nothing registered is
+    /// ever a leftover.
+    /// </summary>
+    [Fact]
+    public async Task A_retry_whose_publish_fails_part_way_takes_back_what_it_registered_and_unlinks_nothing_registered()
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int flushFailed = 0, registrations = 0, gone = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref flushFailed, 1) == 0) throw new IOException("test: the swap's flush fails after a level");
+        };
+        engine._beforeSegmentPublishForTest = _ =>
+        {
+            // The retry's first publish: its second level's registration runs out of memory.
+            if (Interlocked.Increment(ref registrations) == 2) throw new OutOfMemoryException("test: a dictionary node for the second level");
+        };
+        engine._beforeLevelWriteForTest = _ =>
+        {
+            foreach (var seg in engine.ListSegments())
+                if (!File.Exists(seg.FilePath)) Interlocked.Increment(ref gone);
+        };
+        try
+        {
+            await WriteTwoLevelsAsync(engine);
+            await engine.FlushHotTierAsync();   // fails after its first level: a retry takes the tier
+
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the retry to publish the tier", ShortGuard);
+            Assert.True(Volatile.Read(ref registrations) >= 4, "the retry's publish never failed part way");
+            Assert.True(Volatile.Read(ref gone) == 0, "a registered segment's file was unlinked by the next attempt");
+            Assert.Equal(500, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// L23, the swap's own publish: one that failed was left to the heavy phase's finally — the tier
+    /// listed until shutdown (and served twice where a level had got in), its block never published in
+    /// this process. Nothing registered now, it goes to a retry as a failed flush does.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_whose_publish_fails_hands_its_tier_to_a_retry_and_it_is_published_once()
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int registrations = 0;
+        engine._beforeSegmentPublishForTest = _ =>
+        {
+            if (Interlocked.Increment(ref registrations) == 2) throw new OutOfMemoryException("test: a dictionary node for the second level");
+        };
+        try
+        {
+            await WriteTwoLevelsAsync(engine);
+            try { await engine.FlushHotTierAsync(); }
+            catch (OutOfMemoryException) { /* before the fix the publish's throw escaped the heavy phase */ }
+
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the tier to be published by a retry", ShortGuard);
+            Assert.Equal(500, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// L23, the despill's publish: one that failed queued the block again while its tier stayed listed
+    /// for good, served beside the block's second despill. It goes to a retry now.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_publish_fails_hands_its_tier_to_a_retry_and_the_block_is_published_once()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        using (var spill = WriteAheadLog.Open(Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}"),
+                                              opts.NodeId, new SegmentId(9_000), 1 << 20))
+            for (int i = 0; i < 100; i++)
+                spill.Append(T0 + i * TimeSpan.TicksPerMillisecond, i < 60 ? LogLevel.Information : LogLevel.Error, 40, "event {n}", Props(i),
+                             serviceIndex: 41, service: "spill.svc");
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        int registrations = 0;
+        engine._beforeSegmentPublishForTest = _ =>
+        {
+            if (Interlocked.Increment(ref registrations) == 2) throw new OutOfMemoryException("test: a dictionary node for the second level");
+        };
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "the block to be published once, its tier unlisted", ShortGuard);
+            Assert.Equal(100, ReadAll(engine).Count);
+            Assert.Equal(100, engine.DespilledEvents);
         }
     }
 

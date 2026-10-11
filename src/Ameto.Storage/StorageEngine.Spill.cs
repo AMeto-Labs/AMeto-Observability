@@ -903,37 +903,20 @@ public sealed partial class StorageEngine
             // The FLUSH failed — not this method's await of it (see TryFlushAsync's heavy phase).
             catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
-                // Nothing in here may throw past the hand-over: the tier is listed and counted, and a
-                // throw out of this catch — its own log line, which allocates — reached the finally
-                // below, which gave the slot back, ended the heavy phase and queued the block again,
-                // leaving the tier listed for good, served beside the block's second despill.
-                try
-                {
-                    _logger.LogError(ex,
-                        "Despill of {File} failed — its tier stays frozen and queryable; retrying in background every {Delay}s",
-                        file.Path, FlushRetryDelay.TotalSeconds);
-                }
-                catch (Exception) { /* the line is lost; the hand-over below is not */ }
-                // A retry that started owns the slot and the count from here; the block stays queued,
-                // in flight, until it publishes the block — or shutdown leaves it for the next start.
-                // Exactly one side gives the tier up: the retry once it has started (and
-                // TryScheduleFlushRetry throws nothing after that), this catch when it has not.
-                try
-                {
-                    var (onPublished, onAbandoned) = DespillRetryCallbacks(tier, file);
-                    slotTransferred = TryScheduleFlushRetry(tier, file.Path, file.SegId, onPublished, file.PublishedLevels, onAbandoned);
-                }
-                catch (Exception) { /* its callbacks could not be allocated: nothing started */ }
-                if (!slotTransferred)
-                    // No retry could be started (out of memory): the block is read from its file again
-                    // later instead — the finally queues it — so the tier is given up here, unlisted
-                    // and retired, with the levels the attempt moved into place, as the retry would.
-                    AbandonDespilledTier(tier, file);
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file);
                 return;
             }
             finally { ReleaseHeavyPermit(); }
 
-            PublishFlushedTier(written, tier, file.Path, file.SegId);
+            // Published all or nothing (PublishFlushedTier): one that failed registered nothing, and the
+            // tier goes to a retry as a failed flush's does. Left to the finally, the block was queued
+            // again while its tier stayed listed for good, served beside the block's second despill.
+            try { PublishFlushedTier(written, tier, file.Path, file.SegId); }
+            catch (Exception ex)
+            {
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file);
+                return;
+            }
             DespillPublished(file.SegId, written, afterRetry: false);
             settled = true;
         }
@@ -954,6 +937,42 @@ public sealed partial class StorageEngine
             }
             Interlocked.Increment(ref _despillsCompleted);
         }
+    }
+
+    /// <summary>
+    /// A despilled tier whose flush — or whose publishing — failed goes to a background retry. True
+    /// when the retry took the slot and the count over; false when none could be started, and the
+    /// tier has been given up here instead (the caller's finally queues the block again). Never throws:
+    /// the tier is listed and counted, and a throw out of here — its own log line, which allocates —
+    /// reached the finally, which gave the slot back, ended the heavy phase and queued the block again,
+    /// leaving the tier listed for good, served beside the block's second despill.
+    /// </summary>
+    private bool HandFailedDespillToRetry(Exception ex, HotTierSegment tier, SpillFile file)
+    {
+        try
+        {
+            _logger.LogError(ex,
+                "Despill of {File} failed — its tier stays frozen and queryable; retrying in background every {Delay}s",
+                file.Path, FlushRetryDelay.TotalSeconds);
+        }
+        catch (Exception) { /* the line is lost; the hand-over below is not */ }
+        // A retry that started owns the slot and the count from here; the block stays queued, in
+        // flight, until it publishes the block — or shutdown leaves it for the next start. Exactly one
+        // side gives the tier up: the retry once it has started (and TryScheduleFlushRetry throws
+        // nothing after that), this method when it has not.
+        bool started = false;
+        try
+        {
+            var (onPublished, onAbandoned) = DespillRetryCallbacks(tier, file);
+            started = TryScheduleFlushRetry(tier, file.Path, file.SegId, onPublished, file.PublishedLevels, onAbandoned);
+        }
+        catch (Exception) { /* its callbacks could not be allocated: nothing started */ }
+        if (!started)
+            // No retry could be started (out of memory): the block is read from its file again later
+            // instead, so the tier is given up here, unlisted and retired, with the levels the attempt
+            // moved into place, as the retry would.
+            AbandonDespilledTier(tier, file);
+        return started;
     }
 
     /// <summary>
@@ -988,10 +1007,15 @@ public sealed partial class StorageEngine
         lock (_spillQueueLock) failures = _spillQueue.TryGetValue(segId, out var q) ? q.Failures : 0;
         SettleSpill(segId);
         // The end of an episode of failed despills says so: the failures after its first were at Debug.
-        string retried = afterRetry ? ", after a retry" : "";
-        if (failures > 0) retried += $", after {failures} failed attempt(s)";
-        _logger.LogInformation("Despilled block {Block}: {Events} event(s) into {Segments} segment(s){Retried}",
-            segId, events, written.Count, retried);
+        // Never throws: the block is published (its caller marks it settled next).
+        try
+        {
+            string retried = afterRetry ? ", after a retry" : "";
+            if (failures > 0) retried += $", after {failures} failed attempt(s)";
+            _logger.LogInformation("Despilled block {Block}: {Events} event(s) into {Segments} segment(s){Retried}",
+                segId, events, written.Count, retried);
+        }
+        catch (Exception) { /* the line is lost */ }
     }
 
     /// <summary>
