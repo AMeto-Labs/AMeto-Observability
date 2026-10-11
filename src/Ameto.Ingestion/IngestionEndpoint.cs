@@ -874,6 +874,7 @@ public sealed class IngestionEndpoint
         int serviceIdx)
     {
         BeforeStageForTest?.Invoke();
+        serviceUtf8 = ServiceName(serviceUtf8);
         // The service name belongs to the resourceLogs block, not the record: when the
         // parser has already interned it, every record under that block skips the
         // UTF-8 decode + hash that used to run once per record. A full pool answers -1 with the
@@ -912,6 +913,25 @@ public sealed class IngestionEndpoint
     internal int MaxEventPayloadBytes => _maxEventPayloadBytes;
 
     /// <summary>
+    /// The longest <c>@service</c> an event keeps, in UTF-8 bytes: a longer one is cut (at a whole
+    /// character). A service is an identifier, and it rides with every event of its batch: one of
+    /// 70 KB, pooled but too long for a WAL pool row, was carried in EVERY entry of the log — 1 000
+    /// events made a 70 MB WAL, 3 500 a 230 MB one whose replay ran a 384 MiB heap out at every start.
+    /// </summary>
+    internal const int MaxServiceNameBytes = 1024;
+
+    /// <summary><paramref name="utf8"/> cut to <see cref="MaxServiceNameBytes"/>, at the start of the character the cut would split.</summary>
+    internal static ReadOnlySpan<byte> ServiceName(ReadOnlySpan<byte> utf8)
+    {
+        if (utf8.Length <= MaxServiceNameBytes) return utf8;
+        int cut = MaxServiceNameBytes;
+        // On a continuation byte: back to its lead — three at most, the most a character has. A longer
+        // run is not UTF-8, and the decode makes U+FFFD of it whatever the cut.
+        for (int back = 0; back < 3 && (utf8[cut] & 0xC0) == 0x80; back++) cut--;
+        return utf8[..cut];
+    }
+
+    /// <summary>
     /// An event the parser refused before it built its property map, which would have been
     /// <paramref name="payloadBytes"/> long (see <see cref="IOtlpLogSink.TryIngestOversized"/>):
     /// staged as <see cref="StageRaw"/> stages an oversized one. Returns false.
@@ -926,6 +946,7 @@ public sealed class IngestionEndpoint
         int serviceIdx)
     {
         BeforeStageForTest?.Invoke();
+        serviceUtf8 = ServiceName(serviceUtf8);
         string? service = null;
         if (serviceIdx < 0 && !serviceUtf8.IsEmpty)
         {
@@ -981,6 +1002,7 @@ public sealed class IngestionEndpoint
         ReadOnlySpan<byte> serviceUtf8)
     {
         BeforeStageForTest?.Invoke();
+        serviceUtf8 = ServiceName(serviceUtf8);
         if (msgpackProps.Length > _maxEventPayloadBytes)
         {
             // Cold path: the strings here are worth their cost — this is one marker event per

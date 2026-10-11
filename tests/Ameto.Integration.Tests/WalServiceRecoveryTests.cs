@@ -125,10 +125,110 @@ public sealed class WalServiceRecoveryTests : IDisposable
         }
     }
 
-    private static async Task<List<LogEvent>> QueryAsync(QueryExecutor q, string? filter)
+    /// <summary>
+    /// Round-4 H2 at the door. An <c>@service</c> past <see cref="IngestionEndpoint.MaxServiceNameBytes"/>
+    /// is cut — at a whole character — before it is interned, so the WAL logs it as one pool row, and
+    /// every event keeps the cut name through a crash replay. The review's probe: 1 000 CLEF events with
+    /// a 70 KB service made a 70 MB live WAL, and 3 500 a log whose replay ran a 384 MiB heap out at
+    /// every start. (A service is an identifier; 1 KiB is far past any real one.)
+    /// </summary>
+    [Fact]
+    public async Task A_service_past_the_limit_is_cut_at_the_door_and_logged_once()
+    {
+        Directory.CreateDirectory(_dir);
+        var opts = new ServerOptions { DataDirectory = _dir };
+        long t0  = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond * TimeSpan.TicksPerMillisecond;
+        const int Events = 200;
+        // 1 023 bytes of 'a', then a two-byte 'é' across the cut, then 70 KB more: cut to the 'a's.
+        string service = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1) + "é" + new string('b', 70_000);
+        string cut     = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1);
+
+        var engine = NewEngine(opts);
+        try
+        {
+            var endpoint = new IngestionEndpoint(engine, engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+            using (var clef = endpoint.BeginBatch())
+            {
+                Assert.Equal(Events, LogEventSerializer.StreamBatch(LongServiceBatch(t0, Events, service), clef, out int dropped));
+                Assert.Equal(0, dropped);
+                Assert.Equal(new LogIngestResult(Events, 0, Busy: false), await clef.CommitAsync());
+            }
+
+            long walBytes = engine.LiveWalForTest!.WrittenBytes;
+            Assert.True(walBytes < 64 * 1024, $"{walBytes:N0} B logged for {Events} events of one {service.Length:N0}-char service");
+
+            // kill -9, as above: the events are in the WAL only when the next start comes.
+            ulong  walId = engine.LiveWalSegmentId;
+            string wal   = Directory.GetFiles(WalDir, "*.wal").Single();
+            File.Copy(wal, wal + ".crash", overwrite: true);
+            File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+            await engine.DisposeAsync();
+            foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
+            {
+                var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+                if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+            }
+            File.Move(wal + ".crash", wal, overwrite: true);
+            File.Move(wal + ".pool.crash", wal + ".pool", overwrite: true);
+        }
+        finally
+        {
+            await engine.DisposeAsync();
+        }
+
+        await using var restarted = NewEngine(opts);
+        await restarted.CatalogLoaded;
+        var query  = new QueryExecutor(restarted, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        var events = await QueryAsync(query, filter: null, count: Events + 1);
+        Assert.Equal(Events, events.Count);
+        Assert.All(events, ev => Assert.Equal(cut, ev.ServiceName));
+    }
+
+    /// <summary>
+    /// The cut falls at the start of the character it would split — two-, three- and four-byte ones,
+    /// at each byte they can be split on — and a name within the limit is kept whole.
+    /// </summary>
+    [Theory]
+    [InlineData(0,    "",   1024)]   // 1 024 ASCII: whole
+    [InlineData(1,    "",   1024)]   // 1 025 ASCII: the last byte goes
+    [InlineData(-1,   "é",  1023)]   // 'é' over bytes 1023-1024
+    [InlineData(-1,   "€",  1023)]   // '€' over 1023-1025
+    [InlineData(-2,   "€",  1022)]   // '€' over 1022-1024
+    [InlineData(-1,   "💳", 1023)]   // '💳' over 1023-1026
+    [InlineData(-3,   "💳", 1021)]   // '💳' over 1021-1024
+    [InlineData(-4,   "💳", 1024)]   // '💳' over 1020-1023: within the limit, whole
+    public void ServiceName_cuts_at_the_start_of_the_character_it_would_split(int asciiPastLimit, string character, int expectedBytes)
+    {
+        byte[] name = Encoding.UTF8.GetBytes(new string('a', IngestionEndpoint.MaxServiceNameBytes + asciiPastLimit) + character + "tail");
+        if (character.Length == 0) name = name[..(IngestionEndpoint.MaxServiceNameBytes + asciiPastLimit)];
+        var cut = IngestionEndpoint.ServiceName(name);
+        Assert.Equal(expectedBytes, cut.Length);
+        Assert.Equal(name.AsSpan(0, expectedBytes).ToArray(), cut.ToArray());
+        Assert.DoesNotContain('�', Encoding.UTF8.GetString(cut));
+    }
+
+    /// <summary><paramref name="count"/> CLEF events, one millisecond apart, all with <paramref name="service"/> as <c>@service</c>.</summary>
+    private static ReadOnlyMemory<byte> LongServiceBatch(long t0, int count, string service)
+    {
+        var buf = new ArrayBufferWriter<byte>(1024);
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(count);
+        for (int i = 0; i < count; i++)
+        {
+            w.WriteMapHeader(4);
+            w.Write("@t");       w.Write(new DateTimeOffset(t0 + i * TimeSpan.TicksPerMillisecond, TimeSpan.Zero).ToString("O", CultureInfo.InvariantCulture));
+            w.Write("@mt");      w.Write("clef {N}");
+            w.Write("N");        w.Write(i);
+            w.Write("@service"); w.Write(service);
+        }
+        w.Flush();
+        return buf.WrittenMemory.ToArray();
+    }
+
+    private static async Task<List<LogEvent>> QueryAsync(QueryExecutor q, string? filter, int count = 100)
     {
         var res = new List<LogEvent>();
-        await foreach (var ev in q.ExecuteAsync(new QueryRequest { Filter = filter, Count = 100 }))
+        await foreach (var ev in q.ExecuteAsync(new QueryRequest { Filter = filter, Count = count }))
             res.Add(ev);
         return res;
     }

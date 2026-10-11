@@ -252,7 +252,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         => Count(_owner.StageRaw(this, tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8, serviceIdx));
 
     /// <inheritdoc/>
-    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _owner.Pool.Intern(serviceUtf8);
+    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _owner.Pool.Intern(IngestionEndpoint.ServiceName(serviceUtf8));
 
     /// <inheritdoc cref="IOtlpLogSink.MaxEventPayloadBytes"/>
     public int MaxEventPayloadBytes => _owner.MaxEventPayloadBytes;

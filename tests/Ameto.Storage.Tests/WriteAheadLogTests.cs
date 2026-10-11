@@ -368,6 +368,92 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// Round-4 H2. A POOLED service longer than a pool row is written once per log, as a long pooled
+    /// template is: by the first entry that uses its index, and every later entry of that index gets it
+    /// back — the same string, and by the index of a template too, the pool being one. It was carried by
+    /// every entry: 1 000 events of one 70 KB service made a 70 MB log (the review's probe), and 3 500 of
+    /// a 65 600-character one a log whose replay ran a 384 MiB heap out at every start.
+    /// </summary>
+    [Fact]
+    public void A_long_pooled_service_is_written_once_per_log_and_every_entry_of_its_index_gets_it_back()
+    {
+        string path        = NewWalPath();
+        string longService = "Svc." + new string('s', 70_000);   // 70 004 bytes: more than a row holds
+        try
+        {
+            long written;
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                for (int i = 0; i < 1_000; i++)
+                    wal.Append(1_000 + i, LogLevel.Information, 7, "short {n}", [(byte)i], serviceIndex: 9, service: longService);
+                wal.Append(5_000, LogLevel.Information, 9, longService, [0xB1]);                               // its index as a template
+                wal.Append(6_000, LogLevel.Information, 7, "short {n}", [0xC1], serviceIndex: 8, service: "svc.short");
+                written = wal.WrittenBytes;
+            }
+
+            Assert.True(written < 2 * longService.Length, $"{written:N0} B logged for 1 000 events of one service");
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(1_002, entries.Count);
+            Assert.Equal(longService, entries[0].Service);
+            for (int i = 0; i < 1_000; i++)
+            {
+                Assert.Same(entries[0].Service, entries[i].Service);   // one string, not one per entry
+                Assert.Equal(-1, entries[i].ServiceIndex);              // no row to resolve: the text is attached
+                Assert.Equal((byte)i, Assert.Single(entries[i].Payload));
+            }
+            Assert.True(entries[1_000].Unpooled);
+            Assert.Same(entries[0].Service, entries[1_000].Template);
+            Assert.Equal(8, entries[1_001].ServiceIndex);
+            Assert.Null(entries[1_001].Service);
+
+            var rows = WriteAheadLog.LoadPool(path + ".pool");
+            Assert.DoesNotContain((ushort)9, rows.Keys);                // no row cut short
+            Assert.Equal("svc.short", rows[8]);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// Round-4 H2. A walk of a log makes ONE string per distinct inline text. A template or service
+    /// outside the pool is in every entry that uses it, and the walk built a string per entry, which
+    /// the tier a replay fills held per event: a log of one 64 KB unpooled service in every entry held
+    /// a copy per event. Distinct texts stay distinct, and a text met again after others is still the
+    /// first string.
+    /// </summary>
+    [Fact]
+    public void A_walk_makes_one_string_per_distinct_inline_text()
+    {
+        string path    = NewWalPath();
+        string serviceA = "A." + new string('a', 64 * 1024);
+        string serviceB = "B." + new string('a', 64 * 1024);      // as long as A: only the bytes tell them apart
+        string template = "unpooled " + new string('t', 64 * 1024) + " {n}";
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                for (int i = 0; i < 200; i++)
+                    wal.Append(1_000 + i, LogLevel.Information, -1, template, [(byte)i], serviceIndex: -1, service: i % 3 == 2 ? serviceB : serviceA);
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(200, entries.Count);
+            var services  = new HashSet<string>(ReferenceEqualityComparer.Instance);
+            var templates = new HashSet<string>(ReferenceEqualityComparer.Instance);
+            for (int i = 0; i < 200; i++)
+            {
+                Assert.Equal(i % 3 == 2 ? serviceB : serviceA, entries[i].Service);
+                Assert.Equal(template, entries[i].Template);
+                services.Add(entries[i].Service!);
+                templates.Add(entries[i].Template!);
+            }
+            Assert.Equal(2, services.Count);
+            Assert.Single(templates);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// A long pooled template counts as carried only once an entry that carries it is in the log: an
     /// append refused for want of room (a spill log) leaves the next one to carry it, so no entry can
     /// name the index ahead of the text. And each log carries it for itself — the one a spill rotates
