@@ -17,11 +17,12 @@ namespace Ameto.Storage;
 /// <para>Memory: the payloads live in one array from <see cref="IngestBufferPool"/> (doubled as it
 /// fills) and the per-event records in one from <see cref="ArrayPool{T}.Shared"/>, both handed back
 /// on <see cref="Dispose"/>. A request holds it while it waits, and nothing here outlives the
-/// request — but nothing bounds it either, beyond the request's byte limit: a record costs an
-/// <c>Item</c> (~80 B) besides its payload, and an OTLP record carries a copy of its resource's
-/// attributes, so a body of many tiny records decodes to many times its own size (an 8 MiB body of
-/// empty records is ~4 M of them). The ring this replaced copied each record into a fixed arena and
-/// dropped past it; what to bound this by, and what to answer past the bound, is an open decision.</para>
+/// request. Nothing here bounds it: a record costs an <c>Item</c> (~80 B) besides its payload, and
+/// an OTLP record carries a copy of its resource's attributes, so a body of many tiny records
+/// decodes to many times its own size (an 8 MiB body of empty records is ~4 M of them). The
+/// receivers bound it before they decode — each request by <c>Ingestion.MaxDecodedLogBatchBytes</c>
+/// (413 past it), and the batches held at once by twice that (503 past it); see
+/// <c>IngestionEndpoint.TryBeginBatch</c>.</para>
 ///
 /// <para>Not thread-safe: one request fills it, then one writer reads it.</para>
 /// </summary>

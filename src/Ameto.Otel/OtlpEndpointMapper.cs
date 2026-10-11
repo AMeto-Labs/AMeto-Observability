@@ -242,8 +242,38 @@ public static class OtlpEndpointMapper
 
                     try
                     {
-                        batch = endpoint.BeginBatch(payloadSizeHint: bodyLen);
                         bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+
+                        // THE BATCH IS WEIGHED BEFORE A RECORD IS STAGED (OtlpLogBatchWeight): it is
+                        // decoded whole before it is written, and a record of two bytes on the wire
+                        // decodes to ~130, its resource's attributes copied in. Over the limit it is
+                        // refused as what it is, too large; under it, its weight is reserved against
+                        // what the batches held decoded at once may weigh, or it is asked to retry.
+                        // A body the walk cannot frame is refused 400 here, nothing of it ingested.
+                        long weight;
+                        try
+                        {
+                            weight = isProto ? OtlpLogBatchWeight.WeighProto(body.AsSpan(0, bodyLen))
+                                             : OtlpLogBatchWeight.WeighJson(body.AsSpan(0, bodyLen));
+                        }
+                        catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                        {
+                            ctx.Response.StatusCode = 400;
+                            return;
+                        }
+                        if (weight > endpoint.MaxDecodedBatchBytes)
+                        {
+                            // Logged as well as answered: the exporter does not retry a 413.
+                            endpoint.NoteTooHeavy(ctx.Request.Path.Value, weight);
+                            WriteTooHeavy(ctx, isProto);
+                            return;
+                        }
+                        batch = endpoint.TryBeginBatch(payloadSizeHint: bodyLen, weight);
+                        if (batch is null)
+                        {
+                            WriteRetryLater(ctx, OtlpLogBatchWeight.BudgetFullMessageUtf8);
+                            return;
+                        }
 
                         // Both encodings decode straight into the batch — no OTLP object graph, no
                         // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
@@ -601,6 +631,20 @@ public static class OtlpEndpointMapper
 
         var writer = response.BodyWriter;
         writer.Advance(FormatStatus(writer.GetSpan(StatusBodyMaxBytes), OtlpMetricPointBudget.RefusalMessageUtf8, isProto));
+    }
+
+    /// <summary>
+    /// The refusal of a logs batch that would decode past <c>Ingestion.MaxDecodedLogBatchBytes</c>
+    /// (<see cref="OtlpLogBatchWeight"/>): 413, and the OTLP Status saying why. Nothing of it ingested.
+    /// </summary>
+    private static void WriteTooHeavy(HttpContext ctx, bool isProto)
+    {
+        var response = ctx.Response;
+        response.StatusCode  = StatusCodes.Status413PayloadTooLarge;
+        response.ContentType = isProto ? ProtobufContentType : JsonContentType;
+
+        var writer = response.BodyWriter;
+        writer.Advance(FormatStatus(writer.GetSpan(StatusBodyMaxBytes), OtlpLogBatchWeight.RefusalMessageUtf8, isProto));
     }
 
     // ── Content-Encoding ──────────────────────────────────────────────────────

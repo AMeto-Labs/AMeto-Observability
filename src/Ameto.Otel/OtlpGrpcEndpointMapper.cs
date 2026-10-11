@@ -329,7 +329,19 @@ public static class OtlpGrpcEndpointMapper
             {
                 if (logs)
                 {
-                    batch = ctx.RequestServices.GetRequiredService<IngestionEndpoint>().BeginBatch(payloadSizeHint: segment.Count);
+                    // Weighed before a record is staged (OtlpLogBatchWeight), as on the HTTP route: over
+                    // the limit, RESOURCE_EXHAUSTED; the decoded budget spent, UNAVAILABLE. A message
+                    // the walk cannot frame throws into the INVALID_ARGUMENT below with no batch begun,
+                    // so nothing of it is written.
+                    var  endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
+                    long weight   = OtlpLogBatchWeight.WeighProto(segment.AsSpan());
+                    if (weight > endpoint.MaxDecodedBatchBytes)
+                    {
+                        endpoint.NoteTooHeavy(ctx.Request.Path.Value, weight);
+                        throw new OtlpLogBatchWeight.TooHeavyException(weight, endpoint.MaxDecodedBatchBytes);
+                    }
+                    batch = endpoint.TryBeginBatch(payloadSizeHint: segment.Count, weight)
+                         ?? throw new OtlpLogBatchWeight.BudgetFullException();
                     OtlpLogProtoParser.Parse(segment.AsSpan(), batch);
                     (ok, rejected, why) = (true, 0, null);
                 }
@@ -344,6 +356,21 @@ public static class OtlpGrpcEndpointMapper
                 // (#126 review F2, NEW-1): the "batch too large" answer, as for one over the byte limit.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
+                return;
+            }
+            catch (OtlpLogBatchWeight.TooHeavyException)
+            {
+                // The same for a logs batch that would decode past Ingestion.MaxDecodedLogBatchBytes.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                await FinishAsync(ctx, StatusResourceExhausted, OtlpLogBatchWeight.RefusalMessage);
+                return;
+            }
+            catch (OtlpLogBatchWeight.BudgetFullException)
+            {
+                // The batches held decoded at once are at their limit — the store is behind and
+                // requests are waiting for room. Nothing decoded, nothing written: retried.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                await FinishAsync(ctx, StatusUnavailable, OtlpLogBatchWeight.BudgetFullMessage);
                 return;
             }
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))

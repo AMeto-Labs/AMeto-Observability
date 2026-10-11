@@ -39,10 +39,14 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 
     private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template);
 
-    internal LogIngestBatch(IngestionEndpoint owner, int payloadSizeHint)
+    /// <summary>The decoded weight reserved for this batch (<see cref="IngestionEndpoint.TryBeginBatch"/>), given back on dispose.</summary>
+    private long _reserved;
+
+    internal LogIngestBatch(IngestionEndpoint owner, int payloadSizeHint, long reserved = 0)
     {
-        _owner  = owner;
-        _staged = new LogWriteBatch(payloadSizeHint);
+        _owner    = owner;
+        _staged   = new LogWriteBatch(payloadSizeHint);
+        _reserved = reserved;
     }
 
     /// <summary>
@@ -92,7 +96,17 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>Writes the staged events into the store and says what became of them.</summary>
     public ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default) => _owner.CommitAsync(this, ct);
 
-    public void Dispose() => _staged.Dispose();
+    public void Dispose()
+    {
+        try { _staged.Dispose(); }
+        finally
+        {
+            // Once: a batch disposed twice gives back its reservation once.
+            long reserved = _reserved;
+            _reserved = 0;
+            if (reserved != 0) _owner.ReleaseDecoded(reserved);
+        }
+    }
 
     // ── Sinks ─────────────────────────────────────────────────────────────────
 
