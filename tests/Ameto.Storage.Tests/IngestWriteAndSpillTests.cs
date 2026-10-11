@@ -1937,6 +1937,52 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// The same wait, failing where its state machine is boxed — this method's first real suspension
+    /// — caught and slept out as above. But the compiler guards every finally of the method with the
+    /// state that suspension had set, so each one after it was skipped: the next run's release of the
+    /// writer lock (held for good: every other writer waited for ever) and the lease's end (the batch
+    /// never given back). The lock is released in a method with no await now, and the lease by plain
+    /// code.
+    /// </summary>
+    [Fact]
+    public async Task A_write_whose_first_suspension_cannot_be_boxed_releases_the_writer_lock_and_its_batch()
+    {
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 50;
+        int calls = 0;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref calls) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
+        };
+        var batch = Batch(engine, 0, 10);
+        try
+        {
+            LogBatchWriteResult result;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<WriteBatchAsync>");
+            try { result = await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(5)); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+            Assert.Equal(new LogBatchWriteResult(10, 0, 0), result);
+
+            using var other  = Batch(engine, 10, 5);
+            var       second = Task.Run(async () => await engine.WriteBatchAsync(other, TimeSpan.FromSeconds(5)));
+            Assert.True(await Task.WhenAny(second, Task.Delay(ShortGuard)) == second, "the writer lock was never released");
+            Assert.Equal(new LogBatchWriteResult(5, 0, 0), await second);
+
+            batch.Dispose();
+            Assert.True(batch.ItemCapacity == 0, "the batch was not given back: its write never ended its lease");
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            batch.Dispose();
+            // Off this thread and bounded: with the writer lock held for good (before the fix), shutdown's
+            // fence waits for it for ever.
+            var disposing = Task.Run(async () => await engine.DisposeAsync());
+            await Task.WhenAny(disposing, Task.Delay(ShortGuard));
+        }
+    }
+
+    /// <summary>
     /// Once an event is in the tier it is written, whatever its bookkeeping does next: a throw
     /// after the commit (here the log line of a failed WAL append) must not be taken for "nothing
     /// written", or the event would be written a second time.
