@@ -1611,6 +1611,119 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Ma. A faulting attempt holds the writer lock for as long as the collection a failing rent
+    /// forces, and the requests behind it queued for the lock with that time uncounted: six to eight
+    /// concurrent requests took three to four times a 500 ms wait (forty would take ~50 s, past a
+    /// Collector's 5 s timeout). While the store is faulting a request's wall time is its wait, its
+    /// queueing for the lock included, so each ends within about its wait and one attempt.
+    /// </summary>
+    [Fact]
+    public async Task Concurrent_requests_whose_writes_keep_faulting_each_end_within_about_their_wait()
+    {
+        var engine  = Engine(Options(NewDir()));
+        var batches = new List<LogWriteBatch>();
+        try
+        {
+            engine._afterWriteGate = () =>
+            {
+                Thread.Sleep(150);   // the collection a failing rent waits for, the writer lock held
+                throw new OutOfMemoryException("test: no memory for the template slots");
+            };
+            for (int i = 0; i < 6; i++) batches.Add(Batch(engine, i * 10, 10));
+
+            var done = await Task.WhenAll(batches.Select(b => Task.Run(async () =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var r  = await engine.WriteBatchAsync(b, TimeSpan.FromMilliseconds(500));
+                return (Result: r, Took: sw.Elapsed);
+            }))).WaitAsync(HangGuard);
+
+            foreach (var (r, took) in done)
+            {
+                Assert.Equal(new LogBatchWriteResult(0, 0, 10), r);
+                Assert.True(took < TimeSpan.FromMilliseconds(1_300), $"a request took {took.TotalMilliseconds:F0} ms of a 500 ms wait");
+            }
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            foreach (var b in batches) b.Dispose();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R1a-4. The pause after a fault doubles with each fault IN A ROW; a write that lands between
+    /// them ends the row. The count used to be reset only by a faulting run that had written first,
+    /// so a fault after a run that wrote everything doubled a stale count (806 ms measured where 100
+    /// was right). Three faults, each after a run that landed whole: three first pauses.
+    /// </summary>
+    [Fact]
+    public async Task A_fault_after_a_run_that_landed_pauses_as_a_first_fault_not_a_doubled_one()
+    {
+        const int Run = 256;   // StorageEngine.WriteRunEvents: the faults below each open a run
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 200;
+        try
+        {
+            int calls = 0;
+            engine._afterWriteGate = () =>
+            {
+                int n = Interlocked.Increment(ref calls);
+                if (n == 1 || n == 2 + Run || n == 3 + 2 * Run)
+                    throw new OutOfMemoryException("test: a fault between runs that land");
+            };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (var batch = Batch(engine, 0, 3 * Run))
+                Assert.Equal(new LogBatchWriteResult(3 * Run, 0, 0), await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(10)));
+            sw.Stop();
+
+            // 3 x 200 ms; a stale count paused 200 + 400 + 800.
+            Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(1_100), $"the batch took {sw.Elapsed.TotalMilliseconds:F0} ms");
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R1a-5. A wait for room that cannot even be set up (WaitAsync allocates) was counted as a slice
+    /// that took no time: a request went round twenty times in 6 ms and gave up before the swap it was
+    /// waiting for landed. It waits for real now, with nothing to allocate, and takes the room when it
+    /// comes.
+    /// </summary>
+    [Fact]
+    public async Task A_wait_for_room_that_cannot_be_set_up_still_waits_and_takes_the_room_that_comes()
+    {
+        var engine = OneSlotEngine(Options(NewDir(), spill: false));
+        var gate   = HoldFirstFlush(engine);
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            engine._beforeRoomWaitForTest = () => throw new OutOfMemoryException("test: no memory to set up the wait");
+            using var b = Batch(engine, TierEvents, TierEvents + 10);   // B takes a tier's worth, then has no room
+            // Off this thread: with no wait that can be set up, the write waits on its own thread.
+            var writing = Task.Run(() => engine.WriteBatchAsync(b, TimeSpan.FromSeconds(3)).AsTask());
+
+            await Task.Delay(500);
+            Assert.False(writing.IsCompleted, "the batch gave up within its wait, while the room it waited for was coming");
+            gate.Set();
+            Assert.Equal(new LogBatchWriteResult(TierEvents + 10, 0, 0), await writing.WaitAsync(ShortGuard));
+        }
+        finally
+        {
+            engine._beforeRoomWaitForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Once an event is in the tier it is written, whatever its bookkeeping does next: a throw
     /// after the commit (here the log line of a failed WAL append) must not be taken for "nothing
     /// written", or the event would be written a second time.
