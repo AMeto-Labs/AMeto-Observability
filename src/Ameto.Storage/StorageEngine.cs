@@ -2481,8 +2481,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // and that request is held back like every other after a failure. Released first, it
             // went round at once — a second attempt at what had failed a moment before, and a
             // second count of one failure in the run that decides when the despill may take the slot.
-            if (swapFailed) OnSwapFailed();
-            ReleaseFlushLock();
+            // And the release whatever the failure's bookkeeping does: OnSwapFailed throws nothing
+            // now, but it once did — its retry's closure was allocated before its try — and a throw
+            // here left the swap lock held for good: no swap, spill end, despill or merge ever again,
+            // every request answered 503 until a restart, and shutdown without its final flush.
+            try { if (swapFailed) OnSwapFailed(); }
+            finally { ReleaseFlushLock(); }
         }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
@@ -2636,44 +2640,62 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     }
 
     /// <summary>
-    /// A swap failed before it installed anything (the swap lock is released). Asks for it again
-    /// itself, after <see cref="_swapRetryDelay"/> — one retry waiting at a time — and wakes the
-    /// despill, which may now take the slot the swap could not use. Never throws.
+    /// A swap failed before it installed anything; called with the swap lock still held, by the
+    /// finally that releases it. Asks for the swap again itself, after <see cref="SwapRetryDelayMs"/>
+    /// — one retry waiting at a time — and wakes the despill, which may now take the slot the swap
+    /// could not use. Never throws, and allocates nothing outside its try: the retry's closure is
+    /// built in <see cref="StartSwapRetry"/>. Captured by a lambda here, the delay was hoisted into a
+    /// closure allocated on entry, before any of this ran, and an out-of-memory there left the swap
+    /// lock held for good.
     /// </summary>
     private void OnSwapFailed()
     {
-        long now   = Environment.TickCount64;
-        long delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
-        Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
-        Volatile.Write(ref _swapRetryAt, now + delay);
-        if (Interlocked.Exchange(ref _swapRetryPending, 1) == 0)
+        try
         {
-            try
+            long now   = Environment.TickCount64;
+            long delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
+            Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
+            Volatile.Write(ref _swapRetryAt, now + delay);
+            if (Interlocked.Exchange(ref _swapRetryPending, 1) == 0)
             {
-                var t = Task.Run(async () =>
+                try { StartSwapRetry(delay); }
+                catch (Exception)
                 {
-                    try { await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false); }
-                    catch (Exception) { Volatile.Write(ref _swapRetryPending, 0); return; }   // shutdown
+                    // No retry of its own: the writers' requests, a released slot and the age loop
+                    // still ask, and the hold-back above lets them once its time is up.
                     Volatile.Write(ref _swapRetryPending, 0);
-                    // The wait is over, whatever the two clocks say: the request below is not held back.
-                    Volatile.Write(ref _swapRetryAt, 0);
-                    ScheduleFlush();
-                });
-                _inFlightFlushes[t] = 0;
-                _ = t.ContinueWith(
-                    static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-                    _inFlightFlushes, CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            }
-            catch (Exception)
-            {
-                // No retry of its own: the writers' requests, a released slot and the age loop
-                // still ask, and the hold-back above lets them once its time is up.
-                Volatile.Write(ref _swapRetryPending, 0);
+                }
             }
         }
+        catch (Exception) { /* the bookkeeping is lost; the swap lock is released all the same */ }
         WakeDespill();
     }
+
+    /// <summary>
+    /// Starts the retry a failed swap asks for, <paramref name="delay"/> ms from now. Its own method
+    /// so the closure over the delay is allocated in here, inside <see cref="OnSwapFailed"/>'s try.
+    /// </summary>
+    private void StartSwapRetry(long delay)
+    {
+        _swapRetryClosureForTest?.Invoke();
+        var t = Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false); }
+            catch (Exception) { Volatile.Write(ref _swapRetryPending, 0); return; }   // shutdown
+            Volatile.Write(ref _swapRetryPending, 0);
+            // The wait is over, whatever the two clocks say: the request below is not held back.
+            Volatile.Write(ref _swapRetryAt, 0);
+            ScheduleFlush();
+        });
+        _inFlightFlushes[t] = 0;
+        _ = t.ContinueWith(
+            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+            _inFlightFlushes, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>Test seam: runs where a failed swap's retry allocates its closure; throwing from it is that allocation failing.</summary>
+    internal Action? _swapRetryClosureForTest;
 
     /// <summary>
     /// Releases <see cref="_flushLock"/> and, if a write's request for a swap found it held in the

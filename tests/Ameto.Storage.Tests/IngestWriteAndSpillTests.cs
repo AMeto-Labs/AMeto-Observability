@@ -1350,6 +1350,49 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-4 review H1. The bookkeeping of a failed swap runs before the swap lock is released (so
+    /// the release's re-ask is held back like any other), and it allocated outside its try: the
+    /// retry's closure, hoisted to the method's entry, and the despill's wake (SemaphoreSlim.Release
+    /// allocates with a timed waiter parked). An out-of-memory there skipped the release: the swap
+    /// lock was held for good — no swap, spill end, despill or merge ever again. Whichever of the two
+    /// fails, the lock is released and the next swap installs.
+    /// </summary>
+    [Theory]
+    [InlineData("closure")]
+    [InlineData("wake")]
+    public async Task A_failed_swap_whose_bookkeeping_runs_out_of_memory_still_releases_the_swap_lock(string where)
+    {
+        var engine = Engine(Options(NewDir()));
+        int fail = 1;
+        engine._beforeSwap = () =>
+        {
+            if (Interlocked.Exchange(ref fail, 0) == 1) throw new IOException("test: no room on the volume for the next WAL");
+        };
+        if (where == "closure") engine._swapRetryClosureForTest = () => throw new OutOfMemoryException("test: the retry's closure");
+        else                    engine._wakeDespillForTest      = () => throw new OutOfMemoryException("test: waking the despill");
+        try
+        {
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            var failed = await Record.ExceptionAsync(() => engine.FlushHotTierAsync());   // the swap fails
+
+            engine._swapRetryClosureForTest = null;
+            engine._wakeDespillForTest      = null;
+            await engine.FlushHotTierAsync().WaitAsync(ShortGuard);   // the next swap has the lock
+            Assert.True(engine.LiveHotTier.Count == 0, "the next swap did not run: the swap lock is still held");
+            Assert.NotEmpty(engine.ListSegments());
+            Assert.IsType<IOException>(failed);   // the swap's own failure, not its bookkeeping's
+        }
+        finally
+        {
+            engine._beforeSwap              = null;
+            engine._swapRetryClosureForTest = null;
+            engine._wakeDespillForTest      = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// The same for the swap that ends a spill: asked for once, by the flush that freed the slot, and
     /// lost when it failed — the spill went on beside an idle slot until its block filled or MaxAge.
     /// </summary>

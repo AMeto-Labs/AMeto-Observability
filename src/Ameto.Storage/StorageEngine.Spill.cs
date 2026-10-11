@@ -452,12 +452,25 @@ public sealed partial class StorageEngine
         return TimeSpan.FromMilliseconds(Math.Min(ms, Math.Max(_despillRetryCap.TotalMilliseconds, _despillRetryDelay.TotalMilliseconds)));
     }
 
+    /// <summary>
+    /// Wakes the despill loop. Never throws: it runs in finally blocks that release a slot or the
+    /// swap lock, and <see cref="SemaphoreSlim.Release()"/> allocates when a timed waiter is parked.
+    /// A wake that is lost is the loop's safety-net timeout later.
+    /// </summary>
     private void WakeDespill()
     {
-        if (_despillSignal.CurrentCount != 0) return;
-        try { _despillSignal.Release(); }
+        try
+        {
+            _wakeDespillForTest?.Invoke();
+            if (_despillSignal.CurrentCount != 0) return;
+            _despillSignal.Release();
+        }
         catch (SemaphoreFullException) { /* already woken */ }
+        catch (Exception) { /* out of memory: the loop wakes at its timeout instead */ }
     }
+
+    /// <summary>Test seam: runs as the despill loop is woken; throwing from it is the wake running out of memory.</summary>
+    internal Action? _wakeDespillForTest;
 
     /// <summary>
     /// A flush slot came free. If the engine is spilling, or its live tier is refusing writes, a
@@ -473,7 +486,13 @@ public sealed partial class StorageEngine
         Volatile.Write(ref _swapFailedAt, 0);
         Volatile.Write(ref _swapRetryAt, 0);
         var w = _write;
-        if (w.Spill is not null || Volatile.Read(ref w.HotRefused)) ScheduleFlush();
+        // Never throws: it ends the finally blocks that give a slot back. A swap that could not be
+        // scheduled (out of memory) is asked for again by the next write, release or age pass.
+        if (w.Spill is not null || Volatile.Read(ref w.HotRefused))
+        {
+            try { ScheduleFlush(); }
+            catch (Exception) { /* asked again by the next request */ }
+        }
         WakeDespill();
     }
 
