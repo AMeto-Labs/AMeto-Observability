@@ -147,10 +147,19 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
         StorageEngine.HoldDespillForTest.Value = hold.Task;
         var run1 = Engine(opts);
         StorageEngine.HoldDespillForTest.Value = null;
-        run1._afterLevelPublished = _ => throw new IOException("test: the process dies after its first level's move");
-        hold.SetResult();
-        WaitFor(() => run1.DespillsCompletedForTest == 1, "run 1's despill to stop after its first level");
-        await run1.DisposeAsync();
+        // Disposed whatever happens: a failed wait used to leave run 1 running, its files open, and the
+        // test's directory undeletable.
+        try
+        {
+            run1._afterLevelPublished = _ => throw new IOException("test: the process dies after its first level's move");
+            hold.SetResult();
+            WaitFor(() => run1.DespillsCompletedForTest == 1, "run 1's despill to stop after its first level");
+        }
+        finally
+        {
+            hold.TrySetResult();
+            await run1.DisposeAsync();
+        }
 
         string infoLevel = Assert.Single(Directory.GetFiles(Path.Combine(_dir, "segments"), $"{opts.NodeId.Value}-{Block + 2}-*.seg"));
         Assert.True(File.Exists(spill), "the spill file must outlive run 1");
