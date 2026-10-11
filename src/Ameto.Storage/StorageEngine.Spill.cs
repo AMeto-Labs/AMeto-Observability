@@ -601,6 +601,21 @@ public sealed partial class StorageEngine
             catch (OperationCanceledException) { return; }
         }
 
+        // The server's engine waits for the indexing layer's sink before it writes a block: until
+        // then a despilled block's segments got no index sections (see _indexSinkWait).
+        if (_indexSinkWait > TimeSpan.Zero && IndexSinkFactory is null)
+        {
+            try { await _indexSinkWired.Task.WaitAsync(_indexSinkWait, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "The index sink was not wired within {Wait}s of startup — spilled blocks are written into segments " +
+                    "without index sections until it is (their searches scan; a merge rebuilds the index)",
+                    _indexSinkWait.TotalSeconds);
+            }
+        }
+
         while (!ct.IsCancellationRequested)
         {
             // The timeout is a safety net, not the cadence: every event that can make work possible

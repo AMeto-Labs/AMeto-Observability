@@ -72,7 +72,29 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// emit posting-list offsets as the FILE ordinals the writer hands it, not group-local
     /// ones.</para>
     /// </summary>
-    public SegmentIndexSinkFactory? IndexSinkFactory { get; set; }
+    public SegmentIndexSinkFactory? IndexSinkFactory
+    {
+        get => _indexSinkFactory;
+        set
+        {
+            _indexSinkFactory = value;
+            if (value is not null) _indexSinkWired.TrySetResult();
+        }
+    }
+    private SegmentIndexSinkFactory? _indexSinkFactory;
+
+    /// <summary>Completed once <see cref="IndexSinkFactory"/> is first set — what the despill's first block waits for.</summary>
+    private readonly TaskCompletionSource _indexSinkWired = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// How long the despill loop waits, at its start, for <see cref="IndexSinkFactory"/>. The loop
+    /// starts with the engine, and the indexing layer wires the sink only in its hosted service's
+    /// StartAsync, after every hosted service has been built — so a block an earlier run left could
+    /// be despilled into segments with no index sections. The server's registration asks for the
+    /// wait (<see cref="StorageServiceExtensions.AddAmetoStorage"/>); an engine built directly, with
+    /// no indexing layer to come, has none. Past it the despill goes on without an index, and says so.
+    /// </summary>
+    private readonly TimeSpan _indexSinkWait;
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
@@ -772,9 +794,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     internal StorageEngine(
         IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
-        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null, Task? bootScanHeldUntil = null)
+        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null, Task? bootScanHeldUntil = null,
+        TimeSpan indexSinkWait = default)
     {
         _maintenanceStartDelay = maintenanceStartDelay ?? DefaultMaintenanceStartDelay;
+        _indexSinkWait         = indexSinkWait;
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;

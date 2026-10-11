@@ -634,6 +634,57 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// The server's engine despills a block an earlier run left only once the indexing layer has
+    /// wired its index sink. The despill loop starts with the engine, and the sink is wired by a
+    /// hosted service's StartAsync, after every hosted service has been built: a block despilled in
+    /// between went into segments with no index sections. (The wait is bounded, and is the server
+    /// registration's; an engine built with none despills at once, as every other test here does.)
+    /// </summary>
+    [Fact]
+    public async Task The_servers_engine_despills_a_block_from_an_earlier_run_only_once_the_index_sink_is_wired()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        const ulong Block = 9_000;
+        const int   Spilled = 300;
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(Block), 1 << 20))
+            for (int i = 0; i < Spilled; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "spill.svc");
+
+        var engine = new StorageEngine(
+            Microsoft.Extensions.Options.Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance,
+            MemoryBudgets.Current(),
+            indexSinkWait: HangGuard);
+        try
+        {
+            await engine.CatalogLoaded;
+            // A despill that did not wait would be done well within this.
+            SpinWait.SpinUntil(() => engine.SpillFilesPending == 0, TimeSpan.FromSeconds(1));
+            Assert.Equal(1, engine.SpillFilesPending);
+
+            int sinks = 0;
+            engine.IndexSinkFactory = (events, terms) =>
+            {
+                Interlocked.Increment(ref sinks);
+                return new Ameto.Indexing.SegmentIndexBuilder(events, 5, terms);
+            };
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == Spilled,
+                    "the block to be despilled once the sink is wired", ShortGuard);
+            Assert.True(Volatile.Read(ref sinks) > 0, "the despilled block's segments were written without an index");
+        }
+        finally
+        {
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// The swap that ends a spill commits the frozen tier to its heavy phase: once the tier is
     /// frozen, counted and listed, the flush owns the slot and the count. Ending the spill used to
     /// run inside the try whose catch means "nothing was swapped", so a throw there — the close's
