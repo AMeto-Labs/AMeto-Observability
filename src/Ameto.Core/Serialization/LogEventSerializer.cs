@@ -98,6 +98,25 @@ public static class LogEventSerializer
             ReadOnlySpan<byte> msgpackProps,
             ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8);
+
+        /// <summary>
+        /// The longest property map an event may have: past it the batch reader stops copying the
+        /// event's properties into its scratch and hands the event to <see cref="TryIngestOversizedClef"/>.
+        /// Unbounded for a sink that keeps everything.
+        /// </summary>
+        int MaxEventPayloadBytes => int.MaxValue;
+
+        /// <summary>
+        /// An event whose property map would be <paramref name="payloadBytes"/> long — past
+        /// <see cref="MaxEventPayloadBytes"/> — refused before it was copied. Returns false: dropped.
+        /// </summary>
+        bool TryIngestOversizedClef(
+            long tsTicks,
+            byte level,
+            ReadOnlySpan<byte> templateUtf8,
+            long payloadBytes,
+            ulong traceHi, ulong traceLo, ulong spanId,
+            ReadOnlySpan<byte> serviceUtf8) => false;
     }
 
     // Second scratch for the streaming path: map header + raw pairs, contiguous, so the
@@ -182,17 +201,30 @@ public static class LogEventSerializer
     // method, and its remark "use the ClefBatchProgress overload" onto the overload that IS one.
     public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
-        var reader = new MessagePackReader(body);
-        progress.ElementIndex = -1;   // the header read below is not "element 0"
-        progress.ElementCount = reader.ReadArrayHeader();
-
-        for (int i = 0; i < progress.ElementCount; i++)
+        try
         {
-            progress.ElementIndex = i;
-            if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
-            else                                             progress.Dropped++;
+            var reader = new MessagePackReader(body);
+            progress.ElementIndex = -1;   // the header read below is not "element 0"
+            progress.ElementCount = reader.ReadArrayHeader();
+
+            for (int i = 0; i < progress.ElementCount; i++)
+            {
+                progress.ElementIndex = i;
+                if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
+                else                                             progress.Dropped++;
+            }
+        }
+        finally
+        {
+            // Scratch a request grew past this is let go, not kept on the thread for the next one:
+            // requests that grew it to megabytes held that on their threads for good.
+            if (_tRawPairs is { Capacity: > KeepScratchBytes }) _tRawPairs = null;
+            if (_tPropsOut is { Capacity: > KeepScratchBytes }) _tPropsOut = null;
         }
     }
+
+    /// <summary>Scratch a request grew past this is let go at its end rather than kept on the thread.</summary>
+    private const int KeepScratchBytes = 1 << 20;
 
     private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
@@ -210,6 +242,8 @@ public static class LogEventSerializer
 
         ArrayBufferWriter<byte>? rawPropsBuf = null;
         int                      rawPropsCount = 0;
+        long                     rawPropsBytes = 0;
+        bool                     oversized     = false;
 
         for (int i = 0; i < mapCount; i++)
         {
@@ -238,17 +272,23 @@ public static class LogEventSerializer
                     break;
                 default:
                     // Unrecognised key: copy the (key, value) pair verbatim — the bytes that
-                    // end up in the ring must be identical to the non-streaming path's.
+                    // end up in the ring must be identical to the non-streaming path's. Counted,
+                    // and no longer copied once the map passes the sink's limit: the event is then
+                    // refused unassembled (below), where its scratch grew to the whole map first.
                     reader.Skip();
                     SequencePosition pairEnd = reader.Position;
+                    var pair = sourceSequence.Slice(pairStart, pairEnd);
+                    rawPropsBytes += pair.Length;
+                    rawPropsCount++;
+                    if (!oversized && 5 + rawPropsBytes > sink.MaxEventPayloadBytes) oversized = true;
+                    if (oversized) break;
                     if (rawPropsBuf is null)
                     {
                         rawPropsBuf = _tRawPairs ??= new ArrayBufferWriter<byte>(256);
                         rawPropsBuf.ResetWrittenCount();
                     }
-                    foreach (var segment in sourceSequence.Slice(pairStart, pairEnd))
+                    foreach (var segment in pair)
                         rawPropsBuf.Write(segment.Span);
-                    rawPropsCount++;
                     break;
             }
         }
@@ -260,6 +300,21 @@ public static class LogEventSerializer
         long tsTicks = TryParseTimestampUtf8(tsUtf8, out DateTimeOffset parsed)
             ? parsed.UtcTicks
             : DateTimeOffset.UtcNow.UtcTicks;
+
+        // CLEF @m fallback: a client that sent only a rendered message gets it as template.
+        ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
+
+        // ServiceTieRule: @service, unless it is absent or empty, then service.name.
+        if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
+
+        if (oversized)
+        {
+            long mapBytes = (rawPropsCount < 16 ? 1 : rawPropsCount < 65_536 ? 3 : 5) + rawPropsBytes;
+            progress.InSink = true;
+            bool kept = sink.TryIngestOversizedClef(tsTicks, (byte)level, template, mapBytes, traceIdHi, traceIdLo, spanId, svcUtf8);
+            progress.InSink = false;
+            return kept;
+        }
 
         // header(N) + raw pairs, contiguous in per-thread scratch — no per-event byte[].
         ReadOnlySpan<byte> props = default;
@@ -273,12 +328,6 @@ public static class LogEventSerializer
             outBuf.Write(rawPropsBuf.WrittenSpan);
             props = outBuf.WrittenSpan;
         }
-
-        // CLEF @m fallback: a client that sent only a rendered message gets it as template.
-        ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
-
-        // ServiceTieRule: @service, unless it is absent or empty, then service.name.
-        if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
 
         // Every read of the body is behind us: from here to the end of the call, a throw is the
         // sink's. Deliberately not cleared in a finally — the caller reads the flag AFTER the

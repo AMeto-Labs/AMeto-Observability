@@ -42,6 +42,9 @@ public static class OtlpLogStreamParser
     /// </summary>
     private const int UnescapeScratchBytes = 1024;
 
+    /// <summary>Scratch a request grew past this is let go at its end rather than kept on the thread.</summary>
+    private const int KeepScratchBytes = 1 << 20;
+
     public static (int Ingested, int Dropped) Parse(ReadOnlySpan<byte> json, IOtlpLogSink sink)
     {
         var reader = new Utf8JsonReader(json, isFinalBlock: true, state: default);
@@ -93,6 +96,12 @@ public static class OtlpLogStreamParser
             ArrayPool<byte>.Shared.Return(tmplBuf);
             ArrayPool<byte>.Shared.Return(trBuf);
             ArrayPool<byte>.Shared.Return(spBuf);
+
+            // Scratch a request grew past this is let go, not kept on the thread for the next one
+            // (see the protobuf parser).
+            if (_tRes is { Capacity: > KeepScratchBytes }) _tRes = null;
+            if (_tRec is { Capacity: > KeepScratchBytes }) _tRec = null;
+            if (_tOut is { Capacity: > KeepScratchBytes }) _tOut = null;
         }
     }
 
@@ -282,20 +291,27 @@ public static class OtlpLogStreamParser
         if (!spSpan.IsEmpty) { w.WriteString("@sp"u8); w.WriteString(spSpan); recKeyCount++; }
         w.Flush();
 
-        // Assemble the final msgpack map: header(total) + resource KV bytes + record KV bytes.
         int total = resKeyCount + recKeyCount;
+        ulong trHi = 0, trLo = 0, spanId = 0;
+        if (!trSpan.IsEmpty) TraceIdHelper.TryParseTraceId(trSpan, out trHi, out trLo);
+        if (!spSpan.IsEmpty) TraceIdHelper.TryParseSpanId(spSpan, out spanId);
+        if (tsTicks == 0) tsTicks = DateTimeOffset.UtcNow.UtcTicks;
+
+        // Past the sink's limit — the resource's attributes alone, or with the record's — the map is
+        // not assembled: the record is refused as oversized with the size it would have had. A resource
+        // of megabytes used to be copied into every record under it before each was refused.
+        long mapBytes = (total < 16 ? 1 : total < 65_536 ? 3 : 5) + (long)resBuf.WrittenCount * (resKeyCount > 0 ? 1 : 0) + recBuf.WrittenCount;
+        if (mapBytes > sink.MaxEventPayloadBytes)
+            return sink.TryIngestOversized(tsTicks, level, tmplLen > 0 ? tmplBuf.AsSpan(0, tmplLen) : default, mapBytes,
+                                           trHi, trLo, spanId, svcLen > 0 ? svcBuf.AsSpan(0, svcLen) : default, svcIdx);
+
+        // Assemble the final msgpack map: header(total) + resource KV bytes + record KV bytes.
         outBuf.ResetWrittenCount();
         var ow = new MessagePackWriter(outBuf);
         ow.WriteMapHeader(total);
         if (resKeyCount > 0) ow.WriteRaw(resBuf.WrittenSpan);
         if (recKeyCount > 0) ow.WriteRaw(recBuf.WrittenSpan);
         ow.Flush();
-
-        ulong trHi = 0, trLo = 0, spanId = 0;
-        if (!trSpan.IsEmpty) TraceIdHelper.TryParseTraceId(trSpan, out trHi, out trLo);
-        if (!spSpan.IsEmpty) TraceIdHelper.TryParseSpanId(spSpan, out spanId);
-
-        if (tsTicks == 0) tsTicks = DateTimeOffset.UtcNow.UtcTicks;
 
         return sink.TryIngestRaw(
             tsTicks, level,

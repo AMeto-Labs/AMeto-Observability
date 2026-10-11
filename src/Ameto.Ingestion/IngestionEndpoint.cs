@@ -46,6 +46,28 @@ public interface IOtlpLogSink
 
     /// <summary>Called once after a batch has been parsed. A sink that writes as it goes may ignore it.</summary>
     void NotifyBatchEnqueued();
+
+    /// <summary>
+    /// The longest property map a record may have. A parser stops building one that passes it and
+    /// hands the record to <see cref="TryIngestOversized"/> instead — so its scratch never holds more
+    /// than this for a record, where a resource attribute of bytes that are not UTF-8 grew it to three
+    /// times the attribute, in every record under it, before the record was refused anyway.
+    /// Unbounded for a sink that keeps everything.
+    /// </summary>
+    int MaxEventPayloadBytes => int.MaxValue;
+
+    /// <summary>
+    /// A record whose property map would be <paramref name="payloadBytes"/> long — past
+    /// <see cref="MaxEventPayloadBytes"/> — refused before it was built: the sink records the drop
+    /// as it would an oversized map's, without the map. Returns false: the record is dropped.
+    /// </summary>
+    bool TryIngestOversized(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx) => false;
 }
 
 /// <summary>
@@ -865,26 +887,7 @@ public sealed class IngestionEndpoint
         }
 
         if (msgpackProps.Length > _maxEventPayloadBytes)
-        {
-            // Drop the oversized original, but leave a compact Error breadcrumb in
-            // the stream so the loss is visible on the Events page — not only in
-            // the server's own log. Marked DroppedBy=server to distinguish it from
-            // the client sink's own oversized marker.
-            //
-            // Cold path, one per dropped event: the strings are worth their cost. The log line that
-            // names the producer is written with the answer that ends the request (CommitAsync):
-            // the drop is counted there, once, not per attempt, and a drop whose marker the store
-            // had no room for is always named there. The service comes from the span when the
-            // caller passed one, else from the pool: a parser that interned the block's
-            // service.name once may hand over only the index.
-            string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
-                            : serviceIdx >= 0      ? _pool.Get(serviceIdx)
-                            : string.Empty;
-            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx, service,
-                                  new LogIngestBatch.OversizedDrop(msgpackProps.Length, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120)));
-            return false; // original counted as dropped by the caller
-        }
+            return StageOversizedCore(batch, tsTicks, level, templateUtf8, msgpackProps.Length, traceHi, traceLo, spanId, serviceUtf8, serviceIdx, service);
 
         // Intern hands back the pool's OWN instance, so the tier stores the shared string
         // rather than a per-event duplicate — and one dictionary probe does the work of two.
@@ -903,6 +906,63 @@ public sealed class IngestionEndpoint
 
         batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx, service);
         return true;
+    }
+
+    /// <summary>The longest property map an event may have (<c>Ingestion.MaxEventPayloadBytes</c>, at most a hot-tier chunk).</summary>
+    internal int MaxEventPayloadBytes => _maxEventPayloadBytes;
+
+    /// <summary>
+    /// An event the parser refused before it built its property map, which would have been
+    /// <paramref name="payloadBytes"/> long (see <see cref="IOtlpLogSink.TryIngestOversized"/>):
+    /// staged as <see cref="StageRaw"/> stages an oversized one. Returns false.
+    /// </summary>
+    internal bool StageOversized(
+        LogIngestBatch batch,
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx)
+    {
+        BeforeStageForTest?.Invoke();
+        string? service = null;
+        if (serviceIdx < 0 && !serviceUtf8.IsEmpty)
+        {
+            serviceIdx = _pool.Intern(serviceUtf8, out string svcText);
+            if (serviceIdx < 0 && svcText.Length != 0) service = svcText;
+        }
+        return StageOversizedCore(batch, tsTicks, level, templateUtf8, payloadBytes, traceHi, traceLo, spanId, serviceUtf8, serviceIdx, service);
+    }
+
+    /// <summary>
+    /// Drops an oversized event, but leaves a compact Error breadcrumb in the stream so the loss is
+    /// visible on the Events page — not only in the server's own log. Marked DroppedBy=server to
+    /// distinguish it from the client sink's own oversized marker.
+    ///
+    /// <para>Cold path, one per dropped event: the strings are worth their cost. The log line that
+    /// names the producer is written with the answer that ends the request (CommitAsync): the drop is
+    /// counted there, once, not per attempt, and a drop whose marker the store had no room for is
+    /// named there. The service comes from the span when the caller passed one, else from the pool:
+    /// a parser that interned the block's service.name once may hand over only the index.</para>
+    /// </summary>
+    private bool StageOversizedCore(
+        LogIngestBatch batch,
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx, string? service)
+    {
+        int    bytes    = (int)Math.Min(payloadBytes, int.MaxValue);
+        string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
+        string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
+                        : serviceIdx >= 0      ? _pool.Get(serviceIdx)
+                        : string.Empty;
+        StageServerDropMarker(batch, tsTicks, level, origTmpl, bytes, traceHi, traceLo, spanId, serviceIdx, service,
+                              new LogIngestBatch.OversizedDrop(bytes, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120)));
+        return false; // original counted as dropped by the caller
     }
 
     /// <summary>

@@ -26,14 +26,33 @@ public sealed class StringInternPool
 {
     /// <summary>The cap <see cref="Shared"/> and the parameterless constructor use.</summary>
     public const int DefaultMaxPoolSize = 65536;
+
+    /// <summary>
+    /// How many UTF-16 units of text a pool holds at the most, by default: 16 Mi, 32 MiB. The cap on
+    /// the COUNT of strings bounded nothing in bytes, and a pool keeps every string for the life of
+    /// the process: 26 distinct templates of 4 M characters pinned 206 MiB (the 27th ran the heap
+    /// out), and 65 536 distinct 10 KB stack traces would be ~1.3 GB — left behind by batches refused
+    /// 413 or 503 as well. Past it a miss is answered as on a full pool: a fresh string, unpooled
+    /// (index -1), which the batch that holds it is charged for.
+    /// </summary>
+    public const long DefaultMaxPooledChars = 16L << 20;
+
     private const int InitialSlots = 1024;
 
+    /// <summary>
+    /// UTF-8 input longer than this is decoded straight into its own string for the lookup: a pooled
+    /// char buffer that long would stay with the shared array pool after the call.
+    /// </summary>
+    private const int DecodeInPlaceBytes = 64 * 1024;
+
     private readonly int                               _maxPoolSize;
+    private readonly long                              _maxPooledChars;
     private readonly int                               _initialSlots;
     private readonly ConcurrentDictionary<string, int> _stringToIndex = new(StringComparer.Ordinal);
     private volatile string?[]                         _indexToString;
     private readonly Lock                              _slotLock       = new();
     private          int                               _nextIndex      = 0;
+    private          long                              _pooledChars;
 
     public static readonly StringInternPool Shared = new();
 
@@ -48,16 +67,23 @@ public sealed class StringInternPool
     /// <param name="maxPoolSize">How many distinct strings this pool will ever hold. Past it
     /// every miss is answered with a fresh, unpooled string (index -1) and
     /// <see cref="PoolExhausted"/> fires once.</param>
-    public StringInternPool(int maxPoolSize)
+    /// <param name="maxPooledChars">How much text it holds, in UTF-16 units (<see cref="DefaultMaxPooledChars"/>);
+    /// past it a miss is answered the same way.</param>
+    public StringInternPool(int maxPoolSize, long maxPooledChars = DefaultMaxPooledChars)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxPoolSize, 1);
-        _maxPoolSize   = maxPoolSize;
-        _initialSlots  = Math.Min(InitialSlots, maxPoolSize);
-        _indexToString = new string?[_initialSlots];
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxPooledChars, 1);
+        _maxPoolSize    = maxPoolSize;
+        _maxPooledChars = maxPooledChars;
+        _initialSlots   = Math.Min(InitialSlots, maxPoolSize);
+        _indexToString  = new string?[_initialSlots];
     }
 
     /// <summary>The most distinct strings this pool holds before it stops pooling.</summary>
     public int MaxPoolSize => _maxPoolSize;
+
+    /// <summary>The text this pool holds, in UTF-16 units — at most its budget (see <see cref="DefaultMaxPooledChars"/>), save what recovery restored.</summary>
+    public long PooledChars => Interlocked.Read(ref _pooledChars);
 
     /// <summary>
     /// Raised once, the first time the pool saturates. Past that point every event carries
@@ -101,6 +127,30 @@ public sealed class StringInternPool
         if (_nextIndex >= _maxPoolSize)
             return Exhausted();
 
+        // The text budget (DefaultMaxPooledChars): taken before the claim, given back by every way
+        // out of it that does not keep the string.
+        long length = template.Length;
+        if (Interlocked.Add(ref _pooledChars, length) > _maxPooledChars)
+        {
+            Interlocked.Add(ref _pooledChars, -length);
+            return Exhausted();
+        }
+        bool kept = false;
+        try
+        {
+            return ClaimIndex(template, out canonical, ref kept);
+        }
+        finally
+        {
+            if (!kept) Interlocked.Add(ref _pooledChars, -length);
+        }
+    }
+
+    /// <summary><see cref="Claim"/> past its budget check: the index, and the slot and the mapping. <paramref name="kept"/> is set once this string is the one the pool keeps.</summary>
+    private int ClaimIndex(string template, out string canonical, ref bool kept)
+    {
+        canonical = template;
+
         // The cap is checked AGAIN on the index actually claimed: two threads missing
         // together at 65535 both pass the check above and one of them claims 65536, an id
         // beyond every slot the pool can hold. The counter overshoots the cap by at most
@@ -121,6 +171,7 @@ public sealed class StringInternPool
         SetSlot(newIdx, template);
         if (_stringToIndex.TryAdd(template, newIdx))
         {
+            kept = true;
             OnClaimedForTest?.Invoke();
             return newIdx;          // canonical is `template` — the instance just stored
         }
@@ -168,11 +219,12 @@ public sealed class StringInternPool
     {
         if (utf8.IsEmpty) { canonical = string.Empty; return -1; }
 
-        // Decode UTF-8 → chars for the ordinal lookup. Short by nature ⇒ stack; pool the rare long one.
-        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
-        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
-        Span<char> chars = rented ?? stackalloc char[charCount];
-        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        // Decode UTF-8 → chars for the ordinal lookup. Short by nature ⇒ stack; pool the rare long one,
+        // and a very long one is decoded into its own string (see DecodeInPlaceBytes).
+        if (utf8.Length > DecodeInPlaceBytes) return Intern(Decode(utf8), out canonical);
+        char[]? rented = utf8.Length > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(utf8.Length) : null;
+        Span<char> chars = rented ?? stackalloc char[utf8.Length];
+        int charCount = DecodeInto(utf8, chars);
         var key = chars[..charCount];
         try
         {
@@ -218,10 +270,10 @@ public sealed class StringInternPool
         carriedFrom = FoundHere;
         if (utf8.IsEmpty) { canonical = string.Empty; return -1; }
 
-        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
-        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
-        Span<char> chars = rented ?? stackalloc char[charCount];
-        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        if (utf8.Length > DecodeInPlaceBytes) return InternOrCarry(Decode(utf8), out canonical, carryFrom, out carriedFrom);
+        char[]? rented = utf8.Length > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(utf8.Length) : null;
+        Span<char> chars = rented ?? stackalloc char[utf8.Length];
+        int charCount = DecodeInto(utf8, chars);
         var key = chars[..charCount];
         try
         {
@@ -314,15 +366,46 @@ public sealed class StringInternPool
     {
         if (utf8.IsEmpty) { canonical = null; index = -1; return false; }
 
-        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
-        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
-        Span<char> chars = rented ?? stackalloc char[charCount];
-        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        if (utf8.Length > DecodeInPlaceBytes) return TryGet(Decode(utf8).AsSpan(), out canonical, out index);
+        char[]? rented = utf8.Length > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(utf8.Length) : null;
+        Span<char> chars = rented ?? stackalloc char[utf8.Length];
+        int charCount = DecodeInto(utf8, chars);
         try { return TryGet(chars[..charCount], out canonical, out index); }
         finally
         {
             if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
         }
+    }
+
+    /// <summary>
+    /// Decodes <paramref name="utf8"/> into <paramref name="chars"/> (at least as long as it: no
+    /// UTF-8 sequence decodes to more UTF-16 units than its bytes), U+FFFD for each invalid sequence,
+    /// and returns the units written. <see cref="System.Text.Unicode.Utf8.ToUtf16"/>, not the
+    /// encoding's GetCharCount and GetChars: their fallback for invalid input allocated as it went —
+    /// ~285 MB of garbage interning one body of such bytes.
+    /// </summary>
+    private static int DecodeInto(ReadOnlySpan<byte> utf8, Span<char> chars)
+    {
+        System.Text.Unicode.Utf8.ToUtf16(utf8, chars, out _, out int written, replaceInvalidSequences: true);
+        return written;
+    }
+
+    /// <summary>A long UTF-8 text decoded straight into its own string, as <see cref="DecodeInto"/> decodes.</summary>
+    private static string Decode(ReadOnlySpan<byte> utf8)
+    {
+        int length;
+        if (System.Text.Unicode.Utf8.IsValid(utf8)) length = System.Text.Encoding.UTF8.GetCharCount(utf8);
+        else
+        {
+            length = 0;
+            for (var rest = utf8; !rest.IsEmpty;)
+            {
+                var status = System.Text.Rune.DecodeFromUtf8(rest, out var rune, out int consumed);
+                length += status == System.Buffers.OperationStatus.Done ? rune.Utf16SequenceLength : 1;
+                rest = rest[consumed..];
+            }
+        }
+        return string.Create(length, utf8, static (dest, src) => DecodeInto(src, dest));
     }
 
     /// <summary>Indices claimed so far, capped at <see cref="MaxPoolSize"/> — how full the pool is.</summary>
@@ -399,10 +482,13 @@ public sealed class StringInternPool
     public void ForceIntern(int index, string template)
     {
         var slots = _indexToString;
-        if ((uint)index < (uint)slots.Length
-            && slots[index] is { } previous
+        string? held = (uint)index < (uint)slots.Length ? slots[index] : null;
+        if (held is { } previous
             && !string.Equals(previous, template, StringComparison.Ordinal))
             _stringToIndex.TryRemove(new KeyValuePair<string, int>(previous, index));   // only while it still names this slot
+        // Counted, not refused: recovery restores what a log needs. (A slot it overwrites gives its text back.)
+        if (!string.Equals(held, template, StringComparison.Ordinal))
+            Interlocked.Add(ref _pooledChars, template.Length - (held?.Length ?? 0));
 
         // The array is bounded by the cap; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
@@ -423,5 +509,6 @@ public sealed class StringInternPool
         lock (_slotLock) _indexToString = new string?[_initialSlots];
         System.Threading.Interlocked.Exchange(ref _nextIndex, 0);
         System.Threading.Interlocked.Exchange(ref _exhaustedSignalled, 0);
+        System.Threading.Interlocked.Exchange(ref _pooledChars, 0);
     }
 }

@@ -271,7 +271,14 @@ public sealed class LogWriteBatch : IDisposable
     {
         BeforeGrowForTest.Value?.Invoke();
         long required = (long)_payloadLength + need;
-        if (required > Array.MaxLength) throw new OutOfMemoryException("a log batch's payloads cannot exceed one array");
+        if (required > Array.MaxLength)
+        {
+            // Past what one array holds — and so past the batch's limit, which is below it: refused as
+            // too heavy (413) by the charge, where an out-of-memory thrown first was answered 503 —
+            // retried for ever — or 500. Without a budget, out of memory as before.
+            _budget?.Charge(required - _payload.Length);
+            throw new OutOfMemoryException("a log batch's payloads cannot exceed one array");
+        }
         long first  = _payload.Length == 0 ? Math.Max(InitialPayloadBytes, _payloadSizeHint) : 0;
         long wanted = Math.Max(required, Math.Max(first, (long)_payload.Length * 2));
 

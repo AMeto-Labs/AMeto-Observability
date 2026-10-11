@@ -254,6 +254,28 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <inheritdoc/>
     public int InternService(ReadOnlySpan<byte> serviceUtf8) => _owner.Pool.Intern(serviceUtf8);
 
+    /// <inheritdoc cref="IOtlpLogSink.MaxEventPayloadBytes"/>
+    public int MaxEventPayloadBytes => _owner.MaxEventPayloadBytes;
+
+    /// <inheritdoc/>
+    public bool TryIngestOversized(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx)
+        => Count(_owner.StageOversized(this, tsTicks, level, templateUtf8, payloadBytes, traceHi, traceLo, spanId, serviceUtf8, serviceIdx));
+
+    /// <inheritdoc/>
+    public bool TryIngestOversizedClef(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8)
+        => Count(_owner.StageOversized(this, tsTicks, level, templateUtf8, payloadBytes, traceHi, traceLo, spanId, serviceUtf8, serviceIdx: -1));
+
     /// <summary>Nothing to wake: the batch is written by <see cref="CommitAsync"/>.</summary>
     public void NotifyBatchEnqueued() { }
 

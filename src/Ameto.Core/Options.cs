@@ -220,8 +220,13 @@ public sealed class IngestionOptions
     /// <summary>What one decoded log record costs besides its properties, about: its staged item and that item's share of the doubling array that holds it.</summary>
     public const int DecodedLogRecordBytes = 128;
 
-    /// <summary>The most <see cref="MaxDecodedLogBatchBytes"/> can be: a batch's payloads are one array.</summary>
-    public const long MaxDecodedLogBatchBytesCeiling = int.MaxValue;
+    /// <summary>
+    /// The most <see cref="MaxDecodedLogBatchBytes"/> can be: a batch's payloads are one array, of at most
+    /// <see cref="Array.MaxLength"/> bytes (0x7FFFFFC7). At int.MaxValue a batch could need an array past that and
+    /// still be under its limit: the growth then ran out of memory (503, retried for ever) before its
+    /// charge could refuse it as too heavy (413).
+    /// </summary>
+    public const long MaxDecodedLogBatchBytesCeiling = 0x7FFFFFC7;
 
     /// <summary>The most <see cref="MaxDecodedLogBytesInFlight"/> can be: 1 TiB, far from where its sums could overflow.</summary>
     public const long MaxDecodedLogBytesInFlightCeiling = 1L << 40;

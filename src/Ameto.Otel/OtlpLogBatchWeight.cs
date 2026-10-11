@@ -93,7 +93,12 @@ internal static class OtlpLogBatchWeight
     {
         var  reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
         long records = 0;
-        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return 0;
+        // An OTLP/JSON request is ONE object and nothing after it. Anything else is refused here, 400
+        // with nothing ingested, as a document the reader cannot read is: the walk used to stop at a
+        // first token that was not an object, or at the object's end, and '[', '[1,2' and '{}garbage'
+        // were answered 200 (docs/API.md says a malformed JSON logs body ingests nothing).
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+            throw new InvalidDataException("an OTLP/JSON request is a JSON object");
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
             bool blocks = reader.ValueTextEquals("resourceLogs"u8);
@@ -108,6 +113,9 @@ internal static class OtlpLogBatchWeight
             }
             else reader.Skip();
         }
+        // On the object's end — and then the end of the body: a value after it throws in Read.
+        if (reader.TokenType != JsonTokenType.EndObject || reader.Read())
+            throw new InvalidDataException("an OTLP/JSON request is one JSON object");
         return records * IngestionOptions.DecodedLogRecordBytes;
     }
 
