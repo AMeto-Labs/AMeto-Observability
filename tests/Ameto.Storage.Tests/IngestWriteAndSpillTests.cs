@@ -3198,6 +3198,43 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-4 L18. A pool file whose log is gone is swept at the start. A log's pool is deleted with
+    /// it, best-effort, and on Windows that delete fails while a handle to the file is open — a tick's
+    /// fsync of the pool, off the pool's lock, holds one past the log's dispose — and the .pool stayed
+    /// for good: nothing lists them. A spill file's own pool is not touched.
+    /// </summary>
+    [Fact]
+    public async Task Pool_files_whose_log_is_gone_are_swept_at_the_start()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string walPool   = Path.Combine(walDir, $"{opts.NodeId.Value}-120.wal.pool");
+        string spillPool = Path.Combine(walDir, $"{opts.NodeId.Value}-126{StorageEngine.SpillExtension}.pool");
+        File.WriteAllBytes(walPool,   [1, 0, 1, 0, (byte)'x']);
+        File.WriteAllBytes(spillPool, [1, 0, 1, 0, (byte)'x']);
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        WriteThreeEventLog(spill, opts, 9_000);   // with its own pool, which stays
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        await using (engine)
+        {
+            Assert.False(File.Exists(walPool),   "a log's pool outlived its log");
+            Assert.False(File.Exists(spillPool), "a spill file's pool outlived its spill file");
+            Assert.True(File.Exists(spill + ".pool"), "the pool of a spill file still waiting was swept");
+
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the spill file to be despilled", ShortGuard);
+            AssertThreeEventsWhole(ReadAll(engine));
+        }
+    }
+
+    /// <summary>
     /// Round-4 L14, a flush that fails part way: the replay's flush moves one level into place and
     /// cannot write the next (a directory stands where its file goes). The level it moved — registered
     /// by nobody — is deleted, the WAL goes to the despill, and once the way is clear the despill writes

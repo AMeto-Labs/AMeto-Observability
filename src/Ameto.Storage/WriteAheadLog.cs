@@ -650,7 +650,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         long        from, writeEnd;
         lock (_writeLock)
         {
-            if (_disposed || _accessor is null) return;
+            // Not "or the view is gone": a grow whose restoring map failed too leaves the log unmapped
+            // until rotation, and its entries before the grow — acknowledged — still need the handle
+            // flush. Their pages are the file's (the view was let go of without a write-back, and the
+            // handle flush writes them, as it does after every grow); the tick returned here instead,
+            // on every tick, and an idle log was never made durable at all.
+            if (_disposed) return;
 
             writeEnd = FileHeaderSize + _writeOffset;
             if (writeEnd <= _lastFlushedOffset) return;
@@ -740,15 +745,19 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // flushes the stream's buffer under this lock, and the handle's getter flushes it again), so
         // the fsync of the handle makes them durable; a row written meanwhile dirties the pool again
         // for the next tick, and a failed fsync gives the claim back.
-        Microsoft.Win32.SafeHandles.SafeFileHandle handle;
-        lock (_poolLock)
-        {
-            if (!_poolDirty || _poolStream is null) return;
-            handle     = _poolStream.SafeFileHandle;
-            _poolDirty = false;
-        }
         try
         {
+            Microsoft.Win32.SafeHandles.SafeFileHandle handle;
+            lock (_poolLock)
+            {
+                if (!_poolDirty || _poolStream is null) return;
+                // Inside the try: the getter writes the stream's buffer out first, and a failure there
+                // (a row whose own write failed, retried) is the fsync's, kept dirty and retried — it
+                // used to leave from outside the try, past the rule below, and replaced the WAL's
+                // exception on a tick that had one.
+                handle     = PoolHandleHookForTest is { } get ? get(_poolStream) : _poolStream.SafeFileHandle;
+                _poolDirty = false;
+            }
             if (PoolFlushHookForTest is { } hook) hook(handle);
             else RandomAccess.FlushToDisk(handle);
             Interlocked.Increment(ref _poolFlushCount);
@@ -862,6 +871,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// can watch, hold or fail the pool fsync. Never set in production.
     /// </summary>
     internal Action<Microsoft.Win32.SafeHandles.SafeFileHandle>? PoolFlushHookForTest;
+
+    /// <summary>
+    /// Test seam: when set, the tick's claim of the pool file calls this in place of the stream's
+    /// <c>SafeFileHandle</c> getter — which writes the stream's buffer out first, and can fail doing
+    /// so — under <see cref="_poolLock"/>. Never set in production.
+    /// </summary>
+    internal Func<FileStream, Microsoft.Win32.SafeHandles.SafeFileHandle>? PoolHandleHookForTest;
 
     /// <summary>
     /// Absolute file offset up to which this WAL is durable: msynced AND its file handle
@@ -1210,6 +1226,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     private void Map(long fileSize)
     {
+        MapHookForTest?.Invoke(fileSize);
         _mmf      = MemoryMappedFile.CreateFromFile(_fileStream!, null, fileSize,
                         MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
         _accessor = _mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.ReadWrite);
@@ -1227,9 +1244,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
             if (writeBack) UnmapWriteBackForTest?.Invoke();
-            // Closing the view's handle first unmaps it with no write-back: the accessor's dispose
-            // writes a view back only while it is still open.
-            else _accessor.SafeMemoryMappedViewHandle.Dispose();
+            else
+            {
+                // Closing the view's handle first unmaps it with no write-back: the accessor's dispose
+                // writes a view back only while it is still open.
+                _accessor.SafeMemoryMappedViewHandle.Dispose();
+                UnmapWithoutWriteBackForTest?.Invoke(_accessor.SafeMemoryMappedViewHandle.IsClosed);
+            }
             _accessor.Dispose();
         }
         _mmf?.Dispose();
@@ -1240,6 +1261,16 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     /// <summary>Test seam: runs as an unmap writes the whole view back (a dispose's, not a grow's). Null in production.</summary>
     internal Action? UnmapWriteBackForTest;
+
+    /// <summary>
+    /// Test seam: runs in an unmap without write-back (a grow's) just before the accessor is disposed,
+    /// with whether the view's handle is closed by then — what makes that dispose skip its write-back
+    /// of the whole view. Null in production.
+    /// </summary>
+    internal Action<bool>? UnmapWithoutWriteBackForTest;
+
+    /// <summary>Test seam: runs as the log maps its file, with the size; throwing from it is a map that failed. Null in production.</summary>
+    internal Action<long>? MapHookForTest;
 
     // ── Dispose ──────────────────────────────────────────────────────────────
 

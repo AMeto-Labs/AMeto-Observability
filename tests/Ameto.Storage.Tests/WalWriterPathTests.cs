@@ -104,7 +104,9 @@ public sealed class WalWriterPathTests : IDisposable
         try
         {
             int writeBacks = 0;
-            wal.UnmapWriteBackForTest = () => Interlocked.Increment(ref writeBacks);
+            var closed     = new List<bool>();
+            wal.UnmapWriteBackForTest        = () => Interlocked.Increment(ref writeBacks);
+            wal.UnmapWithoutWriteBackForTest = closed.Add;
 
             var payload = new byte[1024];
             for (int i = 0; i < 200; i++)   // ~210 KB: past 64 KB, so it grows (twice)
@@ -112,9 +114,76 @@ public sealed class WalWriterPathTests : IDisposable
             Assert.True(wal.WrittenBytes > 128 * 1024);
             Assert.Equal(0, writeBacks);
 
+            // Round-4 L20: the mechanism, not only the branch. The accessor's dispose writes the whole
+            // view back while the view is still open; each grow closes the view's handle first, which is
+            // what makes that dispose skip it.
+            Assert.Equal(2, closed.Count);
+            Assert.All(closed, isClosed => Assert.True(isClosed, "the view was still open when its accessor was disposed"));
+
             wal.Flush();
         }
         finally { wal.Dispose(); }   // the file can be opened to read only once the log lets go of it
         Assert.Equal(200, WriteAheadLog.ReadForRecovery(_path).Entries.Count);
+    }
+
+    /// <summary>
+    /// Round-4 L17. A grow whose restoring map failed too leaves the log unmapped until rotation, and
+    /// the tick still flushes its handle: the entries before the grow — acknowledged — are made
+    /// durable. The tick returned before the handle flush whenever the view was gone, on every tick,
+    /// so an idle log stayed in the drive's cache.
+    /// </summary>
+    [Fact]
+    public void A_tick_flushes_the_handle_of_a_log_a_failed_grow_left_unmapped()
+    {
+        var wal = WriteAheadLog.Open(_path, new NodeId(0), new SegmentId(1UL), initialCapacity: 64 * 1024);
+        try
+        {
+            for (int i = 0; i < 10; i++)
+                wal.Append(1 + i, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[100]);
+            long written = wal.WrittenBytes;
+
+            wal.MapHookForTest = _ => throw new IOException("test: the disk is full");
+            Assert.Throws<IOException>(() => wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[128 * 1024]));
+            var unmapped = Assert.Throws<IOException>(() => wal.Append(101, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[1]));
+            Assert.Contains("unmapped", unmapped.Message);
+
+            long flushes = wal.HandleFlushCount;
+            wal.Flush();
+            Assert.Equal(flushes + 1, wal.HandleFlushCount);
+            Assert.Equal(32 + written, wal.LastFlushedOffset);
+        }
+        finally { wal.Dispose(); }
+        Assert.Equal(10, WriteAheadLog.ReadForRecovery(_path).Entries.Count);
+    }
+
+    /// <summary>
+    /// Round-4 L19. The tick's claim of the pool reads the stream's handle, whose getter writes the
+    /// stream's buffer out first and can fail. That failure is the pool fsync's and follows its rule:
+    /// the pool stays dirty for the next tick, an IOException is not the tick's failure, and on a tick
+    /// whose WAL half failed it does not replace the WAL's exception. The claim was made outside that
+    /// rule's try.
+    /// </summary>
+    [Fact]
+    public void A_pool_claim_that_fails_is_retried_and_never_replaces_the_wals_failure()
+    {
+        using var wal = WriteAheadLog.Open(_path, new NodeId(0), new SegmentId(1UL), initialCapacity: 64 * 1024);
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl-a", new byte[] { 1 });   // a row: the pool is dirty
+
+        // The WAL half succeeds: the claim's failure is not the tick's, and the pool stays dirty.
+        wal.PoolHandleHookForTest = _ => throw new IOException("test: the pool's buffer could not be written");
+        wal.Flush();
+        long fsyncs = wal.PoolFlushCount;
+
+        // The WAL half fails too: its exception is the one that leaves the tick.
+        wal.Append(200, Ameto.Core.LogLevel.Information, 1, "tmpl-b", new byte[] { 2 });
+        wal.HandleFlushHookForTest = _ => throw new IOException("test: the WAL's drive flush failed");
+        var failed = Assert.Throws<IOException>(wal.Flush);
+        Assert.Contains("WAL's drive flush", failed.Message);
+
+        // And the pool is fsynced once its claim works again.
+        wal.PoolHandleHookForTest  = null;
+        wal.HandleFlushHookForTest = null;
+        wal.Flush();
+        Assert.Equal(fsyncs + 1, wal.PoolFlushCount);
     }
 }

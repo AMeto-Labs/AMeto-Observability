@@ -5833,6 +5833,23 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             try { File.Delete(marker); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
         }
+
+        // Pool files whose log is gone (round-4 L18). A log's pool goes with it (DeleteLogAndMarker),
+        // but that delete is best-effort, and on Windows it fails while any handle to the file is
+        // open: the tick fsyncs a pool off the pool's lock, a log disposed meanwhile closes its stream
+        // while that fsync still holds the handle, and the delete right behind met a sharing
+        // violation. The .pool then stayed for good — nothing else lists them. Swept here, for the
+        // logs and the spill files alike: nothing writes a log yet (the first opens after this), and a
+        // log is created before its pool, so a pool without its log is never one being written.
+        foreach (var pool in Directory.EnumerateFiles(_walDir, "*.pool"))
+        {
+            string log = pool[..^".pool".Length];
+            if (!log.EndsWith(".wal", StringComparison.OrdinalIgnoreCase)
+                && !log.EndsWith(SpillExtension, StringComparison.OrdinalIgnoreCase)) continue;
+            if (File.Exists(log)) continue;
+            try { File.Delete(pool); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete pool file {File}, whose log is gone", pool); }
+        }
     }
 
     /// <summary>
