@@ -1004,9 +1004,14 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         var    gate   = HoldFirstFlush(engine);
         engine._despillRetryDelay = TimeSpan.FromSeconds(1);
         int reads = 0;
+        // The second read waits for the test to have looked: the pending count is asserted between
+        // the failure and the retry, and a test thread held up for the retry's one second found the
+        // block despilled already.
+        using var looked = new ManualResetEventSlim(false);
         engine._beforeLoadSpillForTest = _ =>
         {
             if (Interlocked.Increment(ref reads) == 1) throw new OutOfMemoryException("test: no memory to materialise the block");
+            looked.Wait(HangGuard);
         };
         const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
         try
@@ -1018,6 +1023,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             gate.Set();
             WaitFor(() => Volatile.Read(ref reads) >= 1, "the first despill to fail its read");
             Assert.Equal(1, engine.SpillFilesPending);   // still on the books while it waits to be tried again
+            looked.Set();
 
             WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
                     "the block to be despilled on its second try", ShortGuard);
@@ -1029,6 +1035,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
         finally
         {
+            looked.Set();
             gate.Set();
             await engine.DisposeAsync();
         }
