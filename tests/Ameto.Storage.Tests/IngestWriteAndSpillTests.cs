@@ -833,6 +833,41 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A write that keeps faulting slowly — each attempt blocked, as a failing large rent blocks on
+    /// the full collection it forces — ends within about its wait plus one attempt, after a few
+    /// attempts. Only the pauses between attempts used to count, so here a 500 ms wait took six
+    /// 150 ms attempts and ~1.4 s; on a heap at its limit it was ~20 attempts and ~7 s a request.
+    /// </summary>
+    [Fact]
+    public async Task A_write_that_keeps_faulting_slowly_ends_within_its_wait_after_a_few_attempts()
+    {
+        var engine = Engine(Options(NewDir()));
+        try
+        {
+            int calls = 0, faulted = 0;
+            engine._afterWriteGate = () =>
+            {
+                if (Interlocked.Increment(ref calls) < 4) return;
+                Interlocked.Increment(ref faulted);
+                Thread.Sleep(150);   // the collection a failing 128 KB rent waits for
+                throw new OutOfMemoryException("test: no memory for the template slots");
+            };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(3, 0, 7), await engine.WriteBatchAsync(batch, TimeSpan.FromMilliseconds(500)));
+            sw.Stop();
+
+            Assert.True(Volatile.Read(ref faulted) <= 4, $"{faulted} faulting attempts in a 500 ms wait");
+            Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500 + 150 + 300), $"the batch took {sw.Elapsed.TotalMilliseconds:F0} ms");
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Once an event is in the tier it is written, whatever its bookkeeping does next: a throw
     /// after the commit (here the log line of a failed WAL append) must not be taken for "nothing
     /// written", or the event would be written a second time.

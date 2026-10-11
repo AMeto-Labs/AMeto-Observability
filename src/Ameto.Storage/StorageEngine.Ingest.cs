@@ -101,7 +101,8 @@ public sealed partial class StorageEngine
     ///
     /// <para>NEVER THROWS for a write that fails. A write that throws — out of memory allocating a
     /// tier chunk, say — wrote nothing (<see cref="WriteLocked"/> commits last), and is waited out
-    /// and tried again like one that found no room, then reported as not written with everything
+    /// and tried again like one that found no room — its own attempt counted against the wait, and
+    /// the pause after each fault in a row doubled — then reported as not written with everything
     /// after it. It used to escape: the request was answered 500 (gRPC UNKNOWN), which no OTLP
     /// exporter retries, the count of what was already written was lost, and a Seq client, which
     /// does retry a 500, wrote the batch's prefix a second time.</para>
@@ -122,14 +123,20 @@ public sealed partial class StorageEngine
         bool waited   = false;
         long budgetMs = (long)Math.Max(0, maxWait.TotalMilliseconds);
         long waitedMs = 0;
+        int  faults   = 0;   // faulted attempts in a row: the pause after each one doubles
 
         while (next < batch.Count)
         {
             WriteState   full;
             Task         room;
-            WriteOutcome outcome = WriteOutcome.Written;
+            WriteOutcome outcome    = WriteOutcome.Written;
+            int          runFrom    = next;
+            long         faultedFor = 0;
             lock (_writerLock)
             {
+                // Read once a run, not once an event: on a fault, the run's time is the attempt's (at
+                // most a few hundred events before it, microseconds — next to a full GC, nothing).
+                long runStart = Environment.TickCount64;
                 int end = Math.Min(batch.Count, next + WriteRunEvents);
                 while (next < end)
                 {
@@ -139,7 +146,8 @@ public sealed partial class StorageEngine
                     }
                     catch (Exception ex)
                     {
-                        outcome = WriteOutcome.Faulted;   // nothing of the event was written: see WriteLocked
+                        outcome    = WriteOutcome.Faulted;   // nothing of the event was written: see WriteLocked
+                        faultedFor = Environment.TickCount64 - runStart;
                         NoteWriteFaultLocked(ex);
                     }
                     if (outcome == WriteOutcome.Written)       written++;
@@ -158,6 +166,21 @@ public sealed partial class StorageEngine
                 room = Volatile.Read(ref _roomSignal).Task;
             }
 
+            if (outcome == WriteOutcome.Faulted)
+            {
+                // A faulted attempt is part of the wait, not free time between waits: on a heap at its
+                // limit the attempt itself — a failing 128 KB rent and the full collection it forces —
+                // can take longer than the slice after it. Counted only the slices, a request retried
+                // about twenty times in a 2 s wait and took ~7 s, past an OpenTelemetry Collector's
+                // 5 s timeout, which then resent the batch and wrote its prefix twice; and forty such
+                // requests made ~400 failing allocations a second. So the attempt counts, and each
+                // fault in a row doubles the pause after it: a request that keeps faulting ends within
+                // about BackPressureWait plus one attempt, after four or five of them.
+                waitedMs += faultedFor;
+                faults    = next > runFrom ? 1 : faults + 1;
+                if (budgetMs - waitedMs <= 0) break;
+            }
+
             if (!ReferenceEquals(_write, full)) continue;
 
             long left = budgetMs - waitedMs;
@@ -167,6 +190,9 @@ public sealed partial class StorageEngine
                 waited = true;
                 Interlocked.Increment(ref _ingestRoomWaits);
             }
+            long slice = outcome == WriteOutcome.Faulted
+                ? (long)_roomRecheckMs << Math.Min(faults - 1, 6)
+                : _roomRecheckMs;
             long began = Environment.TickCount64;
             try
             {
@@ -174,7 +200,7 @@ public sealed partial class StorageEngine
                 // write that finds no room asks for the swap again. A request is no longer dropped
                 // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
                 // the wake-ups, not what they rest on.
-                await room.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(left, _roomRecheckMs)), ct).ConfigureAwait(false);
+                await room.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(left, slice)), ct).ConfigureAwait(false);
             }
             catch (TimeoutException) { /* write again */ }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
