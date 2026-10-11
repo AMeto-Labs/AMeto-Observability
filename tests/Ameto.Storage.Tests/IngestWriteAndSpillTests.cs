@@ -2094,6 +2094,153 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── A recovery walk that fails part way ───────────────────────────────────
+
+    private static readonly ExceptionInfo WalkedException = new()
+    {
+        Type = "System.InvalidOperationException", Message = "the middle event's exception", StackTrace = "   at Orders.Handle()",
+    };
+
+    /// <summary>A log of three events, the middle one with an exception; the first and last use row 40, the middle row 41.</summary>
+    private static void WriteThreeEventLog(string path, ServerOptions opts, ulong block)
+    {
+        using var wal = WriteAheadLog.Open(path, opts.NodeId, new SegmentId(block), 1 << 20);
+        for (int i = 0; i < 3; i++)
+            wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, i == 1 ? LogLevel.Error : LogLevel.Information,
+                       i == 1 ? 41 : 40, i == 1 ? "failed {n}" : "event {n}", Props(i),
+                       exception: i == 1 ? WalkedException : null, serviceIndex: 42, service: "spill.svc",
+                       traceIdHi: 0xA000_0000_0000_0000UL | (uint)i, traceIdLo: (ulong)i * 7 + 1, spanId: (ulong)i * 13 + 1);
+    }
+
+    private static void AssertThreeEventsWhole(Dictionary<long, RawSegmentEvent> events)
+    {
+        Assert.Equal(3, events.Count);
+        Assert.Equal("event {n}",  events[0].Template);
+        Assert.Equal("failed {n}", events[1].Template);
+        Assert.Equal("event {n}",  events[2].Template);
+        Assert.Equal(WalkedException.Message, events[1].Exception?.Message);
+        Assert.All(events.Values, e => Assert.Equal("spill.svc", e.Service));
+    }
+
+    /// <summary>
+    /// Mc. Decoding a checksummed entry's exception is not reading a torn entry: an out-of-memory
+    /// there — a long stack trace on a tight heap — was taken for the end of the durable log, and the
+    /// replay published the event before it and deleted the WAL with the rest. It propagates now: the
+    /// replay fails ("WAL recovery failed"), the WAL stays for the next start, which replays all three.
+    /// And (R2-3) the walk that failed part way frees its tier and its mapping: the file can be opened
+    /// with no sharing at all.
+    /// </summary>
+    [Fact]
+    public async Task A_replay_that_runs_out_of_memory_decoding_an_exception_keeps_its_wal_for_the_next_start()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string wal  = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal");
+        WriteThreeEventLog(wal, opts, 9_000);
+
+        HotTierSegment? tier = null;
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () => throw new OutOfMemoryException("test: decoding the exception");
+        StorageEngine.RecoveryTierCreatedForTest.Value   = t => tier = t;
+        StorageEngine run1;
+        try { run1 = Engine(opts); }
+        finally
+        {
+            WriteAheadLog.BeforeExceptionDecodeForTest.Value = null;
+            StorageEngine.RecoveryTierCreatedForTest.Value   = null;
+        }
+        await using (run1)
+        {
+            await run1.CatalogLoaded;
+            Assert.True(File.Exists(wal), "the WAL was deleted after a replay that stopped part way");
+            Assert.Empty(ReadAll(run1));
+            Assert.NotNull(tier);
+            Assert.True(tier!.IsDisposed, "the tier the failed walk filled was not freed");
+            using (new FileStream(wal, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }   // no mapping left on it
+        }
+
+        await using var run2 = Engine(opts);
+        await run2.CatalogLoaded;
+        AssertThreeEventsWhole(ReadAll(run2));
+    }
+
+    /// <summary>
+    /// Mc, for the pool. A pool file that could not be read part way — out of memory, here — came back
+    /// as the rows read so far: the replay resolved the missing row's index through the LIVE pool and
+    /// published the middle event with another template (or none), then deleted the WAL. The failure
+    /// propagates now and the WAL stays; the next start replays every event with its own template.
+    /// </summary>
+    [Fact]
+    public async Task A_replay_whose_pool_read_fails_part_way_keeps_its_wal_for_the_next_start()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string wal  = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal");
+        WriteThreeEventLog(wal, opts, 9_000);
+
+        WriteAheadLog.BeforePoolRowForTest.Value = index =>
+        {
+            if (index == 41) throw new OutOfMemoryException("test: reading the middle event's row");
+        };
+        StorageEngine run1;
+        try { run1 = Engine(opts); }
+        finally { WriteAheadLog.BeforePoolRowForTest.Value = null; }
+        await using (run1)
+        {
+            await run1.CatalogLoaded;
+            Assert.True(File.Exists(wal), "the WAL was deleted after a replay that read part of its pool");
+        }
+
+        await using var run2 = Engine(opts);
+        await run2.CatalogLoaded;
+        AssertThreeEventsWhole(ReadAll(run2));
+    }
+
+    /// <summary>
+    /// Mc, for the despill: the read that ran out of memory decoding an exception despilled the event
+    /// before it and deleted the spill file with the rest. It fails now, is backed off and read again
+    /// (M5), and the block comes back whole; the tier the failed read filled is freed (R2-3).
+    /// </summary>
+    [Fact]
+    public async Task A_despill_that_runs_out_of_memory_decoding_an_exception_reads_the_block_again()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string spill = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        WriteThreeEventLog(spill, opts, 9_000);
+
+        int thrown = 0;
+        var tiers  = new System.Collections.Concurrent.ConcurrentQueue<HotTierSegment>();
+        var hold   = new TaskCompletionSource();
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () =>
+        {
+            if (Interlocked.Exchange(ref thrown, 1) == 0) throw new OutOfMemoryException("test: decoding the exception");
+        };
+        StorageEngine.RecoveryTierCreatedForTest.Value = tiers.Enqueue;
+        StorageEngine.HoldDespillForTest.Value         = hold.Task;
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally
+        {
+            WriteAheadLog.BeforeExceptionDecodeForTest.Value = null;
+            StorageEngine.RecoveryTierCreatedForTest.Value   = null;
+            StorageEngine.HoldDespillForTest.Value           = null;
+        }
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the block to be despilled", ShortGuard);
+
+            Assert.Equal(1, Volatile.Read(ref thrown));
+            Assert.Equal(3, engine.DespilledEvents);
+            Assert.True(tiers.TryPeek(out var first) && first.IsDisposed, "the tier the failed read filled was not freed");
+            AssertThreeEventsWhole(ReadAll(engine));
+        }
+    }
+
     // ── Recovery reads the log where it lies ──────────────────────────────────
 
     /// <summary>

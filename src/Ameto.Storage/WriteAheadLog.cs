@@ -959,10 +959,20 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         ExceptionInfo? exception = null;
         if (eh.ExceptionLength > 0)
         {
-            // v3 entries carry no checksum, so garbage here throws deep inside msgpack —
-            // treat it as the end of the durable data instead of failing the whole WAL.
-            try { exception = ExceptionInfo.FromBytes(excSpan); }
-            catch { return false; }
+            // v3 entries carry no checksum, so garbage here throws deep inside msgpack — treat it as
+            // the end of the durable data instead of failing the whole WAL. Only for v3, and never
+            // for an OutOfMemoryException, which says nothing about the bytes: a v4+ entry's
+            // exception is under its checksum, verified above, and a decode that fails there is not
+            // a torn entry. Taken for one, an out-of-memory decoding a large stack trace ended the
+            // replay at that event, and the replay then published the prefix and deleted the log.
+            // It propagates now: the replay keeps the WAL ("WAL recovery failed"), the despill backs
+            // off and reads the block again.
+            try
+            {
+                BeforeExceptionDecodeForTest.Value?.Invoke();   // stands in for the decode throwing
+                exception = ExceptionInfo.FromBytes(excSpan);
+            }
+            catch (Exception ex) when (layout == EntryLayout.V3 && ex is not OutOfMemoryException) { return false; }
         }
 
         // v3 entries predate the flag and their byte 13 was never written: never unpooled.
@@ -1142,26 +1152,41 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // ── Crash recovery helpers ─────────────────────────────────────────────
 
+    /// <summary>
+    /// A log's pool rows. A file that ends part way through a row ends the rows there — the torn
+    /// tail of a crash. A failure to read it — out of memory, the file held by another process —
+    /// propagates: it used to be swallowed, and the caller went on with the rows read so far, so the
+    /// replay resolved every missing row's index through the LIVE pool (another template) and lost
+    /// the services those rows named, then deleted the log. The replay now keeps the WAL, and the
+    /// despill backs off and reads the block again.
+    /// </summary>
     public static Dictionary<ushort, string> LoadPool(string poolPath)
     {
         var dict = new Dictionary<ushort, string>();
         if (!File.Exists(poolPath)) return dict;
-        try
+        using var fs = new FileStream(poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Span<byte> hdr = stackalloc byte[4];
+        while (fs.ReadAtLeast(hdr, 4, throwOnEndOfStream: false) == 4)
         {
-            using var fs = new FileStream(poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            Span<byte> hdr = stackalloc byte[4];
-            while (fs.Read(hdr) == 4)
-            {
-                ushort index = BinaryPrimitives.ReadUInt16LittleEndian(hdr);
-                ushort len   = BinaryPrimitives.ReadUInt16LittleEndian(hdr[2..]);
-                var    bytes = new byte[len];
-                if (fs.Read(bytes) != len) break;
-                dict[index] = Encoding.UTF8.GetString(bytes);
-            }
+            ushort index = BinaryPrimitives.ReadUInt16LittleEndian(hdr);
+            ushort len   = BinaryPrimitives.ReadUInt16LittleEndian(hdr[2..]);
+            BeforePoolRowForTest.Value?.Invoke(index);
+            var    bytes = new byte[len];
+            if (fs.ReadAtLeast(bytes, len, throwOnEndOfStream: false) != len) break;
+            dict[index] = Encoding.UTF8.GetString(bytes);
         }
-        catch { /* best-effort */ }
         return dict;
     }
+
+    /// <summary>
+    /// Test seam: called by the recovery walk before it decodes an entry's exception — throwing from
+    /// it is that decode failing. An <see cref="AsyncLocal{T}"/>, so it reaches only the walks of the
+    /// test that set it (the replay runs in the engine's constructor). Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> BeforeExceptionDecodeForTest = new();
+
+    /// <summary>Test seam: called by <see cref="LoadPool"/> with each row's index before it reads the row. Null in production.</summary>
+    internal static readonly AsyncLocal<Action<ushort>?> BeforePoolRowForTest = new();
 
     /// <summary>The format this build writes, and the newest it reads (see WalVersion).</summary>
     public const ushort FormatVersion = WalVersion;

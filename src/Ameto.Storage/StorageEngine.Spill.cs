@@ -1003,8 +1003,19 @@ public sealed partial class StorageEngine
     /// log's bytes bound its payloads, and its events at one per <see cref="MinLogEntryBytes"/>. The
     /// tier takes its native chunks as events arrive, so the bounds cost nothing the events do not.
     /// </summary>
-    private HotTierSegment CreateRecoveryTier(long logDataBytes) =>
-        CreateRecoveryTier((int)Math.Min(int.MaxValue - 1, logDataBytes / MinLogEntryBytes + 1), logDataBytes);
+    private HotTierSegment CreateRecoveryTier(long logDataBytes)
+    {
+        var tier = CreateRecoveryTier((int)Math.Min(int.MaxValue - 1, logDataBytes / MinLogEntryBytes + 1), logDataBytes);
+        RecoveryTierCreatedForTest.Value?.Invoke(tier);
+        return tier;
+    }
+
+    /// <summary>
+    /// Test seam: handed each tier a replay or a despill reads a log into — how a test sees that a
+    /// walk that failed part way freed it. An <see cref="AsyncLocal{T}"/>: the replay runs in the
+    /// constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<HotTierSegment>?> RecoveryTierCreatedForTest = new();
 
     /// <summary>The smallest entry any log format holds: a v3 header and nothing else.</summary>
     private const int MinLogEntryBytes = 20;
