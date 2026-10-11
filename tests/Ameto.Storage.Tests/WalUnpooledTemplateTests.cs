@@ -164,6 +164,54 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
         Assert.Equal("short {n}", events[t + 3 * TimeSpan.TicksPerSecond].Template);
     }
 
+    /// <summary>
+    /// A WAL whose events all carry their templates in their entries — every one outside a saturated
+    /// pool — has no pool rows, and that loses nothing: they replay with their templates, and the
+    /// replay does not say otherwise. It warned that every event was replayed without its template.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_with_no_pool_rows_whose_events_carry_their_templates_replays_without_a_false_warning()
+    {
+        await _engine.DisposeAsync();
+        const ulong SegId = 2_000;
+        string walPath = Path.Combine(WalDir, $"0-{SegId}.wal");
+        long   t       = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(walPath, new NodeId(0), new SegmentId(SegId), initialCapacity: 1 << 20))
+        {
+            wal.Append(t,                           LogLevel.Information, -1, "unpooled one {n}", Props(1));
+            wal.Append(t + TimeSpan.TicksPerSecond, LogLevel.Information, -1, "unpooled two {n}", Props(2));
+        }
+        Assert.Equal(0, new FileInfo(walPath + ".pool").Length);
+
+        var log  = new WarningLog();
+        var opts = new ServerOptions { DataDirectory = _dir };
+        _engine  = new StorageEngine(Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance), log);
+        await _engine.CatalogLoaded;
+
+        var events = ReadAllByTicks();
+        Assert.Equal("unpooled one {n}", events[t].Template);
+        Assert.Equal("unpooled two {n}", events[t + TimeSpan.TicksPerSecond].Template);
+        Assert.DoesNotContain(log.Warnings, w => w.Contains("without", StringComparison.Ordinal));
+    }
+
+    /// <summary>The engine's Warning lines.</summary>
+    private sealed class WarningLog : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _warnings = new();
+
+        public string[] Warnings => _warnings.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Warning) _warnings.Enqueue(formatter(state, exception));
+        }
+    }
+
     /// <summary>kill -9: keep the live WAL's bytes, let shutdown flush and unlink them, undo that flush, and start again.</summary>
     private async Task CrashAndRestartAsync()
     {

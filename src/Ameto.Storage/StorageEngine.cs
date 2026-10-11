@@ -5563,10 +5563,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         var pool         = WriteAheadLog.LoadPool(poolPath);
         bool poolMissing = pool.Count == 0;
         if (poolMissing)
-            _logger.LogWarning(
-                "Orphaned WAL {File}: no template pool rows — either power loss before the pool was fsynced, "
-              + "or every event in it was outside a saturated template pool. Replaying {Count} events without templates",
-                walFile, entries.Count);
+        {
+            // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
+            // outside a saturated pool, one too long for a row — and those events replay with it. Only
+            // the others, whose rows the lost pool held, come back without one. (The line used to say
+            // every event replayed without its template, which a log of nothing but such events made
+            // false for every one of them.)
+            int withoutTemplate = 0;
+            foreach (var entry in entries)
+                if (entry.Template is null) withoutTemplate++;
+            if (withoutTemplate > 0)
+                _logger.LogWarning(
+                    "Orphaned WAL {File}: no template pool rows — power loss before the pool was fsynced, or (a log "
+                  + "older than v6) events outside a saturated template pool. {Without} of its {Count} event(s) replay "
+                  + "without a template",
+                    walFile, withoutTemplate, entries.Count);
+        }
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)
