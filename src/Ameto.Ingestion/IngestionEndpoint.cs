@@ -71,16 +71,17 @@ public interface IOtlpLogSink
 ///          throws (see HandleAsync 1b). Kestrel fails that read itself.
 ///   413 Payload Too Large, no body, above <see cref="IngestionOptions.MaxBatchBytes"/>, or for a
 ///          batch that would decode to more than <see cref="IngestionOptions.MaxDecodedLogBatchBytes"/>
-///          (weighed before decoding; nothing of it ingested)
+///          (weighed before decoding, or counted the moment the decode passes it; nothing of it
+///          ingested)
 ///   503 Service Unavailable, Retry-After { "ingested": 0, "dropped": M }
 ///          The store had no room for any of the client's events within
 ///          <see cref="IngestionOptions.BackPressureWait"/>, writing into it kept failing for
 ///          that long, or it is shutting down. Nothing of the batch was written — the drop
 ///          markers standing in for events over the size limit go in after the client's own
 ///          events — so a retry duplicates nothing. A batch of nothing but events over the size
-///          limit is answered 200, never 503: no retry could store any of them. Also, before
-///          anything is decoded, when the batches held decoded at once are at their limit
-///          (<see cref="TryBeginBatch"/>).
+///          limit is answered 200, never 503: no retry could store any of them. Also, before or
+///          while it is decoded, when the batches held decoded at once are at their limit
+///          (<see cref="TryBeginBatch"/>, <see cref="ReserveMore"/>), nothing of it written.
 ///   500 A fault in the server underneath (intern pool, logger). It leaves the handler and
 ///          hosting answers it; see IsMalformedPayload.
 /// </summary>
@@ -106,10 +107,10 @@ public sealed class IngestionEndpoint
     /// <summary>The most one batch may decode to (<c>Ingestion.MaxDecodedLogBatchBytes</c>) — 413 above it.</summary>
     private readonly long _maxDecodedBatchBytes;
 
-    /// <summary>The most the batches held decoded at once may weigh together: twice <see cref="_maxDecodedBatchBytes"/>.</summary>
+    /// <summary>The most the batches held decoded at once may hold together (<c>Ingestion.MaxDecodedLogBytesInFlight</c>).</summary>
     private readonly long _decodedInFlightLimit;
 
-    /// <summary>What the batches held decoded right now weigh, as reserved by <see cref="TryBeginBatch"/>.</summary>
+    /// <summary>What the batches held decoded right now have reserved (<see cref="TryBeginBatch"/>, <see cref="ReserveMore"/>).</summary>
     private long _decodedInFlight;
 
     /// <summary>The seconds a 503 asks a client to wait before retrying.</summary>
@@ -128,7 +129,7 @@ public sealed class IngestionEndpoint
         _maxEventPayloadBytes = (int)Math.Min(options.Ingestion.MaxEventPayloadBytes, HotTierSegment.ChunkPayloadBytes);
         _backPressureWait     = options.Ingestion.BackPressureWait;
         _maxDecodedBatchBytes = options.Ingestion.EffectiveMaxDecodedLogBatchBytes;
-        _decodedInFlightLimit = 2 * _maxDecodedBatchBytes;
+        _decodedInFlightLimit = options.Ingestion.EffectiveMaxDecodedLogBytesInFlight;
 
         if (options.Ingestion.RingCapacity is not null || options.Ingestion.PayloadPoolBytes is not null)
             _logger.LogWarning(
@@ -139,6 +140,14 @@ public sealed class IngestionEndpoint
             _logger.LogWarning(
                 "Ingestion.MaxEventPayloadBytes {Configured} B is more than one hot-tier chunk holds; events are refused " +
                 "above {Effective} B", options.Ingestion.MaxEventPayloadBytes, _maxEventPayloadBytes);
+        if (options.Ingestion.MaxDecodedLogBatchBytes > IngestionOptions.MaxDecodedLogBatchBytesCeiling)
+            _logger.LogWarning(
+                "Ingestion.MaxDecodedLogBatchBytes {Configured} B is past the most a log batch can hold; {Effective} B is used",
+                options.Ingestion.MaxDecodedLogBatchBytes, _maxDecodedBatchBytes);
+        if (options.Ingestion.MaxDecodedLogBytesInFlight > IngestionOptions.MaxDecodedLogBytesInFlightCeiling)
+            _logger.LogWarning(
+                "Ingestion.MaxDecodedLogBytesInFlight {Configured} B is past the most the log batches can hold; {Effective} B is used",
+                options.Ingestion.MaxDecodedLogBytesInFlight, _decodedInFlightLimit);
     }
 
     /// <summary>The intern pool templates and services are interned into — the store's.</summary>
@@ -153,30 +162,36 @@ public sealed class IngestionEndpoint
     /// The payload bytes the batch is likely to hold — the body's length is a good one — so its
     /// buffer is rented once at that size rather than doubled up to it. 0: start small and grow.
     /// </param>
-    public LogIngestBatch BeginBatch(int payloadSizeHint = 0) => new(this, payloadSizeHint);
+    public LogIngestBatch BeginBatch(int payloadSizeHint = 0) => new(this, payloadSizeHint, reserved: 0, limit: long.MaxValue, bounded: false);
 
     // ── Decoded-batch budgets ─────────────────────────────────────────────────
 
     /// <summary>
     /// The most one batch may decode to, in bytes (<c>Ingestion.MaxDecodedLogBatchBytes</c>): a
-    /// receiver weighs its body first and refuses a heavier one — 413, gRPC RESOURCE_EXHAUSTED —
-    /// with nothing ingested.
+    /// receiver refuses a heavier one — 413, gRPC RESOURCE_EXHAUSTED — with nothing ingested; by its
+    /// weight before decoding when that already passes it, else the moment its decode does
+    /// (<see cref="LogIngestBatch"/> counts what it takes).
     /// </summary>
     public long MaxDecodedBatchBytes => _maxDecodedBatchBytes;
 
-    /// <summary>What the batches held decoded right now weigh together.</summary>
+    /// <summary>The most the batches held decoded at once may hold together (<c>Ingestion.MaxDecodedLogBytesInFlight</c>).</summary>
+    public long MaxDecodedBytesInFlight => _decodedInFlightLimit;
+
+    /// <summary>What the batches held decoded right now have reserved together.</summary>
     public long DecodedBytesInFlight => Interlocked.Read(ref _decodedInFlight);
 
     /// <summary>
-    /// A fresh batch for one request, its <paramref name="decodedWeight"/> reserved against what the
-    /// batches held decoded at once may weigh (twice <see cref="MaxDecodedBatchBytes"/>) until it is
-    /// disposed — or null when that would take the total past it: the receiver answers 503 with
-    /// Retry-After (gRPC: UNAVAILABLE), having decoded and written nothing. That is the bound on a
-    /// stalled store's waiting requests, each holding its decoded batch for up to BackPressureWait.
-    /// A batch is always taken when nothing else is held, so no weight is refused for good here.
+    /// A fresh batch for one request, <paramref name="decodedWeight"/> reserved for it against what
+    /// the batches held decoded at once may hold (<see cref="MaxDecodedBytesInFlight"/>) — or null
+    /// when that would take the total past it: the receiver answers 503 with Retry-After (gRPC:
+    /// UNAVAILABLE), having decoded and written nothing. That is the bound on a stalled store's
+    /// waiting requests, each holding its decoded batch for up to BackPressureWait. The reservation
+    /// grows as the decode takes more (<see cref="ReserveMore"/>), and shrinks to what the batch holds
+    /// once it is decoded. A batch is always taken when nothing else is held, so no weight is refused
+    /// for good here.
     /// </summary>
     /// <param name="payloadSizeHint">See <see cref="BeginBatch"/>.</param>
-    /// <param name="decodedWeight">What the request's body was weighed to decode to.</param>
+    /// <param name="decodedWeight">What the request's body was weighed to decode to: the first reservation.</param>
     public LogIngestBatch? TryBeginBatch(int payloadSizeHint, long decodedWeight)
     {
         long weight = Math.Max(0, decodedWeight);
@@ -187,12 +202,37 @@ public sealed class IngestionEndpoint
             NoteDecodedBudgetFull(weight);
             return null;
         }
-        try { return new LogIngestBatch(this, payloadSizeHint, weight); }
+        try { return new LogIngestBatch(this, payloadSizeHint, weight, _maxDecodedBatchBytes, bounded: true); }
         catch
         {
             Interlocked.Add(ref _decodedInFlight, -weight);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Grows a batch's reservation from <paramref name="reserved"/> to cover <paramref name="charged"/>
+    /// bytes it holds: to twice what it had, at most its <paramref name="limit"/>, or to exactly what
+    /// it holds when the doubling does not fit. Returns the new reservation; throws
+    /// <see cref="LogBatchBudgetFullException"/> when even that would take the total past
+    /// <see cref="MaxDecodedBytesInFlight"/> while other batches hold some of it.
+    /// </summary>
+    internal long ReserveMore(long reserved, long charged, long limit)
+    {
+        long doubled = reserved > long.MaxValue / 2 ? long.MaxValue : 2 * reserved;
+        long want    = Math.Min(limit, Math.Max(charged, doubled));
+        if (TryReserve(want - reserved, want)) return want;
+        if (want > charged && TryReserve(charged - reserved, charged)) return charged;
+        NoteDecodedBudgetFull(charged);
+        throw new LogBatchBudgetFullException();
+    }
+
+    private bool TryReserve(long delta, long batchTotal)
+    {
+        long total = Interlocked.Add(ref _decodedInFlight, delta);
+        if (total <= _decodedInFlightLimit || total <= batchTotal) return true;   // under, or nothing else held
+        Interlocked.Add(ref _decodedInFlight, -delta);
+        return false;
     }
 
     /// <summary>Gives back a batch's reservation (<see cref="LogIngestBatch.Dispose"/>).</summary>
@@ -243,8 +283,8 @@ public sealed class IngestionEndpoint
         {
             _logger.LogWarning(
                 "A log batch of about {Weight:N0} B decoded was asked to retry (503 / UNAVAILABLE): the batches held " +
-                "decoded already weigh {InFlight:N0} B of the {Limit:N0} B allowed at once (twice " +
-                "Ingestion.MaxDecodedLogBatchBytes) — the store is behind and requests are waiting for room. " +
+                "decoded already hold {InFlight:N0} B of the {Limit:N0} B allowed at once " +
+                "(Ingestion.MaxDecodedLogBytesInFlight) — the store is behind and requests are waiting for room. " +
                 "{Skipped} more asked to retry since the last of these warnings",
                 weight, DecodedBytesInFlight, _decodedInFlightLimit, skipped);
         }
@@ -346,8 +386,13 @@ public sealed class IngestionEndpoint
     /// </summary>
     internal async ValueTask<LogIngestResult> CommitAsync(LogIngestBatch batch, CancellationToken ct)
     {
+        // Decoded: for the wait for room, the batch keeps reserved what it holds and no more.
+        batch.TrimReservation();
+
         // The drop markers join the batch now, AFTER every one of the client's events: a write that
-        // stops before the first of the client's events then stops before every marker too.
+        // stops before the first of the client's events then stops before every marker too. Into
+        // the room kept for them as they were staged — this grows nothing, so it cannot run out of
+        // memory here, outside the receivers' decode.
         var staged = batch.Seal();
         if (staged.Count == 0)
             return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
@@ -520,6 +565,24 @@ public sealed class IngestionEndpoint
             try
             {
                 LogEventSerializer.StreamBatch(bodyBuf.AsMemory(0, bodyLen), batch, ref progress);
+            }
+            // What the decode held passed the batch's limit — counted as it was taken, the weight
+            // above being only an estimate: refused as what it is, too large, and nothing of it
+            // written (the finally gives the batch back unwritten).
+            catch (LogBatchTooHeavyException ex)
+            {
+                NoteTooHeavy(ctx.Request.Path.Value, ex.Weight);
+                ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                return;
+            }
+            // Its reservation could not grow: the batches held at once are at their limit. Nothing
+            // written, so the retry the 503 asks for duplicates nothing.
+            catch (LogBatchBudgetFullException)
+            {
+                ctx.Response.Headers.RetryAfter = RetryAfterSeconds;
+                await WriteCountsAsync(ctx, StatusCodes.Status503ServiceUnavailable, ingested: 0,
+                                       dropped: (int)Math.Min(events, int.MaxValue));
+                return;
             }
             // Classified by WHERE it was thrown, not by its type. This used to be
             // catch(Exception), which also swallowed failures of the sink underneath — an
@@ -699,6 +762,11 @@ public sealed class IngestionEndpoint
         // template attaches null — never "", which the tier would prefer over the pool.
         string? tmpl    = canonicalTmpl.Length != 0 ? canonicalTmpl : null;
 
+        // What a full pool made for this record alone is held by the batch: charged to it, as its
+        // arrays are. A pooled string is shared and costs the batch nothing.
+        if (tmplIdx < 0 && tmpl is not null) batch.ChargeString(tmpl);
+        if (service is not null)             batch.ChargeString(service);
+
         batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx, service);
         return true;
     }
@@ -742,6 +810,11 @@ public sealed class IngestionEndpoint
         string? tmpl     = canonical.Length != 0 ? canonical : null;   // see StageRaw: kept past saturation, never ""
         int     svcIdx   = _pool.Intern(serviceUtf8, out string svcText);   // -1 when empty
         string? service  = svcIdx < 0 && svcText.Length != 0 ? svcText : null;   // see StageRaw: kept past saturation
+
+        // Charged as in StageRaw — and the event's @x, decoded into a tree of strings for it alone.
+        if (tmplIdx < 0 && tmpl is not null) batch.ChargeString(tmpl);
+        if (service is not null)             batch.ChargeString(service);
+        if (exception is not null)           batch.ChargeException(exception);
 
         batch.Add(tsTicks, level, tmplIdx, tmpl, exception, msgpackProps, traceHi, traceLo, spanId, svcIdx, service);
         return true;

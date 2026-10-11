@@ -189,42 +189,85 @@ public sealed class IngestionOptions
         (int)Math.Clamp(budgets.IngestBufferBytes / DecodedMetricPointBytes, MinOtlpMetricPoints, int.MaxValue);
 
     /// <summary>
-    /// The most one LOG batch — <c>POST /api/events</c>, OTLP/HTTP or OTLP/gRPC — may decode to, in
-    /// bytes. A log batch is decoded whole before any of it is written (the request is answered only
-    /// once its events are in the store), and it decodes to far more than its body when its records
-    /// are small: a record costs <see cref="DecodedLogRecordBytes"/> besides its properties, and an
-    /// OTLP record's properties begin with a copy of its resource's attributes — so an 8 MiB body of
-    /// empty LogRecords, two bytes each, decoded to ~540 MB, past a 512 MB container's whole heap.
-    /// The batch is weighed before a record is staged, by a walk that allocates nothing: per record,
-    /// <see cref="DecodedLogRecordBytes"/> plus its own bytes plus its resource's attribute bytes
-    /// (a CLEF batch: its element count from the array header, plus its body). A batch weighing more
-    /// is refused 413 (gRPC: RESOURCE_EXHAUSTED) — split it — and nothing of it is ingested.
+    /// The most one LOG batch — <c>POST /api/events</c>, OTLP/HTTP or OTLP/gRPC — may hold decoded,
+    /// in bytes. A log batch is decoded whole before any of it is written (the request is answered
+    /// only once its events are in the store), and it can decode to far more than its body: a record
+    /// costs a staged item besides its properties, an OTLP record's properties begin with a copy of
+    /// its resource's attributes, bytes that are not UTF-8 are stored as U+FFFD (three bytes each), and
+    /// past a full intern pool a record's template and service are strings of its own. An 8 MiB body
+    /// of empty LogRecords decoded to ~540 MB; a 25 KB body of one resource attribute of invalid
+    /// UTF-8 over 1 528 empty records, to ~100 MB staged.
     ///
-    /// <para>The batches held decoded at once are bounded too, at twice this: a request that would
-    /// take the total past it — the store has no room and requests are waiting out
-    /// <see cref="BackPressureWait"/> with their batches — is answered 503 with <c>Retry-After</c>
-    /// (gRPC: UNAVAILABLE) before it decodes anything, which every OTLP exporter and Seq client retries.</para>
+    /// <para>So the decode COUNTS what it holds as it takes it — its arrays before they are grown,
+    /// the strings and exceptions it creates — and stops the moment the batch would pass this limit:
+    /// refused 413 (gRPC: RESOURCE_EXHAUSTED) — split it — with nothing of it written. Before that, a
+    /// body is weighed by a walk that allocates nothing, and refused at once when the weight already
+    /// passes the limit: per protobuf record <see cref="DecodedLogRecordBytes"/> plus its own bytes
+    /// plus its resource's attribute bytes; per OTLP/JSON record <see cref="DecodedLogRecordBytes"/>
+    /// alone (JSON spells a record out at two or three times what it decodes to, and weighed by its
+    /// text a JSON batch was refused at a fraction of the content a protobuf one carries); per CLEF
+    /// event <see cref="DecodedLogRecordBytes"/>, plus the body. The weight is only that early
+    /// refusal and the batch's first reservation; the count is the bound.</para>
     ///
     /// <para>Unset — or 0 or below — <see cref="DefaultMaxDecodedLogBatchBytesFor"/>: the request-body
     /// share of the heap (<c>MemoryBudgets.IngestBufferBytes</c>), and never less than four OTLP
     /// bodies' worth (<c>4 × MaxOtlpBatchBytes</c>, 32 MiB at the default), so that a full OTLP batch
     /// of small records under a kilobyte or two of resource attributes still goes through. A positive
-    /// value always wins.</para>
+    /// value wins, up to <see cref="MaxDecodedLogBatchBytesCeiling"/> (a batch's payloads are one array).</para>
     /// </summary>
     public long? MaxDecodedLogBatchBytes { get; init; }
 
     /// <summary>What one decoded log record costs besides its properties, about: its staged item and that item's share of the doubling array that holds it.</summary>
     public const int DecodedLogRecordBytes = 128;
 
+    /// <summary>The most <see cref="MaxDecodedLogBatchBytes"/> can be: a batch's payloads are one array.</summary>
+    public const long MaxDecodedLogBatchBytesCeiling = int.MaxValue;
+
+    /// <summary>The most <see cref="MaxDecodedLogBytesInFlight"/> can be: 1 TiB, far from where its sums could overflow.</summary>
+    public const long MaxDecodedLogBytesInFlightCeiling = 1L << 40;
+
     /// <summary>The configured decoded-batch limit when it is positive, or the default rule applied to this host.</summary>
     public long EffectiveMaxDecodedLogBatchBytes =>
         MaxDecodedLogBatchBytes is > 0 and long explicitBytes
-            ? explicitBytes
+            ? Math.Min(explicitBytes, MaxDecodedLogBatchBytesCeiling)
             : DefaultMaxDecodedLogBatchBytesFor(MemoryBudgets.Current(), MaxOtlpBatchBytes);
 
     /// <summary>The default decoded-batch limit as a pure function of the host's budgets. See <see cref="MaxDecodedLogBatchBytes"/>.</summary>
     public static long DefaultMaxDecodedLogBatchBytesFor(in MemoryBudgets budgets, int maxOtlpBatchBytes) =>
-        Math.Max(budgets.IngestBufferBytes, 4L * Math.Max(maxOtlpBatchBytes, 0));
+        Math.Min(MaxDecodedLogBatchBytesCeiling, Math.Max(budgets.IngestBufferBytes, 4L * Math.Max(maxOtlpBatchBytes, 0)));
+
+    /// <summary>
+    /// The most the LOG batches held decoded at once may hold together, in bytes — the requests
+    /// waiting out <see cref="BackPressureWait"/> with their batches decoded while the store has no
+    /// room. Each batch reserves what it holds against this as its decode takes it (see
+    /// <see cref="MaxDecodedLogBatchBytes"/>); a request that would take the total past it is answered
+    /// 503 with <c>Retry-After</c> (gRPC: UNAVAILABLE), with nothing of its batch written — before it
+    /// decodes anything, or the moment its decode would. Every OTLP exporter and Seq client retries
+    /// that. A batch is always taken when no other is held, so no batch is refused for good here.
+    ///
+    /// <para>Unset — or 0 or below — <see cref="DefaultMaxDecodedLogBytesInFlightFor"/>: an eighth
+    /// of the heap's limit (<c>MemoryBudgets.ManagedLimitBytes</c>) — 48 MiB on a 384 MiB heap —
+    /// and never less than 16 MiB; 256 MiB where the limit is unknown. It is request memory, out of
+    /// the part of the heap the <c>MemoryBudgets</c> shares leave free, and no longer twice the
+    /// per-batch limit: that grew eight-fold with <see cref="MaxOtlpBatchBytes"/>, and was 64 MiB,
+    /// a sixth of the stand's heap. A positive value wins, up to <see cref="MaxDecodedLogBytesInFlightCeiling"/>.</para>
+    /// </summary>
+    public long? MaxDecodedLogBytesInFlight { get; init; }
+
+    /// <summary>Share of the heap's limit <see cref="MaxDecodedLogBytesInFlight"/> takes when unset.</summary>
+    public const double DecodedLogBytesInFlightFraction = 0.125;
+
+    /// <summary>The configured in-flight bound when it is positive, or the default rule applied to this host.</summary>
+    public long EffectiveMaxDecodedLogBytesInFlight =>
+        MaxDecodedLogBytesInFlight is > 0 and long explicitBytes
+            ? Math.Min(explicitBytes, MaxDecodedLogBytesInFlightCeiling)
+            : DefaultMaxDecodedLogBytesInFlightFor(MemoryBudgets.Current());
+
+    /// <summary>The default in-flight bound as a pure function of the host's budgets. See <see cref="MaxDecodedLogBytesInFlight"/>.</summary>
+    public static long DefaultMaxDecodedLogBytesInFlightFor(in MemoryBudgets budgets) =>
+        budgets.ManagedLimitBytes > 0
+            ? Math.Clamp((long)(budgets.ManagedLimitBytes * DecodedLogBytesInFlightFraction), 16L * 1024 * 1024, MaxDecodedLogBytesInFlightCeiling)
+            : 256L * 1024 * 1024;
 
     /// <summary>
     /// How long a log ingest request waits for room in the store before it gives up on what it has

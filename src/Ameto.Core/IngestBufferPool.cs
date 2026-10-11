@@ -119,6 +119,9 @@ public static class IngestBufferPool
     /// </summary>
     public static long PooledBytes => Volatile.Read(ref _pool).PooledBytes;
 
+    /// <summary>The length <see cref="Rent"/> hands back for <paramref name="minimumLength"/>, so a caller can count it before it rents.</summary>
+    public static int RentLength(int minimumLength) => Volatile.Read(ref _pool).RentLength(minimumLength);
+
     /// <summary>Rents an array of at least <paramref name="minimumLength"/> bytes. Contents are undefined.</summary>
     public static byte[] Rent(int minimumLength)
     {

@@ -4,26 +4,23 @@ using Ameto.Core;
 namespace Ameto.Otel;
 
 /// <summary>
-/// What an OTLP logs batch will decode to, weighed before a record is staged: the receivers refuse a
-/// batch heavier than <c>Ingestion.MaxDecodedLogBatchBytes</c> with 413 (gRPC: RESOURCE_EXHAUSTED),
-/// nothing of it ingested, and reserve the weight of one they take against what the batches held
-/// decoded at once may weigh (<c>IngestionEndpoint.TryBeginBatch</c>).
+/// What an OTLP logs batch weighs before a record is staged: the receivers refuse at once a batch
+/// whose weight already passes <c>Ingestion.MaxDecodedLogBatchBytes</c> — 413 (gRPC: RESOURCE_EXHAUSTED),
+/// nothing of it ingested — and reserve the weight of one they take as its first reservation against
+/// what the batches held decoded at once may hold (<c>IngestionEndpoint.TryBeginBatch</c>).
 ///
-/// <para><b>Why.</b> A log batch is decoded whole before any of it is written — the request is
-/// answered only once its records are in the store — and an OTLP record decodes to much more than
-/// it was on the wire when it is small: a staged record costs an item (~80 B, and a share of the
-/// doubling array that holds it) besides its properties, and its properties begin with a copy of
-/// its resource's attributes. An 8 MiB body of empty LogRecords, two bytes each, decoded to ~4 M
-/// items, ~540 MB — past a 512 MB container's whole heap; one of small records under kilobytes of
-/// resource attributes to many times its size. Nothing bounded it but the body's byte limit.</para>
+/// <para><b>Not the bound.</b> The decode counts what it actually takes and stops the moment the
+/// batch passes the limit (<c>LogIngestBatch</c>). This weight is an estimate, and a body built to
+/// beat it beat it: a resource attribute of bytes that are not UTF-8 is stored as U+FFFD, three
+/// bytes for each, in every record under it — 25 KB on the wire decoded to ~100 MB staged, weighed
+/// at 33 MB. It stays as the cheap early refusal of a body that is plainly too heavy.</para>
 ///
-/// <para><b>The weight.</b> Per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/>, plus the
-/// record's own bytes on the wire, plus its resource's attribute bytes on the wire. About, and not
-/// less in practice: a property is written to msgpack at about its protobuf length; the body, which
-/// becomes the template, counts once, where an unpooled template is held as UTF-16 (the default
-/// limit's slack absorbs that); OTLP/JSON spells a record out at two or three times its decoded
-/// size, so JSON batches weigh heavier than they decode. Every record counts, whatever the parser
-/// later makes of it.</para>
+/// <para><b>The weight.</b> Protobuf: per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/>,
+/// plus the record's own bytes on the wire, plus its resource's attribute bytes on the wire.
+/// OTLP/JSON: per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/> alone. JSON spells a
+/// record out at two or three times what it decodes to, and weighed by its text a JSON batch was
+/// refused at a fraction of the content a protobuf one carried; what it holds once decoded is
+/// counted like any other.</para>
 ///
 /// <para>Every field is skipped by its length, never decoded, and nothing is allocated. A message the
 /// walk cannot frame throws as the parse would — the receivers answer it 400 with nothing ingested.</para>
@@ -41,17 +38,6 @@ internal static class OtlpLogBatchWeight
 
     /// <inheritdoc cref="BudgetFullMessage"/>
     internal static ReadOnlySpan<byte> BudgetFullMessageUtf8 => "the server is holding as many decoded log batches as it allows; retry"u8;
-
-    /// <summary>Thrown by the gRPC decode for a batch over the limit: answered RESOURCE_EXHAUSTED.</summary>
-    internal sealed class TooHeavyException(long weight, long limit)
-        : Exception($"an OTLP logs batch decoding to about {weight} bytes is over the limit of {limit} bytes")
-    {
-        public long Weight { get; } = weight;
-        public long Limit  { get; } = limit;
-    }
-
-    /// <summary>Thrown by the gRPC decode when the decoded budget is spent: answered UNAVAILABLE.</summary>
-    internal sealed class BudgetFullException() : Exception(BudgetFullMessage);
 
     /// <summary>
     /// The weight of an <c>ExportLogsServiceRequest</c> in protobuf: resource_logs (1) → resource (1) →
@@ -97,15 +83,16 @@ internal static class OtlpLogBatchWeight
     }
 
     /// <summary>
-    /// The weight of an <c>ExportLogsServiceRequest</c> in OTLP/JSON, along the names the parser reads:
-    /// <c>resourceLogs</c> → <c>resource</c> → <c>attributes</c>, and <c>resourceLogs</c> →
-    /// <c>scopeLogs</c> → <c>logRecords</c>. A value's bytes are measured by skipping it. A malformed
-    /// document throws as the parse would.
+    /// The weight of an <c>ExportLogsServiceRequest</c> in OTLP/JSON: its records, along the names
+    /// the parser reads (<c>resourceLogs</c> → <c>scopeLogs</c> → <c>logRecords</c>), at
+    /// <see cref="IngestionOptions.DecodedLogRecordBytes"/> each — what a record costs at the least,
+    /// not what its text spells out (see the class doc). A malformed document throws as the parse
+    /// would.
     /// </summary>
     internal static long WeighJson(ReadOnlySpan<byte> json)
     {
-        var  reader = new Utf8JsonReader(json, isFinalBlock: true, state: default);
-        long weight = 0;
+        var  reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
+        long records = 0;
         if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return 0;
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
@@ -115,35 +102,24 @@ internal static class OtlpLogBatchWeight
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
-                    if (reader.TokenType == JsonTokenType.StartObject) weight += WeighJsonResourceLogs(ref reader);
+                    if (reader.TokenType == JsonTokenType.StartObject) records += CountJsonRecords(ref reader);
                     else reader.Skip();
                 }
             }
             else reader.Skip();
         }
-        return weight;
+        return records * IngestionOptions.DecodedLogRecordBytes;
     }
 
-    /// <summary>One <c>resourceLogs</c> element, the reader on its <c>StartObject</c> and left on its <c>EndObject</c>.</summary>
-    private static long WeighJsonResourceLogs(ref Utf8JsonReader reader)
+    /// <summary>The records of one <c>resourceLogs</c> element, the reader on its <c>StartObject</c> and left on its <c>EndObject</c>.</summary>
+    private static long CountJsonRecords(ref Utf8JsonReader reader)
     {
-        long resourceBytes = 0, records = 0, recordBytes = 0;
+        long records = 0;
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
-            bool resource = reader.ValueTextEquals("resource"u8);
-            bool scopes   = !resource && reader.ValueTextEquals("scopeLogs"u8);
+            bool scopes = reader.ValueTextEquals("scopeLogs"u8);
             reader.Read();
-            if (resource && reader.TokenType == JsonTokenType.StartObject)
-            {
-                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
-                {
-                    bool attributes = reader.ValueTextEquals("attributes"u8);
-                    reader.Read();
-                    if (attributes) resourceBytes += SkipMeasured(ref reader);
-                    else reader.Skip();
-                }
-            }
-            else if (scopes && reader.TokenType == JsonTokenType.StartArray)
+            if (scopes && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
@@ -156,7 +132,7 @@ internal static class OtlpLogBatchWeight
                         {
                             while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                             {
-                                recordBytes += SkipMeasured(ref reader);
+                                reader.Skip();
                                 records++;
                             }
                         }
@@ -166,14 +142,6 @@ internal static class OtlpLogBatchWeight
             }
             else reader.Skip();
         }
-        return records * (IngestionOptions.DecodedLogRecordBytes + resourceBytes) + recordBytes;
-    }
-
-    /// <summary>The bytes of the value the reader is on, which it skips — left on its last token.</summary>
-    private static long SkipMeasured(ref Utf8JsonReader reader)
-    {
-        long start = reader.TokenStartIndex;
-        reader.Skip();
-        return reader.BytesConsumed - start;
+        return records;
     }
 }

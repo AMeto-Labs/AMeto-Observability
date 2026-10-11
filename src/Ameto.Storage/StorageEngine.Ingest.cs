@@ -120,111 +120,119 @@ public sealed partial class StorageEngine
     /// events already written is written.</param>
     public async ValueTask<LogBatchWriteResult> WriteBatchAsync(LogWriteBatch batch, TimeSpan maxWait, CancellationToken ct = default)
     {
-        int  next     = 0, written = 0, refused = 0;
-        bool waited   = false;
-        long budgetMs = (long)Math.Max(0, maxWait.TotalMilliseconds);
-        long waitedMs = 0;
-        int  faults   = 0;   // faulted attempts in a row: the pause after each one doubles
-
-        while (next < batch.Count)
+        // Held until this method ends — in this method, not a wrapper, whose own await could throw
+        // while this one is still suspended: a dispose meanwhile (the request's own await threw, and
+        // its finally disposed the batch) is deferred to the end of the write (see LogWriteBatch).
+        batch.Lease();
+        try
         {
-            WriteState   full;
-            Task         room;
-            WriteOutcome outcome    = WriteOutcome.Written;
-            int          runFrom    = next;
-            long         faultedFor = 0;
-            lock (_writerLock)
+            int  next     = 0, written = 0, refused = 0;
+            bool waited   = false;
+            long budgetMs = (long)Math.Max(0, maxWait.TotalMilliseconds);
+            long waitedMs = 0;
+            int  faults   = 0;   // faulted attempts in a row: the pause after each one doubles
+
+            while (next < batch.Count)
             {
-                // Read once a run, not once an event: on a fault, the run's time is the attempt's (at
-                // most a few hundred events before it, microseconds — next to a full GC, nothing).
-                long runStart = Environment.TickCount64;
-                int end = Math.Min(batch.Count, next + WriteRunEvents);
-                while (next < end)
+                WriteState   full;
+                Task         room;
+                WriteOutcome outcome    = WriteOutcome.Written;
+                int          runFrom    = next;
+                long         faultedFor = 0;
+                lock (_writerLock)
                 {
-                    try
+                    // Read once a run, not once an event: on a fault, the run's time is the attempt's (at
+                    // most a few hundred events before it, microseconds — next to a full GC, nothing).
+                    long runStart = Environment.TickCount64;
+                    int end = Math.Min(batch.Count, next + WriteRunEvents);
+                    while (next < end)
                     {
-                        outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next),
-                                              batch.ServiceAt(next));
+                        try
+                        {
+                            outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next),
+                                                  batch.ServiceAt(next));
+                        }
+                        catch (Exception ex)
+                        {
+                            outcome    = WriteOutcome.Faulted;   // nothing of the event was written: see WriteLocked
+                            faultedFor = Environment.TickCount64 - runStart;
+                            NoteWriteFaultLocked(ex);
+                        }
+                        if (outcome == WriteOutcome.Written)       written++;
+                        else if (outcome == WriteOutcome.TooLarge) { refused++; Interlocked.Increment(ref _ingestRefusedTooLarge); }
+                        else break;
+                        next++;
                     }
-                    catch (Exception ex)
-                    {
-                        outcome    = WriteOutcome.Faulted;   // nothing of the event was written: see WriteLocked
-                        faultedFor = Environment.TickCount64 - runStart;
-                        NoteWriteFaultLocked(ex);
-                    }
-                    if (outcome == WriteOutcome.Written)       written++;
-                    else if (outcome == WriteOutcome.TooLarge) { refused++; Interlocked.Increment(ref _ingestRefusedTooLarge); }
-                    else break;
-                    next++;
+                    if (outcome is WriteOutcome.Written or WriteOutcome.TooLarge) continue;   // the run is done; let others in
+                    if (outcome == WriteOutcome.Closed) break;
+
+                    // No room, or a fault. Captured under the lock, in this order, so the wake-up cannot
+                    // be lost: a state change stores _write BEFORE it swaps the signal (SignalRoom), so
+                    // either the signal read here is the one about to complete, or _write has already
+                    // moved on and the check below sees it.
+                    full = _write;
+                    room = Volatile.Read(ref _roomSignal).Task;
                 }
-                if (outcome is WriteOutcome.Written or WriteOutcome.TooLarge) continue;   // the run is done; let others in
-                if (outcome == WriteOutcome.Closed) break;
 
-                // No room, or a fault. Captured under the lock, in this order, so the wake-up cannot
-                // be lost: a state change stores _write BEFORE it swaps the signal (SignalRoom), so
-                // either the signal read here is the one about to complete, or _write has already
-                // moved on and the check below sees it.
-                full = _write;
-                room = Volatile.Read(ref _roomSignal).Task;
+                if (outcome == WriteOutcome.Faulted)
+                {
+                    // A faulted attempt is part of the wait, not free time between waits: on a heap at its
+                    // limit the attempt itself — a failing 128 KB rent and the full collection it forces —
+                    // can take longer than the slice after it. Counted only the slices, a request retried
+                    // about twenty times in a 2 s wait and took ~7 s, past an OpenTelemetry Collector's
+                    // 5 s timeout, which then resent the batch and wrote its prefix twice; and forty such
+                    // requests made ~400 failing allocations a second. So the attempt counts, and each
+                    // fault in a row doubles the pause after it: a request that keeps faulting ends within
+                    // about BackPressureWait plus one attempt, after four or five of them.
+                    waitedMs += faultedFor;
+                    faults    = next > runFrom ? 1 : faults + 1;
+                    if (budgetMs - waitedMs <= 0) break;
+                }
+
+                if (!ReferenceEquals(_write, full)) continue;
+
+                long left = budgetMs - waitedMs;
+                if (left <= 0) break;
+                if (!waited && outcome == WriteOutcome.NoRoom)
+                {
+                    waited = true;
+                    Interlocked.Increment(ref _ingestRoomWaits);
+                }
+                long slice = outcome == WriteOutcome.Faulted
+                    ? (long)_roomRecheckMs << Math.Min(faults - 1, 6)
+                    : _roomRecheckMs;
+                long began     = Environment.TickCount64;
+                long thisSlice = Math.Min(left, slice);
+                bool waitFailed = false;
+                try
+                {
+                    // In slices: a slice that ends without a signal goes round and writes again, and the
+                    // write that finds no room asks for the swap again. A request is no longer dropped
+                    // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
+                    // the wake-ups, not what they rest on.
+                    _beforeRoomWaitForTest?.Invoke();
+                    await room.WaitAsync(TimeSpan.FromMilliseconds(thisSlice), ct).ConfigureAwait(false);
+                }
+                catch (TimeoutException) { /* write again */ }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception)
+                {
+                    // The wait itself could not be set up — WaitAsync allocates, and a heap at its limit
+                    // refuses that too. It used to escape here, after events may already have been
+                    // written: the request was answered 500 and the count of what was written lost. It is
+                    // counted as a slice waited, so a store that cannot even wait still ends within its
+                    // budget, and the batch goes round and writes again.
+                    waitFailed = true;
+                }
+                long elapsed = Environment.TickCount64 - began;
+                waitedMs += waitFailed ? Math.Max(elapsed, thisSlice) : elapsed;
             }
 
-            if (outcome == WriteOutcome.Faulted)
-            {
-                // A faulted attempt is part of the wait, not free time between waits: on a heap at its
-                // limit the attempt itself — a failing 128 KB rent and the full collection it forces —
-                // can take longer than the slice after it. Counted only the slices, a request retried
-                // about twenty times in a 2 s wait and took ~7 s, past an OpenTelemetry Collector's
-                // 5 s timeout, which then resent the batch and wrote its prefix twice; and forty such
-                // requests made ~400 failing allocations a second. So the attempt counts, and each
-                // fault in a row doubles the pause after it: a request that keeps faulting ends within
-                // about BackPressureWait plus one attempt, after four or five of them.
-                waitedMs += faultedFor;
-                faults    = next > runFrom ? 1 : faults + 1;
-                if (budgetMs - waitedMs <= 0) break;
-            }
-
-            if (!ReferenceEquals(_write, full)) continue;
-
-            long left = budgetMs - waitedMs;
-            if (left <= 0) break;
-            if (!waited && outcome == WriteOutcome.NoRoom)
-            {
-                waited = true;
-                Interlocked.Increment(ref _ingestRoomWaits);
-            }
-            long slice = outcome == WriteOutcome.Faulted
-                ? (long)_roomRecheckMs << Math.Min(faults - 1, 6)
-                : _roomRecheckMs;
-            long began     = Environment.TickCount64;
-            long thisSlice = Math.Min(left, slice);
-            bool waitFailed = false;
-            try
-            {
-                // In slices: a slice that ends without a signal goes round and writes again, and the
-                // write that finds no room asks for the swap again. A request is no longer dropped
-                // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
-                // the wake-ups, not what they rest on.
-                _beforeRoomWaitForTest?.Invoke();
-                await room.WaitAsync(TimeSpan.FromMilliseconds(thisSlice), ct).ConfigureAwait(false);
-            }
-            catch (TimeoutException) { /* write again */ }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            catch (Exception)
-            {
-                // The wait itself could not be set up — WaitAsync allocates, and a heap at its limit
-                // refuses that too. It used to escape here, after events may already have been
-                // written: the request was answered 500 and the count of what was written lost. It is
-                // counted as a slice waited, so a store that cannot even wait still ends within its
-                // budget, and the batch goes round and writes again.
-                waitFailed = true;
-            }
-            long elapsed = Environment.TickCount64 - began;
-            waitedMs += waitFailed ? Math.Max(elapsed, thisSlice) : elapsed;
+            int notWritten = batch.Count - next;
+            if (notWritten > 0) Interlocked.Add(ref _ingestNotWritten, notWritten);
+            return new LogBatchWriteResult(written, refused, notWritten);
         }
-
-        int notWritten = batch.Count - next;
-        if (notWritten > 0) Interlocked.Add(ref _ingestNotWritten, notWritten);
-        return new LogBatchWriteResult(written, refused, notWritten);
+        finally { batch.EndLease(); }
     }
 
     /// <summary>The body of every write; the caller holds <see cref="_writerLock"/>.</summary>

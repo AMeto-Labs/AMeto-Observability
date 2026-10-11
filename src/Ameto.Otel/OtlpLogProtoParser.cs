@@ -48,10 +48,13 @@ namespace Ameto.Otel;
 ///   the more forgiving of the two readings and the one <see cref="ProtoReader"/> already gave
 ///   the metric path. (The trace path still decodes through <c>CodedInputStream</c> and still
 ///   throws — <c>OtlpGrpcMessageSegmentTests</c> relies on exactly that.)</item>
-///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
-///   already staged — and the receiver writes them — when it answers 400. The DOM path decoded the whole request
-///   before ingesting any of it. This matches the JSON path, which has always behaved this
-///   way, and a client that gets a 400 is expected to resend the batch.</item>
+///   <item>Damage inside a record aborts the batch mid-way, so records before the bad byte are
+///   already staged — and the receiver writes them — when it answers 400. The DOM path decoded the
+///   whole request before ingesting any of it. Damage in the request's framing never gets here: the
+///   receivers weigh the body first (<c>OtlpLogBatchWeight</c>), a walk that follows resource_logs,
+///   resource, scope_logs and log_records and refuses what it cannot frame with nothing ingested.
+///   The JSON path is refused whole for any malformed document, as its walk reads all of it
+///   (docs/API.md states the one rule for every road).</item>
 /// </list>
 /// </summary>
 public static class OtlpLogProtoParser

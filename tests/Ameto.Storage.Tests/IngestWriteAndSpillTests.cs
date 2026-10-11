@@ -1816,6 +1816,50 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// R1a-3. A request whose own await throws — its state machine's box, out of memory, once the
+    /// write it awaits has suspended — leaves through its finally, which disposes the batch while the
+    /// write is still waiting for room on it. The arrays went back to their pools at once, and the
+    /// write, woken, read a batch emptied under it: here it wrote nothing and said so; with a pool
+    /// handing the arrays to another request first, a zeroed event or another request's. A dispose
+    /// is now deferred to the end of the write that holds the batch.
+    /// </summary>
+    [Fact]
+    public async Task A_batch_disposed_while_its_write_waits_for_room_is_given_back_only_when_the_write_ends()
+    {
+        var engine = OneSlotEngine(Options(NewDir(), spill: false));
+        var gate   = HoldFirstFlush(engine);
+        engine._roomRecheckMs = (int)HangGuard.TotalMilliseconds;   // the write waits for the signal, not a timer
+        try
+        {
+            using (var fill = Batch(engine, 0, 2 * TierEvents))   // A held in its flush, B full
+                Assert.Equal(2 * TierEvents, (await engine.WriteBatchAsync(fill, HangGuard)).Written);
+
+            var batch   = Batch(engine, 2 * TierEvents, 10);
+            var writing = engine.WriteBatchAsync(batch, HangGuard).AsTask();
+            WaitFor(() => engine.LiveHotTierRefused && engine.IngestRoomWaits > 0, "the write to wait for room");
+            Assert.False(writing.IsCompleted);
+
+            batch.Dispose();                  // the request gave up on it
+            Assert.Equal(10, batch.Count);    // still whole: the write holds it
+
+            gate.Set();
+            Assert.Equal(new LogBatchWriteResult(10, 0, 0), await writing.WaitAsync(TimeSpan.FromSeconds(20)));
+            Assert.Equal(0, batch.Count);     // given back as the write ended
+
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the held flush and the one after it to end", ShortGuard);
+            await engine.FlushHotTierAsync();
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the last flush to end", ShortGuard);
+            var events = ReadAll(engine);
+            for (int n = 2 * TierEvents; n < 2 * TierEvents + 10; n++) AssertIsEvent(n, events[n]);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     /// <summary>A closed engine writes nothing and says so, so the caller answers "retry later".</summary>
     [Fact]
     public async Task A_closed_engine_writes_nothing_and_reports_it_as_not_written()

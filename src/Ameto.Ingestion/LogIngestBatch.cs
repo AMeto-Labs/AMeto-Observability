@@ -8,13 +8,24 @@ namespace Ameto.Ingestion;
 /// One ingest request's log events, decoded and waiting to be written: the sink the parsers write
 /// into (<see cref="IOtlpLogSink"/> for OTLP, <see cref="LogEventSerializer.IClefBatchSink"/> for
 /// CLEF), then <see cref="CommitAsync"/> to put them in the store. From
-/// <see cref="IngestionEndpoint.BeginBatch"/>; dispose it when the request is done.
+/// <see cref="IngestionEndpoint.TryBeginBatch"/>; dispose it when the request is done.
 ///
 /// <para>Every staging rule — the per-event size limit and its drop marker, template and service
 /// interning — is the endpoint's (<see cref="IngestionEndpoint.StageRaw"/>,
 /// <see cref="IngestionEndpoint.StageClef"/>); this holds what they stage.</para>
+///
+/// <para><b>What it holds is counted as it is taken</b> (<see cref="ILogBatchBudget"/>): the arrays
+/// its <see cref="LogWriteBatch"/> grows — charged before they are taken — and the strings and
+/// exceptions the decode creates for it, which a pool with room shares and a full pool makes once
+/// per record. Past the batch's limit (<c>Ingestion.MaxDecodedLogBatchBytes</c>) the decode stops
+/// with <see cref="LogBatchTooHeavyException"/> — 413, nothing written; past what the batches held
+/// at once may hold (<c>Ingestion.MaxDecodedLogBytesInFlight</c>), with
+/// <see cref="LogBatchBudgetFullException"/> — 503, nothing written. The weight a receiver puts on
+/// a body before decoding it is only the first reservation and an early refusal: an estimate,
+/// which a body built to beat it (bytes that decode three times their size, a resource copied into
+/// every record) used to beat.</para>
 /// </summary>
-public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatchSink, IDisposable
+public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatchSink, ILogBatchBudget, IDisposable
 {
     private readonly IngestionEndpoint _owner;
     private readonly LogWriteBatch     _staged;
@@ -31,6 +42,11 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// the retry writes each marker once. A marker keeps its event's timestamp, which is what the
     /// store orders by; its place in the batch changes only its event id, as for any event that
     /// arrives late.</para>
+    ///
+    /// <para>Room for each is kept at the end of <see cref="_staged"/> when it is staged
+    /// (<see cref="LogWriteBatch.ReserveTail"/>): <see cref="Seal"/>, which runs in the commit,
+    /// outside the receivers' decode, never grows an array — an out-of-memory there was a 500,
+    /// which exporters drop, for a batch nothing of which was written.</para>
     /// </summary>
     private List<StagedMarker>? _markers;
 
@@ -39,14 +55,30 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 
     private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template, string? Service);
 
-    /// <summary>The decoded weight reserved for this batch (<see cref="IngestionEndpoint.TryBeginBatch"/>), given back on dispose.</summary>
+    /// <summary>What a staged marker holds besides its payload: its writer's buffer slack, its list slot.</summary>
+    private const int MarkerOverheadBytes = 1024;
+
+    /// <summary>The most this batch may hold (<c>Ingestion.MaxDecodedLogBatchBytes</c>); <see cref="long.MaxValue"/> for a batch with no bound.</summary>
+    private readonly long _limit;
+
+    /// <summary>Whether this batch reserves what it holds against the process-wide bound.</summary>
+    private readonly bool _bounded;
+
+    /// <summary>What the batch holds now: its arrays, and the strings and exceptions charged to it.</summary>
+    private long _charged;
+
+    /// <summary>Reserved for it against the batches held decoded at once; given back when its arrays are.</summary>
     private long _reserved;
 
-    internal LogIngestBatch(IngestionEndpoint owner, int payloadSizeHint, long reserved = 0)
+    private int _released;
+
+    internal LogIngestBatch(IngestionEndpoint owner, int payloadSizeHint, long reserved, long limit, bool bounded)
     {
         _owner    = owner;
-        _staged   = new LogWriteBatch(payloadSizeHint);
         _reserved = reserved;
+        _limit    = limit;
+        _bounded  = bounded;
+        _staged   = new LogWriteBatch(payloadSizeHint, this);
     }
 
     /// <summary>
@@ -55,18 +87,39 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// </summary>
     internal LogWriteBatch Staged => _staged;
 
+    /// <summary>What the batch holds, counted as it was taken (<see cref="ILogBatchBudget"/>).</summary>
+    public long ChargedBytes => Volatile.Read(ref _charged);
+
+    /// <summary>What is reserved for it against the batches held decoded at once.</summary>
+    internal long ReservedBytes => Volatile.Read(ref _reserved);
+
     /// <summary>
     /// Puts the drop markers into <see cref="Staged"/>, after every one of the client's events, and
-    /// returns it. Once: the batch is sealed afterwards, and a second call adds nothing.
+    /// returns it — into the room kept for them, so nothing grows. Once: the batch is sealed
+    /// afterwards, and a second call adds nothing.
     /// </summary>
     internal LogWriteBatch Seal()
     {
         if (_sealed) return _staged;
         if (_markers is not null)
             foreach (var m in _markers)
-                _staged.Add(m.Header, m.Payload.Span, m.Template, exception: null, m.Service);
+                _staged.AddReserved(m.Header, m.Payload.Span, m.Template, exception: null, m.Service);
         _sealed = true;
         return _staged;
+    }
+
+    /// <summary>
+    /// The decode is done: what is reserved for the batch shrinks to what it holds, for the wait
+    /// for room that may follow. The reservation grows by doubling while the batch is decoded, and
+    /// a weight taken before decoding can be more than the decode made of it.
+    /// </summary>
+    internal void TrimReservation()
+    {
+        if (!_bounded) return;
+        long excess = _reserved - _charged;
+        if (excess <= 0) return;
+        _reserved = _charged;
+        _owner.ReleaseDecoded(excess);
     }
 
     /// <summary>Events refused at the door (over the per-event size limit); a marker stands in for each.</summary>
@@ -96,17 +149,59 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>Writes the staged events into the store and says what became of them.</summary>
     public ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default) => _owner.CommitAsync(this, ct);
 
-    public void Dispose()
+    /// <summary>
+    /// Gives the batch's arrays back, and its reservation with them — when the write that holds the
+    /// batch ends, if one does (<see cref="LogWriteBatch.Dispose"/>).
+    /// </summary>
+    public void Dispose() => _staged.Dispose();
+
+    // ── What it holds (ILogBatchBudget) ───────────────────────────────────────
+
+    long ILogBatchBudget.Headroom => _limit - _charged;
+
+    void ILogBatchBudget.Charge(long bytes) => Charge(bytes);
+
+    void ILogBatchBudget.Released()
     {
-        try { _staged.Dispose(); }
-        finally
-        {
-            // Once: a batch disposed twice gives back its reservation once.
-            long reserved = _reserved;
-            _reserved = 0;
-            if (reserved != 0) _owner.ReleaseDecoded(reserved);
-        }
+        if (Interlocked.Exchange(ref _released, 1) != 0) return;
+        long reserved = _reserved;
+        _reserved = 0;
+        if (_bounded && reserved > 0) _owner.ReleaseDecoded(reserved);
     }
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> more as held — or throws, and then they are not:
+    /// <see cref="LogBatchTooHeavyException"/> past the batch's limit, <see cref="LogBatchBudgetFullException"/>
+    /// when the reservation cannot grow to cover them. Negative undoes an earlier charge.
+    /// </summary>
+    internal void Charge(long bytes)
+    {
+        long charged = _charged + bytes;
+        if (bytes > 0 && _bounded)
+        {
+            if (charged > _limit) throw new LogBatchTooHeavyException(charged, _limit);
+            if (charged > _reserved) _reserved = _owner.ReserveMore(_reserved, charged, _limit);
+        }
+        _charged = charged;
+    }
+
+    /// <summary>A string the decode made for this batch alone: its size in the heap.</summary>
+    internal void ChargeString(string s) => Charge(StringBytes(s));
+
+    /// <summary>An exception tree the decode made for this batch alone (CLEF's <c>@x</c>): its size in the heap.</summary>
+    internal void ChargeException(ExceptionInfo exception)
+    {
+        long bytes = 0;
+        for (var e = exception; e is not null; e = e.Inner)
+            bytes += ExceptionInfoObjectBytes + StringBytes(e.Type) + StringBytes(e.Message) + StringBytes(e.StackTrace);
+        Charge(bytes);
+    }
+
+    /// <summary>A string's size in a 64-bit heap: header, method table, length, its UTF-16 and a terminator, 8-aligned.</summary>
+    internal static long StringBytes(string? s) => s is null ? 0 : (22L + 2L * s.Length + 7) & ~7L;
+
+    /// <summary>An <see cref="ExceptionInfo"/> object: header, method table and its four references.</summary>
+    private const long ExceptionInfoObjectBytes = 48;
 
     // ── Sinks ─────────────────────────────────────────────────────────────────
 
@@ -163,14 +258,17 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     }
 
     /// <summary>
-    /// Stages a drop marker, to be written after the client's events (see <see cref="_markers"/>).
-    /// <paramref name="payload"/> is kept, not copied: the caller hands over a buffer of its own.
+    /// Stages a drop marker, to be written after the client's events (see <see cref="_markers"/>),
+    /// and keeps room for it at the end of the batch now. <paramref name="payload"/> is kept, not
+    /// copied: the caller hands over a buffer of its own.
     /// </summary>
     internal void AddMarker(long tsTicks, byte level, int templateIdx, string template,
                             ReadOnlyMemory<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx,
                             string? service = null)
     {
         System.Diagnostics.Debug.Assert(!_sealed, "a marker staged after the batch was committed");
+        Charge(MarkerOverheadBytes + payload.Length + StringBytes(service));
+        _staged.ReserveTail(payload.Length);
         (_markers ??= []).Add(new StagedMarker(
             Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, service));
     }
@@ -201,3 +299,23 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 /// answered for good, with its markers written if the store had room for them.
 /// </param>
 public readonly record struct LogIngestResult(int Ingested, int Dropped, bool Busy);
+
+/// <summary>
+/// A log batch whose decode passed <c>Ingestion.MaxDecodedLogBatchBytes</c> — weighed before it was
+/// decoded, or counted while it was: refused 413 (gRPC RESOURCE_EXHAUSTED), nothing of it written.
+/// </summary>
+public sealed class LogBatchTooHeavyException(long weight, long limit)
+    : Exception("a log batch decodes to more than the configured limit for one request")
+{
+    /// <summary>What it weighed, or had been counted at, when it was refused.</summary>
+    public long Weight { get; } = weight;
+
+    /// <summary>The limit it passed.</summary>
+    public long Limit { get; } = limit;
+}
+
+/// <summary>
+/// The batches held decoded at once are at their limit (<c>Ingestion.MaxDecodedLogBytesInFlight</c>):
+/// answered 503 with Retry-After (gRPC UNAVAILABLE), nothing of the batch written.
+/// </summary>
+public sealed class LogBatchBudgetFullException() : Exception("the log batches held decoded at once are at their limit");

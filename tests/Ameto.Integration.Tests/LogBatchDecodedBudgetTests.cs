@@ -35,7 +35,7 @@ public sealed class LogBatchDecodedBudgetTests : IClassFixture<LogBatchDecodedBu
 
     public sealed class Factory : AmetoWebAppFactory
     {
-        protected override IngestionOptions ConfiguredIngestion => new() { MaxDecodedLogBatchBytes = Limit };
+        protected override IngestionOptions ConfiguredIngestion => new() { MaxDecodedLogBatchBytes = Limit, MaxDecodedLogBytesInFlight = 2 * Limit };
     }
 
     private static readonly OtlpGzipTooLargeLog NoLog       = new(NullLogger.Instance, TimeProvider.System);
@@ -74,9 +74,13 @@ public sealed class LogBatchDecodedBudgetTests : IClassFixture<LogBatchDecodedBu
         Assert.True(allocated < 1024, $"weighing allocated {allocated:N0} B");
     }
 
-    /// <summary>A resource's attributes count once per record under it: they are copied into each.</summary>
+    /// <summary>
+    /// A resource's attributes count once per protobuf record under it: they are copied into each.
+    /// An OTLP/JSON record weighs its staged item alone — its text spells it out at two or three times
+    /// what it decodes to, and what it holds is counted as it is decoded (R1b-4).
+    /// </summary>
     [Fact]
-    public void A_resources_attributes_weigh_once_per_record_in_protobuf_and_json()
+    public void A_resources_attributes_weigh_once_per_protobuf_record_and_a_json_record_weighs_its_item()
     {
         byte[] attribute = Attribute("k8s.pod.name", new string('p', 200));
         byte[] record    = Record("hello {n}");
@@ -88,10 +92,7 @@ public sealed class LogBatchDecodedBudgetTests : IClassFixture<LogBatchDecodedBu
             {"resourceLogs":[{"resource":{"attributes":[{"key":"k8s.pod.name","value":{"stringValue":"PPP"}}]},
               "scopeLogs":[{"logRecords":[{"body":{"stringValue":"a"}},{"body":{"stringValue":"b"}}]}]}]}
             """.Replace("PPP", new string('p', 200));
-        int attributesBytes = json.IndexOf("]},", StringComparison.Ordinal) + 1 - json.IndexOf("[{\"key\"", StringComparison.Ordinal);
-        long jsonWeight = OtlpLogBatchWeight.WeighJson(Encoding.UTF8.GetBytes(json));
-        Assert.Equal(2 * (IngestionOptions.DecodedLogRecordBytes + attributesBytes) + 2 * "{\"body\":{\"stringValue\":\"a\"}}".Length,
-                     jsonWeight);
+        Assert.Equal(2 * IngestionOptions.DecodedLogRecordBytes, OtlpLogBatchWeight.WeighJson(Encoding.UTF8.GetBytes(json)));
     }
 
     // ── One batch over the limit: 413, nothing ingested ───────────────────────

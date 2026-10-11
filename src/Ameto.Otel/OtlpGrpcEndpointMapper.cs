@@ -329,19 +329,17 @@ public static class OtlpGrpcEndpointMapper
             {
                 if (logs)
                 {
-                    // Weighed before a record is staged (OtlpLogBatchWeight), as on the HTTP route: over
-                    // the limit, RESOURCE_EXHAUSTED; the decoded budget spent, UNAVAILABLE. A message
-                    // the walk cannot frame throws into the INVALID_ARGUMENT below with no batch begun,
-                    // so nothing of it is written.
+                    // Weighed before a record is staged (OtlpLogBatchWeight), as on the HTTP route: plainly
+                    // over the limit, RESOURCE_EXHAUSTED; the decoded budget spent, UNAVAILABLE. The decode
+                    // then counts what it takes and throws the same two the moment the batch passes either
+                    // bound, with nothing of it written. A message the walk cannot frame throws into the
+                    // INVALID_ARGUMENT below with no batch begun, so nothing of it is written.
                     var  endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
                     long weight   = OtlpLogBatchWeight.WeighProto(segment.AsSpan());
                     if (weight > endpoint.MaxDecodedBatchBytes)
-                    {
-                        endpoint.NoteTooHeavy(ctx.Request.Path.Value, weight);
-                        throw new OtlpLogBatchWeight.TooHeavyException(weight, endpoint.MaxDecodedBatchBytes);
-                    }
+                        throw new LogBatchTooHeavyException(weight, endpoint.MaxDecodedBatchBytes);
                     batch = endpoint.TryBeginBatch(payloadSizeHint: segment.Count, weight)
-                         ?? throw new OtlpLogBatchWeight.BudgetFullException();
+                         ?? throw new LogBatchBudgetFullException();
                     OtlpLogProtoParser.Parse(segment.AsSpan(), batch);
                     (ok, rejected, why) = (true, 0, null);
                 }
@@ -358,14 +356,17 @@ public static class OtlpGrpcEndpointMapper
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
                 return;
             }
-            catch (OtlpLogBatchWeight.TooHeavyException)
+            catch (LogBatchTooHeavyException ex)
             {
-                // The same for a logs batch that would decode past Ingestion.MaxDecodedLogBatchBytes.
+                // The same for a logs batch that decodes past Ingestion.MaxDecodedLogBatchBytes — weighed
+                // so before it was decoded, or counted so while it was. Nothing of it is written: the
+                // batch is given back in the finally, never committed. Logged: the exporter does not retry.
+                ctx.RequestServices.GetRequiredService<IngestionEndpoint>().NoteTooHeavy(ctx.Request.Path.Value, ex.Weight);
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpLogBatchWeight.RefusalMessage);
                 return;
             }
-            catch (OtlpLogBatchWeight.BudgetFullException)
+            catch (LogBatchBudgetFullException)
             {
                 // The batches held decoded at once are at their limit — the store is behind and
                 // requests are waiting for room. Nothing decoded, nothing written: retried.

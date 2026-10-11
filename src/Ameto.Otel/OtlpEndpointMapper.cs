@@ -240,16 +240,18 @@ public static class OtlpEndpointMapper
                     var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
                     if (body is null) return;
 
+                    bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
                     try
                     {
-                        bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-
                         // THE BATCH IS WEIGHED BEFORE A RECORD IS STAGED (OtlpLogBatchWeight): it is
                         // decoded whole before it is written, and a record of two bytes on the wire
-                        // decodes to ~130, its resource's attributes copied in. Over the limit it is
-                        // refused as what it is, too large; under it, its weight is reserved against
-                        // what the batches held decoded at once may weigh, or it is asked to retry.
-                        // A body the walk cannot frame is refused 400 here, nothing of it ingested.
+                        // decodes to ~130, its resource's attributes copied in. Plainly over the limit
+                        // it is refused at once as what it is, too large; otherwise its weight is its
+                        // first reservation against what the batches held decoded at once may hold, or
+                        // it is asked to retry. The weight is only an estimate: the decode counts what
+                        // it takes, and stops — 413 or 503, nothing written — the moment the batch
+                        // passes either bound (the catches below). A body the walk cannot frame is
+                        // refused 400 here, nothing of it ingested.
                         long weight;
                         try
                         {
@@ -268,7 +270,13 @@ public static class OtlpEndpointMapper
                             WriteTooHeavy(ctx, isProto);
                             return;
                         }
-                        batch = endpoint.TryBeginBatch(payloadSizeHint: bodyLen, weight);
+                        // The payload array is first taken at about what the records' properties come to,
+                        // and is counted at its length: a protobuf body's own length, while JSON spells a
+                        // record out at two or more times its msgpack, so a quarter of its text — the array
+                        // grows if that is short. Taken at the whole text, it was counted at twice what
+                        // the batch went on to fill, and a JSON batch could be refused 413 for room it
+                        // never used.
+                        batch = endpoint.TryBeginBatch(payloadSizeHint: isProto ? bodyLen : bodyLen / 4, weight);
                         if (batch is null)
                         {
                             WriteRetryLater(ctx, OtlpLogBatchWeight.BudgetFullMessageUtf8);
@@ -283,8 +291,27 @@ public static class OtlpEndpointMapper
                             ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), batch)
                             : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), batch);
                     }
-                    // A malformed tail: the prefix decoded before it is written below and the batch
-                    // answered 400, which OTLP defines as not retryable — as it always was.
+                    // The decode passed the batch's limit — counted as it took it, past what the weight
+                    // said: too large, nothing of it written (the finally below gives the batch back).
+                    catch (LogBatchTooHeavyException ex)
+                    {
+                        endpoint.NoteTooHeavy(ctx.Request.Path.Value, ex.Weight);
+                        WriteTooHeavy(ctx, isProto);
+                        return;
+                    }
+                    // Its reservation could not grow: the batches held at once are at their limit.
+                    // Nothing written, so the retry the 503 asks for duplicates nothing.
+                    catch (LogBatchBudgetFullException)
+                    {
+                        WriteRetryLater(ctx, OtlpLogBatchWeight.BudgetFullMessageUtf8);
+                        return;
+                    }
+                    // A malformed body: the records decoded before the fault are written below and the
+                    // batch answered 400, which OTLP defines as not retryable. (A JSON body is read
+                    // whole by the weighing walk first, so a malformed one is refused there with
+                    // nothing written; a protobuf body's walk only frames fields, so damage inside a
+                    // record — a value nested too deep, a bad varint in an attribute — is found here,
+                    // after the records before it.)
                     catch (Exception ex) when (!OtlpOutOfMemoryLog.IsOutOfMemory(ex))
                     {
                         malformed = true;
