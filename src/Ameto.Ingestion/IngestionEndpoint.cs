@@ -150,6 +150,60 @@ public sealed class IngestionEndpoint
     /// </summary>
     public long DroppedOversized => Interlocked.Read(ref _droppedOversized);
 
+    // ── The oversized-drop Warning, rate-limited ──────────────────────────────
+
+    /// <summary>
+    /// The oversized-drop Warning is written at most once in this long; the drops in between are
+    /// counted into the next one. It is logged as each attempt is decoded, and a batch answered 503
+    /// is decoded again by every retry: one oversized event in a batch retried each second for a
+    /// minute wrote sixty Warnings, and a producer sending oversized events in bulk wrote one per
+    /// event. Internal, so a test that injects its fault through that log call can lift the limit.
+    /// </summary>
+    internal TimeSpan OversizedWarningInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>The clock <see cref="OversizedWarningInterval"/> is measured by; a test's own moves only when it says.</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>The <see cref="Clock"/> timestamp from which the next Warning may be written.</summary>
+    private long _oversizedWarnFrom = long.MinValue;
+
+    /// <summary>Drops since the last Warning that wrote none of their own.</summary>
+    private int _oversizedWarnSkipped;
+
+    /// <summary>
+    /// Whether this drop writes its Warning, with <paramref name="skipped"/> the drops since the
+    /// last one that did not — the shape of OtlpOutOfMemoryLog's line. Lock-free: of two drops in
+    /// the same instant, one writes it.
+    /// </summary>
+    private bool TakeOversizedWarning(out int skipped)
+    {
+        var  clock = Clock;
+        long now   = clock.GetTimestamp();
+        long from  = Volatile.Read(ref _oversizedWarnFrom);
+        long step  = (long)(OversizedWarningInterval.TotalSeconds * clock.TimestampFrequency);
+        if (now >= from && Interlocked.CompareExchange(ref _oversizedWarnFrom, now + step, from) == from)
+        {
+            skipped = Interlocked.Exchange(ref _oversizedWarnSkipped, 0);
+            return true;
+        }
+        Interlocked.Increment(ref _oversizedWarnSkipped);
+        skipped = 0;
+        return false;
+    }
+
+    private void LogOversizedDrop(int payloadBytes, string service, string template, int skipped)
+    {
+        if (skipped == 0)
+            _logger.LogWarning(
+                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
+                payloadBytes, _maxEventPayloadBytes, service, template);
+        else
+            _logger.LogWarning(
+                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\"); " +
+                "{Unlogged} more dropped since the last of these warnings, which are written at most once a second",
+                payloadBytes, _maxEventPayloadBytes, service, template, skipped);
+    }
+
     // ── Commit ────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -193,9 +247,10 @@ public sealed class IngestionEndpoint
         // Events refused at the door are COUNTED by the answer that ends the request: a 503 is
         // staged again by its retry, and one oversized event in a batch retried each second for
         // three minutes read as ~180 drops. A 400 (malformed) is final whatever the store did.
-        // (Their Warning stays where it is, logged as each attempt is decoded: a log call that runs
-        // out of memory there is the server's failure, answered 503 before anything is written —
-        // #126's F3 — where one after the write would make a written batch a 500.)
+        // (Their Warning stays where it is, logged as each attempt is decoded, at most once a second
+        // — see TakeOversizedWarning: a log call that runs out of memory there is the server's
+        // failure, answered 503 before anything is written — #126's F3 — where one after the write
+        // would make a written batch a 500.)
         if (!busy || batch.Malformed) Interlocked.Add(ref _droppedOversized, batch.DroppedAtDoor);
         return new LogIngestResult(ingested, dropped, busy);
     }
@@ -450,14 +505,16 @@ public sealed class IngestionEndpoint
             // is the one that names the producer, as TryIngest and TryIngestClef do. The service
             // comes from the span when the caller passed one, else from the pool: a parser that
             // interned the block's service.name once may hand over only the index. The drop is
-            // COUNTED when the batch is answered (CommitAsync), once, not per attempt.
+            // COUNTED when the batch is answered (CommitAsync), once, not per attempt, and the
+            // Warning is written at most once a second (TakeOversizedWarning).
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
-                            : serviceIdx >= 0      ? _pool.Get(serviceIdx)
-                            : string.Empty;
-            _logger.LogWarning(
-                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
-                msgpackProps.Length, _maxEventPayloadBytes, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120));
+            if (TakeOversizedWarning(out int skipped))
+            {
+                string svcStr = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
+                              : serviceIdx >= 0      ? _pool.Get(serviceIdx)
+                              : string.Empty;
+                LogOversizedDrop(msgpackProps.Length, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120), skipped);
+            }
             StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
             return false; // original counted as dropped by the caller
         }
@@ -495,13 +552,13 @@ public sealed class IngestionEndpoint
         {
             // Cold path: the strings here are worth their cost — this is one log line and
             // one marker event per dropped event, not per event. The drop is COUNTED when the
-            // batch is answered (CommitAsync), once, not per attempt.
+            // batch is answered (CommitAsync), once, not per attempt, and the Warning is written
+            // at most once a second (TakeOversizedWarning).
             string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
 
-            _logger.LogWarning(
-                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
-                msgpackProps.Length, _maxEventPayloadBytes, svcStr ?? "(none)", Truncate(tmplStr, 120));
+            if (TakeOversizedWarning(out int skipped))
+                LogOversizedDrop(msgpackProps.Length, svcStr ?? "(none)", Truncate(tmplStr, 120), skipped);
             StageServerDropMarker(
                 batch, tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
                 svcStr is not null ? _pool.Intern(svcStr) : -1);

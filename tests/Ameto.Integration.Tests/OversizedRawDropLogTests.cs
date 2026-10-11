@@ -51,6 +51,49 @@ public sealed class OversizedRawDropLogTests : IClassFixture<AmetoWebAppFactory>
         Assert.Equal("raw oversize probe {N}", entry.Values["Template"]);
     }
 
+    /// <summary>
+    /// The Warning is written at most once a second, and the next one counts the drops in between.
+    /// It is logged as each attempt is decoded, and a batch answered 503 is decoded again by every
+    /// retry; a producer sending oversized events in bulk wrote one line per event. Every drop is
+    /// still counted, and still leaves its marker.
+    /// </summary>
+    [Fact]
+    public async Task The_drop_Warning_is_written_at_most_once_a_second_and_the_next_one_counts_the_rest()
+    {
+        var sp       = _factory.Services;
+        var pool     = sp.GetRequiredService<StringInternPool>();
+        var options  = sp.GetRequiredService<ServerOptions>();
+        var logger   = new CapturingLogger();
+        var clock    = new Ameto.Testing.ManualTimeProvider();
+        var endpoint = new IngestionEndpoint(sp.GetRequiredService<StorageEngine>(), pool, options, logger) { Clock = clock };
+        var props    = new byte[options.Ingestion.MaxEventPayloadBytes + 1];
+
+        async Task<LogIngestResult> Send(int oversized)
+        {
+            using var batch = endpoint.BeginBatch();
+            for (int i = 0; i < oversized; i++)
+                batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information,
+                                   "rate probe {N}"u8, props, 0, 0, 0, "rate-probe-svc"u8);
+            return await batch.CommitAsync();
+        }
+
+        var first = await Send(3);
+        Assert.Equal(3, first.Dropped);
+        var only = Assert.Single(logger.Entries);                    // the first of the three
+        Assert.False(only.Values.ContainsKey("Unlogged"));
+
+        clock.Advance(TimeSpan.FromMilliseconds(999));
+        await Send(1);
+        Assert.Single(logger.Entries);                               // still inside the second
+
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        await Send(1);
+        Assert.Equal(2, logger.Entries.Count);
+        Assert.Equal(3, logger.Entries[1].Values["Unlogged"]);       // the two of the first batch, and the one after
+        Assert.Equal("rate-probe-svc", logger.Entries[1].Values["Service"]);
+        Assert.Equal(5, endpoint.DroppedOversized);                  // every drop counted
+    }
+
     private sealed record Entry(Microsoft.Extensions.Logging.LogLevel Level, Dictionary<string, object?> Values);
 
     private sealed class CapturingLogger : ILogger<IngestionEndpoint>

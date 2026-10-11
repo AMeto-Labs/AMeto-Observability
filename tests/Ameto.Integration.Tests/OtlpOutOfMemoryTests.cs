@@ -92,7 +92,12 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
                     sp.GetRequiredService<Ameto.Storage.StorageEngine>(),
                     sp.GetRequiredService<StringInternPool>(),
                     sp.GetRequiredService<ServerOptions>(),
-                    _sinkLoggers.CreateLogger<IngestionEndpoint>()));
+                    _sinkLoggers.CreateLogger<IngestionEndpoint>())
+                {
+                    // The log fault is injected through the oversized-drop Warning, which every
+                    // log batch of this class must reach: no once-a-second limit on it here.
+                    OversizedWarningInterval = TimeSpan.Zero,
+                });
             });
         }
 
