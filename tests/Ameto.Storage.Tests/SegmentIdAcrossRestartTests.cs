@@ -68,11 +68,14 @@ public sealed class SegmentIdAcrossRestartTests : IDisposable
     /// the next start. The block used to be reserved only once the read had worked, from the header:
     /// after a failed read the first log the run opened was handed that same block, and with it the
     /// same file name. It reopened the file, appended after the entries no replay had read, and its
-    /// own flush deleted them: acknowledged events lost.
+    /// own flush deleted them: acknowledged events lost. (Since round 4 the despill reads such a log
+    /// again in the same run, into the same block; it is held here, so the log waits for the next
+    /// start, as it did.)
     /// </summary>
     [Fact]
     public async Task A_log_the_replay_fails_to_read_keeps_its_block_and_its_events_for_the_next_start()
     {
+        StorageEngine.HoldDespillForTest.Value = new TaskCompletionSource().Task;   // never released: cancelled at dispose
         string dir    = Dir("unread");
         string walDir = Path.Combine(dir, "wal");
         Directory.CreateDirectory(walDir);
@@ -94,7 +97,11 @@ public sealed class SegmentIdAcrossRestartTests : IDisposable
                 $"the run opened block {first.LiveWalSegmentId} — the unread log's own");
             Write(first, t + TimeSpan.TicksPerSecond, 1);
         }
-        finally { StorageEngine.BeforeWalReplayReadForTest.Value = null; }
+        finally
+        {
+            StorageEngine.BeforeWalReplayReadForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value         = null;
+        }
         Assert.True(File.Exists(orphan), "the unread log is gone");
 
         await using var next = NewEngine(dir);

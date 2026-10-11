@@ -5801,8 +5801,25 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
         {
             // Per WAL, so one unreadable log cannot strand the others behind it.
-            try { ReplayOrphanedWal(walFile); }
-            catch (Exception ex) { _logger.LogError(ex, "WAL recovery failed for {File}", walFile); }
+            ulong flushing = 0;
+            try { ReplayOrphanedWal(walFile, ref flushing); }
+            catch (Exception ex)
+            {
+                // Read again in THIS process, by the despill, with its backoff — not left for the next
+                // start, its events served by nobody until a restart however soon the cause cleared
+                // (a read the heap could not hold, a file a scanner held, a flush the disk refused).
+                bool retried = false;
+                try { retried = HandFailedReplayToDespill(walFile, flushing); }
+                catch (Exception) { /* left for the next start */ }
+                try
+                {
+                    _logger.LogError(ex, retried
+                        ? "WAL recovery failed for {File} — the log is kept and read again in the background, backing off while it fails, until its events are in segments"
+                        : "WAL recovery failed for {File} — the log is kept for the next start",
+                        walFile);
+                }
+                catch (Exception) { /* the line is lost; the log is not */ }
+            }
         }
 
         // Markers whose WAL is gone: the delete pair is WAL-then-marker, so a crash between
@@ -5818,7 +5835,54 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
     }
 
-    private void ReplayOrphanedWal(string walFile)
+    /// <summary>
+    /// Round-4 L14: hands a WAL whose startup replay failed to the despill, which reads it again in
+    /// this process — with its backoff (M5) — until its events are in segments, as it does a spill
+    /// file or a WAL whose flush a crash cut short. It was left for the next start: its events served
+    /// by nobody until a restart, however soon the cause cleared. Counted in
+    /// <see cref="SpillFilesPending"/> meanwhile, which is what a rollback waits on.
+    ///
+    /// <para>False — left for the next start, as before — for a file the despill cannot take: one whose
+    /// name carries no block, or a block past the last usable id; and for one whose flush completed,
+    /// its marker beside it: the next start removes it, and the levels it wrote are the boot scan's.</para>
+    ///
+    /// <para>The levels on disk. A replay that failed before it looked (<paramref name="flushingBlock"/>
+    /// 0) may have found levels an EARLIER run published: they are kept, as the branch that despills a
+    /// crash-cut WAL keeps them. One that failed while reading or flushing a block with none
+    /// (<paramref name="flushingBlock"/> set) wrote any there are itself — moved into place, registered
+    /// by nobody — and they are deleted (recorded for a running boot scan, as every such delete is):
+    /// the despill writes the whole block again, and never moves a level over a file that is there. A
+    /// delete that fails is done again by the despill's own failure path, which runs whenever such a
+    /// file stops its flush.</para>
+    /// </summary>
+    private bool HandFailedReplayToDespill(string walFile, ulong flushingBlock)
+    {
+        ulong segId = flushingBlock;
+        if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;
+        if (!File.Exists(walFile) || File.Exists(FlushMarkerPath(segId))) return false;
+
+        byte published = 0;
+        if (flushingBlock != 0)
+            DeleteUnpublishedLevelFiles(segId);
+        else
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (SegmentFileExists(segId + (ulong)lvl)) published |= (byte)(1 << lvl);
+
+        ReserveWalBlock(segId);
+        lock (_spillQueueLock)
+        {
+            if (!_spillQueue.ContainsKey(segId)) _spillQueue[segId] = new QueuedSpill(walFile, published);
+        }
+        WakeDespill();
+        return true;
+    }
+
+    /// <param name="flushing">
+    /// Set to the block once the replay is past the check for levels an earlier run published, and so
+    /// reads and flushes a block with no level on disk: a failure from there on leaves only level files
+    /// of its own (see <see cref="HandFailedReplayToDespill"/>). Left 0 before that.
+    /// </param>
+    private void ReplayOrphanedWal(string walFile, ref ulong flushing)
     {
         // The block the file is NAMED after is spent before a byte of it is read. It used to be
         // reserved only once a read had worked (from the header, below — still done), so a read that
@@ -5929,6 +5993,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 "despill once the boot scan has read the ones on disk", walFile);
             return;
         }
+
+        // No level of the block is on disk: every one this replay writes is its own (HandFailedReplayToDespill).
+        flushing = segId;
 
         // Load template pool. An empty pool used to discard the ENTIRE WAL — dropping events
         // whose payloads DID reach disk because their template strings did not. Replay them

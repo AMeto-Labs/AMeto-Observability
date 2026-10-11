@@ -3099,12 +3099,15 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// Mc. Decoding a checksummed entry's exception is not reading a torn entry: an out-of-memory
     /// there — a long stack trace on a tight heap — was taken for the end of the durable log, and the
     /// replay published the event before it and deleted the WAL with the rest. It propagates now: the
-    /// replay fails ("WAL recovery failed"), the WAL stays for the next start, which replays all three.
-    /// And (R2-3) the walk that failed part way frees its tier and its mapping: the file can be opened
-    /// with no sharing at all.
+    /// replay fails ("WAL recovery failed") and the WAL stays. And (R2-3) the walk that failed part way
+    /// frees its tier and its mapping: the file can be opened with no sharing at all.
+    ///
+    /// <para>Round-4 L14: and the WAL is read again in the same run, by the despill — held here until
+    /// the checks above are made — once the heap allows: all three events come back whole and the WAL
+    /// goes, without a restart. It used to wait for the next start.</para>
     /// </summary>
     [Fact]
-    public async Task A_replay_that_runs_out_of_memory_decoding_an_exception_keeps_its_wal_for_the_next_start()
+    public async Task A_replay_that_runs_out_of_memory_decoding_an_exception_keeps_its_wal_until_the_despill_reads_it()
     {
         string dir  = NewDir();
         var    opts = Options(dir);
@@ -3113,14 +3116,21 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         WriteThreeEventLog(wal, opts, 9_000);
 
         HotTierSegment? tier = null;
-        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () => throw new OutOfMemoryException("test: decoding the exception");
-        StorageEngine.RecoveryTierCreatedForTest.Value   = t => tier = t;
+        int outOfMemory      = 1;   // the despill's context sees these seams too: they are switched off, not unset
+        var hold             = new TaskCompletionSource();
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () =>
+        {
+            if (Volatile.Read(ref outOfMemory) == 1) throw new OutOfMemoryException("test: decoding the exception");
+        };
+        StorageEngine.RecoveryTierCreatedForTest.Value = t => tier ??= t;
+        StorageEngine.HoldDespillForTest.Value         = hold.Task;
         StorageEngine run1;
         try { run1 = Engine(opts); }
         finally
         {
             WriteAheadLog.BeforeExceptionDecodeForTest.Value = null;
             StorageEngine.RecoveryTierCreatedForTest.Value   = null;
+            StorageEngine.HoldDespillForTest.Value           = null;
         }
         await using (run1)
         {
@@ -3130,11 +3140,102 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             Assert.NotNull(tier);
             Assert.True(tier!.IsDisposed, "the tier the failed walk filled was not freed");
             using (new FileStream(wal, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }   // no mapping left on it
+            Assert.Equal(1, run1.SpillFilesPending);                                                // counted until it is in segments
+
+            Volatile.Write(ref outOfMemory, 0);
+            hold.SetResult();
+            WaitFor(() => run1.SpillFilesPending == 0, "the WAL to be read again by the despill", ShortGuard);
+            AssertThreeEventsWhole(ReadAll(run1));
+            Assert.False(File.Exists(wal), "the WAL was kept after its events reached segments");
         }
 
         await using var run2 = Engine(opts);
         await run2.CatalogLoaded;
-        AssertThreeEventsWhole(ReadAll(run2));
+        AssertThreeEventsWhole(ReadAll(run2));   // once each: nothing replayed a second time
+    }
+
+    /// <summary>
+    /// Round-4 L14. A WAL the startup replay could not read — held by a scanner, here — is read again
+    /// in the same run by the despill, with its backoff, and its events reach segments without a
+    /// restart. The replay used to leave it for the next start: its events served by nobody, however
+    /// soon the scanner let go.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_the_replay_cannot_open_is_read_again_by_the_despill_in_the_same_run()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string wal  = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal");
+        WriteThreeEventLog(wal, opts, 9_000);
+
+        var log  = new RecordingLogger();
+        var hold = new TaskCompletionSource();
+        StorageEngine.BeforeWalReplayReadForTest.Value = path =>
+        {
+            if (path == wal) throw new IOException("test: the file is held by a scanner");
+        };
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts, log); }
+        finally
+        {
+            StorageEngine.BeforeWalReplayReadForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value         = null;
+        }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.Equal(1, engine.SpillFilesPending);
+            Assert.Single(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && l.Line.StartsWith($"WAL recovery failed for {wal} — the log is kept and read again", StringComparison.Ordinal));
+
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the WAL to be read again by the despill", ShortGuard);
+            AssertThreeEventsWhole(ReadAll(engine));
+            Assert.False(File.Exists(wal), "the WAL was kept after its events reached segments");
+        }
+    }
+
+    /// <summary>
+    /// Round-4 L14, a flush that fails part way: the replay's flush moves one level into place and
+    /// cannot write the next (a directory stands where its file goes). The level it moved — registered
+    /// by nobody — is deleted, the WAL goes to the despill, and once the way is clear the despill writes
+    /// the whole block: every event once. Left there, the level would stop the despill's own flush,
+    /// which never moves a level over a file.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_replay_flush_fails_part_way_is_written_whole_by_the_despill()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string segDir = Path.Combine(dir, "segments");
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        Directory.CreateDirectory(segDir);
+        string wal    = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal");
+        WriteThreeEventLog(wal, opts, 9_000);
+        // Where the Error level (block + 4) of the middle event goes: taken by a directory.
+        long   errorAt = T0 + TimeSpan.TicksPerMillisecond;
+        string blocker = Path.Combine(segDir, $"{opts.NodeId.Value}-{9_000 + (int)LogLevel.Error}-{errorAt}-{errorAt}.seg");
+        Directory.CreateDirectory(blocker);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.Equal(1, engine.SpillFilesPending);
+            Assert.Empty(Directory.GetFiles(segDir, $"{opts.NodeId.Value}-{9_000 + (int)LogLevel.Information}-*.seg"));   // the level it moved, gone
+
+            Directory.Delete(blocker);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the WAL to be written by the despill", ShortGuard);
+            AssertThreeEventsWhole(ReadAll(engine));
+            Assert.False(File.Exists(wal), "the WAL was kept after its events reached segments");
+        }
     }
 
     /// <summary>
