@@ -2323,8 +2323,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// reason it was asked for still holds, read under the lock (<see cref="SwapWanted"/>). False —
     /// the age loop, <see cref="FlushHotTierAsync"/>, the final flush — swaps any non-empty tier.
     /// </param>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0, bool onlyIfStillWanted = false)
     {
+        // Boxed first, owning nothing. A state machine is boxed at its first real suspension, and that
+        // allocation can run out of memory like any other — with every finally of the method skipped,
+        // since the compiler guards them with the state the suspension has already set. That first
+        // suspension was the heavy phase's await of the flush, which always suspends: its failure was
+        // caught as a failed FLUSH while the flush ran on — handed to a retry that flushed the same tier
+        // beside it, and the finallys that give back the heavy-phase permit, the slot and the count
+        // skipped (with one permit, every later heavy phase waited for ever). Or it was the final
+        // flush's wait for the swap lock or a slot, which then stayed taken. Here nothing is owned yet.
+        await Task.Yield();
+
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
         //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
         //    rotates the WAL, then releases the lock so the NEXT full tier can be
@@ -2434,7 +2445,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // left behind, an open 64 MB WAL with its mapping and id block and a tier's
                 // first chunk, at every attempt a request for the swap made.
                 if (successor is not null) DiscardSuccessor(successor);
-                _flushSlots.Release();
+                try { _flushSlots.Release(); }
+                catch (Exception) { /* waking a waiter, which has the slot: the swap's own failure is the one that goes up */ }
                 throw;
             }
 
@@ -2506,11 +2518,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             List<SegmentInfo> written;
+            Task<List<SegmentInfo>>? flush = null;
             try
             {
-                written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
+                flush   = FlushTierByLevelAsync(oldHot, reservedSegId, ct);
+                written = await flush;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            // The FLUSH failed — not this method's await of it. Anything else thrown at the await
+            // (its continuation's registration, out of memory) leaves the flush running: handing the
+            // tier to a retry then would flush it twice, and freeing it would free it under the flush.
+            catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
                 // A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no
                 // retry for the life of the process, while its back-pressure slot was
@@ -2549,18 +2566,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 }
                 return;
             }
-            finally { _flushConcurrency.Release(); }
+            finally { ReleaseHeavyPermit(); }
 
             PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
         }
         finally
         {
             if (!slotTransferred)
-            {
-                _flushSlots.Release();
-                EndHeavyPhase();
-                OnFlushSlotReleased();
-            }
+                GiveBackSlot(endHeavyPhase: true);
         }
     }
 
@@ -2821,35 +2834,42 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// A despill's levels an earlier run published (see <c>FlushTierByLevelAsync</c>): kept on disk
     /// and not written again. The retry used to unlink them as leftovers and rewrite every level.
     /// </param>
+    /// <param name="onAbandoned">
+    /// Called, at most once, if the retry ends without giving its owners back itself — it could not be
+    /// queued, or its first suspension's box could not be allocated, which skips its finally — before
+    /// the slot and the count go back: how a despill's retry gives its tier up and queues its block
+    /// again, as the despill does when no retry starts. A swap's tier stays listed, served, until
+    /// shutdown frees it, and its WAL replays it at the next start.
+    /// </param>
     /// <returns>
-    /// True once the retry has started: from then on it owns the tier, its slot and its heavy-phase
-    /// count, and nothing here throws. False when it could not be started (out of memory before the
-    /// start): nothing of it runs, and the caller still owns all three — exactly one of the two
-    /// gives them up. Never throws.
+    /// True once the retry is handed the tier: from then on it — or, if it ends without giving them
+    /// back, its continuation — owns the tier, its slot and its heavy-phase count, and nothing here
+    /// throws. False when nothing was handed over (out of memory before the start): nothing of it
+    /// runs, and the caller still owns all three — exactly one of the two gives them up. Never throws.
     /// </returns>
     private bool TryScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
-                                       Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0)
+                                       Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0,
+                                       Action? onAbandoned = null)
     {
         // Everything the retry needs is allocated BEFORE it starts: its task, the promise DisposeAsync
-        // awaits, the continuation that forgets it, and its entry in _inFlightFlushes. Task.Run
-        // allocated its promise after queueing the work, and the bookkeeping came after that: an
-        // out-of-memory there reached the caller as "not started" while the retry was running, and
-        // the caller freed the tier the retry went on to flush.
-        Task<Task>? start = null;
-        Task?       retry = null;
+        // awaits, its owners and the continuation that gives them back if the retry cannot (and
+        // forgets it), and its entry in _inFlightFlushes. Task.Run allocated its promise after
+        // queueing the work, and the bookkeeping came after that: an out-of-memory there reached the
+        // caller as "not started" while the retry was running, and the caller freed the tier the
+        // retry went on to flush.
+        Task<Task> start;
+        Task?      retry = null;
         try
         {
             _beforeFlushRetryStartForTest?.Invoke();
-            start = NewFlushRetryTask(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels);
+            var owners = new FlushRetryOwners(this, reservedSegId, onAbandoned);
+            start = NewFlushRetryTask(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels, owners);
             retry = start.Unwrap();
             _ = retry.ContinueWith(
-                static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-                _inFlightFlushes, CancellationToken.None,
+                static (x, s) => ((FlushRetryOwners)s!).RetryEnded(x),
+                owners, CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             _inFlightFlushes[retry] = 0;
-            // The hand-over. Start throws only when the work could not be queued — the task is then
-            // faulted, never run, and its promise completes for anyone awaiting it.
-            start.Start(_flushRetrySchedulerForTest ?? TaskScheduler.Default);
         }
         catch (Exception)
         {
@@ -2859,7 +2879,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             return false;
         }
 
-        // Started: the retry owns the tier. Anything here runs after the hand-over and must not undo it.
+        // The hand-over. From here the retry owns the tier, its slot and its count — or, when it ends
+        // without giving them back, the continuation above does. Start throws only when the work could
+        // not be queued: the task is then faulted and never runs, and its continuation, run as the
+        // fault completes it, has already given the owners back (onAbandoned) — so that is handed over
+        // too. It used to be the caller's to give up as well, and with the continuation that was twice.
+        try { start.Start(_flushRetrySchedulerForTest ?? TaskScheduler.Default); }
+        catch (Exception)
+        {
+            if (!start.IsCompleted)
+            {
+                // Not even faulted (out of memory recording why it was not queued): it never runs and
+                // its continuation never comes, so the owners are still the caller's.
+                _inFlightFlushes.TryRemove(retry, out _);
+                return false;
+            }
+        }
+
+        // Anything here runs after the hand-over and must not undo it.
         try { _afterFlushRetryStartForTest?.Invoke(); }
         catch (Exception) { /* the retry has the tier, its slot and its count */ }
         return true;
@@ -2886,12 +2923,83 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// on entry, before any of its code ran.
     /// </summary>
     private Task<Task> NewFlushRetryTask(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
-                                         Action<List<SegmentInfo>>? onPublished, byte publishedLevels) =>
-        new(() => FlushRetryLoopAsync(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels));
+                                         Action<List<SegmentInfo>>? onPublished, byte publishedLevels,
+                                         FlushRetryOwners owners) =>
+        new(() => FlushRetryLoopAsync(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels, owners));
+
+    /// <summary>
+    /// What a started flush retry owns — its tier's flush slot and heavy-phase count — given back
+    /// exactly once: by the retry's own finally, or, when that finally never ran, by the
+    /// continuation that sees the retry's task end (registered before the retry started). The
+    /// finally does not run when the retry's first suspension — the wait before its first attempt,
+    /// where its state machine is boxed — runs out of memory: the compiler guards it with the state
+    /// the suspension has already set. The slot and the count were then held for good, and the tier
+    /// never flushed.
+    /// </summary>
+    private sealed class FlushRetryOwners(StorageEngine engine, ulong block, Action? onAbandoned)
+    {
+        private int _givenBack;
+
+        /// <summary>The retry's finally: it ended — published, or shut down — and gives them back.</summary>
+        internal void GiveBack()
+        {
+            if (Interlocked.Exchange(ref _givenBack, 1) == 0) engine.ReleaseFlushRetryOwners();
+        }
+
+        /// <summary>The retry's task ended. Never throws: it runs as that task's continuation.</summary>
+        internal void RetryEnded(Task retry)
+        {
+            try { engine._inFlightFlushes.TryRemove(retry, out _); }
+            catch (Exception) { /* DisposeAsync's wait for it is bounded */ }
+            if (Interlocked.Exchange(ref _givenBack, 1) != 0) return;
+            // Ended without giving them back: nothing of it runs now, so its tier is given up as when
+            // no retry starts — a swap's left listed until shutdown (its WAL replays it), a despill's
+            // unlisted and its block queued again (onAbandoned).
+            try { engine._logger.LogError("The flush retry of block {Block} ended without finishing; its slot is given back", block); }
+            catch (Exception) { /* the line is lost */ }
+            try { onAbandoned?.Invoke(); }
+            catch (Exception) { /* each step of it is guarded */ }
+            engine.ReleaseFlushRetryOwners();
+        }
+    }
+
+    /// <summary>Gives a flush retry's slot and heavy-phase count back. Never throws.</summary>
+    private void ReleaseFlushRetryOwners() => GiveBackSlot(endHeavyPhase: true);
+
+    /// <summary>
+    /// Gives a heavy-phase permit (<see cref="_flushConcurrency"/>) back. Never throws: a release that
+    /// fails waking a parked waiter has handed that waiter the permit, and a throw out of the finally
+    /// it ends skipped the publish or the slot's release after it.
+    /// </summary>
+    private void ReleaseHeavyPermit()
+    {
+        try { _flushConcurrency.Release(); }
+        catch (Exception) { /* the waiter has it */ }
+    }
+
+    /// <summary>
+    /// Gives a flush slot back — and the heavy-phase count with it when <paramref name="endHeavyPhase"/>
+    /// — then says the slot is free. Each step on its own: the slot's release allocates when it wakes
+    /// a parked async waiter, and a throw from it skipped the count's end, which shutdown then waited
+    /// for its whole budget. Never throws; it ends the finally blocks that own both.
+    /// </summary>
+    private void GiveBackSlot(bool endHeavyPhase)
+    {
+        try { _flushSlots.Release(); }
+        catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
+        if (endHeavyPhase)
+        {
+            try { EndHeavyPhase(); }
+            catch (Exception) { /* the count fell; only shutdown's wake is lost, and its wait is bounded */ }
+        }
+        OnFlushSlotReleased();
+    }
 
     /// <summary>The flush retry itself (see <see cref="TryScheduleFlushRetry"/>).</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task FlushRetryLoopAsync(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
-                                           Action<List<SegmentInfo>>? onPublished, byte publishedLevels)
+                                           Action<List<SegmentInfo>>? onPublished, byte publishedLevels,
+                                           FlushRetryOwners owners)
     {
         try
         {
@@ -2916,7 +3024,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
                         written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
                     }
-                    finally { _flushConcurrency.Release(); }
+                    finally { ReleaseHeavyPermit(); }
 
                     PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
                 }
@@ -2950,13 +3058,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
         catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
         catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
-        finally
-        {
-            // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
-            try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
-            EndHeavyPhase();
-            OnFlushSlotReleased();
-        }
+        finally { owners.GiveBack(); }
     }
 
     /// <summary>

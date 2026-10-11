@@ -2355,10 +2355,15 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// The swap's tier whose retry cannot be started (the new failure path of the hand-over): its slot
     /// and heavy phase go back once, and the tier stays listed — queries go on serving it — until
     /// shutdown frees it; its WAL stays, and the next start replays every event once, though the failed
-    /// attempt had moved a level file into place.
+    /// attempt had moved a level file into place. Either way it cannot start: nothing of it set up
+    /// ("before"), and the caller gives the tier up; or set up and refused by the scheduler, where its
+    /// continuation gives it up — and only it: with the caller too, the slot and the heavy phase went
+    /// back twice, the count negative and shutdown waiting its whole budget.
     /// </summary>
-    [Fact]
-    public async Task A_swapped_tier_whose_retry_cannot_start_stays_served_and_comes_back_once_at_the_next_start()
+    [Theory]
+    [InlineData("before")]
+    [InlineData("scheduler")]
+    public async Task A_swapped_tier_whose_retry_cannot_start_stays_served_and_comes_back_once_at_the_next_start(string how)
     {
         string dir    = NewDir();
         var    opts   = Options(dir);
@@ -2368,7 +2373,8 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         {
             if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after a level");
         };
-        engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be started");
+        if (how == "before") engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be started");
+        else                 engine._flushRetrySchedulerForTest   = new RefusingScheduler();
         try
         {
             using (var batch = Batch(engine, 0, 500))
@@ -2536,6 +2542,174 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         await using var reopened = Engine(opts);
         await reopened.CatalogLoaded;   // the boot scan registers the segment, in the background
         Assert.Equal(10, ReadAll(reopened).Count);
+    }
+
+    // ── A first suspension whose box cannot be allocated ──────────────────────
+
+    /// <summary>
+    /// OwnerAsync's seam, armed for one first suspension of the method whose state machine's name
+    /// carries <paramref name="method"/> (as "&lt;TryFlushAsync&gt;"): it then throws where the runtime
+    /// boxes the state machine, every finally of the method skipped as a real failure skips them.
+    /// </summary>
+    private static Func<Type, bool> FailFirstSuspensionOnce(string method)
+    {
+        int armed = 1;
+        return t => t.Name.Contains(method, StringComparison.Ordinal) && Interlocked.Exchange(ref armed, 0) == 1;
+    }
+
+    /// <summary>
+    /// Round-4 review H5, the swap. TryFlushAsync's first real suspension was the heavy phase's await
+    /// of the flush, which always suspends: a box that could not be allocated there was caught as a
+    /// FAILED flush while the flush ran on — handed to a retry — and the finallys that give the
+    /// heavy-phase permit back were skipped. With one permit, every later heavy phase waited for ever.
+    /// The method is boxed before it owns anything now: that failure fails the swap before it swaps,
+    /// and the next one flushes everything once.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_whose_first_suspension_cannot_be_boxed_owns_nothing_and_every_tier_is_flushed_once()
+    {
+        var engine = Engine(Options(NewDir()));   // one heavy-phase permit, slots to spare
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            using (var a = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<TryFlushAsync>");
+            Exception? first;
+            try { first = await Record.ExceptionAsync(() => engine.FlushHotTierAsync()); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            using (var b = Batch(engine, 10, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            var next = engine.FlushHotTierAsync();   // a heavy phase that needs the one permit
+            Assert.True(await Task.WhenAny(next, Task.Delay(ShortGuard)) == next,
+                        "the next heavy phase never got its permit: the failed one kept it");
+            await next;
+
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "every tier flushed and published", ShortGuard);
+            Assert.Equal(20, ReadAll(engine).Count);
+            Assert.IsType<OutOfMemoryException>(first);   // it failed owning nothing, before it swapped
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// H5, the despill: its first real suspension was the wait for the swap lock or the permit, or the
+    /// await of the flush — a box that could not be allocated there skipped every finally, and the
+    /// permit, the slot and the block stayed taken (the block never despilled in this process). It is
+    /// boxed first now, owning only the slot the loop took for it, which its catch gives back with
+    /// the block queued again; the next despill writes it.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_first_suspension_cannot_be_boxed_gives_its_slot_back_and_the_block_is_despilled_later()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value       = hold.Task;
+        OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<DespillAsync>");
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally
+        {
+            StorageEngine.HoldDespillForTest.Value       = null;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = null;
+        }
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 50,
+                    "the block to be despilled after the despill that could not be boxed", ShortGuard);
+            Assert.Equal(50, ReadAll(engine).Count);
+            Assert.Equal(0, engine.HeavyPhasesInFlight);
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L21. A started flush retry owns its tier's slot and heavy-phase count; its first
+    /// suspension — the wait before its first attempt, where it is boxed — could run out of memory,
+    /// which skipped the finally that gives them back: the slot and the count held for good, the tier
+    /// never flushed, shutdown waiting its budget. The continuation registered before the retry
+    /// started gives them back now (once); the tier stays listed, served, until shutdown, and its WAL
+    /// brings every event back once at the next start.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_retry_whose_first_suspension_cannot_be_boxed_gives_its_slot_and_count_back()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        var    engine = OneSlotEngine(opts);
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int failed = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after a level");
+        };
+        try
+        {
+            using (var batch = Batch(engine, 0, 500))
+                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<FlushRetryLoopAsync>");
+            try { await engine.FlushHotTierAsync(); }   // the flush fails; its retry starts, and is not boxed
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the dead retry's slot and heavy phase to be given back", ShortGuard);
+            Assert.Equal(1, engine.FrozenTierCountForTest);   // listed, and served, until shutdown
+        }
+        finally
+        {
+            engine._afterLevelPublished = null;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await engine.DisposeAsync();
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), $"shutdown waited {sw.Elapsed.TotalSeconds:F1}s for a heavy phase");
+        }
+
+        await using var reopened = Engine(opts);
+        await reopened.CatalogLoaded;
+        WaitFor(() => reopened.SpillFilesPending == 0 && ReadAll(reopened).Count == 500, "the tier's WAL to bring its events back", ShortGuard);
+        Assert.Equal(500, ReadAll(reopened).Count);
+    }
+
+    /// <summary>
+    /// Round-4 review L22. DespillAsync's callback for its retry captured the block, so the closure was
+    /// allocated on its entry, before any of its try blocks: an out-of-memory there left the slot the
+    /// loop took for it held, and the block in flight, for good. The callbacks are built where they
+    /// are handed over now; failing there, no retry starts and the block is despilled again.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_retry_callbacks_cannot_be_allocated_still_despills_its_block()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        int callbacks = 0, failed = 0;
+        engine._despillRetryCallbacksForTest = () =>
+        {
+            if (Interlocked.Increment(ref callbacks) == 1) throw new OutOfMemoryException("test: the retry's callbacks");
+        };
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the despill's flush fails after a level");
+        };
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 50, "the block to be despilled", ShortGuard);
+            Assert.Equal(50, ReadAll(engine).Count);
+            Assert.Equal(0, engine.HeavyPhasesInFlight);
+        }
     }
 
     // ── A block id past the last usable one ───────────────────────────────────

@@ -822,8 +822,25 @@ public sealed partial class StorageEngine
     /// is flushed: listed as frozen (so queries see it) for its heavy phase, published with the same
     /// completion marker, its WAL deleted against it. Owns the flush slot the caller took.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task DespillAsync(SpillFile file, CancellationToken ct)
     {
+        // Boxed first (see TryFlushAsync). Its first real suspension was the wait for the swap lock or
+        // the heavy-phase permit, or the await of the flush: a box that could not be allocated there
+        // skipped every finally below — the slot, the count and the tier held for good, a lock or a
+        // permit granted to a waiter that was gone — or was caught as a failed FLUSH while the flush
+        // ran on, and the tier freed under it. Here the slot (the loop took it for this despill) is
+        // all it owns, and this catch, which the compiler does not guard as it guards a finally,
+        // gives it back and queues the block again.
+        try { await Task.Yield(); }
+        catch (Exception)
+        {
+            RetrySpillLater(file.SegId);
+            GiveBackSlot(endHeavyPhase: false);
+            Interlocked.Increment(ref _despillsCompleted);
+            throw;
+        }
+
         bool slotTransferred = false;
         bool counted         = false;
         bool settled         = false;   // published, found published already, or not this release's to read
@@ -873,15 +890,18 @@ public sealed partial class StorageEngine
 
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             List<SegmentInfo> written;
+            Task<List<SegmentInfo>>? flush = null;
             try
             {
                 // A block a crash left half-written keeps the levels it got out — the ones found on
                 // disk when this run STARTED, not now: the boot scan registers them as ordinary
                 // segments, and a merge or retention pass may have taken one since. Asking the disk
                 // here found it gone and wrote its events a second time.
-                written = await FlushTierByLevelAsync(tier, file.SegId, ct, publishedLevels: file.PublishedLevels).ConfigureAwait(false);
+                flush   = FlushTierByLevelAsync(tier, file.SegId, ct, publishedLevels: file.PublishedLevels);
+                written = await flush.ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            // The FLUSH failed — not this method's await of it (see TryFlushAsync's heavy phase).
+            catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
                 // Nothing in here may throw past the hand-over: the tier is listed and counted, and a
                 // throw out of this catch — its own log line, which allocates — reached the finally
@@ -900,11 +920,10 @@ public sealed partial class StorageEngine
                 // TryScheduleFlushRetry throws nothing after that), this catch when it has not.
                 try
                 {
-                    slotTransferred = TryScheduleFlushRetry(tier, file.Path, file.SegId,
-                                          onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
-                                          publishedLevels: file.PublishedLevels);
+                    var (onPublished, onAbandoned) = DespillRetryCallbacks(tier, file);
+                    slotTransferred = TryScheduleFlushRetry(tier, file.Path, file.SegId, onPublished, file.PublishedLevels, onAbandoned);
                 }
-                catch (Exception) { /* its callback could not be allocated: nothing started */ }
+                catch (Exception) { /* its callbacks could not be allocated: nothing started */ }
                 if (!slotTransferred)
                     // No retry could be started (out of memory): the block is read from its file again
                     // later instead — the finally queues it — so the tier is given up here, unlisted
@@ -912,7 +931,7 @@ public sealed partial class StorageEngine
                     AbandonDespilledTier(tier, file);
                 return;
             }
-            finally { _flushConcurrency.Release(); }
+            finally { ReleaseHeavyPermit(); }
 
             PublishFlushedTier(written, tier, file.Path, file.SegId);
             DespillPublished(file.SegId, written, afterRetry: false);
@@ -920,20 +939,44 @@ public sealed partial class StorageEngine
         }
         finally
         {
-            unlisted?.Dispose();
+            if (unlisted is not null)
+            {
+                try { unlisted.Dispose(); }
+                catch (Exception) { /* its native memory is lost; the slot still goes back */ }
+            }
             if (!slotTransferred)
             {
                 // Before the slot goes back, so the loop that takes it sees this block as gone, or
                 // as not ready yet.
                 if (settled) SettleSpill(file.SegId);
                 else         RetrySpillLater(file.SegId);
-                _flushSlots.Release();
-                if (counted) EndHeavyPhase();
-                OnFlushSlotReleased();
+                GiveBackSlot(endHeavyPhase: counted);
             }
             Interlocked.Increment(ref _despillsCompleted);
         }
     }
+
+    /// <summary>
+    /// The callbacks a despill hands its flush retry: on publishing, count the block and take it out
+    /// of the queue; on ending without finishing (see <c>FlushRetryOwners</c>), give the tier up and
+    /// queue the block again, as the despill does when no retry starts. Built here so their closure
+    /// is allocated inside the try that hands over: written as lambdas in DespillAsync, their capture
+    /// of the block was allocated on its entry, before any try, and an out-of-memory there left the
+    /// slot the loop took for it held for good.
+    /// </summary>
+    private (Action<List<SegmentInfo>> OnPublished, Action OnAbandoned) DespillRetryCallbacks(HotTierSegment tier, SpillFile file)
+    {
+        _despillRetryCallbacksForTest?.Invoke();
+        return (retried => DespillPublished(file.SegId, retried, afterRetry: true),
+                () =>
+                {
+                    AbandonDespilledTier(tier, file);
+                    RetrySpillLater(file.SegId);
+                });
+    }
+
+    /// <summary>Test seam: runs where a despill's retry callbacks are allocated; throwing from it is that allocation failing.</summary>
+    internal Action? _despillRetryCallbacksForTest;
 
     /// <summary>A despilled block is in segments: counted, out of the queue, and said so.</summary>
     private void DespillPublished(ulong segId, List<SegmentInfo> written, bool afterRetry)

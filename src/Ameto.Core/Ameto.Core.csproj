@@ -31,6 +31,13 @@
     <InternalsVisibleTo Include="Ameto.Ingestion" />
     <InternalsVisibleTo Include="Ameto.Tracing" />
     <InternalsVisibleTo Include="Ameto.Perf" />
+    <!-- OwnerTaskMethodBuilder / OwnerValueTaskMethodBuilder: the async methods that hold a flush
+         slot, the swap lock, a heavy-phase count or a batch's lease across an await are built with
+         them (the storage engine, the log receivers), and their tests fail a first suspension the
+         way an out-of-memory box allocation does. -->
+    <InternalsVisibleTo Include="Ameto.Storage" />
+    <InternalsVisibleTo Include="Ameto.Otel" />
+    <InternalsVisibleTo Include="Ameto.Storage.Tests" />
   </ItemGroup>
 
 </Project>
