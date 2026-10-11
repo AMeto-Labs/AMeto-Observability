@@ -2397,6 +2397,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     SpillWithoutSlot(oldState);
                 return;
             }
+            WriteState? successor = null;
             try
             {
                 // Open the SUCCESSOR first, so the swap installs a complete (tier, WAL)
@@ -2410,8 +2411,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // (under sustained 100k/s load, long enough to overflow the ingest ring
                 // logs then passed through).
                 var (newWal, newSegId) = OpenWalCore();
-                WriteState newState;
-                try { newState = new WriteState(CreateHotTier(), newWal, newSegId); }
+                try { successor = new WriteState(CreateHotTier(), newWal, newSegId); }
                 catch { try { newWal.Delete(); } catch { } throw; }
 
                 reservedSegId = oldState.WalSegId;
@@ -2420,12 +2420,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // writer lock (see InstallSwap for why each of those is where it is). It throws
                 // only before the freeze, and it is the LAST step of this try: the catch below
                 // means "nothing was swapped", and is wrong about anything that runs after it.
-                InstallSwap(newState, oldState.Hot, reservedSegId);
+                InstallSwap(successor, oldState.Hot, reservedSegId);
             }
             catch
             {
                 // Successor could not be built (disk full creating the WAL, native OOM on
-                // the tier): nothing was swapped, so the slot must not stay consumed.
+                // the tier), or not installed: nothing was swapped, so the slot must not stay
+                // consumed — and a successor built but not installed (InstallSwap throws only
+                // before the install) is no one's: its tier is freed and its WAL deleted. It was
+                // left behind, an open 64 MB WAL with its mapping and id block and a tier's
+                // first chunk, at every attempt a request for the swap made.
+                if (successor is not null) DiscardSuccessor(successor);
                 _flushSlots.Release();
                 throw;
             }
@@ -2523,6 +2528,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 OnFlushSlotReleased();
             }
         }
+    }
+
+    /// <summary>
+    /// Frees a successor the swap built and did not install: no writer and no reader ever saw it.
+    /// Never throws — it runs in the catch that gives the slot back.
+    /// </summary>
+    private void DiscardSuccessor(WriteState successor)
+    {
+        try { successor.Hot.Dispose(); }
+        catch (Exception) { /* its native memory is lost; the slot still goes back */ }
+        try { successor.Wal?.Delete(); }
+        catch (Exception) { /* an empty WAL the next start deletes */ }
     }
 
     /// <summary>

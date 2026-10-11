@@ -404,12 +404,25 @@ public sealed partial class StorageEngine
     {
         try
         {
+            if (next is null) _beforeRoomSignalAllocForTest?.Invoke();
             var old = Interlocked.Exchange(ref _roomSignal,
                 next ?? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
             old.TrySetResult();
         }
         catch (Exception) { /* see above: the writers' own re-check covers a lost wake-up */ }
     }
+
+    /// <summary>
+    /// Test hook: the signal a state change wakes the writers with is about to be allocated —
+    /// throwing from it is that allocation running out of memory. Null in production.
+    /// </summary>
+    internal Action? _beforeRoomSignalAllocForTest;
+
+    /// <summary>
+    /// Test hook: the swap is about to give the frozen-tier list room for its tier — throwing from it
+    /// is that growth running out of memory. Null in production.
+    /// </summary>
+    internal Action? _beforeFrozenListGrowForTest;
 
     /// <summary>
     /// Installs <paramref name="next"/> as the write state under <see cref="_writerLock"/> — so no
@@ -450,12 +463,14 @@ public sealed partial class StorageEngine
     /// </summary>
     private void InstallSwap(WriteState next, HotTierSegment frozen, ulong frozenSegId)
     {
+        _beforeRoomSignalAllocForTest?.Invoke();
         var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         EnterWriterLock();
         try
         {
             lock (_frozenLock)
             {
+                _beforeFrozenListGrowForTest?.Invoke();
                 _frozenHot.EnsureCapacity(_frozenHot.Count + 1);
                 frozen.Freeze();
                 Interlocked.Increment(ref _heavyPhases);

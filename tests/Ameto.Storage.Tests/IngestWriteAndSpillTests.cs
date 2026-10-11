@@ -936,6 +936,41 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A swap whose install fails after it built its successor gives the successor back — its tier
+    /// freed, its WAL deleted. The catch that gave the slot back left it behind: an open 64 MB WAL
+    /// with its mapping and id block, and a tier's first chunk, at every attempt a request made.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_whose_install_fails_gives_back_the_successor_it_built()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        string walDir = Path.Combine(dir, "wal");
+        int    armed  = 1;
+        engine._beforeFrozenListGrowForTest = () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) throw new OutOfMemoryException("test: no room to list the frozen tier");
+        };
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => engine.FlushHotTierAsync());
+
+            Assert.Single(Directory.GetFiles(walDir, "*.wal"));   // the live WAL alone: the successor's is gone
+            Assert.Equal(1, engine.LiveHotTier.Count);            // nothing was swapped
+            Assert.True(TryWriteOne(engine, 1));
+
+            await engine.FlushHotTierAsync();                     // the next swap installs
+            Assert.Equal(2, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._beforeFrozenListGrowForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A swap that failed asks for itself again. It used to be asked for again only by a writer that
     /// came back to find the tier still refusing — so once the requests had given up (503), nothing
     /// did, and the tier went on refusing after the failure had cleared, until MaxAge.
