@@ -208,7 +208,10 @@ public sealed class LogWriteBatch : IDisposable
     /// </summary>
     public void Dispose()
     {
-        Volatile.Write(ref _disposeDeferred, 1);
+        // A full fence, not a volatile write: the read of the leases below must not pass the store,
+        // or this and an EndLease racing it each read the other's old value — this a lease still held,
+        // that no dispose asked — and neither gives the arrays and the reservation back, for good.
+        Interlocked.Exchange(ref _disposeDeferred, 1);
         if (Volatile.Read(ref _leases) == 0 && Interlocked.Exchange(ref _disposeDeferred, 0) == 1)
             DisposeCore();
     }
