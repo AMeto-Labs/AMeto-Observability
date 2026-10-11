@@ -210,11 +210,14 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
     [Fact]
     public async Task SinkFault_EscapingTheHandler_StillReturnsItsBuffer()
     {
-        // One event over the 64 KB per-event limit sends the sink down its warning path, and the
-        // logger there throws: a server fault, which leaves the handler rather than answering 400.
-        var ctx = Post(new MemoryStream(OversizedEventBatch()), declaredLength: null, fixLength: true);
+        // The sink underneath throws as it stages the event: a server fault, which leaves the handler
+        // rather than answering 400. (It used to be the drop Warning's logger, which the sink called as
+        // it staged an oversized event; that line is written with the answer now, and guarded.)
+        var ctx      = Post(new MemoryStream(OversizedEventBatch()), declaredLength: null, fixLength: true);
+        var endpoint = Endpoint();
+        endpoint.BeforeStageForTest = () => throw new InvalidOperationException("sink fault: a dependency under TryIngestClef failed");
 
-        var (thrown, ledger) = await DriveAsync(Endpoint(new ThrowingLogger()), ctx);
+        var (thrown, ledger) = await DriveAsync(endpoint, ctx);
 
         Assert.IsType<InvalidOperationException>(thrown);
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
@@ -411,15 +414,6 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-    }
-
-    private sealed class ThrowingLogger : ILogger<IngestionEndpoint>
-    {
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
-                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-            => throw new InvalidOperationException("sink fault: the logger under TryIngestClef failed");
     }
 }
 

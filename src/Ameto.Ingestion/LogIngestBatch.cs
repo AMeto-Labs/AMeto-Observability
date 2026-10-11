@@ -53,7 +53,14 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>The markers are in <see cref="_staged"/>, after the client's events.</summary>
     private bool _sealed;
 
-    private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template, string? Service);
+    private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template, string? Service,
+                                                OversizedDrop Drop);
+
+    /// <summary>An event refused at the door, as the line that names it says: its properties' size, its sender's service and its template.</summary>
+    internal readonly record struct OversizedDrop(int PayloadBytes, string Service, string Template);
+
+    /// <summary>The drop the <paramref name="index"/>-th marker stands in for.</summary>
+    internal OversizedDrop DropAt(int index) => _markers![index].Drop;
 
     /// <summary>What a staged marker holds besides its payload: its writer's buffer slack, its list slot.</summary>
     private const int MarkerOverheadBytes = 1024;
@@ -264,13 +271,13 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// </summary>
     internal void AddMarker(long tsTicks, byte level, int templateIdx, string template,
                             ReadOnlyMemory<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx,
-                            string? service = null)
+                            string? service, OversizedDrop drop)
     {
         System.Diagnostics.Debug.Assert(!_sealed, "a marker staged after the batch was committed");
-        Charge(MarkerOverheadBytes + payload.Length + StringBytes(service));
+        Charge(MarkerOverheadBytes + payload.Length + StringBytes(service) + StringBytes(drop.Service) + StringBytes(drop.Template));
         _staged.ReserveTail(payload.Length);
         (_markers ??= []).Add(new StagedMarker(
-            Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, service));
+            Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, service, drop));
     }
 
     private static LogEventHeader Header(long tsTicks, byte level, int templateIdx,

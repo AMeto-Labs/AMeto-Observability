@@ -328,15 +328,23 @@ public sealed class IngestionEndpoint
 
     /// <summary>
     /// The oversized-drop Warning is written at most once in this long; the drops in between are
-    /// counted into the next one. It is logged as each attempt is decoded, and a batch answered 503
-    /// is decoded again by every retry: one oversized event in a batch retried each second for a
-    /// minute wrote sixty Warnings, and a producer sending oversized events in bulk wrote one per
-    /// event. Internal, so a test that injects its fault through that log call can lift the limit.
+    /// counted into the next one. It is written with the answer that ends a request (a 503 is
+    /// staged again by its retry, which is not a new drop), so the count is of drops, not of
+    /// attempts; a producer sending oversized events in bulk wrote one line per event. A drop whose
+    /// marker the store had no room for is named whatever this says (see LogOversizedDrops).
+    /// Internal, so a test that injects its fault through that log call can lift the limit.
     /// </summary>
     internal TimeSpan OversizedWarningInterval { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>The clock <see cref="OversizedWarningInterval"/> is measured by; a test's own moves only when it says.</summary>
     internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>
+    /// Test seam: runs as each record is staged, before anything of it is; throwing from it is the
+    /// decode itself running out of memory — the server's failure, answered 503 (gRPC UNAVAILABLE)
+    /// with nothing written. Null in production.
+    /// </summary>
+    internal Action? BeforeStageForTest { get; set; }
 
     /// <summary>The <see cref="Clock"/> timestamp from which the next Warning may be written.</summary>
     private long _oversizedWarnFrom = long.MinValue;
@@ -429,18 +437,48 @@ public sealed class IngestionEndpoint
         // of them. A batch of nothing but markers is never busy. No retry could store any of its
         // events — it could only send them again, each one over the size limit, to write the
         // markers — so it is answered for good, and a marker the store had no room for is not
-        // written (the Warning that named the drop is in the server's log either way).
+        // written: the drop is then named in a Warning of its own (LogOversizedDrops, below).
         bool busy = r.Written == 0 && clientUnsent > 0;
 
         // Events refused at the door are COUNTED by the answer that ends the request: a 503 is
         // staged again by its retry, and one oversized event in a batch retried each second for
-        // three minutes read as ~180 drops. A 400 (malformed) is final whatever the store did.
-        // (Their Warning stays where it is, logged as each attempt is decoded, at most once a second
-        // — see TakeOversizedWarning: a log call that runs out of memory there is the server's
-        // failure, answered 503 before anything is written — #126's F3 — where one after the write
-        // would make a written batch a 500.)
-        if (!busy || batch.Malformed) Interlocked.Add(ref _droppedOversized, batch.DroppedAtDoor);
+        // three minutes read as ~180 drops. A 400 (malformed) is final whatever the store did. The
+        // lines that name them are written here too, for the same reason: logged as each attempt was
+        // decoded, a retried batch wrote one per attempt, and the count of drops in the next line
+        // counted attempts (~170 for 20 drops). Guarded: a line that runs out of memory after the
+        // write must not make a written batch a 500.
+        if (!busy || batch.Malformed)
+        {
+            Interlocked.Add(ref _droppedOversized, batch.DroppedAtDoor);
+            if (batch.MarkerCount > 0) LogOversizedDrops(batch, markersWritten);
+        }
         return new LogIngestResult(ingested, dropped, busy);
+    }
+
+    /// <summary>
+    /// Names the events a finally answered request dropped at the door. A drop whose marker was
+    /// written is named at most once a second (its marker names it on the Events page); one whose
+    /// marker the store had no room for, after the client's own events, is ALWAYS named — this line
+    /// is the only record of it, and suppressing it with the rest left a drop no one could find.
+    /// Never throws.
+    /// </summary>
+    private void LogOversizedDrops(LogIngestBatch batch, int markersWritten)
+    {
+        try
+        {
+            for (int i = 0; i < batch.MarkerCount; i++)
+            {
+                var drop = batch.DropAt(i);
+                if (i >= markersWritten)
+                    _logger.LogWarning(
+                        "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\"); " +
+                        "the store had no room for its marker after the batch's own events, so this line is the only record of it",
+                        drop.PayloadBytes, _maxEventPayloadBytes, drop.Service, drop.Template);
+                else if (TakeOversizedWarning(out int skipped))
+                    LogOversizedDrop(drop.PayloadBytes, drop.Service, drop.Template, skipped);
+            }
+        }
+        catch (Exception) { /* the lines are lost; the answer is not */ }
     }
 
     // ── POST /api/events (CLEF) ───────────────────────────────────────────────
@@ -715,6 +753,7 @@ public sealed class IngestionEndpoint
         ReadOnlySpan<byte> serviceUtf8,
         int serviceIdx)
     {
+        BeforeStageForTest?.Invoke();
         // The service name belongs to the resourceLogs block, not the record: when the
         // parser has already interned it, every record under that block skips the
         // UTF-8 decode + hash that used to run once per record. A full pool answers -1 with the
@@ -734,21 +773,18 @@ public sealed class IngestionEndpoint
             // the server's own log. Marked DroppedBy=server to distinguish it from
             // the client sink's own oversized marker.
             //
-            // Cold path, one per dropped event: the strings are worth their cost. The log line
-            // is the one that names the producer, as TryIngest and TryIngestClef do. The service
-            // comes from the span when the caller passed one, else from the pool: a parser that
-            // interned the block's service.name once may hand over only the index. The drop is
-            // COUNTED when the batch is answered (CommitAsync), once, not per attempt, and the
-            // Warning is written at most once a second (TakeOversizedWarning).
+            // Cold path, one per dropped event: the strings are worth their cost. The log line that
+            // names the producer is written with the answer that ends the request (CommitAsync):
+            // the drop is counted there, once, not per attempt, and a drop whose marker the store
+            // had no room for is always named there. The service comes from the span when the
+            // caller passed one, else from the pool: a parser that interned the block's
+            // service.name once may hand over only the index.
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            if (TakeOversizedWarning(out int skipped))
-            {
-                string svcStr = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
-                              : serviceIdx >= 0      ? _pool.Get(serviceIdx)
-                              : string.Empty;
-                LogOversizedDrop(msgpackProps.Length, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120), skipped);
-            }
-            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx, service);
+            string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
+                            : serviceIdx >= 0      ? _pool.Get(serviceIdx)
+                            : string.Empty;
+            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx, service,
+                                  new LogIngestBatch.OversizedDrop(msgpackProps.Length, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120)));
             return false; // original counted as dropped by the caller
         }
 
@@ -786,21 +822,20 @@ public sealed class IngestionEndpoint
         ulong traceHi, ulong traceLo, ulong spanId,
         ReadOnlySpan<byte> serviceUtf8)
     {
+        BeforeStageForTest?.Invoke();
         if (msgpackProps.Length > _maxEventPayloadBytes)
         {
-            // Cold path: the strings here are worth their cost — this is one log line and
-            // one marker event per dropped event, not per event. The drop is COUNTED when the
-            // batch is answered (CommitAsync), once, not per attempt, and the Warning is written
-            // at most once a second (TakeOversizedWarning).
+            // Cold path: the strings here are worth their cost — this is one marker event per
+            // dropped event, not per event. The drop is COUNTED, and the line that names it written,
+            // with the answer that ends the request (CommitAsync), as in StageRaw.
             string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
 
-            if (TakeOversizedWarning(out int skipped))
-                LogOversizedDrop(msgpackProps.Length, svcStr ?? "(none)", Truncate(tmplStr, 120), skipped);
             int markerSvcIdx = svcStr is not null ? _pool.Intern(svcStr) : -1;
             StageServerDropMarker(
                 batch, tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
-                markerSvcIdx, markerSvcIdx < 0 ? svcStr : null);
+                markerSvcIdx, markerSvcIdx < 0 ? svcStr : null,
+                new LogIngestBatch.OversizedDrop(msgpackProps.Length, svcStr ?? "(none)", Truncate(tmplStr, 120)));
             return false;
         }
 
@@ -837,7 +872,8 @@ public sealed class IngestionEndpoint
     private void StageServerDropMarker(
         LogIngestBatch batch,
         long tsTicks, byte originalLevel, string originalTemplate,
-        int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx, string? service)
+        int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx, string? service,
+        LogIngestBatch.OversizedDrop drop)
     {
         const int MaxTemplateChars = 256;
         string origTmpl  = originalTemplate.Length <= MaxTemplateChars ? originalTemplate : originalTemplate[..MaxTemplateChars];
@@ -855,7 +891,7 @@ public sealed class IngestionEndpoint
 
         int mtIdx = _pool.Intern(DropMarkerTemplate);
         batch.AddMarker(tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
-                        buf.WrittenMemory, traceHi, traceLo, spanId, serviceIdx, service);
+                        buf.WrittenMemory, traceHi, traceLo, spanId, serviceIdx, service, drop);
     }
 
     /// <summary>
