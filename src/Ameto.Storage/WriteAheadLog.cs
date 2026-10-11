@@ -392,6 +392,20 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // keeps it — goes into the entry itself (v6 InlineService). With none given, no service.
         bool   hasService    = (uint)serviceIndex <= ushort.MaxValue;
         ushort svcIndex      = hasService ? (ushort)serviceIndex : (ushort)0;
+        if (hasService && !_savedPoolRows[svcIndex])
+        {
+            // A pooled service no row can hold whole (past 65 535 bytes) is carried in the entry, as an
+            // unpooled one is: a row used to be written cut, and the service replayed cut — and a
+            // template at the same index (templates and services share the pool) was then taken for
+            // carried by that row, and replayed cut where the entry would have carried it whole. The
+            // index is marked long, so the template path carries its text too.
+            byte state = Volatile.Read(ref _longTemplates[svcIndex]);
+            if (state != 0 || !FitsPoolRow(service))
+            {
+                if (state == 0) Volatile.Write(ref _longTemplates[svcIndex], LongTemplateUnlogged);
+                hasService = false;
+            }
+        }
         if (hasService) EnsurePoolRow(svcIndex, service);
         bool   inlineService = !hasService && !string.IsNullOrEmpty(service);
         int    serviceBytes  = inlineService ? Encoding.UTF8.GetByteCount(service!) : 0;

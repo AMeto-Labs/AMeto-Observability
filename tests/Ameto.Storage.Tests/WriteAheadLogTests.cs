@@ -249,6 +249,38 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// R5-3. Templates and services share the pool, so one text can be both. A pooled SERVICE too long
+    /// for a row was written to a row cut at 65 535 bytes: the service replayed cut, and when the same
+    /// text came next as a template, its index already had a row — so its entry was taken for carried
+    /// by it, and the template replayed cut too (or with no text). A text no row can hold is now carried
+    /// in the entry whichever it is used as, and gets no row.
+    /// </summary>
+    [Fact]
+    public void A_text_too_long_for_a_row_used_as_a_service_and_then_as_a_template_comes_back_whole_as_both()
+    {
+        string path     = NewWalPath();
+        string longText = new string('é', 40_000) + " {n}";   // 80 004 UTF-8 bytes
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 7, "short {n}", [0xA1], serviceIndex: 9, service: longText);
+                wal.Append(2_000, LogLevel.Information, 9, longText,    [0xB1]);
+                wal.Append(3_000, LogLevel.Information, 9, longText,    [0xC1], serviceIndex: 9, service: longText);
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(3, entries.Count);
+            Assert.Equal(longText, entries[0].Service);
+            Assert.Equal(longText, entries[1].Template);
+            Assert.Equal(longText, entries[2].Template);
+            Assert.Equal(longText, entries[2].Service);
+            Assert.DoesNotContain((ushort)9, WriteAheadLog.LoadPool(path + ".pool").Keys);   // no row cut short
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// A log that cannot be opened — here its pre-size is more than any disk has — leaves nothing
     /// behind. It used to leave a 0-byte file, its FileStream open until finalisation: on a full
     /// disk, one per attempt to open a spill file or the next live WAL.
