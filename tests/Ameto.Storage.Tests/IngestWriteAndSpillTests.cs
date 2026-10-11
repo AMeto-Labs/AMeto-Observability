@@ -1029,6 +1029,124 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>A block an earlier run spilled: <paramref name="count"/> events from <paramref name="from"/>.</summary>
+    private static void EarlierRunSpill(ServerOptions opts, string dir, ulong block, int from, int count)
+    {
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}{StorageEngine.SpillExtension}");
+        using var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(block), 1 << 20);
+        for (int i = from; i < from + count; i++)
+            wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                       serviceIndex: 41, service: "spill.svc");
+    }
+
+    /// <summary>
+    /// R4-3. One transient swap failure, spilling off: the despill does not take the free slot (for a
+    /// whole block), and the writers waiting are written once the swap installs at its first retry, a
+    /// re-check interval later. The despill took the slot at the first failure while the writers were
+    /// held back a fixed second: (0, 0, 10) after ~2 s, while the swap would have installed. It takes
+    /// the slot once failures persist — three in a row — or when a spill can take the writers.
+    /// </summary>
+    [Fact]
+    public async Task One_transient_swap_failure_leaves_the_slot_to_the_swap_and_the_writers_are_written()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        using var despillGate = new ManualResetEventSlim(false);
+        int failing = 1, failures = 0;
+        engine._beforeSwap = () =>
+        {
+            if (Volatile.Read(ref failing) == 1)
+            {
+                Interlocked.Increment(ref failures);
+                throw new IOException("test: a transient failure creating the next WAL");
+            }
+        };
+        engine._beforeLoadSpillForTest = _ => despillGate.Wait(HangGuard);   // a despill that took the slot keeps it
+        engine._roomRecheckMs  = 500;                       // the swap's first retry half a second after its failure
+        engine._swapRetryDelay = TimeSpan.FromSeconds(2);
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
+            WaitFor(() => Volatile.Read(ref failures) >= 1 && engine.LiveHotTierRefused, "the swap to fail");
+
+            Volatile.Write(ref failing, 0);   // transient: the next attempt installs
+            hold.SetResult();                  // the despill loop starts, the only slot free
+            using (var b = Batch(engine, TierEvents + 1, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, TimeSpan.FromSeconds(4)));
+            Assert.Equal(1, Volatile.Read(ref failures));
+        }
+        finally
+        {
+            despillGate.Set();
+            hold.TrySetResult();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R4-6. A slot coming free gives a swap that failed the first go at it: what it failed on may have
+    /// cleared. Two queued blocks, a spill to take the writers, a swap that failed: the despill takes
+    /// the free slot for the first block (a spill can take the writers), and when that slot comes free
+    /// the swap installs before the second block's despill starts — though the swap is slow to reach
+    /// the slot, and the despill loop is already there. Unpinned until now: a mutant that left the
+    /// failure standing passed every test.
+    /// </summary>
+    [Fact]
+    public async Task A_slot_a_despill_frees_goes_to_the_swap_that_failed_before_the_next_block()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+        EarlierRunSpill(opts, dir, 9_006, 200_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        engine._roomRecheckMs  = (int)HangGuard.TotalMilliseconds;   // no retry of the swap's own: only a freed slot asks
+        engine._swapRetryDelay = HangGuard;
+        var order   = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        int failing = 1;
+        engine._beforeSwap = () =>
+        {
+            if (Volatile.Read(ref failing) == 1) throw new IOException("test: a failure creating the next WAL");
+            Thread.Sleep(300);   // the swap is slow to reach the slot: a despill loop that did not yield would take it
+        };
+        engine._beforeFrozenListGrowForTest = () => order.Enqueue("swap");   // installing: it has the slot
+        engine._beforeLoadSpillForTest      = segId => order.Enqueue($"despill {segId}");
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
+            WaitFor(() => engine.LiveHotTierRefused, "the full tier to refuse a write");
+
+            Volatile.Write(ref failing, 0);
+            hold.SetResult();
+            WaitFor(() => order.Count >= 3, "both despills and the swap", ShortGuard);
+            Assert.Equal(new[] { "despill 9000", "swap", "despill 9006" }, order.Take(3));
+        }
+        finally
+        {
+            hold.TrySetResult();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
     /// <summary>
     /// A swap whose install fails after it built its successor gives the successor back — its tier
     /// freed, its WAL deleted. The catch that gave the slot back left it behind: an open 64 MB WAL
