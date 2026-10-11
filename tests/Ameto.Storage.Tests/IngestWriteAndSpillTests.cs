@@ -1771,6 +1771,51 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Ma, its second half: a request queued for the writer lock sees its cancellation. It blocked
+    /// in Enter until the holder let go — behind a holder stuck in a collection, a client long gone
+    /// kept its thread and its batch. Cancelled while another write holds the lock, it stops within
+    /// a slice, having written nothing.
+    /// </summary>
+    [Fact]
+    public async Task A_request_queued_for_the_writer_lock_stops_when_it_is_cancelled()
+    {
+        var engine = Engine(Options(NewDir()));
+        using var entered = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        int calls = 0;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref calls) != 1) return;
+            entered.Set();
+            release.Wait(HangGuard);   // the first write holds the writer lock until the test lets go
+        };
+        using var holder = Batch(engine, 0, 1);
+        using var queued = Batch(engine, 1, 5);
+        using var cts    = new CancellationTokenSource();
+        Task<LogBatchWriteResult>? held = null;
+        try
+        {
+            held = Task.Run(async () => await engine.WriteBatchAsync(holder, HangGuard));
+            Assert.True(entered.Wait(HangGuard), "the first write never took the lock");
+
+            var waiting = Task.Run(async () => await engine.WriteBatchAsync(queued, HangGuard, cts.Token));
+            await Task.Delay(100);   // at the lock (a request cancelled before it gets there stops the same way)
+            cts.Cancel();
+
+            var r = await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new LogBatchWriteResult(0, 0, 5), r);
+            Assert.False(held.IsCompleted);   // the holder still has the lock: the queued request did not wait it out
+        }
+        finally
+        {
+            release.Set();
+            if (held is not null) await held.WaitAsync(HangGuard);
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// R1a-4. The pause after a fault doubles with each fault IN A ROW; a write that lands between
     /// them ends the row. The count used to be reset only by a faulting run that had written first,
     /// so a fault after a run that wrote everything doubled a stale count (806 ms measured where 100
