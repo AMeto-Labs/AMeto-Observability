@@ -716,6 +716,30 @@ public sealed partial class StorageEngine
 
     /// <summary>Test hook: the despills that have completed, including those that found nothing to write.</summary>
     internal int DespillsCompletedForTest => Volatile.Read(ref _despillsCompleted);
+
+    /// <summary>Test hook: the tiers listed as frozen — swapped or despilled, not yet published.</summary>
+    internal int FrozenTierCountForTest { get { lock (_frozenLock) return _frozenHot.Count; } }
+
+    /// <summary>
+    /// Gives up a despilled tier whose flush failed and whose retry could not be started: unlisted,
+    /// retired (freed once no reader holds it), and the levels its attempt moved into place unlinked
+    /// (those an earlier run published kept), so the block's next despill, from its file, starts clean.
+    /// Never throws; the caller's finally gives the slot back, ends the heavy phase and requeues the block.
+    /// </summary>
+    private void AbandonDespilledTier(HotTierSegment tier, SpillFile file)
+    {
+        try
+        {
+            lock (_frozenLock)
+                for (int i = _frozenHot.Count - 1; i >= 0; i--)
+                    if (ReferenceEquals(_frozenHot[i].Tier, tier)) _frozenHot.RemoveAt(i);
+        }
+        catch (Exception) { /* not listed */ }
+        try { RetireHotTier(tier); }
+        catch (Exception) { /* its native memory is lost */ }
+        try { DeleteUnpublishedLevelFiles(file.SegId, file.PublishedLevels); }
+        catch (Exception) { /* the next attempt's flush overwrites them */ }
+    }
     private int _despillsCompleted;
 
     /// <summary>
@@ -789,15 +813,33 @@ public sealed partial class StorageEngine
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex,
-                    "Despill of {File} failed — its tier stays frozen and queryable; retrying in background every {Delay}s",
-                    file.Path, FlushRetryDelay.TotalSeconds);
-                // Owns the slot and the count from here; the block stays queued, in flight, until the
-                // retry publishes it — or shutdown leaves it for the next start.
-                ScheduleFlushRetry(tier, file.Path, file.SegId,
-                                   onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
-                                   publishedLevels: file.PublishedLevels);
-                slotTransferred = true;
+                // Nothing in here may throw past the hand-over: the tier is listed and counted, and a
+                // throw out of this catch — its own log line, which allocates — reached the finally
+                // below, which gave the slot back, ended the heavy phase and queued the block again,
+                // leaving the tier listed for good, served beside the block's second despill.
+                try
+                {
+                    _logger.LogError(ex,
+                        "Despill of {File} failed — its tier stays frozen and queryable; retrying in background every {Delay}s",
+                        file.Path, FlushRetryDelay.TotalSeconds);
+                }
+                catch (Exception) { /* the line is lost; the hand-over below is not */ }
+                try
+                {
+                    // Owns the slot and the count from here; the block stays queued, in flight, until the
+                    // retry publishes it — or shutdown leaves it for the next start.
+                    ScheduleFlushRetry(tier, file.Path, file.SegId,
+                                       onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
+                                       publishedLevels: file.PublishedLevels);
+                    slotTransferred = true;
+                }
+                catch (Exception)
+                {
+                    // No retry could be started (out of memory): the block is read from its file again
+                    // later instead — the finally queues it — so the tier is given up here, unlisted
+                    // and retired, with the levels the attempt moved into place, as the retry would.
+                    AbandonDespilledTier(tier, file);
+                }
                 return;
             }
             finally { _flushConcurrency.Release(); }

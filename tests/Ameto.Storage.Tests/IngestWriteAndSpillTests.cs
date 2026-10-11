@@ -1315,6 +1315,56 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A despill whose flush fails hands its tier, slot and heavy phase to the flush retry — even when
+    /// the line that says so throws. The throw left the catch before the hand-over: the finally gave
+    /// the slot back, ended the heavy phase and queued the block again, so the tier stayed listed as
+    /// frozen for good (its native memory held, its events served beside the block's second despill).
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_flush_fails_hands_its_tier_to_the_retry_even_when_its_error_line_throws()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.Contains("its tier stays frozen", StringComparison.Ordinal));
+        var    engine = OneSlotEngine(Options(dir), logger);
+        var    gate   = HoldFirstFlush(engine);
+        engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+        engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling);
+
+            // The despill's flush fails once, after its first level.
+            int despilling = 0, failed = 0;
+            engine._beforeLoadSpillForTest = _ => Volatile.Write(ref despilling, 1);
+            var parkFirst = engine._afterLevelPublished;
+            engine._afterLevelPublished = level =>
+            {
+                parkFirst?.Invoke(level);
+                if (Volatile.Read(ref despilling) == 1 && Interlocked.Exchange(ref failed, 1) == 0)
+                    throw new IOException("test: the despill's flush fails after a level");
+            };
+
+            gate.Set();
+            WaitFor(() => logger.Thrown > 0, "the despill's error line to throw");
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents
+                       && engine.HeavyPhasesInFlight == 0,
+                    "the block to be despilled and every heavy phase to end", ShortGuard);
+
+            Assert.Equal(0, engine.FrozenTierCountForTest);   // no tier left listed
+            await engine.FlushHotTierAsync();
+            Assert.Equal(Total, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     /// <summary>Every line, with its level.</summary>
     private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
     {
