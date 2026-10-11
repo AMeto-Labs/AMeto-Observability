@@ -281,7 +281,8 @@ public static class OtlpEndpointMapper
                 }
                 if (result.Busy)
                 {
-                    // Nothing written for want of room: the exporter retries, and duplicates nothing.
+                    // Nothing of the batch written for want of room — its drop markers go in after its
+                    // records, so none of those either: the exporter retries, and duplicates nothing.
                     WriteRetryLater(ctx, LogStoreBusyMessage);
                     return;
                 }

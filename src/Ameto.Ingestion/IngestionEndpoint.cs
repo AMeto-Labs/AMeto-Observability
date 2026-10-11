@@ -72,9 +72,11 @@ public interface IOtlpLogSink
 ///   413 Payload Too Large, no body, above <see cref="IngestionOptions.MaxBatchBytes"/>
 ///   503 Service Unavailable, Retry-After { "ingested": 0, "dropped": M }
 ///          The store had no room for any of the client's events within
-///          <see cref="IngestionOptions.BackPressureWait"/>, or is shutting down. None of them
-///          was written, so a retry duplicates none (a drop marker standing in for an event over
-///          the size limit may have been, and the retry writes it again).
+///          <see cref="IngestionOptions.BackPressureWait"/>, writing into it kept failing for
+///          that long, or it is shutting down. Nothing of the batch was written — the drop
+///          markers standing in for events over the size limit go in after the client's own
+///          events — so a retry duplicates nothing. A batch of nothing but events over the size
+///          limit is answered 200, never 503: no retry could store any of them.
 ///   500 A fault in the server underneath (intern pool, logger). It leaves the handler and
 ///          hosting answers it; see IsMalformedPayload.
 /// </summary>
@@ -156,7 +158,9 @@ public sealed class IngestionEndpoint
     /// </summary>
     internal async ValueTask<LogIngestResult> CommitAsync(LogIngestBatch batch, CancellationToken ct)
     {
-        var staged = batch.Staged;
+        // The drop markers join the batch now, AFTER every one of the client's events: a write that
+        // stops before the first of the client's events then stops before every marker too.
+        var staged = batch.Seal();
         if (staged.Count == 0)
             return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
 
@@ -170,19 +174,21 @@ public sealed class IngestionEndpoint
         int markersWritten = batch.MarkersBefore(processed);
         int markersUnsent  = batch.MarkerCount - markersWritten;
         int ingested       = r.Written - markersWritten;
-        int dropped        = batch.DroppedAtDoor + r.Refused + (r.NotWritten - markersUnsent);
+        int clientUnsent   = r.NotWritten - markersUnsent;
+        int dropped        = batch.DroppedAtDoor + r.Refused + clientUnsent;
 
         if (r.NotWritten > 0)
             _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
                 r.NotWritten, staged.Count, _backPressureWait);
 
-        // None of the CLIENT's events written for want of room: the caller answers "retry later",
-        // which duplicates none of them. Asked of `ingested`, not of r.Written: a batch whose first
-        // event was refused at the door had its drop marker written and then found no room, and
-        // r.Written == 1 answered that 200 with every one of the client's records dropped, a
-        // partial success no client retries. A marker written here is written again by the retry
-        // — a second breadcrumb for the same refusal, against the client's records lost.
-        bool busy = ingested == 0 && r.NotWritten > 0;
+        // Nothing written, and some of the client's events were waiting: the caller answers "retry
+        // later", and the retry duplicates nothing. Nothing at all, markers included: they come
+        // after the client's events, so a write that stopped before the first of those wrote none
+        // of them. A batch of nothing but markers is never busy. No retry could store any of its
+        // events — it could only send them again, each one over the size limit, to write the
+        // markers — so it is answered for good, and a marker the store had no room for is not
+        // written (the Warning that named the drop is in the server's log either way).
+        bool busy = r.Written == 0 && clientUnsent > 0;
 
         // Events refused at the door are COUNTED by the answer that ends the request: a 503 is
         // staged again by its retry, and one oversized event in a batch retried each second for
@@ -547,7 +553,7 @@ public sealed class IngestionEndpoint
 
         int mtIdx = _pool.Intern(DropMarkerTemplate);
         batch.AddMarker(tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
-                        buf.WrittenSpan, traceHi, traceLo, spanId, serviceIdx);
+                        buf.WrittenMemory, traceHi, traceLo, spanId, serviceIdx);
     }
 
     /// <summary>

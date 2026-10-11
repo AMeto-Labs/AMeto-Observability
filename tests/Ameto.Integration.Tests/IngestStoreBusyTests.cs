@@ -53,30 +53,20 @@ public sealed class IngestStoreBusyTests : IDisposable
     }
 
     /// <summary>
-    /// "Nothing written" is about the CLIENT's events. A batch whose first event is over the size
-    /// limit has a drop marker staged in its place, and the marker is written like any event; when
-    /// the store then takes nothing more, r.Written was 1 and the batch was answered 200 with every
-    /// one of the client's records dropped — a partial success no client retries. It is a 503.
+    /// The drop markers are written AFTER the client's events. A batch whose first event is over the
+    /// size limit used to have its marker staged in that event's place, so a store with room for one
+    /// event took the marker and none of the client's records: the request was answered 503 although
+    /// something was written, and the retry wrote the Error marker again. The store's one event is
+    /// now the client's first record, and the answer a partial 200, as for any batch the store ran
+    /// out of room part way through.
     /// </summary>
     [Fact]
-    public async Task A_batch_of_which_only_a_drop_marker_was_written_is_answered_503_not_200()
+    public async Task A_store_with_room_for_one_event_takes_the_clients_first_record_not_its_drop_marker()
     {
-        Directory.CreateDirectory(_dir);
-        var opts = new ServerOptions
-        {
-            DataDirectory = _dir,
-            Ingestion     = new IngestionOptions { MaxEventPayloadBytes = 64, BackPressureWait = TimeSpan.FromMilliseconds(100) },
-        };
-        await using var storage = new StorageEngine(
-            Microsoft.Extensions.Options.Options.Create(opts),
-            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance);
-        int writes = 0;
-        storage._afterWriteGate = () =>
-        {
-            // The store takes the marker, then nothing: each later write fails, and is retried until the wait runs out.
-            if (Interlocked.Increment(ref writes) >= 2) throw new OutOfMemoryException("test: no room after the marker");
-        };
+        var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var written = CaptureWrites(storage);
+        TakeOnly(storage, events: 1);   // then each write fails, and is retried until the wait runs out
         try
         {
             var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
@@ -84,14 +74,76 @@ public sealed class IngestStoreBusyTests : IDisposable
 
             await endpoint.HandleAsync(ctx);
 
-            Assert.Equal(StatusCodes.Status503ServiceUnavailable, ctx.Response.StatusCode);
-            ctx.Response.Body.Position = 0;
-            using var doc = JsonDocument.Parse(ctx.Response.Body);
-            Assert.Equal(0, doc.RootElement.GetProperty("ingested").GetInt32());
-            Assert.Equal(4, doc.RootElement.GetProperty("dropped").GetInt32());   // the oversized one, and the three not written
-            Assert.Equal(1, endpoint.AcceptedTotal);                               // the marker
+            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+            var (ingested, dropped) = Counts(ctx);
+            Assert.Equal(1, ingested);
+            Assert.Equal(3, dropped);                     // the oversized one, and the two the store had no room for
+            Assert.Equal(new[] { "busy probe {i}" }, written);   // the client's record — no drop marker
+            Assert.Equal(1, endpoint.DroppedOversized);   // a 200 ends the request: counted
         }
         finally { storage._afterWriteGate = null; }
+    }
+
+    /// <summary>
+    /// A batch of nothing but events over the size limit is answered for good — a 200 with every
+    /// one dropped — however much room the store had. No retry could store any of its events, only
+    /// send them again, each over the limit, to write the markers. It was a 503 whenever a marker
+    /// was left unwritten, the one already written included (then written again by the retry).
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task A_batch_of_nothing_but_events_over_the_size_limit_is_answered_200_whatever_the_store_took(int room)
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var written = CaptureWrites(storage);
+        TakeOnly(storage, events: room);
+        try
+        {
+            var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+            var ctx      = Post(ClefOversizedOnly(2));
+
+            await endpoint.HandleAsync(ctx);
+
+            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+            var (ingested, dropped) = Counts(ctx);
+            Assert.Equal(0, ingested);
+            Assert.Equal(2, dropped);
+            Assert.Equal(room, written.Count);            // the markers there was room for
+            Assert.Equal(2, endpoint.DroppedOversized);
+        }
+        finally { storage._afterWriteGate = null; }
+    }
+
+    /// <summary>
+    /// The promise end to end: a store that takes none of a batch with an event over the size limit
+    /// writes nothing of it — not its drop marker either — and answers 503; the retry, with room,
+    /// writes the client's records and the marker once each.
+    /// </summary>
+    [Fact]
+    public async Task A_503_wrote_nothing_and_its_retry_writes_the_drop_marker_once()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var written  = CaptureWrites(storage);
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+
+        TakeOnly(storage, events: 0);
+        var refused = Post(ClefOversizedFirst(2));
+        try { await endpoint.HandleAsync(refused); }
+        finally { storage._afterWriteGate = null; }
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, refused.Response.StatusCode);
+        Assert.Empty(written);
+
+        var retried = Post(ClefOversizedFirst(2));
+        await endpoint.HandleAsync(retried);
+
+        Assert.Equal(StatusCodes.Status200OK, retried.Response.StatusCode);
+        Assert.Equal((2, 1), Counts(retried));
+        Assert.Equal(1, written.Count(t => t.Contains("dropped an oversized log event", StringComparison.Ordinal)));
+        Assert.Equal(3, written.Count);
     }
 
     /// <summary>
@@ -135,6 +187,62 @@ public sealed class IngestStoreBusyTests : IDisposable
         await accepting.HandleAsync(last);
         Assert.Equal(StatusCodes.Status200OK, last.Response.StatusCode);
         Assert.Equal(1, accepting.DroppedOversized);
+    }
+
+    private ServerOptions Options(TimeSpan backPressureWait)
+    {
+        Directory.CreateDirectory(_dir);
+        return new ServerOptions
+        {
+            DataDirectory = _dir,
+            Ingestion     = new IngestionOptions { MaxEventPayloadBytes = 64, BackPressureWait = backPressureWait },
+        };
+    }
+
+    private static StorageEngine Engine(ServerOptions opts) => new(
+        Microsoft.Extensions.Options.Options.Create(opts),
+        new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+        NullLogger<StorageEngine>.Instance);
+
+    /// <summary>The templates of the events the store writes, in the order it writes them.</summary>
+    private static List<string> CaptureWrites(StorageEngine storage)
+    {
+        var written = new List<string>();
+        storage.EventWritten = (_, template) => { lock (written) written.Add(template); };
+        return written;
+    }
+
+    /// <summary>The store takes <paramref name="events"/> more events, then fails every write — retried until the wait runs out.</summary>
+    private static void TakeOnly(StorageEngine storage, int events)
+    {
+        int writes = 0;
+        storage._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref writes) > events) throw new OutOfMemoryException("test: no room");
+        };
+    }
+
+    private static (int Ingested, int Dropped) Counts(DefaultHttpContext ctx)
+    {
+        ctx.Response.Body.Position = 0;
+        using var doc = JsonDocument.Parse(ctx.Response.Body);
+        return (doc.RootElement.GetProperty("ingested").GetInt32(), doc.RootElement.GetProperty("dropped").GetInt32());
+    }
+
+    /// <summary>A CLEF batch of <paramref name="events"/> events, each with properties over a 64-byte limit.</summary>
+    private static byte[] ClefOversizedOnly(int events)
+    {
+        var buf = new ArrayBufferWriter<byte>(512);
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(events);
+        for (int i = 0; i < events; i++)
+        {
+            w.WriteMapHeader(2);
+            w.Write("@mt");  w.Write("oversized probe");
+            w.Write("Blob"); w.Write(new string('x', 200));
+        }
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
     }
 
     /// <summary>A CLEF batch whose first event's properties are over a 64-byte limit, then <paramref name="events"/> ordinary ones.</summary>

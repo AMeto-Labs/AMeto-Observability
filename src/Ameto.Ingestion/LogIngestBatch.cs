@@ -19,8 +19,25 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     private readonly IngestionEndpoint _owner;
     private readonly LogWriteBatch     _staged;
 
-    /// <summary>Positions in <see cref="_staged"/> of drop markers, ascending. Usually empty.</summary>
-    private List<int>? _markers;
+    /// <summary>
+    /// Drop markers, staged apart from the client's events and put into <see cref="_staged"/> after
+    /// all of them by <see cref="Seal"/>. Usually null.
+    ///
+    /// <para><b>Why last.</b> The store writes a batch as a prefix and stops at the first event it
+    /// has no room for. A marker staged where its oversized event stood could be written before the
+    /// store ran out, so "nothing written" was false of a request answered 503, and its retry wrote
+    /// that Error marker again. With the markers behind the client's events, a write that stopped
+    /// before any of the client's events stopped before every marker too: a 503 wrote nothing, and
+    /// the retry writes each marker once. A marker keeps its event's timestamp, which is what the
+    /// store orders by; its place in the batch changes only its event id, as for any event that
+    /// arrives late.</para>
+    /// </summary>
+    private List<StagedMarker>? _markers;
+
+    /// <summary>The markers are in <see cref="_staged"/>, after the client's events.</summary>
+    private bool _sealed;
+
+    private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template);
 
     internal LogIngestBatch(IngestionEndpoint owner, int payloadSizeHint)
     {
@@ -28,8 +45,25 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         _staged = new LogWriteBatch(payloadSizeHint);
     }
 
-    /// <summary>The events staged — the client's, and drop markers.</summary>
+    /// <summary>
+    /// The events to write: the client's, then the drop markers. The markers join only when the
+    /// batch is committed (<see cref="Seal"/>); before that this holds the client's events alone.
+    /// </summary>
     internal LogWriteBatch Staged => _staged;
+
+    /// <summary>
+    /// Puts the drop markers into <see cref="Staged"/>, after every one of the client's events, and
+    /// returns it. Once: the batch is sealed afterwards, and a second call adds nothing.
+    /// </summary>
+    internal LogWriteBatch Seal()
+    {
+        if (_sealed) return _staged;
+        if (_markers is not null)
+            foreach (var m in _markers)
+                _staged.Add(m.Header, m.Payload.Span, m.Template, exception: null);
+        _sealed = true;
+        return _staged;
+    }
 
     /// <summary>Events refused at the door (over the per-event size limit); a marker stands in for each.</summary>
     public int DroppedAtDoor { get; private set; }
@@ -45,22 +79,15 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     public void MarkMalformed() => Malformed = true;
 
     /// <summary>Client events staged so far, drop markers not counted.</summary>
-    public int StagedEvents => _staged.Count - MarkerCount;
+    public int StagedEvents => _sealed ? _staged.Count - MarkerCount : _staged.Count;
 
     internal int MarkerCount => _markers?.Count ?? 0;
 
-    /// <summary>Drop markers among the first <paramref name="count"/> staged events.</summary>
-    internal int MarkersBefore(int count)
-    {
-        if (_markers is null) return 0;
-        int n = 0;
-        foreach (int at in _markers)
-        {
-            if (at >= count) break;
-            n++;
-        }
-        return n;
-    }
+    /// <summary>
+    /// Drop markers among the first <paramref name="count"/> events of the sealed batch: the
+    /// markers are its last <see cref="MarkerCount"/> events.
+    /// </summary>
+    internal int MarkersBefore(int count) => Math.Clamp(count - StagedEvents, 0, MarkerCount);
 
     /// <summary>Writes the staged events into the store and says what became of them.</summary>
     public ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default) => _owner.CommitAsync(this, ct);
@@ -116,7 +143,25 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     internal void Add(long tsTicks, byte level, int templateIdx, string? template, ExceptionInfo? exception,
                       ReadOnlySpan<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
     {
-        var header = new LogEventHeader
+        System.Diagnostics.Debug.Assert(!_sealed, "an event staged after the batch was committed");
+        _staged.Add(Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, exception);
+    }
+
+    /// <summary>
+    /// Stages a drop marker, to be written after the client's events (see <see cref="_markers"/>).
+    /// <paramref name="payload"/> is kept, not copied: the caller hands over a buffer of its own.
+    /// </summary>
+    internal void AddMarker(long tsTicks, byte level, int templateIdx, string template,
+                            ReadOnlyMemory<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+    {
+        System.Diagnostics.Debug.Assert(!_sealed, "a marker staged after the batch was committed");
+        (_markers ??= []).Add(new StagedMarker(
+            Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template));
+    }
+
+    private static LogEventHeader Header(long tsTicks, byte level, int templateIdx,
+                                         ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+        => new()
         {
             TimestampUtcTicks        = tsTicks,
             Level                    = (Ameto.Core.LogLevel)level,
@@ -126,24 +171,17 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
             TraceIdLo                = traceLo,
             SpanId                   = spanId,
         };
-        _staged.Add(header, payload, template, exception);
-    }
-
-    internal void AddMarker(long tsTicks, byte level, int templateIdx, string template,
-                            ReadOnlySpan<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
-    {
-        (_markers ??= []).Add(_staged.Count);
-        Add(tsTicks, level, templateIdx, template, exception: null, payload, traceHi, traceLo, spanId, serviceIdx);
-    }
 }
 
 /// <summary>What became of an ingest request's log events.</summary>
 /// <param name="Ingested">The client's events now in the store.</param>
 /// <param name="Dropped">The client's events that are not: refused at the door, or given up on for lack of room.</param>
 /// <param name="Busy">
-/// None of the client's events was written, for lack of room or because the store is shutting
-/// down, and some were waiting: the request is answered "retry later" (503, gRPC UNAVAILABLE),
-/// which duplicates none of them. A drop marker — the server's own event standing in for one over
-/// the size limit — may have been written; the retry then writes it again.
+/// Nothing of the batch was written — for lack of room, because writing kept failing, or because
+/// the store is shutting down — and some of the client's events were waiting: the request is
+/// answered "retry later" (503, gRPC UNAVAILABLE), and the retry duplicates nothing. The drop
+/// markers are written after the client's events, so none of them was written either. A batch of
+/// nothing but drop markers is never busy: no retry could store any of its events, so it is
+/// answered for good, with its markers written if the store had room for them.
 /// </param>
 public readonly record struct LogIngestResult(int Ingested, int Dropped, bool Busy);

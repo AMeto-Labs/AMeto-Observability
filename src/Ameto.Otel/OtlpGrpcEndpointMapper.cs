@@ -183,7 +183,8 @@ public static class OtlpGrpcEndpointMapper
     /// decoded into a <see cref="LogIngestBatch"/> (<paramref name="decode"/> unused), the inflate
     /// buffer and its slot go back, and the batch is then written into the store — waiting for room
     /// if it must — before the call is answered: OK once its records are in a WAL, UNAVAILABLE when
-    /// the store had no room for any of them, so the retry duplicates nothing.
+    /// the store had no room for any of them — and so wrote nothing of the batch, whose drop markers
+    /// go in after its records — so the retry duplicates nothing.
     /// </summary>
     private static async Task HandleCoreAsync(
         HttpContext ctx,
