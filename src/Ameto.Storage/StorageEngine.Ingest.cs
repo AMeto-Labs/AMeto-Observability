@@ -157,9 +157,11 @@ public sealed partial class StorageEngine
                 // While the store is faulting the lock is taken within what is left of the wait, its own
                 // wait counted from when the request came to it (even when the first fault is only seen
                 // part way through that wait), and a cancelled request stops queueing.
-                if (!_writerLock.TryEnter() && !WaitForWriterLock(Environment.TickCount64, budgetMs, waitedMs, ref countFrom, ref countWaited, ct))
+                if (!_writerLock.TryEnter() &&
+                    !WaitForWriterLock(Environment.TickCount64, budgetMs, waitedMs, nothingWritten: written == 0, ref countFrom, ref countWaited, ct))
                     break;
                 var outcome = WriteRunLocked(batch, ref next, ref written, ref refused, out long runStart, out var full, out var room);
+                _afterWriteRunForTest?.Invoke();
 
                 // A write landed: the time up to this attempt counted, and the request is a healthy
                 // one again — and the pause after its next fault starts from the first. The count of
@@ -226,8 +228,9 @@ public sealed partial class StorageEngine
                     // counted as a slice that took no time, and a request went round twenty times in 6 ms
                     // and gave up before the swap it waited for landed. It waits for real now, with
                     // nothing to allocate (a blocked thread, but only on a heap that cannot set up a
-                    // timer), and counts what it waited.
-                    Thread.Sleep((int)Math.Min(left, _roomRecheckMs));
+                    // timer), and counts what it waited — the slice it would have waited, so the pause
+                    // after each fault in a row still doubles (it slept the re-check interval, every time).
+                    Thread.Sleep((int)thisSlice);
                 }
                 long elapsed = Environment.TickCount64 - began;
                 if (countFrom < 0) waitedMs += elapsed;
@@ -568,18 +571,24 @@ public sealed partial class StorageEngine
 
     /// <summary>
     /// Waits for <see cref="_writerLock"/>, held by another writer, for a batch writer that came to it
-    /// at <paramref name="lockFrom"/>. In slices: while the store is faulting (<see cref="StoreFaulting"/>,
-    /// or the writer's own run of faults, <paramref name="countFrom"/> set) the writer's wall time
-    /// counts against its <paramref name="budgetMs"/> — from <paramref name="lockFrom"/> when the
-    /// faulting is only seen during this wait — and it gives up when that is spent. A cancelled request
-    /// stops waiting either way. False when it gave up: the batch is done, with nothing more written.
+    /// at <paramref name="lockFrom"/>. In slices: while the writer is in a run of faults of its own
+    /// (<paramref name="countFrom"/> set) — or, with <paramref name="nothingWritten"/>, while the store
+    /// is faulting (<see cref="StoreFaulting"/>) — its wall time counts against its
+    /// <paramref name="budgetMs"/>, from <paramref name="lockFrom"/> when the faulting is only seen
+    /// during this wait, and it gives up when that is spent. A cancelled request stops waiting either
+    /// way. False when it gave up: the batch is done, with nothing more written.
+    ///
+    /// <para>Not a healthy writer that has written part of its batch: charged for its queueing behind
+    /// other requests' faults, run after run, a healthy batch gave up part way under contention — a
+    /// 200 with its tail dropped, which no client retries (10+4 and 6+6 of 96 requests, where none
+    /// did before). One that has written nothing gives up cleanly, with a 503 its client retries.</para>
     /// </summary>
-    private bool WaitForWriterLock(long lockFrom, long budgetMs, long waitedMs, ref long countFrom, ref long countWaited,
-                                   CancellationToken ct)
+    private bool WaitForWriterLock(long lockFrom, long budgetMs, long waitedMs, bool nothingWritten, ref long countFrom,
+                                   ref long countWaited, CancellationToken ct)
     {
         while (true)
         {
-            if (countFrom < 0 && StoreFaulting())
+            if (countFrom < 0 && nothingWritten && StoreFaulting())
             {
                 countFrom   = lockFrom;
                 countWaited = waitedMs;
@@ -596,8 +605,16 @@ public sealed partial class StorageEngine
         }
     }
 
-    /// <summary>How long a writer in a run of faults waits for the lock before it looks at its token again.</summary>
-    private const int LockWaitSliceMs = 50;
+    /// <summary>
+    /// How long a writer waits for the lock before it looks at its token (and, counting, at its wait)
+    /// again. Over <see cref="System.Threading.Lock"/>'s 100 ms: a waiter that has waited that long is
+    /// handed the lock rather than barged past, and a waiter that gave up every 50 ms and came back as
+    /// a new one never got there — a lone small request waited up to 462 ms behind busy writers.
+    /// </summary>
+    private const int LockWaitSliceMs = 200;
+
+    /// <summary>Test hook: runs after each run of a batch's writes, outside the writer lock.</summary>
+    internal Action? _afterWriteRunForTest;
 
     /// <summary>When a write last faulted (<see cref="Environment.TickCount64"/>); written under <see cref="_writerLock"/>.</summary>
     private long _lastWriteFaultAt = long.MinValue / 2;

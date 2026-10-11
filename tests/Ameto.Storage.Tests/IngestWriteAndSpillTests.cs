@@ -1790,6 +1790,11 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     {
         var engine  = Engine(Options(NewDir()));
         var batches = new List<LogWriteBatch>();
+        // Six requests each block a pool thread (asleep under the lock, or waiting for it): on two cores
+        // the pool's floor is two, and threads injected late were counted as the requests' own time
+        // (2 of 30 runs over the bound). The floor is raised for the test; the measure is the engine's.
+        ThreadPool.GetMinThreads(out int minWorkers, out int minIo);
+        ThreadPool.SetMinThreads(Math.Max(minWorkers, 16), minIo);
         try
         {
             engine._afterWriteGate = () =>
@@ -1814,8 +1819,156 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
         finally
         {
+            ThreadPool.SetMinThreads(minWorkers, minIo);
             engine._afterWriteGate = null;
             foreach (var b in batches) b.Dispose();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review M1. While the store was faulting (any fault in the last second), a request was
+    /// charged its queueing for the writer lock — a healthy one too, run after run: under contention a
+    /// healthy batch gave up part way, a 200 with its tail dropped that no client retries. Only a
+    /// request in a run of faults of its own, or one that has written nothing yet (whose giving up is
+    /// a clean 503), is charged now. Here a healthy batch of three runs queues 350 ms behind another
+    /// request after each of its first two, the store faulting: with a 500 ms wait it gave up at its
+    /// third run; it writes all of it now.
+    /// </summary>
+    [Fact]
+    public async Task A_healthy_batch_that_has_written_is_not_charged_its_queueing_while_the_store_faults()
+    {
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 20;
+        using var inGate = new SemaphoreSlim(0);
+        int failFirst = 1, holdNext = 0, hThread = 0, hRuns = 0;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Exchange(ref failFirst, 0) == 1) throw new OutOfMemoryException("test: another request's write faults");
+            if (Interlocked.Exchange(ref holdNext, 0) == 1)
+            {
+                inGate.Release();
+                Thread.Sleep(350);   // another request's write holds the writer lock
+            }
+        };
+        var others = new System.Collections.Concurrent.ConcurrentBag<Task>();
+        engine._afterWriteRunForTest = () =>
+        {
+            // After the healthy batch's first and second runs, another request takes the lock first.
+            if (Environment.CurrentManagedThreadId != Volatile.Read(ref hThread) || Interlocked.Increment(ref hRuns) > 2) return;
+            Volatile.Write(ref holdNext, 1);
+            int n = 100_000 + Volatile.Read(ref hRuns);
+            others.Add(Task.Run(async () =>
+            {
+                using var g = Batch(engine, n, 1);
+                await engine.WriteBatchAsync(g, HangGuard);
+            }));
+            Assert.True(inGate.Wait(HangGuard), "the other request never took the lock");
+        };
+        try
+        {
+            using (var f = Batch(engine, 50_000, 1))   // faults once, then writes: the store is faulting
+                Assert.Equal(new LogBatchWriteResult(1, 0, 0), await engine.WriteBatchAsync(f, HangGuard));
+
+            using var h = Batch(engine, 0, 3 * 256);
+            var result = await Task.Run(async () =>
+            {
+                Volatile.Write(ref hThread, Environment.CurrentManagedThreadId);
+                return await engine.WriteBatchAsync(h, TimeSpan.FromMilliseconds(500));
+            }).WaitAsync(HangGuard);
+
+            Assert.Equal(new LogBatchWriteResult(3 * 256, 0, 0), result);
+            await Task.WhenAll(others).WaitAsync(HangGuard);
+        }
+        finally
+        {
+            engine._afterWriteGate      = null;
+            engine._afterWriteRunForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L1. The writer lock was waited for in 50 ms slices, each a TryEnter that gave up
+    /// and came back as a new waiter — so none ever reached System.Threading.Lock's 100 ms, after which
+    /// a waiter is handed the lock instead of barged past: a lone small request behind a busy writer
+    /// waited up to 462 ms (at most ~110 before the slices). The slices are 200 ms now: here it gets
+    /// the lock while the busy writer is still in its runs.
+    /// </summary>
+    [Fact]
+    public async Task A_lone_writer_behind_a_busy_one_is_handed_the_lock_within_the_locks_bound()
+    {
+        var engine = Engine(Options(NewDir(), tierBytes: 64 * MB));
+        int busyThread = 0;
+        long eventTicks = System.Diagnostics.Stopwatch.Frequency / 25_000;   // 40 µs an event: ~10 ms a run
+        engine._afterWriteGate = () =>
+        {
+            if (Environment.CurrentManagedThreadId != Volatile.Read(ref busyThread)) return;
+            long until = System.Diagnostics.Stopwatch.GetTimestamp() + eventTicks;
+            while (System.Diagnostics.Stopwatch.GetTimestamp() < until) Thread.SpinWait(20);
+        };
+        try
+        {
+            using var busy = Batch(engine, 0, 400 * 256);   // ~4 s of runs, the lock taken again at once after each
+            var busyWrite  = Task.Run(async () =>
+            {
+                Volatile.Write(ref busyThread, Environment.CurrentManagedThreadId);
+                return await engine.WriteBatchAsync(busy, HangGuard);
+            });
+            WaitFor(() => Volatile.Read(ref busyThread) != 0, "the busy writer to start");
+            await Task.Delay(100);
+
+            long worst = 0;
+            for (int i = 0; i < 8; i++)   // one lone writer at a time, each measured
+            {
+                using var lone = Batch(engine, 1_000_000 + i, 1);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var r  = await Task.Run(async () => await engine.WriteBatchAsync(lone, HangGuard));
+                sw.Stop();
+                Assert.Equal(new LogBatchWriteResult(1, 0, 0), r);
+                worst = Math.Max(worst, sw.ElapsedMilliseconds);
+            }
+            Assert.False(busyWrite.IsCompleted, "the busy writer finished first: nothing was measured");
+            Assert.True(worst < 250, $"a lone writer waited {worst} ms behind the busy one");
+            await busyWrite.WaitAsync(HangGuard);
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L7. The pause after each fault in a row doubles; when the pause could not be set
+    /// up (out of memory) the fallback slept the re-check interval every time instead, so a request
+    /// that kept faulting went round twenty times in a 2 s wait where five would do. It sleeps the
+    /// pause it would have waited now.
+    /// </summary>
+    [Fact]
+    public async Task A_faulting_write_whose_pause_cannot_be_set_up_still_pauses_twice_as_long_each_time()
+    {
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 100;
+        int attempts = 0;
+        engine._afterWriteGate = () =>
+        {
+            Interlocked.Increment(ref attempts);
+            throw new OutOfMemoryException("test: every write faults");
+        };
+        engine._beforeRoomWaitForTest = () => throw new OutOfMemoryException("test: no memory to set up the pause");
+        try
+        {
+            using var batch = Batch(engine, 0, 1);
+            var r = await Task.Run(async () => await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(2)));
+            Assert.Equal(new LogBatchWriteResult(0, 0, 1), r);
+            // 100 + 200 + 400 + 800 ms of pauses spend the 2 s wait in about six attempts.
+            Assert.InRange(Volatile.Read(ref attempts), 3, 8);
+        }
+        finally
+        {
+            engine._afterWriteGate        = null;
+            engine._beforeRoomWaitForTest = null;
             await engine.DisposeAsync();
         }
     }
