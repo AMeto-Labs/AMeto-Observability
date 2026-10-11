@@ -346,6 +346,13 @@ public sealed class IngestionEndpoint
     /// </summary>
     internal Action? BeforeStageForTest { get; set; }
 
+    /// <summary>
+    /// Test seam: runs when a commit's write has not completed at once and the commit is about to
+    /// await it — its first suspension, where its state machine is boxed; throwing from it is that
+    /// allocation running out of memory, after the write began. Null in production.
+    /// </summary>
+    internal Action? BeforeCommitSuspendsForTest { get; set; }
+
     /// <summary>The <see cref="Clock"/> timestamp from which the next Warning may be written.</summary>
     private long _oversizedWarnFrom = long.MinValue;
 
@@ -405,7 +412,26 @@ public sealed class IngestionEndpoint
         if (staged.Count == 0)
             return new LogIngestResult(0, batch.DroppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
 
-        var r = await _storage.WriteBatchAsync(staged, _backPressureWait, ct).ConfigureAwait(false);
+        var pending = _storage.WriteBatchAsync(staged, _backPressureWait, ct);
+        LogBatchWriteResult r;
+        try
+        {
+            if (!pending.IsCompleted) BeforeCommitSuspendsForTest?.Invoke();
+            r = await pending.ConfigureAwait(false);
+        }
+        // The await could not suspend: this method's state machine is boxed at its first suspension,
+        // which is here — AFTER the write began, so part of the batch may be written — and a heap at
+        // its limit refuses that allocation too. It used to leave as a 500 (gRPC UNKNOWN) while the
+        // write went on: the counts were lost, and a Seq client's retry wrote what had been written a
+        // second time. The write ends by itself, within its wait, so it is waited out here with
+        // nothing to allocate (a blocked thread, but only on a heap that cannot box a state machine)
+        // and the request answered from what it did. A write still going after that is left to end
+        // on its own — it holds the batch (LogWriteBatch.Lease) — and the failure goes up as it did.
+        catch (OutOfMemoryException) when (!pending.IsCompleted || pending.IsCompletedSuccessfully)
+        {
+            if (!WaitOutWrite(pending, _backPressureWait)) throw;
+            r = pending.Result;
+        }
         Interlocked.Add(ref _acceptedTotal, r.Written);
 
         // Drop markers stand in for events refused at the door: they are written like any other
@@ -454,6 +480,29 @@ public sealed class IngestionEndpoint
         }
         return new LogIngestResult(ingested, dropped, busy);
     }
+
+    /// <summary>
+    /// Blocks until <paramref name="pending"/> has completed, allocating nothing: false when it has
+    /// not within <paramref name="wait"/> (the write's own wait for room) and
+    /// <see cref="CommitWaitOutGraceMs"/> more — a write that long is queued behind other writers,
+    /// or its continuation is starved of a thread, and is not waited for any longer.
+    /// </summary>
+    private static bool WaitOutWrite(ValueTask<LogBatchWriteResult> pending, TimeSpan wait)
+    {
+        long deadline = Environment.TickCount64 + Math.Max(0, (long)wait.TotalMilliseconds) + CommitWaitOutGraceMs;
+        while (!pending.IsCompleted)
+        {
+            if (Environment.TickCount64 >= deadline) return false;
+            Thread.Sleep(CommitWaitOutPollMs);
+        }
+        return true;
+    }
+
+    /// <summary>How long past the write's own wait <see cref="WaitOutWrite"/> waits for it.</summary>
+    private const int CommitWaitOutGraceMs = 1000;
+
+    /// <summary>How often <see cref="WaitOutWrite"/> looks at the write.</summary>
+    private const int CommitWaitOutPollMs = 5;
 
     /// <summary>
     /// Names the events a finally answered request dropped at the door. A drop whose marker was

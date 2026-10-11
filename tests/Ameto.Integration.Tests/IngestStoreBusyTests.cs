@@ -211,6 +211,93 @@ public sealed class IngestStoreBusyTests : IDisposable
         Assert.Equal((0, 3), Counts(ctx));
     }
 
+    /// <summary>
+    /// Round-3 review R1a-3. A commit's state machine is boxed at its first suspension, which is at
+    /// the write, after the write began; on a heap at its limit that allocation fails. The failure
+    /// left as a 500 while the write went on and wrote the batch: the counts were lost, and a Seq
+    /// client's retry wrote it a second time. The commit now waits the write out, allocating
+    /// nothing, and answers from what it did. (The body is read from memory, so the handler has not
+    /// suspended before the commit either: nothing above it is boxed yet.)
+    /// </summary>
+    [Fact]
+    public async Task A_commit_whose_await_cannot_suspend_waits_the_write_out_and_answers_what_it_wrote()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromSeconds(5));
+        await using var storage = Engine(opts);
+        var written = CaptureWrites(storage);
+        int failing = 1;
+        storage._afterWriteGate = () =>
+        {
+            if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
+        };
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        endpoint.BeforeCommitSuspendsForTest = () =>
+        {
+            Volatile.Write(ref failing, 0);   // the write's next attempt lands
+            throw new OutOfMemoryException("test: the commit's state machine box");
+        };
+        try
+        {
+            var ctx = Post(Clef(3));
+
+            await endpoint.HandleAsync(ctx);
+
+            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+            Assert.Equal((3, 0), Counts(ctx));
+            Assert.Equal(3, written.Count);
+            Assert.Equal(3, endpoint.AcceptedTotal);
+        }
+        finally { storage._afterWriteGate = null; }
+    }
+
+    /// <summary>
+    /// The new path R1a-3's wait-out adds: a write still going after its own wait and a second more
+    /// is not waited for any longer — the failure goes up as it did (a 500), with the thread
+    /// blocked about that long and no longer — and the write, left to end on its own, still holds
+    /// its batch (the request's dispose waits for it): every event written whole.
+    /// </summary>
+    [Fact]
+    public async Task A_commit_whose_write_outlives_its_wait_out_fails_as_before_and_the_write_keeps_its_batch()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var written = CaptureWrites(storage);
+        using var release = new ManualResetEventSlim(false);
+        int attempts = 0;
+        storage._afterWriteGate = () =>
+        {
+            int n = Interlocked.Increment(ref attempts);
+            if (n == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
+            if (n == 2) release.Wait(TimeSpan.FromSeconds(30));   // the retry lands only when the test says
+        };
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        endpoint.BeforeCommitSuspendsForTest = () => throw new OutOfMemoryException("test: the commit's state machine box");
+        try
+        {
+            var ctx = Post(Clef(3));
+            var sw  = System.Diagnostics.Stopwatch.StartNew();
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => endpoint.HandleAsync(ctx));
+            sw.Stop();
+            Assert.InRange(sw.ElapsedMilliseconds, 1_000, 10_000);   // the wait plus a second: waited for, then given up
+
+            release.Set();
+            var until = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < until)
+            {
+                lock (written) if (written.Count >= 3) break;
+                await Task.Delay(10);
+            }
+            await Task.Delay(100);   // nothing more comes
+            lock (written)
+                Assert.Equal(new[] { "busy probe {i}", "busy probe {i}", "busy probe {i}" }, written);
+        }
+        finally
+        {
+            release.Set();
+            storage._afterWriteGate = null;
+        }
+    }
+
     /// <summary>Throws an <see cref="OutOfMemoryException"/> from every Debug line.</summary>
     private sealed class OutOfMemoryOnDebug : Microsoft.Extensions.Logging.ILogger<IngestionEndpoint>
     {
