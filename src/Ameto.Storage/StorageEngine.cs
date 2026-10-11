@@ -5218,7 +5218,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         {
             // {nodeId}-{segId}-{minTs}-{maxTs}.seg, or {nodeId}-{segId}.seg for a replica
             var parts = Path.GetFileNameWithoutExtension(file).Split('-');
-            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId))
+            // An id near the end of the id space is no file this store wrote, and would wrap the floor
+            // (see ReserveWalBlock): the catalog scan decides what the file is; the allocator ignores it.
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId) && IsUsableBlockId(segId))
                 AdvanceSegmentIdFloor(segId + 1);
         }
     }
@@ -5642,6 +5644,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         ushort version        = reader.Version;
         bool   recordsEntries = reader.HeaderRecordsEntries;
 
+        // A block past the last usable id, by its name or its header: its levels' ids would wrap past
+        // zero onto other blocks. Not this store's — left in place, not replayed, never deleted.
+        if ((namedBlock != 0 && !IsUsableBlockId(namedBlock)) || !IsUsableBlockId(segId))
+        {
+            _logger.LogError(
+                "WAL {File} names block {Block}, past the last block id this store can use: left in place, not replayed",
+                walFile, IsUsableBlockId(segId) ? namedBlock : segId);
+            return;
+        }
+
         // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
         // here. Cleaning it up as the branch below does with what it cannot read is what every
         // release before log WAL v5 does to a v5 log, and it throws away every acknowledged event
@@ -5916,7 +5928,28 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     }
 
     /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
-    private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
+    private void ReserveWalBlock(ulong walSegId)
+    {
+        // A block near the end of the id space cannot be one this store wrote: reserving one at
+        // ulong.MaxValue - 2 wrapped the floor to 3, and the next blocks were handed out again; one
+        // a little lower left the allocator to wrap at its next block instead.
+        if (!IsUsableBlockId(walSegId)) return;
+        AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
+    }
+
+    /// <summary>
+    /// The highest block id this store takes from a name or a header: <see cref="long.MaxValue"/>.
+    /// Ids grow by one block a flush, so a store reaches it in no lifetime; past it, a block's levels
+    /// — or the blocks the allocator hands out after it — would wrap past zero onto other blocks.
+    /// </summary>
+    private const ulong MaxUsableBlockId = long.MaxValue;
+
+    /// <summary>
+    /// Whether a block id, from a log's name or header, is one this store can have written: one past
+    /// <see cref="MaxUsableBlockId"/> is not, and its log is left alone, with an Error, by the replay
+    /// and the despill.
+    /// </summary>
+    private static bool IsUsableBlockId(ulong segId) => segId <= MaxUsableBlockId;
 
     /// <summary>
     /// Registers a segment file received from a peer, taking ownership of it. The file is STAGED
@@ -6010,7 +6043,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         bool claimed = true;
         if (staged.NodeId.Value == _options.NodeId.Value)
             claimed = TryClaimLocalSegmentId(staged.Id.Value);
-        else
+        else if (IsUsableBlockId(staged.Id.Value))   // an id near the end would wrap the floor (see ReserveWalBlock)
             AdvanceSegmentIdFloor(staged.Id.Value + 1);
 
         bool inPlace = string.Equals(stagedPath, finalPath, StringComparison.OrdinalIgnoreCase);

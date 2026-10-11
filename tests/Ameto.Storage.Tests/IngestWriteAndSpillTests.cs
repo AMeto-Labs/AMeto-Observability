@@ -2251,6 +2251,44 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── A block id past the last usable one ───────────────────────────────────
+
+    /// <summary>
+    /// R2-2. A WAL or spill file whose name or header says a block near the end of the id space cannot
+    /// be one this store wrote. Reserving ulong.MaxValue − 2 wrapped the allocator's floor to 3, and the
+    /// next blocks were handed out again; one a little lower left the next allocation to wrap; replaying
+    /// it wrote levels at ids that wrap onto other blocks. Such a file (past long.MaxValue) is left in
+    /// place, with an Error, and the allocator untouched.
+    /// </summary>
+    [Fact]
+    public async Task A_log_naming_a_block_past_the_last_usable_id_is_left_alone_and_wraps_nothing()
+    {
+        const ulong Past = ulong.MaxValue - 2;
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string wal   = Path.Combine(walDir, $"{opts.NodeId.Value}-{Past}.wal");
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{Past - 6}{StorageEngine.SpillExtension}");
+        foreach (var (path, block) in new[] { (wal, Past), (spill, Past - 6) })
+            using (var log = WriteAheadLog.Open(path, opts.NodeId, new SegmentId(block), 1 << 20))
+                log.Append(T0, LogLevel.Fatal, 40, "event {n}", Props(0));
+        Directory.CreateDirectory(Path.Combine(dir, "segments"));   // and a segment file named past it: the allocator's seed
+        File.WriteAllBytes(Path.Combine(dir, "segments", $"{opts.NodeId.Value}-{Past}-0-0.seg"), [1, 2, 3]);
+
+        ulong fresh;
+        await using (var empty = Engine(Options(NewDir()))) fresh = empty.LiveWalSegmentId;
+
+        await using var engine = Engine(opts);
+        await engine.CatalogLoaded;
+
+        Assert.Equal(fresh, engine.LiveWalSegmentId);   // the allocator did not take a wrapped floor
+        Assert.True(File.Exists(wal), "the WAL past the last block id was replayed and deleted");
+        Assert.True(File.Exists(spill));
+        Assert.Equal(0, engine.SpillFilesPending);       // not queued for a despill into wrapping ids
+        Assert.Empty(ReadAll(engine));
+    }
+
     // ── A recovery walk that fails part way ───────────────────────────────────
 
     private static readonly ExceptionInfo WalkedException = new()

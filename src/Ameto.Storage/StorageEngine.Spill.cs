@@ -506,6 +506,13 @@ public sealed partial class StorageEngine
                 _logger.LogWarning("Spill file {File} does not carry a block id in its name — left where it is", file);
                 continue;
             }
+            if (!IsUsableBlockId(segId))
+            {
+                // Its levels' ids would wrap past zero onto other blocks (see ReserveWalBlock).
+                _logger.LogError("Spill file {File} names block {Block}, past the last block id this store can use: left where it is",
+                    file, segId);
+                continue;
+            }
             ReserveWalBlock(segId);
             onDisk ??= LocalSegmentIdsOnDisk();
             byte published = 0;
