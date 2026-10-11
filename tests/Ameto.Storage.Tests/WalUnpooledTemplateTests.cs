@@ -194,6 +194,41 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
         Assert.DoesNotContain(log.Warnings, w => w.Contains("without", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The other side of the line above (R2-4): a WAL whose pool rows were lost — its .pool file
+    /// zeroed by a power loss before it was fsynced — replays its pooled events without their
+    /// templates, and says how many of how many; an event carrying its template in its entry still
+    /// comes back with it and is not counted.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_pool_rows_were_lost_says_how_many_of_its_events_replay_without_a_template()
+    {
+        await _engine.DisposeAsync();
+        const ulong SegId = 2_000;
+        string walPath = Path.Combine(WalDir, $"0-{SegId}.wal");
+        long   t       = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(walPath, new NodeId(0), new SegmentId(SegId), initialCapacity: 1 << 20))
+        {
+            wal.Append(t,                               LogLevel.Information, 7,  "pooled one {n}",   Props(1));
+            wal.Append(t + TimeSpan.TicksPerSecond,     LogLevel.Information, 8,  "pooled two {n}",   Props(2));
+            wal.Append(t + 2 * TimeSpan.TicksPerSecond, LogLevel.Information, -1, "unpooled {n}",     Props(3));
+        }
+        Assert.True(new FileInfo(walPath + ".pool").Length > 0);
+        File.WriteAllBytes(walPath + ".pool", []);   // the rows lost to a power loss
+
+        var log  = new WarningLog();
+        var opts = new ServerOptions { DataDirectory = _dir };
+        _engine  = new StorageEngine(Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance), log);
+        await _engine.CatalogLoaded;
+
+        var events = ReadAllByTicks();
+        Assert.Equal(3, events.Count);
+        Assert.Equal("", events[t].Template);
+        Assert.Equal("", events[t + TimeSpan.TicksPerSecond].Template);
+        Assert.Equal("unpooled {n}", events[t + 2 * TimeSpan.TicksPerSecond].Template);
+        Assert.Single(log.Warnings, w => w.Contains("2 of its 3 event(s) replay without a template", StringComparison.Ordinal));
+    }
+
     /// <summary>The engine's Warning lines.</summary>
     private sealed class WarningLog : Microsoft.Extensions.Logging.ILogger<StorageEngine>
     {
