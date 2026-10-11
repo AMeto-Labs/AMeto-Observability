@@ -971,6 +971,75 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// The swap's own allocations — the room signal it wakes the writers with, room in the frozen
+    /// list for its tier — are made before it freezes anything, so one that runs out of memory swaps
+    /// nothing. In the shape before the review, the signal was allocated after the install: a throw
+    /// there was taken for "nothing swapped", and the tier the swap had frozen, counted and listed was
+    /// never flushed (its heavy phase counted for ever, shutdown waiting its whole budget for it).
+    /// </summary>
+    [Fact]
+    public async Task A_swap_whose_room_signal_cannot_be_allocated_swaps_nothing_and_orphans_nothing()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(5);
+        int armed = 1;
+        engine._beforeRoomSignalAllocForTest = () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) throw new OutOfMemoryException("test: no memory for the room signal");
+        };
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            try { await engine.FlushHotTierAsync(); }
+            catch (OutOfMemoryException) { /* nothing swapped */ }
+
+            await engine.FlushHotTierAsync();   // the allocation works again
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "every heavy phase to end", ShortGuard);
+            Assert.Equal(1, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._beforeRoomSignalAllocForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The same for room in the frozen list: in the shape before the review it was found after the
+    /// freeze and the count, and a list that could not grow left the live tier frozen — every write
+    /// refused for good — and its heavy phase counted with nothing to end it.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_whose_frozen_list_cannot_grow_leaves_the_live_tier_writable()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(5);
+        int armed = 1;
+        engine._beforeFrozenListGrowForTest = () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) throw new OutOfMemoryException("test: no room to list the frozen tier");
+        };
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            try { await engine.FlushHotTierAsync(); }
+            catch (OutOfMemoryException) { /* nothing swapped */ }
+
+            Assert.True(TryWriteOne(engine, 1), "the live tier refuses writes after a swap that failed");
+            await engine.FlushHotTierAsync();
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "every heavy phase to end", ShortGuard);
+            Assert.Equal(2, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._beforeFrozenListGrowForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A swap that failed asks for itself again. It used to be asked for again only by a writer that
     /// came back to find the tier still refusing — so once the requests had given up (503), nothing
     /// did, and the tier went on refusing after the failure had cleared, until MaxAge.
