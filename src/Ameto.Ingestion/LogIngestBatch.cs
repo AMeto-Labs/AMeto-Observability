@@ -37,7 +37,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>The markers are in <see cref="_staged"/>, after the client's events.</summary>
     private bool _sealed;
 
-    private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template);
+    private readonly record struct StagedMarker(LogEventHeader Header, ReadOnlyMemory<byte> Payload, string Template, string? Service);
 
     /// <summary>The decoded weight reserved for this batch (<see cref="IngestionEndpoint.TryBeginBatch"/>), given back on dispose.</summary>
     private long _reserved;
@@ -64,7 +64,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         if (_sealed) return _staged;
         if (_markers is not null)
             foreach (var m in _markers)
-                _staged.Add(m.Header, m.Payload.Span, m.Template, exception: null);
+                _staged.Add(m.Header, m.Payload.Span, m.Template, exception: null, m.Service);
         _sealed = true;
         return _staged;
     }
@@ -155,10 +155,11 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     // ── Staging (from the endpoint) ───────────────────────────────────────────
 
     internal void Add(long tsTicks, byte level, int templateIdx, string? template, ExceptionInfo? exception,
-                      ReadOnlySpan<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+                      ReadOnlySpan<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx,
+                      string? service = null)
     {
         System.Diagnostics.Debug.Assert(!_sealed, "an event staged after the batch was committed");
-        _staged.Add(Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, exception);
+        _staged.Add(Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, exception, service);
     }
 
     /// <summary>
@@ -166,11 +167,12 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <paramref name="payload"/> is kept, not copied: the caller hands over a buffer of its own.
     /// </summary>
     internal void AddMarker(long tsTicks, byte level, int templateIdx, string template,
-                            ReadOnlyMemory<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+                            ReadOnlyMemory<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx,
+                            string? service = null)
     {
         System.Diagnostics.Debug.Assert(!_sealed, "a marker staged after the batch was committed");
         (_markers ??= []).Add(new StagedMarker(
-            Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template));
+            Header(tsTicks, level, templateIdx, traceHi, traceLo, spanId, serviceIdx), payload, template, service));
     }
 
     private static LogEventHeader Header(long tsTicks, byte level, int templateIdx,

@@ -18,12 +18,13 @@ namespace Ameto.Storage;
 ///     [Trace context — 24 bytes, only with the Trace flag: traceIdHi uint64, traceIdLo uint64,
 ///      spanId uint64]
 ///     [Template — only with the InlineTemplate flag: byteLength uint32, then that many UTF-8 bytes]
+///     [Service — only with the InlineService flag: byteLength uint32, then that many UTF-8 bytes]
 ///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
 ///   [Entry 1 …]
 ///   ...
 ///
-/// The checksum covers header bytes [0, 22), the trace context, the inline template (its length
-/// included), the payload and the exception.
+/// The checksum covers header bytes [0, 22), the trace context, the inline template and service
+/// (their lengths included), the payload and the exception.
 ///
 /// Flags (byte 13 of the entry header, inside the checksummed range):
 ///   bit 0 — Unpooled: the event's template has no pool row (the pool was full, the index was past
@@ -49,6 +50,10 @@ namespace Ameto.Storage;
 ///           Without the bit such an event replayed with no template, or a truncated one; for a
 ///           spilled event, whose only copy is its spill file, that was every such event of every
 ///           overload, despilled with its message gone for good.
+///   bit 4 — InlineService (v6): the event's <c>@service</c> TEXT follows the inline template (byte
+///           length uint32, then UTF-8, under the checksum), because the service was outside the
+///           intern pool — a full pool answers -1 — so no index and no row name it. Never with the
+///           Service bit. Without it such an event was logged, replayed and despilled with no service.
 ///   Other bits are reserved and written as zero.
 ///
 /// <para>v6 exists because a WAL is no longer only a crash net. A log WAL that replays is how a
@@ -119,6 +124,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private const byte   EntryFlagTrace    = 0x04;
     // … and the template's text, which no pool row can carry (v6; see the class doc).
     private const byte   EntryFlagInlineTemplate = 0x08;
+    // … and the service's text, outside the pool (v6; see the class doc).
+    private const byte   EntryFlagInlineService  = 0x10;
     // The longest text a pool row holds: its length field is 16 bits.
     private const int    MaxPoolRowBytes   = ushort.MaxValue;
 
@@ -328,13 +335,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// </param>
     /// <param name="serviceIndex">
     /// The event's <c>@service</c>, as <see cref="LogEventHeader.ServiceNamePoolIndex"/> holds it:
-    /// an index into the same pool. -1, or anything else outside <c>[0, 65 535]</c>, logs the event
-    /// with no service — the hot tier has nothing else to resolve a service from either.
+    /// an index into the same pool. -1, or anything else outside <c>[0, 65 535]</c>, logs the
+    /// event's service by its text, in the entry (InlineService) — or, with no text, no service.
     /// </param>
     /// <param name="service">
     /// The text at <paramref name="serviceIndex"/>, written as a pool row the first time this WAL
-    /// logs that index. Null or empty writes none; recovery then gives the event no service unless
-    /// another of this WAL's events wrote the row.
+    /// logs that index; for an index outside the pool, the service's text itself, which the entry
+    /// carries. Null or empty writes none; recovery then gives the event no service unless another
+    /// of this WAL's events wrote the row.
     /// </param>
     /// <param name="traceIdHi">The event's trace id, high half. With the other two all zero, no trace context is logged.</param>
     /// <param name="traceIdLo">The event's trace id, low half.</param>
@@ -379,11 +387,15 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         int  templateBytes  = inlineTemplate ? Encoding.UTF8.GetByteCount(template) : 0;
         int  inlineLen      = inlineTemplate ? 4 + templateBytes : 0;
 
-        // The same compare for the service, whose "outside the pool" is simply "none": a full pool
-        // answers -1 at ingest and the header keeps no text for it, unlike the template.
-        bool   hasService = (uint)serviceIndex <= ushort.MaxValue;
-        ushort svcIndex   = hasService ? (ushort)serviceIndex : (ushort)0;
+        // The same compare for the service. Outside the pool (a full pool answers -1 at ingest) it
+        // has no row to be named by, so its text — given, the only copy of the name, as the tier
+        // keeps it — goes into the entry itself (v6 InlineService). With none given, no service.
+        bool   hasService    = (uint)serviceIndex <= ushort.MaxValue;
+        ushort svcIndex      = hasService ? (ushort)serviceIndex : (ushort)0;
         if (hasService) EnsurePoolRow(svcIndex, service);
+        bool   inlineService = !hasService && !string.IsNullOrEmpty(service);
+        int    serviceBytes  = inlineService ? Encoding.UTF8.GetByteCount(service!) : 0;
+        int    inlineSvcLen  = inlineService ? 4 + serviceBytes : 0;
 
         ReadOnlySpan<byte> excBytes = default;
         if (exception is not null)
@@ -397,7 +409,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         }
         bool hasTrace  = (traceIdHi | traceIdLo | spanId) != 0;
         int  traceLen  = hasTrace ? TraceContextSize : 0;
-        int  entrySize = EntryHeaderSize + traceLen + inlineLen + payload.Length + excBytes.Length;
+        int  entrySize = EntryHeaderSize + traceLen + inlineLen + inlineSvcLen + payload.Length + excBytes.Length;
 
         lock (_writeLock)
         {
@@ -434,7 +446,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             eh.Flags           = (byte)((pooled ? 0 : EntryFlagUnpooled)
                                       | (hasService ? EntryFlagService : 0)
                                       | (hasTrace ? EntryFlagTrace : 0)
-                                      | (inlineTemplate ? EntryFlagInlineTemplate : 0));
+                                      | (inlineTemplate ? EntryFlagInlineTemplate : 0)
+                                      | (inlineService ? EntryFlagInlineService : 0));
             eh.TemplateIndex   = index;
             eh.ExceptionLength = (uint)excBytes.Length;
             eh.ServiceIndex    = svcIndex;
@@ -454,17 +467,25 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 Encoding.UTF8.GetBytes(template.AsSpan(), new Span<byte>(inline + 4, templateBytes));
             }
 
+            byte* inlineSvc = inline + inlineLen;
+            if (inlineService)
+            {
+                Unsafe.WriteUnaligned(inlineSvc, (uint)serviceBytes);
+                Encoding.UTF8.GetBytes(service.AsSpan(), new Span<byte>(inlineSvc + 4, serviceBytes));
+            }
+
             // Checksum the header bytes (crc field excluded — it is the last 4 bytes), the trace
-            // context, the inline template and both data spans, BEFORE copying the spans: same
-            // bytes, and the header, trace and template parts are already in place.
+            // context, the inline template and service and both data spans, BEFORE copying the
+            // spans: same bytes, and the header, trace and inline parts are already in place.
             uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(dest, ChecksummedHeaderBytes));
             crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(trace, traceLen));
             crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(inline, inlineLen));
+            crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(inlineSvc, inlineSvcLen));
             crc      = Crc32c.Append(crc, payload);
             crc      = Crc32c.Append(crc, excBytes);
             eh.Checksum = crc;
 
-            byte* body = inline + inlineLen;
+            byte* body = inlineSvc + inlineSvcLen;
             if (payload.Length > 0)
                 payload.CopyTo(new Span<byte>(body, payload.Length));
             if (excBytes.Length > 0)
@@ -875,7 +896,17 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             inlineLen = 4 + textLen;
         }
 
-        long total = (long)headerSize + traceLen + inlineLen + eh.PayloadLength + eh.ExceptionLength;
+        // The inline service (v6, InlineService) follows the inline template, held to the same bounds.
+        long inlineSvcLen = 0;
+        if (layout == EntryLayout.V6 && (eh.Flags & EntryFlagInlineService) != 0)
+        {
+            if (pos + headerSize + traceLen + inlineLen + 4 > end) return false;
+            uint textLen = Unsafe.ReadUnaligned<uint>(trace + traceLen + inlineLen);
+            if (textLen > int.MaxValue - 4) return false;
+            inlineSvcLen = 4 + textLen;
+        }
+
+        long total = (long)headerSize + traceLen + inlineLen + inlineSvcLen + eh.PayloadLength + eh.ExceptionLength;
         if (pos + total > end)
             return false;
         // Span construction takes int — in a WAL past 2 GiB a garbage length in
@@ -886,22 +917,25 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             return false;
 
         byte* inline    = trace + traceLen;
-        byte* body      = inline + inlineLen;
+        byte* inlineSvc = inline + inlineLen;
+        byte* body      = inlineSvc + inlineSvcLen;
         var traceSpan   = new ReadOnlySpan<byte>(trace, traceLen);
         var inlineSpan  = new ReadOnlySpan<byte>(inline, (int)inlineLen);
+        var svcSpan     = new ReadOnlySpan<byte>(inlineSvc, (int)inlineSvcLen);
         var payloadSpan = new ReadOnlySpan<byte>(body, (int)eh.PayloadLength);
         var excSpan     = new ReadOnlySpan<byte>(body + (int)eh.PayloadLength, (int)eh.ExceptionLength);
 
         // v4 on end their header with the checksum, over every header byte before it, the trace
-        // context, the inline template and both spans — v5's over the service index too, v6's over
-        // the trace context and the template, so a torn or rotted field fails the entry like any
-        // other. v3 has none.
+        // context, the inline template and service and both spans — v5's over the service index
+        // too, v6's over the trace context and the inline texts, so a torn or rotted field fails
+        // the entry like any other. v3 has none.
         if (layout != EntryLayout.V3)
         {
             int  covered = headerSize - 4;
             uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(src, covered));
             crc      = Crc32c.Append(crc, traceSpan);
             crc      = Crc32c.Append(crc, inlineSpan);
+            crc      = Crc32c.Append(crc, svcSpan);
             crc      = Crc32c.Append(crc, payloadSpan);
             crc      = Crc32c.Append(crc, excSpan);
             if (crc != Unsafe.ReadUnaligned<uint>(src + covered))
@@ -957,6 +991,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             TraceIdLo      = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 8)  : 0,
             SpanId         = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 16) : 0,
             Template       = template,
+            Service        = inlineSvcLen != 0 ? Encoding.UTF8.GetString(svcSpan[4..]) : null,
             Payload        = payload,
             Exception      = exception,
         };
@@ -1238,6 +1273,13 @@ public sealed class WalEntry
     /// template, if any, is <see cref="TemplateIndex"/>'s pool row.
     /// </summary>
     public string?        Template       { get; init; }
+
+    /// <summary>
+    /// The event's <c>@service</c> text where no pool row names it (v6, InlineService): the service
+    /// was outside a full intern pool when the event was logged, and the entry carries the name.
+    /// Null otherwise: the service, if any, is <see cref="ServiceIndex"/>'s row.
+    /// </summary>
+    public string?        Service        { get; init; }
 
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }

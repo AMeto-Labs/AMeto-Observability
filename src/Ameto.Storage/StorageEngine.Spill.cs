@@ -179,7 +179,7 @@ public sealed partial class StorageEngine
     /// no id here — the despill assigns it, from the same timestamp.
     /// </summary>
     private WriteOutcome SpillLocked(SpillTarget spill, in LogEventHeader h, ReadOnlySpan<byte> payload,
-                                     string? template, ExceptionInfo? exception)
+                                     string? template, ExceptionInfo? exception, string? service = null)
     {
         if (spill.Full || !spill.Admission.TryAdmit(payload.Length))
         {
@@ -191,7 +191,7 @@ public sealed partial class StorageEngine
         }
 
         string  tmplStr = template ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
-        string? svcStr  = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
+        string? svcStr  = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : service;   // one outside a full pool: by its text
         try
         {
             if (!spill.Wal.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,
@@ -923,8 +923,18 @@ public sealed partial class StorageEngine
                 string? tmpl = e.Template
                                ?? (!e.Unpooled && rows.TryGetValue(e.TemplateIndex, out var t) && t.Length != 0 ? t : null);
                 int tmplIdx  = tmpl is null ? -1 : TemplatePool.Intern(tmpl, out tmpl);
-                int svcAt    = e.ServiceIndexIn(rows);
-                int svcIdx   = svcAt >= 0 ? TemplatePool.Intern(rows[(ushort)svcAt]) : -1;
+                // The service by its row, or by the text the entry carries (logged outside a full
+                // pool): interned into the live pool by text, and kept beside the event when that
+                // pool is full too — the name used to be dropped there, the event despilled with none.
+                int     svcAt   = e.ServiceIndexIn(rows);
+                string? svcText = svcAt >= 0 ? rows[(ushort)svcAt] : e.Service;
+                int     svcIdx  = -1;
+                string? svcKept = null;
+                if (!string.IsNullOrEmpty(svcText))
+                {
+                    svcIdx = TemplatePool.Intern(svcText, out string canonicalSvc);
+                    if (svcIdx < 0) svcKept = canonicalSvc;
+                }
 
                 var header = new LogEventHeader
                 {
@@ -937,7 +947,7 @@ public sealed partial class StorageEngine
                     TraceIdLo                = e.TraceIdLo,
                     SpanId                   = e.SpanId,
                 };
-                if (tier.TryWrite(header, e.Payload, tmpl, e.Exception))
+                if (tier.TryWrite(header, e.Payload, tmpl, e.Exception, svcKept))
                     NotifyEventWritten(in header, tmpl ?? string.Empty);
                 else
                     refused++;

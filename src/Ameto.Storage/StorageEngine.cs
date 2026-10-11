@@ -5654,7 +5654,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
             string tmpl = entry.Template ?? (noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex));
-            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
+            // A service logged outside a full pool comes back by the text its entry carries, kept
+            // beside the event with no pool index — as the unpooled template is, and for the same reason.
+            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception, entry.Service))
                 replayed++;
         }
         if (replayed < entries.Count)

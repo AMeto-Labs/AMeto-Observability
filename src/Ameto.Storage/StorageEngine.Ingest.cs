@@ -84,9 +84,10 @@ public sealed partial class StorageEngine
     /// been asked for), the write path is closed, or no tier can hold an event that large. A throw
     /// (out of memory in the tier) also means nothing was written.
     /// </summary>
-    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
+    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null,
+                         string? service = null)
     {
-        lock (_writerLock) return WriteLocked(header, propertiesPayload, template, exception) == WriteOutcome.Written;
+        lock (_writerLock) return WriteLocked(header, propertiesPayload, template, exception, service) == WriteOutcome.Written;
     }
 
     /// <summary>
@@ -142,7 +143,8 @@ public sealed partial class StorageEngine
                 {
                     try
                     {
-                        outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next));
+                        outcome = WriteLocked(batch.HeaderAt(next), batch.PayloadAt(next), batch.TemplateAt(next), batch.ExceptionAt(next),
+                                              batch.ServiceAt(next));
                     }
                     catch (Exception ex)
                     {
@@ -226,7 +228,8 @@ public sealed partial class StorageEngine
     }
 
     /// <summary>The body of every write; the caller holds <see cref="_writerLock"/>.</summary>
-    private WriteOutcome WriteLocked(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception)
+    private WriteOutcome WriteLocked(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+                                     string? service = null)
     {
         // Shut by DisposeAsync. Refused like a full tier — the caller keeps the event — and before
         // anything else, so a refused write neither takes an id nor schedules a flush. Under the
@@ -245,7 +248,7 @@ public sealed partial class StorageEngine
         // never land in a tier whose WAL this call does not also hold.
         var w = _write;
         if (w.Spill is { } spill)
-            return SpillLocked(spill, header, payload, template, exception);
+            return SpillLocked(spill, header, payload, template, exception, service);
 
         // The live WAL refused an append (below): until a swap replaces it, the tier takes nothing
         // more. An event written into it now would be acknowledged as durable and be in memory
@@ -265,7 +268,7 @@ public sealed partial class StorageEngine
         var h = header;
         h.Id  = _idGen.Next(header.TimestampUtcTicks);
 
-        if (!w.Hot.TryWrite(h, payload, template, exception))
+        if (!w.Hot.TryWrite(h, payload, template, exception, service))
         {
             // Full (or wedged on a chunk an event does not fit): ask for a swap — or, with no flush
             // slot free, for a spill — and tell the caller to wait. The flag is what lets the swap
@@ -295,7 +298,9 @@ public sealed partial class StorageEngine
             // The service is logged the way the header holds it, by pool index, and its text goes into
             // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
             // flush resolves it, so a replayed event carries the service the flushed one would have.
-            string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
+            // One with no index (the pool was full) is logged by its text, in the entry (v6
+            // InlineService), as the tier keeps it.
+            string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : service;
             try
             {
                 w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, payload, exception,

@@ -107,6 +107,11 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     // Per-event structured exceptions (managed, parallel to _chunkTemplates).
     // Lazily allocated per chunk on first event that carries an exception.
     private readonly ExceptionInfo?[]?[] _chunkExceptions;
+    // Per-event @service strings for the events whose service has no pool index — the intern
+    // pool was full when it arrived, so ServiceNamePoolIndex is -1 and this is the only copy of
+    // the name, as the attached template is for a template. Parallel to _chunkTemplates, and
+    // allocated per chunk only once such an event arrives: a pool with room never needs it.
+    private readonly string?[]?[] _chunkServices;
     // Zone map: the smallest and largest TimestampUtcTicks written into each chunk. Updated
     // by the writer for every event BEFORE the count increment publishes it, so a reader
     // that snapshotted Count sees bounds covering every event below its snapshot — and
@@ -180,6 +185,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         _chunkPayloadTails = new long[_maxChunks];
         _chunkTemplates    = new string?[]?[_maxChunks];
         _chunkExceptions   = new ExceptionInfo?[]?[_maxChunks];
+        _chunkServices     = new string?[]?[_maxChunks];
         _chunkMinTicks     = new long[_maxChunks];
         _chunkMaxTicks     = new long[_maxChunks];
 
@@ -195,8 +201,12 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <paramref name="template"/>: optional message-template string. When provided
     /// it is stored alongside the header so cold-tier flush can persist it even if
     /// the <see cref="StringInternPool"/> no longer contains the entry.
+    /// <paramref name="service"/>: the event's <c>@service</c> when it has no pool index
+    /// (<see cref="LogEventHeader.ServiceNamePoolIndex"/> -1: the pool was full) — kept beside the
+    /// header the same way; ignored for an event whose service is pooled.
     /// </summary>
-    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
+    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null,
+                         ExceptionInfo? exception = null, string? service = null)
     {
         // Unsynchronised fast reject. Purely an optimisation — a tier that is already
         // frozen or full says so without paying for the claim below, which matters because
@@ -217,7 +227,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         Interlocked.Exchange(ref _writeInProgress, 1);
         try
         {
-            return TryWriteClaimed(in header, propertiesPayload, template, exception);
+            // A pooled service needs no copy: the index names it.
+            return TryWriteClaimed(in header, propertiesPayload, template, exception,
+                                   header.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? service : null);
         }
         finally
         {
@@ -229,7 +241,8 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         }
     }
 
-    private bool TryWriteClaimed(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template, ExceptionInfo? exception)
+    private bool TryWriteClaimed(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template,
+                                 ExceptionInfo? exception, string? service)
     {
         if (_frozen || _count >= _maxEvents)
             return false;   // Freeze() won the race — the caller retries into the successor tier
@@ -264,6 +277,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         //    as its own.
         string?[]?        templates  = template  is not null ? _chunkTemplates[ci]  ??= RentSlotsFor<string?>()        : _chunkTemplates[ci];
         ExceptionInfo?[]? exceptions = exception is not null ? _chunkExceptions[ci] ??= RentSlotsFor<ExceptionInfo?>() : _chunkExceptions[ci];
+        string?[]?        services   = service   is not null ? _chunkServices[ci]   ??= RentSlotsFor<string?>()        : _chunkServices[ci];
 
         // ── Write payload ────────────────────────────────────────────────────
         byte* dest = ChunkPayloadPtr(ci) + _chunkPayloadTails[ci];
@@ -282,6 +296,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         //    never published can be read as this event's.
         if (templates  is not null) templates[si]  = template;
         if (exceptions is not null) exceptions[si] = exception;
+        if (services   is not null) services[si]   = service;
 
         _chunkPayloadTails[ci] += payloadLen;
         _payloadBytes          += payloadLen;
@@ -338,6 +353,23 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     }
 
     /// <summary>
+    /// The <c>@service</c> kept beside the event at <paramref name="eventIndex"/> because it has no
+    /// pool index (the pool was full when it arrived), or null: the event's service, if any, is its
+    /// <see cref="LogEventHeader.ServiceNamePoolIndex"/>'s. See <see cref="ServiceOf"/>.
+    /// </summary>
+    public string? GetService(int eventIndex)
+    {
+        var arr = _chunkServices[eventIndex / ChunkEventCapacity];
+        return arr is null ? null : arr[eventIndex % ChunkEventCapacity];
+    }
+
+    /// <summary>The event's <c>@service</c>, wherever it is kept: its pool index's text, or the string beside it.</summary>
+    public string? ServiceOf(int eventIndex, in LogEventHeader header, StringInternPool? pool) =>
+        header.ServiceNamePoolIndex >= 0
+            ? pool?.Get(header.ServiceNamePoolIndex)
+            : GetService(eventIndex);
+
+    /// <summary>
     /// Returns the structured <see cref="ExceptionInfo"/> attached to the event at
     /// <paramref name="eventIndex"/>, or <c>null</c> if the event has no exception.
     /// </summary>
@@ -385,7 +417,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             ref var h = ref GetHeader(i);
             long ts = h.TimestampUtcTicks;
             if (ts < fromTicks || ts > toTicks) continue;
-            agg.AddByPoolIndex(ts, h.Level, h.ServiceNamePoolIndex);
+            // A service with no pool index (the pool was full) is the string kept beside the event.
+            if (h.ServiceNamePoolIndex < 0 && GetService(i) is { } kept) agg.AddByServiceName(ts, h.Level, kept);
+            else                                                           agg.AddByPoolIndex(ts, h.Level, h.ServiceNamePoolIndex);
         }
     }
 
@@ -501,9 +535,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             TraceIdHi       = h.TraceIdHi,
             TraceIdLo       = h.TraceIdLo,
             SpanId          = h.SpanId,
-            ServiceName     = (h.ServiceNamePoolIndex >= 0 && pool is not null)
-                                  ? pool.Get(h.ServiceNamePoolIndex)
-                                  : null,
+            ServiceName     = ServiceOf(index, in h, pool),
         };
     }
 
@@ -544,6 +576,11 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             {
                 _chunkExceptions[i] = null;
                 ArrayPool<ExceptionInfo?>.Shared.Return(x, clearArray: true);
+            }
+            if (_chunkServices[i] is { } s)
+            {
+                _chunkServices[i] = null;
+                ArrayPool<string?>.Shared.Return(s, clearArray: true);
             }
         }
     }

@@ -34,6 +34,8 @@ public sealed class LogWriteBatch : IDisposable
         public LogEventHeader Header;
         public string?        Template;
         public ExceptionInfo? Exception;
+        /// <summary>The <c>@service</c> of an event whose service has no pool index (the pool was full); null otherwise.</summary>
+        public string?        Service;
     }
 
     private const int InitialItems        = 256;
@@ -64,7 +66,12 @@ public sealed class LogWriteBatch : IDisposable
     /// Stages one event. <paramref name="header"/>'s id and payload offset are ignored — the writer
     /// assigns the one and this batch the other; everything else is kept as given.
     /// </summary>
-    public void Add(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception)
+    /// <param name="service">
+    /// The event's <c>@service</c> when it has no pool index (<see cref="LogEventHeader.ServiceNamePoolIndex"/>
+    /// -1: the pool was full) — the only copy of the name, kept by the tier and the WAL as a template is.
+    /// </param>
+    public void Add(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+                    string? service = null)
     {
         if (_count == _items.Length) GrowItems();
         if (_payload.Length - _payloadLength < payload.Length) GrowPayload(payload.Length);
@@ -77,6 +84,7 @@ public sealed class LogWriteBatch : IDisposable
         item.Header.HasException          = exception is not null;
         item.Template                     = template;
         item.Exception                    = exception;
+        item.Service                      = header.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? service : null;
 
         payload.CopyTo(_payload.AsSpan(_payloadLength));
         _payloadLength += payload.Length;
@@ -95,6 +103,7 @@ public sealed class LogWriteBatch : IDisposable
 
     internal string?        TemplateAt(int index)  => _items[index].Template;
     internal ExceptionInfo? ExceptionAt(int index) => _items[index].Exception;
+    internal string?        ServiceAt(int index)   => _items[index].Service;
 
     /// <summary>Gives both arrays back. The batch is empty, and usable again, afterwards.</summary>
     public void Dispose()

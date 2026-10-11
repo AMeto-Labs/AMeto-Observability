@@ -654,8 +654,15 @@ public sealed class IngestionEndpoint
     {
         // The service name belongs to the resourceLogs block, not the record: when the
         // parser has already interned it, every record under that block skips the
-        // UTF-8 decode + hash that used to run once per record.
-        if (serviceIdx < 0) serviceIdx = _pool.Intern(serviceUtf8);   // -1 when empty
+        // UTF-8 decode + hash that used to run once per record. A full pool answers -1 with the
+        // name materialised, and it is then kept beside the event, as a template is (the name
+        // used to be lost from every event ingested past saturation); -1 and null when empty.
+        string? service = null;
+        if (serviceIdx < 0 && !serviceUtf8.IsEmpty)
+        {
+            serviceIdx = _pool.Intern(serviceUtf8, out string svcText);
+            if (serviceIdx < 0 && svcText.Length != 0) service = svcText;
+        }
 
         if (msgpackProps.Length > _maxEventPayloadBytes)
         {
@@ -678,7 +685,7 @@ public sealed class IngestionEndpoint
                               : string.Empty;
                 LogOversizedDrop(msgpackProps.Length, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120), skipped);
             }
-            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
+            StageServerDropMarker(batch, tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx, service);
             return false; // original counted as dropped by the caller
         }
 
@@ -692,7 +699,7 @@ public sealed class IngestionEndpoint
         // template attaches null — never "", which the tier would prefer over the pool.
         string? tmpl    = canonicalTmpl.Length != 0 ? canonicalTmpl : null;
 
-        batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx);
+        batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx, service);
         return true;
     }
 
@@ -722,9 +729,10 @@ public sealed class IngestionEndpoint
 
             if (TakeOversizedWarning(out int skipped))
                 LogOversizedDrop(msgpackProps.Length, svcStr ?? "(none)", Truncate(tmplStr, 120), skipped);
+            int markerSvcIdx = svcStr is not null ? _pool.Intern(svcStr) : -1;
             StageServerDropMarker(
                 batch, tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
-                svcStr is not null ? _pool.Intern(svcStr) : -1);
+                markerSvcIdx, markerSvcIdx < 0 ? svcStr : null);
             return false;
         }
 
@@ -732,9 +740,10 @@ public sealed class IngestionEndpoint
         // template instead of retaining this event's copy (see StageRaw).
         int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical); // -1 when empty
         string? tmpl     = canonical.Length != 0 ? canonical : null;   // see StageRaw: kept past saturation, never ""
-        int svcIdx  = _pool.Intern(serviceUtf8);                     // -1 when empty
+        int     svcIdx   = _pool.Intern(serviceUtf8, out string svcText);   // -1 when empty
+        string? service  = svcIdx < 0 && svcText.Length != 0 ? svcText : null;   // see StageRaw: kept past saturation
 
-        batch.Add(tsTicks, level, tmplIdx, tmpl, exception, msgpackProps, traceHi, traceLo, spanId, svcIdx);
+        batch.Add(tsTicks, level, tmplIdx, tmpl, exception, msgpackProps, traceHi, traceLo, spanId, svcIdx, service);
         return true;
     }
 
@@ -755,7 +764,7 @@ public sealed class IngestionEndpoint
     private void StageServerDropMarker(
         LogIngestBatch batch,
         long tsTicks, byte originalLevel, string originalTemplate,
-        int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+        int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx, string? service)
     {
         const int MaxTemplateChars = 256;
         string origTmpl  = originalTemplate.Length <= MaxTemplateChars ? originalTemplate : originalTemplate[..MaxTemplateChars];
@@ -773,7 +782,7 @@ public sealed class IngestionEndpoint
 
         int mtIdx = _pool.Intern(DropMarkerTemplate);
         batch.AddMarker(tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
-                        buf.WrittenMemory, traceHi, traceLo, spanId, serviceIdx);
+                        buf.WrittenMemory, traceHi, traceLo, spanId, serviceIdx, service);
     }
 
     /// <summary>

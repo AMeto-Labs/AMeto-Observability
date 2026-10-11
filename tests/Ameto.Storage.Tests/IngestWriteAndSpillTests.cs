@@ -509,6 +509,97 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A spilled event keeps a <c>@service</c> that has no pool index — the intern pool was full when
+    /// it arrived — and a block despilled into a live pool that is full keeps the services its rows
+    /// name. A full pool answers -1 for a service; the spill logged such an event with no service,
+    /// and the despill dropped the name of every row it could not intern.
+    /// </summary>
+    [Fact]
+    public async Task A_spilled_event_keeps_its_service_when_the_pool_is_full()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        const int First = 2 * TierEvents;   // after A and B, in the tiers
+        try
+        {
+            using (var tiers = Batch(engine, 0, First))
+                Assert.Equal(new LogBatchWriteResult(First, 0, 0), await engine.WriteBatchAsync(tiers, HangGuard));
+
+            for (int i = 0; engine.TemplatePool.Intern("filler " + i) >= 0; i++) { }   // the pool is full from here
+            using (var spilled = new LogWriteBatch())
+            {
+                spilled.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + First * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"), ServiceNamePoolIndex = -1,
+                }, Props(First), "event {n}", exception: null, service: "svc.past.saturation");
+                spilled.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + (First + 1) * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+                    ServiceNamePoolIndex     = engine.TemplatePool.Intern("spill.svc"),   // pooled before the pool filled
+                }, Props(First + 1), "event {n}", exception: null);
+                Assert.Equal(new LogBatchWriteResult(2, 0, 0), await engine.WriteBatchAsync(spilled, HangGuard));
+            }
+            Assert.Equal(2, engine.SpilledEvents);
+
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == 2,
+                    "the spill to end and its block to be despilled");
+
+            var events = ReadAll(engine);
+            Assert.Equal("svc.past.saturation", events[First].Service);
+            Assert.Equal("spill.svc", events[First + 1].Service);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A block an earlier run spilled, despilled into a live pool that is full: its services come
+    /// from its own pool file's rows, and with no room to intern them they are kept beside the events.
+    /// </summary>
+    [Fact]
+    public async Task A_block_despilled_into_a_full_pool_keeps_its_rows_services()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        const ulong Block = 9_000;
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(Block), 1 << 20))
+            for (int i = 0; i < 10; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "row.svc");
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        try
+        {
+            for (int i = 0; engine.TemplatePool.Intern("filler " + i) >= 0; i++) { }   // full before the despill
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 10, "the block to be despilled");
+
+            var events = ReadAll(engine);
+            Assert.Equal(10, events.Count);
+            Assert.All(events.Values, e => Assert.Equal("row.svc", e.Service));
+        }
+        finally
+        {
+            hold.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A spill file the process died with is despilled by the next start, in the background, and a
     /// block an earlier life had already written out in full (its completion marker on disk) is
     /// deleted rather than written twice.

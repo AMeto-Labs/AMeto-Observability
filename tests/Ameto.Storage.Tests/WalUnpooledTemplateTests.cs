@@ -212,6 +212,40 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// An event whose <c>@service</c> is outside a full intern pool keeps it — in the tier, which keeps
+    /// the name beside the event as it keeps the template; in its segment once flushed; and through a
+    /// crash, its WAL entry carrying the name. A full pool answers -1 for the service, and the name was
+    /// lost from the live event, its segment and its replay alike.
+    /// </summary>
+    [Fact]
+    public async Task An_events_service_outside_a_full_pool_survives_the_tier_the_flush_and_a_crash()
+    {
+        for (int i = 0; _engine.TemplatePool.Intern("filler " + i) >= 0; i++) { }
+        Assert.Equal(-1, _engine.TemplatePool.Intern("svc.past.saturation"));
+        long t = DateTime.UtcNow.Ticks;
+
+        WriteWithService(t, "svc.past.saturation", 1);
+        Assert.Equal("svc.past.saturation", _engine.LiveHotTier.Materialise(0, _engine.TemplatePool).ServiceName);
+        await _engine.FlushHotTierAsync();                     // through the tier into a segment
+
+        WriteWithService(t + TimeSpan.TicksPerSecond, "svc.after.the.crash", 2);
+        await CrashAndRestartAsync();                          // and through the WAL
+
+        var events = ReadAllByTicks();
+        Assert.Equal("svc.past.saturation", events[t].Service);
+        Assert.Equal("svc.after.the.crash", events[t + TimeSpan.TicksPerSecond].Service);
+    }
+
+    private void WriteWithService(long ticks, string service, int n) =>
+        Assert.True(_engine.TryWrite(new LogEventHeader
+        {
+            TimestampUtcTicks        = ticks,
+            Level                    = LogLevel.Information,
+            MessageTemplatePoolIndex = -1,
+            ServiceNamePoolIndex     = -1,
+        }, Props(n), "service probe {n}", exception: null, service: service));
+
     /// <summary>kill -9: keep the live WAL's bytes, let shutdown flush and unlink them, undo that flush, and start again.</summary>
     private async Task CrashAndRestartAsync()
     {

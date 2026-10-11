@@ -430,6 +430,43 @@ public sealed class WriteAheadLogTests
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
 
+    /// <summary>
+    /// A service outside the pool — a full pool answers -1 — travels in its entry (v6 InlineService),
+    /// after the inline template and under the checksum, and comes back whole; a pooled one is still
+    /// named by its index and row, and an entry given none has none. It used to be logged with no
+    /// service at all, and replayed and despilled so.
+    /// </summary>
+    [Fact]
+    public void A_service_outside_the_pool_travels_in_its_entry()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, -1, "unpooled {n}", [1], serviceIndex: -1, service: "svc.outside");
+                wal.Append(2_000, LogLevel.Information, 5,  "pooled {n}",   [2], serviceIndex: 9,  service: "svc.pooled");
+                wal.Append(3_000, LogLevel.Information, 5,  "pooled {n}",   [3], serviceIndex: -1, service: null);
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(3, entries.Count);
+            Assert.Equal("svc.outside", entries[0].Service);
+            Assert.Equal(-1, entries[0].ServiceIndex);
+            Assert.Equal("unpooled {n}", entries[0].Template);
+            Assert.Equal([1], entries[0].Payload);
+            Assert.Null(entries[1].Service);
+            Assert.Equal(9, entries[1].ServiceIndex);
+            Assert.Null(entries[2].Service);
+            Assert.Equal(-1, entries[2].ServiceIndex);
+
+            // A rotted byte in the first entry's service fails that entry, like any other field.
+            Corrupt(path, FileHeader + EntryHeader + 4 + "unpooled {n}".Length + 4 + 2);
+            Assert.Empty(WriteAheadLog.ReadForRecovery(path).Entries);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
     /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
     [Fact]
     public void A_rotted_inline_template_stops_replay_at_its_entry()
