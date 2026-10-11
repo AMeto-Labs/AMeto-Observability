@@ -121,6 +121,69 @@ public sealed class SegmentIdAcrossRestartTests : IDisposable
         Assert.Equal(4, events);    // and the one event the run between took
     }
 
+    /// <summary>
+    /// Round-4 L12, the review's probe. An orphaned log named after block <c>long.MaxValue − 2</c> — a
+    /// usable block, its levels within the id space — raised the allocator past the last usable block
+    /// id, and the run's live log was named after a block past it. Killed, the next start left that
+    /// log alone ("past the last block id this store can use") and its events were in no segment: 1 of
+    /// 101 served. The allocator refuses such a floor now: the live log takes the block after the ones
+    /// on disk, and every event comes back.
+    /// </summary>
+    [Fact]
+    public async Task A_log_named_near_the_end_of_the_id_space_leaves_the_allocator_where_it_was()
+    {
+        const ulong NearEnd = long.MaxValue - 2;
+        string dir    = Dir("near-end");
+        string walDir = Path.Combine(dir, "wal");
+        string segDir = Path.Combine(dir, "segments");
+        Directory.CreateDirectory(walDir);
+        long t = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(Path.Combine(walDir, $"0-{NearEnd}.wal"), new NodeId(0), new SegmentId(NearEnd), initialCapacity: 1 << 20))
+            for (int i = 0; i < 100; i++)
+                wal.Append(t + i, LogLevel.Information, -1, "orphan {n}", Props(i));
+
+        var first = NewEngine(dir);
+        ulong live;
+        try
+        {
+            await first.CatalogLoaded;
+            live = first.LiveWalSegmentId;
+            Assert.InRange(live, 1UL, 1UL << 20);   // after the ones on disk — not past the end of the id space
+            Write(first, t + TimeSpan.TicksPerSecond, 1);
+
+            // kill -9: the live log keeps its event, the shutdown flush is undone.
+            string liveWal = Path.Combine(walDir, $"0-{live}.wal");
+            File.Copy(liveWal, liveWal + ".crash", overwrite: true);
+            File.Copy(liveWal + ".pool", liveWal + ".pool.crash", overwrite: true);
+            await first.DisposeAsync();
+            foreach (var f in Directory.GetFiles(segDir, "*.seg"))
+            {
+                var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+                if (ulong.TryParse(parts[1], out var id) && id >= live && id < live + Slots) File.Delete(f);
+            }
+            File.Move(liveWal + ".crash", liveWal, overwrite: true);
+            File.Move(liveWal + ".pool.crash", liveWal + ".pool", overwrite: true);
+        }
+        finally { await first.DisposeAsync(); }
+
+        await using var next = NewEngine(dir);
+        await next.CatalogLoaded;
+        int events = 0, orphans = 0;
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seg in next.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                events++;
+                if (ev.Template == "orphan {n}") orphans++;
+            }
+        }
+        Assert.Equal(100, orphans);
+        Assert.Equal(101, events);
+        Assert.Empty(Directory.GetFiles(walDir, $"0-{live}.wal"));   // replayed, not left alone
+    }
+
     private static byte[] Props(int n)
     {
         var buf = new ArrayBufferWriter<byte>(32);

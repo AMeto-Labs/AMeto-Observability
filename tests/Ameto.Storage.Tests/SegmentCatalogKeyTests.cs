@@ -453,6 +453,32 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-4 L12, the other-node road. A segment from ANOTHER node raises this node's allocator past
+    /// its id (so the two never share a file name), and one numbered near the end of the id space —
+    /// <c>long.MaxValue − 2</c>, a usable id — raised it there: the blocks handed out next were past the
+    /// last one a replay reads back, and a crash lost what their logs held. The allocator refuses that
+    /// floor now; the segment is registered, and the next blocks follow the ones before.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_from_another_node_numbered_near_the_end_leaves_the_allocator_where_it_was()
+    {
+        const ulong NearEnd = long.MaxValue - 2;
+        long  now  = DateTime.UtcNow.Ticks;
+        ulong prev = _engine.LiveWalSegmentId;
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(WritePeerSegment(new NodeId(7), NearEnd, now)));
+
+        for (int swap = 0; swap < 2; swap++)
+        {
+            Write(5, now);
+            await _engine.FlushHotTierAsync();   // the next WAL takes the next block
+            ulong next = _engine.LiveWalSegmentId;
+            Assert.InRange(next, prev + 1, prev + 1_000);
+            prev = next;
+        }
+    }
+
+    /// <summary>
     /// The one ambiguity the key cannot resolve — two nodes CONFIGURED with the same NodeId — and
     /// therefore the last place in the engine where registering a segment could still remove one.
     /// The import used to log a warning saying, correctly, that "one of the two files will not be

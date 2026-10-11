@@ -158,6 +158,57 @@ public sealed class SegmentIdAllocatorTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-4 L12 at the counter: a floor past <see cref="StorageEngine.MaxAllocatorFloor"/> is
+    /// refused — the allocator stays where it is, and the first refusal is logged, once — and one at
+    /// it is taken, so every block the allocator hands out has all its levels at usable ids. Every
+    /// caller checked the id it came from, none what the raise did next.
+    /// </summary>
+    [Fact]
+    public async Task A_floor_past_the_allocator_ceiling_is_refused_and_logged_once()
+    {
+        string dir    = _dir + "-ceiling";
+        Directory.CreateDirectory(dir);
+        int    errors = 0;
+        var    opts   = new ServerOptions { DataDirectory = dir };
+        await using var engine = new StorageEngine(
+            Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            new ErrorCounter(() => Interlocked.Increment(ref errors)));
+        try
+        {
+            await engine.CatalogLoaded;
+            ulong before = engine.NextSegmentIdForTest;
+
+            engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor + 1);
+            engine.AdvanceSegmentIdFloor((ulong)long.MaxValue + 4);   // a log at long.MaxValue − 2: its block + 6
+            Assert.Equal(before, engine.NextSegmentIdForTest);
+            Assert.Equal(1, Volatile.Read(ref errors));
+
+            engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor);
+            Assert.Equal(StorageEngine.MaxAllocatorFloor, engine.AllocateSegmentIdBlock());
+            Assert.True(engine.AllocateSegmentIdBlock() + 5 <= long.MaxValue, "a block's levels passed the last usable id");
+        }
+        finally
+        {
+            await engine.DisposeAsync();
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    /// <summary>Counts the Error lines.</summary>
+    private sealed class ErrorCounter(Action onError) : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Error) onError();
+        }
+    }
+
+    /// <summary>
     /// The race, at the counter rather than through the callers. The flush path takes level blocks
     /// and the import path raises the floor; running both from several threads at once is what the
     /// replication endpoint does to a busy node, and the two invariants below are the ones the

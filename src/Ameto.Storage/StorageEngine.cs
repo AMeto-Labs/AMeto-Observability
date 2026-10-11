@@ -6174,14 +6174,56 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// is spent from somewhere other than the allocator — a file name on disk, a WAL's reserved
     /// block, a segment received from a peer. Monotonic: it can only ever move forward, so a
     /// caller arriving with stale information cannot hand out an id twice.
+    ///
+    /// <para>Never past <see cref="MaxAllocatorFloor"/> (round-4 L12): such a floor is refused, and
+    /// the first refusal logged. Every caller checked the id it came from against the last usable
+    /// block id, but not what the raise did next: a WAL at <c>long.MaxValue − 2</c> raised the floor
+    /// past that bound, the live WAL was named after a block past it, and the next start left that
+    /// log alone — after a crash, its events were in no segment (the review's probe: 1 of 101 served).
+    /// Below the ceiling the allocator would need 2^32 more ids to reach the bound: one a flush, no
+    /// store gets there. An id that high was not handed out by this allocator — a copied or edited
+    /// file, or another system's segment — and nothing it names can be handed out again before then.</para>
     /// </summary>
     internal void AdvanceSegmentIdFloor(ulong floor)
     {
+        if (floor > MaxAllocatorFloor)
+        {
+            RefuseSegmentIdFloor(floor);
+            return;
+        }
         lock (_segIdLock)
         {
             if (floor > _nextSegmentId) _nextSegmentId = floor;
         }
     }
+
+    /// <summary>
+    /// The highest floor <see cref="AdvanceSegmentIdFloor"/> takes: <see cref="MaxUsableBlockId"/>
+    /// less 2^32 ids, so that every block the allocator hands out after it is one a replay reads back.
+    /// </summary>
+    internal const ulong MaxAllocatorFloor = MaxUsableBlockId - (1UL << 32);
+
+    private int _segmentIdFloorRefused;
+
+    /// <summary>Says, once per engine, that a floor past <see cref="MaxAllocatorFloor"/> was refused.</summary>
+    private void RefuseSegmentIdFloor(ulong floor)
+    {
+        if (Interlocked.Exchange(ref _segmentIdFloorRefused, 1) != 0) return;
+        try
+        {
+            _logger.LogError(
+                "A segment id floor of {Floor} — from a segment file's name, a log's header or a replicated segment — is past " +
+                "the highest the id allocator is raised to ({Ceiling}): the allocator stays where it is. Raised there, the blocks " +
+                "it handed out next would pass the last block id a log is replayed from, and their events would be lost to the " +
+                "first crash. Ids grow by one block per flush, so no store reaches this; the id was not handed out here — a " +
+                "copied or edited file, or another system's segment. Logged once",
+                floor, MaxAllocatorFloor);
+        }
+        catch (Exception) { /* the line is lost; the allocator is unchanged either way */ }
+    }
+
+    /// <summary>Test seam: the id the allocator hands out next.</summary>
+    internal ulong NextSegmentIdForTest { get { lock (_segIdLock) return _nextSegmentId; } }
 
     /// <summary>
     /// Claims <paramref name="id"/> for a segment that arrived carrying THIS node's own NodeId,
@@ -6207,14 +6249,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
     /// deployment error the 409 exists to report.</para>
     ///
-    /// <para>An id past <see cref="MaxUsableBlockId"/> is claimed with no raise: the allocator
+    /// <para>An id at or past <see cref="MaxAllocatorFloor"/> is claimed with no raise: the allocator
     /// never reaches it, so the two stay disjoint without one — and the raise, <c>id + 1</c>, wrapped
     /// the floor past zero for an id at the end of the id space (the blocks handed out next were
-    /// ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>).</para>
+    /// ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>); below the end, it
+    /// left the allocator handing out blocks no replay reads back (see <see cref="AdvanceSegmentIdFloor"/>).</para>
     /// </summary>
     private bool TryClaimLocalSegmentId(ulong id)
     {
-        if (!IsUsableBlockId(id)) return true;
+        if (id >= MaxAllocatorFloor)
+        {
+            RefuseSegmentIdFloor(id < ulong.MaxValue ? id + 1 : id);
+            return true;
+        }
         lock (_segIdLock)
         {
             if (id < _nextSegmentId) return false;
