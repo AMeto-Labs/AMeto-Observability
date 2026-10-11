@@ -373,6 +373,38 @@ public sealed class WriteAheadLogTests
         }
     }
 
+    /// <summary>
+    /// A spill log's pool file counts against the log's capacity. Its rows — up to 64 KB each, written
+    /// before the entry that needs them is checked for room — were counted by no capacity and no floor:
+    /// a hundred events with distinct long templates and tiny payloads filled a 256 KB spill log's
+    /// pool to 6 MB while the log itself took every one of them.
+    /// </summary>
+    [Fact]
+    public void A_spill_logs_pool_rows_count_against_its_capacity()
+    {
+        string     path     = NewWalPath();
+        const long Capacity = 256 * 1024;
+        try
+        {
+            int taken = 0;
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: Capacity, spill: true))
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    string template = new string((char)('a' + i % 26), 60_000) + i;   // a pooled row of ~60 KB each
+                    if (!wal.Append(1_000 + i, LogLevel.Information, i, template, [(byte)i])) break;
+                    taken++;
+                }
+            }
+
+            long onDisk = new FileInfo(path).Length + new FileInfo(path + ".pool").Length;
+            Assert.InRange(taken, 1, 5);
+            Assert.True(onDisk <= 32 + Capacity + WriteAheadLog.MaxRowsPastCapacity,
+                        $"{onDisk:N0} B on disk for a {Capacity:N0} B spill log");
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
     /// <summary>A rotted byte in an inline template fails its entry like any other field: the checksum covers it.</summary>
     [Fact]
     public void A_rotted_inline_template_stops_replay_at_its_entry()

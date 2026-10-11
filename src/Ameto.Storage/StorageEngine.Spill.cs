@@ -333,14 +333,16 @@ public sealed partial class StorageEngine
             // is the same wait as the floor.
             return true;
         }
-        return free >= _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes;
+        // The file, its pool counted in, and the two rows a refused append can leave past it.
+        return free >= _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes + WriteAheadLog.MaxRowsPastCapacity;
     }
 
     /// <summary>
-    /// What one spill file is, and — since it never grows (see <see cref="WriteAheadLog.Open"/>) —
-    /// the most it can come to: a tier's payload plus a header and trace context an event, and at
-    /// least 1 MB. A block whose entries weigh more (large exceptions, long inline templates) is
-    /// closed when its file is full, and the next one is checked against the floor before it opens.
+    /// What one spill file is — its log and its pool file together — and, since it never grows (see
+    /// <see cref="WriteAheadLog.Open"/>), the most it can come to: a tier's payload plus a header and
+    /// trace context an event, and at least 1 MB. A block whose entries weigh more (large exceptions,
+    /// long inline templates, many long pool rows) is closed when its file is full, and the next one
+    /// is checked against the floor before it opens.
     /// </summary>
     internal long SpillFileCapacityBytes => Math.Max(1L << 20,
         _options.HotTier.MaxSizeBytes + (long)HotTierSegment.EventCapacityFor(_options.HotTier.MaxSizeBytes) * 50);

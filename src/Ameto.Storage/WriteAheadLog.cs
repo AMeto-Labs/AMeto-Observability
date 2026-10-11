@@ -198,10 +198,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     /// <param name="spill">
     /// A spill target's log (see <c>StorageEngine</c>, "Spill"). It never grows past
-    /// <paramref name="initialCapacity"/> — <see cref="Append"/> refuses an entry that does not
-    /// fit, and the spill rotates to a new file, which the spill's free-space floor is checked
-    /// against first; only an empty log takes an entry whatever its size — and when it is closed
-    /// the file is cut to what it holds. A growing spill file used to double past the space its
+    /// <paramref name="initialCapacity"/>, its pool file counted in — <see cref="Append"/> refuses
+    /// an entry that does not fit, and the spill rotates to a new file, which the spill's
+    /// free-space floor is checked against first; only an empty log takes an entry whatever its
+    /// size — and when it is closed the file is cut to what it holds. A growing spill file used to double past the space its
     /// floor check had counted (a storm of large exceptions took one block from ~74 MB to over
     /// 2 GB), and a closed one kept its whole pre-size on NTFS, which allocates it.
     /// </param>
@@ -304,6 +304,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _poolStream = new FileStream(_filePath + ".pool",
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolStream.Seek(0, SeekOrigin.End);
+        _poolBytes = _poolStream.Length;
     }
 
     // ── Append ───────────────────────────────────────────────────────────────
@@ -409,13 +410,16 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             if (_ptr is null)
                 throw new IOException("WAL is unmapped after a failed grow — appends unavailable until rotation");
 
-            if (_writeOffset + entrySize > _capacity)
+            // A spill log's pool file shares its capacity: the floor check counted one file's worth
+            // for the block, and rows of up to 64 KB each, written first, were counted by nothing.
+            long pool = _spill ? Volatile.Read(ref _poolBytes) : 0;
+            if (_writeOffset + entrySize + pool > _capacity)
             {
                 // A spill target's log is as large as its floor check counted, and no larger: the
                 // spill rotates instead. An empty one takes any entry, or one larger than a whole
                 // file would be refused by every file in turn.
                 if (_spill && _writeOffset > 0) return false;
-                Grow(_writeOffset + entrySize);
+                if (_writeOffset + entrySize > _capacity) Grow(_writeOffset + entrySize);
             }
 
             byte* dest = _ptr + FileHeaderSize + _writeOffset;
@@ -510,8 +514,19 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             _poolStream.Write(bytes, 0, len);
             _poolStream.Flush();
             _poolDirty = true;
+            Volatile.Write(ref _poolBytes, _poolBytes + 4 + len);
         }
     }
+
+    /// <summary>
+    /// Bytes in the pool file. A spill log counts them against its capacity (see <see cref="Append"/>):
+    /// its rows are written before the entry that needs them is checked for room, so a refused append
+    /// may leave at most two rows — a template's and a service's, 64 KB each — past it.
+    /// </summary>
+    private long _poolBytes;
+
+    /// <summary>The most a refused spill append can leave in the pool file past the log's capacity: two full rows.</summary>
+    internal const long MaxRowsPastCapacity = 2 * (4 + MaxPoolRowBytes);
 
     // ── Durability ───────────────────────────────────────────────────────────
 
