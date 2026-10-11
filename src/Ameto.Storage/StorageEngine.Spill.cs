@@ -749,6 +749,13 @@ public sealed partial class StorageEngine
     internal Action<ulong>? _beforeLoadSpillForTest;
 
     /// <summary>
+    /// Test hook: called with the block's id once the despill has read the spill file into a tier,
+    /// before anything else is done with it — on the thread that read it, so it and
+    /// <see cref="_beforeLoadSpillForTest"/> bracket the read.
+    /// </summary>
+    internal Action<ulong>? _afterLoadSpillForTest;
+
+    /// <summary>
     /// Replays one spilled block into a tier and flushes it into the block, exactly as a frozen tier
     /// is flushed: listed as frozen (so queries see it) for its heavy phase, published with the same
     /// completion marker, its WAL deleted against it. Owns the flush slot the caller took.
@@ -781,6 +788,7 @@ public sealed partial class StorageEngine
                 return;
             }
             unlisted = tier;
+            _afterLoadSpillForTest?.Invoke(file.SegId);
 
             // Counted and listed under the swap lock, as a swap counts its tier: shutdown takes this
             // lock after closing the write path, and from then on the count may only fall. A
@@ -892,31 +900,33 @@ public sealed partial class StorageEngine
     /// </summary>
     private HotTierSegment? LoadSpill(SpillFile file)
     {
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(file.Path, out ushort version, out _);
-        if (version > WriteAheadLog.FormatVersion)
+        // Read where it lies, one entry at a time, straight into the tier (see ReplayOrphanedWal):
+        // the despill used to hold the whole block twice, a copy in the heap beside the tier.
+        using var reader = WriteAheadLog.RecoveryReader.Open(file.Path);
+        if (reader.Version > WriteAheadLog.FormatVersion)
         {
             _logger.LogError(
                 "Spill file {File} is format v{Version}, newer than this release reads (v{Current}): left in place, " +
                 "not despilled. Its events come back when the release that wrote it starts again.",
-                file.Path, version, WriteAheadLog.FormatVersion);
+                file.Path, reader.Version, WriteAheadLog.FormatVersion);
             return null;
         }
-        if (segId == 0 || entries.Count == 0)
+        if (reader.SegmentId == 0 || !reader.TryReadNext(out var e))
         {
+            reader.Dispose();   // unmapped before the delete: on Windows a mapped file cannot be deleted
             DeleteSpillFiles(file);
             return null;
         }
 
-        var  rows    = WriteAheadLog.LoadPool(file.Path + ".pool");
-        long payload = 0;
-        foreach (var e in entries) payload += e.Payload.Length;
-
-        var tier    = CreateRecoveryTier(entries.Count, payload);
+        var rows    = WriteAheadLog.LoadPool(file.Path + ".pool");
+        var tier    = CreateRecoveryTier(reader.DataBytes);
+        int count   = 0;
         int refused = 0;
         try
         {
-            foreach (var e in entries)
+            do
             {
+                count++;
                 // A template with no pool row — outside a saturated pool, or longer than a row holds
                 // — is in the entry itself (v6); the spill file is the event's only copy, and such a
                 // template used to come back empty, or cut at 65 535 bytes.
@@ -952,6 +962,7 @@ public sealed partial class StorageEngine
                 else
                     refused++;
             }
+            while (reader.TryReadNext(out e));
         }
         catch
         {
@@ -964,7 +975,7 @@ public sealed partial class StorageEngine
             // admitted only what a tier takes (HotTierAdmission) — and it would be a loss if it did,
             // so it is said loudly rather than counted quietly.
             _logger.LogError("Despill of {File}: {Refused} of {Count} event(s) did not fit the tier and were not written",
-                file.Path, refused, entries.Count);
+                file.Path, refused, count);
         return tier;
     }
 
@@ -985,4 +996,16 @@ public sealed partial class StorageEngine
         int  cfgEvents  = HotTierSegment.EventCapacityFor(cfgPayload);
         return new HotTierSegment(Math.Max(cfgEvents, events), Math.Max(cfgPayload, payloadBytes + 1));
     }
+
+    /// <summary>
+    /// A recovery tier for a log whose data area is <paramref name="logDataBytes"/> long
+    /// (<see cref="WriteAheadLog.RecoveryReader.DataBytes"/>), sized before a byte of it is read: the
+    /// log's bytes bound its payloads, and its events at one per <see cref="MinLogEntryBytes"/>. The
+    /// tier takes its native chunks as events arrive, so the bounds cost nothing the events do not.
+    /// </summary>
+    private HotTierSegment CreateRecoveryTier(long logDataBytes) =>
+        CreateRecoveryTier((int)Math.Min(int.MaxValue - 1, logDataBytes / MinLogEntryBytes + 1), logDataBytes);
+
+    /// <summary>The smallest entry any log format holds: a v3 header and nothing else.</summary>
+    private const int MinLogEntryBytes = 20;
 }

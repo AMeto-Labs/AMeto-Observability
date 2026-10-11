@@ -870,7 +870,21 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         byte* basePtr, long pos, long end, EntryLayout layout, Dictionary<ushort, string> longTemplates,
         out WalEntry? entry, out long entrySize)
     {
-        entry     = null;
+        entry = null;
+        if (!TryParseRecord(basePtr, pos, end, layout, longTemplates, out var record, out entrySize)) return false;
+        entry = record.ToEntry();
+        return true;
+    }
+
+    /// <summary>
+    /// <see cref="TryParseEntry"/> without the copy: the record's payload is a span over the mapping
+    /// at <paramref name="basePtr"/>, and lives as long as the mapping does.
+    /// </summary>
+    private static unsafe bool TryParseRecord(
+        byte* basePtr, long pos, long end, EntryLayout layout, Dictionary<ushort, string> longTemplates,
+        out WalRecord record, out long entrySize)
+    {
+        record    = default;
         entrySize = 0;
 
         int headerSize = HeaderSizeOf(layout);
@@ -942,13 +956,6 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 return false;
         }
 
-        byte[] payload = [];
-        if (eh.PayloadLength > 0)
-        {
-            payload = new byte[eh.PayloadLength];
-            payloadSpan.CopyTo(payload);
-        }
-
         ExceptionInfo? exception = null;
         if (eh.ExceptionLength > 0)
         {
@@ -978,7 +985,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             }
         }
 
-        entry = new WalEntry
+        record = new WalRecord
         {
             TimestampTicks = eh.TimestampTicks,
             Level          = (LogLevel)eh.Level,
@@ -992,7 +999,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             SpanId         = traceLen != 0 ? Unsafe.ReadUnaligned<ulong>(trace + 16) : 0,
             Template       = template,
             Service        = inlineSvcLen != 0 ? Encoding.UTF8.GetString(svcSpan[4..]) : null,
-            Payload        = payload,
+            Payload        = payloadSpan,
             Exception      = exception,
         };
         entrySize = total;
@@ -1162,6 +1169,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     public static (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(string walPath) =>
         ReadForRecovery(walPath, out _, out _);
 
+    /// <summary>
+    /// Every complete entry of a log, materialised — each payload copied into the heap. For a caller
+    /// that wants the list; the startup replay and the despill walk the log with
+    /// <see cref="RecoveryReader"/> instead, one entry at a time, where it lies.
+    /// </summary>
     /// <param name="version">
     /// The format the file's header claims, or 0 when the file is not one of these logs. A version
     /// above <see cref="FormatVersion"/> comes back with no entries: a later release wrote the file,
@@ -1173,67 +1185,200 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// the version is looked at, so a later release's file can be told empty too; any other value
     /// says "may hold entries", which is also what a later format that moved the field would read as.
     /// </param>
-    public static unsafe (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(
+    public static (ulong SegmentId, List<WalEntry> Entries) ReadForRecovery(
         string walPath, out ushort version, out bool headerRecordsEntries)
     {
-        version              = 0;
-        headerRecordsEntries = false;
-        if (!File.Exists(walPath)) return (0, []);
-        long fileSize = new FileInfo(walPath).Length;
-        if (fileSize < FileHeaderSize) return (0, []);
+        using var reader = RecoveryReader.Open(walPath);
+        version              = reader.Version;
+        headerRecordsEntries = reader.HeaderRecordsEntries;
+        var entries = new List<WalEntry>();
+        while (reader.TryReadNext(out var record)) entries.Add(record.ToEntry());
+        return (reader.SegmentId, entries);
+    }
 
-        using var mmf  = MemoryMappedFile.CreateFromFile(walPath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.Read);
-        using var view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-        byte* ptr = null;
-        view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-        try
+    /// <summary>
+    /// A log's complete entries read one at a time where they lie in its mapping — the recovery walk
+    /// with no copy of the log in the heap. <see cref="ReadForRecovery(string, out ushort, out bool)"/>
+    /// collected every entry first, each payload copied into a byte array, and a replay then held the
+    /// log twice: in that list, and in the tier it filled from it. Read-only; the file is mapped
+    /// until <see cref="Dispose"/>, which on Windows is what lets it be deleted.
+    /// </summary>
+    public sealed unsafe class RecoveryReader : IDisposable
+    {
+        private MemoryMappedFile?         _mmf;
+        private MemoryMappedViewAccessor? _view;
+        private byte*                     _ptr;
+        private readonly EntryLayout      _layout;
+        private readonly bool             _readable;
+        private readonly long             _end;
+        private long                      _pos;
+        private bool                      _stopped;
+        private readonly Dictionary<ushort, string> _longTemplates = new();
+
+        /// <summary>The block the log's header names; 0 when the file is not one of these logs.</summary>
+        public ulong SegmentId { get; }
+
+        /// <summary>The format the header claims (see <see cref="ReadForRecovery(string, out ushort, out bool)"/>); 0 for no log.</summary>
+        public ushort Version { get; }
+
+        /// <summary>See <see cref="ReadForRecovery(string, out ushort, out bool)"/>.</summary>
+        public bool HeaderRecordsEntries { get; }
+
+        /// <summary>
+        /// The bytes of the data area the walk covers — the header's write offset, clamped to the
+        /// file: an upper bound on what the entries hold (payloads, and events at no fewer than 20
+        /// bytes each). 0 when there is nothing to read.
+        /// </summary>
+        public long DataBytes => _readable ? _end : 0;
+
+        private RecoveryReader() { }
+
+        private RecoveryReader(MemoryMappedFile mmf, MemoryMappedViewAccessor view, byte* ptr, EntryLayout layout, bool readable,
+                               ulong segmentId, ushort version, bool recordsEntries, long end)
         {
-            ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
-            if (fh.Magic != MagicNumber) return (0, []);
-            version              = fh.Version;
-            headerRecordsEntries = fh.WriteOffset != FileHeaderSize;
-            // v6 = current. v5 = the releases before it: no trace context. v4: checksummed, no
-            // service. v3: replayable, no per-entry validation possible. Anything else is
-            // unreplayable by construction.
-            EntryLayout layout;
-            switch (fh.Version)
-            {
-                case WalVersion:   layout = EntryLayout.V6; break;
-                case WalVersionV5: layout = EntryLayout.V5; break;
-                case WalVersionV4: layout = EntryLayout.V4; break;
-                case WalVersionV3: layout = EntryLayout.V3; break;
-                default:           return (fh.SegmentId, []);
-            }
-            ulong segId       = fh.SegmentId;
-            long  writeOffset = fh.WriteOffset - FileHeaderSize;
-            if (writeOffset <= 0) return (segId, []);
-
-            // The header page and the data pages hit disk independently — a torn header
-            // can claim ANY offset. Clamp to the file so the walk stays inside the view
-            // (unclamped, this was an uncatchable AccessViolation in the engine
-            // constructor: a crash-loop until an operator deleted the file by hand).
-            long maxData = fileSize - FileHeaderSize;
-            if (writeOffset > maxData) writeOffset = maxData;
-
-            int headerSize = HeaderSizeOf(layout);
-            var  entries = new List<WalEntry>();
-            var  longTemplates = new Dictionary<ushort, string>();
-            long pos     = 0;
-            long end     = writeOffset;
-            while (pos + headerSize <= end)
-            {
-                if (!TryParseEntry(ptr, pos, end, layout, longTemplates, out var entry, out long entrySize))
-                    break;
-                entries.Add(entry!);
-                pos += entrySize;
-            }
-            return (segId, entries);
+            _mmf                 = mmf;
+            _view                = view;
+            _ptr                 = ptr;
+            _layout              = layout;
+            _readable            = readable;
+            _end                 = end;
+            SegmentId            = segmentId;
+            Version              = version;
+            HeaderRecordsEntries = recordsEntries;
         }
-        finally
+
+        /// <summary>Opens <paramref name="walPath"/>; a missing, short or foreign file reads as a log of no entries.</summary>
+        public static RecoveryReader Open(string walPath)
         {
-            view.SafeMemoryMappedViewHandle.ReleasePointer();
+            if (!File.Exists(walPath)) return new RecoveryReader();
+            long fileSize = new FileInfo(walPath).Length;
+            if (fileSize < FileHeaderSize) return new RecoveryReader();
+
+            var mmf = MemoryMappedFile.CreateFromFile(walPath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.Read);
+            MemoryMappedViewAccessor? view = null;
+            byte* ptr = null;
+            try
+            {
+                view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
+                view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+
+                ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
+                if (fh.Magic != MagicNumber)
+                    return new RecoveryReader(mmf, view, ptr, EntryLayout.V6, readable: false, 0, 0, false, 0);
+
+                ushort version        = fh.Version;
+                bool   recordsEntries = fh.WriteOffset != FileHeaderSize;
+                // v6 = current. v5 = the releases before it: no trace context. v4: checksummed, no
+                // service. v3: replayable, no per-entry validation possible. Anything else is
+                // unreplayable by construction.
+                EntryLayout layout;
+                bool        known = true;
+                switch (version)
+                {
+                    case WalVersion:   layout = EntryLayout.V6; break;
+                    case WalVersionV5: layout = EntryLayout.V5; break;
+                    case WalVersionV4: layout = EntryLayout.V4; break;
+                    case WalVersionV3: layout = EntryLayout.V3; break;
+                    default:           layout = EntryLayout.V6; known = false; break;
+                }
+
+                // The header page and the data pages hit disk independently — a torn header
+                // can claim ANY offset. Clamp to the file so the walk stays inside the view
+                // (unclamped, this was an uncatchable AccessViolation in the engine
+                // constructor: a crash-loop until an operator deleted the file by hand).
+                long writeOffset = fh.WriteOffset - FileHeaderSize;
+                long maxData     = fileSize - FileHeaderSize;
+                if (writeOffset > maxData) writeOffset = maxData;
+
+                return new RecoveryReader(mmf, view, ptr, layout, readable: known && writeOffset > 0,
+                                          fh.SegmentId, version, recordsEntries, Math.Max(0, writeOffset));
+            }
+            catch
+            {
+                if (ptr != null) view!.SafeMemoryMappedViewHandle.ReleasePointer();
+                view?.Dispose();
+                mmf.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// The next complete entry, or false at the end of the durable data — the first entry that
+        /// does not verify, and everything past it. The record's payload is a span over the mapping:
+        /// valid until this reader is disposed.
+        /// </summary>
+        public bool TryReadNext(out WalRecord record)
+        {
+            record = default;
+            if (_stopped || !_readable || _pos + HeaderSizeOf(_layout) > _end) return false;
+            if (!TryParseRecord(_ptr, _pos, _end, _layout, _longTemplates, out record, out long size))
+            {
+                _stopped = true;
+                return false;
+            }
+            _pos += size;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            if (_view is not null)
+            {
+                if (_ptr != null) _view.SafeMemoryMappedViewHandle.ReleasePointer();
+                _ptr = null;
+                _view.Dispose();
+                _view = null;
+            }
+            _mmf?.Dispose();
+            _mmf = null;
         }
     }
+}
+
+/// <summary>
+/// One entry of a log as <see cref="WriteAheadLog.RecoveryReader"/> reads it: the fields of a
+/// <see cref="WalEntry"/>, with its payload a span over the log's mapping rather than a copy.
+/// </summary>
+public readonly ref struct WalRecord
+{
+    public long               TimestampTicks { get; init; }
+    public LogLevel           Level          { get; init; }
+    public ushort             TemplateIndex  { get; init; }
+    /// <inheritdoc cref="WalEntry.Unpooled"/>
+    public bool               Unpooled       { get; init; }
+    /// <inheritdoc cref="WalEntry.ServiceIndex"/>
+    public int                ServiceIndex   { get; init; }
+    public ulong              TraceIdHi      { get; init; }
+    public ulong              TraceIdLo      { get; init; }
+    public ulong              SpanId         { get; init; }
+    /// <inheritdoc cref="WalEntry.Template"/>
+    public string?            Template       { get; init; }
+    /// <inheritdoc cref="WalEntry.Service"/>
+    public string?            Service        { get; init; }
+    /// <summary>The properties payload, over the mapping: valid until the reader is disposed.</summary>
+    public ReadOnlySpan<byte> Payload        { get; init; }
+    public ExceptionInfo?     Exception      { get; init; }
+
+    /// <inheritdoc cref="WalEntry.ServiceIndexIn"/>
+    public int ServiceIndexIn(IReadOnlyDictionary<ushort, string> poolRows) =>
+        ServiceIndex >= 0 && poolRows.ContainsKey((ushort)ServiceIndex) ? ServiceIndex : -1;
+
+    /// <summary>The entry, materialised: its payload copied into the heap.</summary>
+    public WalEntry ToEntry() => new()
+    {
+        TimestampTicks = TimestampTicks,
+        Level          = Level,
+        TemplateIndex  = TemplateIndex,
+        Unpooled       = Unpooled,
+        ServiceIndex   = ServiceIndex,
+        TraceIdHi      = TraceIdHi,
+        TraceIdLo      = TraceIdLo,
+        SpanId         = SpanId,
+        Template       = Template,
+        Service        = Service,
+        Payload        = Payload.IsEmpty ? [] : Payload.ToArray(),
+        Exception      = Exception,
+    };
 }
 
 public sealed class WalEntry

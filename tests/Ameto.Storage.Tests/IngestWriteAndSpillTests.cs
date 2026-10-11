@@ -126,12 +126,14 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         return gate;
     }
 
-    private static byte[] Props(long n)
+    /// <summary>The event's number; and, with <paramref name="pad"/>, that many bytes of padding beside it.</summary>
+    private static byte[] Props(long n, int pad = 0)
     {
-        var buf = new ArrayBufferWriter<byte>(32);
+        var buf = new ArrayBufferWriter<byte>(32 + pad);
         var w   = new MessagePackWriter(buf);
-        w.WriteMapHeader(1);
+        w.WriteMapHeader(pad > 0 ? 2 : 1);
         w.Write("n"); w.Write(n);
+        if (pad > 0) { w.Write("pad"); w.Write(new string((char)('a' + n % 26), pad)); }
         w.Flush();
         return buf.WrittenSpan.ToArray();
     }
@@ -140,9 +142,10 @@ public sealed class IngestWriteAndSpillTests : IDisposable
 
     /// <summary>
     /// Events <paramref name="from"/>..<paramref name="from"/>+<paramref name="count"/>, one per
-    /// millisecond, each carrying its number, a trace context derived from it and one service.
+    /// millisecond, each carrying its number, a trace context derived from it and one service —
+    /// and <paramref name="pad"/> bytes of padding in its properties (<see cref="Props"/>).
     /// </summary>
-    private static LogWriteBatch Batch(StorageEngine engine, int from, int count)
+    private static LogWriteBatch Batch(StorageEngine engine, int from, int count, int pad = 0)
     {
         var batch = new LogWriteBatch();
         int tmpl  = engine.TemplatePool.Intern("event {n}");
@@ -157,7 +160,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
                 TraceIdHi                = 0xA000_0000_0000_0000UL | (uint)i,
                 TraceIdLo                = (ulong)i * 7 + 1,
                 SpanId                   = (ulong)i * 13 + 1,
-            }, Props(i), "event {n}", exception: null);
+            }, Props(i, pad), "event {n}", exception: null);
         return batch;
     }
 
@@ -1822,5 +1825,151 @@ public sealed class IngestWriteAndSpillTests : IDisposable
 
         using var batch = Batch(engine, 0, 5);
         Assert.Equal(new LogBatchWriteResult(0, 0, 5), await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(5)));
+    }
+
+    // ── Recovery reads the log where it lies ──────────────────────────────────
+
+    /// <summary>
+    /// Padding per event in the tests below: properties enough that a copy of the log in the heap
+    /// stands out from everything else a read allocates, and few enough (410 B, under the 512 B a
+    /// chunk's arena gives each slot) that a tier's worth fills a chunk by count.
+    /// </summary>
+    private const int RecoveryPad = 400;
+
+    /// <summary>
+    /// The startup replay reads an orphaned WAL one entry at a time, where it lies in the file's
+    /// mapping, straight into the recovery tier. It used to collect every entry first, each payload
+    /// copied into a heap array, and so held the log twice — that list beside the tier it then
+    /// filled — at the one moment, the start after a crash, a host has least to spare. Measured on
+    /// the thread that reads, between the seams either side of the read: well under a quarter of
+    /// the properties the log holds, where the copy alone was all of them. Every event comes back
+    /// whole, its properties byte for byte, though the bytes it was written from were the mapping's.
+    /// </summary>
+    [Fact]
+    public async Task The_startup_replay_reads_the_wal_where_it_lies_with_no_copy_of_it_in_the_heap()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, tierBytes: 4 * TierBytes);   // one tier, and so one WAL, takes them all
+        const int Many = 2 * TierEvents;
+        var engine = Engine(opts);
+        try
+        {
+            using var batch = Batch(engine, 0, Many, RecoveryPad);
+            Assert.Equal(Many, (await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(30))).Written);
+            await KillKeepingTheWalAsync(engine, dir);
+        }
+        finally { await engine.DisposeAsync(); }
+
+        // Paired by path: a clean stop leaves its successor's empty WAL beside the one restored, and
+        // the replay looks at that one too — the before seam only, as an empty log is not read.
+        var  before    = new Dictionary<string, long>();
+        long allocated = -1;
+        int  reads     = 0;
+        StorageEngine.BeforeWalReplayReadForTest.Value = wal => before[wal] = GC.GetAllocatedBytesForCurrentThread();
+        StorageEngine.AfterWalReplayReadForTest.Value  = wal =>
+        {
+            allocated = GC.GetAllocatedBytesForCurrentThread() - before[wal];
+            reads++;
+        };
+        StorageEngine restarted;
+        try { restarted = Engine(opts); }
+        finally
+        {
+            StorageEngine.BeforeWalReplayReadForTest.Value = null;
+            StorageEngine.AfterWalReplayReadForTest.Value  = null;
+        }
+        await using (restarted)
+        {
+            await restarted.CatalogLoaded;
+            Assert.Equal(1, reads);   // the restored WAL, read whole on one thread
+
+            long properties = (long)Many * RecoveryPad;
+            Assert.True(allocated < properties / 4,
+                $"reading a WAL of {properties:N0} bytes of properties allocated {allocated:N0} bytes in the heap — a copy of the log");
+
+            var events = ReadAll(restarted);
+            Assert.Equal(Many, events.Count);
+            foreach (var (n, ev) in events)
+            {
+                AssertIsEvent(n, ev);
+                Assert.Equal(Props(n, RecoveryPad), ev.Props);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The despill reads a spill file the same way, one entry at a time from its mapping into the
+    /// tier it flushes, where it used to copy the whole block into the heap first: a backlog of
+    /// spilled blocks came back at twice the memory each block takes — during an overload, which is
+    /// when there are spilled blocks at all. Measured between the seams either side of each read,
+    /// summed over the blocks.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_reads_the_spill_file_where_it_lies_with_no_copy_of_it_in_the_heap()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        const int Total = 3 * TierEvents + 1_000;          // A and B in tiers, the rest spilled
+        using var started   = new ThreadLocal<long>();
+        long      allocated = 0;
+        int       reads     = 0;
+        engine._beforeLoadSpillForTest = _ => started.Value = GC.GetAllocatedBytesForCurrentThread();
+        engine._afterLoadSpillForTest  = _ =>
+        {
+            Interlocked.Add(ref allocated, GC.GetAllocatedBytesForCurrentThread() - started.Value);
+            Interlocked.Increment(ref reads);
+        };
+        try
+        {
+            using (var batch = Batch(engine, 0, Total, RecoveryPad))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.SpilledEvents >= TierEvents, $"only {engine.SpilledEvents} event(s) spilled");
+
+            gate.Set();
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0
+                       && engine.DespilledEvents == engine.SpilledEvents,
+                    "the spill to end and every spilled block to be despilled");
+
+            long properties = engine.SpilledEvents * RecoveryPad;
+            Assert.True(Volatile.Read(ref reads) > 0, "no spill file was read");
+            Assert.True(Volatile.Read(ref allocated) < properties / 4,
+                $"reading {Volatile.Read(ref reads)} spill file(s), {properties:N0} bytes of properties, allocated "
+              + $"{Volatile.Read(ref allocated):N0} bytes in the heap — a copy of the blocks");
+
+            await engine.FlushHotTierAsync();
+            var events = ReadAll(engine);
+            Assert.Equal(Total, events.Count);
+            foreach (var (n, ev) in events)
+            {
+                AssertIsEvent(n, ev);
+                Assert.Equal(Props(n, RecoveryPad), ev.Props);
+            }
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// kill -9 with <paramref name="engine"/>'s live WAL left behind: its bytes kept, the shutdown's
+    /// flush of it undone, so the next start finds it orphaned and replays it.
+    /// </summary>
+    private static async Task KillKeepingTheWalAsync(StorageEngine engine, string dir)
+    {
+        ulong  walId = engine.LiveWalSegmentId;
+        string wal   = Directory.GetFiles(Path.Combine(dir, "wal"), "*.wal").Single();
+        File.Copy(wal, wal + ".crash", overwrite: true);
+        File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+        await engine.DisposeAsync();
+        foreach (var f in Directory.GetFiles(Path.Combine(dir, "segments"), "*.seg"))
+        {
+            var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+        }
+        File.Move(wal + ".crash", wal, overwrite: true);
+        File.Move(wal + ".pool.crash", wal + ".pool", overwrite: true);
     }
 }

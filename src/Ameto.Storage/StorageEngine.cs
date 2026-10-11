@@ -5452,6 +5452,21 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     }
 
     /// <summary>
+    /// Test seam: called with each orphaned WAL's path just before the startup replay reads it —
+    /// throwing from it is a read that failed. An <see cref="AsyncLocal{T}"/>, as
+    /// <see cref="HoldCatalogScanForTest"/> is: the replay runs in the constructor, before a test
+    /// could set anything on the instance. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> BeforeWalReplayReadForTest = new();
+
+    /// <summary>
+    /// Test seam: called with the WAL's path once the startup replay has read every entry into its
+    /// recovery tier, before the tier is flushed — on the thread that read them, as
+    /// <see cref="BeforeWalReplayReadForTest"/> is, so the two bracket the read. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> AfterWalReplayReadForTest = new();
+
+    /// <summary>
     /// Replays every WAL left behind by a previous process, one at a time, then clears markers
     /// whose WAL is already gone.
     ///
@@ -5463,14 +5478,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// or an exception on one level, between the first move and the last was silent, total loss
     /// of the rest of the tier.</para>
     /// </summary>
-    /// <summary>
-    /// Test seam: called with each orphaned WAL's path just before the startup replay reads it —
-    /// throwing from it is a read that failed. An <see cref="AsyncLocal{T}"/>, as
-    /// <see cref="HoldCatalogScanForTest"/> is: the replay runs in the constructor, before a test
-    /// could set anything on the instance. Null in production.
-    /// </summary>
-    internal static readonly AsyncLocal<Action<string>?> BeforeWalReplayReadForTest = new();
-
     private void ReplayOrphanedWals()
     {
         foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
@@ -5504,8 +5511,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (TryParseBlockId(walFile, out ulong namedBlock)) ReserveWalBlock(namedBlock);
         BeforeWalReplayReadForTest.Value?.Invoke(walFile);
 
-        string poolPath   = walFile + ".pool";
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version, out bool recordsEntries);
+        string poolPath = walFile + ".pool";
+        // Read where it lies, one entry at a time, straight into the tier below: the replay used to
+        // collect every entry first, payloads copied into the heap, and held the log twice — that
+        // list beside the tier it filled. Disposed (unmapped) before the file is deleted: on Windows
+        // a mapped file cannot be.
+        using var reader = WriteAheadLog.RecoveryReader.Open(walFile);
+        ulong  segId          = reader.SegmentId;
+        ushort version        = reader.Version;
+        bool   recordsEntries = reader.HeaderRecordsEntries;
 
         // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
         // here. Cleaning it up as the branch below does with what it cannot read is what every
@@ -5536,8 +5550,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
 
         // Empty or corrupt WAL — clean up
-        if (segId == 0 || entries.Count == 0)
+        bool any = reader.TryReadNext(out var record);
+        if (segId == 0 || !any)
         {
+            reader.Dispose();
             try { File.Delete(walFile); } catch { }
             try { File.Delete(poolPath); } catch { }
             if (segId != 0)
@@ -5557,10 +5573,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // The flush of this WAL completed — every level reached disk before the marker did.
         // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
         // (it opens every file), so a catalog lookup here races the enumeration that would
-        // answer it, and losing that race replays a WAL whose events are already cold.
+        // answer it, and losing that race replays a WAL whose events are already cold. Asked
+        // before the log is read past its first entry: a flushed log is not read at all.
         string marker = FlushMarkerPath(segId);
         if (File.Exists(marker))
         {
+            reader.Dispose();
             _logger.LogInformation("WAL {File} already flushed — removing", walFile);
             DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
             return;
@@ -5571,7 +5589,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // template-less instead: timestamp, level, properties and exception all survive,
         // only @mt is lost, and the index below must not alias a live pool entry.
         //
-        // Empty has TWO causes and the warning must name both. Pool writes are only fsynced
+        // Empty has TWO causes and the warning below must name both. Pool writes are only fsynced
         // periodically, so power loss can zero the file — that is the one this started as. But
         // since the template pool stopped writing a row for an event it could not intern, a WAL
         // every one of whose events arrived past a SATURATED pool writes no rows either, and its
@@ -5579,23 +5597,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // only an operator reading "no template pool" as corruption would be wrong.
         var pool         = WriteAheadLog.LoadPool(poolPath);
         bool poolMissing = pool.Count == 0;
-        if (poolMissing)
-        {
-            // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
-            // outside a saturated pool, one too long for a row — and those events replay with it. Only
-            // the others, whose rows the lost pool held, come back without one. (The line used to say
-            // every event replayed without its template, which a log of nothing but such events made
-            // false for every one of them.)
-            int withoutTemplate = 0;
-            foreach (var entry in entries)
-                if (entry.Template is null) withoutTemplate++;
-            if (withoutTemplate > 0)
-                _logger.LogWarning(
-                    "Orphaned WAL {File}: no template pool rows — power loss before the pool was fsynced, or (a log "
-                  + "older than v6) events outside a saturated template pool. {Without} of its {Count} event(s) replay "
-                  + "without a template",
-                    walFile, withoutTemplate, entries.Count);
-        }
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)
@@ -5609,28 +5610,30 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         //
         // Sized from the WAL, not only from today's HotTier.MaxSizeBytes: a restart that lowered
         // the setting used to replay into a tier that refused the WAL's tail, and a refused event
-        // was simply not counted as replayed — lost without a word.
-        long walPayload = 0;
-        foreach (var entry in entries) walPayload += entry.Payload.Length;
-        using var recoveredHot = CreateRecoveryTier(entries.Count, walPayload);
-        int replayed = 0;
-        foreach (var entry in entries)
+        // was simply not counted as replayed — lost without a word. From its bytes, which bound
+        // its payloads and its entries: the tier allocates its chunks as events arrive, so the
+        // bound costs nothing the events themselves do not.
+        using var recoveredHot = CreateRecoveryTier(reader.DataBytes);
+        int count = 0, replayed = 0, withoutTemplate = 0;
+        do
         {
+            count++;
             // Unpooled: the event's template had no pool row when it was logged. Its index field
             // is 0 and names nothing — resolving the 0 attached index 0's template to it. A v6
             // entry carries the text itself (InlineTemplate), attached here with no pool index —
             // claiming one could take a slot a later WAL's rows are force-interned into — and an
             // older entry never stored it, so that event replays with no template.
-            bool noTemplate = poolMissing || entry.Unpooled;
+            bool noTemplate = poolMissing || record.Unpooled;
+            if (poolMissing && record.Template is null) withoutTemplate++;
             var header = new LogEventHeader
             {
-                Id                       = _idGen.Next(entry.TimestampTicks),
-                TimestampUtcTicks        = entry.TimestampTicks,
-                Level                    = entry.Level,
+                Id                       = _idGen.Next(record.TimestampTicks),
+                TimestampUtcTicks        = record.TimestampTicks,
+                Level                    = record.Level,
                 // With no pool the stored index points at whatever the LIVE pool holds
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
-                MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
+                MessageTemplatePoolIndex = noTemplate ? -1 : record.TemplateIndex,
                 // The service the event was logged with (WAL v5): its pool index, whose text
                 // is one of the rows force-interned above — templates and services share the
                 // pool — so the flush below resolves it to the string a normal flush would
@@ -5644,24 +5647,39 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // (`ServiceNamePoolIndex >= 0`). Slot 0 is ordinarily this WAL's first
                 // template, and that is what every recovered event was once stamped with,
                 // permanently, in its segment's @svc column.
-                ServiceNamePoolIndex     = entry.ServiceIndexIn(pool),
+                ServiceNamePoolIndex     = record.ServiceIndexIn(pool),
                 // WAL v6 keeps the trace context; an older entry has none to give back, and an
                 // event replayed out of one comes back unlinked from its trace, as it always did.
-                TraceIdHi                = entry.TraceIdHi,
-                TraceIdLo                = entry.TraceIdLo,
-                SpanId                   = entry.SpanId,
+                TraceIdHi                = record.TraceIdHi,
+                TraceIdLo                = record.TraceIdLo,
+                SpanId                   = record.SpanId,
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = entry.Template ?? (noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex));
+            string tmpl = record.Template ?? (noTemplate ? string.Empty : TemplatePool.Get(record.TemplateIndex));
             // A service logged outside a full pool comes back by the text its entry carries, kept
             // beside the event with no pool index — as the unpooled template is, and for the same reason.
-            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception, entry.Service))
+            if (recoveredHot.TryWrite(header, record.Payload, tmpl, record.Exception, record.Service))
                 replayed++;
         }
-        if (replayed < entries.Count)
+        while (reader.TryReadNext(out record));
+        AfterWalReplayReadForTest.Value?.Invoke(walFile);
+        reader.Dispose();   // the tier holds its own copy now; the mapping goes before the flush
+
+        // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
+        // outside a saturated pool, one too long for a row — and those events replay with it. Only
+        // the others, whose rows the lost pool held, come back without one. (The line used to say
+        // every event replayed without its template, which a log of nothing but such events made
+        // false for every one of them.)
+        if (withoutTemplate > 0)
+            _logger.LogWarning(
+                "Orphaned WAL {File}: no template pool rows — power loss before the pool was fsynced, or (a log "
+              + "older than v6) events outside a saturated template pool. {Without} of its {Count} event(s) replay "
+              + "without a template",
+                walFile, withoutTemplate, count);
+        if (replayed < count)
             _logger.LogError("WAL recovery: {Refused} of {Count} event(s) in {File} did not fit the recovery tier and were not replayed",
-                entries.Count - replayed, entries.Count, walFile);
+                count - replayed, count, walFile);
         _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
 
         // Flush recovered events to cold segments (no index — acceptable for crash recovery),
