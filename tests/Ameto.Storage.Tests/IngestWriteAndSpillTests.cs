@@ -2460,6 +2460,33 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// R4-4, its second half: shutdown goes on past a despill loop that died. The loop survives its
+    /// own failures now, so only a loop that died anyway reaches this — here its start hold faults.
+    /// Shutdown's await of it threw out of DisposeAsync before the final flush, the live tier left in
+    /// its WAL. Unpinned until now: the loop no longer dies in the test above, so a mutant without
+    /// this guard passed it.
+    /// </summary>
+    [Fact]
+    public async Task Shutdown_goes_on_to_its_final_flush_past_a_despill_loop_that_died()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        StorageEngine.HoldDespillForTest.Value = Task.FromException(new OutOfMemoryException("test: the despill loop died"));
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        using (var batch = Batch(engine, 0, 10))
+            Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+
+        await engine.DisposeAsync();
+
+        Assert.NotEmpty(Directory.GetFiles(Path.Combine(dir, "segments"), "*.seg"));   // the final flush ran
+        await using var reopened = Engine(opts);
+        Assert.Equal(10, ReadAll(reopened).Count);
+    }
+
     // ── A block id past the last usable one ───────────────────────────────────
 
     /// <summary>
