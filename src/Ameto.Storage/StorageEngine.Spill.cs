@@ -832,22 +832,22 @@ public sealed partial class StorageEngine
                         file.Path, FlushRetryDelay.TotalSeconds);
                 }
                 catch (Exception) { /* the line is lost; the hand-over below is not */ }
+                // A retry that started owns the slot and the count from here; the block stays queued,
+                // in flight, until it publishes the block — or shutdown leaves it for the next start.
+                // Exactly one side gives the tier up: the retry once it has started (and
+                // TryScheduleFlushRetry throws nothing after that), this catch when it has not.
                 try
                 {
-                    // Owns the slot and the count from here; the block stays queued, in flight, until the
-                    // retry publishes it — or shutdown leaves it for the next start.
-                    ScheduleFlushRetry(tier, file.Path, file.SegId,
-                                       onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
-                                       publishedLevels: file.PublishedLevels);
-                    slotTransferred = true;
+                    slotTransferred = TryScheduleFlushRetry(tier, file.Path, file.SegId,
+                                          onPublished: retried => DespillPublished(file.SegId, retried, afterRetry: true),
+                                          publishedLevels: file.PublishedLevels);
                 }
-                catch (Exception)
-                {
+                catch (Exception) { /* its callback could not be allocated: nothing started */ }
+                if (!slotTransferred)
                     // No retry could be started (out of memory): the block is read from its file again
                     // later instead — the finally queues it — so the tier is given up here, unlisted
                     // and retired, with the levels the attempt moved into place, as the retry would.
                     AbandonDespilledTier(tier, file);
-                }
                 return;
             }
             finally { _flushConcurrency.Release(); }

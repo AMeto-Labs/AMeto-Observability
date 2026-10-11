@@ -1827,6 +1827,273 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         Assert.Equal(new LogBatchWriteResult(0, 0, 5), await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(5)));
     }
 
+    // ── A flush retry and its hand-over ───────────────────────────────────────
+
+    /// <summary>A scheduler that queues nothing: a flush retry started on it is a start that failed.</summary>
+    private sealed class RefusingScheduler : TaskScheduler
+    {
+        protected override void QueueTask(Task task) => throw new OutOfMemoryException("test: the retry could not be queued");
+        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued) => false;
+        protected override IEnumerable<Task> GetScheduledTasks() => [];
+    }
+
+    /// <summary>
+    /// The despill's flush fails once, after its first level; the despill hands its tier to a retry.
+    /// Returns the spilled engine with its first flush released.
+    /// </summary>
+    private async Task<(StorageEngine Engine, ManualResetEventSlim Gate)> DespillWhoseFlushFailsOnceAsync(
+        string dir, Action<StorageEngine> arm, Microsoft.Extensions.Logging.ILogger<StorageEngine>? logger = null)
+    {
+        var engine = OneSlotEngine(Options(dir), logger);
+        var gate   = HoldFirstFlush(engine);
+        engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+        engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+        using (var batch = Batch(engine, 0, 2 * TierEvents + 1_000))   // A, B in tiers; the rest spilled
+            Assert.Equal(new LogBatchWriteResult(2 * TierEvents + 1_000, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+        Assert.True(engine.IsSpilling);
+
+        int despilling = 0, failed = 0;
+        engine._beforeLoadSpillForTest = _ => Volatile.Write(ref despilling, 1);
+        var parkFirst = engine._afterLevelPublished;
+        engine._afterLevelPublished = level =>
+        {
+            parkFirst?.Invoke(level);
+            if (Volatile.Read(ref despilling) == 1 && Interlocked.Exchange(ref failed, 1) == 0)
+                throw new IOException("test: the despill's flush fails after a level");
+        };
+        arm(engine);
+        gate.Set();
+        return (engine, gate);
+    }
+
+    /// <summary>
+    /// H2. A retry that has started owns the tier, its slot and its heavy phase, whatever happens next
+    /// in the call that started it. Task.Run allocated its promise after queueing the work, and the
+    /// bookkeeping came after that: an out-of-memory there reached the despill as "no retry", and the
+    /// despill gave the tier up — unlisted, retired, freed — while the retry went on to flush it every
+    /// 15 s (an access violation), or, if a reader kept it alive, raced the block's second despill and
+    /// unlinked a level it had published. The throw here comes right after the start; the retry is
+    /// held at its first attempt while the test looks.
+    /// </summary>
+    [Fact]
+    public async Task A_throw_right_after_a_despills_retry_has_started_does_not_take_the_tier_from_the_retry()
+    {
+        int thrown = 0, tearDown = 0;
+        using var attempt = new ManualResetEventSlim(false);
+        var (engine, gate) = await DespillWhoseFlushFailsOnceAsync(NewDir(), e =>
+        {
+            e._afterFlushRetryStartForTest = () =>
+            {
+                if (Interlocked.Exchange(ref thrown, 1) == 0) throw new OutOfMemoryException("test: right after the retry's start");
+            };
+            e._beforeFlushRetryAttemptForTest = () =>
+            {
+                attempt.Wait(HangGuard);
+                if (Volatile.Read(ref tearDown) == 1) throw new OperationCanceledException("test: torn down before the attempt");
+            };
+        });
+        try
+        {
+            WaitFor(() => Volatile.Read(ref thrown) == 1 && engine.DespillsCompletedForTest == 1,
+                    "the despill to hand its tier over and return", ShortGuard);
+
+            // The retry has the tier: still listed (queries serve it), its block still pending, its
+            // heavy phase still counted — none of it given back by the despill.
+            Assert.Equal(1, engine.FrozenTierCountForTest);
+            Assert.Equal(1, engine.SpillFilesPending);
+            Assert.Equal(1, engine.HeavyPhasesInFlight);
+
+            attempt.Set();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents
+                       && engine.HeavyPhasesInFlight == 0,
+                    "the retry to publish the block", ShortGuard);
+            Assert.Equal(0, engine.FrozenTierCountForTest);
+            Assert.Equal(1, engine.DespillsCompletedForTest);   // the block was not despilled a second time
+            await engine.FlushHotTierAsync();
+            Assert.Equal(2 * TierEvents + 1_000, ReadAll(engine).Count);
+        }
+        finally
+        {
+            Volatile.Write(ref tearDown, 1);   // a retry still parked leaves without touching its tier
+            attempt.Set();
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// H2, the other side. A retry that cannot be started — out of memory before the start, here the
+    /// scheduler refusing it — leaves the tier with the despill, which gives it up exactly once: the
+    /// block is read from its file again and despilled, once. The retry's entry, taken before the
+    /// start, does not outlive it (shutdown awaits every entry).
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_retry_cannot_start_gives_its_tier_up_once_and_despills_the_block_again()
+    {
+        var (engine, gate) = await DespillWhoseFlushFailsOnceAsync(NewDir(), e => e._flushRetrySchedulerForTest = new RefusingScheduler());
+        try
+        {
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents
+                       && engine.HeavyPhasesInFlight == 0,
+                    "the block to be despilled again from its file", ShortGuard);
+            Assert.Equal(2, engine.DespillsCompletedForTest);
+            Assert.Equal(0, engine.FrozenTierCountForTest);
+            Assert.Empty(engine.InFlightFlushTasks());
+            await engine.FlushHotTierAsync();
+            Assert.Equal(2 * TierEvents + 1_000, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            var disposing = engine.DisposeAsync().AsTask();
+            Assert.True(await Task.WhenAny(disposing, Task.Delay(ShortGuard)) == disposing, "shutdown waited for a retry that never started");
+        }
+    }
+
+    /// <summary>
+    /// The swap's own flush hands its tier to a retry the same way, and its error line stood
+    /// unguarded before the hand-over (the despill's was guarded in d6399f5): a throw from it left
+    /// the tier listed and never flushed, while the slot and the heavy phase went back.
+    /// </summary>
+    [Fact]
+    public async Task A_swapped_tier_whose_flush_fails_reaches_its_retry_even_when_the_error_line_throws()
+    {
+        var logger = new ThrowingLogger(line => line.Contains("Segment flush failed", StringComparison.Ordinal));
+        var engine = OneSlotEngine(Options(NewDir()), logger);
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int failed = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after a level");
+        };
+        try
+        {
+            using (var batch = Batch(engine, 0, 500))
+                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            try { await engine.FlushHotTierAsync(); }
+            catch (OutOfMemoryException) { /* the unguarded line, before the fix */ }
+
+            Assert.Equal(1, logger.Thrown);
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "the failed tier to be flushed by its retry", ShortGuard);
+            Assert.Equal(500, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// The swap's tier whose retry cannot be started (the new failure path of the hand-over): its slot
+    /// and heavy phase go back once, and the tier stays listed — queries go on serving it — until
+    /// shutdown frees it; its WAL stays, and the next start replays every event once, though the failed
+    /// attempt had moved a level file into place.
+    /// </summary>
+    [Fact]
+    public async Task A_swapped_tier_whose_retry_cannot_start_stays_served_and_comes_back_once_at_the_next_start()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        var    engine = OneSlotEngine(opts);
+        int failed = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after a level");
+        };
+        engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be started");
+        try
+        {
+            using (var batch = Batch(engine, 0, 500))
+                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            try { await engine.FlushHotTierAsync(); }
+            catch (OutOfMemoryException) { /* before the fix the start's throw escaped */ }
+
+            Assert.Equal(0, engine.HeavyPhasesInFlight);
+            Assert.Equal(1, engine.FrozenTierCountForTest);
+            Assert.Empty(engine.InFlightFlushTasks());
+            using (var reader = engine.OpenHotTierReader())
+                Assert.Equal(500, reader.ReadAll().Count());
+            Assert.Empty(ReadAll(engine));   // in no segment yet
+        }
+        finally { await engine.DisposeAsync(); }
+
+        await using var restarted = OneSlotEngine(opts);
+        await restarted.CatalogLoaded;
+        var events = ReadAll(restarted);
+        Assert.Equal(500, events.Count);
+        foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+    }
+
+    /// <summary>
+    /// A retry that has published its tier is done, whatever its success line does. The line sat in
+    /// the attempt, and a throw from it sent the loop round again: the next attempt unlinked the level
+    /// files just published — registered segments — and flushed the tier PublishFlushedTier had just
+    /// handed to be freed (a reader here keeps it alive, or that is an access violation). The block's
+    /// level is written twice where once is right.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_retry_whose_success_line_throws_does_not_write_its_block_again()
+    {
+        var logger = new ThrowingLogger(line => line.Contains("Frozen-tier flush retry succeeded", StringComparison.Ordinal));
+        var engine = OneSlotEngine(Options(NewDir()), logger);
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int levelWrites = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Increment(ref levelWrites) == 1) throw new IOException("test: the flush fails after a level");
+        };
+        try
+        {
+            using (var batch = Batch(engine, 0, 500))
+                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            using (engine.OpenHotTierReader())   // keeps the tier's memory alive whatever the retry does
+            {
+                await engine.FlushHotTierAsync();
+                WaitFor(() => logger.Thrown == 1 && engine.HeavyPhasesInFlight == 0 && engine.InFlightFlushTasks().Length == 0,
+                        "the retry to publish the block and end", ShortGuard);
+            }
+
+            Assert.Equal(2, Volatile.Read(ref levelWrites));   // the failed attempt's level, and the retry's
+            foreach (var seg in engine.ListSegments())
+                Assert.True(File.Exists(seg.FilePath), $"{seg.FilePath} is in the catalog and not on disk");
+            Assert.Equal(500, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Publishing a flushed tier is done once its segments are registered and the tier unlisted:
+    /// what follows — the log line, the SegmentFlushed subscribers (replication), the WAL's delete,
+    /// the tier's retirement — is best-effort and throws nothing. A subscriber that threw used to
+    /// skip the WAL's delete and the tier's retirement, and reached the flush's caller as a failure
+    /// of a flush that had published (in the retry loop, as a reason to write the block again).
+    /// </summary>
+    [Fact]
+    public async Task A_segment_flushed_subscriber_that_throws_does_not_undo_a_published_flush()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        int calls = 0;
+        engine.SegmentFlushed = _ =>
+        {
+            Interlocked.Increment(ref calls);
+            throw new OutOfMemoryException("test: the subscriber runs out of memory");
+        };
+        try
+        {
+            using (var batch = Batch(engine, 0, 500))
+                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            ulong walId = engine.LiveWalSegmentId;
+            await engine.FlushHotTierAsync();   // threw the subscriber's exception before
+
+            Assert.Equal(1, calls);
+            Assert.Equal(0, engine.FrozenTierCountForTest);
+            Assert.NotEqual(walId, engine.LiveWalSegmentId);
+            Assert.DoesNotContain(Directory.GetFiles(Path.Combine(dir, "wal"), "*.wal"),
+                f => Path.GetFileNameWithoutExtension(f).EndsWith($"-{walId}", StringComparison.Ordinal));   // the published tier's WAL is gone
+            Assert.Equal(500, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
     // ── Recovery reads the log where it lies ──────────────────────────────────
 
     /// <summary>

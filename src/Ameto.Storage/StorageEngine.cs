@@ -2508,11 +2508,33 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // RAM: slot exhaustion skips further swaps → spill, or ingest waits) that
                 // re-attempts until the disk recovers or the engine shuts down — in which
                 // case the tier's WAL replays it on the next start.
-                _logger.LogError(ex,
-                    "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
-                    FlushRetryDelay.TotalSeconds);
-                ScheduleFlushRetry(oldHot, oldWalPath, reservedSegId);
-                slotTransferred = true;
+                //
+                // Nothing in here may throw past the hand-over (as in the despill's catch): the line
+                // below used to be unguarded, and a throw from it left the tier listed and never
+                // flushed while the finally gave its slot and heavy phase back.
+                try
+                {
+                    _logger.LogError(ex,
+                        "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
+                        FlushRetryDelay.TotalSeconds);
+                }
+                catch (Exception) { /* the line is lost; the hand-over below is not */ }
+                slotTransferred = TryScheduleFlushRetry(oldHot, oldWalPath, reservedSegId);
+                if (!slotTransferred)
+                {
+                    // No retry could be started (out of memory): the tier stays listed, and queries go
+                    // on serving it, until shutdown frees it; its WAL stays on disk and the next start
+                    // replays it, skipping the levels the failed attempt got out. Its slot and heavy
+                    // phase go back below — holding them for a tier nothing will flush would wedge
+                    // ingest behind it.
+                    try
+                    {
+                        _logger.LogError(
+                            "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
+                            "until shutdown, and its WAL replays it at the next start", reservedSegId);
+                    }
+                    catch (Exception) { /* the line is lost */ }
+                }
                 return;
             }
             finally { _flushConcurrency.Release(); }
@@ -2665,20 +2687,40 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private void PublishFlushedTier(List<SegmentInfo> written, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
     {
-        // Register the cold segments AND drop oldHot from the frozen list atomically.
+        // Register the cold segments AND drop oldHot from the frozen list atomically. A loop, not
+        // RemoveAll(lambda): the lambda was allocated after the segments were registered.
         lock (_frozenLock)
         {
             foreach (var w in written) PublishLocalSegment(w);
-            _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
+            for (int i = _frozenHot.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_frozenHot[i].Tier, oldHot)) _frozenHot.RemoveAt(i);
         }
-        _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
-            written.Count, written.Sum(w => (long)w.EventCount));
 
-        foreach (var w in written) SegmentFlushed?.Invoke(w);
+        // PUBLISHED. Nothing below throws: a caller takes a throw for "not published", and the flush
+        // retry then went round again — unlinking the level files just registered and flushing a
+        // tier handed to be freed. Each step is best-effort and says so when it fails.
+        try
+        {
+            long events = 0;
+            foreach (var w in written) events += w.EventCount;
+            _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total", written.Count, events);
+        }
+        catch (Exception) { /* the line is lost */ }
+
+        foreach (var w in written)
+        {
+            try { SegmentFlushed?.Invoke(w); }
+            catch (Exception ex)
+            {
+                try { _logger.LogWarning(ex, "A subscriber to SegmentFlushed failed for {File}", w.FilePath); }
+                catch (Exception) { /* the line is lost */ }
+            }
+        }
 
         if (oldWalPath is not null) DeleteLogAndMarker(oldWalPath, reservedSegId);
 
-        RetireHotTier(oldHot);
+        try { RetireHotTier(oldHot); }
+        catch (Exception) { /* out of memory growing the retire list: the tier's native memory is lost, never freed under a reader */ }
     }
 
     /// <summary>
@@ -2695,13 +2737,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private void DeleteLogAndMarker(string logPath, ulong segId)
     {
+        // Never throws: it runs after a block was published (PublishFlushedTier).
         bool gone = true;
         try { _deleteWalFile(logPath); }
         catch (Exception ex)
         {
             gone = !File.Exists(logPath);
             if (!gone)
-                _logger.LogWarning(ex, "Failed to delete {Path} — its completion marker is kept, and the next start deletes both", logPath);
+                try { _logger.LogWarning(ex, "Failed to delete {Path} — its completion marker is kept, and the next start deletes both", logPath); }
+                catch (Exception) { /* the line is lost; the marker is kept all the same */ }
         }
         try { _deleteWalFile(logPath + ".pool"); } catch { /* best-effort */ }
         if (gone)
@@ -2725,65 +2769,142 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// A despill's levels an earlier run published (see <c>FlushTierByLevelAsync</c>): kept on disk
     /// and not written again. The retry used to unlink them as leftovers and rewrite every level.
     /// </param>
-    private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
-                                    Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0)
+    /// <returns>
+    /// True once the retry has started: from then on it owns the tier, its slot and its heavy-phase
+    /// count, and nothing here throws. False when it could not be started (out of memory before the
+    /// start): nothing of it runs, and the caller still owns all three — exactly one of the two
+    /// gives them up. Never throws.
+    /// </returns>
+    private bool TryScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                       Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0)
     {
-        var t = Task.Run(async () =>
+        // Everything the retry needs is allocated BEFORE it starts: its task, the promise DisposeAsync
+        // awaits, the continuation that forgets it, and its entry in _inFlightFlushes. Task.Run
+        // allocated its promise after queueing the work, and the bookkeeping came after that: an
+        // out-of-memory there reached the caller as "not started" while the retry was running, and
+        // the caller freed the tier the retry went on to flush.
+        Task<Task>? start = null;
+        Task?       retry = null;
+        try
         {
-            try
+            _beforeFlushRetryStartForTest?.Invoke();
+            start = NewFlushRetryTask(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels);
+            retry = start.Unwrap();
+            _ = retry.ContinueWith(
+                static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+                _inFlightFlushes, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            _inFlightFlushes[retry] = 0;
+            // The hand-over. Start throws only when the work could not be queued — the task is then
+            // faulted, never run, and its promise completes for anyone awaiting it.
+            start.Start(_flushRetrySchedulerForTest ?? TaskScheduler.Default);
+        }
+        catch (Exception)
+        {
+            // Not started. An entry the dictionary took before it threw must not outlive this:
+            // DisposeAsync awaits every entry, and this one would never complete.
+            if (retry is not null) _inFlightFlushes.TryRemove(retry, out _);
+            return false;
+        }
+
+        // Started: the retry owns the tier. Anything here runs after the hand-over and must not undo it.
+        try { _afterFlushRetryStartForTest?.Invoke(); }
+        catch (Exception) { /* the retry has the tier, its slot and its count */ }
+        return true;
+    }
+
+    /// <summary>Test seam: runs before a flush retry is set up; throwing from it is a retry that could not be started.</summary>
+    internal Action? _beforeFlushRetryStartForTest;
+
+    /// <summary>
+    /// Test seam: runs right after a flush retry has started, where Task.Run's promise and the
+    /// bookkeeping used to allocate; throwing from it must not undo the hand-over.
+    /// </summary>
+    internal Action? _afterFlushRetryStartForTest;
+
+    /// <summary>Test seam: the scheduler a flush retry is started on; one that refuses the task is a start that failed.</summary>
+    internal TaskScheduler? _flushRetrySchedulerForTest;
+
+    /// <summary>Test seam: runs as a flush retry begins an attempt, before it touches the tier.</summary>
+    internal Action? _beforeFlushRetryAttemptForTest;
+
+    /// <summary>
+    /// The retry's task, not started. Its own method so the closure over the arguments is allocated
+    /// in here, inside the caller's try — captured by a lambda in the caller, they were allocated
+    /// on entry, before any of its code ran.
+    /// </summary>
+    private Task<Task> NewFlushRetryTask(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                         Action<List<SegmentInfo>>? onPublished, byte publishedLevels) =>
+        new(() => FlushRetryLoopAsync(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels));
+
+    /// <summary>The flush retry itself (see <see cref="TryScheduleFlushRetry"/>).</summary>
+    private async Task FlushRetryLoopAsync(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                           Action<List<SegmentInfo>>? onPublished, byte publishedLevels)
+    {
+        try
+        {
+            while (true)
             {
-                while (true)
+                await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
+                List<SegmentInfo> written;
+                try
                 {
-                    await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
+                    _beforeFlushRetryAttemptForTest?.Invoke();
+                    await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
                     try
                     {
-                        await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
-                        List<SegmentInfo> written;
-                        try
-                        {
-                            // The failed attempt may have MOVED some level files into place
-                            // without registering them (the publish block never ran, so no
-                            // query, merge or replication can hold them). Delete the
-                            // leftovers and rewrite the whole block — simpler to prove
-                            // correct than resuming, and the block's ids are reserved to
-                            // this WAL so nothing else can have produced these files. Save
-                            // a despill's levels an EARLIER run published: those are
-                            // registered segments, and are kept and not rewritten.
-                            DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
-                            written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
-                        }
-                        finally { _flushConcurrency.Release(); }
-
-                        PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
-                        _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId);
-                        try { onPublished?.Invoke(written); }
-                        catch (Exception ex) { _logger.LogWarning(ex, "Bookkeeping after the retry of block {Block} failed", reservedSegId); }
-                        return;
+                        // The failed attempt may have MOVED some level files into place
+                        // without registering them (the publish block never ran, so no
+                        // query, merge or replication can hold them). Delete the
+                        // leftovers and rewrite the whole block — simpler to prove
+                        // correct than resuming, and the block's ids are reserved to
+                        // this WAL so nothing else can have produced these files. Save
+                        // a despill's levels an EARLIER run published: those are
+                        // registered segments, and are kept and not rewritten.
+                        DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
+                        written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
                     }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
+                    finally { _flushConcurrency.Release(); }
+
+                    PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    try
                     {
                         _logger.LogError(ex,
                             "Frozen-tier flush retry failed for block {Block} — next attempt in {Delay}s",
                             reservedSegId, FlushRetryDelay.TotalSeconds);
                     }
+                    catch (Exception) { /* the line is lost; the next attempt is not */ }
+                    continue;
                 }
+
+                // Published: the block is registered and the tier retired. Nothing from here goes
+                // round again — the success line used to sit inside the attempt, and a throw from it
+                // sent the loop into a second attempt, which unlinked the level files just
+                // published (registered segments) and flushed a tier already handed to be freed.
+                try { _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId); }
+                catch (Exception) { /* the line is lost */ }
+                try { onPublished?.Invoke(written); }
+                catch (Exception ex)
+                {
+                    try { _logger.LogWarning(ex, "Bookkeeping after the retry of block {Block} failed", reservedSegId); }
+                    catch (Exception) { /* the line is lost */ }
+                }
+                return;
             }
-            catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
-            catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
-            finally
-            {
-                // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
-                try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
-                EndHeavyPhase();
-                OnFlushSlotReleased();
-            }
-        });
-        _inFlightFlushes[t] = 0;
-        _ = t.ContinueWith(
-            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-            _inFlightFlushes, CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+        catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
+        catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
+        finally
+        {
+            // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
+            try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
+            EndHeavyPhase();
+            OnFlushSlotReleased();
+        }
     }
 
     /// <summary>
@@ -6369,8 +6490,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try { RetryPendingSegmentDeletes(); } catch { /* best-effort */ }
 
         // Flushes scheduled before shutdown. Not the guarantee (see _inFlightFlushes) — only a
-        // way to let them finish before the final flush competes with them for the lock.
-        try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
+        // way to let them finish before the final flush competes with them for the lock. Within the
+        // budget: an entry whose task never started cannot hold shutdown for good.
+        try { await CompletesBy(Task.WhenAll(_inFlightFlushes.Keys.ToArray()), deadline).ConfigureAwait(false); }
+        catch { /* best-effort */ }
 
         // ── Final flush. Waits for its turn at the lock and for a slot rather than dropping out
         //    when a racing flush holds either: dropping out left the live tier to the WAL replay.
