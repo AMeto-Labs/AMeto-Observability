@@ -256,6 +256,15 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         if (_chunkPayloadTails[ci] + payloadLen > ChunkPayloadBytes)
             return false;
 
+        // ── The managed side arrays, rented BEFORE anything is stored. A rent (a 128 KB array) is
+        //    the step below that can throw, and a write that throws must have stored nothing: its
+        //    caller takes it for "nothing written" and tries the event again. The template used to
+        //    be stored ahead of the exception's rent, and a rent that ran out of memory left it in
+        //    the slot — where the next event written there, with no template of its own, read it
+        //    as its own.
+        string?[]?        templates  = template  is not null ? _chunkTemplates[ci]  ??= RentSlotsFor<string?>()        : _chunkTemplates[ci];
+        ExceptionInfo?[]? exceptions = exception is not null ? _chunkExceptions[ci] ??= RentSlotsFor<ExceptionInfo?>() : _chunkExceptions[ci];
+
         // ── Write payload ────────────────────────────────────────────────────
         byte* dest = ChunkPayloadPtr(ci) + _chunkPayloadTails[ci];
         if (payloadLen > 0)
@@ -268,17 +277,11 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         h.HasException          = exception is not null;
         ChunkHeadersPtr(ci)[si] = h;
 
-        // ── Store template (managed, parallel to header) ────────────────────
-        if (template is not null)
-        {
-            var arr = _chunkTemplates[ci] ??= RentSlots<string?>();
-            arr[si] = template;
-        }
-        if (exception is not null)
-        {
-            var arr = _chunkExceptions[ci] ??= RentSlots<ExceptionInfo?>();
-            arr[si] = exception;
-        }
+        // ── Store template and exception (managed, parallel to header) ──────
+        //    Every slot of a rented array written, set or not: nothing left in it by a write that
+        //    never published can be read as this event's.
+        if (templates  is not null) templates[si]  = template;
+        if (exceptions is not null) exceptions[si] = exception;
 
         _chunkPayloadTails[ci] += payloadLen;
         _payloadBytes          += payloadLen;
@@ -560,6 +563,20 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         Array.Clear(arr);
         return arr;
     }
+
+    /// <summary><see cref="RentSlots{T}"/> for the write path, behind its test seam.</summary>
+    private T[] RentSlotsFor<T>()
+    {
+        _beforeSlotRentForTest?.Invoke(typeof(T));
+        return RentSlots<T>();
+    }
+
+    /// <summary>
+    /// Test seam: called with the element type as the write path is about to rent a chunk's
+    /// template or exception array — throwing from it is a rent that ran out of memory. Reached
+    /// once per chunk and kind, not per event. Null in production.
+    /// </summary>
+    internal Action<Type>? _beforeSlotRentForTest;
 }
 
 /// <summary>

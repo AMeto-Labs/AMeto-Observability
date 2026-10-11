@@ -243,6 +243,31 @@ public sealed class HotTierSlotArrayRecyclingTests
         Assert.All(events.Where(e => e.Id.RawValue != new EventId(0u, 3u).RawValue), e => Assert.Null(e.Exception));
     }
 
+    /// <summary>
+    /// A write that throws stored nothing — the caller takes the throw for exactly that and writes
+    /// the event again. The template used to be stored in its slot before the exception array was
+    /// rented, so a rent that ran out of memory left it there, and the next event written into the
+    /// slot, with no template of its own, came back with it.
+    /// </summary>
+    [Fact]
+    public void A_write_that_throws_renting_its_exception_array_leaves_its_template_to_no_later_event()
+    {
+        var ex = new ExceptionInfo { Type = "T", Message = "m" };
+        using var tier = new HotTierSegment(64, 64 * 1024);
+        tier._beforeSlotRentForTest = t =>
+        {
+            if (t == typeof(ExceptionInfo)) throw new OutOfMemoryException("test: no 128 KB array for the exceptions");
+        };
+        Assert.Throws<OutOfMemoryException>(() => tier.TryWrite(Header(0), ReadOnlySpan<byte>.Empty, "the failed write's {n}", ex));
+        Assert.Equal(0, tier.Count);
+
+        tier._beforeSlotRentForTest = null;
+        Assert.True(tier.TryWrite(Header(1), ReadOnlySpan<byte>.Empty, template: null, exception: null));   // the same slot
+
+        Assert.Null(tier.GetTemplate(0));
+        Assert.Null(tier.GetException(0));
+    }
+
     private static LogEventHeader Header(int seq) => new()
     {
         Id                = new EventId(0u, (uint)seq).RawValue,
