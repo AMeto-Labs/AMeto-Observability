@@ -696,6 +696,176 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── A swap that fails ─────────────────────────────────────────────────────
+
+    /// <summary>One event outside every batch here, for a write that only has to be refused.</summary>
+    private static bool TryWriteOne(StorageEngine engine, int n) => engine.TryWrite(new LogEventHeader
+    {
+        TimestampUtcTicks        = T0 + n * TimeSpan.TicksPerMillisecond,
+        Level                    = LogLevel.Information,
+        MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+        ServiceNamePoolIndex     = engine.TemplatePool.Intern("spill.svc"),
+    }, Props(n), "event {n}");
+
+    /// <summary>
+    /// The despill does not yield its slot to a swap that cannot install. It yields to a live tier
+    /// that refuses writes, so the swap gets the slot first — but the swap here keeps failing (the
+    /// stand-in for an NTFS volume too full for the next 64 MB WAL), so the slot sat idle and the
+    /// backlog, whose despill is what would free that disk, stayed pending for as long as it failed.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_is_not_starved_by_a_swap_that_keeps_failing()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir, spill: false);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+
+        // The backlog: a block an earlier run spilled.
+        const ulong Block = 9_000;
+        const int   Spilled = 300, From = 100_000;
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(Block), 1 << 20))
+            for (int i = From; i < From + Spilled; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "spill.svc");
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        int swaps = 0;
+        engine._beforeSwap = () =>
+        {
+            Interlocked.Increment(ref swaps);
+            throw new IOException("test: no room on the volume for the next WAL");
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
+            WaitFor(() => Volatile.Read(ref swaps) >= 1 && engine.LiveHotTierRefused, "the swap to fail");
+
+            hold.SetResult();   // the despill loop starts, with the only slot free and the swap failing
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == Spilled,
+                    "the backlog to be despilled while the swap fails", ShortGuard);
+        }
+        finally
+        {
+            hold.TrySetResult();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A swap that failed asks for itself again. It used to be asked for again only by a writer that
+    /// came back to find the tier still refusing — so once the requests had given up (503), nothing
+    /// did, and the tier went on refusing after the failure had cleared, until MaxAge.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_that_failed_is_tried_again_with_no_write_asking()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(100);
+        int failures = 2;
+        engine._beforeSwap = () =>
+        {
+            if (Interlocked.Decrement(ref failures) >= 0) throw new IOException("test: no room on the volume for the next WAL");
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // refused; nothing writes from here on
+
+            WaitFor(() => !engine.LiveHotTierRefused && engine.LiveHotTier.Count == 0,
+                    "the failed swap to be tried again, and install", ShortGuard);
+            Assert.True(TryWriteOne(engine, TierEvents));
+        }
+        finally
+        {
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The same for the swap that ends a spill: asked for once, by the flush that freed the slot, and
+    /// lost when it failed — the spill went on beside an idle slot until its block filled or MaxAge.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_that_would_end_a_spill_and_fails_is_tried_again()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(100);
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling);
+
+            int failures = 1;
+            engine._beforeSwap = () =>
+            {
+                if (Interlocked.Decrement(ref failures) >= 0) throw new IOException("test: no room on the volume for the next WAL");
+            };
+            gate.Set();   // A's flush ends; the swap that would end the spill fails once
+
+            WaitFor(() => Volatile.Read(ref failures) <= 0, "the swap that ends the spill to fail");
+            WaitFor(() => !engine.IsSpilling, "the spill to end on the retried swap", ShortGuard);
+            Assert.True(Volatile.Read(ref failures) < 0, "the spill ended without the swap being tried again");
+        }
+        finally
+        {
+            gate.Set();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A swap that failed is not tried again by every waiting writer's re-check — ten a second per
+    /// writer, each one creating a 64 MB WAL on the disk that has just refused one — but about once
+    /// per retry delay.
+    /// </summary>
+    [Fact]
+    public async Task A_failing_swap_is_tried_about_once_per_retry_delay_not_by_every_waiting_writer()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir, spill: false));
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(250);
+        engine._roomRecheckMs  = 10;
+        int attempts = 0;
+        engine._beforeSwap = () =>
+        {
+            Interlocked.Increment(ref attempts);
+            throw new IOException("test: no room on the volume for the next WAL");
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            using (var b = Batch(engine, TierEvents, 10))
+                Assert.Equal(new LogBatchWriteResult(0, 0, 10), await engine.WriteBatchAsync(b, TimeSpan.FromSeconds(1)));
+
+            // About 1 s of waiting at a 10 ms re-check: a hundred requests for the swap. At most one
+            // attempt per 250 ms gets through, plus the first and the one each retry makes.
+            Assert.InRange(Volatile.Read(ref attempts), 1, 12);
+        }
+        finally
+        {
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
     /// <summary>
     /// A despill whose read of the spilled block fails — out of memory materialising it, the file
     /// held by a scanner — is tried again, and its block counts as pending meanwhile. The loop used

@@ -433,10 +433,16 @@ public sealed partial class StorageEngine
     /// <summary>
     /// A flush slot came free. If the engine is spilling, or its live tier is refusing writes, a
     /// swap can now install a fresh tier; and the despill may have a slot to take.
+    ///
+    /// <para>A swap that failed earlier gets this slot first, at once: what it failed on may have
+    /// cleared — the flush or despill that just ended freed disk and memory — so its failure is
+    /// forgotten here, and the despill yields to it again until it fails once more.</para>
     /// </summary>
     private void OnFlushSlotReleased()
     {
         if (Volatile.Read(ref _writesClosed) != 0) return;
+        Volatile.Write(ref _swapFailedAt, 0);
+        Volatile.Write(ref _swapRetryAt, 0);
         var w = _write;
         if (w.Spill is not null || Volatile.Read(ref w.HotRefused)) ScheduleFlush();
         WakeDespill();
@@ -529,7 +535,8 @@ public sealed partial class StorageEngine
     /// Despills queued blocks, oldest first, one at a time, each in a free flush slot — and none while the live tier
     /// needs the slot: while the engine is spilling, or while the live tier is refusing writes. A
     /// slot that comes free then goes to the swap, so new events are searchable again first and the
-    /// backlog drains behind them.
+    /// backlog drains behind them — unless that swap has just failed (OnSwapFailed), when the slot
+    /// would otherwise sit idle.
     /// </summary>
     private async Task RunDespillLoopAsync(Task? heldUntil, CancellationToken ct)
     {
@@ -555,8 +562,12 @@ public sealed partial class StorageEngine
                 // ahead of the swap the release had queued with Task.Run: with spilling off and a
                 // backlog of spill files left by an earlier run, every slot that came free went to
                 // the next despill while requests waited out BackPressureWait and were answered 503.
+                // But not to a swap that cannot install: one that has failed since the last slot
+                // came free (a disk too full for the next WAL, say) would leave the slot idle, and
+                // the backlog — whose despill is what frees that disk — unwritten for as long as
+                // it went on failing.
                 var live = _write;
-                if (live.Spill is not null || Volatile.Read(ref live.HotRefused)) break;
+                if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
 
                 SpillFile next = default;
                 lock (_spillQueueLock)

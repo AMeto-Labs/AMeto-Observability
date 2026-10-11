@@ -2315,6 +2315,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (onlyIfStillWanted) Volatile.Write(ref _swapRequested, 1);
         if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
             return; // a swap is already in progress — and its release asks again for this one
+        bool swapFailed = false;
         try
         {
             // Every request made before this line is answered by the state read below.
@@ -2323,6 +2324,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // Again under the lock: shutdown takes this lock after closing, so a flush that got
             // here first either sees the close or swaps before shutdown counts what is running.
             if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
+
+            // A swap that failed a moment ago is not tried again by every write's request: each
+            // writer waiting for room asks ten times a second, and each attempt would create a
+            // 64 MB WAL on a disk that has just refused one, or allocate a tier that has just failed
+            // to be. The failure has asked for its own retry (OnSwapFailed). With no slot free there
+            // is nothing to hold back: the spill below may still take the events.
+            if (onlyIfStillWanted && SwapBackingOff() && _flushSlots.CurrentCount != 0) return;
 
             _beforeSwap?.Invoke();
 
@@ -2395,6 +2403,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 throw;
             }
 
+            // Installed: whatever failed before has cleared.
+            Volatile.Write(ref _swapFailedAt, 0);
+            Volatile.Write(ref _swapRetryAt, 0);
+
             // ── SWAPPED. The heavy phase below owns the slot and the count from here, and nothing
             //    may stand between them and it. Ending a spill used to sit inside the try above —
             //    a Task.Run, a dictionary insert, a log line — so an out-of-memory there gave the
@@ -2419,7 +2431,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 }
             }
         }
-        finally { ReleaseFlushLock(); }
+        catch when (!finalFlush)
+        {
+            // Nothing was swapped: everything that can throw above runs before the install, and
+            // nothing after it throws (the spill's end is guarded). Shutdown's final flush is not
+            // asked again — its WAL replays the tier.
+            swapFailed = true;
+            throw;
+        }
+        finally
+        {
+            ReleaseFlushLock();
+            if (swapFailed) OnSwapFailed();
+        }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
 
@@ -2481,6 +2505,79 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <see cref="ReleaseFlushLock"/> when it is still set there.
     /// </summary>
     private int _swapRequested;
+
+    // ── A swap that fails ─────────────────────────────────────────────────────
+    //
+    // The successor's WAL could not be created (an NTFS volume too full for the next 64 MB file),
+    // or its tier not allocated. Nothing was swapped and the slot went back — and that used to be
+    // all: nothing asked for the swap again but a writer that came back to find the tier still
+    // refusing, the despill went on yielding its slot to the live tier for as long as the tier
+    // refused, and a spill that the failed swap was to end went on beside an idle slot. With the
+    // writers gone (answered 503), the backlog that would have freed the disk was never despilled.
+
+    /// <summary><see cref="Environment.TickCount64"/> of the last swap that failed; 0 once one installs, or a slot comes free.</summary>
+    private long _swapFailedAt;
+
+    /// <summary><see cref="Environment.TickCount64"/> before which a write's request does not try a swap again; 0 for none.</summary>
+    private long _swapRetryAt;
+
+    /// <summary>1 while the retry a failed swap asked for is waiting to ask (<see cref="OnSwapFailed"/>).</summary>
+    private int _swapRetryPending;
+
+    /// <summary>How long after a failed swap it is tried again. Internal so a test can shorten it.</summary>
+    internal TimeSpan _swapRetryDelay = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// The last swap attempt failed, and no slot has come free since: the despill does not yield
+    /// its slot to a live tier whose swap cannot install (see RunDespillLoopAsync).
+    /// </summary>
+    private bool SwapFailing => Volatile.Read(ref _swapFailedAt) != 0;
+
+    /// <summary>Whether a write's request for a swap is held back after a failure (see TryFlushAsync).</summary>
+    private bool SwapBackingOff()
+    {
+        long at = Volatile.Read(ref _swapRetryAt);
+        return at != 0 && Environment.TickCount64 < at;
+    }
+
+    /// <summary>
+    /// A swap failed before it installed anything (the swap lock is released). Asks for it again
+    /// itself, after <see cref="_swapRetryDelay"/> — one retry waiting at a time — and wakes the
+    /// despill, which may now take the slot the swap could not use. Never throws.
+    /// </summary>
+    private void OnSwapFailed()
+    {
+        long now = Environment.TickCount64;
+        Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
+        Volatile.Write(ref _swapRetryAt, now + (long)_swapRetryDelay.TotalMilliseconds);
+        if (Interlocked.Exchange(ref _swapRetryPending, 1) == 0)
+        {
+            try
+            {
+                var t = Task.Run(async () =>
+                {
+                    try { await Task.Delay(_swapRetryDelay, _cts.Token).ConfigureAwait(false); }
+                    catch (Exception) { Volatile.Write(ref _swapRetryPending, 0); return; }   // shutdown
+                    Volatile.Write(ref _swapRetryPending, 0);
+                    // The wait is over, whatever the two clocks say: the request below is not held back.
+                    Volatile.Write(ref _swapRetryAt, 0);
+                    ScheduleFlush();
+                });
+                _inFlightFlushes[t] = 0;
+                _ = t.ContinueWith(
+                    static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+                    _inFlightFlushes, CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+            catch (Exception)
+            {
+                // No retry of its own: the writers' requests, a released slot and the age loop
+                // still ask, and the hold-back above lets them once its time is up.
+                Volatile.Write(ref _swapRetryPending, 0);
+            }
+        }
+        WakeDespill();
+    }
 
     /// <summary>
     /// Releases <see cref="_flushLock"/> and, if a write's request for a swap found it held in the
