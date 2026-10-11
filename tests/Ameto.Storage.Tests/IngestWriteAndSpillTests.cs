@@ -1040,6 +1040,71 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// A write's request for a swap that a swap has answered already does not swap again: the tier
+    /// it finds is the fresh one, with no reason to go. Acted on, it froze that tier — a segment of
+    /// a few events, for nothing — whenever a second flush slot was free. Here the request is the
+    /// one a refused write made while the swap lock was held, asked again when the lock came free.
+    /// </summary>
+    [Fact]
+    public async Task A_request_for_a_swap_answered_already_leaves_the_fresh_tier_alone()
+    {
+        string dir  = NewDir();
+        var    opts = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes          = TierBytes,
+                FlushConcurrency      = 2,   // two slots: a stale request finds one free
+                SpillEnabled          = false,
+                SpillMinFreeDiskBytes = 0,
+            },
+        };
+        var engine = new StorageEngine(
+            Microsoft.Extensions.Options.Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance,
+            MemoryBudgets.Derive(managedLimitBytes: 64 * MB, physicalLimitBytes: 64 * MB));
+        Assert.Equal(2, engine.FlushSlots);
+        using var inFirst    = new ManualResetEventSlim(false);
+        using var firstGoes  = new ManualResetEventSlim(false);
+        using var inSecond   = new ManualResetEventSlim(false);
+        using var secondGoes = new ManualResetEventSlim(false);
+        int swaps = 0;
+        engine._beforeSwap = () =>
+        {
+            switch (Interlocked.Increment(ref swaps))
+            {
+                case 1: inFirst.Set();  firstGoes.Wait(HangGuard);  break;
+                case 2: inSecond.Set(); secondGoes.Wait(HangGuard); break;
+            }
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))   // A fills: its swap is asked for, and held at the seam
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.True(inFirst.Wait(HangGuard), "A's swap never started");
+            Assert.False(TryWriteOne(engine, TierEvents));   // refused: asks again, and finds the swap lock held
+
+            firstGoes.Set();   // A swaps; releasing the lock asks again for the request it held
+            Assert.True(inSecond.Wait(HangGuard), "the request held behind A's swap was never asked again");
+            for (int i = 1; i <= 10; i++)
+                Assert.True(TryWriteOne(engine, TierEvents + i));   // the fresh tier takes a few
+            secondGoes.Set();
+
+            WaitFor(() => engine.InFlightFlushTasks().All(t => t.IsCompleted), "the request to be answered");
+            Assert.Equal(10, engine.LiveHotTier.Count);   // not swapped for a request A's swap answered
+        }
+        finally
+        {
+            firstGoes.Set();
+            secondGoes.Set();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A swap that failed asks for itself again. It used to be asked for again only by a writer that
     /// came back to find the tier still refusing — so once the requests had given up (503), nothing
     /// did, and the tier went on refusing after the failure had cleared, until MaxAge.
