@@ -1051,11 +1051,13 @@ public sealed partial class StorageEngine
         var tier    = CreateRecoveryTier(reader.DataBytes);
         int count   = 0;
         int refused = 0;
+        var undecoded = new UndecodedExceptions();
         try
         {
             do
             {
                 count++;
+                undecoded.Note(in e);
                 // A template with no pool row — outside a saturated pool, or longer than a row holds
                 // — is in the entry itself (v6); the spill file is the event's only copy, and such a
                 // template used to come back empty, or cut at 65 535 bytes.
@@ -1099,13 +1101,55 @@ public sealed partial class StorageEngine
             throw;
         }
 
-        if (refused > 0)
-            // Cannot happen while the tier is sized from the block (CreateRecoveryTier) and the block
-            // admitted only what a tier takes (HotTierAdmission) — and it would be a loss if it did,
-            // so it is said loudly rather than counted quietly.
-            _logger.LogError("Despill of {File}: {Refused} of {Count} event(s) did not fit the tier and were not written",
-                file.Path, refused, count);
+        // The tier is handed to the caller below, and nothing between may throw past it: a line that
+        // cannot be written (a logger out of memory) is lost, the tier is not.
+        try
+        {
+            undecoded.Report(_logger, file.Path);
+            if (refused > 0)
+                // Cannot happen while the tier is sized from the block (CreateRecoveryTier) and the block
+                // admitted only what a tier takes (HotTierAdmission) — and it would be a loss if it did,
+                // so it is said loudly rather than counted quietly.
+                _logger.LogError("Despill of {File}: {Refused} of {Count} event(s) did not fit the tier and were not written",
+                    file.Path, refused, count);
+        }
+        catch (Exception) { /* the lines are lost */ }
         return tier;
+    }
+
+    /// <summary>
+    /// The events of one log a walk read without their exception, whose decode failed on bytes that
+    /// verified (<see cref="WalRecord.ExceptionDecodeError"/>): counted as the walk goes, and named in
+    /// one Error at its end — the startup replay's and the despill's. Such an entry used to fail the
+    /// walk at every reading, its whole log replayed at no start and despilled by no retry.
+    /// </summary>
+    private struct UndecodedExceptions
+    {
+        private int                _count;
+        private long               _firstTicks;
+        private Ameto.Core.LogLevel _firstLevel;
+        private Exception?         _first;
+
+        internal void Note(in WalRecord record)
+        {
+            if (record.ExceptionDecodeError is not { } fault) return;
+            if (_count++ == 0)
+            {
+                _first      = fault;
+                _firstTicks = record.TimestampTicks;
+                _firstLevel = record.Level;
+            }
+        }
+
+        internal readonly void Report(ILogger logger, string file)
+        {
+            if (_count == 0) return;
+            logger.LogError(_first,
+                "Log {File}: {Count} event(s) are written to segments without their exception, which could not be " +
+                "decoded — the first stamped {Time:o} ({Level}). Their bytes verified, so the log is not torn: the rest " +
+                "of each event is kept, and the log is written and removed as usual",
+                file, _count, new DateTime(_firstTicks, DateTimeKind.Utc), _firstLevel);
+        }
     }
 
     /// <summary>The spill file, its pool and — once the file is gone, not before (see <see cref="DeleteLogAndMarker"/>) — its marker.</summary>

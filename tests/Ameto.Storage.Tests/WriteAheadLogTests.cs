@@ -482,6 +482,70 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// Round-4 L13, the poison pill. An entry that verifies — its bytes are the ones written — but whose
+    /// exception the decoder refuses is read WITHOUT its exception, the rest of it whole, and the record
+    /// says why; the walk goes on to the entries after it. The decode's failure propagated, and failed the
+    /// walk at every reading: the log replayed at no start and was despilled by no retry, for good. Here
+    /// the exception's map claims fifteen fields and holds two, and the checksum is recomputed over that.
+    /// </summary>
+    [Fact]
+    public void An_entry_whose_exception_cannot_be_decoded_is_read_without_it_and_the_walk_goes_on()
+    {
+        string path = NewWalPath();
+        var    exc  = new ExceptionInfo { Type = "System.InvalidOperationException", Message = "the middle event's exception" };
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 1, "event {n}",  [0xA1]);
+                wal.Append(2_000, LogLevel.Error,       2, "failed {n}", [0xB1], exception: exc);
+                wal.Append(3_000, LogLevel.Information, 1, "event {n}",  [0xC1], exception: exc);
+            }
+            PoisonException(path, entry: 1);
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(3, entries.Count);
+            Assert.Null(entries[1].Exception);
+            Assert.NotNull(entries[1].ExceptionDecodeError);
+            Assert.Equal([0xB1], entries[1].Payload);
+            Assert.Equal(LogLevel.Error, entries[1].Level);
+            Assert.Equal(2_000, entries[1].TimestampTicks);
+            Assert.Null(entries[0].ExceptionDecodeError);
+            Assert.Null(entries[2].ExceptionDecodeError);
+            Assert.Equal(exc.Message, entries[2].Exception?.Message);   // the walk went on, and decoded the next one
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// Makes entry <paramref name="entry"/>'s exception undecodable — its map header claims fifteen
+    /// fields — and recomputes the entry's checksum, so the entry still verifies. Entries without the
+    /// trace context and inline texts only: header, payload, exception.
+    /// </summary>
+    private static void PoisonException(string path, int entry)
+    {
+        byte[] file = File.ReadAllBytes(path);
+        long   pos  = FileHeader;
+        for (int i = 0; i < entry; i++)
+            pos += EntryHeader + BinaryPrimitives.ReadUInt32LittleEndian(file.AsSpan((int)pos))
+                               + BinaryPrimitives.ReadUInt32LittleEndian(file.AsSpan((int)pos + 16));
+        int at         = (int)pos;
+        int payloadLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(file.AsSpan(at));
+        int excLen     = (int)BinaryPrimitives.ReadUInt32LittleEndian(file.AsSpan(at + 16));
+        Assert.Equal(0, file[at + 13] & ~0x03);                   // no trace context or inline text in the way
+        Assert.True(excLen > 0, "the entry has no exception to poison");
+        int excAt      = at + EntryHeader + payloadLen;
+        Assert.Equal(0x80, file[excAt] & 0xF0);                   // a fixmap …
+        file[excAt] = 0x8F;                                       // … that now claims 15 fields
+
+        uint crc = Crc32c.Append(0, file.AsSpan(at, EntryHeader - 4));
+        crc      = Crc32c.Append(crc, file.AsSpan(at + EntryHeader, payloadLen));
+        crc      = Crc32c.Append(crc, file.AsSpan(excAt, excLen));
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(at + EntryHeader - 4), crc);
+        File.WriteAllBytes(path, file);
+    }
+
+    /// <summary>
     /// A long pooled template counts as carried only once an entry that carries it is in the log: an
     /// append refused for want of room (a spill log) leaves the next one to carry it, so no entry can
     /// name the index ahead of the text. And each log carries it for itself — the one a spill rotates

@@ -997,23 +997,35 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 return false;
         }
 
-        ExceptionInfo? exception = null;
+        ExceptionInfo? exception      = null;
+        Exception?     exceptionFault = null;
         if (eh.ExceptionLength > 0)
         {
             // v3 entries carry no checksum, so garbage here throws deep inside msgpack — treat it as
-            // the end of the durable data instead of failing the whole WAL. Only for v3, and never
-            // for an OutOfMemoryException, which says nothing about the bytes: a v4+ entry's
-            // exception is under its checksum, verified above, and a decode that fails there is not
-            // a torn entry. Taken for one, an out-of-memory decoding a large stack trace ended the
-            // replay at that event, and the replay then published the prefix and deleted the log.
-            // It propagates now: the replay keeps the WAL ("WAL recovery failed"), the despill backs
-            // off and reads the block again.
+            // the end of the durable data instead of failing the whole WAL.
+            //
+            // Never an OutOfMemoryException, which says nothing about the bytes. Taken for a torn
+            // entry, an out-of-memory decoding a large stack trace ended the replay at that event, and
+            // the replay then published the prefix and deleted the log. It propagates: the replay is
+            // retried by the despill, which backs off and reads the block again.
+            //
+            // A v4+ entry's exception is under its checksum, verified above: the bytes are the ones
+            // written, and a decode that fails on them fails the same way at every reading. It used to
+            // propagate like the out-of-memory, and that entry blocked its whole log for good — the
+            // replay failed at every start, the despill retried for ever, and a rollback waiting for a
+            // start that logs neither replay line waited with it. The event is read without its
+            // exception now, the rest of it whole, and the record says why (ExceptionDecodeError):
+            // the replay and the despill name it in an Error.
             try
             {
                 BeforeExceptionDecodeForTest.Value?.Invoke();   // stands in for the decode throwing
                 exception = ExceptionInfo.FromBytes(excSpan);
             }
-            catch (Exception ex) when (layout == EntryLayout.V3 && ex is not OutOfMemoryException) { return false; }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                if (layout == EntryLayout.V3) return false;
+                exceptionFault = ex;
+            }
         }
 
         // v3 entries predate the flag and their byte 13 was never written: never unpooled.
@@ -1072,6 +1084,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             Service        = service,
             Payload        = payloadSpan,
             Exception      = exception,
+            ExceptionDecodeError = exceptionFault,
         };
         entrySize = total;
         return true;
@@ -1516,6 +1529,8 @@ public readonly ref struct WalRecord
     /// <summary>The properties payload, over the mapping: valid until the reader is disposed.</summary>
     public ReadOnlySpan<byte> Payload        { get; init; }
     public ExceptionInfo?     Exception      { get; init; }
+    /// <inheritdoc cref="WalEntry.ExceptionDecodeError"/>
+    public Exception?         ExceptionDecodeError { get; init; }
 
     /// <inheritdoc cref="WalEntry.ServiceIndexIn"/>
     public int ServiceIndexIn(IReadOnlyDictionary<ushort, string> poolRows) =>
@@ -1536,6 +1551,7 @@ public readonly ref struct WalRecord
         Service        = Service,
         Payload        = Payload.IsEmpty ? [] : Payload.ToArray(),
         Exception      = Exception,
+        ExceptionDecodeError = ExceptionDecodeError,
     };
 }
 
@@ -1586,6 +1602,14 @@ public sealed class WalEntry
 
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }
+
+    /// <summary>
+    /// Why the event's exception is not in <see cref="Exception"/>: the entry verified — its bytes are
+    /// the ones written — and the decode of its exception failed on them, as it will at every reading.
+    /// The event is read without it, the rest of it whole; null otherwise. (An out-of-memory decoding
+    /// it says nothing about the bytes, and fails the walk instead.)
+    /// </summary>
+    public Exception?     ExceptionDecodeError { get; init; }
 
     /// <summary>
     /// <see cref="ServiceIndex"/> when <paramref name="poolRows"/> — the rows of this entry's own pool

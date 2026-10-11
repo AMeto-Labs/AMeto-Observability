@@ -3214,6 +3214,122 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>The three events of <see cref="WriteThreeEventLog"/>, the middle one without its exception.</summary>
+    private static void AssertThreeEventsTheMiddleWithoutItsException(Dictionary<long, RawSegmentEvent> events)
+    {
+        Assert.Equal(3, events.Count);
+        Assert.Equal("event {n}",  events[0].Template);
+        Assert.Equal("failed {n}", events[1].Template);
+        Assert.Equal("event {n}",  events[2].Template);
+        Assert.Null(events[1].Exception);
+        Assert.Equal((byte)Ameto.Core.LogLevel.Error, events[1].Level);
+        Assert.All(events.Values, e => Assert.Equal("spill.svc", e.Service));
+    }
+
+    /// <summary>
+    /// Round-4 L13, the poison pill, at the startup replay. A checksummed entry whose exception the
+    /// decoder refuses — not out of memory: the bytes themselves — failed the replay at every start,
+    /// the WAL kept and its events served by nobody, and a rollback waiting for a start that logs
+    /// neither replay line waited for ever. The event is written without its exception now, the others
+    /// whole, the WAL removed, and an Error names the log and the event.
+    /// </summary>
+    [Fact]
+    public async Task A_replay_whose_exception_cannot_be_decoded_writes_every_event_without_it_and_says_so()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string wal  = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal");
+        WriteThreeEventLog(wal, opts, 9_000);
+
+        var log = new RecordingLogger();
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () => throw new InvalidDataException("test: the exception's bytes do not decode");
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts, log); }
+        finally { WriteAheadLog.BeforeExceptionDecodeForTest.Value = null; }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.False(File.Exists(wal), "the WAL was kept");
+            AssertThreeEventsTheMiddleWithoutItsException(ReadAll(engine));
+            Assert.Single(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && l.Line.Contains("1 event(s) are written to segments without their exception", StringComparison.Ordinal)
+                                          && l.Line.Contains(wal, StringComparison.Ordinal));
+            Assert.DoesNotContain(log.Lines, l => l.Line.Contains("WAL recovery failed", StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>The same poison pill in a spill file: the despill retried it for ever, and the block never reached segments.</summary>
+    [Fact]
+    public async Task A_despill_whose_exception_cannot_be_decoded_writes_every_event_without_it()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        string spill = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        WriteThreeEventLog(spill, opts, 9_000);
+
+        var log  = new RecordingLogger();
+        var hold = new TaskCompletionSource();
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () => throw new InvalidDataException("test: the exception's bytes do not decode");
+        StorageEngine.HoldDespillForTest.Value           = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts, log); }
+        finally
+        {
+            WriteAheadLog.BeforeExceptionDecodeForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value           = null;
+        }
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the block to be despilled", ShortGuard);
+
+            Assert.Equal(3, engine.DespilledEvents);
+            AssertThreeEventsTheMiddleWithoutItsException(ReadAll(engine));
+            Assert.Single(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error
+                                          && l.Line.Contains("1 event(s) are written to segments without their exception", StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>
+    /// Round-4 L13: a flushed WAL — its completion marker beside it — is removed without a read. The
+    /// marker was asked after the log's first entry had been read, and a first entry that could not be
+    /// read (out of memory decoding its exception, here) failed, at every start, the replay of a log that
+    /// only had to be deleted.
+    /// </summary>
+    [Fact]
+    public async Task A_flushed_wal_is_removed_without_reading_its_first_entry()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string wal    = Path.Combine(walDir, $"{opts.NodeId.Value}-9000.wal");
+        string marker = Path.Combine(walDir, $"{opts.NodeId.Value}-9000.flushed");
+        using (var log = WriteAheadLog.Open(wal, opts.NodeId, new SegmentId(9_000), 1 << 20))
+            log.Append(T0, LogLevel.Error, 41, "failed {n}", Props(0), exception: WalkedException);
+        File.WriteAllText(marker, "");
+
+        int decodes = 0;
+        WriteAheadLog.BeforeExceptionDecodeForTest.Value = () =>
+        {
+            Interlocked.Increment(ref decodes);
+            throw new OutOfMemoryException("test: decoding the first entry's exception");
+        };
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { WriteAheadLog.BeforeExceptionDecodeForTest.Value = null; }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.Equal(0, Volatile.Read(ref decodes));
+            Assert.False(File.Exists(wal), "the flushed WAL was kept");
+            Assert.False(File.Exists(marker), "the marker of a removed WAL was kept");
+        }
+    }
+
     // ── Recovery reads the log where it lies ──────────────────────────────────
 
     /// <summary>

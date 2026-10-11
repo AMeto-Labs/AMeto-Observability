@@ -5877,6 +5877,28 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             return;
         }
 
+        // The block this WAL names is spent whatever happens next — its levels are either
+        // already on disk or about to be written below. Burning it here stops a later flush or
+        // merge being handed an id that already carries a file: the allocator is seeded from
+        // segment file NAMES, and a block whose flush never produced one leaves it behind.
+        if (segId != 0) ReserveWalBlock(segId);
+
+        // The flush of this WAL completed — every level reached disk before the marker did.
+        // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
+        // (it opens every file), so a catalog lookup here races the enumeration that would
+        // answer it, and losing that race replays a WAL whose events are already cold. Asked
+        // before the log is read at all: a flushed log needs nothing from its entries. It was asked
+        // after the first one was read, and a first entry that could not be read — an
+        // out-of-memory decoding its exception — failed, at every start, the replay of a log that
+        // only had to be deleted.
+        if (segId != 0 && File.Exists(FlushMarkerPath(segId)))
+        {
+            reader.Dispose();
+            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+            DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
+            return;
+        }
+
         // Empty or corrupt WAL — clean up
         bool any = reader.TryReadNext(out var record);
         if (segId == 0 || !any)
@@ -5885,30 +5907,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             try { File.Delete(walFile); } catch { }
             try { File.Delete(poolPath); } catch { }
             if (segId != 0)
-            {
-                ReserveWalBlock(segId);
                 try { File.Delete(FlushMarkerPath(segId)); } catch { }
-            }
-            return;
-        }
-
-        // The block this WAL names is spent whatever happens next — its levels are either
-        // already on disk or about to be written below. Burning it here stops a later flush or
-        // merge being handed an id that already carries a file: the allocator is seeded from
-        // segment file NAMES, and a block whose flush never produced one leaves it behind.
-        ReserveWalBlock(segId);
-
-        // The flush of this WAL completed — every level reached disk before the marker did.
-        // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
-        // (it opens every file), so a catalog lookup here races the enumeration that would
-        // answer it, and losing that race replays a WAL whose events are already cold. Asked
-        // before the log is read past its first entry: a flushed log is not read at all.
-        string marker = FlushMarkerPath(segId);
-        if (File.Exists(marker))
-        {
-            reader.Dispose();
-            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
-            DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
             return;
         }
 
@@ -5961,9 +5960,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // bound costs nothing the events themselves do not.
         using var recoveredHot = CreateRecoveryTier(reader.DataBytes);
         int count = 0, replayed = 0, withoutTemplate = 0;
+        var undecoded = new UndecodedExceptions();
         do
         {
             count++;
+            undecoded.Note(in record);
             // Unpooled: the event's template had no pool row when it was logged. Its index field
             // is 0 and names nothing — resolving the 0 attached index 0's template to it. A v6
             // entry carries the text itself (InlineTemplate), attached here with no pool index —
@@ -6019,6 +6020,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         while (reader.TryReadNext(out record));
         AfterWalReplayReadForTest.Value?.Invoke(walFile);
         reader.Dispose();   // the tier holds its own copy now; the mapping goes before the flush
+        undecoded.Report(_logger, walFile);
 
         // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
         // outside a saturated pool, one too long for a row — and those events replay with it. Only
