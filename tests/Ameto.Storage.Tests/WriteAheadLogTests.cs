@@ -374,6 +374,31 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// A spill log grows for a first entry larger than it to that entry's size and no further, so it
+    /// takes nothing after it. It doubled, like a live WAL: a first entry between one and two
+    /// capacities left it at twice the size its floor check had counted, taking entries until that
+    /// was full (the review's probe: 2 050 468 B written where 1 048 576 were counted).
+    /// </summary>
+    [Fact]
+    public void A_spill_log_grows_for_its_first_entry_only_to_that_entrys_size()
+    {
+        string path = NewWalPath();
+        byte[] big  = new byte[1_500_000];
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024, spill: true))
+            {
+                Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", big));       // larger than the log: taken, being the first
+                Assert.False(wal.Append(2_000, LogLevel.Information, 1, "t", [1]));      // and nothing after it
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(big.Length, Assert.Single(entries).Payload.Length);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// A spill log's pool file counts against the log's capacity. Its rows — up to 64 KB each, written
     /// before the entry that needs them is checked for room — were counted by no capacity and no floor:
     /// a hundred events with distinct long templates and tiny payloads filled a 256 KB spill log's

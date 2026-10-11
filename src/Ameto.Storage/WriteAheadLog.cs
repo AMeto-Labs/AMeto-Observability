@@ -952,7 +952,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // for this first.
         long oldCapacity = _capacity;
         long oldFileSize = FileHeaderSize + oldCapacity;
-        long newCapacity = Math.Max(oldCapacity * 2, required);
+        // A spill log grows only for its first entry, and only to that entry's size: it is as large
+        // as its floor check counted, and a doubling made a log that took a first entry between one
+        // and two capacities go on taking entries up to twice what was counted.
+        long newCapacity = _spill ? required : Math.Max(oldCapacity * 2, required);
         long newFileSize = FileHeaderSize + newCapacity;
 
         Unmap();
