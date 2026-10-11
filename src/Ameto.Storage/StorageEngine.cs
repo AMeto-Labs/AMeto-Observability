@@ -5936,14 +5936,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // template-less instead: timestamp, level, properties and exception all survive,
         // only @mt is lost, and the index below must not alias a live pool entry.
         //
-        // Empty has TWO causes and the warning below must name both. Pool writes are only fsynced
-        // periodically, so power loss can zero the file — that is the one this started as. But
-        // since the template pool stopped writing a row for an event it could not intern, a WAL
-        // every one of whose events arrived past a SATURATED pool writes no rows either, and its
-        // .pool file stays at 0 bytes with nothing wrong. The replay is right in both cases;
-        // only an operator reading "no template pool" as corruption would be wrong.
-        var pool         = WriteAheadLog.LoadPool(poolPath);
-        bool poolMissing = pool.Count == 0;
+        // Empty has TWO causes. Pool writes are only fsynced periodically, so power loss can zero
+        // the file, or keep only part of it — that is the one this started as, and the warning
+        // below counts the events whose rows it lost. But since the template pool stopped writing a
+        // row for an event it could not intern, a WAL every one of whose events arrived past a
+        // SATURATED pool writes no rows either, and its .pool file stays at 0 bytes with nothing
+        // wrong: those entries are unpooled, need no row, and are not counted.
+        var pool = WriteAheadLog.LoadPool(poolPath);
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)
@@ -5970,17 +5969,25 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // entry carries the text itself (InlineTemplate), attached here with no pool index —
             // claiming one could take a slot a later WAL's rows are force-interned into — and an
             // older entry never stored it, so that event replays with no template.
-            bool noTemplate = poolMissing || record.Unpooled;
-            if (poolMissing && record.Template is null) withoutTemplate++;
+            //
+            // Pooled: its index's row in THIS log's pool file, and only there — as the service is
+            // (ServiceIndexIn). A row the file lost (a power loss before the pool was fsynced, a
+            // torn tail) used to be resolved through the LIVE pool, whose slot holds whatever is
+            // there — another orphaned log's row, force-interned by the replay before this one — and
+            // the event was stamped with that template, in its segment, for good. It replays with
+            // none (-1, persisted as an empty @mt) and is counted below.
+            string? rowTemplate = null;
+            bool    fromRow     = !record.Unpooled && pool.TryGetValue(record.TemplateIndex, out rowTemplate);
+            if (!record.Unpooled && !fromRow) withoutTemplate++;
             var header = new LogEventHeader
             {
                 Id                       = _idGen.Next(record.TimestampTicks),
                 TimestampUtcTicks        = record.TimestampTicks,
                 Level                    = record.Level,
-                // With no pool the stored index points at whatever the LIVE pool holds
-                // at that slot — resolving it would stamp a random template onto every
-                // recovered event. -1 = "no template", persisted as an empty @mt.
-                MessageTemplatePoolIndex = noTemplate ? -1 : record.TemplateIndex,
+                // Without its row the stored index points at whatever the LIVE pool holds at that
+                // slot — resolving it would stamp another template onto the recovered event.
+                // -1 = "no template", persisted as an empty @mt.
+                MessageTemplatePoolIndex = fromRow ? record.TemplateIndex : -1,
                 // The service the event was logged with (WAL v5): its pool index, whose text
                 // is one of the rows force-interned above — templates and services share the
                 // pool — so the flush below resolves it to the string a normal flush would
@@ -6001,9 +6008,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 TraceIdLo                = record.TraceIdLo,
                 SpanId                   = record.SpanId,
             };
-            // Resolve template via the freshly restored pool and attach it
-            // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = record.Template ?? (noTemplate ? string.Empty : TemplatePool.Get(record.TemplateIndex));
+            // The template's text — the entry's own, or its row, the string force-interned above —
+            // attached to the hot tier so the recovery flush persists @mt correctly.
+            string tmpl = record.Template ?? rowTemplate ?? string.Empty;
             // A service logged outside a full pool comes back by the text its entry carries, kept
             // beside the event with no pool index — as the unpooled template is, and for the same reason.
             if (recoveredHot.TryWrite(header, record.Payload, tmpl, record.Exception, record.Service))
@@ -6015,15 +6022,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
         // outside a saturated pool, one too long for a row — and those events replay with it. Only
-        // the others, whose rows the lost pool held, come back without one. (The line used to say
+        // the pooled ones whose rows the pool file lost come back without one. (The line used to say
         // every event replayed without its template, which a log of nothing but such events made
-        // false for every one of them.)
+        // false for every one of them; and it was said only when the file held no row at all.)
         if (withoutTemplate > 0)
             _logger.LogWarning(
-                "Orphaned WAL {File}: no template pool rows — power loss before the pool was fsynced, or (a log "
-              + "older than v6) events outside a saturated template pool. {Without} of its {Count} event(s) replay "
-              + "without a template",
-                walFile, withoutTemplate, count);
+                "Orphaned WAL {File}: its pool file holds {Rows} template row(s), and not the rows of some of its "
+              + "events — a power loss before the pool was fsynced, or a torn tail. {Without} of its {Count} "
+              + "event(s) replay without a template",
+                walFile, pool.Count, withoutTemplate, count);
         if (replayed < count)
             _logger.LogError("WAL recovery: {Refused} of {Count} event(s) in {File} did not fit the recovery tier and were not replayed",
                 count - replayed, count, walFile);

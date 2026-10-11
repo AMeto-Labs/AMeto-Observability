@@ -454,6 +454,34 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// Round-4 L15. A pool file whose tail a power loss zero-filled — NTFS can keep a file's size and
+    /// lose its data — ends its rows at the first row of length 0: no row is written empty. Read as
+    /// rows, the zeros were (0, "") over and over, and the first of them overwrote row 0, ordinarily the
+    /// log's first template, which its events then replayed without.
+    /// </summary>
+    [Fact]
+    public void A_pool_files_zero_filled_tail_ends_its_rows_and_leaves_row_0_alone()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 0, "first {n}",  [1]);
+                wal.Append(2_000, LogLevel.Information, 1, "second {n}", [2]);
+            }
+            using (var pool = new FileStream(path + ".pool", FileMode.Append))
+                pool.Write(new byte[64]);   // the zero-filled tail
+
+            var rows = WriteAheadLog.LoadPool(path + ".pool");
+            Assert.Equal(2, rows.Count);
+            Assert.Equal("first {n}",  rows[0]);
+            Assert.Equal("second {n}", rows[1]);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// A long pooled template counts as carried only once an entry that carries it is in the log: an
     /// append refused for want of room (a spill log) leaves the next one to carry it, so no entry can
     /// name the index ahead of the text. And each log carries it for itself — the one a spill rotates

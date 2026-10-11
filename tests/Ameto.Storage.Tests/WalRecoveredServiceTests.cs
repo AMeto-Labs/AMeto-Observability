@@ -334,6 +334,57 @@ public sealed class WalRecoveredServiceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-4 L16, the template twin of the test above. A power loss kept the entry and lost the pool
+    /// row its TEMPLATE needed. The event replays with no template — not with whatever the restarted
+    /// process's pool holds at that index, here another orphaned WAL's template, force-interned at the
+    /// same index by its replay, which ran first. The replay resolved a pooled template through the
+    /// live pool whenever the file held any row at all, and stamped that template on the event, in its
+    /// segment, for good.
+    /// </summary>
+    [Fact]
+    public async Task A_template_whose_pool_row_was_lost_replays_without_one_not_as_another_wals_template()
+    {
+        const string Kept     = "kept {n}";
+        const string Lost     = "lost {n}";
+        const string Stale    = "stale template {n}";
+        const ulong  StaleSeg = 1_000;
+        long t       = DateTime.UtcNow.Ticks;
+        int  keptIdx = _engine.TemplatePool.Intern(Kept);
+        int  lostIdx = _engine.TemplatePool.Intern(Lost);
+        foreach (var (ticks, index, template, n) in new[] { (t, keptIdx, Kept, 0), (t + TimeSpan.TicksPerSecond, lostIdx, Lost, 1) })
+            Assert.True(_engine.TryWrite(new LogEventHeader
+            {
+                TimestampUtcTicks        = ticks,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = index,
+                ServiceNamePoolIndex     = -1,
+            }, Props(n), template));
+
+        await CrashAndRestartAsync(tamper: wal =>
+        {
+            // The first template's row reached disk; the second's did not.
+            var rows = WriteAheadLog.LoadPool(wal + ".pool");
+            Assert.Equal([Kept, Lost], rows.OrderBy(kv => kv.Key).Select(kv => kv.Value));
+            using (var pool = File.Create(wal + ".pool"))
+                foreach (var (index, text) in rows)
+                    if (text != Lost) WritePoolRow(pool, index, text);
+
+            CreateListedBefore(wal, path =>
+            {
+                using var stale = WriteAheadLog.Open(path, NodeId.Local, new SegmentId(StaleSeg), 64 * 1024);
+                stale.Append(t - TimeSpan.TicksPerSecond, LogLevel.Information, lostIdx, Stale, Props(99));
+            });
+        });
+
+        var events = ReadAllByTicks();
+        Assert.Equal(3, events.Count);
+        Assert.Equal(Stale, events[t - TimeSpan.TicksPerSecond].Template);   // the other WAL's event keeps its own
+        Assert.Equal(Kept, events[t].Template);
+        Assert.True(string.IsNullOrEmpty(events[t + TimeSpan.TicksPerSecond].Template),
+            $"a template with no pool row was resolved anyway: '{events[t + TimeSpan.TicksPerSecond].Template}'");
+    }
+
+    /// <summary>
     /// Creates a WAL (through <paramref name="create"/>) under a name the directory lists BEFORE
     /// <paramref name="other"/>, so the engine's replay, which walks that listing, replays it first.
     /// The order is the file system's — by name on NTFS, by hash on ext4, newest first on tmpfs — so

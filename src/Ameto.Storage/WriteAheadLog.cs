@@ -1281,7 +1281,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     /// <summary>
     /// A log's pool rows. A file that ends part way through a row ends the rows there — the torn
-    /// tail of a crash. A failure to read it — out of memory, the file held by another process —
+    /// tail of a crash — and so does a row of length 0, the tail a power loss zero-filled. A
+    /// failure to read it — out of memory, the file held by another process —
     /// propagates: it used to be swallowed, and the caller went on with the rows read so far, so the
     /// replay resolved every missing row's index through the LIVE pool (another template) and lost
     /// the services those rows named, then deleted the log. The replay now keeps the WAL, and the
@@ -1297,6 +1298,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             ushort index = BinaryPrimitives.ReadUInt16LittleEndian(hdr);
             ushort len   = BinaryPrimitives.ReadUInt16LittleEndian(hdr[2..]);
+            // No row is written empty (EnsurePoolRow skips an empty text), so a length of 0 is the torn
+            // tail: NTFS zero-fills the part of a file whose size a power loss kept and whose data it
+            // did not. Read as rows, that was (0, "") over and over, and the first of them overwrote row
+            // 0 — ordinarily the log's first template, which its events then replayed without.
+            if (len == 0) break;
             BeforePoolRowForTest.Value?.Invoke(index);
             var    bytes = new byte[len];
             if (fs.ReadAtLeast(bytes, len, throwOnEndOfStream: false) != len) break;
