@@ -3894,6 +3894,136 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-5 H-C. The boot scan runs beside the startup replay, and can register a level the replay
+    /// moved into place before the replay failed on a later one. The hand-off to the despill deleted
+    /// that level and left the scan's entry: the catalog named a file that was gone, and once the
+    /// despill or its retry had put the same level back at that path, a merge could take the stale
+    /// entry, and the block's publication then stored the level's events twice. The hand-off takes out
+    /// what the scan registered now. Here the scan runs, whole, between the failure and the hand-off.
+    /// </summary>
+    [Fact]
+    public async Task A_level_the_boot_scan_registered_goes_out_of_the_catalog_with_the_failed_replays_hand_off()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string segDir = Path.Combine(dir, "segments");
+        Directory.CreateDirectory(Path.Combine(dir, "wal"));
+        Directory.CreateDirectory(segDir);
+        WriteThreeEventLog(Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal"), opts, 9_000);
+        long   errorAt = T0 + TimeSpan.TicksPerMillisecond;
+        string blocker = Path.Combine(segDir, $"{opts.NodeId.Value}-{9_000 + (int)LogLevel.Error}-{errorAt}-{errorAt}.seg");
+        Directory.CreateDirectory(blocker);   // the replay fails on its Error level, after the Information one
+
+        var     scan    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var     logger  = new CountingLogger(line => line.StartsWith("Loaded ", StringComparison.Ordinal) && line.Contains(" segments from ", StringComparison.Ordinal));
+        var     despill = new TaskCompletionSource();
+        string? moved   = null;
+        bool    scanned = false;
+        StorageEngine.BeforeFailedReplayHandOffForTest.Value = _ =>
+        {
+            moved = Directory.GetFiles(segDir, $"{opts.NodeId.Value}-{9_000 + (int)LogLevel.Information}-*.seg").SingleOrDefault();
+            scan.SetResult();   // the boot scan lists the directory and registers the level the replay moved
+            scanned = SpinWait.SpinUntil(() => logger.Count == 1, HangGuard);
+        };
+        StorageEngine.HoldDespillForTest.Value = despill.Task;
+        StorageEngine engine;
+        try
+        {
+            engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger,
+                                       maintenanceStartDelay: TimeSpan.FromHours(1), bootScanHeldUntil: scan.Task);
+        }
+        finally
+        {
+            StorageEngine.BeforeFailedReplayHandOffForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value               = null;
+        }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.True(scanned, "setup: the boot scan did not finish before the hand-off");
+            Assert.NotNull(moved);                                                      // setup: the replay had moved its Information level
+            Assert.False(File.Exists(moved), "setup: the hand-off did not delete the level the replay moved");
+            Assert.Equal(1, engine.SpillFilesPending);
+            var stale = engine.ListSegments().Where(s => !File.Exists(s.FilePath)).Select(s => Path.GetFileName(s.FilePath)).ToList();
+            Assert.True(stale.Count == 0, $"the catalog names a level file the failed replay's hand-off deleted: {string.Join(", ", stale)}");
+
+            Directory.Delete(blocker);
+            despill.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0, "the WAL to be written by the despill", ShortGuard);
+            AssertThreeEventsWhole(ReadAll(engine));
+        }
+    }
+
+    /// <summary>
+    /// H-C's other half, and round-5 L-19: the merge planner took entries of a block a flush still
+    /// owned. A swapped tier's flush fails after its Information level is in place, and a catalog scan
+    /// registers that level — as the boot scan does with a level it lists in its first minutes — and a
+    /// merge took it with a neighbour; the retry then wrote the level again and published it, and its
+    /// events were stored twice. (A publish being rolled back left the planner the same kind of entry.)
+    /// The planner leaves the blocks of frozen tiers and queued spills to their own flushes now.
+    /// </summary>
+    [Fact]
+    public async Task A_merge_leaves_alone_a_level_of_a_block_whose_flush_is_being_retried()
+    {
+        var  engine = Engine(Options(NewDir()));
+        long old    = DateTime.UtcNow.AddDays(-20).Date.Ticks;   // a sealed bucket: two small files are a batch
+        void Write(int from, int count, LogLevel level)
+        {
+            for (int i = from; i < from + count; i++)
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks        = old + i * TimeSpan.TicksPerMillisecond,
+                    Level                    = level,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+                }, Props(i), "event {n}"));
+        }
+        using var attempt = new ManualResetEventSlim(false);
+        try
+        {
+            Write(0, 10, LogLevel.Information);
+            await engine.FlushHotTierAsync();   // the neighbour: block A's Information level, published
+
+            int failed = 0;
+            engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._afterLevelPublished = _ =>
+            {
+                if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after its first level");
+            };
+            engine._beforeFlushRetryAttemptForTest = () => attempt.Wait(HangGuard);
+            Write(100, 10, LogLevel.Information);
+            Write(200, 10, LogLevel.Error);
+            await engine.FlushHotTierAsync();   // block B: its Information level in place, its Error one not; a retry has it
+            Assert.Equal(1, engine.FrozenTierCountForTest);
+
+            engine.LoadSegmentCatalog();        // a catalog scan registers what it lists, block B's level among it
+            Assert.Equal(2, engine.ListSegments().Count(s => s.MinLevel == LogLevel.Information));   // setup
+
+            engine._allowIndexlessMerge = true;
+            await engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+
+            attempt.Set();
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the retry to publish block B", ShortGuard);
+            var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+            var seen  = new Dictionary<long, int>();
+            foreach (var seg in engine.ListSegments())
+            {
+                using var r = SegmentReader.Open(seg.FilePath);
+                foreach (var ev in r.ReadAllRaw(dedup))
+                    seen[ev.TsTicks] = seen.GetValueOrDefault(ev.TsTicks) + 1;
+            }
+            int twice = seen.Count(kv => kv.Value > 1);
+            Assert.True(twice == 0, $"{twice} event(s) are stored twice: a merge took a level of the block its retry wrote again");
+            Assert.Equal(30, seen.Count);
+        }
+        finally
+        {
+            attempt.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Mc, for the pool. A pool file that could not be read part way — out of memory, here — came back
     /// as the rows read so far: the replay resolved the missing row's index through the LIVE pool and
     /// published the middle event with another template (or none), then deleted the WAL. The failure

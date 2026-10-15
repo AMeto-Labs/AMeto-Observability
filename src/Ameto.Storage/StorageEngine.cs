@@ -3159,11 +3159,40 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // place before the scan listed the directory met the scan's open as a file gone with
                 // no delete of ours: left unread, the store Degraded until a restart, over our own
                 // unlink. The record makes it the delete it is: skipped at Debug.
-                lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(f);
+                //
+                // And unregistered, if the scan got there first (round-5 H-C). The scan runs beside
+                // the startup replay and beside every flush of its first minutes, and may have
+                // registered the file already: the entry outlived the unlink, naming a path the
+                // despill or the retry later filled again with the same level, and a merge that took
+                // it while that file was there stored the level's events a second time once the block
+                // was published. Only the scan registers an unpublished level, and only under this
+                // gate: a scan that comes later finds the record and skips the file; one that came
+                // earlier left the entry that goes here — the same step as a delete of a segment.
+                lock (_importLock)
+                lock (_scanDeleteGate)
+                {
+                    _deletedDuringCatalogScan?.Add(f);
+                    UnregisterScannedLevel(f);
+                }
                 try { File.Delete(f); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete unpublished level file {File}", f); }
             }
         }
+    }
+
+    /// <summary>
+    /// Takes out of the catalog the entry the boot scan registered for an unpublished level file that is
+    /// about to be unlinked (see <see cref="DeleteUnpublishedLevelFiles"/>), if there is one: the entry under
+    /// the file's key whose path is the file. The caller holds <c>_importLock</c> and
+    /// <see cref="_scanDeleteGate"/>, as for every removal (<see cref="ForgetRemovedSegment"/>).
+    /// </summary>
+    private void UnregisterScannedLevel(string file)
+    {
+        var key = KeyOfSegmentFileName(file);
+        if (key.Equals(default(SegmentKey)) || !_segments.TryGetValue(key, out var entry)) return;
+        if (!string.Equals(entry.FilePath, file, StringComparison.OrdinalIgnoreCase)) return;
+        if (_segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, entry)))
+            ForgetRemovedSegment(key, file);
     }
 
     /// <summary>
@@ -3474,6 +3503,37 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         Math.Max(s.UncompressedBytes, s.CompressedBytes);
 
     /// <summary>
+    /// The segment ids of the levels a flush still owns, or null when there are none: every level of a
+    /// frozen tier's block (swapped, with or without its retry), and of a queued spill's (a spill file, a
+    /// WAL a crash cut short, a WAL whose replay failed; a despilled tier's block stays queued until it is
+    /// published) the levels its despill writes — not the ones an earlier run published
+    /// (<see cref="QueuedSpill.PublishedLevels"/>), registered segments the despill never writes, which a
+    /// merge may take meanwhile. The merge planner leaves these entries alone (see
+    /// <see cref="SelectMergeBatch"/>). Read under each list's lock, one at a time; off every hot path.
+    /// </summary>
+    private HashSet<ulong>? LevelIdsAFlushOwns()
+    {
+        HashSet<ulong>? ids    = null;
+        HashSet<ulong>? queued = null;
+        lock (_spillQueueLock)
+            foreach (var (block, q) in _spillQueue)
+            {
+                (queued ??= new HashSet<ulong>()).Add(block);
+                AddLevels(ref ids, block, q.PublishedLevels);
+            }
+        lock (_frozenLock)
+            foreach (var (_, block) in _frozenHot)
+                if (queued is null || !queued.Contains(block)) AddLevels(ref ids, block, keep: 0);
+        return ids;
+
+        static void AddLevels(ref HashSet<ulong>? ids, ulong block, byte keep)
+        {
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if ((keep & (1 << lvl)) == 0) (ids ??= new HashSet<ulong>()).Add(block + (ulong)lvl);
+        }
+    }
+
+    /// <summary>
     /// Picks the next batch: the oldest (level, expiry bucket) group that holds a mergeable run,
     /// and as many of that run's segments as one merged file affords. Null when nothing is worth
     /// merging — which is the steady state, not a failure: every bucket has either reached
@@ -3502,9 +3562,21 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         var  buckets  = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
         bool anyKept  = !_outputsWithKeptManifest.IsEmpty;
         bool anyWait  = !_undecidedMergeOutputs.IsEmpty;
-        foreach (var s in _segments.Values)
+        // The catalog's snapshot first, then the blocks a flush owns: an entry a publish registered is
+        // in the snapshot only once that publish holds _frozenLock, and the owners are read under it —
+        // after a commit (the block unlisted, the entry final) or a rollback (the block still listed).
+        var  catalog  = _segments.Values;
+        var  owned    = LevelIdsAFlushOwns();
+        foreach (var s in catalog)
         {
             if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
+            // Not a level a flush still owns (round-5 H-C, L-19): of a frozen tier's block, swapped or
+            // despilled, with or without its retry, or a queued spill's — save the levels an earlier run
+            // published, which no despill writes. Such an entry is not the block's publication — the
+            // boot scan registered a level a failed attempt had moved into place, or a publish is being
+            // rolled back — and the block's own flush writes that level again: merged meanwhile, its
+            // events were stored twice, once in the merged file.
+            if (owned is not null && s.NodeId.Value == _options.NodeId.Value && owned.Contains(s.Id.Value)) continue;
             // Not while its manifest waits for a held source: see _outputsWithKeptManifest.
             if (anyKept && _outputsWithKeptManifest.ContainsKey(s.FilePath)) continue;
             // Nor inside the span of an output whose verdict is not carried out yet: see _undecidedMergeOutputs.
@@ -5971,6 +6043,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;
         if (!File.Exists(walFile) || File.Exists(FlushMarkerPath(segId))) return false;
 
+        BeforeFailedReplayHandOffForTest.Value?.Invoke(walFile);
         byte published = 0;
         if (flushingBlock != 0)
             DeleteUnpublishedLevelFiles(segId);
@@ -5986,6 +6059,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         WakeDespill();
         return true;
     }
+
+    /// <summary>
+    /// Test seam: called with the WAL's path as a failed startup replay is about to be handed to the
+    /// despill — before it deletes the levels the replay moved into place. An <see cref="AsyncLocal{T}"/>:
+    /// the replay runs in the constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> BeforeFailedReplayHandOffForTest = new();
 
     /// <param name="flushing">
     /// Set to the block once the replay is past the check for levels an earlier run published, and so
