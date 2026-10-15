@@ -3776,6 +3776,53 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── A box made before its registration failed (round-5 M-C) ───────────────
+
+    /// <summary>
+    /// Round-5 review M-C. WriteBatchAsync's first suspension — its wait for room — can make its box (its
+    /// state machine copied into it) and then fail to register the continuation (the TPL event source,
+    /// async debugging, a second continuation). The catch below the await went on, in a Release build in
+    /// the method's own copy of the state machine; the next suspension that succeeded reused the box and
+    /// resumed the copy taken at the failed one — and wrote every event since a second time (the review's
+    /// Release probe: 33 168 events stored for a batch of 16 784). A call that caught anything at that
+    /// await never awaits again now. A Debug build's state machine is a class and cannot show it: the
+    /// proof is run in Release.
+    /// </summary>
+    [Fact]
+    public async Task A_batch_whose_box_was_made_before_its_registration_failed_writes_each_event_once()
+    {
+        const int Tier = HotTierSegment.ChunkEventCapacity;
+        var  engine = Engine(Options(NewDir(), tierBytes: 8 * MB));
+        long stored = 0;
+        engine.EventWritten = (_, _) => Interlocked.Increment(ref stored);
+        int swaps = 0;
+        engine._beforeSwap = () => { if (Interlocked.Increment(ref swaps) == 2) Thread.Sleep(300); };   // a real wait for room
+        try
+        {
+            using (var fill = Batch(engine, 0, Tier - 100)) await engine.WriteBatchAsync(fill, HangGuard);
+            long before = Interlocked.Read(ref stored);
+
+            using var batch = Batch(engine, Tier, Tier + 400);
+            int armed = 1;
+            OwnerAsync.BoxThenFailForTest.Value =
+                t => t.Name.Contains("<WriteBatchAsync>", StringComparison.Ordinal) && Interlocked.Exchange(ref armed, 0) == 1;
+            LogBatchWriteResult result;
+            try { result = await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(10)); }
+            finally { OwnerAsync.BoxThenFailForTest.Value = null; }
+
+            Assert.Equal(0, armed);   // setup: the seam made the box and failed
+            Assert.Equal(new LogBatchWriteResult(batch.Count, 0, 0), result);
+            await Task.Delay(300);    // a stale copy resumed by the box would write on after the result
+            long twice = Interlocked.Read(ref stored) - before - batch.Count;
+            Assert.True(twice == 0, $"{twice:N0} event(s) of a batch of {batch.Count:N0} stored twice");
+        }
+        finally
+        {
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── Waiting for an owner semaphore (round-5 M-B) ──────────────────────────
 
     /// <summary>

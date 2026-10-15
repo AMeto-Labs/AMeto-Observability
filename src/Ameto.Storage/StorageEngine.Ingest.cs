@@ -149,6 +149,14 @@ public sealed partial class StorageEngine
             // the prefix twice. A healthy store keeps the rule above: only a batch's waits count.
             long countFrom   = -1;
             long countWaited = 0;
+            // False once anything was caught at the await for room below: from then on this call never
+            // awaits again (round-5 review M-C). A suspension whose box was made and whose registration
+            // then threw — the TPL event source, async debugging, a second continuation — left the box in
+            // the builder with a copy of this method's state taken at that suspension; the method went on
+            // in its own copy (a Release build's struct state machine), and the next suspension that
+            // succeeded reused the box and resumed that stale copy: every event written since, written
+            // again (16 384 events twice for a batch of 16 784, in the review's Release probe).
+            bool awaitable = true;
 
             while (next < batch.Count)
             {
@@ -216,7 +224,8 @@ public sealed partial class StorageEngine
                     // when the swap lock is held (ReleaseFlushLock asks again), so this is the net under
                     // the wake-ups, not what they rest on.
                     _beforeRoomWaitForTest?.Invoke();
-                    await room.WaitAsync(TimeSpan.FromMilliseconds(thisSlice), ct).ConfigureAwait(false);
+                    if (awaitable) await room.WaitAsync(TimeSpan.FromMilliseconds(thisSlice), ct).ConfigureAwait(false);
+                    else           room.Wait((int)thisSlice, ct);   // past a failed await: a blocked thread, never a suspension
                 }
                 catch (TimeoutException) { /* write again */ }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
@@ -230,6 +239,8 @@ public sealed partial class StorageEngine
                     // nothing to allocate (a blocked thread, but only on a heap that cannot set up a
                     // timer), and counts what it waited — the slice it would have waited, so the pause
                     // after each fault in a row still doubles (it slept the re-check interval, every time).
+                    // And it does not await again (see awaitable).
+                    awaitable = false;
                     Thread.Sleep((int)thisSlice);
                 }
                 long elapsed = Environment.TickCount64 - began;

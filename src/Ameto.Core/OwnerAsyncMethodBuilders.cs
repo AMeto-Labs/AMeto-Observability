@@ -49,6 +49,31 @@ internal static class OwnerAsync
         if (Volatile.Read(ref s_firstSuspensionFails)?.Value is { } fails && fails(stateMachine))
             throw new OutOfMemoryException("test: the async state machine's box could not be allocated");
     }
+
+    /// <summary>
+    /// Test seam (round-5 review M-C): asked at an owner-holding async method's FIRST real suspension,
+    /// with its state machine's type; true makes the box — the state machine copied into it, as the
+    /// runtime makes it before it registers the continuation — and then throws, as a registration that
+    /// fails after the box would (the TPL event source, async debugging, a second continuation, a queue's
+    /// growth). In a Release build the method then goes on in its own copy of the state machine, while
+    /// the builder keeps the box with the copy taken at that suspension. Created by the first test that
+    /// asks for it, like <see cref="FirstSuspensionFailsForTest"/>.
+    /// </summary>
+    internal static AsyncLocal<Func<Type, bool>?> BoxThenFailForTest =>
+        Volatile.Read(ref s_boxThenFail)
+        ?? Interlocked.CompareExchange(ref s_boxThenFail, new AsyncLocal<Func<Type, bool>?>(), null)
+        ?? s_boxThenFail!;
+
+    /// <summary>What <see cref="BoxThenFailForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<Type, bool>?>? s_boxThenFail;
+
+    /// <summary>Whether the seam asks this first suspension to make its box and then fail.</summary>
+    internal static bool BoxThenFail(Type stateMachine) =>
+        Volatile.Read(ref s_boxThenFail)?.Value is { } boxThenFail && boxThenFail(stateMachine);
+
+    /// <summary>A task that never completes: the box <see cref="BoxThenFailForTest"/> makes is registered on it.</summary>
+    internal static Task Never => (s_never ??= new TaskCompletionSource()).Task;
+    private static TaskCompletionSource? s_never;
 }
 
 /// <summary><see cref="AsyncTaskMethodBuilder"/> with <see cref="OwnerAsync"/>'s seam.</summary>
@@ -73,22 +98,32 @@ internal struct OwnerTaskMethodBuilder
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
-    private void Suspending<TStateMachine>()
+    /// <summary>The seams, at the first suspension: true when <see cref="OwnerAsync.BoxThenFailForTest"/> asks for the box and then a failure.</summary>
+    private bool Suspending<TStateMachine>()
     {
-        if (_boxed) return;
+        if (_boxed) return false;
         OwnerAsync.FirstSuspension(typeof(TStateMachine));
         _boxed = true;   // before the box copies the state machine, and this builder with it
+        return OwnerAsync.BoxThenFail(typeof(TStateMachine));
+    }
+
+    /// <summary>Makes the box — registered on a task that never completes — and throws as a registration that failed after it.</summary>
+    private void BoxThenFail<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine
+    {
+        var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
+        _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
 
@@ -118,22 +153,32 @@ internal struct OwnerTaskMethodBuilder<TResult>
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
-    private void Suspending<TStateMachine>()
+    /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
+    private bool Suspending<TStateMachine>()
     {
-        if (_boxed) return;
+        if (_boxed) return false;
         OwnerAsync.FirstSuspension(typeof(TStateMachine));
         _boxed = true;
+        return OwnerAsync.BoxThenFail(typeof(TStateMachine));
+    }
+
+    /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
+    private void BoxThenFail<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine
+    {
+        var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
+        _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
 
@@ -160,21 +205,31 @@ internal struct OwnerValueTaskMethodBuilder<TResult>
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        Suspending<TStateMachine>();
+        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
-    private void Suspending<TStateMachine>()
+    /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
+    private bool Suspending<TStateMachine>()
     {
-        if (_boxed) return;
+        if (_boxed) return false;
         OwnerAsync.FirstSuspension(typeof(TStateMachine));
         _boxed = true;
+        return OwnerAsync.BoxThenFail(typeof(TStateMachine));
+    }
+
+    /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
+    private void BoxThenFail<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine
+    {
+        var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
+        _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
