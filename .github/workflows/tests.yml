@@ -150,7 +150,8 @@ jobs:
   # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
   # madvise(MADV_DONTNEED) on Linux — see the second step), and the span bloom under invariant
   # globalization, the Docker image's mode (the third step), and the WALs' durable upgrade rename and
-  # the span WAL's relocation record (the fourth), and log-merge recovery (the fifth). The whole
+  # the span WAL's relocation record (the fourth), the log WAL's flush tick (the fifth), the WALs'
+  # block reservation (the sixth), and log-merge recovery (the seventh). The whole
   # suite already runs above; this job exists for the code that only does anything on Linux, or only
   # in production's mode, or whose tests were written on Windows' share modes.
   #
@@ -323,6 +324,29 @@ jobs:
                    A_grow_unmaps_the_old_view_without_writing_it_back; do
             if ! grep -q "Passed Ameto.Storage.Tests.WalWriterPathTests.$t" walflush-output.txt; then
               echo "::error::WalWriterPathTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE WALS' BLOCKS, RESERVED WHERE THEY ARE SIZED, ON LINUX (round-5 H-F). The log WAL and its
+      # spill files and the metric WAL are mapped over files sized with SetLength — ftruncate here,
+      # which leaves them sparse — and a write through the mapping into a page of a full volume was
+      # SIGBUS: the server killed, where NTFS fails the open or the grow with an IOException the engine
+      # answers 503 with. FileSpace reserves the blocks (posix_fallocate) at each open and each growth;
+      # these facts read the blocks a log has on disk (stat) against its length. They return early off
+      # Linux, which the guard turns into a failure here if the filter stops reaching them.
+      - name: Test the WALs' block reservation (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow|FullyQualifiedName~On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth" \
+            --logger "console;verbosity=normal" 2>&1 | tee reserve-output.txt
+
+          for t in WriteAheadLogTests.On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow \
+                   MetricWalTests.On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth; do
+            if ! grep -q "Passed Ameto.Storage.Tests.$t" reserve-output.txt; then
+              echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1
             fi
           done

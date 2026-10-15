@@ -719,8 +719,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         }
 
         long fileSize = _headerSize + initialCapacity;
-        if (_file.Length < fileSize) _file.SetLength(fileSize);
-        else                         fileSize = _file.Length;   // reopen an already-grown log
+        long found    = _file.Length;
+        if (found < fileSize)
+        {
+            _file.SetLength(fileSize);
+            // Its blocks reserved (round-5 H-F, as the logs' WAL): on Linux SetLength leaves the file
+            // sparse, and the first write through the mapping into a page of a full volume is SIGBUS.
+            FileSpace.Reserve(_file.SafeFileHandle, found, fileSize - found);
+        }
+        else fileSize = found;   // reopen an already-grown log
 
         _capacity = fileSize - _headerSize;
         Map(fileSize);
@@ -2647,6 +2654,12 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // mapping still in place, which an explicit SetLength could not be sure of on Windows.
             mmf  = MemoryMappedFile.CreateFromFile(_file!, null, newFileSize, MemoryMappedFileAccess.ReadWrite,
                                                    HandleInheritability.None, leaveOpen: true);
+            // The extension's blocks reserved before anything is written through the new view (round-5
+            // H-F): on Linux the mapping extended the file sparse, and a write into a page of a full volume
+            // is SIGBUS. From the old mapping's end, not the file's: a growth that failed after extending the
+            // file left its tail unreserved. A volume that cannot hold them fails this growth, the old
+            // mapping still in place.
+            FileSpace.Reserve(_file!.SafeFileHandle, _headerSize + capacity, target - capacity);
             view = mmf.CreateViewAccessor(0, newFileSize, MemoryMappedFileAccess.ReadWrite);
             byte* ptr = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);

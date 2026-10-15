@@ -919,6 +919,28 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(n - 1, replayed[^1].Point.Value);
     }
 
+    /// <summary>
+    /// Round-5 review H-F, the metric log: as the logs' WAL, it is mapped over a file sized with SetLength
+    /// (and grown by a mapping's own capacity), which on Linux leaves it sparse — a write into a page of a
+    /// full volume is SIGBUS. Its blocks are reserved at the open and at each growth now.
+    /// </summary>
+    [Fact]
+    public void On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth()
+    {
+        if (!OperatingSystem.IsLinux()) return;   // NTFS allocates on SetLength; this is Linux's road
+        var wal = OpenWal(4 * 1024);
+        long sized = new FileInfo(WalPath).Length;
+        Assert.True(FileAllocation.AllocatedBytes(WalPath) >= sized,
+            $"the metric log is sparse from its open: {FileAllocation.AllocatedBytes(WalPath):N0} of {sized:N0} bytes on disk");
+
+        for (int i = 0; i < 2_000; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
+        long grown = new FileInfo(WalPath).Length;
+        Assert.True(grown > sized, "setup: the metric log did not grow");
+        Assert.True(FileAllocation.AllocatedBytes(WalPath) >= grown,
+            $"the metric log is sparse past its growth: {FileAllocation.AllocatedBytes(WalPath):N0} of {grown:N0} bytes on disk");
+        wal.Dispose();
+    }
+
     // ── The regression this change is about ───────────────────────────────────
 
     private static MetricIngestItem[] Minute(long nano, int metricNames, int seriesPerName)

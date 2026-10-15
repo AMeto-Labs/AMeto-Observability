@@ -299,6 +299,40 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// Round-5 review H-F. On Linux a log is sized with ftruncate, which leaves the file sparse: its blocks
+    /// were taken by the first write into each page, through the mapping, and on a volume that had filled
+    /// meanwhile that write was SIGBUS — the process killed, where NTFS, which allocates on SetLength, fails
+    /// the open or the grow with an IOException the engine answers 503 with. The blocks are reserved where
+    /// the size is set now, at the open and at every grow: the file has them before anything is written.
+    /// </summary>
+    [Fact]
+    public void On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow()
+    {
+        if (!OperatingSystem.IsLinux()) return;   // NTFS allocates on SetLength; this is Linux's road
+        string path    = NewWalPath();
+        byte[] payload = new byte[600 * 1024];
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                long sized = new FileInfo(path).Length;
+                Assert.True(FileAllocation.AllocatedBytes(path) >= sized,
+                    $"the log is sparse from its open: {FileAllocation.AllocatedBytes(path):N0} of {sized:N0} bytes on disk");
+
+                // The second entry does not fit: the log doubles to 2 MB, and its upper half is written by nothing
+                // yet — the pages a later append would have met unallocated.
+                Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", payload));
+                Assert.True(wal.Append(2_000, LogLevel.Information, 1, "t", payload));
+                long grown = new FileInfo(path).Length;
+                Assert.True(grown > sized, "setup: the log did not grow");
+                Assert.True(FileAllocation.AllocatedBytes(path) >= grown,
+                    $"the log is sparse past its grow: {FileAllocation.AllocatedBytes(path):N0} of {grown:N0} bytes on disk");
+            }
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// An entry larger than twice the log's capacity grows the log to fit it. Grow doubled once and
     /// assumed that was enough, so such an entry was copied past the end of the mapping — reachable
     /// in a spill log, which can be as small as 1 MB and takes its first entry whatever its size.

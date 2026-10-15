@@ -260,10 +260,17 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // or a recovered WriteOffset beyond the requested size would walk off the view.
         long fileSize = FileHeaderSize + initialCapacity;
         _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        if (_fileStream.Length < fileSize)
+        long found = _fileStream.Length;
+        if (found < fileSize)
+        {
             _fileStream.SetLength(fileSize);
+            // Its blocks reserved, not left to the first write into each page (round-5 H-F): on Linux
+            // SetLength is ftruncate, the file sparse, and that write SIGBUS on a full volume — the
+            // process killed where NTFS fails this open with an IOException. See FileSpace.
+            FileSpace.Reserve(_fileStream.SafeFileHandle, found, fileSize - found);
+        }
         else
-            fileSize = _fileStream.Length;
+            fileSize = found;
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
@@ -1192,6 +1199,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             try
             {
                 _fileStream!.SetLength(newFileSize);
+                // Reserved, as at the open (round-5 H-F): a full volume fails this grow, which the
+                // catch undoes, and not the first append into a new page, with SIGBUS.
+                FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize);
                 Map(newFileSize);
                 _capacity = newCapacity;
             }
