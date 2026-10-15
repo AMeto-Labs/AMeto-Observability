@@ -2216,54 +2216,58 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// charged its queueing for the writer lock — a healthy one too, run after run: under contention a
     /// healthy batch gave up part way, a 200 with its tail dropped that no client retries. Only a
     /// request in a run of faults of its own, or one that has written nothing yet (whose giving up is
-    /// a clean 503), is charged now. Here a healthy batch of three runs queues 350 ms behind another
-    /// request after each of its first two, the store faulting: with a 500 ms wait it gave up at its
-    /// third run; it writes all of it now.
+    /// a clean 503), is charged now. Here a healthy batch, after its first run, queues 700 ms behind
+    /// another request whose own first write faulted a moment before — longer than its whole 500 ms
+    /// wait: charged, it gave up there; it writes all of it now.
+    ///
+    /// <para>Reworked in round 5 (review L-8: it caught its revert 1 run in 8 on two cores). It queued
+    /// 350 ms twice, and each request ran on the pool: on two cores the other request's thread came
+    /// late, and the episode — a second from the one fault at the start — could end before the second
+    /// queueing. And since round-5 L-6 a write that lands drops what its queueing was charged, so the
+    /// charge must pass the wait within one queueing. Each request has a thread of its own now, and
+    /// the other request's own fault starts the episode as the healthy batch comes back for the lock.</para>
     /// </summary>
     [Fact]
     public async Task A_healthy_batch_that_has_written_is_not_charged_its_queueing_while_the_store_faults()
     {
+        const int WaitMs = 500, HoldMs = 700;   // one queueing longer than the whole wait
         var engine = Engine(Options(NewDir()));
         engine._roomRecheckMs = 20;
         using var inGate = new SemaphoreSlim(0);
-        int failFirst = 1, holdNext = 0, hThread = 0, hRuns = 0;
+        int failNext = 0, holdNext = 0, hThread = 0, hRuns = 0;
         engine._afterWriteGate = () =>
         {
-            if (Interlocked.Exchange(ref failFirst, 0) == 1) throw new OutOfMemoryException("test: another request's write faults");
+            if (Interlocked.Exchange(ref failNext, 0) == 1) throw new OutOfMemoryException("test: another request's write faults");
             if (Interlocked.Exchange(ref holdNext, 0) == 1)
             {
                 inGate.Release();
-                Thread.Sleep(350);   // another request's write holds the writer lock
+                Thread.Sleep(HoldMs);   // another request's write holds the writer lock
             }
         };
-        var others = new System.Collections.Concurrent.ConcurrentBag<Task>();
+        Task<LogBatchWriteResult>? other = null;
         engine._afterWriteRunForTest = () =>
         {
-            // After the healthy batch's first and second runs, another request takes the lock first.
-            if (Environment.CurrentManagedThreadId != Volatile.Read(ref hThread) || Interlocked.Increment(ref hRuns) > 2) return;
+            // After the healthy batch's first run, another request comes: its first write faults — the store
+            // is faulting — and its next holds the lock while the healthy batch comes back for it.
+            if (Environment.CurrentManagedThreadId != Volatile.Read(ref hThread) || Interlocked.Increment(ref hRuns) != 1) return;
+            Volatile.Write(ref failNext, 1);
             Volatile.Write(ref holdNext, 1);
-            int n = 100_000 + Volatile.Read(ref hRuns);
-            others.Add(Task.Run(async () =>
-            {
-                using var g = Batch(engine, n, 1);
-                await engine.WriteBatchAsync(g, HangGuard);
-            }));
+            var g = Batch(engine, 100_000, 1);
+            other = Task.Factory.StartNew(async () => { using (g) return await engine.WriteBatchAsync(g, HangGuard); },
+                                          CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
             Assert.True(inGate.Wait(HangGuard), "the other request never took the lock");
         };
         try
         {
-            using (var f = Batch(engine, 50_000, 1))   // faults once, then writes: the store is faulting
-                Assert.Equal(new LogBatchWriteResult(1, 0, 0), await engine.WriteBatchAsync(f, HangGuard));
-
             using var h = Batch(engine, 0, 3 * 256);
-            var result = await Task.Run(async () =>
+            var result = await Task.Factory.StartNew(() =>
             {
                 Volatile.Write(ref hThread, Environment.CurrentManagedThreadId);
-                return await engine.WriteBatchAsync(h, TimeSpan.FromMilliseconds(500));
-            }).WaitAsync(HangGuard);
+                return engine.WriteBatchAsync(h, TimeSpan.FromMilliseconds(WaitMs)).AsTask();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap().WaitAsync(HangGuard);
 
             Assert.Equal(new LogBatchWriteResult(3 * 256, 0, 0), result);
-            await Task.WhenAll(others).WaitAsync(HangGuard);
+            Assert.Equal(new LogBatchWriteResult(1, 0, 0), await other!.WaitAsync(HangGuard));
         }
         finally
         {
@@ -2272,7 +2276,6 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             await engine.DisposeAsync();
         }
     }
-
     /// <summary>
     /// Round-5 review L-6 (M1, its other half). A request that has written nothing yet is charged its
     /// queueing for the writer lock while the store faults, so that it gives up cleanly with a 503 — but
