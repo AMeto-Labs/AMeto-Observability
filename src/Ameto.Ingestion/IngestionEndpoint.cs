@@ -990,8 +990,8 @@ public sealed class IngestionEndpoint
         int serviceIdx, string? service)
     {
         int    bytes    = (int)Math.Min(payloadBytes, int.MaxValue);
-        string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-        string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
+        string origTmpl = MarkerTemplate(templateUtf8);
+        string svcStr   = !serviceUtf8.IsEmpty ? StringInternPool.Decode(serviceUtf8)
                         : serviceIdx >= 0      ? _pool.Get(serviceIdx)
                         : string.Empty;
         StageServerDropMarker(batch, tsTicks, level, origTmpl, bytes, traceHi, traceLo, spanId, serviceIdx, service,
@@ -1021,8 +1021,8 @@ public sealed class IngestionEndpoint
             // Cold path: the strings here are worth their cost — this is one marker event per
             // dropped event, not per event. The drop is COUNTED, and the line that names it written,
             // with the answer that ends the request (CommitAsync), as in StageRaw.
-            string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
+            string  tmplStr = MarkerTemplate(templateUtf8);
+            string? svcStr  = serviceUtf8.IsEmpty  ? null         : StringInternPool.Decode(serviceUtf8);
 
             int markerSvcIdx = svcStr is not null ? _pool.Intern(svcStr) : -1;
             StageServerDropMarker(
@@ -1056,6 +1056,20 @@ public sealed class IngestionEndpoint
     private const string DropMarkerTemplate =
         "Ameto server dropped an oversized log event: properties {EventBodyBytes} B exceed limit {EventBodyLimitBytes} B ({OriginalTemplate})";
 
+    /// <summary>The most of a refused event's template its drop marker keeps, in UTF-16 units.</summary>
+    private const int MarkerTemplateChars = 256;
+
+    /// <summary>
+    /// The start of a refused event's template — what its drop marker keeps (<see cref="MarkerTemplateChars"/>)
+    /// and its drop line names (120 units) — decoded from no more of its UTF-8 than that can take, four bytes
+    /// a unit at the most, U+FFFD for what is not UTF-8, allocating nothing but the string (round-5 review
+    /// L-13). The whole template was decoded, through Encoding.UTF8's replacement fallback, ~35 B for each
+    /// byte that is not UTF-8 — 140 MB for one record of a 4 MB body, every record refused unassembled — and
+    /// all but its first 256 units dropped.
+    /// </summary>
+    private static string MarkerTemplate(ReadOnlySpan<byte> utf8) =>
+        utf8.IsEmpty ? string.Empty : StringInternPool.Decode(utf8[..Math.Min(utf8.Length, 4 * MarkerTemplateChars)]);
+
     /// <summary>
     /// Stages a compact Error event standing in for a dropped oversized one,
     /// preserving its timestamp / trace-span / service. The marker is tiny (the
@@ -1068,8 +1082,7 @@ public sealed class IngestionEndpoint
         int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx, string? service,
         LogIngestBatch.OversizedDrop drop)
     {
-        const int MaxTemplateChars = 256;
-        string origTmpl  = originalTemplate.Length <= MaxTemplateChars ? originalTemplate : originalTemplate[..MaxTemplateChars];
+        string origTmpl  = originalTemplate.Length <= MarkerTemplateChars ? originalTemplate : originalTemplate[..MarkerTemplateChars];
         string origLevel = ((Ameto.Core.LogLevel)originalLevel).ToString();
 
         var buf = new ArrayBufferWriter<byte>(384);

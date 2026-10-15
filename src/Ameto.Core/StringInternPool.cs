@@ -454,8 +454,13 @@ public sealed class StringInternPool
         return written;
     }
 
-    /// <summary>A long UTF-8 text decoded straight into its own string, as <see cref="DecodeInto"/> decodes.</summary>
-    private static string Decode(ReadOnlySpan<byte> utf8)
+    /// <summary>
+    /// A UTF-8 text decoded straight into its own string, as <see cref="DecodeInto"/> decodes — U+FFFD for each
+    /// invalid sequence, as <see cref="System.Text.Encoding.UTF8"/> makes it, allocating nothing but the string.
+    /// Internal for the ingest path's drop markers (round-5 review L-13), whose GetString allocated ~35 B for
+    /// each byte that is not UTF-8 — 140 MB for one record of a 4 MB body.
+    /// </summary>
+    internal static string Decode(ReadOnlySpan<byte> utf8)
     {
         int length;
         if (System.Text.Unicode.Utf8.IsValid(utf8)) length = System.Text.Encoding.UTF8.GetCharCount(utf8);

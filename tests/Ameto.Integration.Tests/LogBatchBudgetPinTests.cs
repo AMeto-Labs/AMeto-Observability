@@ -139,6 +139,32 @@ public sealed class LogBatchBudgetPinTests : IClassFixture<LogBatchBudgetPinTest
         Assert.Equal(accepted, endpoint.AcceptedTotal);
     }
 
+    // ── L-13: a record refused unassembled ────────────────────────────────────
+
+    /// <summary>
+    /// Round-5 review L-13. A record refused unassembled has its template decoded for its drop marker
+    /// (which keeps 256 units of it) and its drop line (120): the whole template, through
+    /// Encoding.UTF8's replacement fallback — ~35 B for each byte that is not UTF-8, 140 MB for one record
+    /// of a 4 MB body. Only the start the marker keeps is decoded now, U+FFFD for what is not UTF-8.
+    /// </summary>
+    [Fact]
+    public void A_record_refused_unassembled_decodes_only_the_start_of_its_template()
+    {
+        var endpoint = Endpoint(limit: 64L * 1024 * 1024, inFlight: 64L * 1024 * 1024);
+        using var batch = endpoint.TryBeginBatch(payloadSizeHint: 0, decodedWeight: 1024 * 1024)!;
+        byte[] template = new byte[4_000_000];
+        template.AsSpan().Fill(0xFF);
+        long ts = DateTimeOffset.UtcNow.UtcTicks;
+        batch.TryIngestOversized(ts, (byte)LogLevel.Information, template, 1_000_000, 0, 0, 0, default, -1);   // warm
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.False(batch.TryIngestOversized(ts, (byte)LogLevel.Information, template, 1_000_000, 0, 0, 0, default, -1));
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 64 * 1024, $"refusing a record of a 4 MB template that is not UTF-8 allocated {allocated:N0} B");
+        Assert.Equal(new string('�', 120) + "…", batch.DropAt(1).Template);   // what its drop line names, as before
+    }
+
     // ── L-7: a refused batch goes back before its answer ──────────────────────
 
     /// <summary>A response body that notes what was held decoded at once when the answer was first written.</summary>
