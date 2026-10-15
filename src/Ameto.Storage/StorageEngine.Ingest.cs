@@ -149,6 +149,11 @@ public sealed partial class StorageEngine
             // the prefix twice. A healthy store keeps the rule above: only a batch's waits count.
             long countFrom   = -1;
             long countWaited = 0;
+            // Within that counting: when its own first fault was (-1: none — it is counting the store's
+            // episode alone), and what its room waits took. A write that lands keeps only those charged
+            // (round-5 review L-6).
+            long ownFrom     = -1;
+            long countSlices = 0;
             // False once anything was caught at the await for room below: from then on this call never
             // awaits again (round-5 review M-C). A suspension whose box was made and whose registration
             // then threw — the TPL event source, async debugging, a second continuation — left the box in
@@ -177,9 +182,17 @@ public sealed partial class StorageEngine
                 // a later fault doubled a stale count.
                 if (next > runFrom)
                 {
-                    if (countFrom >= 0) waitedMs = countWaited + (runStart - countFrom);
-                    countFrom = -1;
-                    faults    = 0;
+                    // What stays charged of the counting: its own run of faults, from the first — and of a
+                    // count that was the store's episode alone (it queued while others faulted), only the
+                    // waits it did. The whole of its queueing behind the episode stayed charged, and a
+                    // healthy request then gave up at a routine wait for room later in its batch: a 200
+                    // with its tail dropped, which no client retries (round-5 review L-6).
+                    if (countFrom >= 0)
+                        waitedMs = countWaited + (ownFrom >= 0 ? Math.Max(0, runStart - ownFrom) : countSlices);
+                    countFrom   = -1;
+                    ownFrom     = -1;
+                    countSlices = 0;
+                    faults      = 0;
                 }
 
                 if (outcome is WriteOutcome.Written or WriteOutcome.TooLarge) continue;   // the run is done; let others in
@@ -198,6 +211,7 @@ public sealed partial class StorageEngine
                         countFrom   = runStart;
                         countWaited = waitedMs;
                     }
+                    if (ownFrom < 0) ownFrom = runStart;
                     faults++;
                     waitedMs = countWaited + (Environment.TickCount64 - countFrom);
                     if (budgetMs - waitedMs <= 0) break;
@@ -245,7 +259,11 @@ public sealed partial class StorageEngine
                 }
                 long elapsed = Environment.TickCount64 - began;
                 if (countFrom < 0) waitedMs += elapsed;
-                else               waitedMs  = countWaited + (Environment.TickCount64 - countFrom);
+                else
+                {
+                    countSlices += elapsed;
+                    waitedMs     = countWaited + (Environment.TickCount64 - countFrom);
+                }
             }
 
             int notWritten = batch.Count - next;

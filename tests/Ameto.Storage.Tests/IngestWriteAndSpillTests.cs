@@ -2274,6 +2274,110 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-5 review L-6 (M1, its other half). A request that has written nothing yet is charged its
+    /// queueing for the writer lock while the store faults, so that it gives up cleanly with a 503 — but
+    /// the charge stayed after its first write landed: a healthy request that queued 700 ms of its 1 s
+    /// behind the episode then gave up at a routine wait for room later in its batch (a 600 ms swap), a
+    /// 200 with its tail dropped. What stays charged once a write lands is its own faults and its waits.
+    /// </summary>
+    [Fact]
+    public async Task A_request_whose_first_write_lands_is_not_charged_the_episode_it_queued_through()
+    {
+        const int WaitMs = 1_000, HoldMs = 700, SwapMs = 600;   // queueing + swap > the wait > the swap
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 20;
+        using var holding = new SemaphoreSlim(0);
+        int failFirst = 0, holdNext = 0;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Exchange(ref failFirst, 0) == 1) throw new OutOfMemoryException("test: another request's write faults");
+            if (Interlocked.Exchange(ref holdNext, 0) == 1)
+            {
+                holding.Release();
+                Thread.Sleep(HoldMs);   // another request's write holds the writer lock
+            }
+        };
+        Task? letGo = null;
+        try
+        {
+            using (var fill = Batch(engine, 0, TierEvents - 300))   // the tier, all but 300 events of it
+                Assert.Equal(new LogBatchWriteResult(TierEvents - 300, 0, 0), await engine.WriteBatchAsync(fill, HangGuard));
+
+            Volatile.Write(ref failFirst, 1);
+            using (var f = Batch(engine, 50_000, 1))   // faults once, then writes: the store is faulting
+                Assert.Equal(new LogBatchWriteResult(1, 0, 0), await engine.WriteBatchAsync(f, HangGuard));
+
+            // A routine swap, not a quick one: the swap lock held until the request has waited SwapMs for
+            // room. Held and let go on threads of their own, as is everything here that waits: on two
+            // cores a pool thread blocked for the swap starved the request's re-checks, and its wait for
+            // room went by in one slice; and a pool thread for the request came only once the other had
+            // let go of the writer lock, so it queued for nothing.
+            using var h     = Batch(engine, TierEvents, 600);   // queues behind the other; its 300th event fills the tier
+            using var other = Batch(engine, 60_000, 1);
+            Assert.True(engine.FlushLockForTest.Wait(0), "setup: a swap was running");
+            letGo = Task.Factory.StartNew(() => { Thread.Sleep(HoldMs + SwapMs); engine.FlushLockForTest.Release(); },
+                                          CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Volatile.Write(ref holdNext, 1);
+            var holder = Task.Factory.StartNew(() => engine.WriteBatchAsync(other, HangGuard).AsTask(),
+                                               CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            Assert.True(holding.Wait(HangGuard), "setup: the other request never took the lock");
+
+            var result = await Task.Factory.StartNew(() => engine.WriteBatchAsync(h, TimeSpan.FromMilliseconds(WaitMs)).AsTask(),
+                                                     CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+                                           .Unwrap().WaitAsync(HangGuard);
+
+            Assert.Equal(new LogBatchWriteResult(600, 0, 0), result);
+            await holder.WaitAsync(HangGuard);
+        }
+        finally
+        {
+            if (letGo is not null) await letGo.WaitAsync(HangGuard);
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The other side of L-6: what a write that lands drops is the store's episode, not the request's own
+    /// faults. A request whose own writes kept failing, then landed one run, then failed again ends within
+    /// about its wait from its first fault — given a fresh wait at each run that landed, a store that
+    /// faults all but now and then kept it going past a client's timeout, whose resend writes the prefix
+    /// twice.
+    /// </summary>
+    [Fact]
+    public async Task A_request_whose_own_writes_fault_around_one_that_lands_ends_within_its_wait()
+    {
+        const int WaitMs = 2_000, FaultFirstMs = 1_000, FaultMs = 200;   // an attempt that faults takes time: a full GC
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 20;
+        long started = 0;
+        int  landed  = 0;   // events let through: one run's worth, after FaultFirstMs of faults
+        engine._afterWriteGate = () =>
+        {
+            if (Environment.TickCount64 - Volatile.Read(ref started) >= FaultFirstMs && Interlocked.Increment(ref landed) <= 256) return;
+            Thread.Sleep(FaultMs);
+            throw new OutOfMemoryException("test: this request's write faults");
+        };
+        try
+        {
+            using var r  = Batch(engine, 0, 1_000);
+            var       sw = System.Diagnostics.Stopwatch.StartNew();
+            Volatile.Write(ref started, Environment.TickCount64);
+            var result = await engine.WriteBatchAsync(r, TimeSpan.FromMilliseconds(WaitMs)).AsTask().WaitAsync(HangGuard);
+            sw.Stop();
+
+            Assert.Equal(new LogBatchWriteResult(256, 0, 744), result);
+            Assert.True(sw.ElapsedMilliseconds < WaitMs + 500,
+                        $"the request took {sw.ElapsedMilliseconds} ms of a {WaitMs} ms wait: the faults before its write landed were forgotten");
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Round-4 review L1. The writer lock was waited for in 50 ms slices, each a TryEnter that gave up
     /// and came back as a new waiter — so none ever reached System.Threading.Lock's 100 ms, after which
     /// a waiter is handed the lock instead of barged past: a lone small request behind a busy writer
