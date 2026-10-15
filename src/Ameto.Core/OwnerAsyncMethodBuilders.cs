@@ -80,6 +80,51 @@ internal struct OwnerTaskMethodBuilder
     }
 }
 
+/// <summary>
+/// <see cref="AsyncTaskMethodBuilder{TResult}"/> with <see cref="OwnerAsync"/>'s seam: for a method that
+/// is handed something to read by a caller who owns it — a flush reading a frozen tier — whose caller
+/// takes the method's fault for "it has stopped reading" (round-5 H-B).
+/// </summary>
+internal struct OwnerTaskMethodBuilder<TResult>
+{
+    private AsyncTaskMethodBuilder<TResult> _inner;
+    private bool                            _boxed;
+
+    public static OwnerTaskMethodBuilder<TResult> Create() => new() { _inner = AsyncTaskMethodBuilder<TResult>.Create() };
+
+    public Task<TResult> Task => _inner.Task;
+
+    public void Start<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine =>
+        _inner.Start(ref stateMachine);
+
+    public void SetStateMachine(IAsyncStateMachine stateMachine) => _inner.SetStateMachine(stateMachine);
+
+    public void SetResult(TResult result) => _inner.SetResult(result);
+
+    public void SetException(Exception exception) => _inner.SetException(exception);
+
+    public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
+        where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
+    {
+        Suspending<TStateMachine>();
+        _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+    }
+
+    public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
+        where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
+    {
+        Suspending<TStateMachine>();
+        _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+    }
+
+    private void Suspending<TStateMachine>()
+    {
+        if (_boxed) return;
+        OwnerAsync.FirstSuspension(typeof(TStateMachine));
+        _boxed = true;
+    }
+}
+
 /// <summary><see cref="AsyncValueTaskMethodBuilder{TResult}"/> with <see cref="OwnerAsync"/>'s seam.</summary>
 internal struct OwnerValueTaskMethodBuilder<TResult>
 {

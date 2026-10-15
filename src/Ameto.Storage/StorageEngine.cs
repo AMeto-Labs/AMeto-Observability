@@ -5268,9 +5268,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// their file is still there — a merge or retention pass may have taken it since, and asking
     /// the disk now would write those events a second time.
     /// </param>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
         HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false, byte publishedLevels = 0)
     {
+        // Boxed first, before any level write is queued (round-5 H-B; see TryFlushAsync). Its first real
+        // suspension was the await of its first level's FlushToColdAsync, whose Task.Run is already
+        // reading the tier: a box that could not be allocated there faulted this task while that write
+        // ran on, and every caller takes this task's fault for "the flush has stopped" — the swap and the
+        // despill handed the tier to a retry that wrote it beside the orphan, a despill whose retry could
+        // not start freed it under the write, and the startup replay's `using` freed it the same way. A
+        // failure here faults the task before anything reads the tier.
+        await Task.Yield();
+
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
         var perLevel = new int[LevelSegmentSlots][];
@@ -5462,6 +5472,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>Test seam: runs as a block's marker is about to be removed; throwing from it is a marker that cannot be. Null in production.</summary>
     internal Action<ulong>? _removeFlushMarkerForTest;
 
+    /// <summary>
+    /// Test seam: called with the tier as a level write begins, on its thread, before it reads anything
+    /// — how a test holds a write and sees whether its tier is freed or written again beside it. An
+    /// <see cref="AsyncLocal{T}"/>: the startup replay's flush runs in the constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<HotTierSegment>?> LevelWriteStartingForTest = new();
+
     /// <param name="orderCount">
     /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
     /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
@@ -5475,6 +5492,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         long groupBudget = _groupPayloadBudgetBytes;
         return Task.Run(() =>
         {
+            LevelWriteStartingForTest.Value?.Invoke(hot);
             // One sort order shared by the index build and the block writer: posting-list
             // offsets become file ordinals, which the reader maps back to blocks/rows.
             // A caller-supplied order may be a SUBSET of the tier (level-split flush).
@@ -6309,8 +6327,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // all: its complete flush replays to zero new segments and the WAL is simply dropped.
         if (recoveredHot.Count > 0)
         {
-            var written = FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true)
-                              .GetAwaiter().GetResult();
+            var written = ResultOnceEnded(FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true));
             long recovered = 0;
             for (int i = 0; i < written.Count; i++)
             {
@@ -6323,6 +6340,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
 
         DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
+    }
+
+    /// <summary>
+    /// The startup replay's wait for its flush, which reads the recovery tier the replay's <c>using</c>
+    /// frees on the way out — so it returns, or throws, only once the flush has ended. Task's own blocking
+    /// wait allocates once the task has not completed (its event, its completion action): an out of
+    /// memory there threw out of <c>GetResult</c> with the flush still reading, and the tier was freed
+    /// under it (round-5 H-B, the same line). This one waits allocating nothing — a sleep a millisecond at
+    /// a time, once per replayed log at the start — then takes the outcome of a task that has ended.
+    /// </summary>
+    private static T ResultOnceEnded<T>(Task<T> flush)
+    {
+        while (!flush.IsCompleted) Thread.Sleep(1);
+        return flush.GetAwaiter().GetResult();
     }
 
     // ── Segment-id allocator ──────────────────────────────────────────────────
