@@ -641,6 +641,7 @@ public sealed partial class StorageEngine
                 sliceMs = Math.Min(sliceMs, left);
             }
             if (_writerLock.TryEnter((int)sliceMs)) return true;
+            _onWriterLockSliceForTest?.Invoke();
             if (ct.IsCancellationRequested) return false;
         }
     }
@@ -652,6 +653,9 @@ public sealed partial class StorageEngine
     /// a new one never got there — a lone small request waited up to 462 ms behind busy writers.
     /// </summary>
     private const int LockWaitSliceMs = 200;
+
+    /// <summary>Test seam: a writer's wait for the lock ran out one slice without it (see <see cref="LockWaitSliceMs"/>).</summary>
+    internal Action? _onWriterLockSliceForTest;
 
     /// <summary>Test hook: runs after each run of a batch's writes, outside the writer lock.</summary>
     internal Action? _afterWriteRunForTest;

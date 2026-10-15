@@ -2276,6 +2276,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             await engine.DisposeAsync();
         }
     }
+
     /// <summary>
     /// Round-5 review L-6 (M1, its other half). A request that has written nothing yet is charged its
     /// queueing for the writer lock while the store faults, so that it gives up cleanly with a 503 — but
@@ -2427,6 +2428,50 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally
         {
             engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L1, pinned on any number of cores (round-5 review L-8: the test above can never fail
+    /// on two — there a lone writer gets the lock between the busy one's runs with either slice). A writer
+    /// waits for the lock in slices longer than System.Threading.Lock's 100 ms, so that it stays the waiter
+    /// long enough to be handed the lock; a writer held off 450 ms by another's write comes back for it at
+    /// most twice. With 50 ms slices it came back seven times, a new waiter each time, never handed it.
+    /// </summary>
+    [Fact]
+    public async Task A_writer_waits_for_the_lock_in_slices_past_the_locks_handoff_bound()
+    {
+        var engine = Engine(Options(NewDir()));
+        using var holding = new SemaphoreSlim(0);
+        int holdNext = 1, slices = 0;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Exchange(ref holdNext, 0) != 1) return;
+            holding.Release();
+            Thread.Sleep(450);   // another request's write holds the writer lock
+        };
+        engine._onWriterLockSliceForTest = () => Interlocked.Increment(ref slices);
+        try
+        {
+            using var first  = Batch(engine, 0, 1);
+            using var second = Batch(engine, 1, 1);
+            var holder = Task.Factory.StartNew(() => engine.WriteBatchAsync(first, HangGuard).AsTask(),
+                                               CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            Assert.True(holding.Wait(HangGuard), "setup: the first write never took the lock");
+            var waiter = Task.Factory.StartNew(() => engine.WriteBatchAsync(second, HangGuard).AsTask(),
+                                               CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+            Assert.Equal(new LogBatchWriteResult(1, 0, 0), await waiter.WaitAsync(HangGuard));
+            Assert.Equal(new LogBatchWriteResult(1, 0, 0), await holder.WaitAsync(HangGuard));
+            int came = Volatile.Read(ref slices);
+            Assert.True(came >= 1, "setup: the writer never waited out a slice");
+            Assert.True(came <= 3, $"the writer came back for the lock {came} times in 450 ms");
+        }
+        finally
+        {
+            engine._afterWriteGate           = null;
+            engine._onWriterLockSliceForTest = null;
             await engine.DisposeAsync();
         }
     }
