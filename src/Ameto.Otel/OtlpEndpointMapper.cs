@@ -110,9 +110,24 @@ public static class OtlpEndpointMapper
         // The answer to an ACCEPTED batch is written outside: once the batch is stored, a retry
         // would only store it twice.
 
+        // BOXED FIRST, OWNING NOTHING (round-5 H-G, M-D). A handler's state machine is boxed at its first
+        // real suspension, and a box that cannot be allocated throws there with every finally of the
+        // handler skipped while what it awaited runs on. That was the body read (ReadBodyAsync), which
+        // goes on to wait for an inflate slot and take it for nobody — two such on the stand's two slots,
+        // and every compressed batch, logs, traces and metrics, HTTP and gRPC, was refused until a
+        // restart — or, for logs read whole without suspending, the commit, waited out on a pool thread
+        // the commit itself needed. Each handler yields before anything else now: a failure there takes
+        // nothing with it and is answered 503 with Retry-After, which exporters retry.
+
         // ── Traces ────────────────────────────────────────────────────────────
-        var traces = async (HttpContext ctx, ISpanSink sink) =>
+        var traces = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx, ISpanSink sink) =>
         {
+            try { await Task.Yield(); }
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+            {
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
             int ingested, refused;
@@ -154,8 +169,14 @@ public static class OtlpEndpointMapper
         };
 
         // ── Metrics ───────────────────────────────────────────────────────────
-        var metrics = async (HttpContext ctx) =>
+        var metrics = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx) =>
         {
+            try { await Task.Yield(); }   // boxed first (see above)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+            {
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
             if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
 
@@ -228,6 +249,12 @@ public static class OtlpEndpointMapper
         // ── Logs ──────────────────────────────────────────────────────────────
         var logs = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx) =>
         {
+            try { await Task.Yield(); }   // boxed first (see above)
+            catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+            {
+                RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
@@ -329,24 +356,10 @@ public static class OtlpEndpointMapper
                 }
 
                 // Answered only once the events are in the store — the hot tier and its WAL, or a
-                // spill file — so a 200 survives the death of this process (IngestionEndpoint).
-                // Guarded, and the batch given back right after, not in the finally: this handler's first real
-                // suspension can be this await (a body read whole without suspending), where its state machine
-                // is boxed — and a box that cannot be allocated threw here while the commit ran on (a 500 for a
-                // batch the store went on to write), skipping every finally of the handler, the batch's
-                // dispose among them (its reservation held for good). See IngestionEndpoint.HandleAsync.
-                var commit = batch!.CommitAsync(ctx.RequestAborted);
-                LogIngestResult result;
-                try { result = await commit; }
-                catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
-                {
-                    if (!batch.TryWaitOutCommit(commit, out result))
-                    {
-                        batch.Dispose();   // deferred to the end of the write that holds it
-                        batch = null;
-                        throw;
-                    }
-                }
+                // spill file — so a 200 survives the death of this process (IngestionEndpoint). The
+                // batch is given back as soon as the commit has written it, before the answer. This await
+                // runs on the box the handler made first.
+                LogIngestResult result = await batch!.CommitAsync(ctx.RequestAborted);
                 batch.Dispose();
                 batch = null;
                 if (malformed)
@@ -484,6 +497,7 @@ public static class OtlpEndpointMapper
     /// has already gone back), and <c>Slot</c> is the gate slot it holds: see
     /// <see cref="OtlpInflateGate"/> for why the slot lives as long as the buffer.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
     private static async ValueTask<(byte[]? Buffer, int Length, OtlpInflateGate? Slot)> ReadBodyAsync(
         HttpContext ctx, OtlpInflateGate gate, OtlpGzipTooLargeLog tooLargeLog)
     {
@@ -517,8 +531,21 @@ public static class OtlpEndpointMapper
         // A slot before the inflate buffer exists — and the compressed buffer back on every way
         // out that does not reach InflateBody, which returns it itself.
         bool entered;
-        try { entered = await gate.TryEnterAsync(ctx.RequestAborted); }
-        catch { IngestBufferPool.Return(buffer); throw; }
+        var  wait = gate.TryEnterAsync(ctx.RequestAborted);
+        try { entered = await wait; }
+        catch
+        {
+            // This await can be this method's first real suspension (a body read whole without
+            // suspending), where its state machine is boxed: a box that cannot be allocated throws here
+            // with the wait still pending, and the wait went on to take the next freed slot for nobody
+            // (round-5 H-G). It is waited out instead, allocating nothing — it ends within the gate's
+            // patience — and a slot it took is given back: a wait that granted one can only reach this
+            // catch unread. A wait that failed (cancelled, out of memory) took none.
+            OtlpInflateGate.WaitOut(wait);
+            if (wait.IsCompletedSuccessfully && wait.Result) gate.Exit();
+            IngestBufferPool.Return(buffer);
+            throw;
+        }
         if (!entered)
         {
             IngestBufferPool.Return(buffer);

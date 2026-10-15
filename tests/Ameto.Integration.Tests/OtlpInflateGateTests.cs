@@ -226,6 +226,37 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal(1, gate.Available);
     }
 
+    /// <summary>
+    /// Round-5, found with H-G. The gate's own wait is boxed at its first real suspension — its wait on the
+    /// doorbell, inside the try whose finally takes the waiter off the count — and a box that could not be
+    /// allocated skipped that finally. The count stayed up for good: every later caller was taken for one
+    /// queued behind a waiter that had gone, the fast path never opened again, and each give-back rang for
+    /// nobody. A catch takes the waiter off now, once.
+    /// </summary>
+    [Fact]
+    public async Task A_wait_whose_first_suspension_cannot_be_boxed_leaves_the_fast_path_open()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        int armed = 1;
+        OwnerAsync.FirstSuspensionFailsForTest.Value = t =>
+            t.DeclaringType == typeof(OtlpInflateGate) && t.Name.Contains("<WaitAsync>", StringComparison.Ordinal)
+            && Interlocked.Exchange(ref armed, 0) == 1;
+        Task<bool> failed;
+        try { failed = gate.TryEnterAsync(default); }
+        finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+        await Assert.ThrowsAsync<OutOfMemoryException>(() => failed);
+        Assert.Equal(0, Volatile.Read(ref armed));   // setup: the wait's first suspension failed
+
+        gate.Exit();
+        var next = gate.TryEnterAsync(default);
+        Assert.True(next.IsCompleted, "a newcomer at a free gate was queued behind a waiter that had gone");
+        Assert.True(await next);
+        gate.Exit();
+        Assert.Equal(1, gate.Available);
+    }
+
     // ── OTLP/HTTP: 503 + Retry-After ──────────────────────────────────────────
 
     [Theory]

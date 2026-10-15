@@ -529,9 +529,6 @@ public sealed class IngestionEndpoint
     /// <summary>How often <see cref="WaitOut{T}"/> looks at what it waits for.</summary>
     private const int CommitWaitOutPollMs = 5;
 
-    /// <summary>The longest a receiver waits a commit out (<see cref="LogIngestBatch.TryWaitOutCommit"/>): the commit's own wait-out, and a second.</summary>
-    internal TimeSpan ReceiverWaitOut => _backPressureWait + CommitWaitOutGrace + _backPressureWait + CommitWaitOutGrace;
-
     /// <summary>
     /// The unwritten-marker Warnings a request writes on its own before the rest are summed up in one
     /// line: they are written whatever the once-a-second limit says (each is the only record of its
@@ -587,6 +584,16 @@ public sealed class IngestionEndpoint
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     public async Task HandleAsync(HttpContext ctx)
     {
+        // Boxed first, owning nothing (round-5 H-G, M-D). A state machine is boxed at its first real
+        // suspension, and a box that cannot be allocated throws there with every finally of the method
+        // skipped while what it awaited runs on: a body read writing into a buffer handed back, or —
+        // the body read whole without suspending — the commit, which went on to write the batch whose
+        // reservation the skipped finally never gave back. The handler waited such a commit out on its
+        // thread (ce9e57c), a pool thread the commit itself needed: under a burst on two cores the whole
+        // pool stalled for seconds, and the bound then expired into a 500. Here nothing is held yet: a
+        // failure is a 500 for a request nothing was taken from, which a Seq client retries.
+        await Task.Yield();
+
         // ── 1. Read body into a pooled buffer ─────────────────────────────────
         long? contentLength = ctx.Request.ContentLength;
         if (contentLength > _maxBatchBytes)
@@ -741,23 +748,9 @@ public sealed class IngestionEndpoint
             bodyBuf = null;
 
             // ── 4. Write, then answer ─────────────────────────────────────────
-            // Guarded, and the batch given back right after, not in the finally: this method's first
-            // real suspension can be this await (a body read whole without suspending), where its state
-            // machine is boxed. A box that cannot be allocated threw here while the commit ran on — a 500
-            // for a batch the store went on to write (a Seq client's retry wrote it twice) — and skipped
-            // every finally of the method, the batch's dispose among them: its reservation held for good.
-            var commit = batch.CommitAsync(ctx.RequestAborted);
-            LogIngestResult result;
-            try { result = await commit; }
-            catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
-            {
-                if (!batch.TryWaitOutCommit(commit, out result))
-                {
-                    batch.Dispose();   // deferred to the end of the write that holds it
-                    batch = null;
-                    throw;
-                }
-            }
+            // The batch is given back as soon as the commit has written it, before the answer, which a
+            // slow client can hold up. This await runs on the box made above: it allocates none.
+            LogIngestResult result = await batch.CommitAsync(ctx.RequestAborted);
             batch.Dispose();
             batch = null;
 

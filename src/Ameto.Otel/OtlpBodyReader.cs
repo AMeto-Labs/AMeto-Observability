@@ -48,6 +48,7 @@ internal static class OtlpBodyReader
     /// port — returns the buffer here before the exception leaves: dropping it is not a leak, it
     /// is a permanent withdrawal from the pool every receiver shares.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
     internal static async ValueTask<(byte[]? Buffer, int Length)> ReadAsync(HttpContext ctx, int maxBytes)
     {
         long? declared = ctx.Request.ContentLength;
@@ -58,6 +59,7 @@ internal static class OtlpBodyReader
         int initial = declared.HasValue ? (int)declared.Value : UndeclaredCapacityBytes;
         byte[] buf  = IngestBufferPool.Rent(Math.Max(initial, MinCapacityBytes));
         int total   = 0;
+        ValueTask<int> read = default;   // the read into `buf` in progress: see the catch
         try
         {
             while (true)
@@ -91,9 +93,11 @@ internal static class OtlpBodyReader
                     buf = larger;
                 }
 
-                int read = await ctx.Request.Body.ReadAsync(buf.AsMemory(total), ctx.RequestAborted);
-                if (read == 0) break;
-                total += read;
+                read = ctx.Request.Body.ReadAsync(buf.AsMemory(total), ctx.RequestAborted);
+                int n = await read;
+                read = default;
+                if (n == 0) break;
+                total += n;
 
                 if (total > maxBytes)
                 {
@@ -106,9 +110,26 @@ internal static class OtlpBodyReader
         }
         catch
         {
-            IngestBufferPool.Return(buf);
+            // Not while a read may still write into it (round-5, found with H-G). The await of a read
+            // can be this method's first real suspension, where its state machine is boxed: a box that
+            // cannot be allocated throws here with the read still pending, and the buffer went back to
+            // the pool while the read went on to fill it — inside whichever request rented it next, its
+            // body overwritten under its parser. Such a buffer is left to the read, and to the collector
+            // after it. A read that failed has ended.
+            if (!MayStillWrite(read)) IngestBufferPool.Return(buf);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="read"/> — a read whose await threw — may still write into its buffer: true while
+    /// it is pending, which it can only be when the await never reached it (the awaiting method's box). One whose
+    /// result the await took (it failed) may have had its source reused, and asking it again throws; it has ended.
+    /// </summary>
+    private static bool MayStillWrite(ValueTask<int> read)
+    {
+        try { return !read.IsCompleted; }
+        catch (InvalidOperationException) { return false; }
     }
 
     /// <summary>

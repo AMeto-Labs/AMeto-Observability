@@ -381,6 +381,7 @@ internal sealed class OtlpInflateGate
         return Volatile.Read(ref _waiting) == 0 && TryTake() ? Task.FromResult(true) : WaitAsync(ct);
     }
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<bool> WaitAsync(CancellationToken ct)
     {
         long deadline = Stopwatch.GetTimestamp() + (long)(_patience.TotalSeconds * Stopwatch.Frequency);
@@ -393,6 +394,7 @@ internal sealed class OtlpInflateGate
             return true;
         }
 
+        bool counted = true;
         try
         {
             while (true)
@@ -404,11 +406,36 @@ internal sealed class OtlpInflateGate
                 if (TryTake()) return true;
             }
         }
+        catch
+        {
+            // Off the count here as well as in the finally, once (round-5, found with H-G). The await above
+            // is this method's first real suspension, where its state machine is boxed, and a box that
+            // cannot be allocated skips the finally — a catch still runs. The count stayed up for good: the
+            // fast path, taken only while nobody waits, closed to every newcomer, and each Exit rang for a
+            // waiter that was not there.
+            Interlocked.Decrement(ref _waiting);
+            counted = false;
+            throw;
+        }
         finally
         {
-            Interlocked.Decrement(ref _waiting);
+            if (counted) Interlocked.Decrement(ref _waiting);
         }
     }
+
+    /// <summary>
+    /// Blocks until <paramref name="wait"/> — a <see cref="TryEnterAsync"/> — has ended, allocating nothing: for a
+    /// caller whose own await of it threw while it was pending (its state machine's box, out of memory), which
+    /// must give back the slot the wait may still take. It ends within the gate's patience and one
+    /// <see cref="PollInterval"/>: <see cref="WaitAsync"/> looks for the last time at its deadline.
+    /// </summary>
+    internal static void WaitOut(Task<bool> wait)
+    {
+        while (!wait.IsCompleted) Thread.Sleep(WaitOutPollMs);
+    }
+
+    /// <summary>How often <see cref="WaitOut"/> looks.</summary>
+    private const int WaitOutPollMs = 5;
 
     private bool TryTake()
     {

@@ -313,36 +313,43 @@ public sealed class IngestStoreBusyTests : IDisposable
     }
 
     /// <summary>
-    /// Round-4 review L4. The frame above the commit — the receiver's handler — first suspends at the
-    /// same await when its body was read without suspending (here, from memory), and its box failing
-    /// there was the 500 da665b7 left: the counts lost while the store wrote the batch, and every
-    /// finally of the handler skipped, the batch's dispose among them, its reservation held for good.
-    /// The handler waits the commit out too now, answers from it, and gives the batch back itself.
+    /// Round-5 review M-D and H-G. The handler's first real suspension, where its state machine is boxed,
+    /// was its await of the commit when the body was read without suspending (here, from memory) — after
+    /// the batch was decoded and its write had begun. A box that could not be allocated there was waited
+    /// out on the caller's thread (ce9e57c): a pool thread the commit itself needed, so a burst on two
+    /// cores stalled the whole pool for seconds and the bound then expired into a 500. The handler is boxed
+    /// before it owns anything now: that failure fails it at once, nothing decoded, reserved or written —
+    /// a 500, which a Seq client retries — and no thread is held. The store faults throughout here, so a
+    /// commit waits its whole BackPressureWait.
     /// </summary>
     [Fact]
-    public async Task A_receiver_whose_await_of_the_commit_cannot_suspend_answers_what_was_written_and_gives_the_batch_back()
+    public async Task A_receiver_whose_first_suspension_cannot_be_boxed_takes_nothing_and_holds_no_thread()
     {
         var opts = Options(backPressureWait: TimeSpan.FromSeconds(5));
         await using var storage = Engine(opts);
-        var written = CaptureWrites(storage);
-        int failing = 1;
+        var written  = CaptureWrites(storage);
+        int attempts = 0;
         storage._afterWriteGate = () =>
         {
-            if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
+            Interlocked.Increment(ref attempts);
+            throw new OutOfMemoryException("test: a fault, so a write waits");
         };
         var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
         try
         {
-            var ctx = Post(Clef(3));
-
-            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<HandleAsync>", () => Volatile.Write(ref failing, 0));
-            try { await endpoint.HandleAsync(ctx); }
+            var  ctx = Post(Clef(3));
+            var  sw  = System.Diagnostics.Stopwatch.StartNew();
+            Task handled;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<HandleAsync>");
+            try { handled = endpoint.HandleAsync(ctx); }   // what the caller's thread spends before it has the task back
             finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+            long heldMs = sw.ElapsedMilliseconds;
 
-            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
-            Assert.Equal((3, 0), Counts(ctx));
-            Assert.Equal(3, written.Count);
-            Assert.Equal(0, endpoint.DecodedBytesInFlight);   // the batch was given back, its reservation with it
+            Assert.True(heldMs < 1_000, $"the handler held its caller's thread {heldMs} ms, waiting a commit out");
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => handled);
+            Assert.Equal(0, Volatile.Read(ref attempts));   // nothing was decoded, so nothing was written
+            Assert.Empty(written);
+            Assert.Equal(0, endpoint.DecodedBytesInFlight);
         }
         finally { storage._afterWriteGate = null; }
     }

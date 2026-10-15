@@ -202,6 +202,20 @@ public static class OtlpGrpcEndpointMapper
         ctx.Response.StatusCode  = StatusCodes.Status200OK;
         ctx.Response.ContentType = GrpcContentType;
 
+        // Boxed first, owning nothing (round-5 H-G, M-D). A state machine is boxed at its first real
+        // suspension, and a box that cannot be allocated throws there with every finally skipped while
+        // what it awaited runs on. That was the inflate gate's wait (a message read whole, the gate
+        // full): answered UNAVAILABLE, and the wait took the next freed slot for nobody — two such on
+        // the stand's two slots, and every compressed batch, HTTP or gRPC, was refused until a restart.
+        // Or it was the commit, waited out on a pool thread the commit itself needed. Here a failure
+        // takes nothing with it, and is answered UNAVAILABLE, which exporters retry.
+        try { await Task.Yield(); }
+        catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+        {
+            await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+            return;
+        }
+
         // gRPC IS HTTP/2. Serving these paths over HTTP/1.1 looked harmless and was not: once a
         // response body has gone out on HTTP/1.1 there are no trailers to carry the status and no
         // headers left to write it into, so a SUCCESSFUL export answered 200 with a valid
@@ -275,7 +289,10 @@ public static class OtlpGrpcEndpointMapper
                     // The wait itself ran out — its timer, the doorbell's queue node (#126 review
                     // NEW-4): the server's failure, answered as the read's is, UNAVAILABLE. It used to
                     // leave the handler, which hosting answered 500 and a client reads as UNKNOWN,
-                    // never retried. No slot was taken; the body goes back in the finally below.
+                    // never retried. No slot was taken: a wait that fails leaves the gate's count as it
+                    // was, and this await is not the handler's first suspension any more (the yield
+                    // above is), so it cannot be one whose box failed with the wait still pending.
+                    // The body goes back in the finally below.
                     await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                     return;
                 }
@@ -398,19 +415,8 @@ public static class OtlpGrpcEndpointMapper
                     batch.MarkMalformed();
                     IngestBufferPool.Return(body);   // before the write, which may wait (see below)
                     body = null;
-                    // Guarded, and the batch given back right after (see the commit below).
-                    var prefix = batch.CommitAsync(ctx.RequestAborted);
-                    try { await prefix; }
-                    catch (OutOfMemoryException) when (!prefix.IsCompleted || prefix.IsCompletedSuccessfully)
-                    {
-                        if (!batch.TryWaitOutCommit(prefix, out _))
-                        {
-                            batch.Dispose();   // deferred to the end of the write that holds it
-                            batch = null;
-                            throw;
-                        }
-                    }
-                    batch.Dispose();
+                    await batch.CommitAsync(ctx.RequestAborted);
+                    batch.Dispose();   // before the answer (see the commit below)
                     batch = null;
                 }
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
@@ -442,23 +448,9 @@ public static class OtlpGrpcEndpointMapper
                 // to hold its message twice, the body until the outer finally.
                 IngestBufferPool.Return(body);
                 body = null;
-                // Guarded, and the batch given back right after, not in the finally: this handler's first real
-                // suspension can be this await (a message read whole without suspending), where its state
-                // machine is boxed — and a box that cannot be allocated threw here while the commit ran on
-                // (UNKNOWN for a batch the store went on to write), skipping every finally of the handler, the
-                // batch's dispose among them (its reservation held for good). See IngestionEndpoint.HandleAsync.
-                var commit = batch.CommitAsync(ctx.RequestAborted);
-                LogIngestResult result;
-                try { result = await commit; }
-                catch (OutOfMemoryException) when (!commit.IsCompleted || commit.IsCompletedSuccessfully)
-                {
-                    if (!batch.TryWaitOutCommit(commit, out result))
-                    {
-                        batch.Dispose();   // deferred to the end of the write that holds it
-                        batch = null;
-                        throw;
-                    }
-                }
+                // The batch is given back as soon as the commit has written it, before the answer, which a
+                // client that stops reading can hold up. This await runs on the box the handler made first.
+                LogIngestResult result = await batch.CommitAsync(ctx.RequestAborted);
                 batch.Dispose();
                 batch = null;
                 if (result.Busy)
