@@ -28,7 +28,8 @@ public sealed class StringInternPool
     public const int DefaultMaxPoolSize = 65536;
 
     /// <summary>
-    /// How many UTF-16 units of text a pool holds at the most, by default: 16 Mi, 32 MiB. The cap on
+    /// How many UTF-16 units of text a pool claims at the most, by default: 16 Mi, 32 MiB (what recovery
+    /// restores is held on top of it: <see cref="RestoredChars"/>). The cap on
     /// the COUNT of strings bounded nothing in bytes, and a pool keeps every string for the life of
     /// the process: 26 distinct templates of 4 M characters pinned 206 MiB (the 27th ran the heap
     /// out), and 65 536 distinct 10 KB stack traces would be ~1.3 GB — left behind by batches refused
@@ -67,14 +68,22 @@ public sealed class StringInternPool
     private readonly Lock                              _slotLock       = new();
     private          int                               _nextIndex      = 0;
     private          long                              _pooledChars;
+    private          long                              _restoredChars;
 
     public static readonly StringInternPool Shared = new();
 
     /// <summary>
-    /// Test seam fired right after a claim publishes its string → index mapping — where the
-    /// dictionary's own <c>GrowTable</c> throws when the heap is out (#126 review F5). Null in production.
+    /// Test seam fired right after a claim's <c>TryAdd</c> linked its string → index mapping, before the
+    /// claim counts the string as kept — where the dictionary's own <c>GrowTable</c> throws, out of
+    /// <c>TryAdd</c> itself, when the heap is out (#126 review F5, round-5 L-14). Null in production.
     /// </summary>
     internal Action? OnClaimedForTest;
+
+    /// <summary>
+    /// Test seam fired by <see cref="ForceIntern"/> between storing the slot and mapping the string —
+    /// where the second of the two runs out of memory (round-5 L-14). Null in production.
+    /// </summary>
+    internal Action? OnRestoredSlotStoredForTest;
 
     public StringInternPool() : this(DefaultMaxPoolSize) { }
 
@@ -106,8 +115,16 @@ public sealed class StringInternPool
     /// <summary>The longest text this pool takes, in UTF-16 units.</summary>
     public int MaxTextChars => _maxTextChars;
 
-    /// <summary>The text this pool holds, in UTF-16 units — at most its budget (see <see cref="DefaultMaxPooledChars"/>), save what recovery restored.</summary>
+    /// <summary>The text this pool claimed, in UTF-16 units — at most its budget (see <see cref="DefaultMaxPooledChars"/>). What recovery restored is <see cref="RestoredChars"/>, on top.</summary>
     public long PooledChars => Interlocked.Read(ref _pooledChars);
+
+    /// <summary>
+    /// The text recovery restored (<see cref="ForceIntern"/>), in UTF-16 units: held outside the budget, which bounds
+    /// what this process claims. A replay restores every row a log needs, and a log an earlier version wrote can
+    /// hold more than today's budget; counted against it, that left every new text unpooled for the life of the
+    /// process (round-5 L-14).
+    /// </summary>
+    public long RestoredChars => Interlocked.Read(ref _restoredChars);
 
     /// <summary>
     /// Raised once, the first time the pool saturates. Past that point every event carries
@@ -196,10 +213,24 @@ public sealed class StringInternPool
         // failure leaves either an unreferenced slot (this claim lost, or never published) or
         // the mapping with its slot; and no reader can see a published index with an empty slot.
         SetSlot(newIdx, template);
-        if (_stringToIndex.TryAdd(template, newIdx))
+        bool added;
+        try
+        {
+            added = _stringToIndex.TryAdd(template, newIdx);
+            if (added) OnClaimedForTest?.Invoke();
+        }
+        catch
+        {
+            // TryAdd links the key and only then grows its table: a growth that throws (the heap is out)
+            // leaves the string pooled under this index all the same, and its text stays counted (round-5
+            // L-14). Given back, it was text the pool held outside its budget, for the life of the pool.
+            // A failure before the link maps nothing, and the claim gives its text back as on any failure.
+            kept = _stringToIndex.TryGetValue(template, out int mapped) && mapped == newIdx;
+            throw;
+        }
+        if (added)
         {
             kept = true;
-            OnClaimedForTest?.Invoke();
             return newIdx;          // canonical is `template` — the instance just stored
         }
 
@@ -511,6 +542,15 @@ public sealed class StringInternPool
     /// string claims a fresh index. (Only the replay calls this, before ingest starts, and it
     /// flushes each WAL's events before the next WAL's rows arrive: nothing still holds the index
     /// for the old string.)</para>
+    ///
+    /// <para>Restored text is counted apart (<see cref="RestoredChars"/>), outside the budget: not refused,
+    /// since recovery restores what a log needs, and not charged to what this process may claim, or a log an
+    /// earlier version wrote — over today's budget — left every new text unpooled for good (round-5 L-14).
+    /// The replay runs before anything claims, so a slot it overwrites held restored text too.</para>
+    ///
+    /// <para>The slot is stored before the string is mapped, as a claim does (#126 review F5): mapped first,
+    /// a slot array's doubling that ran out of memory left the string mapped to a slot that still held the
+    /// other WAL's string, and every live event of the string after the start was filed under that one.</para>
     /// </summary>
     public void ForceIntern(int index, string template)
     {
@@ -519,14 +559,14 @@ public sealed class StringInternPool
         if (held is { } previous
             && !string.Equals(previous, template, StringComparison.Ordinal))
             _stringToIndex.TryRemove(new KeyValuePair<string, int>(previous, index));   // only while it still names this slot
-        // Counted, not refused: recovery restores what a log needs. (A slot it overwrites gives its text back.)
-        if (!string.Equals(held, template, StringComparison.Ordinal))
-            Interlocked.Add(ref _pooledChars, template.Length - (held?.Length ?? 0));
 
         // The array is bounded by the cap; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
-        _stringToIndex[template] = index;
         SetSlot(index, template);   // guarded inside for an id beyond the cap
+        if (!string.Equals(held, template, StringComparison.Ordinal))
+            Interlocked.Add(ref _restoredChars, template.Length - (held?.Length ?? 0));   // a slot overwritten gives its text back
+        OnRestoredSlotStoredForTest?.Invoke();
+        _stringToIndex[template] = index;
         int expected = _nextIndex;
         while (index + 1 > expected)
         {
@@ -543,5 +583,6 @@ public sealed class StringInternPool
         System.Threading.Interlocked.Exchange(ref _nextIndex, 0);
         System.Threading.Interlocked.Exchange(ref _exhaustedSignalled, 0);
         System.Threading.Interlocked.Exchange(ref _pooledChars, 0);
+        System.Threading.Interlocked.Exchange(ref _restoredChars, 0);
     }
 }

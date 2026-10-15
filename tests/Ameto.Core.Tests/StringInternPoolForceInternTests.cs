@@ -59,4 +59,46 @@ public sealed class StringInternPoolForceInternTests
         Assert.Equal("Платежи.Шлюз", pool.Get(svc));
         Assert.False(pool.TryGet("Платежи.Шлюз".AsSpan(), out _, out int stale) && stale == 3);
     }
+
+    /// <summary>
+    /// Round-5 L-14: recovery's text was counted against the budget without being refused, so a log an
+    /// earlier version wrote — with more text in its pool than today's budget — left the pool past it
+    /// after the replay, and every new template and service after the start went unpooled for the life
+    /// of the process. Restored text is held outside the budget now; the budget bounds what is claimed.
+    /// </summary>
+    [Fact]
+    public void Text_recovery_restored_past_the_budget_leaves_the_budget_to_new_text()
+    {
+        var pool = new StringInternPool(1024, maxPooledChars: 10);
+        pool.ForceIntern(0, new string('a', 30));
+        pool.ForceIntern(1, new string('b', 30));
+        pool.ForceIntern(1, new string('c', 20));   // a later WAL's row over the same slot gives the first back
+
+        int fresh = pool.Intern("new");
+        Assert.True(fresh >= 0, "new text was refused: the restored text spent the budget");
+        Assert.Equal("new", pool.Get(fresh));
+        Assert.Equal(-1, pool.Intern("12345678"));  // 3 + 8 is past the budget of 10: it still bounds claims
+        Assert.Equal(3, pool.PooledChars);
+        Assert.Equal(50, pool.RestoredChars);
+    }
+
+    /// <summary>
+    /// Round-5 L-14 (found beside it): ForceIntern mapped the string before it stored the slot, so a slot
+    /// array's doubling that ran out of memory left the string mapped to a slot that still held another
+    /// WAL's string — every live event of it after the start was filed under that one. The slot goes first
+    /// now, as a claim's does (#126 review F5); the seam stands for the second step failing.
+    /// </summary>
+    [Fact]
+    public void A_restore_whose_second_step_runs_out_of_memory_maps_no_string_to_another()
+    {
+        var pool = new StringInternPool();
+        pool.ForceIntern(5, "Orders.Api");
+        int faults = 1;
+        pool.OnRestoredSlotStoredForTest = () => { if (faults-- > 0) throw new OutOfMemoryException("injected"); };
+
+        Assert.Throws<OutOfMemoryException>(() => pool.ForceIntern(5, "Billing.Worker"));
+
+        Assert.Equal("Billing.Worker", pool.Get(pool.Intern("Billing.Worker")));
+        Assert.Equal("Orders.Api", pool.Get(pool.Intern("Orders.Api")));
+    }
 }

@@ -43,4 +43,27 @@ public sealed class StringInternPoolClaimTests
         Assert.Equal("GET /orders {Id}", pool.Get(index));
         Assert.Same(canonical, pool.Get(index));
     }
+
+    /// <summary>
+    /// Round-5 L-14: TryAdd links the key and only then grows its table, so a growth that runs out of
+    /// memory throws out of TryAdd with the string pooled. The claim took that for a claim that kept
+    /// nothing and gave the text back: the pool held it outside its budget for good, and the next text
+    /// was taken past the budget.
+    /// </summary>
+    [Fact]
+    public void A_claim_whose_table_growth_runs_out_of_memory_keeps_its_text_counted()
+    {
+        var pool   = new StringInternPool(1024, maxPooledChars: 10);
+        int faults = 1;
+        pool.OnClaimedForTest = () => { if (faults-- > 0) throw new OutOfMemoryException("injected: GrowTable"); };
+
+        Assert.Throws<OutOfMemoryException>(() => pool.Intern("abcdefgh"));   // linked, then the growth failed
+        Assert.Equal(8, pool.PooledChars);
+        Assert.Equal(-1, pool.Intern("123456789"));                            // 8 + 9 is past the budget of 10
+        Assert.Equal(8, pool.PooledChars);
+
+        int index = pool.Intern("abcdefgh");                                   // and the string is pooled
+        Assert.Equal("abcdefgh", pool.Get(index));
+        Assert.Equal(8, pool.PooledChars);
+    }
 }
