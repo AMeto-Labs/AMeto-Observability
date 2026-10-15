@@ -3776,6 +3776,187 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── Waiting for an owner semaphore (round-5 M-B) ──────────────────────────
+
+    /// <summary>
+    /// Round-5 review M-B, the swap lock. A merge waited for it with SemaphoreSlim.WaitAsync(ct), which
+    /// links its waiter and then allocates (its box, the registration): an out of memory there failed the
+    /// merge with the waiter still queued, and the next release granted the lock to it — no swap, despill
+    /// or merge ever ran again, and every request was answered 503. The merge never queues in it now: an
+    /// out of memory while it waits (here, at its pause) fails the merge and leaves the lock to the next.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_a_merge_waits_for_the_swap_lock_leaves_the_lock_to_the_next_taker()
+    {
+        var  engine = Engine(Options(NewDir()));
+        long old    = DateTime.UtcNow.AddDays(-20).Date.Ticks;   // a sealed bucket: two small files are a batch
+        void Write(int from, int count)
+        {
+            for (int i = from; i < from + count; i++)
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks = old + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+                }, Props(i), "event {n}"));
+        }
+        using var inSwap  = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        using var cts     = new CancellationTokenSource();   // the maintenance loop's waits carry a token
+        try
+        {
+            Write(0, 10);   await engine.FlushHotTierAsync();
+            Write(100, 10); await engine.FlushHotTierAsync();
+            engine._allowIndexlessMerge = true;
+
+            // A swap holds the lock while the merge comes for it.
+            int armed = 1;
+            engine._beforeSwap = () =>
+            {
+                if (Interlocked.Exchange(ref armed, 0) == 1) { inSwap.Set(); release.Wait(HangGuard); }
+            };
+            Write(200, 10);
+            var swap = Task.Run(() => engine.FlushHotTierAsync());
+            Assert.True(inSwap.Wait(HangGuard), "setup: the swap never took the lock");
+
+            int failed = 0;
+            engine._beforeOwnerPollForTest = s =>
+            {
+                if (s == engine.FlushLockForTest && Interlocked.Exchange(ref failed, 1) == 0)
+                    throw new OutOfMemoryException("test: no memory while the merge waits for the swap lock");
+            };
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => engine.TryMergeSmallSegmentsOnceAsync(cts.Token));
+            engine._beforeOwnerPollForTest = null;
+            release.Set();
+            await swap;
+
+            // The lock is anyone's: the next swap takes it, and the merge that failed runs.
+            Write(300, 10);
+            await engine.FlushHotTierAsync();
+            Assert.True(engine.LiveTierCountForTest == 0 && engine.FlushLockForTest.CurrentCount == 1,
+                        $"after the failed merge: {engine.LiveTierCountForTest} event(s) left unswapped, the swap lock's count {engine.FlushLockForTest.CurrentCount}");
+            Assert.True(await engine.TryMergeSmallSegmentsOnceAsync(cts.Token), "no merge ran after the failed one");
+        }
+        finally
+        {
+            release.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the heavy-phase permit. A flush waited for it with WaitAsync(ct): an out of
+    /// memory after the waiter was linked left it queued, and the permit went to it when the flush ahead
+    /// gave it back — with one permit, no flush, merge or despill ran again. Out of memory while waiting
+    /// now, the tier goes to a flush retry, and the permit to whoever takes it next.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_a_flush_waits_for_its_permit_leaves_the_permit_to_the_next()
+    {
+        var engine = Engine(Options(NewDir()));   // FlushConcurrency 1: one permit
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        using var held    = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        using var cts     = new CancellationTokenSource();   // the swaps a write asks for carry the engine's token
+        int armed = 1;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) { held.Set(); release.Wait(HangGuard); }
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, 10)) await engine.WriteBatchAsync(a, HangGuard);
+            var first = Task.Run(() => engine.FlushHotTierAsync(cts.Token));   // holds the one permit, at its first level
+            Assert.True(held.Wait(HangGuard), "setup: the first flush never took the permit");
+
+            int failed = 0;
+            engine._beforeOwnerPollForTest = s =>
+            {
+                if (s == engine.FlushConcurrencyForTest && Interlocked.Exchange(ref failed, 1) == 0)
+                    throw new OutOfMemoryException("test: no memory while the flush waits for its permit");
+            };
+            using (var b = Batch(engine, 10, 10)) await engine.WriteBatchAsync(b, HangGuard);
+            try { await engine.FlushHotTierAsync(cts.Token); }
+            catch (OutOfMemoryException) { /* the wait that failed, where it is the caller's */ }
+            Assert.Equal(1, Volatile.Read(ref failed));
+            engine._beforeOwnerPollForTest = null;
+
+            release.Set();
+            await first;
+            using (var c = Batch(engine, 20, 10)) await engine.WriteBatchAsync(c, HangGuard);
+            var third = engine.FlushHotTierAsync(cts.Token);   // its heavy phase is inline: it waits for the permit
+            Assert.True(await Task.WhenAny(third, Task.Delay(ShortGuard)) == third,
+                        "the flush after the wait that failed never got the permit");
+            await third;
+
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "every tier to be flushed after the wait that failed", ShortGuard);
+            Assert.Equal(30, ReadAll(engine).Count);
+            Assert.Equal(1, engine.FlushConcurrencyForTest.CurrentCount);
+        }
+        finally
+        {
+            release.Set();
+            cts.Cancel();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the despill's two waits: the swap lock (to list its tier) and the heavy-phase
+    /// permit. Out of memory while waiting for either, the despill fails and its block is despilled again
+    /// later, once — its tier, listed already for the permit's wait, given up rather than served for good
+    /// beside its next despill — and the lock and the permit go on to the next taker.
+    /// </summary>
+    [Theory]
+    [InlineData("lock")]
+    [InlineData("permit")]
+    public async Task An_out_of_memory_while_a_despill_waits_leaves_the_lock_and_the_permit_to_the_next(string which)
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        var gate   = HoldFirstFlush(engine);
+        engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+        SemaphoreSlim target = which == "lock" ? engine.FlushLockForTest : engine.FlushConcurrencyForTest;
+
+        // The first despill finds the semaphore taken (by the test, at its read), and runs out of memory
+        // at its first pause — the test lets go of the semaphore as it does.
+        int taken = 0, failed = 0;
+        engine._afterLoadSpillForTest = _ =>
+        {
+            if (Interlocked.Exchange(ref taken, 1) == 0) Assert.True(target.Wait(HangGuard), "setup: the semaphore stayed taken");
+        };
+        engine._beforeOwnerPollForTest = s =>
+        {
+            if (s == target && Volatile.Read(ref taken) == 1 && Interlocked.Exchange(ref failed, 1) == 0)
+            {
+                target.Release();
+                throw new OutOfMemoryException("test: no memory while the despill waits");
+            }
+        };
+        const int Total = 2 * TierEvents + 1_000;   // A, B in tiers; the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            Assert.True(engine.IsSpilling);
+
+            gate.Set();
+            WaitFor(() => Volatile.Read(ref failed) == 1, "the first despill to run out of memory waiting", ShortGuard);
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
+                    "the block to be despilled after the failed wait", ShortGuard);
+            await FlushEverythingAsync(engine, ShortGuard);
+
+            Assert.Equal(Total, ReadAll(engine).Count);   // each once
+            Assert.Equal(0, engine.FrozenTierCountForTest);
+            Assert.True(engine.FlushLockForTest.CurrentCount == 1 && engine.FlushConcurrencyForTest.CurrentCount == 1,
+                        $"the lock's count {engine.FlushLockForTest.CurrentCount}, the permit's {engine.FlushConcurrencyForTest.CurrentCount}");
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A publish that fails keeps its block (round-5 H-A) ────────────────────
 
     /// <summary>A spill file an earlier run left: block 9 000, 100 events — 60 Information, then 40 Error.</summary>

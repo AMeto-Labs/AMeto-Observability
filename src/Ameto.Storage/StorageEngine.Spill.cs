@@ -963,7 +963,10 @@ public sealed partial class StorageEngine
             // lock after closing the write path, and from then on the count may only fall. A
             // shutdown that cancels this wait used to leave the tier — up to a tier's native memory —
             // unfreed: it is still `unlisted`, and the finally frees it.
-            await _flushLock.WaitAsync(ct).ConfigureAwait(false);
+            // Never queued in the lock or the permit below (OwnerPoll; round-5 M-B).
+            ct.ThrowIfCancellationRequested();
+            for (int pause = 1; !_flushLock.Wait(0); )
+                await OwnerPoll(_flushLock, ref pause, 0, ct).ConfigureAwait(false);
             try
             {
                 if (Volatile.Read(ref _writesClosed) != 0) return;   // never listed; the file is the next start's
@@ -978,7 +981,21 @@ public sealed partial class StorageEngine
             }
             finally { ReleaseFlushLock(); }
 
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                for (int pause = 1; !_flushConcurrency.Wait(0); )
+                    await OwnerPoll(_flushConcurrency, ref pause, 0, ct).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Listed and counted, and nothing of it written: given up as a despill whose retry could
+                // not start (AbandonDespilledTier), its block queued again by the finally. Left listed —
+                // as a wait that threw here left it — it was served for good beside the block's next
+                // despill.
+                parked = !AbandonDespilledTier(tier, file);
+                throw;
+            }
             List<SegmentInfo> written;
             Task<List<SegmentInfo>>? flush = null;
             try

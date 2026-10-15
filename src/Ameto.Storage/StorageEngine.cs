@@ -2385,8 +2385,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // whichever swap, merge or despill held the lock at that instant, leaving the engine
         // spilling beside an idle slot until the spill file filled or MaxAge came round.
         if (onlyIfStillWanted) Volatile.Write(ref _swapRequested, 1);
-        if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
-            return; // a swap is already in progress — and its release asks again for this one
+        ct.ThrowIfCancellationRequested();
+        if (!_flushLock.Wait(0))
+        {
+            if (!finalFlush) return; // a swap is already in progress — and its release asks again for this one
+            // The final flush waits its turn, never queued in the lock (OwnerPoll; round-5 M-B).
+            bool locked = false;
+            for (int pause = 1; !(locked = _flushLock.Wait(0)) && Environment.TickCount64 < waitDeadline; )
+                await OwnerPoll(_flushLock, ref pause, waitDeadline, ct).ConfigureAwait(false);
+            if (!locked) return;
+        }
         bool swapFailed = false;
         try
         {
@@ -2441,8 +2449,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // the disk at its floor, wait in their requests for a slot to come free.
             // The final flush waits for a slot instead: every holder is a heavy phase or a retry
             // that shutdown's cancellation has already ended, and none of them takes this lock.
-            if (!_flushSlots.Wait(0) &&
-                (!finalFlush || !await _flushSlots.WaitAsync(Until(waitDeadline), ct).ConfigureAwait(false)))
+            // Never queued in the semaphore (OwnerPoll; round-5 M-B).
+            bool slot = _flushSlots.Wait(0);
+            if (!slot && finalFlush)
+                for (int pause = 1; !(slot = _flushSlots.Wait(0)) && Environment.TickCount64 < waitDeadline; )
+                    await OwnerPoll(_flushSlots, ref pause, waitDeadline, ct).ConfigureAwait(false);
+            if (!slot)
             {
                 if (finalFlush)
                     _logger.LogWarning(
@@ -2561,7 +2573,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // try, so a WAL that throws on close still hands back the slot and the count.
             oldWal?.Dispose();
 
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
+                    await OwnerPoll(_flushConcurrency, ref pause, 0, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Out of memory waiting for the permit, the tier unread: a retry flushes it (and owns the
+                // slot and the count from here). It used to stay listed, unflushed, until shutdown.
+                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);
+                return;
+            }
             List<SegmentInfo> written;
             Task<List<SegmentInfo>>? flush = null;
             try
@@ -3095,6 +3119,50 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
     }
 
+    // ── Waiting for an owner semaphore (round-5 review M-B) ────────────────────
+    //
+    // SemaphoreSlim.WaitAsync with a token or a timeout links its waiter into the semaphore's queue and
+    // only then allocates — WaitUntilCountOrTimeoutAsync's box, the registration, the timer, the
+    // promise. An out of memory there faulted the wait with its waiter still queued, and the next
+    // Release granted the permit, or the swap lock, to that waiter, which nobody would ever give back:
+    // with one heavy-phase permit no flush, merge or despill ran again; with the swap lock no swap, and
+    // every request was answered 503 until a restart. The owner semaphores (_flushLock, _flushSlots,
+    // _flushConcurrency) are never waited on that way. A contended take tries Wait(0), which never
+    // queues, and pauses between tries with a Task.Delay, whose allocations own nothing: an out of
+    // memory there is a failed wait and no more. The pause carries the cancellation and the deadline.
+    // (WaitAsync with neither returns its queued waiter itself, allocating nothing after the link, but
+    // a cancellation or a deadline would still need a way to take a waiter out of the queue.)
+
+    /// <summary>The longest pause between two tries at an owner semaphore.</summary>
+    private const int OwnerPollMaxMs = 16;
+
+    /// <summary>
+    /// The pause before the next try at <paramref name="semaphore"/>: <paramref name="pauseMs"/>, which
+    /// doubles up to <see cref="OwnerPollMaxMs"/>, cut to <paramref name="deadline"/>
+    /// (<see cref="Environment.TickCount64"/>; 0 for none). Not an async method: the caller awaits the
+    /// delay itself and takes the semaphore in its own frame, so nothing takes it on behalf of a caller
+    /// whose await has failed.
+    /// </summary>
+    private Task OwnerPoll(SemaphoreSlim semaphore, ref int pauseMs, long deadline, CancellationToken ct)
+    {
+        _beforeOwnerPollForTest?.Invoke(semaphore);
+        int pause = pauseMs;
+        pauseMs = Math.Min(2 * pause, OwnerPollMaxMs);
+        if (deadline != 0) pause = (int)Math.Clamp(deadline - Environment.TickCount64, 0, pause);
+        return Task.Delay(pause, ct);
+    }
+
+    /// <summary>
+    /// Test seam: runs before each pause of a contended take of an owner semaphore, with the semaphore;
+    /// throwing from it is an out of memory while waiting for it.
+    /// </summary>
+    internal Action<SemaphoreSlim>? _beforeOwnerPollForTest;
+
+    /// <summary>Test hooks: the owner semaphores, for a seam to tell apart and a test to count.</summary>
+    internal SemaphoreSlim FlushLockForTest        => _flushLock;
+    internal SemaphoreSlim FlushConcurrencyForTest => _flushConcurrency;
+    internal SemaphoreSlim FlushSlotsForTest       => _flushSlots;
+
     /// <summary>Gives a flush retry's slot, its tier's frozen text and its heavy-phase count back. Never throws.</summary>
     private void ReleaseFlushRetryOwners(HotTierSegment tier) => GiveBackSlot(endHeavyPhase: true, tier);
 
@@ -3149,7 +3217,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 try
                 {
                     _beforeFlushRetryAttemptForTest?.Invoke();
-                    await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
+                    _cts.Token.ThrowIfCancellationRequested();
+                    for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
+                        await OwnerPoll(_flushConcurrency, ref pause, 0, _cts.Token).ConfigureAwait(false);
                     try
                     {
                         // The failed attempt may have MOVED some level files into place
@@ -4047,7 +4117,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         ulong reserved;
         try
         {
-            await _flushLock.WaitAsync(ct);
+            // Never queued in the lock (OwnerPoll; round-5 M-B): a queued waiter whose wait ran out of
+            // memory after it was linked was granted the lock by the next release — no swap, despill or
+            // merge ever again.
+            ct.ThrowIfCancellationRequested();
+            for (int pause = 1; !_flushLock.Wait(0); )
+                await OwnerPoll(_flushLock, ref pause, 0, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -4111,7 +4186,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         SegmentInfo info;
         try
         {
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
+                await OwnerPoll(_flushConcurrency, ref pause, 0, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -4467,7 +4544,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // Task.Run: a Task.Run whose token is already signalled transitions the task
                 // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
                 // the only place the readers this method took ownership of are closed. Cancelling
-                // in the window between _flushConcurrency.WaitAsync returning and the delegate
+                // in the window between taking the heavy-phase permit and the delegate
                 // being scheduled therefore left up to MergeMaxSources mapped views alive for the
                 // life of the process, and a mapped file on Windows can be neither compacted nor
                 // unlinked by retention. That is the very hazard the wait's own catch guards
@@ -7210,10 +7287,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         // ── Take the swap lock and KEEP it. A flush that holds it now finishes its swap (and is
         //    counted) first; every later one finds the close, or the lock taken, and swaps nothing.
-        var swapLockTaken = _flushLock.WaitAsync(Until(deadline));
-        if (!swapLockTaken.IsCompleted)
+        //    Never queued in the lock (OwnerPoll; round-5 M-B).
+        bool swapLockTaken = _flushLock.Wait(0);
+        if (!swapLockTaken)
+        {
             _onWaitingForFlushLock?.Invoke();
-        if (!await swapLockTaken.ConfigureAwait(false))
+            for (int pause = 1; !(swapLockTaken = _flushLock.Wait(0)) && Environment.TickCount64 < deadline; )
+                await OwnerPoll(_flushLock, ref pause, deadline, CancellationToken.None).ConfigureAwait(false);
+        }
+        if (!swapLockTaken)
         {
             _logger.LogError(
                 "Shutdown could not take the hot-tier swap lock within {Budget}s — every hot tier is left " +
