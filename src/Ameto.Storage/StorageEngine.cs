@@ -508,6 +508,28 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// same reason as <see cref="FlushWidth"/>.
     /// </summary>
     internal int FlushSlots { get; }
+
+    /// <summary>
+    /// The managed text the frozen tiers hold of their events' own — templates and services the intern
+    /// pool did not take, CLEF exceptions (<see cref="HotTierSegment.ManagedBytes"/>) — as each swap
+    /// charged it, and each tier's flush slot gave it back (round-5 review H-D). A tier bounds its own
+    /// (<see cref="HotTierSegment.TryWrite"/>), and the slots bound how many tiers are frozen — by their
+    /// NATIVE footprint, against the physical limit. Nothing bounded what they held on the managed heap:
+    /// on a 384 MiB heap limit with a host's RAM behind the native budget, 30 frozen tiers of one 8 MB
+    /// CLEF stack each ran it out. See <see cref="_frozenTextBudgetBytes"/>.
+    /// </summary>
+    private long _frozenTextBytes;
+
+    /// <summary>
+    /// The most of that text the frozen tiers may hold: as many tiers' worth (<c>HotTier.MaxSizeBytes</c>)
+    /// as flushes run at once (<see cref="FlushWidth"/>). The tiers past the width only queue for a
+    /// flush; a tier whose freeze would take the backlog past this waits as for a slot — its events
+    /// spill, or wait in their requests — unless no frozen tier holds any, so one always can.
+    /// </summary>
+    private readonly long _frozenTextBudgetBytes;
+
+    /// <summary>Test hook: <see cref="_frozenTextBytes"/>.</summary>
+    internal long FrozenTextBytesForTest => Volatile.Read(ref _frozenTextBytes);
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -856,6 +878,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
         FlushWidth  = flushWidth;
         FlushSlots  = flushSlots;
+        _frozenTextBudgetBytes = flushWidth * Math.Max(1L, _options.HotTier.MaxSizeBytes);
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
@@ -2402,6 +2425,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 return;
             }
 
+            // The same for the text the frozen tiers hold of their events' own (round-5 H-D): a tier
+            // whose freeze would take it past its budget waits as for a slot, and so do its events —
+            // until a flush gives text back with its slot (GiveBackSlot), which asks for this swap
+            // again. Never past a backlog that holds none, and never for the final flush.
+            if (!finalFlush && !FrozenTextHasRoomFor(oldState.Hot))
+            {
+                SpillWithoutSlot(oldState);
+                return;
+            }
+
             // Back-pressure gate: if the in-flight tier budget is exhausted, no new tier. The
             // frozen tiers stay within their RAM budget, and the events that the full tier
             // refuses go to a spill file instead (SpillWithoutSlot) — or, with spilling off or
@@ -2462,6 +2495,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             Volatile.Write(ref _swapFailedAt, 0);
             Volatile.Write(ref _swapRetryAt, 0);
             Volatile.Write(ref _swapFailures, 0);
+
+            // Frozen: its events' own text is the frozen backlog's until its slot goes back. Allocates
+            // nothing, so nothing stands between the slot and the heavy phase below.
+            ChargeFrozenText(oldState.Hot);
 
             // ── SWAPPED. The heavy phase below owns the slot and the count from here, and nothing
             //    may stand between them and it. Ending a spill used to sit inside the try above —
@@ -2551,8 +2588,30 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         finally
         {
             if (!slotTransferred)
-                GiveBackSlot(endHeavyPhase: true);
+                GiveBackSlot(endHeavyPhase: true, oldHot);
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="tier"/> may be frozen beside the frozen tiers' text of their events' own
+    /// (<see cref="_frozenTextBytes"/>): yes when it holds none, when they hold none, or when both fit
+    /// <see cref="_frozenTextBudgetBytes"/>.
+    /// </summary>
+    private bool FrozenTextHasRoomFor(HotTierSegment tier)
+    {
+        long adding = tier.ManagedBytes;
+        if (adding == 0) return true;
+        long frozen = Volatile.Read(ref _frozenTextBytes);
+        return frozen == 0 || frozen + adding <= _frozenTextBudgetBytes;
+    }
+
+    /// <summary>Counts a tier just frozen against the frozen tiers' text, on the tier as well. Never throws.</summary>
+    private void ChargeFrozenText(HotTierSegment tier)
+    {
+        long bytes = tier.ManagedBytes;
+        if (bytes == 0) return;
+        tier.ChargeFrozenText(bytes);
+        Interlocked.Add(ref _frozenTextBytes, bytes);
     }
 
     /// <summary>
@@ -2935,7 +2994,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try
         {
             _beforeFlushRetryStartForTest?.Invoke();
-            var owners = new FlushRetryOwners(this, reservedSegId, onAbandoned);
+            var owners = new FlushRetryOwners(this, reservedSegId, onAbandoned, oldHot);
             start = NewFlushRetryTask(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels, owners);
             retry = start.Unwrap();
             _ = retry.ContinueWith(
@@ -3009,14 +3068,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// the suspension has already set. The slot and the count were then held for good, and the tier
     /// never flushed.
     /// </summary>
-    private sealed class FlushRetryOwners(StorageEngine engine, ulong block, Action? onAbandoned)
+    private sealed class FlushRetryOwners(StorageEngine engine, ulong block, Action? onAbandoned, HotTierSegment tier)
     {
         private int _givenBack;
 
         /// <summary>The retry's finally: it ended — published, or shut down — and gives them back.</summary>
         internal void GiveBack()
         {
-            if (Interlocked.Exchange(ref _givenBack, 1) == 0) engine.ReleaseFlushRetryOwners();
+            if (Interlocked.Exchange(ref _givenBack, 1) == 0) engine.ReleaseFlushRetryOwners(tier);
         }
 
         /// <summary>The retry's task ended. Never throws: it runs as that task's continuation.</summary>
@@ -3032,12 +3091,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             catch (Exception) { /* the line is lost */ }
             try { onAbandoned?.Invoke(); }
             catch (Exception) { /* each step of it is guarded */ }
-            engine.ReleaseFlushRetryOwners();
+            engine.ReleaseFlushRetryOwners(tier);
         }
     }
 
-    /// <summary>Gives a flush retry's slot and heavy-phase count back. Never throws.</summary>
-    private void ReleaseFlushRetryOwners() => GiveBackSlot(endHeavyPhase: true);
+    /// <summary>Gives a flush retry's slot, its tier's frozen text and its heavy-phase count back. Never throws.</summary>
+    private void ReleaseFlushRetryOwners(HotTierSegment tier) => GiveBackSlot(endHeavyPhase: true, tier);
 
     /// <summary>
     /// Gives a heavy-phase permit (<see cref="_flushConcurrency"/>) back. Never throws: a release that
@@ -3051,13 +3110,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     }
 
     /// <summary>
-    /// Gives a flush slot back — and the heavy-phase count with it when <paramref name="endHeavyPhase"/>
-    /// — then says the slot is free. Each step on its own: the slot's release allocates when it wakes
-    /// a parked async waiter, and a throw from it skipped the count's end, which shutdown then waited
-    /// for its whole budget. Never throws; it ends the finally blocks that own both.
+    /// Gives a flush slot back — and the heavy-phase count with it when <paramref name="endHeavyPhase"/>,
+    /// and the frozen text <paramref name="tier"/> was charged with at its swap (a swap's tier; a
+    /// despill's never is) — then says the slot is free. Each step on its own: the slot's release
+    /// allocates when it wakes a parked async waiter, and a throw from it skipped the count's end,
+    /// which shutdown then waited for its whole budget. The text goes first, so the swap the free slot
+    /// asks for finds it gone. Never throws; it ends the finally blocks that own all three.
     /// </summary>
-    private void GiveBackSlot(bool endHeavyPhase)
+    private void GiveBackSlot(bool endHeavyPhase, HotTierSegment? tier = null)
     {
+        if (tier is not null)
+        {
+            long text = tier.TakeFrozenTextCharge();
+            if (text != 0) Interlocked.Add(ref _frozenTextBytes, -text);
+        }
         try { _flushSlots.Release(); }
         catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
         if (endHeavyPhase)

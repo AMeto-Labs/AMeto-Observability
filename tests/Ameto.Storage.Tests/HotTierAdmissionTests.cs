@@ -54,6 +54,49 @@ public sealed class HotTierAdmissionTests
     }
 
     /// <summary>
+    /// Round-5 review H-D: the text an event brings of its own (an unpooled template or service, an
+    /// exception) counts against a tier's size, and a spilled block's admission counts it the same way —
+    /// the despill's tier counts none, so the block is what holds it to a tier's worth. Every answer equal,
+    /// over events with and without such text, and both refuse past the limit what an empty tier takes.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void It_answers_every_event_with_text_of_its_own_exactly_as_a_tier_does(int seed)
+    {
+        long maxPayload = 2 * HotTierSegment.ChunkPayloadBytes + 123;
+        int  maxEvents  = HotTierSegment.EventCapacityFor(maxPayload);
+        using var tier  = new HotTierSegment(maxEvents, maxPayload);
+        var admission   = new HotTierAdmission(maxEvents, maxPayload);
+
+        var rng     = new Random(seed);
+        var payload = new byte[64 * 1024];
+        int refusedForText = 0;
+        for (int i = 0; i < 40_000; i++)
+        {
+            int  len = rng.Next(0, 600);
+            long own = rng.Next(100) switch
+            {
+                0      => maxPayload + rng.Next(1, 1_000),   // larger than a tier
+                < 8    => rng.Next(64 * 1024, 2 * 1024 * 1024),
+                < 30   => rng.Next(24, 4 * 1024),
+                _      => 0,
+            };
+            bool fitsText    = own == 0 || admission.Count == 0 || admission.ManagedBytes + own <= maxPayload;
+            bool byTier      = tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i }, payload.AsSpan(0, len), ownManagedBytes: own);
+            bool byAdmission = admission.TryAdmit(len, own);
+            Assert.True(byTier == byAdmission, $"event {i} of {len} B and {own} B of its own text: tier {byTier}, admission {byAdmission}");
+            if (!byTier && !fitsText) refusedForText++;
+        }
+
+        Assert.Equal(tier.Count, admission.Count);
+        Assert.Equal(tier.ManagedBytes, admission.ManagedBytes);
+        Assert.True(refusedForText > 0, "setup: the run never refused an event for its text");
+        Assert.True(admission.ManagedBytes <= maxPayload + 1_000, $"{admission.ManagedBytes} B of text admitted at a limit of {maxPayload}");
+    }
+
+    /// <summary>
     /// What a despill and a WAL replay rely on to size their tier from the block rather than from
     /// today's configuration: a sequence a tier of some limits takes whole, a tier of larger limits
     /// takes whole too.

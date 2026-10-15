@@ -197,6 +197,19 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <summary>The managed bytes this tier holds that are its events' own (see <see cref="_managedBytes"/>).</summary>
     internal long ManagedBytes => Volatile.Read(ref _managedBytes);
 
+    /// <summary>
+    /// What of <see cref="ManagedBytes"/> the engine counted against its frozen tiers' text when it froze this
+    /// tier (round-5 H-D) — kept here, on the tier, so whichever owner gives the tier's flush slot back gives
+    /// the text back with it, once (<see cref="TakeFrozenTextCharge"/>).
+    /// </summary>
+    private long _frozenTextCharge;
+
+    /// <summary>Records the frozen-text charge the engine took for this tier. Allocates nothing.</summary>
+    internal void ChargeFrozenText(long bytes) => Volatile.Write(ref _frozenTextCharge, bytes);
+
+    /// <summary>The frozen-text charge, given back: what it was the first time, 0 after. Allocates nothing.</summary>
+    internal long TakeFrozenTextCharge() => Interlocked.Exchange(ref _frozenTextCharge, 0);
+
     // ── Construction ─────────────────────────────────────────────────────────
 
     /// <param name="maxEvents">Maximum number of events before flush is triggered.</param>
@@ -682,6 +695,8 @@ internal struct HotTierAdmission
 
     private int  _count;
     private long _payloadBytes;
+    /// <summary>The managed text the admitted events brought of their own, as the tier counts it (round-5 H-D).</summary>
+    private long _managedBytes;
     /// <summary>The highest chunk a tier would have allocated by now; chunk 0 is allocated by its constructor.</summary>
     private int  _lastChunk;
     /// <summary>Payload bytes in chunk <see cref="_lastChunk"/>, the only one still taking events.</summary>
@@ -702,13 +717,23 @@ internal struct HotTierAdmission
     /// <summary>Payload bytes admitted so far.</summary>
     public readonly long PayloadBytes => _payloadBytes;
 
+    /// <summary>Managed text of their own the admitted events brought (see <see cref="HotTierSegment.ManagedBytes"/>).</summary>
+    public readonly long ManagedBytes => _managedBytes;
+
     /// <summary>
     /// True, and counted, when a tier would take an event of <paramref name="payloadLength"/>
-    /// bytes next; false, and nothing changes, when it would refuse it.
+    /// bytes, bringing <paramref name="ownManagedBytes"/> of text of its own
+    /// (<see cref="HotTierSegment.TryWrite"/>), next; false, and nothing changes, when it would refuse it.
+    ///
+    /// <para>The text is what bounds a spilled block's to a tier's (round-5 H-D): the despill replays the
+    /// block into one tier that counts none of it — its log bounds it — and a block admitted on payload
+    /// alone held up to twice its file in strings (an 8 MB tier's spill file took 28 MB of UTF-16
+    /// templates).</para>
     /// </summary>
-    public bool TryAdmit(int payloadLength)
+    public bool TryAdmit(int payloadLength, long ownManagedBytes = 0)
     {
         if (_count >= _maxEvents) return false;
+        if (ownManagedBytes > 0 && _count > 0 && _managedBytes + ownManagedBytes > _maxPayloadBytes) return false;
 
         int ci = _count / HotTierSegment.ChunkEventCapacity;
         if (ci > _lastChunk)
@@ -724,6 +749,7 @@ internal struct HotTierAdmission
 
         _chunkTail    += payloadLength;
         _payloadBytes += payloadLength;
+        _managedBytes += ownManagedBytes;
         _count++;
         return true;
     }

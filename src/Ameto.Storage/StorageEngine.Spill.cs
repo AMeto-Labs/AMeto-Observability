@@ -186,10 +186,12 @@ public sealed partial class StorageEngine
     private WriteOutcome SpillLocked(SpillTarget spill, in LogEventHeader h, ReadOnlySpan<byte> payload,
                                      string? template, ExceptionInfo? exception, string? service = null)
     {
-        if (spill.Full || !spill.Admission.TryAdmit(payload.Length))
+        if (spill.Full || !spill.Admission.TryAdmit(payload.Length, OwnManagedBytes(h, template, exception, service)))
         {
             // A tier would refuse this event: the block is closed here and the next one opened by
-            // the swap, so the despill replays it into ONE tier. The event waits for that one.
+            // the swap, so the despill replays it into ONE tier. The event waits for that one. The
+            // text the events bring of their own counts as the tier counts it (round-5 H-D): the
+            // despill's tier counts none, so the block is what holds it to a tier's worth.
             spill.Full = true;
             ScheduleFlush();
             return WriteOutcome.NoRoom;
@@ -841,6 +843,9 @@ public sealed partial class StorageEngine
 
     /// <summary>Test hook: the tiers listed as frozen — swapped or despilled, not yet published.</summary>
     internal int FrozenTierCountForTest { get { lock (_frozenLock) return _frozenHot.Count; } }
+
+    /// <summary>Test hook: the events in the live tier.</summary>
+    internal int LiveTierCountForTest => _write.Hot.Count;
 
     /// <summary>
     /// Gives up a despilled tier whose flush — or whose publish — failed and whose retry could not be

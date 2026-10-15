@@ -3596,6 +3596,26 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     // ── The text a tier's events carry of their own (round-5 H-D) ─────────────
 
     /// <summary>
+    /// Flushes until nothing is left in memory or in a spill file: a flush request that found no slot, or
+    /// the frozen tiers at their share of text of their events' own, did nothing, and is asked again.
+    /// </summary>
+    private static async Task FlushEverythingAsync(StorageEngine engine, TimeSpan within)
+    {
+        var until = DateTime.UtcNow + within;
+        while (true)
+        {
+            await engine.FlushHotTierAsync();
+            if (engine.LiveTierCountForTest == 0 && engine.FrozenTierCountForTest == 0 && !engine.IsSpilling &&
+                engine.SpillFilesPending == 0 && engine.HeavyPhasesInFlight == 0)
+                return;
+            Assert.True(DateTime.UtcNow < until,
+                        $"not flushed within {within}: {engine.LiveTierCountForTest} live event(s), {engine.FrozenTierCountForTest} frozen tier(s), " +
+                        $"spilling {engine.IsSpilling}, {engine.SpillFilesPending} spill file(s) pending");
+            await Task.Delay(20);
+        }
+    }
+
+    /// <summary>
     /// Round-5 review H-D. Past the intern pool's budget — or past the longest text it takes — a template
     /// is a string of the event's own, and the tier held every one until it flushed: its fullness counted
     /// events and payload bytes only, and the batch that had been charged for the string let go of it at
@@ -3632,12 +3652,97 @@ public sealed class IngestWriteAndSpillTests : IDisposable
                     }, Props(i), "event {n}", new ExceptionInfo { Type = "E", Message = "m", StackTrace = own });
                 Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
             }
-            await engine.FlushHotTierAsync();
-            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "every tier to be flushed", ShortGuard);
+            // A tier of text that found the frozen ones at their share of it spilled, or waited (see the test below).
+            await FlushEverythingAsync(engine, ShortGuard);
 
-            int tiers = engine.ListSegments().Count;   // one level: one segment a tier
+            int tiers = engine.ListSegments().Count;   // one level: one segment a tier or spilled block
             Assert.True(tiers >= 3, $"{Events} events with {Events * (long)Chars * 2 / MB} MB of their own text went into {tiers} tier(s) of 8 MB");
             Assert.Equal(Events, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review H-D, the frozen backlog's half. Each tier bounds the text its events carry of their
+    /// own, but the frozen tiers were bounded only in number, by their native footprint against the
+    /// physical limit — on a 384 MiB heap limit over a host's RAM, 30 frozen tiers of one 8 MB CLEF stack
+    /// each ran the heap out. They hold at most as many tiers' worth of that text as flushes run at once
+    /// now: with one flush, and the first tier's held, the second tier of text does not freeze beside it —
+    /// its events spill — and every event is there once the flush goes on.
+    /// </summary>
+    [Fact]
+    public async Task The_frozen_tiers_hold_no_more_of_their_events_own_text_than_their_flushes_run_at_once()
+    {
+        // 40 KB of text each: four 8 MB tiers' worth — one frozen and held, one live and full, and more
+        // than a tier's worth spilled.
+        const int Events = 900, Chars = 20_000;
+        var engine = Engine(Options(NewDir(), tierBytes: 8 * MB));   // one flush at a time (FlushConcurrency 1)
+        var gate   = HoldFirstFlush(engine);
+        try
+        {
+            Assert.True(engine.FlushWidth == 1 && engine.FlushSlots > 2,
+                        $"setup: width {engine.FlushWidth}, {engine.FlushSlots} slot(s) — the slots alone must leave room for more frozen tiers");
+            for (int i = 0; i < Events; i++)
+            {
+                using var batch = new LogWriteBatch();
+                batch.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                }, Props(i), new string((char)('a' + i % 26), Chars) + i, exception: null);
+                Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            }
+
+            Assert.True(engine.FrozenTierCountForTest == 1 && engine.SpilledEvents > 0,
+                        $"with the first tier's flush held: {engine.FrozenTierCountForTest} frozen tier(s), " +
+                        $"{engine.FrozenTextBytesForTest / MB} MB of their events' own text, {engine.SpilledEvents} event(s) spilled");
+
+            gate.Set();
+            await FlushEverythingAsync(engine, HangGuard);
+            Assert.Equal(Events, ReadAll(engine).Count);
+            Assert.Equal(0, engine.FrozenTextBytesForTest);
+
+            // And a spilled block holds no more of that text than a tier: its despill's tier counts none,
+            // so the spill's admission does (one segment a block or tier: one level).
+            foreach (var s in engine.ListSegments())
+                Assert.True(s.EventCount <= 8 * MB / 40_000 + 1,
+                            $"segment {s.Id} holds {s.EventCount} events of 40 KB of text each — past an 8 MB tier's");
+        }
+        finally { gate.Set(); await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review H-D: the frozen text goes back with the tier's slot whichever owner gives it — here a
+    /// flush retry, after a first attempt that failed. Kept, it would hold the next tier of text out of the
+    /// frozen backlog for good: every event after it spilled, and none was despilled.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_retry_gives_its_tiers_text_back_with_its_slot()
+    {
+        var engine = Engine(Options(NewDir(), tierBytes: 8 * MB));
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int failures = 1;
+        engine._beforeLevelWriteForTest = _ =>
+        {
+            if (Interlocked.Exchange(ref failures, 0) == 1) throw new IOException("test: the first level write fails");
+        };
+        try
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                using var batch = new LogWriteBatch();
+                batch.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                }, Props(i), new string((char)('a' + i), 1_000_000) + i, exception: null);   // 2 MB each
+                Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            }
+            await engine.FlushHotTierAsync();
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the tier to be flushed by its retry", ShortGuard);
+            Assert.Equal(0, Volatile.Read(ref failures));   // the first attempt did fail
+            Assert.Equal(0, engine.FrozenTextBytesForTest);
+            Assert.Equal(4, ReadAll(engine).Count);
         }
         finally { await engine.DisposeAsync(); }
     }
