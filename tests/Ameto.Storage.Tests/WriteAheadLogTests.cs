@@ -543,6 +543,34 @@ public sealed class WriteAheadLogTests
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
 
+    /// <summary>
+    /// Round-5 review L-17. The append encodes an event's exception into a per-thread scratch buffer, which
+    /// kept the largest exception its thread ever wrote — megabytes on each writer thread, for the life of
+    /// the thread. Grown past a megabyte, it is let go once the entry is written; the entry is whole.
+    /// </summary>
+    [Fact]
+    public void A_writer_thread_keeps_no_exception_scratch_past_a_megabyte()
+    {
+        string path  = NewWalPath();
+        var    stack = new string('s', 4_000_000);
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Error, 0, "failed {n}", [1],
+                           new ExceptionInfo { Type = "System.Exception", Message = "boom", StackTrace = stack });
+
+                var scratch = typeof(WriteAheadLog).GetField("_tExc", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+                                                   .GetValue(null) as System.Buffers.ArrayBufferWriter<byte>;
+                Assert.True((scratch?.Capacity ?? 0) <= 1 << 20, $"the thread kept {scratch?.Capacity:N0} B of exception scratch");
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(stack, Assert.Single(entries).Exception!.StackTrace);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
     /// <summary>Round-5 review L-1, the other side: a text that ends in a NUL of its own, with rows after it, is a row like any other.</summary>
     [Fact]
     public void A_row_whose_text_ends_in_a_nul_of_its_own_is_kept()

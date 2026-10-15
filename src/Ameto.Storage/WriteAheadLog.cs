@@ -334,6 +334,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     // below, so nothing outlives the call. Avoids a byte[] per exception-carrying event.
     [ThreadStatic] private static System.Buffers.ArrayBufferWriter<byte>? _tExc;
 
+    /// <summary>The most of <see cref="_tExc"/> a thread keeps between appends.</summary>
+    private const int KeepExcScratchBytes = 1 << 20;
+
     /// <summary>
     /// Appends a single event payload to the WAL. Thread-safe via lock.
     /// Fast path: a single Span copy into the mmap region.
@@ -443,6 +446,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             exception.Write(ref w);
             w.Flush();
             excBytes = buf.WrittenSpan;
+            // Grown past KeepExcScratchBytes, it is not kept on the thread (round-5 review L-17): each
+            // writer thread kept the largest @x it ever wrote, for the life of the thread. The span above
+            // holds the buffer until the copy below.
+            if (buf.Capacity > KeepExcScratchBytes) _tExc = null;
         }
         bool hasTrace  = (traceIdHi | traceIdLo | spanId) != 0;
         int  traceLen  = hasTrace ? TraceContextSize : 0;

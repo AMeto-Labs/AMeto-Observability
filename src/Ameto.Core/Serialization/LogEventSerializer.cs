@@ -238,6 +238,11 @@ public static class LogEventSerializer
         ReadOnlySpan<byte> svcUtf8   = default;   // @service
         ReadOnlySpan<byte> legacySvc = default;   // service.name — see ServiceTieRule
         ExceptionInfo? exception     = null;
+        // Where @x is: decoded once the event is known to be kept (round-5 review L-17). Decoded where
+        // it stood, an event then refused as oversized had built its exception for nothing, charged to
+        // nothing — 15.6 MB of strings for an 8.4 MB @x.
+        SequencePosition exceptionAt = default;
+        bool             hasException = false;
         ulong traceIdHi = 0, traceIdLo = 0, spanId = 0;
 
         ArrayBufferWriter<byte>? rawPropsBuf = null;
@@ -262,7 +267,9 @@ public static class LogEventSerializer
                 case ClefField.ServiceName:       svcUtf8   = ReadUtf8Value(ref reader); break;
                 case ClefField.LegacyServiceName: legacySvc = ReadUtf8Value(ref reader); break;
                 case ClefField.Exception:
-                    exception = ExceptionInfo.Read(ref reader);
+                    exceptionAt  = reader.Position;
+                    hasException = true;
+                    reader.Skip();
                     break;
                 case ClefField.TraceId:
                     TraceIdHelper.TryParseTraceId(ReadUtf8Value(ref reader), out traceIdHi, out traceIdLo);
@@ -310,6 +317,13 @@ public static class LogEventSerializer
 
         // ServiceTieRule: @service, unless it is absent or empty, then service.name.
         if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
+
+        // The last @x, as the field loop's assignment kept the last; never for an event refused below.
+        if (hasException && !oversized)
+        {
+            var at = new MessagePackReader(sourceSequence.Slice(exceptionAt));
+            exception = ExceptionInfo.Read(ref at);
+        }
 
         if (oversized)
         {
@@ -387,13 +401,21 @@ public static class LogEventSerializer
         if (Utf8Parser.TryParse(value, out result, out int consumed, 'O') && consumed == value.Length)
             return true;
 
-        // Non-"O" shape: decode and use the general parser, which is what the batch path
-        // has always used. Short and rare, so the transient string is acceptable.
-        Span<char> chars = value.Length <= 64 ? stackalloc char[64] : new char[value.Length];
+        // Non-"O" shape: decode and use the general parser, which is what the batch path has always
+        // used — into the stack, never into a buffer as long as the value (round-5 review L-17): a
+        // 7.9 MB @t took a 15.9 MB char[], charged to nothing. The parser skips the whitespace around a
+        // value, so that is trimmed first; a value still longer than MaxTimestampChars is no timestamp a
+        // client sends (the round-trip shape is 33 characters) and is answered as one that does not parse.
+        value = value.Trim(" \t\r\n\v\f"u8);
+        if (value.IsEmpty || value.Length > MaxTimestampChars) { result = default; return false; }
+        Span<char> chars = stackalloc char[MaxTimestampChars];
         int written = Encoding.UTF8.GetChars(value, chars);
         return DateTimeOffset.TryParse(
             chars[..written], null, System.Globalization.DateTimeStyles.RoundtripKind, out result);
     }
+
+    /// <summary>The longest CLEF <c>@t</c>, past the whitespace around it, the general parser is asked to read.</summary>
+    private const int MaxTimestampChars = 256;
 
 
 

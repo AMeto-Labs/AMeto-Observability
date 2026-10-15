@@ -23,6 +23,7 @@ public sealed class LogBatchScratchTests
     {
         public readonly List<int>  Assembled = [];
         public readonly List<long> Refused   = [];
+        public readonly List<long> Stamps    = [];   // the timestamps of the CLEF events assembled
 
         public int MaxEventPayloadBytes => Limit;
 
@@ -46,6 +47,7 @@ public sealed class LogBatchScratchTests
                                   ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId, ReadOnlySpan<byte> serviceUtf8)
         {
             Assembled.Add(msgpackProps.Length);
+            Stamps.Add(tsTicks);
             return msgpackProps.Length <= Limit;
         }
 
@@ -165,6 +167,82 @@ public sealed class LogBatchScratchTests
         Assert.Single(sink.Assembled);                                 // the small one
         Assert.True(sink.Refused.Single() >= 3_000_000);
         Assert.True(ScratchCapacity(typeof(LogEventSerializer), "_tRawPairs") <= 1 << 20, "the pair scratch stayed grown on the thread");
+    }
+
+    // ── L-17: uncharged transients of the CLEF decode ─────────────────────────
+
+    /// <summary>One CLEF event: its <c>@t</c>, a template, and the fields <paramref name="more"/> writes after them.</summary>
+    private delegate void WriteFields(ref MessagePackWriter writer);
+
+    private static ReadOnlyMemory<byte> ClefEvent(string timestamp, int moreFields = 0, WriteFields? more = null)
+    {
+        var buf = new ArrayBufferWriter<byte>();
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(1);
+        w.WriteMapHeader(2 + moreFields);
+        w.Write("@t");  w.Write(timestamp);
+        w.Write("@mt"); w.Write("one event");
+        more?.Invoke(ref w);
+        w.Flush();
+        return buf.WrittenMemory;
+    }
+
+    /// <summary>
+    /// Round-5 review L-17. An <c>@t</c> not in the round-trip shape went to the general parser through a
+    /// char[] as long as the value: 15.9 MB for a 7.9 MB <c>@t</c>, charged to nothing. It is decoded on the
+    /// stack now, past the whitespace around it; a value still longer than any timestamp is answered as one
+    /// that does not parse — the event is stamped with its arrival, as before.
+    /// </summary>
+    [Fact]
+    public void A_long_clef_timestamp_is_read_without_a_buffer_of_its_length()
+    {
+        var body = ClefEvent(new string('x', 8_000_000));
+        var sink = new CapturingSink();
+        LogEventSerializer.StreamBatch(ClefEvent("not a timestamp"), sink, out _);   // warm the path
+        sink.Stamps.Clear();
+
+        long before    = GC.GetAllocatedBytesForCurrentThread();
+        long arrived   = DateTimeOffset.UtcNow.UtcTicks;
+        int  ingested  = LogEventSerializer.StreamBatch(body, sink, out _);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(1, ingested);
+        Assert.True(Assert.Single(sink.Stamps) >= arrived, "the event was not stamped with its arrival");
+        Assert.True(allocated < 1_000_000, $"reading an 8 MB @t allocated {allocated:N0} B");
+    }
+
+    /// <summary>The other side: the whitespace around a timestamp the general parser reads is still not its length.</summary>
+    [Fact]
+    public void A_clef_timestamp_padded_with_whitespace_still_parses()
+    {
+        var sink = new CapturingSink();
+        LogEventSerializer.StreamBatch(ClefEvent(new string(' ', 5_000) + "2026-10-15T12:34:56.123Z" + new string(' ', 5_000)), sink, out _);
+
+        Assert.Equal(new DateTimeOffset(2026, 10, 15, 12, 34, 56, 123, TimeSpan.Zero).UtcTicks, Assert.Single(sink.Stamps));
+    }
+
+    /// <summary>
+    /// Round-5 review L-17. A CLEF event's <c>@x</c> was decoded where it stood, so an event then refused
+    /// as oversized had built its exception — 15.6 MB of strings for an 8.4 MB <c>@x</c> — for nothing, and
+    /// charged to nothing. It is decoded once the event is known to be kept.
+    /// </summary>
+    [Fact]
+    public void An_oversized_clef_events_exception_is_never_decoded()
+    {
+        var body = ClefEvent(DateTime.UtcNow.ToString("O"), moreFields: 2, more: (ref MessagePackWriter w) =>
+        {
+            w.Write("@x");   w.Write(new string('s', 8_000_000));   // before the property that makes it oversized
+            w.Write("Blob"); w.Write(new string('b', 2 * Limit));
+        });
+        var sink = new CapturingSink();
+
+        long before    = GC.GetAllocatedBytesForCurrentThread();
+        int  ingested  = LogEventSerializer.StreamBatch(body, sink, out int dropped);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal((0, 1), (ingested, dropped));
+        Assert.Single(sink.Refused);
+        Assert.True(allocated < 2_000_000, $"refusing an event with an 8 MB @x allocated {allocated:N0} B");
     }
 
     // ── H4: the intern pool ───────────────────────────────────────────────────
