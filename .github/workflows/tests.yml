@@ -318,12 +318,38 @@ jobs:
           done
           # The appender's path (round-3 R3-1): the pool's fsync off its lock (and a dispose closing the
           # pool under it), and a grow's unmap without the view's write-back (munmap here,
-          # UnmapViewOfFile on Windows).
+          # UnmapViewOfFile on Windows); and the tick's own failures (round 4): the handle of a log a
+          # failed grow left unmapped, and a pool claim that fails (named here since round-5 L-20 — the
+          # filter ran them, and nothing would have said had it stopped).
           for t in An_append_that_needs_a_new_pool_row_goes_through_while_a_tick_fsyncs_the_pool \
                    A_dispose_while_a_tick_fsyncs_the_pool_is_not_the_ticks_error \
-                   A_grow_unmaps_the_old_view_without_writing_it_back; do
+                   A_grow_unmaps_the_old_view_without_writing_it_back \
+                   A_tick_flushes_the_handle_of_a_log_a_failed_grow_left_unmapped \
+                   A_pool_claim_that_fails_is_retried_and_never_replaces_the_wals_failure; do
             if ! grep -q "Passed Ameto.Storage.Tests.WalWriterPathTests.$t" walflush-output.txt; then
               echo "::error::WalWriterPathTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE STARTUP SWEEPS, ON LINUX (round-5 L-20). The sweeps that delete what a gone log leaves —
+      # its pool (round-4 L18), its completion marker — and the flush that keeps a marker while its log
+      # stays: on Windows a pool outlives its log under a tick's open handle, and the look that says a
+      # log is gone (round-5 L-18) reads a file system's answer, which is the platform's. These ran in
+      # the Windows job alone. Same guard as above: each named fact must appear as Passed.
+      - name: Test the startup sweeps (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker" \
+            --logger "console;verbosity=normal" 2>&1 | tee sweep-output.txt
+
+          for t in Pool_files_whose_log_is_gone_are_swept_at_the_start \
+                   A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker \
+                   A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker; do
+            if ! grep -q "Passed Ameto.Storage.Tests.IngestWriteAndSpillTests.$t" sweep-output.txt; then
+              echo "::error::IngestWriteAndSpillTests.$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1
             fi
           done
