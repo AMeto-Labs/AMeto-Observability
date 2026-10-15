@@ -6617,25 +6617,29 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
     /// deployment error the 409 exists to report.</para>
     ///
-    /// <para>An id at or past <see cref="MaxAllocatorFloor"/> is claimed with no raise: the allocator
-    /// never reaches it, so the two stay disjoint without one — and the raise, <c>id + 1</c>, wrapped
-    /// the floor past zero for an id at the end of the id space (the blocks handed out next were
-    /// ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>); below the end, it
-    /// left the allocator handing out blocks no replay reads back (see <see cref="AdvanceSegmentIdFloor"/>).</para>
+    /// <para>An id at or past <see cref="MaxAllocatorFloor"/> that the allocator has not handed out is
+    /// claimed with no raise — the raise, <c>id + 1</c>, wrapped the floor past zero for an id at the
+    /// end of the id space (the blocks handed out next were ids already used), as a log's name did (see
+    /// <see cref="ReserveWalBlock"/>); below the end, it left the allocator handing out blocks no replay
+    /// reads back (see <see cref="AdvanceSegmentIdFloor"/>). One the allocator HAS handed out is refused
+    /// like any other (round-5 review L-2): the floor itself may sit at the ceiling, and the allocator
+    /// hand out blocks past it, and an id at or past the ceiling was claimed without asking — an import
+    /// wearing this node's id was registered into the live WAL's reserved block, and the local flush
+    /// then displaced it.</para>
     /// </summary>
     private bool TryClaimLocalSegmentId(ulong id)
     {
-        if (id >= MaxAllocatorFloor)
-        {
-            RefuseSegmentIdFloor(id < ulong.MaxValue ? id + 1 : id);
-            return true;
-        }
         lock (_segIdLock)
         {
             if (id < _nextSegmentId) return false;
-            _nextSegmentId = id + 1;
-            return true;
+            if (id < MaxAllocatorFloor)
+            {
+                _nextSegmentId = id + 1;
+                return true;
+            }
         }
+        RefuseSegmentIdFloor(id < ulong.MaxValue ? id + 1 : id);
+        return true;
     }
 
     /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>

@@ -824,6 +824,38 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-5 review L-2: the same refusal once the allocator has reached the ceiling. The floor may
+    /// sit at <see cref="StorageEngine.MaxAllocatorFloor"/> (a segment, a WAL or another node's segment
+    /// numbered just under the ceiling puts it there), and the allocator then hands out blocks past it;
+    /// an id at or past the ceiling was claimed without asking it, and an import wearing this node's id
+    /// was registered into the live WAL's reserved block — answered 204, then displaced by the local
+    /// flush, its file in no catalog.
+    /// </summary>
+    [Fact]
+    public async Task A_peer_wearing_our_id_at_the_ceiling_cannot_take_a_block_handed_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        _engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor);   // accepted: not past the ceiling
+        Write(5, now);
+        await _engine.FlushHotTierAsync();                                 // the next WAL takes the block there
+        ulong live = _engine.LiveWalSegmentId;
+        Assert.True(live >= StorageEngine.MaxAllocatorFloor, $"setup: the live block is {live}");
+
+        ulong  reserved  = live + (ulong)LogLevel.Information;
+        string staged    = Path.Combine(_dir, "pushed-ceiling.body");
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{reserved}.seg");
+        WritePeerSegment(NodeId.Local, reserved, now, events: 4, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.ConflictAllocatedLocally, _engine.ImportSegment(staged, finalPath));
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();
+        var under = Assert.Single(_engine.ListSegments(), s => s.Id.Value == reserved);
+        Assert.Equal(20u, under.EventCount);   // the local flush's, alone under its key
+    }
+
+    /// <summary>
     /// The same displacement from the other end, through the one arrangement the allocator cannot
     /// rule out. The catalog scan runs as a BACKGROUND task and WAL replay publishes while it is
     /// still walking the directory, so a peer file already sitting under
