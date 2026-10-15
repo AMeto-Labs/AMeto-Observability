@@ -1323,6 +1323,162 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-4 review L27: failures a quiet spell apart are not in a row. Two swaps nobody waits on
+    /// fail (explicit flushes of a tier with room: their retry finds nothing to swap); a quiet spell
+    /// passes; then a full tier's swap fails once, transiently. The count the two had left stood for
+    /// good and made that the third failure in a row: the despill took the only slot at once, for a
+    /// whole block, and with spilling off the writers were answered 503 though the swap installed at
+    /// its first retry — R4-3's case again.
+    /// </summary>
+    [Fact]
+    public async Task Swap_failures_a_quiet_spell_apart_are_not_in_a_row()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        using var despillGate = new ManualResetEventSlim(false);
+        int toFail = 2, failures = 0;
+        engine._beforeSwap = () =>
+        {
+            if (Interlocked.Decrement(ref toFail) < 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: a failure creating the next WAL");
+        };
+        engine._beforeLoadSpillForTest = _ => despillGate.Wait(HangGuard);   // a despill that took the slot keeps it
+        engine._roomRecheckMs  = 300;                                // the hold-back after one failure
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(300);    // so failures over 3 s apart are not in a row
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);
+            Thread.Sleep(3_500);   // the quiet spell
+
+            Volatile.Write(ref toFail, 1);   // the full tier's swap fails once
+            using (var a = Batch(engine, 1, TierEvents - 1))
+                Assert.Equal(new LogBatchWriteResult(TierEvents - 1, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
+            WaitFor(() => Volatile.Read(ref failures) >= 3 && engine.LiveHotTierRefused, "the full tier's swap to fail");
+
+            hold.SetResult();   // the despill loop starts, the only slot free
+            using (var b = Batch(engine, TierEvents + 1, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, ShortGuard));
+            Assert.Equal(3, Volatile.Read(ref failures));
+        }
+        finally
+        {
+            despillGate.Set();
+            hold.TrySetResult();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Explicit flushes until the test's count of failed swaps reaches <paramref name="target"/>. A
+    /// flush that finds the swap lock held — a request a release re-asked — returns without trying.
+    /// </summary>
+    private static async Task FailExplicitFlushesUntil(StorageEngine engine, Func<int> failures, int target)
+    {
+        long until = Environment.TickCount64 + (long)ShortGuard.TotalMilliseconds;
+        while (failures() < target)
+        {
+            Assert.True(Environment.TickCount64 < until, $"the swap failed {failures()} of {target} times");
+            try { await engine.FlushHotTierAsync(); }
+            catch (IOException) { /* the failure counted */ }
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L27, the other half of the decision: a slot coming free does not end a run of
+    /// failures. It forgets the last failure, so the swap tries first; but when that try fails too,
+    /// the run goes on — here it is the third, and the backlog's despill takes a slot at once, the
+    /// despill that frees what the swap keeps failing on (M4). Counted from 1 after each release, the
+    /// despill went on yielding to a swap that failed after every flush that ended. No retry of the
+    /// swap's own runs here: the attempts are the test's and the released slot's.
+    /// </summary>
+    [Fact]
+    public async Task A_slot_coming_free_does_not_end_a_run_of_swap_failures()
+    {
+        string dir  = NewDir();
+        var    opts = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes          = TierBytes,
+                FlushConcurrency      = 2,
+                SpillEnabled          = false,
+                SpillMinFreeDiskBytes = 0,
+            },
+        };
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try
+        {
+            engine = new StorageEngine(
+                Microsoft.Extensions.Options.Options.Create(opts),
+                new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+                NullLogger<StorageEngine>.Instance,
+                MemoryBudgets.Derive(managedLimitBytes: 64 * MB, physicalLimitBytes: 64 * MB));
+        }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        Assert.Equal(2, engine.FlushSlots);
+        var gate = HoldFirstFlush(engine);
+        using var despilling = new ManualResetEventSlim(false);
+        int failing = 0, failures = 0;
+        engine._beforeSwap = () =>
+        {
+            if (Volatile.Read(ref failing) == 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: no room on the volume for the next WAL");
+        };
+        engine._beforeLoadSpillForTest = _ => despilling.Set();
+        engine._roomRecheckMs  = (int)HangGuard.TotalMilliseconds;   // no retry of the swap's own
+        engine._swapRetryDelay = HangGuard;
+        try
+        {
+            // Tier 1 swaps, and its flush parks holding one of the two slots.
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));
+            WaitFor(() => engine.FrozenTierCountForTest == 1 && engine.LiveHotTier.Count == 0, "tier 1 to swap");
+
+            // Tier 2 fills, and its swap fails twice: the refusal's request, then an explicit flush.
+            Volatile.Write(ref failing, 1);
+            using (var b = Batch(engine, TierEvents, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            Assert.False(TryWriteOne(engine, 2 * TierEvents));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);
+            Assert.Equal(2, Volatile.Read(ref failures));
+
+            hold.SetResult();   // the despill loop starts: two failures, so it yields the free slot
+            Assert.False(despilling.Wait(300), "the despill took the slot at the second failure");
+
+            // Tier 1's flush ends: its slot comes free, the swap tries first and fails a third time.
+            gate.Set();
+            Assert.True(despilling.Wait(ShortGuard), "the despill went on yielding after the third failure in a row");
+            Assert.Equal(3, Volatile.Read(ref failures));
+        }
+        finally
+        {
+            gate.Set();
+            Volatile.Write(ref failing, 0);
+            hold.TrySetResult();
+            engine._beforeSwap = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A swap whose install fails after it built its successor gives the successor back — its tier
     /// freed, its WAL deleted. The catch that gave the slot back left it behind: an open 64 MB WAL
     /// with its mapping and id block, and a tier's first chunk, at every attempt a request made.

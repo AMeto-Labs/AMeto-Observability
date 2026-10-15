@@ -2634,8 +2634,35 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>The longest pause after a failed swap before it is tried again. Internal so a test can change it.</summary>
     internal TimeSpan _swapRetryDelay = TimeSpan.FromSeconds(1);
 
-    /// <summary>Swaps failed in a row: 0 once one installs. A slot coming free does not reset it.</summary>
+    /// <summary>
+    /// Swaps failed in a row: 0 once one installs, and counted from 1 again by a failure more than
+    /// <see cref="SwapFailureStreakGapMs"/> after the one before. A slot coming free does not reset it.
+    /// </summary>
     private int _swapFailures;
+
+    /// <summary><see cref="Environment.TickCount64"/> of the last failed swap, which nothing clears. Under <c>_flushLock</c> (<see cref="OnSwapFailed"/>).</summary>
+    private long _lastSwapFailureAt;
+
+    /// <summary>
+    /// How long after a failed swap the next failure still counts as one in a row: ten of the longest
+    /// pauses between tries (round-4 L27). A swap that is wanted and keeps failing is tried again
+    /// within <see cref="_swapRetryDelay"/> — by its own retry, sooner by a slot coming free — so a
+    /// longer silence means nothing asked for it: the failures before it were of swaps no writer was
+    /// waiting on (the age loop's, an explicit flush's, whose retries find nothing to swap). Their
+    /// count used to stand for good, and one transient failure hours later, the first of a busy
+    /// spell, was the third "in a row": the despill took the slot at once, for a whole block, with
+    /// spilling off the writers were answered 503 though the swap installed at its next try (R4-3's
+    /// case again), and the hold-back started at its long end.
+    ///
+    /// <para>A slot coming free does not reset the count, deliberately. It says nothing of the cause —
+    /// the flush that ended freed what it held, which may or may not be what the swap failed on, and
+    /// the release already lets the swap try first — and the count is what carries a failure that
+    /// persists across the flushes ending around it: the first failure after a release is then the
+    /// third or later, and hands the slot to the backlog's despill at once, the backlog whose despill
+    /// frees the disk the swap fails on (M4). Reset there, a run of flushes ending would hold that
+    /// despill back after each of them.</para>
+    /// </summary>
+    private long SwapFailureStreakGapMs => 10 * (long)_swapRetryDelay.TotalMilliseconds;
 
     /// <summary>Failed swaps in a row after which the despill takes a free slot even with no spill to take the writers.</summary>
     private const int SwapFailuresBeforeDespillTakesTheSlot = 3;
@@ -2681,7 +2708,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try
         {
             _onSwapFailedForTest?.Invoke();
-            long now   = Environment.TickCount64;
+            long now = Environment.TickCount64;
+            if (now - _lastSwapFailureAt > SwapFailureStreakGapMs) Volatile.Write(ref _swapFailures, 0);   // not in a row
+            _lastSwapFailureAt = now;
             long delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
             Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
             Volatile.Write(ref _swapRetryAt, now + delay);
