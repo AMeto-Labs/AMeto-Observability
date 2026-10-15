@@ -427,11 +427,47 @@ public sealed class IngestStoreBusyTests : IDisposable
         Assert.Contains("80 more oversized", logger.Last);
     }
 
+    /// <summary>
+    /// Round-5 review L-8: the same when written and unwritten markers mix, which no test reached. The
+    /// twenty a request names are its first twenty UNWRITTEN ones, counted from the first marker the store
+    /// had no room for — here thirty are written (named at most once a second, as their markers name them)
+    /// and seventy are not: twenty named, then one line with fifty.
+    /// </summary>
+    [Fact]
+    public async Task A_request_whose_markers_are_partly_written_names_its_first_unwritten_ones_and_sums_up_the_rest()
+    {
+        var opts   = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
+        await using var storage = Engine(opts);
+        var logger = new CountingLogger();
+        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, logger);
+        using var batch = endpoint.BeginBatch();
+        Assert.True(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "client {N}"u8, [0x80], 0, 0, 0, "svc"u8));
+        for (int i = 0; i < 100; i++)
+            Assert.False(batch.TryIngestRaw(DateTimeOffset.UtcNow.UtcTicks, (byte)Ameto.Core.LogLevel.Information, "big {N}"u8, new byte[100], 0, 0, 0, "svc"u8));
+
+        int writes = 0;
+        storage._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref writes) > 31) throw new OutOfMemoryException("test: no room after thirty markers");
+        };
+        try
+        {
+            var result = await batch.CommitAsync();
+            Assert.Equal(new LogIngestResult(1, 100, Busy: false), result);
+        }
+        finally { storage._afterWriteGate = null; }
+
+        Assert.Equal(IngestionEndpoint.UnwrittenMarkerWarningsPerRequest,
+                     logger.Lines.Count(l => l.Contains("the store had no room for its marker", StringComparison.Ordinal)));
+        Assert.Contains("50 more oversized", logger.Last);
+    }
+
     /// <summary>Counts the Warnings written, and keeps the last one.</summary>
     private sealed class CountingLogger : Microsoft.Extensions.Logging.ILogger<IngestionEndpoint>
     {
         public int     Warnings;
         public string? Last;
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Lines = new();
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
@@ -443,6 +479,7 @@ public sealed class IngestStoreBusyTests : IDisposable
             if (logLevel != Microsoft.Extensions.Logging.LogLevel.Warning) return;
             Interlocked.Increment(ref Warnings);
             Last = formatter(state, exception);
+            Lines.Enqueue(Last);
         }
     }
 
