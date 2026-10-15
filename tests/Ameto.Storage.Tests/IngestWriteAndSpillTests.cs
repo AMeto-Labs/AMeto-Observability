@@ -1951,9 +1951,12 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             Volatile.Write(ref failing, 0);
             WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == engine.SpilledEvents,
                     "the block to be despilled once its read works", ShortGuard);
-            Assert.Contains(log.Lines, l => l.Level == Microsoft.Extensions.Logging.LogLevel.Information
-                                            && l.Line.StartsWith("Despilled block", StringComparison.Ordinal)
-                                            && l.Line.Contains("failed attempt(s)", StringComparison.Ordinal));
+            // Waited for, not read once: the block is counted and settled before the line that says so is
+            // written, and a look in between found no line (round 5: 1 run in Linux's WAL set).
+            WaitFor(() => log.Lines.Any(l => l.Level == Microsoft.Extensions.Logging.LogLevel.Information
+                                             && l.Line.StartsWith("Despilled block", StringComparison.Ordinal)
+                                             && l.Line.Contains("failed attempt(s)", StringComparison.Ordinal)),
+                    "the line that says the block was despilled after its failed attempts", ShortGuard);
         }
         finally
         {
