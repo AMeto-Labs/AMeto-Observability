@@ -342,12 +342,65 @@ public sealed partial class StorageEngine
     private long SpillRoomBytes =>
         _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes + WriteAheadLog.MaxRowsPastCapacity;
 
-    /// <summary>The free space the floor check measures (<see cref="VolumeAvailableBytes"/> of the WAL directory), or -1 when the volume cannot say.</summary>
+    /// <summary>
+    /// The free space the floor check measures (<see cref="VolumeAvailableBytes"/> of the WAL directory), or
+    /// -1 when the volume cannot say — as last measured, never measured here (round-5 review L-5). The
+    /// callers hold the swap lock (<see cref="SpillWithoutSlot"/>) or run the despill loop
+    /// (<see cref="SpillCanTakeTheWriters"/>), and the measurement can block: on an unreachable UNC server
+    /// GetDiskFreeSpaceEx waits out the SMB connect timeout, ~21 s measured, and every swap, despill and
+    /// merge waited with it. A measurement older than <see cref="SpillFreeMaxAgeMs"/> (or none yet) asks for
+    /// the next one, which runs on the thread pool, one at a time, off every lock; until one has finished,
+    /// the volume is one that cannot say.
+    /// </summary>
     private long SpillVolumeFreeBytes()
     {
-        try { return _spillFreeDiskForTest?.Invoke() ?? VolumeAvailableBytes(_walDir); }
-        catch (Exception) { return -1; }
+        if (_spillFreeDiskForTest is { } seam)
+        {
+            try { return seam(); }
+            catch (Exception) { return -1; }
+        }
+        long free = Volatile.Read(ref _spillFreeMeasured);
+        if (free == long.MinValue || Environment.TickCount64 - Volatile.Read(ref _spillFreeMeasuredAt) > SpillFreeMaxAgeMs)
+            StartSpillFreeMeasure();
+        return free == long.MinValue ? -1 : free;
     }
+
+    /// <summary>How old a measurement of the spill volume's free space may be before the next is asked for.</summary>
+    private const long SpillFreeMaxAgeMs = 1_000;
+
+    /// <summary>The spill volume's free bytes as last measured (-1: it cannot say), <see cref="long.MinValue"/> before the first.</summary>
+    private long _spillFreeMeasured = long.MinValue;
+
+    /// <summary><see cref="Environment.TickCount64"/> of the last measurement.</summary>
+    private long _spillFreeMeasuredAt;
+
+    /// <summary>1 while a measurement runs.</summary>
+    private int _spillFreeMeasuring;
+
+    /// <summary>Starts a measurement of the spill volume's free space unless one runs. Never throws, never waits.</summary>
+    private void StartSpillFreeMeasure()
+    {
+        if (Interlocked.Exchange(ref _spillFreeMeasuring, 1) != 0) return;
+        try { ThreadPool.UnsafeQueueUserWorkItem(static e => e.MeasureSpillFree(), this, preferLocal: false); }
+        catch (Exception) { Volatile.Write(ref _spillFreeMeasuring, 0); }   // asked again by the next look
+    }
+
+    /// <summary>One measurement, on a pool thread: whatever it takes, it holds nothing but this thread.</summary>
+    private void MeasureSpillFree()
+    {
+        try
+        {
+            long free;
+            try { free = _volumeMeasureForTest?.Invoke(_walDir) ?? VolumeAvailableBytes(_walDir); }
+            catch (Exception) { free = -1; }
+            Volatile.Write(ref _spillFreeMeasuredAt, Environment.TickCount64);
+            Volatile.Write(ref _spillFreeMeasured, free);
+        }
+        finally { Volatile.Write(ref _spillFreeMeasuring, 0); }
+    }
+
+    /// <summary>Test seam: the measurement itself, of the WAL directory, in place of <see cref="VolumeAvailableBytes"/>.</summary>
+    internal Func<string, long>? _volumeMeasureForTest;
 
     /// <summary>
     /// Whether a spill could take the writers, were the despill to take the free slot now

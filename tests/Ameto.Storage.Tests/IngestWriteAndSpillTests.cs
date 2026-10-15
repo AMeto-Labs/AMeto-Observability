@@ -3857,6 +3857,44 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── A volume slow to measure (round-5 L-5) ────────────────────────────────
+
+    /// <summary>
+    /// Round-5 review L-5. The spill's floor check measured the volume's free space under the swap lock
+    /// (and on the despill loop), and on an unreachable UNC server that measurement blocks for the SMB
+    /// connect timeout — ~21 s measured — with every swap, despill and merge waiting behind it. It reads
+    /// the last measurement now, and a new one runs off every lock.
+    /// </summary>
+    [Fact]
+    public async Task A_volume_slow_to_measure_holds_no_swap_up()
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        var gate   = HoldFirstFlush(engine);
+        int measured = 0;
+        engine._volumeMeasureForTest = _ =>
+        {
+            Interlocked.Increment(ref measured);
+            Thread.Sleep(3_000);   // a share that does not answer
+            return long.MaxValue;
+        };
+        const int Total = 2 * TierEvents + 1_000;   // A in its flush, holding the one slot; B full; the rest spilled
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            sw.Stop();
+            Assert.True(engine.IsSpilling, "setup: the batch was written without a spill");
+            Assert.True(sw.ElapsedMilliseconds < 2_000,
+                        $"the batch took {sw.ElapsedMilliseconds} ms: the spill's floor check waited on the volume ({measured} measurement(s))");
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A log the sweeps cannot look at (round-5 L-18) ───────────────────────
 
     /// <summary>

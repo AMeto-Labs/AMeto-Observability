@@ -1011,6 +1011,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // narrowed to the hosted services' start, not closed.
         var despillHeld = HoldDespillForTest.Value;
         _despillLoop = Task.Run(() => RunDespillLoopAsync(despillHeld, _cts.Token));
+        // The spill volume's free space, measured off every lock (SpillVolumeFreeBytes): the first
+        // measurement now, so the floor check has one by the time a spill is wanted.
+        StartSpillFreeMeasure();
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
