@@ -1433,7 +1433,8 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { StorageEngine.HoldDespillForTest.Value = null; }
         Assert.Equal(2, engine.FlushSlots);
         var gate = HoldFirstFlush(engine);
-        using var despilling = new ManualResetEventSlim(false);
+        using var despilling   = new ManualResetEventSlim(false);
+        using var despillGoesOn = new ManualResetEventSlim(false);
         int failing = 0, failures = 0;
         engine._beforeSwap = () =>
         {
@@ -1441,15 +1442,23 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             Interlocked.Increment(ref failures);
             throw new IOException("test: no room on the volume for the next WAL");
         };
-        engine._beforeLoadSpillForTest = _ => despilling.Set();
+        // The despill holds its slot until the count is read (round-5 M-F): finished, it gave the slot
+        // back, and the swap that release asked for failed a fourth time before the test read three.
+        engine._beforeLoadSpillForTest = _ => { despilling.Set(); despillGoesOn.Wait(HangGuard); };
         engine._roomRecheckMs  = (int)HangGuard.TotalMilliseconds;   // no retry of the swap's own
         engine._swapRetryDelay = HangGuard;
+        Task? firstFlush = null;
         try
         {
-            // Tier 1 swaps, and its flush parks holding one of the two slots.
-            using (var a = Batch(engine, 0, TierEvents))
-                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
-            Assert.False(TryWriteOne(engine, TierEvents));
+            // Tier 1 swaps, and its flush parks holding one of the two slots. Swapped by a flush the test
+            // asks for, and one event short of full so that nothing else asks (round-5 M-F): a write the
+            // full tier refused was the trigger, and the swap that fullness had asked for already could
+            // install first — the write then landed in tier 2, one event over what the test fills it with.
+            // A full tier 1 asks too, and then the test's flush could come after tier 2 filled and fail
+            // a swap of it, a failure the test does not count on.
+            using (var a = Batch(engine, 0, TierEvents - 1))
+                Assert.Equal(new LogBatchWriteResult(TierEvents - 1, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            firstFlush = Task.Run(() => engine.FlushHotTierAsync());   // not awaited: a flush that swaps runs its heavy phase inline, and that one parks
             WaitFor(() => engine.FrozenTierCountForTest == 1 && engine.LiveHotTier.Count == 0, "tier 1 to swap");
 
             // Tier 2 fills, and its swap fails twice: the refusal's request, then an explicit flush.
@@ -1471,9 +1480,11 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally
         {
             gate.Set();
+            despillGoesOn.Set();
             Volatile.Write(ref failing, 0);
             hold.TrySetResult();
             engine._beforeSwap = null;
+            if (firstFlush is not null) await firstFlush.WaitAsync(HangGuard);
             await engine.DisposeAsync();
         }
     }
