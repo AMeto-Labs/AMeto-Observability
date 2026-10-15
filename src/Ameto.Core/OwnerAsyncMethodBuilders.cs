@@ -26,15 +26,27 @@ internal static class OwnerAsync
     /// Test seam: asked at an owner-holding async method's FIRST real suspension, with its state
     /// machine's type (whose name carries the method's); true makes that suspension throw
     /// <see cref="OutOfMemoryException"/> where the runtime allocates the box. An
-    /// <see cref="AsyncLocal{T}"/>, so it reaches only the flows of the test that sets it. Null in
-    /// production.
+    /// <see cref="AsyncLocal{T}"/>, so it reaches only the flows of the test that sets it — created by
+    /// the first test that asks for it; production never does.
+    ///
+    /// <para>No static initializer (round-5 review M-A). The AsyncLocal was created by this type's
+    /// initializer, which runs at the process's first owner-method suspension — and an out of memory
+    /// there failed the type for good: every later first suspension threw TypeInitializationException,
+    /// no swap, spill or despill ran again, and log ingest answered 503 or 500 until a restart. The
+    /// field below is null in production, and reading it is all a suspension does.</para>
     /// </summary>
-    internal static readonly AsyncLocal<Func<Type, bool>?> FirstSuspensionFailsForTest = new();
+    internal static AsyncLocal<Func<Type, bool>?> FirstSuspensionFailsForTest =>
+        Volatile.Read(ref s_firstSuspensionFails)
+        ?? Interlocked.CompareExchange(ref s_firstSuspensionFails, new AsyncLocal<Func<Type, bool>?>(), null)
+        ?? s_firstSuspensionFails!;
+
+    /// <summary>What <see cref="FirstSuspensionFailsForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<Type, bool>?>? s_firstSuspensionFails;
 
     /// <summary>Throws where the box would be allocated, when the seam says so.</summary>
     internal static void FirstSuspension(Type stateMachine)
     {
-        if (FirstSuspensionFailsForTest.Value is { } fails && fails(stateMachine))
+        if (Volatile.Read(ref s_firstSuspensionFails)?.Value is { } fails && fails(stateMachine))
             throw new OutOfMemoryException("test: the async state machine's box could not be allocated");
     }
 }
