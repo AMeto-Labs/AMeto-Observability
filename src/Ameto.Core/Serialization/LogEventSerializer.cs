@@ -280,7 +280,11 @@ public static class LogEventSerializer
                     var pair = sourceSequence.Slice(pairStart, pairEnd);
                     rawPropsBytes += pair.Length;
                     rawPropsCount++;
-                    if (!oversized && 5 + rawPropsBytes > sink.MaxEventPayloadBytes) oversized = true;
+                    // The map's header as it stands (round-5 review L-9): it only grows with the count,
+                    // so a map past the limit now is past it at the end. The largest header, 5 B, was
+                    // counted from the first pair, and a map within 4 B of the limit was refused.
+                    if (!oversized && (rawPropsCount < 16 ? 1 : rawPropsCount < 65_536 ? 3 : 5) + rawPropsBytes > sink.MaxEventPayloadBytes)
+                        oversized = true;
                     if (oversized) break;
                     if (rawPropsBuf is null)
                     {

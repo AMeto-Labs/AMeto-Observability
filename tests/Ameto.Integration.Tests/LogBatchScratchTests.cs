@@ -114,6 +114,35 @@ public sealed class LogBatchScratchTests
         Assert.True(ScratchCapacity(typeof(OtlpLogStreamParser), "_tOut") <= 1 << 20, "the map scratch stayed grown on the thread");
     }
 
+    /// <summary>
+    /// Round-5 review L-9. CLEF's early check counted the largest map header (5 B) from the first pair, so
+    /// a map within 4 B of the limit — a one-byte header — was refused, and its marker said "properties
+    /// 65 536 B exceed limit 65 536 B". The header is counted as it stands now: a map of exactly the
+    /// limit is taken, one byte past it refused.
+    /// </summary>
+    [Theory]
+    [InlineData(Limit - 8, true)]       // the map: 1 B header, "pad" 4 B, str16 header 3 B, the text — the limit exactly
+    [InlineData(Limit - 9, true)]
+    [InlineData(Limit - 11, true)]
+    [InlineData(Limit - 7, false)]      // one byte past it
+    public void A_clef_map_up_to_the_limit_is_taken(int textBytes, bool taken)
+    {
+        var buf = new ArrayBufferWriter<byte>();
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(1);
+        w.WriteMapHeader(3);
+        w.Write("@t");  w.Write(DateTime.UtcNow.ToString("O"));
+        w.Write("@mt"); w.Write("at the limit");
+        w.Write("pad"); w.Write(new string('p', textBytes));
+        w.Flush();
+        var sink = new CapturingSink();
+
+        LogEventSerializer.StreamBatch(buf.WrittenMemory, sink, out _);
+
+        if (taken) Assert.Equal(textBytes + 8, Assert.Single(sink.Assembled));
+        else       Assert.Equal(textBytes + 8, Assert.Single(sink.Refused));
+    }
+
     /// <summary>H3, CLEF: an event whose properties pass the limit is refused before they are copied into the thread's scratch, which is let go.</summary>
     [Fact]
     public void A_clef_event_past_the_event_limit_is_refused_before_its_properties_are_copied()
