@@ -185,6 +185,74 @@ public sealed class WalServiceRecoveryTests : IDisposable
     }
 
     /// <summary>
+    /// Round-5 review L-8: the same cut on the OTLP roads, which no test reached — removed from either
+    /// place it is made, every test passed. The parsers intern a resource's <c>service.name</c> once per
+    /// block (<see cref="LogIngestBatch.InternService"/>), and a record's stage interns it itself when that
+    /// gave no index — a full pool (<see cref="IngestionEndpoint.StageRaw"/>). The name is 4 KB, so that
+    /// uncut it would still be pooled (a pool takes a text of up to 16 Ki units).
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true,  false)]
+    [InlineData(false, true)]
+    [InlineData(true,  true)]
+    public async Task An_otlp_service_past_the_limit_is_cut_at_the_door(bool json, bool fullPool)
+    {
+        Directory.CreateDirectory(_dir);
+        var opts = new ServerOptions { DataDirectory = _dir };
+        // 1 023 bytes of 'a', then a two-byte 'é' across the cut, then 3 000 more: cut to the 'a's.
+        string service = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1) + "é" + new string('b', 3_000);
+        string cut     = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1);
+        var    pool    = new StringInternPool(1);
+        pool.Intern("the one string this pool takes");   // full: every name past it is the event's own
+
+        await using var engine = NewEngine(opts);
+        var endpoint = new IngestionEndpoint(engine, fullPool ? pool : engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        using (var batch = endpoint.BeginBatch())
+        {
+            var (ingested, dropped) = json
+                ? OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJsonOfService(service, 3)), batch)
+                : OtlpLogProtoParser.Parse(OtlpProtoOfService(service, 3), batch);
+            Assert.Equal((3, 0), (ingested, dropped));
+            Assert.Equal(new LogIngestResult(3, 0, Busy: false), await batch.CommitAsync());
+        }
+
+        var query  = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        var events = await QueryAsync(query, filter: null, count: 10);
+        Assert.Equal(3, events.Count);
+        Assert.All(events, ev => Assert.Equal(cut, ev.ServiceName));
+    }
+
+    /// <summary>An OTLP/JSON request of <paramref name="records"/> records under one resource named <paramref name="service"/>.</summary>
+    private static string OtlpJsonOfService(string service, int records) =>
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"" + service +
+        "\"}}]},\"scopeLogs\":[{\"logRecords\":[" +
+        string.Join(",", Enumerable.Range(0, records).Select(i => "{\"body\":{\"stringValue\":\"otlp " + i + "\"}}")) +
+        "]}]}]}";
+
+    /// <summary>The same request in protobuf.</summary>
+    private static byte[] OtlpProtoOfService(string service, int records)
+    {
+        static byte[] Pb(int field, byte[] payload)
+        {
+            var o = new List<byte> { (byte)(field << 3 | 2) };
+            for (ulong v = (ulong)payload.Length; ; v >>= 7)
+            {
+                if (v < 0x80) { o.Add((byte)v); break; }
+                o.Add((byte)(v | 0x80));
+            }
+            o.AddRange(payload);
+            return o.ToArray();
+        }
+        static byte[] Str(int field, string text) => Pb(field, Encoding.UTF8.GetBytes(text));
+
+        byte[] resource = Pb(1, Pb(1, [.. Str(1, "service.name"), .. Pb(2, Str(1, service))]));   // Resource.attributes
+        var    logs     = new List<byte>();
+        for (int i = 0; i < records; i++) logs.AddRange(Pb(2, Pb(5, Str(1, "otlp " + i))));       // ScopeLogs.log_records: body
+        return Pb(1, [.. resource, .. Pb(2, logs.ToArray())]);                                    // resource_logs { resource, scope_logs }
+    }
+
+    /// <summary>
     /// The cut falls at the start of the character it would split — two-, three- and four-byte ones,
     /// at each byte they can be split on — and a name within the limit is kept whole.
     /// </summary>
