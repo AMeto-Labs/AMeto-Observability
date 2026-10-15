@@ -75,12 +75,13 @@ public sealed class LogBatchDecodedBudgetTests : IClassFixture<LogBatchDecodedBu
     }
 
     /// <summary>
-    /// A resource's attributes count once per protobuf record under it: they are copied into each.
-    /// An OTLP/JSON record weighs its staged item alone — its text spells it out at two or three times
-    /// what it decodes to, and what it holds is counted as it is decoded (R1b-4).
+    /// A resource's attributes count once per record under it, protobuf or JSON: they are copied into each.
+    /// An OTLP/JSON record weighs its staged item and its resource's attributes as they decode, not its own
+    /// text — which spells it out at two or three times what it decodes to, and what it holds is counted
+    /// as it is decoded (R1b-4; the resource since round-5 review L-12).
     /// </summary>
     [Fact]
-    public void A_resources_attributes_weigh_once_per_protobuf_record_and_a_json_record_weighs_its_item()
+    public void A_resources_attributes_weigh_once_per_record_and_a_json_record_weighs_its_item_and_its_resource()
     {
         byte[] attribute = Attribute("k8s.pod.name", new string('p', 200));
         byte[] record    = Record("hello {n}");
@@ -92,7 +93,8 @@ public sealed class LogBatchDecodedBudgetTests : IClassFixture<LogBatchDecodedBu
             {"resourceLogs":[{"resource":{"attributes":[{"key":"k8s.pod.name","value":{"stringValue":"PPP"}}]},
               "scopeLogs":[{"logRecords":[{"body":{"stringValue":"a"}},{"body":{"stringValue":"b"}}]}]}]}
             """.Replace("PPP", new string('p', 200));
-        Assert.Equal(2 * IngestionOptions.DecodedLogRecordBytes, OtlpLogBatchWeight.WeighJson(Encoding.UTF8.GetBytes(json)));
+        Assert.Equal(2 * (IngestionOptions.DecodedLogRecordBytes + "k8s.pod.name".Length + 200),   // the bodies not weighed
+                     OtlpLogBatchWeight.WeighJson(Encoding.UTF8.GetBytes(json)));
     }
 
     // ── One batch over the limit: 413, nothing ingested ───────────────────────

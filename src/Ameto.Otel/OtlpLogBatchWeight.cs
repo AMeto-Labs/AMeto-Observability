@@ -17,10 +17,12 @@ namespace Ameto.Otel;
 ///
 /// <para><b>The weight.</b> Protobuf: per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/>,
 /// plus the record's own bytes on the wire, plus its resource's attribute bytes on the wire.
-/// OTLP/JSON: per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/> alone. JSON spells a
-/// record out at two or three times what it decodes to, and weighed by its text a JSON batch was
-/// refused at a fraction of the content a protobuf one carried; what it holds once decoded is
-/// counted like any other.</para>
+/// OTLP/JSON: per record, <see cref="IngestionOptions.DecodedLogRecordBytes"/> plus its resource's
+/// attributes as they decode (their strings by their text, a number 9 B) — not the record's own text.
+/// JSON spells a record out at two or three times what it decodes to, and weighed by its text a JSON
+/// batch was refused at a fraction of the content a protobuf one carried; what it holds once decoded
+/// is counted like any other. The resource is copied into every record, and that, as in protobuf, is
+/// what a small body multiplies.</para>
 ///
 /// <para>Every field is skipped by its length, never decoded, and nothing is allocated. A message the
 /// walk cannot frame throws as the parse would — the receivers answer it 400 with nothing ingested.</para>
@@ -86,13 +88,17 @@ internal static class OtlpLogBatchWeight
     /// The weight of an <c>ExportLogsServiceRequest</c> in OTLP/JSON: its records, along the names
     /// the parser reads (<c>resourceLogs</c> → <c>scopeLogs</c> → <c>logRecords</c>), at
     /// <see cref="IngestionOptions.DecodedLogRecordBytes"/> each — what a record costs at the least,
-    /// not what its text spells out (see the class doc). A malformed document throws as the parse
-    /// would.
+    /// not what its text spells out (see the class doc) — plus, for each, its resource's attributes as
+    /// the decode holds them (<see cref="JsonLeafBytes"/>), which it copies into every record, as the
+    /// protobuf weight counts them (round-5 review L-12). Weighed at 128 B a record alone, a batch of
+    /// 10 000 empty records under a 70 KB resource attribute was taken, and each record refused as
+    /// oversized — 10 000 Error markers written for a 100 KB body — where protobuf answered 413. A
+    /// malformed document throws as the parse would.
     /// </summary>
     internal static long WeighJson(ReadOnlySpan<byte> json)
     {
         var  reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
-        long records = 0;
+        long weight  = 0;
         // An OTLP/JSON request is ONE object and nothing after it. Anything else is refused here, 400
         // with nothing ingested, as a document the reader cannot read is: the walk used to stop at a
         // first token that was not an object, or at the object's end, and '[', '[1,2' and '{}garbage'
@@ -107,7 +113,7 @@ internal static class OtlpLogBatchWeight
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
-                    if (reader.TokenType == JsonTokenType.StartObject) records += CountJsonRecords(ref reader);
+                    if (reader.TokenType == JsonTokenType.StartObject) weight += WeighJsonBlock(ref reader);
                     else reader.Skip();
                 }
             }
@@ -116,15 +122,32 @@ internal static class OtlpLogBatchWeight
         // On the object's end — and then the end of the body: a value after it throws in Read.
         if (reader.TokenType != JsonTokenType.EndObject || reader.Read())
             throw new InvalidDataException("an OTLP/JSON request is one JSON object");
-        return records * IngestionOptions.DecodedLogRecordBytes;
+        return weight;
     }
 
-    /// <summary>The records of one <c>resourceLogs</c> element, the reader on its <c>StartObject</c> and left on its <c>EndObject</c>.</summary>
-    private static long CountJsonRecords(ref Utf8JsonReader reader)
+    /// <summary>
+    /// One <c>resourceLogs</c> element's weight — its records, each with its resource's attributes — the
+    /// reader on its <c>StartObject</c> and left on its <c>EndObject</c>. A resource given after its
+    /// records, or twice, counts as the parser keeps it: in whatever order, both.
+    /// </summary>
+    private static long WeighJsonBlock(ref Utf8JsonReader reader)
     {
-        long records = 0;
+        long records = 0, resourceBytes = 0;
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
+            if (reader.ValueTextEquals("resource"u8))
+            {
+                reader.Read();
+                if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
+                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    bool attributes = reader.ValueTextEquals("attributes"u8);
+                    reader.Read();
+                    if (attributes) resourceBytes += JsonLeafBytes(ref reader);
+                    else reader.Skip();
+                }
+                continue;
+            }
             bool scopes = reader.ValueTextEquals("scopeLogs"u8);
             reader.Read();
             if (scopes && reader.TokenType == JsonTokenType.StartArray)
@@ -150,6 +173,30 @@ internal static class OtlpLogBatchWeight
             }
             else reader.Skip();
         }
-        return records;
+        return records * (IngestionOptions.DecodedLogRecordBytes + resourceBytes);
     }
+
+    /// <summary>
+    /// What a JSON value's data comes to, about as the decode writes it into a record's map: each string
+    /// — a key or a value — by the bytes of its text (escapes only shrink it), a number 9 B, a boolean or
+    /// a null 1 B; the OTLP names around them (<c>key</c>, <c>value</c>, <c>stringValue</c>) are structure,
+    /// not data. The reader on the value's first token, and left on its last.
+    /// </summary>
+    private static long JsonLeafBytes(ref Utf8JsonReader reader)
+    {
+        if (reader.TokenType is not (JsonTokenType.StartObject or JsonTokenType.StartArray)) return LeafBytes(ref reader);
+        long bytes = 0;
+        int  depth = reader.CurrentDepth;
+        while (reader.Read() && reader.CurrentDepth > depth)
+            if (reader.TokenType != JsonTokenType.PropertyName) bytes += LeafBytes(ref reader);
+        return bytes;
+    }
+
+    private static long LeafBytes(ref Utf8JsonReader reader) => reader.TokenType switch
+    {
+        JsonTokenType.String => reader.ValueSpan.Length,
+        JsonTokenType.Number => 9,
+        JsonTokenType.True or JsonTokenType.False or JsonTokenType.Null => 1,
+        _ => 0,
+    };
 }

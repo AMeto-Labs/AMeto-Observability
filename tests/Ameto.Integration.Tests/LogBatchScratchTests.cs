@@ -298,6 +298,32 @@ public sealed class LogBatchScratchTests
                      OtlpLogBatchWeight.WeighJson("{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{}]}]}]}"u8));
     }
 
+    /// <summary>
+    /// Round-5 review L-12 (M2's residual). The JSON walk weighed a record at 128 B alone, so a 100 KB
+    /// body of 10 000 empty records under a 70 KB resource attribute was taken — and every record refused
+    /// as oversized, 10 000 Error markers written — where the same batch in protobuf, which weighs each
+    /// record with its resource's attributes, was refused 413 at once. Both weigh the resource into every
+    /// record now, to within a few bytes of each other; a record's own text is still not weighed.
+    /// </summary>
+    [Fact]
+    public void A_json_batch_weighs_its_resource_in_every_record_as_protobuf_does()
+    {
+        const int Records = 10_000, Attribute = 70_000;
+        var sb = new StringBuilder("{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"blob\",\"value\":{\"stringValue\":\"");
+        sb.Append('x', Attribute).Append("\"}}]},\"scopeLogs\":[{\"logRecords\":[");
+        for (int i = 0; i < Records; i++) sb.Append(i == 0 ? "" : ",").Append("{}");
+        sb.Append("]}]}]}");
+
+        long json  = OtlpLogBatchWeight.WeighJson(Encoding.UTF8.GetBytes(sb.ToString()));
+        long proto = OtlpLogBatchWeight.WeighProto(LogBatchHeldMemoryTests.InvalidUtf8ResourceBody(attributeBytes: Attribute, records: Records));
+
+        Assert.True(json >= (long)Records * Attribute, $"the JSON batch weighs {json:N0} B for {Records:N0} records of a {Attribute:N0} B resource");
+        Assert.True(Math.Abs(json - proto) < proto / 100, $"JSON {json:N0} B, protobuf {proto:N0} B");
+        // "blob" 4 + "abc" 3, "n" 1 + a number 9, "b" 1 + a boolean 1 — and the record's own body not at all.
+        Assert.Equal(IngestionOptions.DecodedLogRecordBytes + 4 + 3 + 1 + 9 + 1 + 1,
+                     OtlpLogBatchWeight.WeighJson("{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"blob\",\"value\":{\"stringValue\":\"abc\"}},{\"key\":\"n\",\"value\":{\"doubleValue\":1.5}},{\"key\":\"b\",\"value\":{\"boolValue\":true}}]},\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"not weighed\"}}]}]}]}"u8));
+    }
+
     // ── L10: a batch past one array is too heavy, not out of memory ───────────
 
     /// <summary>
