@@ -186,13 +186,13 @@ public static class OtlpLogProtoParser
     }
 
     /// <summary>The bytes of a msgpack str header for a string of <paramref name="length"/> bytes.</summary>
-    private static int StrHeaderBytes(long length) => length < 32 ? 1 : length < 256 ? 2 : length < 65_536 ? 3 : 5;
+    internal static int StrHeaderBytes(long length) => length < 32 ? 1 : length < 256 ? 2 : length < 65_536 ? 3 : 5;
 
     /// <summary>The bytes of a msgpack array or map header for <paramref name="count"/> entries.</summary>
-    private static int CollectionHeaderBytes(int count) => count < 16 ? 1 : count < 65_536 ? 3 : 5;
+    internal static int CollectionHeaderBytes(int count) => count < 16 ? 1 : count < 65_536 ? 3 : 5;
 
     /// <summary>The bytes <c>MessagePackWriter.Write(long)</c> encodes <paramref name="v"/> in.</summary>
-    private static int IntBytes(long v) =>
+    internal static int IntBytes(long v) =>
         v >= 0 ? (v <= 127 ? 1 : v <= byte.MaxValue ? 2 : v <= ushort.MaxValue ? 3 : v <= uint.MaxValue ? 5 : 9)
                : (v >= -32 ? 1 : v >= sbyte.MinValue ? 2 : v >= short.MinValue ? 3 : v >= int.MinValue ? 5 : 9);
 
@@ -588,7 +588,7 @@ public static class OtlpLogProtoParser
     }
 
     /// <summary>The length of <paramref name="utf8"/> with each invalid sequence replaced by U+FFFD (three bytes). Allocates nothing.</summary>
-    private static long ReplacedLength(ReadOnlySpan<byte> utf8)
+    internal static long ReplacedLength(ReadOnlySpan<byte> utf8)
     {
         long length = 0;
         while (!utf8.IsEmpty)
@@ -601,7 +601,7 @@ public static class OtlpLogProtoParser
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void WriteReplacingInvalid(ref MessagePackWriter w, ReadOnlySpan<byte> utf8, int replacedLength)
+    internal static void WriteReplacingInvalid(ref MessagePackWriter w, ReadOnlySpan<byte> utf8, int replacedLength)
     {
         w.WriteStringHeader(replacedLength);
         int run = 0, pos = 0;

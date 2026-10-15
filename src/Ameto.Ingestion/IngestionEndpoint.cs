@@ -57,6 +57,21 @@ public interface IOtlpLogSink
     int MaxEventPayloadBytes => int.MaxValue;
 
     /// <summary>
+    /// The longest <c>service.name</c> the sink keeps, in UTF-8 bytes: it cuts a longer one at a
+    /// character. A parser that has to copy the name may stop a few bytes past this — what it does
+    /// not copy, the sink would cut. Unbounded for a sink that keeps everything.
+    /// </summary>
+    int MaxServiceNameBytes => int.MaxValue;
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> of scratch the parser is about to take for the batch — the
+    /// unescaped copy of a template whose JSON string carries escapes, as long as the body it is in —
+    /// against what the batch may hold, before it is taken; a negative count gives it back. Throws as
+    /// the batch's own charges do, and then nothing was counted. Nothing for a sink that keeps everything.
+    /// </summary>
+    void ChargeScratch(long bytes) { }
+
+    /// <summary>
     /// A record whose property map would be <paramref name="payloadBytes"/> long — past
     /// <see cref="MaxEventPayloadBytes"/> — refused before it was built: the sink records the drop
     /// as it would an oversized map's, without the map. Returns false: the record is dropped.

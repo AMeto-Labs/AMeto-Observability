@@ -241,6 +241,12 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <inheritdoc cref="IOtlpLogSink.MaxEventPayloadBytes"/>
     public int MaxEventPayloadBytes => _owner.MaxEventPayloadBytes;
 
+    /// <inheritdoc cref="IOtlpLogSink.MaxServiceNameBytes"/>
+    public int MaxServiceNameBytes => IngestionEndpoint.MaxServiceNameBytes;
+
+    /// <inheritdoc cref="IOtlpLogSink.ChargeScratch"/>
+    public void ChargeScratch(long bytes) => Charge(bytes);
+
     /// <inheritdoc/>
     public bool TryIngestOversized(
         long tsTicks, byte level,
