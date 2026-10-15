@@ -3593,6 +3593,84 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── The text a tier's events carry of their own (round-5 H-D) ─────────────
+
+    /// <summary>
+    /// Round-5 review H-D. Past the intern pool's budget — or past the longest text it takes — a template
+    /// is a string of the event's own, and the tier held every one until it flushed: its fullness counted
+    /// events and payload bytes only, and the batch that had been charged for the string let go of it at
+    /// its commit. 41 requests of a distinct 4 M-character template ran a 384 MiB heap out while the tier's
+    /// native memory sat at 9 MiB; a CLEF exception did the same with no pool involved. The tier counts that
+    /// text against its size now, and a full one is swapped like any other: 600 events of 40 KB of text
+    /// each (24 MB) go into at least three 8 MB tiers — one used to take them all.
+    /// </summary>
+    [Theory]
+    [InlineData("template")]
+    [InlineData("exception")]
+    public async Task A_tier_counts_the_text_its_events_carry_of_their_own_and_is_swapped_when_that_reaches_its_size(string carried)
+    {
+        const int Events = 600, Chars = 20_000;
+        var engine = Engine(Options(NewDir(), tierBytes: 8 * MB));
+        try
+        {
+            int tmpl = engine.TemplatePool.Intern("event {n}");
+            for (int i = 0; i < Events; i++)
+            {
+                string own = new string((char)('a' + i % 26), Chars) + i;   // a fresh string of the event's own, as past the budget
+                using var batch = new LogWriteBatch();
+                if (carried == "template")
+                    batch.Add(new LogEventHeader
+                    {
+                        TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                        MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                    }, Props(i), own, exception: null);
+                else
+                    batch.Add(new LogEventHeader
+                    {
+                        TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                        MessageTemplatePoolIndex = tmpl, ServiceNamePoolIndex = -1,
+                    }, Props(i), "event {n}", new ExceptionInfo { Type = "E", Message = "m", StackTrace = own });
+                Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            }
+            await engine.FlushHotTierAsync();
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "every tier to be flushed", ShortGuard);
+
+            int tiers = engine.ListSegments().Count;   // one level: one segment a tier
+            Assert.True(tiers >= 3, $"{Events} events with {Events * (long)Chars * 2 / MB} MB of their own text went into {tiers} tier(s) of 8 MB");
+            Assert.Equal(Events, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review M-E. The intern pool runs out by the count of its entries or by the text they hold,
+    /// and the warning that says so named only the count ("exhausted at 65536 entries … templates built by
+    /// interpolation"), so a pool that a few long texts had spent read as one built by interpolation. It
+    /// names both now, and the longest text a pool takes.
+    /// </summary>
+    [Fact]
+    public async Task The_pool_exhausted_warning_names_the_text_the_pool_holds_as_well_as_its_entries()
+    {
+        var log    = new RecordingLogger();
+        var opts   = Options(NewDir());
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), log);
+        try
+        {
+            // Texts the pool takes, until its text is spent: about a thousand.
+            int each = StringInternPool.DefaultMaxPooledTextChars, i = 0;
+            while (engine.TemplatePool.Intern(new string((char)('a' + i % 26), each - 8) + i.ToString("D8")) >= 0)
+                Assert.True(++i < 4_096, "setup: the pool never ran out of text");
+
+            var line = Assert.Single(log.Lines, l => l.Line.Contains("intern pool exhausted")).Line;
+            Assert.True(line.Contains($" of {StringInternPool.DefaultMaxPoolSize} entries") &&
+                        line.Contains($"of {StringInternPool.DefaultMaxPooledChars} characters of text") &&
+                        line.Contains($"over {StringInternPool.DefaultMaxPooledTextChars} characters is never pooled"),
+                        $"the warning: {line}");
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
     // ── A publish that fails keeps its block (round-5 H-A) ────────────────────
 
     /// <summary>A spill file an earlier run left: block 9 000, 100 events — 60 Information, then 40 Error.</summary>

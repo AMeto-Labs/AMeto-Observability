@@ -335,7 +335,15 @@ public sealed partial class StorageEngine
         var h = header;
         h.Id  = _idGen.Next(header.TimestampUtcTicks);
 
-        if (!w.Hot.TryWrite(h, payload, template, exception, service))
+        // What the event brings that no other event shares, which the tier counts against its size
+        // (round-5 H-D): a template or a service the intern pool did not take — past its budget, or longer
+        // than it takes — and an exception. A pooled one is the pool's instance, shared by every event of it,
+        // and so is the empty string.
+        long own = (h.MessageTemplatePoolIndex < 0 && !string.IsNullOrEmpty(template) ? HotTierSegment.ManagedBytesOf(template) : 0)
+                 + (h.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? HotTierSegment.ManagedBytesOf(service) : 0)
+                 + HotTierSegment.ManagedBytesOf(exception);
+
+        if (!w.Hot.TryWrite(h, payload, template, exception, service, own))
         {
             // Full (or wedged on a chunk an event does not fit): ask for a swap — or, with no flush
             // slot free, for a spill — and tell the caller to wait. The flag is what lets the swap

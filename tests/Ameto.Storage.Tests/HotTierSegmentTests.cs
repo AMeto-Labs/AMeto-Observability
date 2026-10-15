@@ -193,6 +193,34 @@ public sealed class HotTierSegmentTests : IDisposable
         Assert.Equal(late, seg.ChunkHeaders(1, 9)[8].TimestampUtcTicks);
     }
 
+    /// <summary>
+    /// Round-5 review H-D, the tier's half. The managed text an event brings of its own (a template or a
+    /// service the pool did not take, an exception) counts against the payload limit: the tier reads full
+    /// once it holds that much, and refuses an event that would take it past the limit — the writer waits
+    /// for the next tier, as for a full one. An empty tier takes any event, or one larger than a tier
+    /// could never be written.
+    /// </summary>
+    [Fact]
+    public void The_text_an_event_brings_of_its_own_counts_against_the_tiers_size()
+    {
+        const long Limit = 64 * 1024;
+        using var tier = new HotTierSegment(64, Limit);
+        Assert.True(tier.TryWrite(MakeHeader(LogLevel.Information, 0), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: Limit - 100));
+        Assert.False(tier.IsFull, "a tier short of its limit read full");
+        Assert.False(tier.TryWrite(MakeHeader(LogLevel.Information, 1), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 101),
+                     "an event past the limit was taken");
+        Assert.Equal(1, tier.Count);
+        Assert.True(tier.TryWrite(MakeHeader(LogLevel.Information, 2), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 100),
+                    "an event up to the limit was refused");
+        Assert.True(tier.IsFull, "a tier holding its limit of its events' own text did not read full");
+        Assert.Equal(Limit, tier.ManagedBytes);
+
+        using var empty = new HotTierSegment(64, Limit);
+        Assert.True(empty.TryWrite(MakeHeader(LogLevel.Information, 0), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 4 * Limit),
+                    "an empty tier refused an event larger than a tier");
+        Assert.True(empty.IsFull);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEventHeader MakeHeader(

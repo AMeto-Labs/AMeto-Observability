@@ -149,7 +149,9 @@ public sealed class LogBatchScratchTests
     [Fact]
     public void The_intern_pool_stops_taking_text_past_its_budget()
     {
-        var pool = new StringInternPool();
+        // Texts this long are past the longest one the pool takes (round-5 M-E): a pool that takes them
+        // here, so the budget is what stops it.
+        var pool = new StringInternPool(StringInternPool.DefaultMaxPoolSize, StringInternPool.DefaultMaxPooledChars, maxTextChars: int.MaxValue);
         int big  = (int)(StringInternPool.DefaultMaxPooledChars / 4);   // four fill it
         for (int i = 0; i < 4; i++)
             Assert.True(pool.Intern(new string((char)('a' + i), big - 8)) >= 0);
@@ -166,7 +168,8 @@ public sealed class LogBatchScratchTests
     [Fact]
     public void Interning_bytes_that_are_not_utf8_allocates_no_more_than_the_string()
     {
-        var    pool  = new StringInternPool();
+        // A pool that takes a text this long (round-5 M-E), so the decode is the pooling one.
+        var    pool  = new StringInternPool(StringInternPool.DefaultMaxPoolSize, StringInternPool.DefaultMaxPooledChars, maxTextChars: int.MaxValue);
         byte[] bytes = new byte[1_000_000];
         bytes.AsSpan().Fill(0xFF);
         pool.Intern(new byte[] { 0xFF, 0xFE });   // warm
@@ -178,6 +181,66 @@ public sealed class LogBatchScratchTests
         Assert.True(index >= 0);
         Assert.Equal(1_000_000, text.Length);                            // one U+FFFD for each byte
         Assert.True(allocated < 4_000_000, $"interning 1 MB allocated {allocated:N0} B (the string is 2 MB)");
+    }
+
+    /// <summary>
+    /// Round-5 review M-E. The text budget had no cap per text: two of the round-4 review's 8 MB
+    /// single-record requests spent 94 % of it, for every tenant and the life of the process, and every
+    /// new template and service after them stayed unpooled — carried in each WAL entry (86 → 1 106 B an
+    /// event for a 1 000-character template), a string per event (throughput −40 to −82 %). A text longer
+    /// than the pool takes is answered as on a full pool now — unpooled, the string itself — and spends
+    /// nothing, and the pool that saw it has not run out (no PoolExhausted).
+    /// </summary>
+    [Fact]
+    public void A_text_longer_than_the_pool_takes_is_answered_unpooled_and_spends_none_of_its_budget()
+    {
+        var pool      = new StringInternPool();
+        int signalled = 0;
+        pool.PoolExhausted += _ => signalled++;
+        string atCap = new('a', StringInternPool.DefaultMaxPooledTextChars);
+        string past  = new('b', StringInternPool.DefaultMaxPooledTextChars + 1);
+
+        Assert.True(pool.Intern(atCap) >= 0);
+        Assert.Equal(-1, pool.Intern(past, out string kept));
+        Assert.Same(past, kept);
+        Assert.Equal(-1, pool.Intern(Encoding.UTF8.GetBytes(past), out string decoded));
+        Assert.Equal(past, decoded);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(-1, pool.Intern(new string((char)('c' + i), 7_900_000)));   // the review's long bodies
+
+        Assert.Equal(atCap.Length, pool.PooledChars);    // the long ones spent nothing
+        Assert.Equal(0, signalled);                      // and are not a pool that ran out
+        Assert.True(pool.Intern("a template after them {n}") >= 0, "a short template after the long ones went unpooled");
+    }
+
+    /// <summary>
+    /// Round-5 review L-11. An intern hit on UTF-8 over 64 KB decoded a whole new string to look it up —
+    /// 140 KB a hit on the large object heap for the review's 70 KB template, on the ingest path, where the
+    /// round before allocated nothing. No text a pool takes is that long now (the per-text cap, at three
+    /// UTF-8 bytes a unit at the most), so every hit is the in-place lookup. A text the pool does not take
+    /// has no hit to make: it is its event's own string (M-E), counted by the tier (H-D).
+    /// </summary>
+    [Theory]
+    [InlineData('a', 70_000)]                                       // the review's: 70 KB of ASCII
+    [InlineData('€', StringInternPool.DefaultMaxPooledTextChars)]   // the longest a pool takes, 3 bytes a unit
+    [InlineData('€', 30_000)]                                       // 90 KB of 3-byte units
+    public void A_hit_on_any_text_the_pool_takes_allocates_nothing(char unit, int length)
+    {
+        Assert.True(3L * StringInternPool.DefaultMaxPooledTextChars <= StringInternPool.DecodeInPlaceBytes,
+                    "a text the pool takes can be too long to look up in place");
+        var    pool = new StringInternPool();
+        byte[] utf8 = Encoding.UTF8.GetBytes(new string(unit, length));
+        if (pool.Intern(utf8) < 0)
+        {
+            Assert.True(length > StringInternPool.DefaultMaxPooledTextChars, $"a text of {length} units went unpooled");
+            return;   // not taken: no hit to make
+        }
+        pool.Intern(utf8, out _);   // warm
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        pool.Intern(utf8, out _);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(allocated == 0, $"a hit on {utf8.Length:N0} B of UTF-8 allocated {allocated:N0} B");
     }
 
     // ── L9: the JSON walk refuses what is not one JSON object ─────────────────

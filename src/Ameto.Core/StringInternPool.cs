@@ -37,16 +37,30 @@ public sealed class StringInternPool
     /// </summary>
     public const long DefaultMaxPooledChars = 16L << 20;
 
+    /// <summary>
+    /// The longest text a pool takes, by default, in UTF-16 units: 16 Ki (round-5 review M-E). The text
+    /// budget had no cap per text, so two or three long ones — a pair of 8 MB single-record requests
+    /// took 94 % of it — spent it for every tenant for the life of the process, and every new template
+    /// and service after them stayed unpooled: carried in each WAL entry, a string per event. A longer
+    /// text is answered as on a full pool (index -1, the string itself), without spending anything or
+    /// signalling <see cref="PoolExhausted"/>; spending the budget now takes a thousand distinct texts
+    /// of this length. It also keeps every poolable text within <see cref="DecodeInPlaceBytes"/> as UTF-8
+    /// (three bytes a unit at the most), so a hit never decodes a string of its own (round-5 L-11).
+    /// </summary>
+    public const int DefaultMaxPooledTextChars = 16 * 1024;
+
     private const int InitialSlots = 1024;
 
     /// <summary>
     /// UTF-8 input longer than this is decoded straight into its own string for the lookup: a pooled
-    /// char buffer that long would stay with the shared array pool after the call.
+    /// char buffer that long would stay with the shared array pool after the call. No text a pool of
+    /// the default cap takes is that long (<see cref="DefaultMaxPooledTextChars"/>).
     /// </summary>
-    private const int DecodeInPlaceBytes = 64 * 1024;
+    internal const int DecodeInPlaceBytes = 64 * 1024;
 
     private readonly int                               _maxPoolSize;
     private readonly long                              _maxPooledChars;
+    private readonly int                               _maxTextChars;
     private readonly int                               _initialSlots;
     private readonly ConcurrentDictionary<string, int> _stringToIndex = new(StringComparer.Ordinal);
     private volatile string?[]                         _indexToString;
@@ -69,18 +83,28 @@ public sealed class StringInternPool
     /// <see cref="PoolExhausted"/> fires once.</param>
     /// <param name="maxPooledChars">How much text it holds, in UTF-16 units (<see cref="DefaultMaxPooledChars"/>);
     /// past it a miss is answered the same way.</param>
-    public StringInternPool(int maxPoolSize, long maxPooledChars = DefaultMaxPooledChars)
+    /// <param name="maxTextChars">The longest text it takes, in UTF-16 units (<see cref="DefaultMaxPooledTextChars"/>);
+    /// a longer one is answered as on a full pool, without spending anything.</param>
+    public StringInternPool(int maxPoolSize, long maxPooledChars = DefaultMaxPooledChars, int maxTextChars = DefaultMaxPooledTextChars)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxPoolSize, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxPooledChars, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxTextChars, 1);
         _maxPoolSize    = maxPoolSize;
         _maxPooledChars = maxPooledChars;
+        _maxTextChars   = maxTextChars;
         _initialSlots   = Math.Min(InitialSlots, maxPoolSize);
         _indexToString  = new string?[_initialSlots];
     }
 
     /// <summary>The most distinct strings this pool holds before it stops pooling.</summary>
     public int MaxPoolSize => _maxPoolSize;
+
+    /// <summary>The most text this pool holds, in UTF-16 units.</summary>
+    public long MaxPooledChars => _maxPooledChars;
+
+    /// <summary>The longest text this pool takes, in UTF-16 units.</summary>
+    public int MaxTextChars => _maxTextChars;
 
     /// <summary>The text this pool holds, in UTF-16 units — at most its budget (see <see cref="DefaultMaxPooledChars"/>), save what recovery restored.</summary>
     public long PooledChars => Interlocked.Read(ref _pooledChars);
@@ -121,6 +145,9 @@ public sealed class StringInternPool
     private int Claim(string template, out string canonical)
     {
         canonical = template;
+
+        // Longer than one text may be (DefaultMaxPooledTextChars): its own string, unpooled, nothing spent.
+        if (template.Length > _maxTextChars) return -1;
 
         // Fast reject once saturated, so a saturated pool's misses do not keep incrementing
         // the counter (a stream of new templates could carry it round to negative ids).
@@ -219,6 +246,10 @@ public sealed class StringInternPool
     {
         if (utf8.IsEmpty) { canonical = string.Empty; return -1; }
 
+        // Too long to be pooled whatever it decodes to — a UTF-16 unit takes three UTF-8 bytes at the
+        // most — so it is not looked up: decoded once, into the string its caller keeps (round-5 M-E, L-11).
+        if (utf8.Length > 3L * _maxTextChars) { canonical = Decode(utf8); return -1; }
+
         // Decode UTF-8 → chars for the ordinal lookup. Short by nature ⇒ stack; pool the rare long one,
         // and a very long one is decoded into its own string (see DecodeInPlaceBytes).
         if (utf8.Length > DecodeInPlaceBytes) return Intern(Decode(utf8), out canonical);
@@ -238,7 +269,8 @@ public sealed class StringInternPool
             }
 
             // Miss: materialise once and claim. Claim answers with the pooled instance —
-            // its own on a win, the winner's on a loss — never through Get().
+            // its own on a win, the winner's on a loss — never through Get() — or with this one,
+            // unpooled, for a text longer than the pool takes.
             return Claim(new string(key), out canonical);
         }
         finally
@@ -327,6 +359,7 @@ public sealed class StringInternPool
     /// </summary>
     public int Intern(string template, out string canonical)
     {
+        if (template.Length > _maxTextChars) { canonical = template; return -1; }   // never pooled: not looked up
         var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
         if (lookup.TryGetValue(template.AsSpan(), out string? existing, out int idx))
         {

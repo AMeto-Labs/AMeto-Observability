@@ -93,6 +93,18 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     public static long NativeBytesFor(long maxPayloadBytes) =>
         (long)ChunksFor(maxPayloadBytes) * ChunkTotalBytes;
 
+    /// <summary>A string's size in a 64-bit heap: header, method table, length, its UTF-16 and a terminator, 8-aligned — as an ingest batch charges it.</summary>
+    public static long ManagedBytesOf(string? s) => s is null ? 0 : (22L + 2L * s.Length + 7) & ~7L;
+
+    /// <summary>An exception tree's size in the heap: each node, and its type, message and stack — as an ingest batch charges it.</summary>
+    public static long ManagedBytesOf(ExceptionInfo? exception)
+    {
+        long bytes = 0;
+        for (var e = exception; e is not null; e = e.Inner)
+            bytes += 48 + ManagedBytesOf(e.Type) + ManagedBytesOf(e.Message) + ManagedBytesOf(e.StackTrace);
+        return bytes;
+    }
+
     // ── Per-chunk state ───────────────────────────────────────────────────────
 
     // Store arena base pointers as nuint (avoids pointer-in-class-field restriction).
@@ -129,6 +141,17 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <see cref="IsFull"/> check is O(1) instead of re-summing the tails array.</summary>
     private          long       _payloadBytes;
 
+    /// <summary>
+    /// Managed bytes the writers said their events brought that no other event shares — a template or a
+    /// service the intern pool did not take, an exception (see <see cref="TryWrite"/>; round-5 review H-D).
+    /// Past the pool's budget, or past its longest text, a template is a string per event, and the tier
+    /// kept every one of them until it flushed: <see cref="IsFull"/> counted events and payload bytes only,
+    /// and the batch that had been charged for the string let go of it at its commit. 41 requests of a
+    /// distinct 4 M-character template ran a 384 MiB heap out with the tier's native memory flat at 9 MiB.
+    /// Counted against the payload limit: a tier holds at most that much of either.
+    /// </summary>
+    private          long       _managedBytes;
+
     // ── Limits ────────────────────────────────────────────────────────────────
 
     private readonly int  _maxEvents;
@@ -162,12 +185,17 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     public long AllocatedBytes => (long)_chunksAllocated * ChunkTotalBytes;
 
     /// <summary>
-    /// True when the segment is near its event or payload limit.
+    /// True when the segment is near its event or payload limit — or holds as much managed text of its
+    /// events' own as its payload limit (<see cref="ManagedBytes"/>).
     /// Used by <see cref="StorageEngine"/> as a hint to trigger an async flush.
     /// </summary>
     public bool IsFull =>
         _count >= _maxEvents ||
-        _payloadBytes >= _maxPayloadBytes;
+        _payloadBytes >= _maxPayloadBytes ||
+        _managedBytes >= _maxPayloadBytes;
+
+    /// <summary>The managed bytes this tier holds that are its events' own (see <see cref="_managedBytes"/>).</summary>
+    internal long ManagedBytes => Volatile.Read(ref _managedBytes);
 
     // ── Construction ─────────────────────────────────────────────────────────
 
@@ -204,9 +232,14 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <paramref name="service"/>: the event's <c>@service</c> when it has no pool index
     /// (<see cref="LogEventHeader.ServiceNamePoolIndex"/> -1: the pool was full) — kept beside the
     /// header the same way; ignored for an event whose service is pooled.
+    /// <paramref name="ownManagedBytes"/>: the managed bytes of what the event brings that no other event
+    /// shares (<see cref="ManagedBytesOf(string?)"/>, <see cref="ManagedBytesOf(ExceptionInfo?)"/>): counted
+    /// against the payload limit, and an event that would take the tier past it is refused unless the tier
+    /// is empty (round-5 H-D). The live write path says it; a replay or a despill says 0, its log bounding
+    /// what it holds — and its strings are one per distinct text, shared.
     /// </summary>
     public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null,
-                         ExceptionInfo? exception = null, string? service = null)
+                         ExceptionInfo? exception = null, string? service = null, long ownManagedBytes = 0)
     {
         // Unsynchronised fast reject. Purely an optimisation — a tier that is already
         // frozen or full says so without paying for the claim below, which matters because
@@ -229,7 +262,8 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         {
             // A pooled service needs no copy: the index names it.
             return TryWriteClaimed(in header, propertiesPayload, template, exception,
-                                   header.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? service : null);
+                                   header.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? service : null,
+                                   ownManagedBytes);
         }
         finally
         {
@@ -242,10 +276,15 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     }
 
     private bool TryWriteClaimed(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template,
-                                 ExceptionInfo? exception, string? service)
+                                 ExceptionInfo? exception, string? service, long ownManagedBytes)
     {
         if (_frozen || _count >= _maxEvents)
             return false;   // Freeze() won the race — the caller retries into the successor tier
+
+        // The managed text of its events' own, as the payload: past the limit the event waits for the next
+        // tier. An empty tier takes it whatever its size, or an event larger than a tier could never be written.
+        if (ownManagedBytes > 0 && _count > 0 && _managedBytes + ownManagedBytes > _maxPayloadBytes)
+            return false;
 
         int payloadLen = propertiesPayload.Length;
         int eventIdx   = _count;                          // this event's global index
@@ -300,6 +339,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
         _chunkPayloadTails[ci] += payloadLen;
         _payloadBytes          += payloadLen;
+        if (ownManagedBytes > 0) Volatile.Write(ref _managedBytes, _managedBytes + ownManagedBytes);   // the writer's alone
 
         // Zone map, before the publish below — see the field comment for why that order
         // is the whole guarantee.

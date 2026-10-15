@@ -918,12 +918,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         Directory.CreateDirectory(_segDir);
 
         // Surface intern-pool saturation: past it, every event stores its own template
-        // string instead of a pool index, so per-event memory rises permanently.
+        // string instead of a pool index, so per-event memory rises permanently. Either limit
+        // saturates it — the count of strings or the text they hold (round-5 M-E: the line named
+        // only the count, and a pool spent by a few long texts read as one built by interpolation).
         TemplatePool.PoolExhausted += size => _logger.LogWarning(
-            "Message-template intern pool exhausted at {Size} entries. Templates and service " +
-            "names are no longer de-duplicated — per-event memory will rise. This usually means " +
-            "message templates are being built by interpolation (a distinct template per event) " +
-            "rather than passed as structured parameters.", size);
+            "Message-template intern pool exhausted: {Count} of {Size} entries, {Chars} of {MaxChars} characters of text. " +
+            "New templates and service names are no longer de-duplicated — each event carries its own, and per-event " +
+            "memory and WAL size rise for good. Many entries usually means templates built by interpolation (a distinct " +
+            "template per event) rather than passed as structured parameters; much text, long templates (a text over " +
+            "{MaxText} characters is never pooled).",
+            TemplatePool.ClaimedCount, size, TemplatePool.PooledChars, TemplatePool.MaxPooledChars, TemplatePool.MaxTextChars);
 
         _write = new WriteState(CreateHotTier(), null, 0);
         // The next segment id MUST be known before any flush, but it lives in the
