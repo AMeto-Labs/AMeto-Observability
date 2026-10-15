@@ -4044,9 +4044,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         return await MergeSmallSegmentsOnceAsync(ct).ConfigureAwait(false) == MergeOutcome.Merged;
     }
 
-    /// <summary>One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.</summary>
+    /// <summary>
+    /// One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.
+    ///
+    /// <para>Boxed first (round-5 review L-16). Its first real suspension was its await of the batch, and a
+    /// box that could not be allocated there skipped the finally that lets go of the gate — while the batch
+    /// ran on: the gate stayed taken for the life of the process, every later pass and merge Busy, and
+    /// compaction stopped without a word. A failure at the yield runs its catch, which lets go of the gate
+    /// before any batch has begun.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<MergeOutcome> MergeUnderGateAsync(CancellationToken ct)
     {
+        try { await Task.Yield(); }
+        catch
+        {
+            Volatile.Write(ref _mergeGate, 0);
+            throw;
+        }
         try { return await MergeOneBatchAsync(ct).ConfigureAwait(false) ? MergeOutcome.Merged : MergeOutcome.NothingToMerge; }
         finally { Volatile.Write(ref _mergeGate, 0); }
     }

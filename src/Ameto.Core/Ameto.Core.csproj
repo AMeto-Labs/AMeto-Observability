@@ -37,6 +37,8 @@
          way an out-of-memory box allocation does. -->
     <InternalsVisibleTo Include="Ameto.Storage" />
     <InternalsVisibleTo Include="Ameto.Otel" />
+    <!-- And the metric engine's flush, which holds the flush gate across an await (round-5 L-16). -->
+    <InternalsVisibleTo Include="Ameto.Metrics" />
     <InternalsVisibleTo Include="Ameto.Storage.Tests" />
   </ItemGroup>
 

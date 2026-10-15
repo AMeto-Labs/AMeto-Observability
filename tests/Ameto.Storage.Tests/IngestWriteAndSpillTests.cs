@@ -4311,6 +4311,47 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-5 review L-16, the merge gate. MergeUnderGateAsync let go of the gate in a finally, and its
+    /// first real suspension — its await of the batch — could fail to box, which skips every finally while
+    /// the batch runs on: the gate stayed taken, every later pass and merge was Busy, and compaction
+    /// stopped for good. Boxed first now, a failure there lets go of the gate before any batch begins.
+    /// </summary>
+    [Fact]
+    public async Task A_merge_whose_first_suspension_cannot_be_boxed_lets_go_of_the_merge_gate()
+    {
+        var  engine = Engine(Options(NewDir()));
+        long old    = DateTime.UtcNow.AddDays(-20).Date.Ticks;   // a sealed bucket: two small files are a batch
+        void Write(int from, int count)
+        {
+            for (int i = from; i < from + count; i++)
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks = old + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+                }, Props(i), "event {n}"));
+        }
+        try
+        {
+            Write(0, 10);   await engine.FlushHotTierAsync();
+            Write(100, 10); await engine.FlushHotTierAsync();
+            engine._allowIndexlessMerge = true;
+            await engine.CatalogLoaded;
+
+            Exception? failed;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<MergeUnderGateAsync>");
+            try { failed = await Record.ExceptionAsync(() => engine.MergeSmallSegmentsOnceAsync(CancellationToken.None)); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            var next = engine.MergeSmallSegmentsOnceAsync(CancellationToken.None);
+            Assert.True(await Task.WhenAny(next, Task.Delay(ShortGuard)) == next, "setup: the next merge hung");
+            Assert.Equal(MergeOutcome.Merged, await next);   // not Busy: the failed one let go of the gate
+            Assert.IsType<OutOfMemoryException>(failed);
+            Assert.Equal(20, ReadAll(engine).Count);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
     /// Round-5 review M-B, the heavy-phase permit. A flush waited for it with WaitAsync(ct): an out of
     /// memory after the waiter was linked left it queued, and the permit went to it when the flush ahead
     /// gave it back — with one permit, no flush, merge or despill ran again. Out of memory while waiting

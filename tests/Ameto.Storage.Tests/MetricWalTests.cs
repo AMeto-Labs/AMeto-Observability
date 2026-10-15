@@ -1411,6 +1411,65 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-5 review L-16, the metric engine. A flush that found the gate held awaited it, and that
+    /// await was its first real suspension: a box that could not be allocated there threw with the
+    /// wait still queued, and the release that ended the flush ahead granted the gate to it — to
+    /// nobody. No metric flush ran again: every later one waited on the gate for ever. Boxed before
+    /// it waits now, the failure takes nothing, and the next flush gets the gate.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_whose_first_suspension_cannot_be_boxed_leaves_the_gate_to_the_next()
+    {
+        // Outside the registry: with the gate lost, the class's teardown would wait on the engine's
+        // final flush for ever, and so would the test run. Disposed below, with a bound.
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance, PinnedThresholds);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(held);    // a red assertion below must not strand a thread
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int opened  = 0;
+        engine.OnGenerationOpenedForTest = () =>
+        {
+            if (Interlocked.Increment(ref opened) != 1) return;   // only the first flush is held
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+        Task? next = null;
+        try
+        {
+            engine.Ingest(SlowFlushBatch(baseNano, "a", series: 400, pointsPerSeries: 150));
+            var writing = engine.ScheduleThresholdFlushForTest();
+            await reached.Task;                       // the flush ahead holds the gate
+
+            int armed = 1;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = t =>
+                t.DeclaringType == typeof(MetricStorageEngine) && t.Name.Contains("<FlushHotTierAsync>", StringComparison.Ordinal)
+                && Interlocked.Exchange(ref armed, 0) == 1;
+            Exception? failed;
+            try { failed = await Record.ExceptionAsync(() => engine.FlushPeriodicForTest()); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            held.SetResult();
+            await writing;
+
+            engine.Ingest(SlowFlushBatch(baseNano + 3_600_000_000_000L, "b", series: 400, pointsPerSeries: 150));
+            next = engine.FlushPeriodicForTest();
+            Assert.True(await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(15))) == next,
+                        "the next flush never got the gate: the failed one's wait took it");
+            await next;
+            Assert.IsType<OutOfMemoryException>(failed);
+            Assert.Equal(0, engine.HotPointCount);
+        }
+        finally
+        {
+            // Not waited on for ever: with the gate lost, the final flush would wait on it too.
+            var dispose = engine.DisposeAsync().AsTask();
+            await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(15)));
+        }
+    }
+
+    /// <summary>
     /// The second half, which the write-up does not name and which decides the shape of the fix:
     /// a flush whose files THREW restores its points to the hot tier without re-logging them, so
     /// from then on only its own uncommitted WAL records keep them durable. That is safe exactly

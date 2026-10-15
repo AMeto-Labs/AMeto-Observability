@@ -1781,6 +1781,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         if (due) await FlushHotTierAsync().ConfigureAwait(false);
     }
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(Ameto.Core.OwnerTaskMethodBuilder))]
     private async Task FlushHotTierAsync()
     {
         // Cheap pre-check, deliberately OUTSIDE the gate: an empty tier has nothing to flush,
@@ -1788,6 +1789,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // turn every tick during a long write into a wait. _hot keeps its keys after a drain,
         // so the point count — not _hot.IsEmpty — is what "nothing to flush" means here.
         if (_hot.IsEmpty || Volatile.Read(ref _hotPointCount) == 0) return;
+
+        // Boxed before it waits for the gate (round-5 review L-16). A flush that found the gate held
+        // awaited it, and that await was its first real suspension: a box that could not be allocated
+        // there threw with the wait still queued, and the next release granted the gate to it — to
+        // nobody. No metric flush ran again, every later one waiting on the gate for ever, and the hot
+        // tier and the log grew until a restart. A failure here owns nothing.
+        await Task.Yield();
 
         // One flush at a time, from the snapshot through to the commit.
         //
