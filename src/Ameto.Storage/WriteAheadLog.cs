@@ -1335,7 +1335,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     /// <summary>
     /// A log's pool rows. A file that ends part way through a row ends the rows there — the torn
-    /// tail of a crash — and so does a row of length 0, the tail a power loss zero-filled. A
+    /// tail of a crash — and so does a row of length 0, the tail a power loss zero-filled, and a row
+    /// whose text ends in zeros with only zeros after it, a zero-fill from inside its text. A
     /// failure to read it — out of memory, the file held by another process —
     /// propagates: it used to be swallowed, and the caller went on with the rows read so far, so the
     /// replay resolved every missing row's index through the LIVE pool (another template) and lost
@@ -1360,9 +1361,29 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             BeforePoolRowForTest.Value?.Invoke(index);
             var    bytes = new byte[len];
             if (fs.ReadAtLeast(bytes, len, throwOnEndOfStream: false) != len) break;
+            // A text that ends in a zero byte with nothing but zeros after it in the file is the torn tail
+            // too (round-5 review L-1): a power loss that zero-filled the file from inside a row's text kept
+            // the row's header, and the row read as its text plus NULs — which the replay stamped on every
+            // event of its index (a service "Orders" and thirteen NULs). A text that ends in a NUL of its own
+            // is kept when anything but zeros follows it; as the file's very last row it reads as torn.
+            if (bytes[^1] == 0 && OnlyZerosToTheEnd(fs)) break;
             dict[index] = Encoding.UTF8.GetString(bytes);
         }
         return dict;
+    }
+
+    /// <summary>Whether <paramref name="fs"/> holds only zero bytes from its position to its end; the position is left where it was.</summary>
+    private static bool OnlyZerosToTheEnd(FileStream fs)
+    {
+        long at = fs.Position;
+        try
+        {
+            Span<byte> chunk = stackalloc byte[512];
+            for (int n; (n = fs.Read(chunk)) > 0; )
+                if (chunk[..n].ContainsAnyExcept((byte)0)) return false;
+            return true;
+        }
+        finally { fs.Position = at; }
     }
 
     /// <summary>

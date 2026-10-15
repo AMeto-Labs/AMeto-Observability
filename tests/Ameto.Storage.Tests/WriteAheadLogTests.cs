@@ -516,6 +516,55 @@ public sealed class WriteAheadLogTests
     }
 
     /// <summary>
+    /// Round-5 review L-1 (L15's residual). A zero-fill that starts inside a row's TEXT, the row's 4-byte
+    /// header intact, read as that text plus NULs, and the replay stamped it on every event of the index:
+    /// a service "Orders" and thirteen NULs. A row whose text ends in zeros with only zeros after it in
+    /// the file is the torn tail now.
+    /// </summary>
+    [Fact]
+    public void A_zero_fill_from_inside_a_rows_text_ends_the_rows_there()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 0, "first {n}", [1]);
+                wal.Append(2_000, LogLevel.Information, 1, "Orders.Payments.Api", [2]);
+            }
+            byte[] pool = File.ReadAllBytes(path + ".pool");
+            int    from = 4 + "first {n}".Length + 4 + 6;   // six bytes into the last row's text
+            Array.Clear(pool, from, pool.Length - from);     // the power loss: the size kept, the data not
+            File.WriteAllBytes(path + ".pool", pool);
+
+            var rows = WriteAheadLog.LoadPool(path + ".pool");
+            Assert.Equal("first {n}", Assert.Single(rows).Value);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>Round-5 review L-1, the other side: a text that ends in a NUL of its own, with rows after it, is a row like any other.</summary>
+    [Fact]
+    public void A_row_whose_text_ends_in_a_nul_of_its_own_is_kept()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
+            {
+                wal.Append(1_000, LogLevel.Information, 0, "ends in a NUL\0", [1]);
+                wal.Append(2_000, LogLevel.Information, 1, "second {n}", [2]);
+            }
+
+            var rows = WriteAheadLog.LoadPool(path + ".pool");
+            Assert.Equal(2, rows.Count);
+            Assert.Equal("ends in a NUL\0", rows[0]);
+            Assert.Equal("second {n}", rows[1]);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
     /// Round-4 L13, the poison pill. An entry that verifies — its bytes are the ones written — but whose
     /// exception the decoder refuses is read WITHOUT its exception, the rest of it whole, and the record
     /// says why; the walk goes on to the entries after it. The decode's failure propagated, and failed the
