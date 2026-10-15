@@ -2641,14 +2641,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// The despill may take a free slot from a live tier whose swap cannot install (see
     /// RunDespillLoopAsync): the last swap attempt failed, no slot has come free since — and either
     /// the failures persist (<see cref="SwapFailuresBeforeDespillTakesTheSlot"/> in a row), or a
-    /// spill can take the writers meanwhile. It used to take the slot at the first failure, for a
-    /// whole block: one transient failure, and with spilling off the writers were answered 503 while
-    /// the swap would have installed at its next try.
+    /// spill can take the writers meanwhile (<see cref="SpillCanTakeTheWriters"/>). It used to take
+    /// the slot at the first failure, for a whole block: one transient failure, and with spilling off
+    /// the writers were answered 503 while the swap would have installed at its next try.
     /// </summary>
     private bool SwapFailing =>
         Volatile.Read(ref _swapFailedAt) != 0
-        && (Volatile.Read(ref _swapFailures) >= SwapFailuresBeforeDespillTakesTheSlot
-            || (_options.HotTier.SpillEnabled && HasSpillRoom(out _)));
+        && (Volatile.Read(ref _swapFailures) >= SwapFailuresBeforeDespillTakesTheSlot || SpillCanTakeTheWriters);
 
     /// <summary>
     /// The pause after the <paramref name="failures"/>-th failed swap in a row: from the writers'

@@ -1096,6 +1096,171 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-4 review L25: R4-3's case with spilling on. The despill takes the slot at a swap's first
+    /// failure only when a spill can take the writers, and it judged that by HasSpillRoom alone, which
+    /// says yes for a volume that cannot say how full it is (DriveInfo threw on every UNC path). Here
+    /// the volume cannot say and no spill file can be created: a despill that took the slot held it
+    /// for a whole block while the writers could neither swap nor spill, and they were answered 503
+    /// though the swap installed at its first retry. It leaves the slot to the swap.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_does_not_count_on_a_spill_where_the_volume_cannot_say_how_full_it_is()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        using var despillGate = new ManualResetEventSlim(false);
+        int failing = 1, failures = 0;
+        engine._beforeSwap = () =>
+        {
+            if (Volatile.Read(ref failing) == 1)
+            {
+                Interlocked.Increment(ref failures);
+                throw new IOException("test: a transient failure creating the next WAL");
+            }
+        };
+        engine._spillFreeDiskForTest   = () => throw new ArgumentException("test: DriveInfo takes no UNC path");
+        engine._beforeSpillOpenForTest = () => throw new IOException("test: no spill file can be created");
+        engine._beforeLoadSpillForTest = _ => despillGate.Wait(HangGuard);   // a despill that took the slot keeps it
+        engine._roomRecheckMs  = 500;          // the swap's first retry half a second after its failure
+        engine._swapRetryDelay = HangGuard;
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it
+            WaitFor(() => Volatile.Read(ref failures) >= 1 && engine.LiveHotTierRefused, "the swap to fail");
+
+            Volatile.Write(ref failing, 0);   // transient: the next attempt installs
+            hold.SetResult();                  // the despill loop starts, the only slot free
+            using (var b = Batch(engine, TierEvents + 1, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, ShortGuard));
+            Assert.Equal(1, Volatile.Read(ref failures));
+        }
+        finally
+        {
+            despillGate.Set();
+            hold.TrySetResult();
+            engine._beforeSwap             = null;
+            engine._beforeSpillOpenForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L25, the other half: a spill open that has failed, with none opened since, is no
+    /// spill to count on either — the despill ignored SpillWithoutSlot's hold, and a volume that keeps
+    /// refusing spill files refuses the next one too. An open fails while the first flush holds the
+    /// only slot; the volume says it has room throughout. A later swap fails once: the despill leaves
+    /// the slot to its retry, and the writers are written.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_does_not_count_on_a_spill_once_a_spill_open_has_failed()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        var gate = HoldFirstFlush(engine);
+        using var despillGate = new ManualResetEventSlim(false);
+        int opens = 0, failing = 0, failures = 0;
+        engine._beforeSpillOpenForTest = () =>
+        {
+            Interlocked.Increment(ref opens);
+            throw new IOException("test: no spill file can be created");
+        };
+        engine._beforeSwap = () =>
+        {
+            if (Volatile.Read(ref failing) == 1)
+            {
+                Interlocked.Increment(ref failures);
+                throw new IOException("test: a transient failure creating the next WAL");
+            }
+        };
+        engine._beforeLoadSpillForTest = _ => despillGate.Wait(HangGuard);   // a despill that took the slot keeps it
+        engine._roomRecheckMs  = 500;
+        engine._swapRetryDelay = HangGuard;
+        try
+        {
+            // Tier 1 swaps, and its flush parks holding the only slot; tier 2 fills and refuses, and its
+            // swap, finding no slot, tries to spill: the open fails.
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));
+            WaitFor(() => engine.FrozenTierCountForTest == 1 && engine.LiveHotTier.Count == 0, "tier 1 to swap");
+            using (var b = Batch(engine, TierEvents, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            Assert.False(TryWriteOne(engine, 2 * TierEvents));
+            WaitFor(() => Volatile.Read(ref opens) >= 1, "the spill open to fail");
+
+            // The slot comes free: tier 2 swaps and is flushed. No spill file has opened since.
+            gate.Set();
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0 && !engine.LiveHotTierRefused,
+                    "tiers 1 and 2 to be flushed", ShortGuard);
+
+            // Tier 3 fills, and its swap fails once.
+            Volatile.Write(ref failing, 1);
+            using (var c = Batch(engine, 2 * TierEvents, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(c, HangGuard));
+            Assert.False(TryWriteOne(engine, 3 * TierEvents));
+            WaitFor(() => Volatile.Read(ref failures) >= 1 && engine.LiveHotTierRefused, "tier 3's swap to fail");
+
+            Volatile.Write(ref failing, 0);
+            hold.SetResult();   // the despill loop starts, the only slot free
+            using (var d = Batch(engine, 3 * TierEvents + 1, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(d, ShortGuard));
+            Assert.Equal(1, Volatile.Read(ref failures));
+            Assert.Equal(1, Volatile.Read(ref opens));
+        }
+        finally
+        {
+            gate.Set();
+            despillGate.Set();
+            hold.TrySetResult();
+            engine._beforeSwap             = null;
+            engine._beforeSpillOpenForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-4 review L25: the floor is measured on the volume that holds the WAL directory, asked by
+    /// the directory's own path. DriveInfo takes a drive's root alone: it threw on a UNC path — the
+    /// floor never held there, and the despill counted on spills no volume had vouched for — and
+    /// measured the root volume for a directory behind a mount folder or a junction. The path here is
+    /// the directory's extended-length form, which DriveInfo refuses as it refuses a UNC name; this
+    /// machine's admin share is measured too where it can be reached.
+    /// </summary>
+    [Fact]
+    public void The_spill_floor_measures_the_volume_of_a_path_DriveInfo_refuses()
+    {
+        const long GB = 1024 * MB;
+        string full   = Path.GetFullPath(NewDir());
+        long   direct = new DriveInfo(full).AvailableFreeSpace;
+        Assert.InRange(StorageEngine.VolumeAvailableBytes(full), direct - GB, direct + GB);
+        if (!OperatingSystem.IsWindows()) return;
+
+        string extended = @"\\?\" + full;
+        Assert.ThrowsAny<ArgumentException>(() => new DriveInfo(extended));
+        Assert.InRange(StorageEngine.VolumeAvailableBytes(extended), direct - GB, direct + GB);
+
+        string share = $@"\\localhost\{full[0]}$\{full[3..]}";
+        if (Directory.Exists(share))
+            Assert.InRange(StorageEngine.VolumeAvailableBytes(share), direct - GB, direct + GB);
+    }
+
+    /// <summary>
     /// R4-6. A slot coming free gives a swap that failed the first go at it: what it failed on may have
     /// cleared. Two queued blocks, a spill to take the writers, a swap that failed: the despill takes
     /// the free slot for the first block (a spill can take the writers), and when that slot comes free

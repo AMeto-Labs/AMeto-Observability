@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using Ameto.Core;
 using Microsoft.Extensions.Logging;
 
@@ -128,7 +129,11 @@ public sealed partial class StorageEngine
     /// <summary>An open of a spill file failed and said so; cleared when one opens again. Under <c>_flushLock</c>.</summary>
     private bool _spillOpenFailureReported;
 
-    /// <summary><see cref="Environment.TickCount64"/> before which no spill file is opened, after an open failed; 0 when none has. Under <c>_flushLock</c>.</summary>
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> before which no spill file is opened, after an open
+    /// failed; 0 until one fails, and again once one opens. Written under <c>_flushLock</c>; read
+    /// without it by <see cref="SpillCanTakeTheWriters"/>, to which non-zero means "the last open failed".
+    /// </summary>
     private long _spillOpenRetryAt;
 
     /// <summary>How long a failed spill open is left before the next attempt.</summary>
@@ -167,8 +172,8 @@ public sealed partial class StorageEngine
     public int SpillFilesPending { get { lock (_spillQueueLock) return _spillQueue.Count; } }
 
     /// <summary>
-    /// Test seam: the free space a spill measures against its floor, in place of the volume's.
-    /// Null in production.
+    /// Test seam: the free space a spill measures against its floor, in place of the volume's;
+    /// throwing from it is a volume that cannot say. Null in production.
     /// </summary>
     internal Func<long>? _spillFreeDiskForTest;
 
@@ -247,10 +252,11 @@ public sealed partial class StorageEngine
 
         // An open that failed a moment ago is left alone until SpillOpenRetryDelay has passed: the
         // writers wait meanwhile, as at the floor. Every swap attempt used to try again — and with
-        // the slots busy, each waiting writer re-asks ten times a second — so a volume the floor
-        // check cannot see (a UNC path, where DriveInfo throws; a mount folder or junction, where it
-        // measures the root volume) turned a full disk into hundreds of failing opens a second,
-        // each a Warning with its stack, each burning a block of segment ids.
+        // the slots busy, each waiting writer re-asks ten times a second — so a full disk the floor
+        // check could not see (a volume that cannot say; it was every UNC path, and the root volume
+        // stood in for a mount folder or a junction, before VolumeAvailableBytes) turned into
+        // hundreds of failing opens a second, each a Warning with its stack, each burning a block of
+        // segment ids.
         if (_spillOpenRetryAt != 0 && Environment.TickCount64 < _spillOpenRetryAt) return;
 
         if (!HasSpillRoom(out long free))
@@ -319,22 +325,76 @@ public sealed partial class StorageEngine
         }
     }
 
-    /// <summary>Whether the data volume can take another spill file and still keep its floor.</summary>
+    /// <summary>
+    /// Whether the data volume can take another spill file and still keep its floor. A volume that
+    /// cannot say counts as one that can: the open finds out the hard way, and a failure there is the
+    /// same wait as the floor (SpillWithoutSlot holds the next open back).
+    /// </summary>
     private bool HasSpillRoom(out long free)
     {
-        free = -1;
+        free = SpillVolumeFreeBytes();
+        return free < 0 || free >= SpillRoomBytes;
+    }
+
+    /// <summary>What the floor check needs free: the floor, a spill file with its pool, and the two rows a refused append can leave past it.</summary>
+    private long SpillRoomBytes =>
+        _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes + WriteAheadLog.MaxRowsPastCapacity;
+
+    /// <summary>The free space the floor check measures (<see cref="VolumeAvailableBytes"/> of the WAL directory), or -1 when the volume cannot say.</summary>
+    private long SpillVolumeFreeBytes()
+    {
+        try { return _spillFreeDiskForTest?.Invoke() ?? VolumeAvailableBytes(_walDir); }
+        catch (Exception) { return -1; }
+    }
+
+    /// <summary>
+    /// Whether a spill could take the writers, were the despill to take the free slot now
+    /// (<see cref="SwapFailing"/>): spilling is on, no spill open has failed since one last opened,
+    /// and the volume has been MEASURED to keep its floor with another spill file. It was
+    /// <see cref="HasSpillRoom"/> alone, which says yes for a volume that cannot say and knows nothing
+    /// of a failed open — so a swap that failed for a reason that failed the spill open too handed the
+    /// slot to the despill at its first failure, for a whole block, while the writers could neither
+    /// swap nor spill (503). A failed open is forgotten only when one succeeds, not when its hold
+    /// runs out: until then the despill waits for <see cref="SwapFailuresBeforeDespillTakesTheSlot"/>
+    /// failures, about 0.7 s, which is the cheap side to be wrong on. <see cref="_spillOpenRetryAt"/>
+    /// is read without the lock it is written under: a stale read only moves the moment the despill
+    /// takes the slot.
+    /// </summary>
+    private bool SpillCanTakeTheWriters =>
+        _options.HotTier.SpillEnabled
+        && Volatile.Read(ref _spillOpenRetryAt) == 0
+        && SpillVolumeFreeBytes() >= SpillRoomBytes;
+
+    /// <summary>
+    /// The bytes this process may still write on the volume that holds <paramref name="directory"/>,
+    /// or -1 when the volume cannot say. On Windows the directory itself is asked
+    /// (GetDiskFreeSpaceEx): DriveInfo, which the floor check used, takes a drive's root alone — it
+    /// threw on a UNC path, so the floor never held there, and measured the root volume for a
+    /// directory behind a mount folder or a junction. Elsewhere DriveInfo is given the directory,
+    /// and statvfs measures the file system that holds it.
+    /// </summary>
+    internal static long VolumeAvailableBytes(string directory)
+    {
         try
         {
-            free = _spillFreeDiskForTest?.Invoke() ?? new DriveInfo(Path.GetFullPath(_walDir)).AvailableFreeSpace;
+            if (!OperatingSystem.IsWindows()) return new DriveInfo(Path.GetFullPath(directory)).AvailableFreeSpace;
+
+            // The extended-length form, which a path past MAX_PATH needs; a UNC name must end in a separator.
+            string path = DurableFile.ExtendedPath(directory);
+            if (!Path.EndsInDirectorySeparator(path)) path += '\\';
+            return Native.GetDiskFreeSpaceEx(path, out ulong available, out _, out _)
+                ? (long)Math.Min(available, (ulong)long.MaxValue)
+                : -1;
         }
-        catch
-        {
-            // The volume could not say. The open below finds out the hard way, and a failure there
-            // is the same wait as the floor.
-            return true;
-        }
-        // The file, its pool counted in, and the two rows a refused append can leave past it.
-        return free >= _options.HotTier.SpillMinFreeDiskBytes + SpillFileCapacityBytes + WriteAheadLog.MaxRowsPastCapacity;
+        catch (Exception) { return -1; }
+    }
+
+    private static partial class Native
+    {
+        [LibraryImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static partial bool GetDiskFreeSpaceEx(string directoryName, out ulong freeBytesAvailableToCaller,
+                                                        out ulong totalNumberOfBytes, out ulong totalNumberOfFreeBytes);
     }
 
     /// <summary>

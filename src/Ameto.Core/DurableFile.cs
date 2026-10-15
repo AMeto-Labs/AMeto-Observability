@@ -55,7 +55,7 @@ public static partial class DurableFile
     }
 
     /// <summary>The Win32 extended-length (<c>\\?\</c>, or <c>\\?\UNC\</c>) form of a path, which the W APIs take past MAX_PATH.</summary>
-    private static string ExtendedPath(string path)
+    internal static string ExtendedPath(string path)
     {
         string full = Path.GetFullPath(path);
         if (full.StartsWith(@"\\?\", StringComparison.Ordinal) || full.StartsWith(@"\\.\", StringComparison.Ordinal)) return full;
