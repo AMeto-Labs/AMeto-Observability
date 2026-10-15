@@ -3006,7 +3006,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try { _deleteWalFile(logPath); }
         catch (Exception ex)
         {
-            gone = !File.Exists(logPath);
+            gone = Look(logPath) == Presence.Gone;   // a log that cannot be looked at is not gone (L-18)
             if (!gone)
                 try { _logger.LogWarning(ex, "Failed to delete {Path} — its completion marker is kept, and the next start deletes both", logPath); }
                 catch (Exception) { /* the line is lost; the marker is kept all the same */ }
@@ -6194,7 +6194,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         foreach (var marker in Directory.EnumerateFiles(_walDir, "*.flushed"))
         {
             string stem = marker[..^".flushed".Length];
-            if (File.Exists(stem + ".wal") || File.Exists(stem + SpillExtension)) continue;
+            if (Look(stem + ".wal") != Presence.Gone || Look(stem + SpillExtension) != Presence.Gone) continue;
             try { File.Delete(marker); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
         }
@@ -6219,11 +6219,38 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             string log = pool[..^".pool".Length];
             if (!log.EndsWith(".wal", StringComparison.OrdinalIgnoreCase)
                 && !log.EndsWith(SpillExtension, StringComparison.OrdinalIgnoreCase)) continue;
-            if (File.Exists(log)) continue;
+            if (Look(log) != Presence.Gone) continue;
             try { File.Delete(pool); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete pool file {File}, whose log is gone", pool); }
         }
     }
+
+    /// <summary>What a look at a path found (<see cref="Look"/>).</summary>
+    private enum Presence { There, Gone, Unknown }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is there (round-5 review L-18). <see cref="File.Exists"/> answers
+    /// false for a file it could not look at as well as for one that is gone, and the sweeps that delete
+    /// what a gone log leaves — its pool, its completion marker — took a failure to look (a share that
+    /// did not answer, an access check) for the log's absence: a live log's pool deleted, its templates
+    /// lost to its replay. <see cref="Presence.Gone"/> only when the file system says so.
+    /// </summary>
+    private static Presence Look(string path)
+    {
+        if (LookFailsForTest.Value is { } fails && fails(path)) return Presence.Unknown;
+        try
+        {
+            File.GetAttributes(path);
+            return Presence.There;
+        }
+        catch (FileNotFoundException)      { return Presence.Gone; }
+        catch (DirectoryNotFoundException) { return Presence.Gone; }
+        catch (Exception)                  { return Presence.Unknown; }
+    }
+
+    /// <summary>Test seam: true for a path whose look fails (<see cref="Presence.Unknown"/>). A static
+    /// AsyncLocal, so it reaches the constructor's startup sweeps, and only the test's flows.</summary>
+    internal static readonly AsyncLocal<Func<string, bool>?> LookFailsForTest = new();
 
     /// <summary>
     /// Round-4 L14: hands a WAL whose startup replay failed to the despill, which reads it again in

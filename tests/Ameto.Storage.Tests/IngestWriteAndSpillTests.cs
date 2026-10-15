@@ -3787,6 +3787,84 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── A log the sweeps cannot look at (round-5 L-18) ───────────────────────
+
+    /// <summary>
+    /// Round-5 review L-18. The startup sweeps delete what a gone log leaves — its pool, its completion
+    /// marker — and asked File.Exists whether it was gone, which answers false for a file it could not
+    /// look at too (a share that did not answer, an access check): a live spill file's pool was deleted,
+    /// and its despill then read the block's events with none of their templates. A log is gone only when
+    /// the file system says so now; one that cannot be looked at keeps its pool and its marker.
+    /// </summary>
+    [Fact]
+    public async Task A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 0, 10);
+        string walDir = Path.Combine(dir, "wal");
+        string spill  = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        // And a block's completion marker, whose log cannot be looked at either.
+        string stem   = Path.Combine(walDir, $"{opts.NodeId.Value}-9100");
+        File.WriteAllBytes(stem + ".flushed", []);
+        Assert.True(File.Exists(spill + ".pool"), "setup: the spill file has no pool");
+
+        StorageEngine.LookFailsForTest.Value = p => p == spill || p == stem + ".wal";
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { StorageEngine.LookFailsForTest.Value = null; }
+        try
+        {
+            Assert.True(File.Exists(stem + ".flushed"), "the startup sweep deleted a marker whose log it could not look at");
+            await FlushEverythingAsync(engine, ShortGuard);
+            var events = ReadAll(engine);
+            Assert.Equal(10, events.Count);
+            Assert.All(events.Values, e => Assert.Equal("event {n}", e.Template));   // its pool was there for its despill
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review L-18, at the flush: a WAL whose delete failed, and that cannot be looked at, keeps
+    /// its completion marker. Taken for gone — File.Exists answers false for a look that failed — it lost
+    /// its marker, and the next start found the WAL with none and wrote its block a second time.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        var    engine = Engine(opts);
+        try
+        {
+            using (var a = Batch(engine, 0, 100))
+                Assert.Equal(new LogBatchWriteResult(100, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            ulong  block  = engine.LiveWalSegmentId;
+            string wal    = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.wal");
+            string marker = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.flushed");
+            engine._deleteWalFile = p =>
+            {
+                if (p == wal) throw new IOException("test: the share did not answer");
+                File.Delete(p);
+            };
+            StorageEngine.LookFailsForTest.Value = p => p == wal;
+            try { await engine.FlushHotTierAsync(); }
+            finally { StorageEngine.LookFailsForTest.Value = null; }
+
+            Assert.True(File.Exists(marker), "the marker went though its WAL could not be looked at");
+        }
+        finally
+        {
+            engine._deleteWalFile = File.Delete;
+            await engine.DisposeAsync();
+        }
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        Assert.Equal(100, ReadAll(next).Count);   // once: the marker said the block was published
+    }
+
     // ── The WAL flush loop (round-5 L-3) ──────────────────────────────────────
 
     /// <summary>
