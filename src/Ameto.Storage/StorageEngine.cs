@@ -1118,42 +1118,68 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // resurrected entry becomes a merge candidate, fails to open and is skip-listed until
         // restart.)
         try { await _catalogLoad.WaitAsync(ct); }
-        catch (OperationCanceledException) { return; }
-        catch (Exception ex) { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception ex)
+        {
+            try { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
+            catch (Exception) { /* the line is lost; maintenance is not */ }
+        }
 
         try { await Task.Delay(_maintenanceStartDelay, ct); } // let startup settle
-        catch (OperationCanceledException) { return; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception) { /* the pause could not be set up: start now */ }
 
+        // Round again whatever fails, as the WAL loop (round-5 review L-3, the same here): the line that
+        // says a pass failed allocates, and so does the pause, and a throw out of either ended the loop
+        // for good — no segment merged, no interrupted merge finished, no parked delete swept again until
+        // a restart.
         while (!ct.IsCancellationRequested)
         {
-            // One batch per iteration, short pause while a backlog exists.
-            MergeOutcome outcome;
-            Interlocked.Increment(ref _coldMaintenancePasses);
-            try { outcome = await RunColdMaintenancePassAsync(ct); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); outcome = MergeOutcome.NothingToMerge; }
-            if (outcome == MergeOutcome.Merged)
+            try
             {
-                // A merge briefly holds the batch, its native tier copy and the
-                // index builders. Hand that back to the OS instead of letting the
-                // allocator sit on it until the next burst (RSS otherwise ratchets
-                // up across passes and never comes down on an idle server).
-                //
-                // Gated on a merge having HAPPENED, which is what keeps an idle server from
-                // paying for this. The removed HC sweep had its own release behind a bytes
-                // floor for the same reason: its idle pass rewrote the one or two tiny
-                // segments flushed since the last tick ("saved 0.0 MB") and a day's log
-                // showed that shape paying a blocking compacting gen2 plus a working-set
-                // dump six times an hour, around the clock, the working set sawing between
-                // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
-                // there is nothing to release and no floor to test.
-                ReleaseMaintenanceMemory();
-            }
+                // One batch per iteration, short pause while a backlog exists.
+                MergeOutcome outcome;
+                Interlocked.Increment(ref _coldMaintenancePasses);
+                try { outcome = await RunColdMaintenancePassAsync(ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "Segment merge pass failed"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    outcome = MergeOutcome.NothingToMerge;
+                }
+                if (outcome == MergeOutcome.Merged)
+                {
+                    // A merge briefly holds the batch, its native tier copy and the
+                    // index builders. Hand that back to the OS instead of letting the
+                    // allocator sit on it until the next burst (RSS otherwise ratchets
+                    // up across passes and never comes down on an idle server).
+                    //
+                    // Gated on a merge having HAPPENED, which is what keeps an idle server from
+                    // paying for this. The removed HC sweep had its own release behind a bytes
+                    // floor for the same reason: its idle pass rewrote the one or two tiny
+                    // segments flushed since the last tick ("saved 0.0 MB") and a day's log
+                    // showed that shape paying a blocking compacting gen2 plus a working-set
+                    // dump six times an hour, around the clock, the working set sawing between
+                    // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
+                    // there is nothing to release and no floor to test.
+                    ReleaseMaintenanceMemory();
+                }
 
-            try { await Task.Delay(PauseAfter(outcome), ct); }
-            catch (OperationCanceledException) { break; }
+                try { await Task.Delay(_maintenancePauseForTest ?? PauseAfter(outcome), ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+            catch (Exception)
+            {
+                // Anything else — the pause could not be set up, out of memory: a blocked pause, with
+                // nothing to allocate, then round again.
+                Thread.Sleep(1000);
+            }
         }
     }
+
+    /// <summary>Test seam: the maintenance loop's pause after every pass, in place of <see cref="PauseAfter"/>'s.</summary>
+    internal TimeSpan? _maintenancePauseForTest;
 
     /// <summary>
     /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge
@@ -2303,24 +2329,41 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     private async Task RunFlushLoopAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(_options.HotTier.MaxAge);
-        try
+        var maxAge = _options.HotTier.MaxAge;
+        using var timer = new PeriodicTimer(maxAge);
+        // Round again whatever fails, as the WAL loop (round-5 review L-3, the same here): the line that
+        // says a flush failed allocates, and so does the wait, and a throw out of either ended the loop
+        // for good — no tier was flushed for its age again until a restart.
+        while (true)
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            try
             {
-                try { await TryFlushAsync(ct); }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+                while (await timer.WaitForNextTickAsync(ct))
                 {
-                    // A full disk fails the SWAP itself (creating the successor 64 MB WAL).
-                    // The loop must survive it: this tick is the retry mechanism for swap
-                    // failures, and a faulted loop would also detonate DisposeAsync's await.
-                    _logger.LogError(ex, "Age-based flush failed — retried next tick");
+                    try { _beforeAgeFlushForTest?.Invoke(); await TryFlushAsync(ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                    catch (Exception ex)
+                    {
+                        // A full disk fails the SWAP itself (creating the successor 64 MB WAL).
+                        // The loop must survive it: this tick is the retry mechanism for swap
+                        // failures, and a faulted loop would also detonate DisposeAsync's await.
+                        try { _logger.LogError(ex, "Age-based flush failed — retried next tick"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
                 }
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception)
+            {
+                // The wait itself failed: a blocked pause, with nothing to allocate, then round again.
+                Thread.Sleep((int)Math.Min(maxAge.TotalMilliseconds, 1000));
             }
         }
-        catch (OperationCanceledException) { }
     }
+
+    /// <summary>Test seam: runs before each age flush; throwing from it is a flush that failed.</summary>
+    internal Action? _beforeAgeFlushForTest;
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
@@ -7152,22 +7195,53 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (interval <= TimeSpan.Zero) return; // explicitly disabled
 
         using var timer = new PeriodicTimer(interval);
-        try
+        // Round again whatever fails (round-5 review L-3): the line that says a flush failed allocates,
+        // and so does the wait, and a throw out of either ended the loop for good — no live WAL was
+        // msynced again until a restart, and shutdown's await of the loop threw before its final flush.
+        while (true)
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            try
             {
-                // The live tier's WAL and, while the engine spills, the spill target's: both hold
-                // acknowledged events, and the window this loop bounds is the same for both.
-                var w = _write;
-                try { w.Wal?.Flush(); }
-                catch (ObjectDisposedException) { /* raced a rotation — next tick hits the new WAL */ }
-                catch (Exception ex) { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
-                try { w.Spill?.Wal.Flush(); }
-                catch (ObjectDisposedException) { /* raced a rotation; its close writes it back */ }
-                catch (Exception ex) { _logger.LogWarning(ex, "Periodic spill flush failed"); }
+                while (await timer.WaitForNextTickAsync(ct))
+                {
+                    // The live tier's WAL and, while the engine spills, the spill target's: both hold
+                    // acknowledged events, and the window this loop bounds is the same for both.
+                    var w = _write;
+                    try { _beforePeriodicWalFlushForTest?.Invoke(); w.Wal?.Flush(); }
+                    catch (ObjectDisposedException) { /* raced a rotation — next tick hits the new WAL */ }
+                    catch (Exception ex)
+                    {
+                        try { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
+                    try { w.Spill?.Wal.Flush(); }
+                    catch (ObjectDisposedException) { /* raced a rotation; its close writes it back */ }
+                    catch (Exception ex)
+                    {
+                        try { _logger.LogWarning(ex, "Periodic spill flush failed"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
+                }
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception)
+            {
+                // The wait itself failed (out of memory setting it up): a blocked pause, with nothing
+                // to allocate — a second at the most, so shutdown is not kept waiting — then round again.
+                Thread.Sleep((int)Math.Min(interval.TotalMilliseconds, 1000));
             }
         }
-        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>Test seam: runs before each periodic flush of the live WAL; throwing from it is a flush that failed.</summary>
+    internal Action? _beforePeriodicWalFlushForTest;
+
+    /// <summary>A background loop that had ended with a failure before shutdown awaited it: said, and the teardown goes on. Never throws.</summary>
+    private void LoopDiedAtShutdown(Exception ex, string loop)
+    {
+        try { _logger.LogError(ex, "The {Loop} loop had failed before shutdown — the teardown goes on", loop); }
+        catch (Exception) { /* the line is lost; the teardown is not */ }
     }
 
     /// <param name="order">
@@ -7232,15 +7306,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
 
         await _cts.CancelAsync();
+        // A loop that died of anything else must not stop the teardown here, before the final flush
+        // (round-5 review L-3: the WAL loop's own warning, thrown, ended it, and this await rethrew it).
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "hot-tier age"); }
         try { await _walFlushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "WAL flush"); }
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "maintenance"); }
         // The despill loop: cancellation ends its wait at once. A despill in its heavy phase is
         // counted like a flush and waited for below; one that had not reached it leaves its file
         // for the next start.

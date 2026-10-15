@@ -3787,6 +3787,125 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── The WAL flush loop (round-5 L-3) ──────────────────────────────────────
+
+    /// <summary>
+    /// Round-5 review L-3. The loop that msyncs the live WAL on its interval caught a flush that failed
+    /// and said so with a Warning — which allocates, and a throw out of it (out of memory) ended the loop
+    /// for good: no WAL was msynced again until a restart, the window of acknowledged events a power loss
+    /// takes no longer bounded, and shutdown's await of the loop threw before its final flush. It goes
+    /// round whatever fails now, and shutdown flushes.
+    /// </summary>
+    [Fact]
+    public async Task The_wal_flush_loop_goes_round_when_the_warning_of_a_failed_flush_throws()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("Periodic WAL flush failed", StringComparison.Ordinal));
+        var    opts   = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillMinFreeDiskBytes = 0,
+                WalFlushInterval = TimeSpan.FromMilliseconds(20),
+            },
+        };
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger);
+        int ticks = 0;
+        engine._beforePeriodicWalFlushForTest = () =>
+        {
+            Interlocked.Increment(ref ticks);
+            throw new IOException("test: the msync failed");
+        };
+        bool disposed = false;
+        try
+        {
+            using (var b = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            WaitFor(() => Volatile.Read(ref ticks) >= 3, "the WAL flush loop to go round after a warning that threw", ShortGuard);
+
+            await engine.DisposeAsync();   // its final flush: the loop's failures do not stop it
+            disposed = true;
+            Assert.Equal(10, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._beforePeriodicWalFlushForTest = null;
+            if (!disposed) await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-3, the same in the age loop: its Error line for a failed age flush, thrown (out of
+    /// memory), ended the loop for good — no tier was flushed for its age again until a restart, the age
+    /// tick no longer retried a failed swap, and shutdown's await of the loop threw before its final flush.
+    /// </summary>
+    [Fact]
+    public async Task The_age_flush_loop_goes_round_when_the_line_of_a_failed_flush_throws()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("Age-based flush failed", StringComparison.Ordinal));
+        var    opts   = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillMinFreeDiskBytes = 0,
+                MaxAge = TimeSpan.FromMilliseconds(20),
+            },
+        };
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger);
+        int ticks = 0;
+        engine._beforeAgeFlushForTest = () =>
+        {
+            Interlocked.Increment(ref ticks);
+            throw new IOException("test: the age flush failed");
+        };
+        try
+        {
+            WaitFor(() => Volatile.Read(ref ticks) >= 3, "the age loop to go round after a line that threw", ShortGuard);
+            Assert.True(logger.Thrown >= 2, "setup: the line of a failed age flush did not throw");
+        }
+        finally
+        {
+            engine._beforeAgeFlushForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-3, the same in the maintenance loop: its Error line for a failed pass, thrown,
+    /// ended the loop for good — no segment merged, no interrupted merge finished and no parked delete
+    /// swept again until a restart.
+    /// </summary>
+    [Fact]
+    public async Task The_maintenance_loop_goes_round_when_the_line_of_a_failed_pass_throws()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("Segment merge pass failed", StringComparison.Ordinal));
+        var    opts   = Options(dir);
+        var    scan   = new TaskCompletionSource();
+        var    engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                          new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger,
+                                          maintenanceStartDelay: TimeSpan.Zero, bootScanHeldUntil: scan.Task);
+        engine._maintenancePauseForTest = TimeSpan.FromMilliseconds(20);
+        engine._beforeMaintenanceSweeps = () => throw new IOException("test: the pass failed");
+        try
+        {
+            scan.SetResult();   // the catalog loads, and the passes begin
+            WaitFor(() => engine.ColdMaintenancePassesStarted >= 3, "the maintenance loop to go round after a line that threw", ShortGuard);
+            Assert.True(logger.Thrown >= 2, "setup: the line of a failed pass did not throw");
+        }
+        finally
+        {
+            engine._beforeMaintenanceSweeps = null;
+            scan.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A box made before its registration failed (round-5 M-C) ───────────────
 
     /// <summary>
