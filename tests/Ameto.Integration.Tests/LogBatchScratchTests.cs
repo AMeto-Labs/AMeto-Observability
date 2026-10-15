@@ -19,19 +19,19 @@ public sealed class LogBatchScratchTests
     private const int Limit = 64 * 1024;
 
     /// <summary>An OTLP sink that keeps what the parser hands it: the maps it assembled, and the sizes of the ones it refused unassembled.</summary>
-    private sealed class CapturingSink : IOtlpLogSink, LogEventSerializer.IClefBatchSink
+    private sealed class CapturingSink(int limit = Limit) : IOtlpLogSink, LogEventSerializer.IClefBatchSink
     {
         public readonly List<int>  Assembled = [];
         public readonly List<long> Refused   = [];
         public readonly List<long> Stamps    = [];   // the timestamps of the CLEF events assembled
 
-        public int MaxEventPayloadBytes => Limit;
+        public int MaxEventPayloadBytes => limit;
 
         public bool TryIngestRaw(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> msgpackProps,
                                  ulong traceHi, ulong traceLo, ulong spanId, ReadOnlySpan<byte> serviceUtf8)
         {
             Assembled.Add(msgpackProps.Length);
-            return msgpackProps.Length <= Limit;
+            return msgpackProps.Length <= limit;
         }
 
         public bool TryIngestOversized(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, long payloadBytes,
@@ -48,7 +48,7 @@ public sealed class LogBatchScratchTests
         {
             Assembled.Add(msgpackProps.Length);
             Stamps.Add(tsTicks);
-            return msgpackProps.Length <= Limit;
+            return msgpackProps.Length <= limit;
         }
 
         public bool TryIngestOversizedClef(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, long payloadBytes,
@@ -167,6 +167,81 @@ public sealed class LogBatchScratchTests
         Assert.Single(sink.Assembled);                                 // the small one
         Assert.True(sink.Refused.Single() >= 3_000_000);
         Assert.True(ScratchCapacity(typeof(LogEventSerializer), "_tRawPairs") <= 1 << 20, "the pair scratch stayed grown on the thread");
+    }
+
+    // ── L-8: the lines that let a grown scratch go ────────────────────────────
+
+    // Round-5 review L-8: the eight lines that let a log parser's scratch go once it grew past 1 MiB
+    // were unpinned — deleting all of them passed every test: the tests that would grow it refused their
+    // records unassembled since H3, so it never grew. Here each scratch grows past 1 MiB on a batch that
+    // is TAKEN (a sink whose limit is 8 MB), and is let go at the end of the parse.
+
+    private const int Big = 8 * 1024 * 1024;
+
+    /// <summary>A length-delimited protobuf field.</summary>
+    private static byte[] Pb(int field, byte[] payload)
+    {
+        var o = new List<byte> { (byte)(field << 3 | 2) };
+        for (ulong v = (ulong)payload.Length; ; v >>= 7)
+        {
+            if (v < 0x80) { o.Add((byte)v); break; }
+            o.Add((byte)(v | 0x80));
+        }
+        o.AddRange(payload);
+        return o.ToArray();
+    }
+
+    /// <summary>An OTLP KeyValue of a string.</summary>
+    private static byte[] Kv(string key, string value) =>
+        [.. Pb(1, Encoding.UTF8.GetBytes(key)), .. Pb(2, Pb(1, Encoding.UTF8.GetBytes(value)))];
+
+    [Fact]
+    public void A_protobuf_parse_lets_go_of_scratch_it_grew_past_a_megabyte()
+    {
+        string text = new('r', 1_500_000);
+        byte[] resourceLogs = [.. Pb(1, Pb(1, Kv("res", text))), .. Pb(2, Pb(2, Pb(6, Kv("rec", text))))];
+        var sink = new CapturingSink(Big);
+
+        var (ingested, _) = OtlpLogProtoParser.Parse(Pb(1, resourceLogs), sink);
+
+        Assert.Equal(1, ingested);
+        Assert.True(Assert.Single(sink.Assembled) > 2 * 1_500_000, "setup: the record's map did not carry both attributes");
+        Assert.True(ScratchCapacity(typeof(OtlpLogProtoParser), "_tRes") <= 1 << 20, "the resource scratch stayed grown on the thread");
+        Assert.True(ScratchCapacity(typeof(OtlpLogProtoParser), "_tRec") <= 1 << 20, "the record scratch stayed grown on the thread");
+        Assert.True(ScratchCapacity(typeof(OtlpLogProtoParser), "_tOut") <= 1 << 20, "the map scratch stayed grown on the thread");
+    }
+
+    [Fact]
+    public void A_json_parse_lets_go_of_scratch_it_grew_past_a_megabyte()
+    {
+        string text = new('r', 1_500_000);
+        string body = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"res\",\"value\":{\"stringValue\":\"" + text +
+                      "\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"attributes\":[{\"key\":\"rec\",\"value\":{\"stringValue\":\"" + text +
+                      "\"}}]}]}]}]}";
+        var sink = new CapturingSink(Big);
+
+        var (ingested, _) = OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(body), sink);
+
+        Assert.Equal(1, ingested);
+        Assert.True(Assert.Single(sink.Assembled) > 2 * 1_500_000, "setup: the record's map did not carry both attributes");
+        Assert.True(ScratchCapacity(typeof(OtlpLogStreamParser), "_tRes") <= 1 << 20, "the resource scratch stayed grown on the thread");
+        Assert.True(ScratchCapacity(typeof(OtlpLogStreamParser), "_tRec") <= 1 << 20, "the record scratch stayed grown on the thread");
+        Assert.True(ScratchCapacity(typeof(OtlpLogStreamParser), "_tOut") <= 1 << 20, "the map scratch stayed grown on the thread");
+    }
+
+    [Fact]
+    public void A_clef_parse_lets_go_of_scratch_it_grew_past_a_megabyte()
+    {
+        var body = ClefEvent(DateTime.UtcNow.ToString("O"), moreFields: 1, more: (ref MessagePackWriter w) =>
+        {
+            w.Write("Blob"); w.Write(new string('b', 3_000_000));
+        });
+        var sink = new CapturingSink(Big);
+
+        Assert.Equal(1, LogEventSerializer.StreamBatch(body, sink, out _));
+        Assert.True(Assert.Single(sink.Assembled) > 3_000_000, "setup: the event's map did not carry its property");
+        Assert.True(ScratchCapacity(typeof(LogEventSerializer), "_tRawPairs") <= 1 << 20, "the pair scratch stayed grown on the thread");
+        Assert.True(ScratchCapacity(typeof(LogEventSerializer), "_tPropsOut") <= 1 << 20, "the map scratch stayed grown on the thread");
     }
 
     // ── L-17: uncharged transients of the CLEF decode ─────────────────────────
