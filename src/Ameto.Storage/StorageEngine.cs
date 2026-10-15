@@ -2610,6 +2610,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private int _swapRequested;
 
+    /// <summary>Test hook: a write's request for a swap is waiting on <see cref="_flushLock"/>'s holder.</summary>
+    internal bool SwapRequestedForTest => Volatile.Read(ref _swapRequested) != 0;
+
     // ── A swap that fails ─────────────────────────────────────────────────────
     //
     // The successor's WAL could not be created (an NTFS volume too full for the next 64 MB file),
@@ -2677,6 +2680,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     {
         try
         {
+            _onSwapFailedForTest?.Invoke();
             long now   = Environment.TickCount64;
             long delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
             Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
@@ -2721,6 +2725,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>Test seam: runs where a failed swap's retry allocates its closure; throwing from it is that allocation failing.</summary>
     internal Action? _swapRetryClosureForTest;
+
+    /// <summary>Test seam: runs as a failed swap's bookkeeping starts, inside its try; a test stretches the bookkeeping with it.</summary>
+    internal Action? _onSwapFailedForTest;
 
     /// <summary>
     /// Releases <see cref="_flushLock"/> and, if a write's request for a swap found it held in the

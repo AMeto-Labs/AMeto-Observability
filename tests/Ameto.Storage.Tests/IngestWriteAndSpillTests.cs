@@ -1047,6 +1047,9 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// re-check interval later. The despill took the slot at the first failure while the writers were
     /// held back a fixed second: (0, 0, 10) after ~2 s, while the swap would have installed. It takes
     /// the slot once failures persist — three in a row — or when a spill can take the writers.
+    /// The longest pause (_swapRetryDelay) is far past the writers' wait, so the hold-back's START is
+    /// pinned too, not only the slot: a first pause of that fixed length passed while the pause was 2 s
+    /// and the wait 4 (round-3 review of a272a17).
     /// </summary>
     [Fact]
     public async Task One_transient_swap_failure_leaves_the_slot_to_the_swap_and_the_writers_are_written()
@@ -1071,8 +1074,8 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             }
         };
         engine._beforeLoadSpillForTest = _ => despillGate.Wait(HangGuard);   // a despill that took the slot keeps it
-        engine._roomRecheckMs  = 500;                       // the swap's first retry half a second after its failure
-        engine._swapRetryDelay = TimeSpan.FromSeconds(2);
+        engine._roomRecheckMs  = 500;         // the swap's first retry half a second after its failure
+        engine._swapRetryDelay = HangGuard;   // and not this, which would hold the writers past their wait
         try
         {
             using (var a = Batch(engine, 0, TierEvents))
@@ -1083,7 +1086,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             Volatile.Write(ref failing, 0);   // transient: the next attempt installs
             hold.SetResult();                  // the despill loop starts, the only slot free
             using (var b = Batch(engine, TierEvents + 1, 10))
-                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, TimeSpan.FromSeconds(4)));
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, ShortGuard));
             Assert.Equal(1, Volatile.Read(ref failures));
         }
         finally
@@ -1560,6 +1563,56 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             engine._beforeSwap              = null;
             engine._swapRetryClosureForTest = null;
             engine._wakeDespillForTest      = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The failed swap's bookkeeping runs before the swap lock is released, so a request a writer made
+    /// while the failing swap held the lock — which the release asks again — is held back like any
+    /// other after a failure. Released first, the request went round at once: a second attempt at what
+    /// had failed a moment before, and a second count of one failure in the run that decides when the
+    /// despill may take the slot. The R4-3 test saw that only when its write's request happened to land
+    /// while the swap held the lock, and even then the bookkeeping is quicker than a re-ask's thread
+    /// hop (round-3 review of a272a17). Here a request lands in the failing swap for certain, and the
+    /// seam stretches the bookkeeping, so a release that came first would be seen.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_request_made_while_a_swap_fails_is_held_back_like_any_other()
+    {
+        var engine = OneSlotEngine(Options(NewDir(), spill: false));
+        engine._roomRecheckMs  = 500;         // the hold-back after one failure
+        engine._swapRetryDelay = HangGuard;
+        var  attempts = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        long failedAt = 0;
+        int  failing  = 1;
+        engine._beforeSwap = () =>
+        {
+            attempts.Enqueue(Environment.TickCount64);
+            if (Interlocked.Exchange(ref failing, 0) == 0) return;
+            Assert.False(TryWriteOne(engine, TierEvents + 1));   // a writer asks while this swap holds the lock
+            WaitFor(() => engine.SwapRequestedForTest, "the request to find the swap lock held");
+            throw new IOException("test: a transient failure creating the next WAL");
+        };
+        engine._onSwapFailedForTest = () =>
+        {
+            Volatile.Write(ref failedAt, Environment.TickCount64);
+            Thread.Sleep(300);
+        };
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            Assert.False(TryWriteOne(engine, TierEvents));   // the full tier refuses it: the swap is asked for, and fails
+            WaitFor(() => attempts.Count >= 2, "the swap to be tried again", ShortGuard);
+
+            long after = attempts.ToArray()[1] - Volatile.Read(ref failedAt);
+            Assert.True(after >= 400, $"the swap was tried again {after} ms after its failure: the request was not held back");
+        }
+        finally
+        {
+            engine._beforeSwap          = null;
+            engine._onSwapFailedForTest = null;
             await engine.DisposeAsync();
         }
     }
@@ -2718,11 +2771,13 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// <summary>
     /// The swap's tier whose retry cannot be started (the new failure path of the hand-over): its slot
     /// and heavy phase go back once, and the tier stays listed — queries go on serving it — until
-    /// shutdown frees it; its WAL stays, and the next start replays every event once, though the failed
-    /// attempt had moved a level file into place. Either way it cannot start: nothing of it set up
-    /// ("before"), and the caller gives the tier up; or set up and refused by the scheduler, where its
-    /// continuation gives it up — and only it: with the caller too, the slot and the heavy phase went
-    /// back twice, the count negative and shutdown waiting its whole budget.
+    /// shutdown frees it; its WAL stays, and the next start brings every event back once: the level
+    /// the failed attempt had moved into place as it is, the other replayed from the WAL. Two levels,
+    /// because with one the failed attempt had already published everything, the replay had nothing to
+    /// do, and a WAL deleted at shutdown passed (round-3 review of 9275894). Either way it cannot start:
+    /// nothing of it set up ("before"), and the caller gives the tier up; or set up and refused by the
+    /// scheduler, where its continuation gives it up — and only it: with the caller too, the slot and
+    /// the heavy phase went back twice, the count negative and shutdown waiting its whole budget.
     /// </summary>
     [Theory]
     [InlineData("before")]
@@ -2735,14 +2790,17 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         int failed = 0;
         engine._afterLevelPublished = _ =>
         {
+            // After the first level (Information): the second (Warning) is not written.
             if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the flush fails after a level");
         };
         if (how == "before") engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be started");
         else                 engine._flushRetrySchedulerForTest   = new RefusingScheduler();
         try
         {
-            using (var batch = Batch(engine, 0, 500))
-                Assert.Equal(500, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+            using (var info = Batch(engine, 0, 250))
+                Assert.Equal(250, (await engine.WriteBatchAsync(info, HangGuard)).Written);
+            using (var warn = Batch(engine, 250, 250, level: LogLevel.Warning))
+                Assert.Equal(250, (await engine.WriteBatchAsync(warn, HangGuard)).Written);
             try { await engine.FlushHotTierAsync(); }
             catch (OutOfMemoryException) { /* before the fix the start's throw escaped */ }
 
@@ -2755,11 +2813,18 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
         finally { await engine.DisposeAsync(); }
 
+        // A WAL whose block has a level on disk is despilled once the boot scan has read that level
+        // (9cd8b06): the Warning level comes back in the background, after the catalog has loaded.
         await using var restarted = OneSlotEngine(opts);
         await restarted.CatalogLoaded;
+        WaitFor(() => restarted.SpillFilesPending == 0, "the WAL's other level to be written by the despill", ShortGuard);
         var events = ReadAll(restarted);
         Assert.Equal(500, events.Count);
-        foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+        foreach (var (n, ev) in events)
+        {
+            AssertIsEvent(n, ev);
+            Assert.Equal((byte)(n < 250 ? LogLevel.Information : LogLevel.Warning), ev.Level);
+        }
     }
 
     /// <summary>
