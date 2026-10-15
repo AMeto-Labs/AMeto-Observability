@@ -3787,6 +3787,76 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
     }
 
+    // ── A run of swap failures across a despill (round-5 L-4) ─────────────────
+
+    /// <summary>
+    /// Round-5 review L-4. A run of failed swaps ends after a silence of ten retry delays — nothing asked
+    /// for the swap — but the silence was measured over the time the only slot was held too: a despill
+    /// longer than that gap, with the writers asking for their swap all along (and finding no slot to try
+    /// it with), restarted the count at the first failure after it, and the despill then yielded the slot
+    /// to the failing swap again for two more failures. The gap counts the time a slot was free now: the
+    /// first failure after the despill is still one in the run, and the next block's despill takes the
+    /// slot at once.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_longer_than_the_streak_gap_does_not_restart_a_run_of_swap_failures()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+        EarlierRunSpill(opts, dir, 9_100, 200_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(40);   // a run ends after 400 ms of silence
+        engine._roomRecheckMs  = 20;                              // the writers ask for their swap all along
+        int failing = 1, failures = 0, atRelease = -1, atSecond = -1;
+        engine._beforeFrozenListGrowForTest = () =>
+        {
+            if (Volatile.Read(ref failing) == 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: the swap fails after it took the slot");
+        };
+        using var firstDespill  = new ManualResetEventSlim(false);
+        using var firstGoesOn   = new ManualResetEventSlim(false);
+        using var secondDespill = new ManualResetEventSlim(false);
+        engine._beforeLoadSpillForTest = block =>
+        {
+            if (block == 9_000) { firstDespill.Set(); firstGoesOn.Wait(HangGuard); }
+            else if (block == 9_100) { Volatile.Write(ref atSecond, Volatile.Read(ref failures)); secondDespill.Set(); }
+        };
+        Task<LogBatchWriteResult>? writer = null;
+        var batch = Batch(engine, 0, TierEvents + 10);
+        try
+        {
+            writer = Task.Run(async () => await engine.WriteBatchAsync(batch, HangGuard));   // fills the tier, then waits
+            WaitFor(() => Volatile.Read(ref failures) >= 3, "three swap failures in a row", ShortGuard);
+
+            hold.SetResult();   // the despill loop: the failures persist, so it takes the slot
+            Assert.True(firstDespill.Wait(ShortGuard), "setup: the first block's despill never took the slot");
+            await Task.Delay(1_000);   // longer than the gap, the writers asking all along
+
+            Volatile.Write(ref atRelease, Volatile.Read(ref failures));
+            firstGoesOn.Set();   // the first block's despill ends: its slot comes free, the swap tries and fails
+            Assert.True(secondDespill.Wait(ShortGuard), "the second block's despill never took the slot");
+            int between = Volatile.Read(ref atSecond) - Volatile.Read(ref atRelease);
+            Assert.True(between < 3, $"{between} swap failures after the despill before the next block's took the slot: the run restarted");
+        }
+        finally
+        {
+            Volatile.Write(ref failing, 0);
+            firstGoesOn.Set();
+            hold.TrySetResult();
+            if (writer is not null) await writer.WaitAsync(HangGuard);
+            batch.Dispose();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A log the sweeps cannot look at (round-5 L-18) ───────────────────────
 
     /// <summary>

@@ -2482,6 +2482,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // again. Never past a backlog that holds none, and never for the final flush.
             if (!finalFlush && !FrozenTextHasRoomFor(oldState.Hot))
             {
+                SwapCouldNotBeTried(oldState);
                 SpillWithoutSlot(oldState);
                 return;
             }
@@ -2504,7 +2505,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         "Final hot-tier flush skipped: no flush slot came free within the shutdown budget — " +
                         "the WAL replays the tier on the next start");
                 else
+                {
+                    SwapCouldNotBeTried(oldState);
                     SpillWithoutSlot(oldState);
+                }
                 return;
             }
             WriteState? successor = null;
@@ -2796,6 +2800,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>Failed swaps in a row after which the despill takes a free slot even with no spill to take the writers.</summary>
     private const int SwapFailuresBeforeDespillTakesTheSlot = 3;
+
+    /// <summary>
+    /// A swap the writers wait for found no slot free (or the frozen tiers at their share of text), and
+    /// was not tried: a run of failures does not age meanwhile (round-5 review L-4). The gap that ends a
+    /// run (<see cref="SwapFailureStreakGapMs"/>) counts the time when a slot was free — when the swap
+    /// could have been tried — and not the time a despill or a flush held the only one: a despill longer
+    /// than the gap restarted the count at the first failure after it, and the despill then yielded the
+    /// slot again (the "a release does not reset" decision, undone). Only a swap writers wait on: one
+    /// nothing waits on (the age loop's, an explicit flush's) is the silence the gap is there to see.
+    /// Under the swap lock, as <see cref="OnSwapFailed"/>.
+    /// </summary>
+    private void SwapCouldNotBeTried(WriteState state)
+    {
+        if (Volatile.Read(ref _swapFailures) > 0 && Volatile.Read(ref state.HotRefused))
+            _lastSwapFailureAt = Environment.TickCount64;
+    }
 
     /// <summary>
     /// The despill may take a free slot from a live tier whose swap cannot install (see
