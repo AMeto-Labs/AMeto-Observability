@@ -3415,6 +3415,238 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── A publish that fails keeps its block (round-5 H-A) ────────────────────
+
+    /// <summary>A spill file an earlier run left: block 9 000, 100 events — 60 Information, then 40 Error.</summary>
+    private static void TwoLevelSpillBlock(ServerOptions opts, string dir)
+    {
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        using var spill = WriteAheadLog.Open(Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}"),
+                                             opts.NodeId, new SegmentId(9_000), 1 << 20);
+        for (int i = 0; i < 100; i++)
+            spill.Append(T0 + i * TimeSpan.TicksPerMillisecond, i < 60 ? LogLevel.Information : LogLevel.Error, 40, "event {n}", Props(i),
+                         serviceIndex: 41, service: "spill.svc",
+                         traceIdHi: 0xA000_0000_0000_0000UL | (uint)i, traceIdLo: (ulong)i * 7 + 1, spanId: (ulong)i * 13 + 1);
+    }
+
+    /// <summary>A one-slot engine whose despill waits for <paramref name="hold"/>, so a test can set its seams first.</summary>
+    private static StorageEngine HeldDespillEngine(ServerOptions opts, TaskCompletionSource hold)
+    {
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        try { return OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+    }
+
+    /// <summary>The second registration of a flushed tier's levels runs out of memory, once: a publish that fails part way.</summary>
+    private static Func<int> FailSecondRegistration(StorageEngine engine)
+    {
+        int registrations = 0;
+        engine._beforeSegmentPublishForTest = _ =>
+        {
+            if (Interlocked.Increment(ref registrations) == 2) throw new OutOfMemoryException("test: a dictionary node for the second level");
+        };
+        return () => Volatile.Read(ref registrations);
+    }
+
+    /// <summary>
+    /// Round-5 H-A, the despill's give-up. A despill whose flush wrote its levels — and its completion
+    /// marker, last, before the publish — and whose publish then failed, with no retry to be started,
+    /// gave its tier up and unlinked the levels with the marker left: the block's next despill took the
+    /// marker for a block an earlier life had written and deleted the spill file unread. Every event of
+    /// the block lost, in this run and at every start after. The marker goes first now, and the next
+    /// despill writes the block.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_publish_fails_and_whose_retry_cannot_start_writes_its_block_again()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        TwoLevelSpillBlock(opts, dir);
+        var hold   = new TaskCompletionSource();
+        var engine = HeldDespillEngine(opts, hold);
+        FailSecondRegistration(engine);
+        int refused = 0;
+        engine._beforeFlushRetryStartForTest = () =>
+        {
+            if (Interlocked.Exchange(ref refused, 1) == 0) throw new OutOfMemoryException("test: no retry can be set up");
+        };
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "the block to settle", ShortGuard);
+
+            Assert.Equal(1, Volatile.Read(ref refused));
+            var events = ReadAll(engine);
+            Assert.True(events.Count == 100,
+                $"{events.Count} of the block's 100 events are in segments: its next despill took the marker for a written block and deleted the spill file");
+            foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+        }
+    }
+
+    /// <summary>
+    /// H-A, the swap's retry. A swapped tier whose publish failed went to a retry, whose attempt unlinked
+    /// the levels — under the marker the flush had written — before writing them again. Stopped before
+    /// a rewrite landed (here every rewrite fails, as the publish did), the next start found the marker,
+    /// took the WAL for flushed and deleted it unread. The marker goes before the levels now: the next
+    /// start replays the WAL.
+    /// </summary>
+    [Fact]
+    public async Task A_swapped_tier_whose_publish_fails_and_whose_retry_stops_before_its_rewrite_comes_back_at_the_next_start()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        var    engine = OneSlotEngine(opts);
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        var registrations = FailSecondRegistration(engine);
+        int rewrites = 0;
+        engine._beforeLevelWriteForTest = _ =>
+        {
+            if (registrations() < 2) return;   // the swap's own flush writes; the retry's rewrites fail
+            Interlocked.Increment(ref rewrites);
+            throw new IOException("test: the retry's rewrite fails as the publish did");
+        };
+        try
+        {
+            await WriteTwoLevelsAsync(engine);
+            await engine.FlushHotTierAsync();   // its publish fails: a retry takes the tier
+            WaitFor(() => Volatile.Read(ref rewrites) >= 2, "the retry's rewrite to fail twice", ShortGuard);
+        }
+        finally { await engine.DisposeAsync(); }
+
+        await using var restarted = OneSlotEngine(opts);
+        await restarted.CatalogLoaded;
+        WaitFor(() => restarted.SpillFilesPending == 0, "the start's despills to finish", ShortGuard);
+        var events = ReadAll(restarted);
+        Assert.True(events.Count == 500,
+            $"{events.Count} of the tier's 500 events came back: the start took the WAL for flushed and deleted it unread");
+        foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+    }
+
+    /// <summary>
+    /// H-A, the despill's retry: as the swap's, its attempt unlinked the levels under the marker before
+    /// writing them again, and a stop before the rewrite left the next start's despill to find the marker
+    /// and delete the spill file unread.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_publish_fails_and_whose_retry_stops_before_its_rewrite_writes_its_block_at_the_next_start()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        TwoLevelSpillBlock(opts, dir);
+        var hold   = new TaskCompletionSource();
+        var engine = HeldDespillEngine(opts, hold);
+        var registrations = FailSecondRegistration(engine);
+        int rewrites = 0;
+        engine._beforeLevelWriteForTest = _ =>
+        {
+            if (registrations() < 2) return;
+            Interlocked.Increment(ref rewrites);
+            throw new IOException("test: the retry's rewrite fails as the publish did");
+        };
+        try
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => Volatile.Read(ref rewrites) >= 2, "the retry's rewrite to fail twice", ShortGuard);
+        }
+        finally { await engine.DisposeAsync(); }
+
+        await using var restarted = OneSlotEngine(opts);
+        await restarted.CatalogLoaded;
+        WaitFor(() => restarted.SpillFilesPending == 0, "the block to be despilled", ShortGuard);
+        var events = ReadAll(restarted);
+        Assert.True(events.Count == 100,
+            $"{events.Count} of the block's 100 events came back: the start's despill found the marker and deleted the spill file unread");
+        foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+    }
+
+    /// <summary>
+    /// H-A, a despill's retry that ends without finishing (its first suspension cannot be boxed): its
+    /// continuation gives the tier up as the despill does (RetryEnded's onAbandoned) — and unlinked the
+    /// levels under the marker the same way, the block's next despill deleting the spill file unread.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_publish_fails_and_whose_retry_dies_unboxed_writes_its_block_again()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        TwoLevelSpillBlock(opts, dir);
+        var hold = new TaskCompletionSource();
+        OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<FlushRetryLoopAsync>");
+        StorageEngine engine;
+        try { engine = HeldDespillEngine(opts, hold); }   // the despill loop, and the retry it starts, carry the seam
+        finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+        FailSecondRegistration(engine);
+        await using (engine)
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "the block to settle", ShortGuard);
+
+            var events = ReadAll(engine);
+            Assert.True(events.Count == 100,
+                $"{events.Count} of the block's 100 events are in segments: the dead retry's give-up unlinked the levels under the marker");
+            foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+        }
+    }
+
+    /// <summary>
+    /// H-A, a marker that cannot be removed: the despill's give-up keeps it and all it vouches for — the
+    /// levels, the tier (listed, served, until shutdown) and the block (in flight, despilled by nobody in
+    /// this run) — and the next start finishes the block. Giving the tier up with the marker kept left
+    /// the block's next despill to delete the spill file under the marker while the levels it vouches for
+    /// were in no catalog: the events served by nobody until a restart.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_give_up_whose_marker_cannot_be_removed_keeps_its_tier_served_and_the_next_start_finishes_the_block()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        TwoLevelSpillBlock(opts, dir);
+        var hold   = new TaskCompletionSource();
+        var engine = HeldDespillEngine(opts, hold);
+        FailSecondRegistration(engine);
+        engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be set up");
+        int removals = 0;
+        engine._removeFlushMarkerForTest = _ =>
+        {
+            Interlocked.Increment(ref removals);
+            throw new IOException("test: the marker cannot be removed");
+        };
+        try
+        {
+            engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.DespillsCompletedForTest == 1 && engine.HeavyPhasesInFlight == 0, "the despill to give up", ShortGuard);
+
+            Assert.True(Volatile.Read(ref removals) >= 1, "the give-up never tried to remove the marker");
+            Assert.True(engine.FrozenTierCountForTest == 1, "the tier was given up under a marker that stays");
+            Assert.Equal(1, engine.SpillFilesPending);
+            using (var reader = engine.OpenHotTierReader())
+                Assert.Equal(100, reader.ReadAll().Count());   // served, from the tier
+            Assert.Empty(ReadAll(engine));                       // and from nothing else
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10 * 50));   // ten of the despill's retry delays
+            Assert.True(engine.DespillsCompletedForTest == 1 && engine.SpillFilesPending == 1,
+                        "the block was despilled again beside the tier kept for it");
+        }
+        finally { await engine.DisposeAsync(); }
+
+        await using var restarted = OneSlotEngine(opts);
+        await restarted.CatalogLoaded;
+        WaitFor(() => restarted.SpillFilesPending == 0, "the next start to finish the block", ShortGuard);
+        var events = ReadAll(restarted);
+        Assert.Equal(100, events.Count);
+        foreach (var (n, ev) in events) AssertIsEvent(n, ev);
+    }
+
     // ── A block id past the last usable one ───────────────────────────────────
 
     /// <summary>

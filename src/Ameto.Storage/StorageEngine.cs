@@ -3133,6 +3133,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>
     /// Removes level files of a reserved block that were moved into place by a flush attempt that
     /// failed before publishing. internal so a test can run it under the boot scan.
+    ///
+    /// <para>The block's completion marker goes first, durably, or nothing does (round-5 H-A; see
+    /// <see cref="RemoveFlushMarkerDurably"/>): an attempt whose flush completed and whose publish
+    /// failed left one, and a level unlinked under it was a level the next start, or the block's next
+    /// despill, took for written — and deleted the only other copy of. Throws when the marker may
+    /// still be there.</para>
     /// </summary>
     /// <param name="keepLevels">
     /// Levels an EARLIER run published (a despill's; see <c>FlushTierByLevelAsync</c>): the boot
@@ -3141,6 +3147,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </param>
     internal void DeleteUnpublishedLevelFiles(ulong firstSegId, byte keepLevels = 0)
     {
+        RemoveFlushMarkerDurably(firstSegId);
         for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
         {
             if ((keepLevels & (1 << (int)s)) != 0) continue;
@@ -5340,6 +5347,49 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
     }
 
+    /// <summary>
+    /// Round-5 H-A. Removes a block's completion marker so that no power loss brings it back, before
+    /// anything its presence would make wrong: the unlink of a level it vouches for. The marker is
+    /// written last in <see cref="FlushTierByLevelAsync"/>, BEFORE the publish, so a publish that failed
+    /// left a marker over levels nobody registered; the retry and the despill's give-up then unlinked
+    /// those levels under it, and the next start's replay ("already flushed"), or the block's next
+    /// despill, deleted the WAL or the spill file unread — the whole block lost. Throws when it cannot
+    /// say the marker is gone for good; the caller then unlinks nothing.
+    ///
+    /// <para>Durable, because recovery reads the marker's NAME and nothing else. Elsewhere than Windows
+    /// an unlink and an fsync of the directory; on Windows, where a delete is committed lazily, a
+    /// write-through move to a name nothing reads (<see cref="VoidedMarkerPath"/>) and then a plain
+    /// delete of that, which the next start sweeps if it is lost.</para>
+    /// </summary>
+    private void RemoveFlushMarkerDurably(ulong firstSegId)
+    {
+        _removeFlushMarkerForTest?.Invoke(firstSegId);
+        string marker = FlushMarkerPath(firstSegId);
+        if (OperatingSystem.IsWindows())
+        {
+            string voided = VoidedMarkerPath(firstSegId);
+            try { DurableFile.Replace(marker, voided); }
+            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070002)) { return; }   // ERROR_FILE_NOT_FOUND: there is none
+            try { File.Delete(voided); }
+            catch (Exception) { /* a name nothing reads; swept at the next start */ }
+            return;
+        }
+
+        File.Delete(marker);   // a file that is not there is no error; anything else throws
+        if ((OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) && !DurableFile.SyncDirectory(_walDir))
+            throw new IOException($"The removal of {marker} could not be made durable: the fsync of {_walDir} failed");
+    }
+
+    /// <summary>Where <see cref="RemoveFlushMarkerDurably"/> moves a marker on Windows: a name no recovery reads, swept at the start.</summary>
+    private string VoidedMarkerPath(ulong firstSegId) =>
+        Path.Combine(_walDir, $"{_options.NodeId.Value}-{firstSegId}{VoidedMarkerExtension}");
+
+    /// <summary>The extension of a completion marker a retry or a give-up voided (see <see cref="RemoveFlushMarkerDurably"/>).</summary>
+    private const string VoidedMarkerExtension = ".voided";
+
+    /// <summary>Test seam: runs as a block's marker is about to be removed; throwing from it is a marker that cannot be. Null in production.</summary>
+    internal Action<ulong>? _removeFlushMarkerForTest;
+
     /// <param name="orderCount">
     /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
     /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
@@ -5867,6 +5917,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             if (File.Exists(stem + ".wal") || File.Exists(stem + SpillExtension)) continue;
             try { File.Delete(marker); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
+        }
+
+        // Markers a retry or a give-up voided whose delete was lost (RemoveFlushMarkerDurably, on
+        // Windows): a name no recovery reads, so nothing hangs on them; they only take a directory entry.
+        foreach (var voided in Directory.EnumerateFiles(_walDir, "*" + VoidedMarkerExtension))
+        {
+            try { File.Delete(voided); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete voided flush marker {File}", voided); }
         }
 
         // Pool files whose log is gone (round-4 L18). A log's pool goes with it (DeleteLogAndMarker),

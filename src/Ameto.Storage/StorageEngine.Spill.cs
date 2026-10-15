@@ -843,13 +843,36 @@ public sealed partial class StorageEngine
     internal int FrozenTierCountForTest { get { lock (_frozenLock) return _frozenHot.Count; } }
 
     /// <summary>
-    /// Gives up a despilled tier whose flush failed and whose retry could not be started: unlisted,
-    /// retired (freed once no reader holds it), and the levels its attempt moved into place unlinked
-    /// (those an earlier run published kept), so the block's next despill, from its file, starts clean.
-    /// Never throws; the caller's finally gives the slot back, ends the heavy phase and requeues the block.
+    /// Gives up a despilled tier whose flush — or whose publish — failed and whose retry could not be
+    /// started, or ended without finishing: unlisted, retired (freed once no reader holds it), and the
+    /// levels its attempt moved into place unlinked (those an earlier run published kept), so the
+    /// block's next despill, from its file, starts clean. True when it did: the caller then queues the
+    /// block again. Never throws; the caller gives the slot back and ends the heavy phase either way.
+    ///
+    /// <para>The block's completion marker first (round-5 H-A). A flush that completed wrote it before
+    /// the publish that failed, and the levels used to be unlinked under it: the block's next despill
+    /// took the marker for a block written by an earlier life and deleted the spill file unread — every
+    /// event of the block lost. A marker that cannot be removed for good is kept, and with it all it
+    /// vouches for: the levels, whole on disk; the tier, listed — served — until shutdown frees it, as a
+    /// swapped tier with no retry is; and the block, in flight, despilled by nobody in this run. False
+    /// then. The next start finds the block's levels (and the marker, if it is still there) and finishes
+    /// it as it finishes a block a crash left: the despill keeps the levels the boot scan accepted and
+    /// writes the rest, or, under the marker, only removes the spill file.</para>
     /// </summary>
-    private void AbandonDespilledTier(HotTierSegment tier, SpillFile file)
+    private bool AbandonDespilledTier(HotTierSegment tier, SpillFile file)
     {
+        try { RemoveFlushMarkerDurably(file.SegId); }
+        catch (Exception ex)
+        {
+            try
+            {
+                _logger.LogError(ex,
+                    "Despill of {File}: its completion marker could not be removed after the despill failed — its tier stays in " +
+                    "memory, served, until shutdown, and the block is finished by the next start", file.Path);
+            }
+            catch (Exception) { /* the line is lost; the tier and the block are kept all the same */ }
+            return false;
+        }
         try
         {
             lock (_frozenLock)
@@ -860,7 +883,8 @@ public sealed partial class StorageEngine
         try { RetireHotTier(tier); }
         catch (Exception) { /* its native memory is lost */ }
         try { DeleteUnpublishedLevelFiles(file.SegId, file.PublishedLevels); }
-        catch (Exception) { /* the next attempt's flush overwrites them */ }
+        catch (Exception) { /* the next despill's flush meets a level still there, fails, and its retry unlinks it */ }
+        return true;
     }
     private int _despillsCompleted;
 
@@ -904,6 +928,7 @@ public sealed partial class StorageEngine
         bool slotTransferred = false;
         bool counted         = false;
         bool settled         = false;   // published, found published already, or not this release's to read
+        bool parked          = false;   // given up with its marker kept: in flight until the next start (AbandonDespilledTier)
         HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
         try
         {
@@ -963,7 +988,7 @@ public sealed partial class StorageEngine
             // The FLUSH failed — not this method's await of it (see TryFlushAsync's heavy phase).
             catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
-                slotTransferred = HandFailedDespillToRetry(ex, tier, file);
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file, out parked);
                 return;
             }
             finally { ReleaseHeavyPermit(); }
@@ -974,7 +999,7 @@ public sealed partial class StorageEngine
             try { PublishFlushedTier(written, tier, file.Path, file.SegId); }
             catch (Exception ex)
             {
-                slotTransferred = HandFailedDespillToRetry(ex, tier, file);
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file, out parked);
                 return;
             }
             DespillPublished(file.SegId, written, afterRetry: false);
@@ -990,9 +1015,10 @@ public sealed partial class StorageEngine
             if (!slotTransferred)
             {
                 // Before the slot goes back, so the loop that takes it sees this block as gone, or
-                // as not ready yet.
-                if (settled) SettleSpill(file.SegId);
-                else         RetrySpillLater(file.SegId);
+                // as not ready yet. A parked block stays in flight: its tier is kept, listed, and a
+                // despill of its file would serve its events twice.
+                if (settled)      SettleSpill(file.SegId);
+                else if (!parked) RetrySpillLater(file.SegId);
                 GiveBackSlot(endHeavyPhase: counted);
             }
             Interlocked.Increment(ref _despillsCompleted);
@@ -1002,13 +1028,15 @@ public sealed partial class StorageEngine
     /// <summary>
     /// A despilled tier whose flush — or whose publishing — failed goes to a background retry. True
     /// when the retry took the slot and the count over; false when none could be started, and the
-    /// tier has been given up here instead (the caller's finally queues the block again). Never throws:
-    /// the tier is listed and counted, and a throw out of here — its own log line, which allocates —
-    /// reached the finally, which gave the slot back, ended the heavy phase and queued the block again,
-    /// leaving the tier listed for good, served beside the block's second despill.
+    /// tier has been given up here instead (the caller's finally queues the block again) — or, when
+    /// <paramref name="parked"/>, kept with its block in flight (see <see cref="AbandonDespilledTier"/>).
+    /// Never throws: the tier is listed and counted, and a throw out of here — its own log line, which
+    /// allocates — reached the finally, which gave the slot back, ended the heavy phase and queued the
+    /// block again, leaving the tier listed for good, served beside the block's second despill.
     /// </summary>
-    private bool HandFailedDespillToRetry(Exception ex, HotTierSegment tier, SpillFile file)
+    private bool HandFailedDespillToRetry(Exception ex, HotTierSegment tier, SpillFile file, out bool parked)
     {
+        parked = false;
         try
         {
             _logger.LogError(ex,
@@ -1030,8 +1058,8 @@ public sealed partial class StorageEngine
         if (!started)
             // No retry could be started (out of memory): the block is read from its file again later
             // instead, so the tier is given up here, unlisted and retired, with the levels the attempt
-            // moved into place, as the retry would.
-            AbandonDespilledTier(tier, file);
+            // moved into place, as the retry would — unless its marker stays, and then so does it.
+            parked = !AbandonDespilledTier(tier, file);
         return started;
     }
 
@@ -1049,8 +1077,8 @@ public sealed partial class StorageEngine
         return (retried => DespillPublished(file.SegId, retried, afterRetry: true),
                 () =>
                 {
-                    AbandonDespilledTier(tier, file);
-                    RetrySpillLater(file.SegId);
+                    // A tier kept with its marker keeps its block in flight (AbandonDespilledTier).
+                    if (AbandonDespilledTier(tier, file)) RetrySpillLater(file.SegId);
                 });
     }
 
