@@ -139,6 +139,159 @@ public sealed class LogBatchBudgetPinTests : IClassFixture<LogBatchBudgetPinTest
         Assert.Equal(accepted, endpoint.AcceptedTotal);
     }
 
+    // ── L-7: a refused batch goes back before its answer ──────────────────────
+
+    /// <summary>A response body that notes what was held decoded at once when the answer was first written.</summary>
+    private sealed class NotingStream(Func<long> inFlight) : MemoryStream
+    {
+        public long? AtAnswer;
+        private void Note() => AtAnswer ??= inFlight();
+        public override void Write(byte[] buffer, int offset, int count) { Note(); base.Write(buffer, offset, count); }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) { Note(); return base.WriteAsync(buffer, ct); }
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) { Note(); return base.WriteAsync(buffer, offset, count, ct); }
+        public override Task FlushAsync(CancellationToken ct) { Note(); return base.FlushAsync(ct); }
+    }
+
+    /// <summary>A response that notes what was held decoded at once when it was completed (a gRPC answer has no body).</summary>
+    private sealed class NotingResponse(Func<long> inFlight) : Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature
+    {
+        private readonly Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature _inner =
+            new StreamResponseBodyFeature(new MemoryStream());
+        public long? AtAnswer;
+        public Stream Stream => _inner.Stream;
+        public System.IO.Pipelines.PipeWriter Writer => _inner.Writer;
+        public void DisableBuffering() => _inner.DisableBuffering();
+        public Task StartAsync(CancellationToken ct = default) { AtAnswer ??= inFlight(); return _inner.StartAsync(ct); }
+        public Task SendFileAsync(string path, long offset, long? count, CancellationToken ct = default) => _inner.SendFileAsync(path, offset, count, ct);
+        public Task CompleteAsync() { AtAnswer ??= inFlight(); return _inner.CompleteAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review L-7, CLEF. A batch refused mid-decode for the budget held its reservation while its
+    /// 503 was written: the finally gave it back after the answer, and an await whose registration fails
+    /// skips that finally — the reservation lost for good. It goes back before the answer is awaited: when
+    /// the answer is written, what is held decoded is the other batches' alone.
+    /// </summary>
+    [Fact]
+    public async Task A_clef_batch_refused_mid_decode_is_given_back_before_its_answer()
+    {
+        var endpoint = Endpoint(limit: 64L * 1024 * 1024, inFlight: InFlight);
+        byte[] body  = ClefWithExceptions(events: 40, stackChars: 6_000);
+        long weight  = IngestionEndpoint.WeighClef(body, out _);
+        using var others = endpoint.TryBeginBatch(payloadSizeHint: 0, decodedWeight: InFlight - weight - 16 * 1024)!;
+
+        var answer = new NotingStream(() => endpoint.DecodedBytesInFlight);
+        var ctx = new DefaultHttpContext();
+        ctx.Request.Method        = "POST";
+        ctx.Request.ContentType   = "application/octet-stream";
+        ctx.Request.ContentLength = body.Length;
+        ctx.Request.Body          = new MemoryStream(body);
+        ctx.Response.Body         = answer;
+        await endpoint.HandleAsync(ctx);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, ctx.Response.StatusCode);
+        Assert.Equal(others.ReservedBytes, answer.AtAnswer);
+    }
+
+    /// <summary>
+    /// Round-5 review L-7, gRPC: the same for a logs batch refused mid-decode for the budget — its bytes
+    /// that are not UTF-8 decode to three times their weight — answered UNAVAILABLE.
+    /// </summary>
+    [Fact]
+    public async Task A_grpc_batch_refused_mid_decode_is_given_back_before_its_answer()
+    {
+        var endpoint = _factory.Services.GetRequiredService<IngestionEndpoint>();
+        using var others = endpoint.TryBeginBatch(payloadSizeHint: 0, decodedWeight: InFlight - 300 * 1024)!;   // all but 300 KB
+        var answer = new NotingResponse(() => endpoint.DecodedBytesInFlight);
+        var ctx    = GrpcLogsRequest(_factory.Services, answer);
+        await HandleGrpcLogsAsync(ctx);
+
+        Assert.True(ctx.Response.Headers["grpc-status"].ToString() == "14",
+                    $"grpc-status {ctx.Response.Headers["grpc-status"]}: {ctx.Response.Headers["grpc-message"]}");
+        Assert.Equal(others.ReservedBytes, answer.AtAnswer);
+    }
+
+    /// <summary>Round-5 review L-7, gRPC: the same for a logs batch that decodes past its limit, answered RESOURCE_EXHAUSTED.</summary>
+    [Fact]
+    public async Task A_grpc_batch_too_heavy_mid_decode_is_given_back_before_its_answer()
+    {
+        var endpoint = Endpoint(limit: 400 * 1024, inFlight: 64L * 1024 * 1024);   // weighs ~205 KB, decodes to ~600 KB
+        var answer   = new NotingResponse(() => endpoint.DecodedBytesInFlight);
+        var ctx      = GrpcLogsRequest(new WithEndpoint(_factory.Services, endpoint), answer);
+        await HandleGrpcLogsAsync(ctx);
+
+        Assert.True(ctx.Response.Headers["grpc-status"].ToString() == "8",
+                    $"grpc-status {ctx.Response.Headers["grpc-status"]}: {ctx.Response.Headers["grpc-message"]}");
+        Assert.Equal(0, answer.AtAnswer);
+    }
+
+    /// <summary>Round-5 review L-7, gRPC: the same for a logs batch whose decode runs out of memory, answered UNAVAILABLE.</summary>
+    [Fact]
+    public async Task A_grpc_batch_whose_decode_runs_out_of_memory_is_given_back_before_its_answer()
+    {
+        var endpoint = Endpoint(limit: 64L * 1024 * 1024, inFlight: 64L * 1024 * 1024);
+        int staged   = 0;
+        endpoint.BeforeStageForTest = () => { if (++staged == 2) throw new OutOfMemoryException("test: the decode ran out of memory"); };
+        var answer = new NotingResponse(() => endpoint.DecodedBytesInFlight);
+        var ctx    = GrpcLogsRequest(new WithEndpoint(_factory.Services, endpoint), answer);
+        await HandleGrpcLogsAsync(ctx);
+
+        Assert.True(ctx.Response.Headers["grpc-status"].ToString() == "14",
+                    $"grpc-status {ctx.Response.Headers["grpc-status"]}: {ctx.Response.Headers["grpc-message"]}");
+        Assert.Equal(0, answer.AtAnswer);
+    }
+
+    /// <summary>The request services, but for <see cref="IngestionEndpoint"/>: one of the test's own.</summary>
+    private sealed class WithEndpoint(IServiceProvider inner, IngestionEndpoint endpoint) : IServiceProvider
+    {
+        public object? GetService(Type type) => type == typeof(IngestionEndpoint) ? endpoint : inner.GetService(type);
+    }
+
+    /// <summary>
+    /// A gRPC logs request of ten records, each one attribute of 20 KB that is not UTF-8 (~60 KB decoded),
+    /// answered into <paramref name="answer"/>.
+    /// </summary>
+    private static HttpContext GrpcLogsRequest(IServiceProvider services, NotingResponse answer)
+    {
+        byte[] invalid = new byte[20_000];
+        invalid.AsSpan().Fill(0xFF);
+        byte[] record  = Proto(6, Concat(Proto(1, Encoding.UTF8.GetBytes("pad")), Proto(2, Proto(1, invalid))));
+        byte[] message = Proto(1, Proto(2, Concat(Enumerable.Range(0, 10).Select(_ => Proto(2, record)).ToArray())));
+        byte[] framed  = new byte[5 + message.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(1), (uint)message.Length);
+        message.CopyTo(framed, 5);
+
+        var ctx = new DefaultHttpContext { RequestServices = services };
+        ctx.Request.Protocol      = "HTTP/2";
+        ctx.Request.Method        = "POST";
+        ctx.Request.ContentType   = "application/grpc";
+        ctx.Request.ContentLength = framed.Length;
+        ctx.Request.Body          = new MemoryStream(framed);
+        ctx.Request.Headers["X-Seq-ApiKey"] = AmetoWebAppFactory.TestApiKey;
+        ctx.Features.Set<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>(answer);
+        return ctx;
+    }
+
+    private static Task HandleGrpcLogsAsync(HttpContext ctx) =>
+        Ameto.Otel.OtlpGrpcEndpointMapper.HandleLogsAsync(ctx, new Ameto.Otel.OtlpInflateGate(1, TimeSpan.Zero),
+            new Ameto.Otel.OtlpGzipTooLargeLog(NullLogger.Instance, TimeProvider.System),
+            new Ameto.Otel.OtlpOutOfMemoryLog(NullLogger.Instance, TimeProvider.System));
+
+    private static byte[] Concat(params byte[][] parts) => parts.SelectMany(p => p).ToArray();
+
+    /// <summary>A length-delimited protobuf field.</summary>
+    private static byte[] Proto(int field, byte[] payload)
+    {
+        var o = new List<byte> { (byte)(field << 3 | 2) };
+        for (ulong v = (ulong)payload.Length; ; v >>= 7)
+        {
+            if (v < 0x80) { o.Add((byte)v); break; }
+            o.Add((byte)(v | 0x80));
+        }
+        o.AddRange(payload);
+        return o.ToArray();
+    }
+
     /// <summary>CLEF events whose <c>@x</c> carries a stack of <paramref name="stackChars"/> characters.</summary>
     private static byte[] ClefWithExceptions(int events, int stackChars)
     {

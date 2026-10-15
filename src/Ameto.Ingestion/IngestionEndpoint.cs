@@ -741,6 +741,11 @@ public sealed class IngestionEndpoint
             // written, so the retry the 503 asks for duplicates nothing.
             catch (LogBatchBudgetFullException)
             {
+                // Given back before the answer is awaited (round-5 review L-7): an await whose
+                // registration fails skips the finally below, and with it the batch's dispose — its
+                // reservation of the decoded budget lost for good.
+                batch.Dispose();
+                batch = null;
                 ctx.Response.Headers.RetryAfter = RetryAfterSeconds;
                 await WriteCountsAsync(ctx, StatusCodes.Status503ServiceUnavailable, ingested: 0,
                                        dropped: (int)Math.Min(events, int.MaxValue));

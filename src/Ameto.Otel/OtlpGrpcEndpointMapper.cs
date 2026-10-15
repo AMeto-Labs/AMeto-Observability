@@ -381,6 +381,7 @@ public static class OtlpGrpcEndpointMapper
                 // batch is given back in the finally, never committed. Logged: the exporter does not retry.
                 ctx.RequestServices.GetRequiredService<IngestionEndpoint>().NoteTooHeavy(ctx.Request.Path.Value, ex.Weight);
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpLogBatchWeight.RefusalMessage);
                 return;
             }
@@ -389,6 +390,7 @@ public static class OtlpGrpcEndpointMapper
                 // The batches held decoded at once are at their limit — the store is behind and
                 // requests are waiting for room. Nothing decoded, nothing written: retried.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
                 await FinishAsync(ctx, StatusUnavailable, OtlpLogBatchWeight.BudgetFullMessage);
                 return;
             }
@@ -399,6 +401,7 @@ public static class OtlpGrpcEndpointMapper
                 // in; a sink's own log call that ran out arrives wrapped in an AggregateException
                 // (#126 review F3). The buffer and the slot go back before the answer, as below.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
                 await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                 return;
             }
@@ -476,6 +479,20 @@ public static class OtlpGrpcEndpointMapper
             ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
             batch?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Gives a logs batch back before a refusal's answer is awaited, and clears it, so the finally does
+    /// nothing more (round-5 review L-7). An await whose registration fails — the TPL event source, async
+    /// debugging — skips the handler's finally, and with it the batch's dispose: its reservation of the
+    /// decoded budget was lost for good. Never throws.
+    /// </summary>
+    private static void GiveBack(ref LogIngestBatch? batch)
+    {
+        var held = batch;
+        batch = null;
+        try { held?.Dispose(); }
+        catch (Exception) { /* its arrays and its reservation go back in its own finally */ }
     }
 
     /// <summary>
