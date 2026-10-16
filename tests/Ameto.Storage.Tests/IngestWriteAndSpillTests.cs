@@ -5676,6 +5676,60 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review (the LOW on 21eb088's audit): the flush retry's await of its attempt's flush can throw
+    /// with the flush running on — its continuation's registration fails under the TPL event source or
+    /// async debugging. The loop took that for a failed attempt and began the next, which voided the
+    /// block's marker and unlinked the levels the first flush was still writing; that flush then wrote the
+    /// marker over a partial set. No attempt begins while an earlier one's flush runs now; the block is the
+    /// next start's, and comes back once.
+    /// </summary>
+    [Fact]
+    public async Task A_retry_whose_await_fails_with_its_flush_running_begins_no_attempt_beside_it()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        var    engine = Engine(opts);
+        using var gate = new ManualResetEventSlim(false);
+        int writes = 0, started = 0, attempts = 0, failed = 0;
+        bool second;
+        try
+        {
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+            engine._afterLevelPublished = _ =>
+            {
+                if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the swap's flush fails after its level");
+            };
+            engine._beforeFlushRetryAttemptForTest = () => Interlocked.Increment(ref attempts);
+            engine._afterRetryFlushStartedForTest  = () =>
+            {
+                if (Interlocked.Increment(ref started) == 1) throw new OutOfMemoryException("test: the await's registration fails");
+            };
+            // The first retry attempt's level write is held: its flush runs on, past the await that failed.
+            StorageEngine.LevelWriteStartingForTest.Value = _ =>
+            {
+                if (Interlocked.Increment(ref writes) == 2) gate.Wait(HangGuard);
+            };
+            try { await engine.FlushHotTierAsync(); }
+            finally { StorageEngine.LevelWriteStartingForTest.Value = null; }
+
+            WaitFor(() => Volatile.Read(ref started) == 1 && Volatile.Read(ref writes) == 2, "the first attempt's flush to run past its failed await", ShortGuard);
+            second = SpinWait.SpinUntil(() => Volatile.Read(ref attempts) >= 2, TimeSpan.FromSeconds(1));   // twenty retry delays
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+        Assert.False(second, "a second retry attempt began while the first attempt's flush was still writing the block");
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
+    }
+
+    /// <summary>
     /// Mc, for the pool. A pool file that could not be read part way — out of memory, here — came back
     /// as the rows read so far: the replay resolved the missing row's index through the LIVE pool and
     /// published the middle event with another template (or none), then deleted the WAL. The failure

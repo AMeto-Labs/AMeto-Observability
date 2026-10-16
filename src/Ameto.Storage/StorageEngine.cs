@@ -3140,6 +3140,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal Action? _beforeFlushRetryAttemptForTest;
 
     /// <summary>
+    /// Test seam: runs once a retry attempt's flush has started, before the loop awaits it; throwing from
+    /// it is that await failing while the flush runs on. Null in production.
+    /// </summary>
+    internal Action? _afterRetryFlushStartedForTest;
+
+    /// <summary>
     /// The retry's task, not started. Its own method so the closure over the arguments is allocated
     /// in here, inside the caller's try — captured by a lambda in the caller, they were allocated
     /// on entry, before any of its code ran.
@@ -3280,6 +3286,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             {
                 await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
                 List<SegmentInfo> written;
+                Task<List<SegmentInfo>>? flush = null;
                 try
                 {
                     _beforeFlushRetryAttemptForTest?.Invoke();
@@ -3297,14 +3304,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         // a despill's levels an EARLIER run published: those are
                         // registered segments, and are kept and not rewritten.
                         DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
-                        written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
+                        flush = FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
+                        _afterRetryFlushStartedForTest?.Invoke();
+                        written = await flush.ConfigureAwait(false);
                     }
                     finally { ReleaseHeavyPermit(); }
 
                     PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+                // The attempt failed — and its flush is not running (round-6 review, the LOW on 21eb088's audit):
+                // a throw at this loop's await of the flush that is not the flush's own (its continuation's
+                // registration, under the TPL event source or async debugging) left the flush running, and the
+                // next attempt voided the block's marker and unlinked the levels the flush was still writing,
+                // which then wrote the marker over a partial set. Such a throw ends the loop, as TryFlushAsync's
+                // ends its flush: the tier stays listed until shutdown, and the block is the next start's.
+                catch (Exception ex) when (flush is null || flush.IsCompleted)
                 {
                     try
                     {
