@@ -2405,7 +2405,10 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         var engine = Engine(Options(NewDir()));
         engine._roomRecheckMs = 20;
         using var holding = new ManualResetEventSlim(false);
-        int calls = 0;
+        using var started = new ManualResetEventSlim(false);
+        var  sw      = new System.Diagnostics.Stopwatch();
+        long landed  = -1;
+        int  calls   = 0;
         engine._afterWriteGate = () =>
         {
             int n = Interlocked.Increment(ref calls);
@@ -2413,32 +2416,50 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             if (n == 2)
             {
                 holding.Set();
+                started.Wait(HangGuard);                                            // the request has come
                 Thread.Sleep(HolderMs);                                             // a fault that holds the lock: a full GC
                 throw new OutOfMemoryException("test: the store faults again");
             }
-            if (n == 3) return;                                                     // the request's first event lands
+            if (n == 3) { Volatile.Write(ref landed, sw.ElapsedMilliseconds); return; }   // the request's first event lands
             Thread.Sleep(20);
             throw new OutOfMemoryException("test: the request's next writes fault");
         };
+        Thread? holder = null;
         try
         {
-            using var other  = Batch(engine, 0, 1);
-            var       holder = Task.Run(async () => await engine.WriteBatchAsync(other, TimeSpan.FromMilliseconds(200)));
-            Assert.True(holding.Wait(HangGuard), "setup: the other request's second attempt");
+            // No pool thread between the episode's first fault and the request (round-6: the holder and the request
+            // were each started with Task.Run, and on a loaded two-core host — a whole-class run — the request began
+            // after the hold, past the episode, queued through nothing, and was timed with its start: "1057 ms of a
+            // 600 ms wait"). The first fault is a write with no wait, on this thread; the holder is a thread of its
+            // own, its hold begun once the request has come; the request runs on this thread to its first pause.
+            using (var first = Batch(engine, 0, 1))
+                Assert.Equal(0, (await engine.WriteBatchAsync(first, TimeSpan.Zero)).Written);
+            using var other = Batch(engine, 1, 1);
+            holder = new Thread(() => engine.WriteBatchAsync(other, TimeSpan.FromMilliseconds(200)).AsTask().GetAwaiter().GetResult())
+            {
+                IsBackground = true,
+            };
+            holder.Start();
+            Assert.True(holding.Wait(HangGuard), "setup: the holder's attempt");
 
-            using var r      = Batch(engine, 100, 50);
-            var       sw     = System.Diagnostics.Stopwatch.StartNew();
-            var       result = await Task.Run(async () => await engine.WriteBatchAsync(r, TimeSpan.FromMilliseconds(WaitMs)));
+            using var r = Batch(engine, 100, 50);
+            sw.Start();
+            started.Set();
+            var result = await engine.WriteBatchAsync(r, TimeSpan.FromMilliseconds(WaitMs));
             sw.Stop();
-            await holder.WaitAsync(HangGuard);
+            Assert.True(holder.Join(HangGuard), "setup: the holder never ended");
 
             Assert.Equal(1, result.Written);   // setup: it landed one event, then faulted
+            Assert.True(Volatile.Read(ref landed) >= HolderMs / 2,
+                        $"setup: the request's first event landed {Volatile.Read(ref landed)} ms after it came: it queued through no episode");
             Assert.True(sw.ElapsedMilliseconds < WaitMs + HolderMs / 2,
                         $"the request took {sw.ElapsedMilliseconds} ms of a {WaitMs} ms wait: its {HolderMs} ms of queueing through the episode was forgotten when it landed");
         }
         finally
         {
             engine._afterWriteGate = null;
+            started.Set();
+            holder?.Join(HangGuard);
             await engine.DisposeAsync();
         }
     }
