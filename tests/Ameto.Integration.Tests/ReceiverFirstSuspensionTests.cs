@@ -306,6 +306,37 @@ public sealed class ReceiverFirstSuspensionTests : IClassFixture<AmetoWebAppFact
         pendingBody.Complete(framed);                      // the read lands in a buffer nobody else holds
     }
 
+    // ── The frames above a log request (round-6 review, LOW) ──────────────────
+
+    /// <summary>
+    /// The handler yields first, so every request suspends now, and an async frame above it is boxed on every request:
+    /// one that could not be allocated answered 500 while the handler, already queued by its yield, wrote the batch —
+    /// which a Seq client's retry stored again. The CLEF route's own lambda was such a frame; it hands back the handler's
+    /// task now. (ASP.NET Core's endpoint middleware and the app's middleware remain: the residual API.md names.)
+    /// </summary>
+    [Fact]
+    public async Task The_clef_route_hands_back_the_handlers_own_task()
+    {
+        var route = ((RouteEndpoint)_factory.Services.GetRequiredService<EndpointDataSource>().Endpoints
+            .Single(e => e is RouteEndpoint r && r.RoutePattern.RawText == "/api/events"
+                      && e.Metadata.GetMetadata<Microsoft.AspNetCore.Routing.IHttpMethodMetadata>()?.HttpMethods.Contains("POST") == true)).RequestDelegate!;
+        var body = new System.Buffers.ArrayBufferWriter<byte>();
+        var w    = new MessagePack.MessagePackWriter(body);
+        w.WriteArrayHeader(1);
+        w.WriteMapHeader(1);
+        w.Write("@mt"); w.Write("frames probe");
+        w.Flush();
+        var ctx = Context("application/octet-stream", body.WrittenSpan.ToArray());
+
+        Task   handled = route(ctx);
+        string task    = handled.GetType().ToString();
+        await handled.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+        Assert.True(task.Contains("<HandleAsync>", StringComparison.Ordinal),
+                    $"the route answered with {task}: an async frame of its own stood between the request and the handler, boxed on every request");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>Runs <paramref name="run"/> with the first suspension of the method <paramref name="method"/> names failing, once; how many times it fired.</summary>

@@ -29,17 +29,22 @@ public static class EndpointMapper
 
         // ── Ingest: POST /api/events  (CLEF msgpack batch) ───────────────────
         // Hot path: validated via in-memory ApiKeyCache (no JWT, no DB hit).
-        app.MapPost("/api/events", async (HttpContext ctx, IngestionEndpoint ingestion, ApiKeyCache cache) =>
+        //
+        // NOT an async lambda: it hands back the handler's own task (round-6 review, the LOW on the frames above
+        // a log request). The handler yields first (round-5 H-G), so every request now suspends, and an async
+        // frame here was boxed on every one: a box that could not be allocated answered 500 while the handler,
+        // already queued by its yield, went on to write the batch — which a Seq client's retry stored again.
+        // The frames above this one are ASP.NET Core's and the app's middleware: see IngestionEndpoint.HandleAsync.
+        app.MapPost("/api/events", (HttpContext ctx, IngestionEndpoint ingestion, ApiKeyCache cache) =>
         {
             var key = Ameto.Ingestion.ApiKeyHeader.Extract(ctx.Request);
             if (key is null || !cache.Validate(key.AsSpan(), Ameto.Ingestion.ApiKeyPermissions.Logs))
             {
                 ctx.Response.StatusCode  = StatusCodes.Status401Unauthorized;
                 ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync("{\"error\":\"Valid API key with Logs permission required.\"}" );
-                return;
+                return ctx.Response.WriteAsync("{\"error\":\"Valid API key with Logs permission required.\"}");
             }
-            await ingestion.HandleAsync(ctx);
+            return ingestion.HandleAsync(ctx);
         });
 
         // ── Query: GET /api/events  (SSE stream) ─────────────────────────────

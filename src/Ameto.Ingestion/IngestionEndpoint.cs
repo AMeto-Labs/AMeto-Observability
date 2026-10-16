@@ -589,6 +589,13 @@ public sealed class IngestionEndpoint
         // thread (ce9e57c), a pool thread the commit itself needed: under a burst on two cores the whole
         // pool stalled for seconds, and the bound then expired into a 500. Here nothing is held yet: a
         // failure is a 500 for a request nothing was taken from, which a Seq client retries.
+        //
+        // THE RESIDUAL, accepted (round-6 review): yielding, every request suspends, and so the async
+        // frames ABOVE this one are boxed on every request as well — ASP.NET Core's EndpointMiddleware and
+        // the app's middleware lambdas (Program.cs). A box of theirs that cannot be allocated answers 500
+        // while this handler, already queued by the yield, goes on and writes the batch, which a Seq
+        // client's retry stores again. Only on a heap that cannot box a state machine; the route's own
+        // lambda adds no frame (EndpointMapper), and API.md names it.
         await Task.Yield();
 
         // ── 1. Read body into a pooled buffer ─────────────────────────────────

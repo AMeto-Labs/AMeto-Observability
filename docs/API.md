@@ -174,6 +174,8 @@ The body stopped being a CLEF array at element `failedAtElement`. **The events b
 
 Nothing landed — the body was not a MessagePack array at all, or it ended short of its `Content-Length`, which is refused whole for exactly this reason. Safe to retry entire. Note that `failedAtElement` is **absent** here: a failure at the array header is deliberately distinguishable from a failure inside element 0, which reports `"failedAtElement": 0`.
 
+**Response `500 Internal Server Error`:** the server's failure — out of memory taking the request in, before anything of it was decoded or written — which a Seq client retries, and the retry stores the batch once. One residual, accepted: the server out of memory in ASP.NET Core's own request pipeline above the receiver (its endpoint middleware, this server's middleware) after the receiver had taken the request in. That is answered `500` while the receiver goes on and writes the batch, so a retry stores it a second time. It takes a heap too full to set up a request's continuation; the log receivers on `/v1/logs` and OTLP/gRPC share it, where the exporter, which does not retry a `500`, counts a stored batch as failed.
+
 ### `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`
 
 Native OpenTelemetry ingestion over HTTP — point any OTLP exporter here (no collector required).
