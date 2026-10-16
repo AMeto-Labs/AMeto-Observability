@@ -302,6 +302,12 @@ internal static class OtlpGzip
 /// out, or one orphaned by an allocation failure inside the doorbell's own timed wait — costs a
 /// look, never a slot, and a waiter that misses its ring looks at the counter on its own every
 /// <see cref="PollInterval"/>.</para>
+///
+/// <para><b>A wait whose caller is gone takes no slot for good</b> (round-6 review R5-M12). A caller's
+/// await of a pending wait can throw — its box, the registration of its continuation — and the wait
+/// went on to take a slot nobody would give back. Each wait carries a <see cref="Claim"/> its caller
+/// abandons then, and whichever of the wait and the caller comes second gives the slot back: no
+/// thread waits a wait out.</para>
 /// </summary>
 internal sealed class OtlpInflateGate
 {
@@ -370,19 +376,89 @@ internal sealed class OtlpInflateGate
     /// Takes a slot, waiting at most the gate's patience. False: none came free — the caller
     /// answers "retry" and must NOT call <see cref="Exit"/>. Throws if <paramref name="ct"/> (the
     /// request's abort) fires, or if the wait itself cannot be had (out of memory for its timer);
-    /// either way no slot is taken and none is owed.
+    /// either way no slot is taken and none is owed. For a caller whose await of the wait may throw
+    /// while it is pending, see the overload with a <see cref="Claim"/>: a receiver's.
     /// </summary>
-    public Task<bool> TryEnterAsync(CancellationToken ct)
+    public Task<bool> TryEnterAsync(CancellationToken ct) => TryEnterAsync(ct, out _);
+
+    /// <summary>
+    /// <see cref="TryEnterAsync(CancellationToken)"/>, and the <paramref name="claim"/> on a wait it began:
+    /// the caller ABANDONS it when its await of the wait throws — its state machine's box, or the
+    /// registration of its continuation, out of memory, with the wait still pending (round-5 H-G, round-6
+    /// review R5-M12). A slot that wait has taken, or takes later, then goes back to the gate, and
+    /// nothing waits for it to end. Null when no wait began: a slot taken at once, or a refusal.
+    /// </summary>
+    public Task<bool> TryEnterAsync(CancellationToken ct, out Claim? claim)
     {
+        claim = null;
         if (ct.IsCancellationRequested) return Task.FromCanceled<bool>(ct);
 
         // The fast path only while nobody waits: a slot an Exit has just rung for belongs to the
         // waiter it rang for, not to whoever arrives in between.
-        return Volatile.Read(ref _waiting) == 0 && TryTake() ? Task.FromResult(true) : WaitAsync(ct);
+        if (Volatile.Read(ref _waiting) == 0 && TryTake()) return Task.FromResult(true);
+
+        // Made BEFORE the wait begins: one that cannot be allocated throws here, with nothing pending.
+        claim = new Claim(this);
+        var wait = WaitAsync(claim, ct);
+        AfterWaitBegunForTest?.Invoke();
+        return wait;
+    }
+
+    /// <summary>
+    /// Test seam: a wait has begun and its claim is the caller's. Throwing from it is the caller's await of the
+    /// pending wait throwing — a registration of its continuation that failed. Null in production.
+    /// </summary>
+    internal Action? AfterWaitBegunForTest;
+
+    /// <summary>
+    /// Who gives back the slot of a wait whose caller may not be there to take the answer (round-6 review
+    /// R5-M12). The caller's await of a pending wait can throw — its state machine's box at its first
+    /// suspension, or the registration of its continuation, out of memory — and the wait then went on to take
+    /// the next freed slot for nobody, the gate one slot narrower until a restart (round-5 H-G). Round 5 had
+    /// the caller wait the wait out on its thread: a pool thread the wait's own doorbell and timer needed, so
+    /// concurrent failures stalled the whole pool for seconds (6.6 s at sixteen, in the review's probe).
+    ///
+    /// <para>One compare-and-swap on each side, and nothing to wait for: the wait marks the claim granted as it
+    /// takes a slot, the caller marks it abandoned when its await throws, and whichever of the two comes
+    /// second gives the slot back. Allocated once per wait — only a gate that is full waits — and held by
+    /// nothing but the wait and its caller.</para>
+    /// </summary>
+    internal sealed class Claim
+    {
+        private const int Waiting = 0, Granted = 1, Abandoned = 2;
+
+        private readonly OtlpInflateGate _gate;
+        private int _state;
+
+        internal Claim(OtlpInflateGate gate) => _gate = gate;
+
+        /// <summary>
+        /// The wait has taken a slot: true when its caller is still there to hold it. False when the caller
+        /// abandoned the claim first — the slot is then given back here, and the answer reaches nobody.
+        /// </summary>
+        internal bool Grant()
+        {
+            if (Interlocked.CompareExchange(ref _state, Granted, Waiting) == Waiting) return true;
+            _gate.Exit();
+            return false;
+        }
+
+        /// <summary>
+        /// Said by a caller whose await of the wait threw, however it threw: it will never take the answer. A
+        /// slot the wait has already taken goes back now; one it takes later goes back as it is taken
+        /// (<see cref="Grant"/>). A wait that ended without a slot — false, cancelled, out of memory — owes
+        /// none. Once: a second call gives nothing back. Allocates nothing and never throws.
+        /// </summary>
+        public void Abandon()
+        {
+            if (Interlocked.CompareExchange(ref _state, Abandoned, Waiting) == Granted
+                && Interlocked.CompareExchange(ref _state, Abandoned, Granted) == Granted)
+                _gate.Exit();
+        }
     }
 
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
-    private async Task<bool> WaitAsync(CancellationToken ct)
+    private async Task<bool> WaitAsync(Claim claim, CancellationToken ct)
     {
         long deadline = Stopwatch.GetTimestamp() + (long)(_patience.TotalSeconds * Stopwatch.Frequency);
 
@@ -391,7 +467,7 @@ internal sealed class OtlpInflateGate
         if (Interlocked.Increment(ref _waiting) == 1 && TryTake())
         {
             Interlocked.Decrement(ref _waiting);
-            return true;
+            return claim.Grant();
         }
 
         bool counted = true;
@@ -400,10 +476,10 @@ internal sealed class OtlpInflateGate
             while (true)
             {
                 long remaining = deadline - Stopwatch.GetTimestamp();
-                if (remaining <= 0) return TryTake();
+                if (remaining <= 0) return TryTake() && claim.Grant();
                 var pause = TimeSpan.FromSeconds(Math.Clamp((double)remaining / Stopwatch.Frequency, 0.001, PollInterval.TotalSeconds));
                 await (WaitForTest?.Invoke(pause, ct) ?? _doorbell.WaitAsync(pause, ct)).ConfigureAwait(false);
-                if (TryTake()) return true;
+                if (TryTake()) return claim.Grant();
             }
         }
         catch
@@ -422,20 +498,6 @@ internal sealed class OtlpInflateGate
             if (counted) Interlocked.Decrement(ref _waiting);
         }
     }
-
-    /// <summary>
-    /// Blocks until <paramref name="wait"/> — a <see cref="TryEnterAsync"/> — has ended, allocating nothing: for a
-    /// caller whose own await of it threw while it was pending (its state machine's box, out of memory), which
-    /// must give back the slot the wait may still take. It ends within the gate's patience and one
-    /// <see cref="PollInterval"/>: <see cref="WaitAsync"/> looks for the last time at its deadline.
-    /// </summary>
-    internal static void WaitOut(Task<bool> wait)
-    {
-        while (!wait.IsCompleted) Thread.Sleep(WaitOutPollMs);
-    }
-
-    /// <summary>How often <see cref="WaitOut"/> looks.</summary>
-    private const int WaitOutPollMs = 5;
 
     private bool TryTake()
     {

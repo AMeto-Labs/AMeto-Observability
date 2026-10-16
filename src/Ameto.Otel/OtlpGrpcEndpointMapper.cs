@@ -288,19 +288,29 @@ public static class OtlpGrpcEndpointMapper
             if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
             {
                 bool entered;
+                OtlpInflateGate.Claim? claim = null;
                 try
                 {
-                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted);
+                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted, out claim);
                 }
-                catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                catch (Exception ex)
                 {
+                    // Whatever ended the await, a slot the wait has taken or takes later goes back (round-6
+                    // review, the LOW on R5-M12's guard). This await is not the handler's first suspension
+                    // (the yield above is), so its box exists; but registering the continuation can still
+                    // throw with the wait pending — the TPL event source's wrapper, a wait that completed
+                    // meanwhile queued to a pool queue that must grow — and the wait then took the next
+                    // freed slot for nobody. The claim needs nothing to wait for (OtlpInflateGate.Claim).
+                    claim?.Abandon();
+                    if (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) throw;
+
                     // The wait itself ran out — its timer, the doorbell's queue node (#126 review
                     // NEW-4): the server's failure, answered as the read's is, UNAVAILABLE. It used to
                     // leave the handler, which hosting answered 500 and a client reads as UNKNOWN,
-                    // never retried. No slot was taken: a wait that fails leaves the gate's count as it
-                    // was, and this await is not the handler's first suspension any more (the yield
-                    // above is), so it cannot be one whose box failed with the wait still pending.
-                    // The body goes back in the finally below.
+                    // never retried. The body goes back before the answer: a registration that threw
+                    // leaves this method's finally guarded off until an await suspends again (L-7).
+                    IngestBufferPool.Return(body);
+                    body = null;
                     await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                     return;
                 }

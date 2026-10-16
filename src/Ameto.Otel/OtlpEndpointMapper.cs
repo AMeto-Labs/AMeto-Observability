@@ -534,18 +534,19 @@ public static class OtlpEndpointMapper
         // A slot before the inflate buffer exists — and the compressed buffer back on every way
         // out that does not reach InflateBody, which returns it itself.
         bool entered;
-        var  wait = gate.TryEnterAsync(ctx.RequestAborted);
-        try { entered = await wait; }
+        OtlpInflateGate.Claim? claim = null;
+        try { entered = await gate.TryEnterAsync(ctx.RequestAborted, out claim); }
         catch
         {
             // This await can be this method's first real suspension (a body read whole without
             // suspending), where its state machine is boxed: a box that cannot be allocated throws here
             // with the wait still pending, and the wait went on to take the next freed slot for nobody
-            // (round-5 H-G). It is waited out instead, allocating nothing — it ends within the gate's
-            // patience — and a slot it took is given back: a wait that granted one can only reach this
-            // catch unread. A wait that failed (cancelled, out of memory) took none.
-            OtlpInflateGate.WaitOut(wait);
-            if (wait.IsCompletedSuccessfully && wait.Result) gate.Exit();
+            // (round-5 H-G). Round 5 waited the wait out here, on a pool thread its own doorbell needed —
+            // concurrent failures stalled the whole pool for seconds (round-6 review R5-M12). The claim
+            // is abandoned instead, with nothing to wait for: a slot the wait has taken, or takes later,
+            // goes back to the gate. A wait that failed (cancelled, out of memory) took none, and a claim
+            // that could not be made means no wait began.
+            claim?.Abandon();
             IngestBufferPool.Return(buffer);
             throw;
         }

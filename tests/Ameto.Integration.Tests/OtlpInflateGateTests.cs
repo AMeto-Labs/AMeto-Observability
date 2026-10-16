@@ -257,6 +257,66 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         Assert.Equal(1, gate.Available);
     }
 
+    // ── A wait whose caller is gone (round-6 review R5-M12) ───────────────────
+    //
+    // A caller's await of a pending wait can throw — its box, the registration of its continuation — and
+    // the wait went on to take a slot nobody would give back. Its caller abandons the wait's claim then,
+    // and whichever of the two comes second gives the slot back; nothing waits the wait out.
+
+    /// <summary>The caller goes first: the slot the wait takes later goes back as it is taken, and the wait leaves nothing behind.</summary>
+    [Fact]
+    public async Task A_wait_whose_caller_abandons_it_gives_back_the_slot_it_takes_and_leaves_the_gate_as_it_was()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));                   // the one slot, held
+
+        var wait = gate.TryEnterAsync(default, out var claim);
+        Assert.NotNull(claim);                                            // a wait began, with its claim
+        Assert.False(wait.IsCompleted);
+        claim!.Abandon();                                                 // its caller's await threw
+        gate.Exit();                                                      // the slot comes free, and the wait takes it...
+        bool taken = await wait.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(!taken && gate.Available == 1, "a wait whose caller had abandoned it kept the slot it took, for nobody");
+
+        var next = gate.TryEnterAsync(default, out var none);             // ...and leaves the gate as it was: the fast path is open
+        Assert.True(next.IsCompletedSuccessfully && next.Result, "a newcomer at a free gate was queued behind an abandoned wait");
+        Assert.Null(none);                                                // a slot taken at once makes no claim
+        gate.Exit();
+        Assert.Equal(1, gate.Available);
+    }
+
+    /// <summary>The wait goes first: its caller's await threw after the slot was granted, and the slot goes back as the claim is abandoned — once.</summary>
+    [Fact]
+    public async Task A_claim_abandoned_after_its_wait_took_a_slot_gives_the_slot_back_once()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromSeconds(5));
+        Assert.True(await gate.TryEnterAsync(default));
+
+        var wait = gate.TryEnterAsync(default, out var claim);
+        gate.Exit();
+        Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(10)));      // granted: a caller there would hold it now
+        Assert.Equal(0, gate.Available);
+        claim!.Abandon();                                                 // but its await threw, and the answer reached nobody
+        Assert.True(gate.Available == 1, "a slot granted to a wait whose caller then abandoned it was not given back");
+        claim.Abandon();                                                  // a second word changes nothing
+        Assert.Equal(1, gate.Available);
+    }
+
+    /// <summary>A wait that ended without a slot owes none: abandoning its claim gives back nothing it did not take.</summary>
+    [Fact]
+    public async Task A_wait_that_ended_without_a_slot_owes_nothing_when_its_claim_is_abandoned()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.FromMilliseconds(100));
+        Assert.True(await gate.TryEnterAsync(default));                   // the test's slot
+
+        var wait = gate.TryEnterAsync(default, out var claim);
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(10)));     // its patience ran out
+        claim!.Abandon();
+        Assert.True(gate.Available == 0, "abandoning a wait that took nothing gave back a slot it never had");
+        gate.Exit();
+        Assert.Equal(1, gate.Available);
+    }
+
     // ── OTLP/HTTP: 503 + Retry-After ──────────────────────────────────────────
 
     [Theory]
