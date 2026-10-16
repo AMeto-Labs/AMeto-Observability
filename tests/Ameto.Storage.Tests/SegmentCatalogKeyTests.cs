@@ -856,6 +856,38 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-6 review, the rest of L-2: an id at or past the ceiling the allocator has NOT handed out yet was
+    /// claimed with no raise — the floor cannot be raised there — and so stayed the allocator's to hand out:
+    /// registered, answered 204, then displaced by the local flush of the block handed out next, its file in no
+    /// catalog (the review's R5Probe_L2). Every id at or past the ceiling under this node's NodeId is refused now.
+    /// </summary>
+    [Fact]
+    public async Task A_peer_wearing_our_id_at_the_ceiling_cannot_take_a_block_not_yet_handed_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        _engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor);
+        Write(5, now);
+        await _engine.FlushHotTierAsync();
+        ulong next = _engine.NextSegmentIdForTest;                        // the block the allocator hands out next
+        Assert.True(next >= StorageEngine.MaxAllocatorFloor, $"setup: the next block is {next}");
+
+        ulong  target    = next + (ulong)LogLevel.Information;
+        string staged    = Path.Combine(_dir, "pushed-next.body");
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{target}.seg");
+        WritePeerSegment(NodeId.Local, target, now, events: 4, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.ConflictAllocatedLocally, _engine.ImportSegment(staged, finalPath));
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();                                 // the next WAL takes block `next`
+        Write(30, now + 2 * TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();                                 // and that block's Information level is `target`
+        var under = Assert.Single(_engine.ListSegments(), s => s.Id.Value == target);
+        Assert.Equal(30u, under.EventCount);   // the local flush's, alone under its key
+    }
+
+    /// <summary>
     /// The same displacement from the other end, through the one arrangement the allocator cannot
     /// rule out. The catalog scan runs as a BACKGROUND task and WAL replay publishes while it is
     /// still walking the directory, so a peer file already sitting under

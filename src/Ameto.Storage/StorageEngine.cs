@@ -42,8 +42,9 @@ public enum SegmentImportOutcome
     /// <summary>
     /// Refused. The id falls inside the span this node's own allocator has already handed out:
     /// a local flush, merge or WAL replay holds it or is about to publish under it, and none of
-    /// those can give a key back. Same deployment fault as above, different evidence — split so
-    /// the endpoint can tell the sender which one it saw.
+    /// those can give a key back — or it is at or past the highest id the allocator can be raised
+    /// to, where nothing keeps the allocator from handing it out later. Same deployment fault as
+    /// above, different evidence — split so the endpoint can tell the sender which one it saw.
     /// </summary>
     ConflictAllocatedLocally,
 
@@ -6869,15 +6870,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
     /// deployment error the 409 exists to report.</para>
     ///
-    /// <para>An id at or past <see cref="MaxAllocatorFloor"/> that the allocator has not handed out is
-    /// claimed with no raise — the raise, <c>id + 1</c>, wrapped the floor past zero for an id at the
-    /// end of the id space (the blocks handed out next were ids already used), as a log's name did (see
-    /// <see cref="ReserveWalBlock"/>); below the end, it left the allocator handing out blocks no replay
-    /// reads back (see <see cref="AdvanceSegmentIdFloor"/>). One the allocator HAS handed out is refused
-    /// like any other (round-5 review L-2): the floor itself may sit at the ceiling, and the allocator
-    /// hand out blocks past it, and an id at or past the ceiling was claimed without asking — an import
-    /// wearing this node's id was registered into the live WAL's reserved block, and the local flush
-    /// then displaced it.</para>
+    /// <para>At or past <see cref="MaxAllocatorFloor"/> the raise that claims an id, <c>id + 1</c>, cannot be
+    /// made: it wrapped the floor past zero for an id at the end of the id space (the blocks handed out next
+    /// were ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>), and below the end it
+    /// left the allocator handing out blocks no replay reads back (see <see cref="AdvanceSegmentIdFloor"/>).
+    /// So an id there that the allocator can still reach — up to <see cref="MaxUsableBlockId"/> — is refused,
+    /// whether it has been handed out or not (round-5 review L-2; round-6, its rest): the floor itself may sit
+    /// at the ceiling and the allocator hand out blocks past it, and an id claimed there without a raise
+    /// stayed the allocator's to hand out — an import wearing this node's id was registered, answered 204,
+    /// and displaced by the local flush of the block handed out next (or at once, when that block was the
+    /// live WAL's). No store reaches the ceiling by flushing: such an id under this node's NodeId is the
+    /// deployment error the refusal reports, or a copied file. Past the last usable block id the allocator
+    /// never reaches it: taken with no raise, as before (round-3 R2-2).</para>
     /// </summary>
     private bool TryClaimLocalSegmentId(ulong id)
     {
@@ -6890,6 +6894,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 return true;
             }
         }
+        if (id <= MaxUsableBlockId) return false;
         RefuseSegmentIdFloor(id < ulong.MaxValue ? id + 1 : id);
         return true;
     }
@@ -7116,9 +7121,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 {
                     _logger.LogError(
                         "Refused replicated segment {File}: {Key} names a segment id this node has " +
-                        "already allocated for itself, so a local flush, merge or WAL replay either " +
-                        "holds it or is about to publish under it — and none of those can give a key " +
-                        "back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
+                        "already allocated for itself, or one past the highest it can reserve, so a local " +
+                        "flush, merge or WAL replay holds it or may publish under it — and none of those can " +
+                        "give a key back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
                         "registered and the body was left where it was staged.",
                         staged.FilePath, key, info.NodeId);
                     return SegmentImportOutcome.ConflictAllocatedLocally;
