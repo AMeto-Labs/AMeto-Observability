@@ -7527,6 +7527,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         catch (Exception) { /* the line is lost; the loop is not */ }
                     }
                     NoteKeptFlushFailures(w.Spill?.Wal);
+                    RefreshSpillFreeMeasure();   // the floor check's measurement, fresh with nothing spilling (L-5; round-6 review)
                 }
                 return;
             }

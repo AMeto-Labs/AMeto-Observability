@@ -356,7 +356,9 @@ public sealed partial class StorageEngine
     /// GetDiskFreeSpaceEx waits out the SMB connect timeout, ~21 s measured, and every swap, despill and
     /// merge waited with it. A measurement older than <see cref="SpillFreeMaxAgeMs"/> (or none yet) asks for
     /// the next one, which runs on the thread pool, one at a time, off every lock; until one has finished,
-    /// the volume is one that cannot say.
+    /// the volume is one that cannot say. And the WAL loop asks for one each tick once the last is that old
+    /// (<see cref="RefreshSpillFreeMeasure"/>), so what a check reads is about a WAL flush interval, or that second if
+    /// longer, old at the most, spilling or not.
     /// </summary>
     private long SpillVolumeFreeBytes()
     {
@@ -382,6 +384,24 @@ public sealed partial class StorageEngine
 
     /// <summary>1 while a measurement runs.</summary>
     private int _spillFreeMeasuring;
+
+    /// <summary>
+    /// Keeps the spill volume's measurement fresh whether or not anything spills (round-6 review, round-5 L-5): the
+    /// floor check reads the last measurement, and only a check asked for the next — and checks run only as a spill is
+    /// entered or rotated, or the despill weighs a failed swap. So the first check after a quiet period read a value
+    /// as old as the period, the constructor's after days without a spill: a spill file opened past the floor, or held
+    /// back from a volume freed since. Called by the WAL loop each tick; one measurement at a time, off every lock
+    /// (<see cref="StartSpillFreeMeasure"/>). With the WAL loop off (<c>WalFlushInterval</c> 0), only the checks ask, as
+    /// before. Never throws.
+    /// </summary>
+    private void RefreshSpillFreeMeasure()
+    {
+        if (!_options.HotTier.SpillEnabled) return;
+        if (Environment.TickCount64 - Volatile.Read(ref _spillFreeMeasuredAt) > SpillFreeMaxAgeMs) StartSpillFreeMeasure();
+    }
+
+    /// <summary>Test hook: the last measurement of the spill volume's free space, read without asking for the next.</summary>
+    internal long SpillFreeMeasuredForTest => Volatile.Read(ref _spillFreeMeasured);
 
     /// <summary>Starts a measurement of the spill volume's free space unless one runs. Never throws, never waits.</summary>
     private void StartSpillFreeMeasure()

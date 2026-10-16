@@ -4520,6 +4520,69 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>An engine whose WAL loop ticks every 20 ms: the tick that keeps the spill volume's measurement fresh.</summary>
+    private StorageEngine QuickTickEngine() => Engine(new ServerOptions
+    {
+        DataDirectory = NewDir(),
+        HotTier = new HotTierOptions
+        {
+            MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillMinFreeDiskBytes = 0,
+            WalFlushInterval = TimeSpan.FromMilliseconds(20),
+        },
+    });
+
+    /// <summary>
+    /// Round-5 review L-5 (round-6 review). The floor check reads the last measurement of the spill volume's free
+    /// space, and only a check asked for the next — checks run only as a spill is entered or rotated, or the despill
+    /// weighs a failed swap. After a quiet period the first check read a value as old as the period (the
+    /// constructor's, after days without a spill): a spill file opened past the floor. The WAL loop keeps it fresh.
+    /// </summary>
+    [Fact]
+    public async Task The_spill_volume_is_measured_again_while_nothing_spills()
+    {
+        var  engine = QuickTickEngine();
+        long free   = 5_000_000_000;
+        engine._volumeMeasureForTest = _ => Volatile.Read(ref free);
+        try
+        {
+            WaitFor(() => engine.SpillFreeMeasuredForTest == 5_000_000_000, "the volume to be measured", ShortGuard);
+            Volatile.Write(ref free, 1_234);   // the volume fills, nothing spilling
+            WaitFor(() => engine.SpillFreeMeasuredForTest == 1_234, "the volume to be measured again with nothing spilling", ShortGuard);
+        }
+        finally { await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review L-5, the other half of the refresh (round-6 review: pinned by nothing, the review's M19). A
+    /// measurement that does not answer — a share past its SMB timeout — holds one pool thread, and the next is asked
+    /// for only once it is back: the WAL tick asking every 20 ms adds none beside it.
+    /// </summary>
+    [Fact]
+    public async Task The_spill_volume_is_measured_one_measurement_at_a_time()
+    {
+        var engine = QuickTickEngine();
+        int running = 0, most = 0, measured = 0;
+        engine._volumeMeasureForTest = _ =>
+        {
+            int now = Interlocked.Increment(ref running);
+            for (int seen = Volatile.Read(ref most); now > seen && Interlocked.CompareExchange(ref most, now, seen) != seen; seen = Volatile.Read(ref most)) { }
+            Thread.Sleep(300);   // a share slow to answer
+            Interlocked.Decrement(ref running);
+            Interlocked.Increment(ref measured);
+            return 5_000_000_000;
+        };
+        try
+        {
+            WaitFor(() => Volatile.Read(ref measured) >= 3, "three measurements, one after another", ShortGuard);
+            Assert.True(Volatile.Read(ref most) == 1, $"{Volatile.Read(ref most)} measurements ran at once");
+        }
+        finally
+        {
+            engine._volumeMeasureForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A log the sweeps cannot look at (round-5 L-18) ───────────────────────
 
     /// <summary>
