@@ -4291,6 +4291,148 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
     }
 
+    // ── A despill's give-up and its marker (round-6 R5-M7) ───────────────────
+
+    /// <summary>A one-slot engine that despills nothing until <paramref name="hold"/> completes.</summary>
+    private static StorageEngine HeldOneSlotEngine(ServerOptions opts, TaskCompletionSource hold)
+    {
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        try { return OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M7. A despill whose publish failed, and whose retry could not start, keeps its tier
+    /// when its block's completion marker cannot be removed (the tier is served until shutdown, the block is
+    /// the next start's). Nothing bounded those tiers: under the out of memory that stops a retry from
+    /// starting, every despilled block parked one, until the process was killed. At most a flush slot's
+    /// worth are kept now; past that the tier is let go, and the block, whole on disk, waits all the same.
+    /// </summary>
+    [Fact]
+    public async Task Despilled_tiers_kept_for_markers_that_cannot_be_removed_are_no_more_than_the_flush_slots()
+    {
+        const int Blocks = 4;
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        for (int b = 0; b < Blocks; b++) EarlierRunSpill(opts, dir, 9_000 + (ulong)b * 6, b * 100, 100);
+        var hold   = new TaskCompletionSource();
+        var engine = HeldOneSlotEngine(opts, hold);
+        int kept;
+        try
+        {
+            engine._beforeSegmentPublishForTest  = _ => throw new IOException("test: the publish fails");
+            engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be set up");
+            engine._removeFlushMarkerForTest     = _ => throw new OutOfMemoryException("test: the marker's removal cannot allocate");
+            engine._despillRetryDelay            = TimeSpan.FromMinutes(10);
+            hold.SetResult();
+            WaitFor(() => engine.DespillsCompletedForTest >= Blocks, "every block's despill to give up", ShortGuard);
+            kept = engine.FrozenTierCountForTest;
+        }
+        finally { await engine.DisposeAsync(); }
+        Assert.True(kept <= engine.FlushSlots,
+            $"{kept} despilled tiers kept in memory for markers that could not be removed, past the {engine.FlushSlots} flush slot(s)");
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(Blocks * 100, ReadAll(next).Count);   // ReadAll asserts no event is there twice
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M7: a despill whose FLUSH failed wrote no marker — the marker is the flush's last step
+    /// — and gives up without keeping its tier, whatever a marker's removal would do. It kept one whenever the
+    /// removal threw, and the removal allocated (and on Linux fsynced) with or without a marker.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_whose_flush_failed_gives_up_without_keeping_its_tier()
+    {
+        const int Blocks = 3;
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        for (int b = 0; b < Blocks; b++) EarlierRunSpill(opts, dir, 9_000 + (ulong)b * 6, b * 100, 100);
+        var hold   = new TaskCompletionSource();
+        var engine = HeldOneSlotEngine(opts, hold);
+        int kept;
+        try
+        {
+            engine._beforeLevelWriteForTest      = _ => throw new IOException("test: the flush's level write fails");
+            engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be set up");
+            engine._removeFlushMarkerForTest     = _ => throw new OutOfMemoryException("test: the marker's removal cannot allocate");
+            engine._despillRetryDelay            = TimeSpan.FromMinutes(10);
+            hold.SetResult();
+            WaitFor(() => engine.DespillsCompletedForTest >= Blocks, "every block's despill to give up", ShortGuard);
+            kept = engine.FrozenTierCountForTest;
+        }
+        finally { await engine.DisposeAsync(); }
+        Assert.True(kept == 0, $"{kept} despilled tiers kept in memory though no attempt wrote a marker");
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(Blocks * 100, ReadAll(next).Count);
+    }
+
+    /// <summary>
+    /// Round-6 review (LOW, the round-5 reviewer's MA7): a REAL removal failure — the marker held open, without
+    /// FILE_SHARE_DELETE, by a scanner or a backup agent — keeps the give-up from unlinking the levels under
+    /// the marker, which the block's next despill would have taken for written, deleting its spill file. Every
+    /// other test throws from the seam above the removal, so a classification that read any failure of the
+    /// write-through move as "no marker" passed them all and lost the block. Windows only: elsewhere an open
+    /// file is moved and unlinked.
+    /// </summary>
+    [StreamingMergeCrashSafetyTests.WindowsFact]
+    public async Task A_marker_held_open_keeps_the_give_up_from_unlinking_its_levels()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 0, 100);
+        string marker = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.flushed");
+        var hold   = new TaskCompletionSource();
+        var engine = HeldOneSlotEngine(opts, hold);
+        FileStream? held = null;
+        try
+        {
+            int registrations = 0;
+            engine._beforeSegmentPublishForTest = _ =>
+            {
+                if (Interlocked.Increment(ref registrations) != 1) return;
+                held = new FileStream(marker, FileMode.Open, FileAccess.Read, FileShare.Read);   // no FILE_SHARE_DELETE: the move fails
+                throw new IOException("test: the publish fails");
+            };
+            engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be set up");
+            engine._despillRetryDelay            = TimeSpan.FromMilliseconds(50);
+            hold.SetResult();
+            WaitFor(() => engine.DespillsCompletedForTest >= 1 && engine.HeavyPhasesInFlight == 0, "the despill to give up", ShortGuard);
+            await Task.Delay(300);   // retry delays: a block given up, and queued again, would be despilled here
+        }
+        finally
+        {
+            held?.Dispose();
+            await engine.DisposeAsync();
+        }
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        int found = ReadAll(next).Count;
+        Assert.True(found == 100, $"{found} of 100 events: the give-up took a marker it could not remove for none, and the block was lost");
+    }
+
+    /// <summary>
+    /// Round-6 review (LOW, two reviewers): on Linux the removal of a block's marker fsynced the WAL directory,
+    /// and threw when that failed, even when there was no marker. On a mount whose directory fsync fails
+    /// (vboxsf, some FUSE and CIFS mounts, a failing disk) every flush retry then failed at its first step for
+    /// good, every despill give-up kept its tier and every failed-replay hand-off threw. A marker that is not
+    /// there needs no fsync now. Linux and macOS only: Windows' removal is a write-through move.
+    /// </summary>
+    [Fact]
+    public async Task On_linux_a_block_without_a_marker_is_cleaned_up_whatever_the_directory_fsync_says()
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return;
+        string dir = NewDir();
+        await using var engine = Engine(Options(dir));
+        engine._syncWalDirectoryForTest = static () => false;
+        var thrown = Record.Exception(() => engine.DeleteUnpublishedLevelFiles(9_000));
+        Assert.True(thrown is null, $"a block with no marker failed its clean-up on the directory's fsync: {thrown?.Message}");
+    }
+
     // ── A text that ends in a NUL (round-6 R5-M5) ────────────────────────────
 
     /// <summary>

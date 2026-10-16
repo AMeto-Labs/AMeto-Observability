@@ -342,12 +342,21 @@ jobs:
         run: |
           set -o pipefail
           dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
-            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker" \
+            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker|FullyQualifiedName~_cannot_open_is_kept_and_its_events_come_back|FullyQualifiedName~whose_marker_the_|FullyQualifiedName~whose_pool_the_startup_replay_cannot_open|FullyQualifiedName~On_linux_a_block_without_a_marker_is_cleaned_up" \
             --logger "console;verbosity=normal" 2>&1 | tee sweep-output.txt
 
+          # And (round 6) the recovery reads and the marker checks that a look or an open the file system
+          # refuses must not read as "gone" (R5-M6), and the removal of a marker that is not there, which
+          # fsynced the directory here and failed with it (R5-M7's LOW).
           for t in Pool_files_whose_log_is_gone_are_swept_at_the_start \
                    A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker \
-                   A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker; do
+                   A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker \
+                   A_wal_the_startup_replay_cannot_open_is_kept_and_its_events_come_back \
+                   A_spill_file_the_despill_cannot_open_is_kept_and_its_events_come_back \
+                   A_wal_whose_pool_the_startup_replay_cannot_open_keeps_its_templates \
+                   A_flushed_wal_whose_marker_the_start_cannot_look_at_is_not_written_twice \
+                   A_flushed_spill_file_whose_marker_the_despill_cannot_look_at_is_not_written_twice \
+                   On_linux_a_block_without_a_marker_is_cleaned_up_whatever_the_directory_fsync_says; do
             if ! grep -q "Passed Ameto.Storage.Tests.IngestWriteAndSpillTests.$t" sweep-output.txt; then
               echo "::error::IngestWriteAndSpillTests.$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1

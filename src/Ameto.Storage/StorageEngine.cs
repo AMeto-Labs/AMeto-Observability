@@ -5674,7 +5674,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path);
+            // Never throws (round-6 review R5-M7): the marker is the flush's last step, so a flush that
+            // failed has written none of its own — what a despill's give-up relies on to give up without
+            // a removal (AbandonDespilledTier) — and a throw from this line was a failed flush with one.
+            try { _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path); }
+            catch (Exception) { /* the line is lost */ }
         }
     }
 
@@ -5691,25 +5695,42 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// an unlink and an fsync of the directory; on Windows, where a delete is committed lazily, a
     /// write-through move to a name nothing reads (<see cref="VoidedMarkerPath"/>) and then a plain
     /// delete of that, which the next start sweeps if it is lost.</para>
+    ///
+    /// <para>A marker that is not there — gone, as the file system says it (<see cref="Look"/>) — is the
+    /// common case, a give-up whose flush never wrote one, and needs neither (round-6 review, the LOW of
+    /// two reviewers): the directory was fsynced, and a failed fsync thrown, for a marker that never was,
+    /// so on a mount whose directory fsync fails every retry failed for good at its first step, every
+    /// despill give-up parked and every failed-replay hand-off threw. A look that fails is not "gone":
+    /// the removal is tried, and made durable, as for a marker that is there.</para>
+    ///
+    /// <para><paramref name="marker"/> and <paramref name="voided"/>, when the caller has them: made
+    /// before the despill whose give-up runs this in an out of memory (round-6 review R5-M7).</para>
     /// </summary>
-    private void RemoveFlushMarkerDurably(ulong firstSegId)
+    private void RemoveFlushMarkerDurably(ulong firstSegId, string? marker = null, string? voided = null)
     {
         _removeFlushMarkerForTest?.Invoke(firstSegId);
-        string marker = FlushMarkerPath(firstSegId);
+        marker ??= FlushMarkerPath(firstSegId);
+        if (Look(marker) == Presence.Gone) return;
         if (OperatingSystem.IsWindows())
         {
-            string voided = VoidedMarkerPath(firstSegId);
+            voided ??= VoidedMarkerPath(firstSegId);
             try { DurableFile.Replace(marker, voided); }
-            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070002)) { return; }   // ERROR_FILE_NOT_FOUND: there is none
+            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070002)) { return; }   // ERROR_FILE_NOT_FOUND: gone since the look
             try { File.Delete(voided); }
             catch (Exception) { /* a name nothing reads; swept at the next start */ }
             return;
         }
 
         File.Delete(marker);   // a file that is not there is no error; anything else throws
-        if ((OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) && !DurableFile.SyncDirectory(_walDir))
+        if ((OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) && !SyncWalDirectory())
             throw new IOException($"The removal of {marker} could not be made durable: the fsync of {_walDir} failed");
     }
+
+    /// <summary>fsync of the WAL directory (<see cref="DurableFile.SyncDirectory"/>), or the test's answer.</summary>
+    private bool SyncWalDirectory() => _syncWalDirectoryForTest?.Invoke() ?? DurableFile.SyncDirectory(_walDir);
+
+    /// <summary>Test seam: answers the WAL directory's fsync (false: it failed). Null in production.</summary>
+    internal Func<bool>? _syncWalDirectoryForTest;
 
     /// <summary>Where <see cref="RemoveFlushMarkerDurably"/> moves a marker on Windows: a name no recovery reads, swept at the start.</summary>
     private string VoidedMarkerPath(ulong firstSegId) =>

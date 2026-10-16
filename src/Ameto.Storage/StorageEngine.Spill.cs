@@ -916,21 +916,52 @@ public sealed partial class StorageEngine
     /// then. The next start finds the block's levels (and the marker, if it is still there) and finishes
     /// it as it finishes a block a crash left: the despill keeps the levels the boot scan accepted and
     /// writes the rest, or, under the marker, only removes the spill file.</para>
+    ///
+    /// <para>Only when this attempt may have LEFT a marker (round-6 review R5-M7): <paramref name="mayHaveMarker"/>
+    /// is false for a give-up before the flush, and for a flush that failed — the marker is its last step,
+    /// and it never throws (WriteFlushCompletionMarker) — and true for a publish that failed and for a retry
+    /// that ended. It parked on any throw of the removal, which allocated (and on Linux fsynced) whether or
+    /// not there was a marker: in an out of memory every despilled block parked, a tier each, until the
+    /// process was killed. The marker's paths are made before the despill (<paramref name="marker"/>,
+    /// <paramref name="voided"/>), and at most <see cref="FlushSlots"/> tiers are parked: past that a tier
+    /// is let go — unlisted and retired — and the block waits for the next start all the same, whole on
+    /// disk (its spill file, and its levels with the marker over them), its events unserved meanwhile.</para>
     /// </summary>
-    private bool AbandonDespilledTier(HotTierSegment tier, SpillFile file)
+    private bool AbandonDespilledTier(HotTierSegment tier, SpillFile file, bool mayHaveMarker, string? marker, string? voided)
     {
-        try { RemoveFlushMarkerDurably(file.SegId); }
-        catch (Exception ex)
+        if (mayHaveMarker)
         {
-            try
+            try { RemoveFlushMarkerDurably(file.SegId, marker, voided); }
+            catch (Exception ex)
             {
-                _logger.LogError(ex,
-                    "Despill of {File}: its completion marker could not be removed after the despill failed — its tier stays in " +
-                    "memory, served, until shutdown, and the block is finished by the next start", file.Path);
+                bool kept = Interlocked.Increment(ref _parkedDespillTiers) <= FlushSlots;
+                if (!kept)
+                {
+                    Interlocked.Decrement(ref _parkedDespillTiers);
+                    LetGoOfTier(tier);
+                }
+                try
+                {
+                    _logger.LogError(ex, kept
+                        ? "Despill of {File}: its completion marker could not be removed after the despill failed — its tier stays in " +
+                          "memory, served, until shutdown, and the block is finished by the next start"
+                        : "Despill of {File}: its completion marker could not be removed after the despill failed — with every flush slot's " +
+                          "worth of tiers kept so already, its tier is let go: the block's events are on disk and come back at the next start",
+                        file.Path);
+                }
+                catch (Exception) { /* the line is lost; the tier and the block are kept all the same */ }
+                return false;
             }
-            catch (Exception) { /* the line is lost; the tier and the block are kept all the same */ }
-            return false;
         }
+        LetGoOfTier(tier);
+        try { DeleteUnpublishedLevelFiles(file.SegId, file.PublishedLevels); }
+        catch (Exception) { /* the next despill's flush meets a level still there, fails, and its retry unlinks it */ }
+        return true;
+    }
+
+    /// <summary>Unlists a despilled tier and retires it (freed once no reader holds it). Never throws.</summary>
+    private void LetGoOfTier(HotTierSegment tier)
+    {
         try
         {
             lock (_frozenLock)
@@ -940,10 +971,17 @@ public sealed partial class StorageEngine
         catch (Exception) { /* not listed */ }
         try { RetireHotTier(tier); }
         catch (Exception) { /* its native memory is lost */ }
-        try { DeleteUnpublishedLevelFiles(file.SegId, file.PublishedLevels); }
-        catch (Exception) { /* the next despill's flush meets a level still there, fails, and its retry unlinks it */ }
-        return true;
     }
+
+    /// <summary>
+    /// The despilled tiers kept listed, with their blocks in flight, by <see cref="AbandonDespilledTier"/>
+    /// until shutdown frees them — at most <see cref="FlushSlots"/> (round-6 review R5-M7).
+    /// </summary>
+    private int _parkedDespillTiers;
+
+    /// <summary>Test hook: the despilled tiers parked so far (see <see cref="_parkedDespillTiers"/>).</summary>
+    internal int ParkedDespillTiersForTest => Volatile.Read(ref _parkedDespillTiers);
+
     private int _despillsCompleted;
 
     /// <summary>
@@ -990,11 +1028,15 @@ public sealed partial class StorageEngine
         HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
         try
         {
+            // The marker's paths, made here, before anything is owned: a give-up removes the marker in the
+            // out of memory that stopped its retry, and made them there (round-6 review R5-M7).
+            string marker = FlushMarkerPath(file.SegId), voided = VoidedMarkerPath(file.SegId);
+
             // Flushed in full by an earlier life, which stopped before the unlink. Asked as a look (round-6
             // review R5-M6): File.Exists answered false for a marker it could not look at as well, and the
             // block was despilled — every level written a second time. One that cannot be looked at
             // answers neither way: the block is tried again later, read by nothing meanwhile.
-            switch (Look(FlushMarkerPath(file.SegId)))
+            switch (Look(marker))
             {
                 case Presence.There:
                     DeleteSpillFiles(file);
@@ -1052,8 +1094,8 @@ public sealed partial class StorageEngine
                 // Listed and counted, and nothing of it written: given up as a despill whose retry could
                 // not start (AbandonDespilledTier), its block queued again by the finally. Left listed —
                 // as a wait that threw here left it — it was served for good beside the block's next
-                // despill.
-                parked = !AbandonDespilledTier(tier, file);
+                // despill. No flush ran: no marker of this attempt to remove (R5-M7).
+                parked = !AbandonDespilledTier(tier, file, mayHaveMarker: false, marker, voided);
                 throw;
             }
             List<SegmentInfo> written;
@@ -1070,7 +1112,8 @@ public sealed partial class StorageEngine
             // The FLUSH failed — not this method's await of it (see TryFlushAsync's heavy phase).
             catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
             {
-                slotTransferred = HandFailedDespillToRetry(ex, tier, file, out parked);
+                // A flush that failed wrote no marker: the marker is its last step, and never throws (R5-M7).
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file, mayHaveMarker: false, marker, voided, out parked);
                 return;
             }
             finally { ReleaseHeavyPermit(); }
@@ -1081,7 +1124,8 @@ public sealed partial class StorageEngine
             try { PublishFlushedTier(written, tier, file.Path, file.SegId); }
             catch (Exception ex)
             {
-                slotTransferred = HandFailedDespillToRetry(ex, tier, file, out parked);
+                // The flush completed: its marker is there (R5-M7).
+                slotTransferred = HandFailedDespillToRetry(ex, tier, file, mayHaveMarker: true, marker, voided, out parked);
                 return;
             }
             DespillPublished(file.SegId, written, afterRetry: false);
@@ -1116,7 +1160,11 @@ public sealed partial class StorageEngine
     /// allocates — reached the finally, which gave the slot back, ended the heavy phase and queued the
     /// block again, leaving the tier listed for good, served beside the block's second despill.
     /// </summary>
-    private bool HandFailedDespillToRetry(Exception ex, HotTierSegment tier, SpillFile file, out bool parked)
+    /// <param name="mayHaveMarker">Whether the failed attempt may have left the block's completion marker: its publish failed (see <see cref="AbandonDespilledTier"/>).</param>
+    /// <param name="marker">The block's marker path, made before the despill (<see cref="FlushMarkerPath"/>).</param>
+    /// <param name="voided">Where its removal moves it on Windows, made before the despill (<see cref="VoidedMarkerPath"/>).</param>
+    private bool HandFailedDespillToRetry(Exception ex, HotTierSegment tier, SpillFile file, bool mayHaveMarker,
+                                          string? marker, string? voided, out bool parked)
     {
         parked = false;
         try
@@ -1133,7 +1181,7 @@ public sealed partial class StorageEngine
         bool started = false;
         try
         {
-            var (onPublished, onAbandoned) = DespillRetryCallbacks(tier, file);
+            var (onPublished, onAbandoned) = DespillRetryCallbacks(tier, file, marker, voided);
             started = TryScheduleFlushRetry(tier, file.Path, file.SegId, onPublished, file.PublishedLevels, onAbandoned);
         }
         catch (Exception) { /* its callbacks could not be allocated: nothing started */ }
@@ -1141,7 +1189,7 @@ public sealed partial class StorageEngine
             // No retry could be started (out of memory): the block is read from its file again later
             // instead, so the tier is given up here, unlisted and retired, with the levels the attempt
             // moved into place, as the retry would — unless its marker stays, and then so does it.
-            parked = !AbandonDespilledTier(tier, file);
+            parked = !AbandonDespilledTier(tier, file, mayHaveMarker, marker, voided);
         return started;
     }
 
@@ -1153,14 +1201,16 @@ public sealed partial class StorageEngine
     /// of the block was allocated on its entry, before any try, and an out-of-memory there left the
     /// slot the loop took for it held for good.
     /// </summary>
-    private (Action<List<SegmentInfo>> OnPublished, Action OnAbandoned) DespillRetryCallbacks(HotTierSegment tier, SpillFile file)
+    private (Action<List<SegmentInfo>> OnPublished, Action OnAbandoned) DespillRetryCallbacks(
+        HotTierSegment tier, SpillFile file, string? marker, string? voided)
     {
         _despillRetryCallbacksForTest?.Invoke();
         return (retried => DespillPublished(file.SegId, retried, afterRetry: true),
                 () =>
                 {
-                    // A tier kept with its marker keeps its block in flight (AbandonDespilledTier).
-                    if (AbandonDespilledTier(tier, file)) RetrySpillLater(file.SegId);
+                    // A tier kept with its marker keeps its block in flight (AbandonDespilledTier). A retry
+                    // that ended may have left one: its last attempt's flush, and a publish that failed.
+                    if (AbandonDespilledTier(tier, file, mayHaveMarker: true, marker, voided)) RetrySpillLater(file.SegId);
                 });
     }
 
