@@ -5854,6 +5854,20 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review, the LOW on M-B's polling: a contended take of an owner semaphore was up to two ticks of the
+    /// Windows timer late (31 ms), its pauses doubling to 16 ms, which the timer rounds up to two of its 15.6 ms
+    /// ticks. They stop at 8 ms now — one tick there (16 ms measured), the bound of the polling's lateness.
+    /// </summary>
+    [Fact]
+    public void A_contended_take_of_an_owner_semaphore_pauses_at_most_one_timer_tick_between_its_tries()
+    {
+        int pause  = 1;
+        var pauses = new int[10];
+        for (int i = 0; i < pauses.Length; i++) pauses[i] = StorageEngine.NextOwnerPollPause(ref pause);
+        Assert.Equal([1, 2, 4, 8, 8, 8, 8, 8, 8, 8], pauses);
+    }
+
+    /// <summary>
     /// A seam that runs out of memory once, at the first pause of a contended take of <paramref name="target"/> while
     /// <paramref name="armed"/> says so — and lets go of it as it does, as the holder ending just then: a waiter
     /// queued in the semaphore would be handed it, a poller leaves it to the next taker.

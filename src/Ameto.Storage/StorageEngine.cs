@@ -3331,9 +3331,26 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     // memory there is a failed wait and no more. The pause carries the cancellation and the deadline.
     // (WaitAsync with neither returns its queued waiter itself, allocating nothing after the link, but
     // a cancellation or a deadline would still need a way to take a waiter out of the queue.)
+    //
+    // The cost, stated (round-6 review). The waiters are not ordered, and the order is against the one that has
+    // waited longest: a taker that comes as the semaphore is let go takes it with its first try, while a poller's
+    // next try is up to a pause away. Under a stream of takers each arriving within a timer tick of the release
+    // before it — fresh heavy phases under sustained overload on a width-1 host — a merge or the oldest tier's
+    // heavy phase polling for the permit is passed by every one of them until the stream breaks (a synthetic
+    // chain of 200 ms holders, successors 1-8 ms after each release: passed by 25 of 25 in 4-5 trials of 6, at
+    // an 8 ms pause as at 16 — the pause below does not change it;
+    // the round-5 review measured merges about halving on such a host, with no cost in throughput, 503s,
+    // shutdown or idle CPU). And a contended take is up to a pause late: Windows rounds every pause up to its
+    // 15.6 ms timer tick, so a pause of 16 ms was two ticks (31 ms measured, p50 and max alike), 8 ms is one
+    // (16 ms) — hence OwnerPollMaxMs; elsewhere the timer is ~1 ms, and a waiter polls at most 125 times a
+    // second, one Task.Delay each. A ticket would order the waiters, but one that dies with its turn — an out
+    // of memory at its pause — would hold every waiter behind it: M-B's failure, which polling rules out.
 
-    /// <summary>The longest pause between two tries at an owner semaphore.</summary>
-    private const int OwnerPollMaxMs = 16;
+    /// <summary>
+    /// The longest pause between two tries at an owner semaphore: under one tick of the Windows timer (15.6 ms),
+    /// which rounds a pause up to a whole tick — at 16 ms two (round-6 review).
+    /// </summary>
+    private const int OwnerPollMaxMs = 8;
 
     /// <summary>
     /// The pause before the next try at <paramref name="semaphore"/>: <paramref name="pauseMs"/>, which
@@ -3345,10 +3362,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private Task OwnerPoll(SemaphoreSlim semaphore, ref int pauseMs, long deadline, CancellationToken ct)
     {
         _beforeOwnerPollForTest?.Invoke(semaphore);
-        int pause = pauseMs;
-        pauseMs = Math.Min(2 * pause, OwnerPollMaxMs);
+        int pause = NextOwnerPollPause(ref pauseMs);
         if (deadline != 0) pause = (int)Math.Clamp(deadline - Environment.TickCount64, 0, pause);
         return Task.Delay(pause, ct);
+    }
+
+    /// <summary>The pause before a contended take's next try, from 1 ms, and the one after it: doubled, up to <see cref="OwnerPollMaxMs"/>.</summary>
+    internal static int NextOwnerPollPause(ref int pauseMs)
+    {
+        int pause = pauseMs;
+        pauseMs = Math.Min(2 * pause, OwnerPollMaxMs);
+        return pause;
     }
 
     /// <summary>
