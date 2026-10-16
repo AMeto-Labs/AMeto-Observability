@@ -6271,13 +6271,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// false for a file it could not look at as well as for one that is gone, and the sweeps that delete
     /// what a gone log leaves — its pool, its completion marker — took a failure to look (a share that
     /// did not answer, an access check) for the log's absence: a live log's pool deleted, its templates
-    /// lost to its replay. <see cref="Presence.Gone"/> only when the file system says so.
+    /// lost to its replay. <see cref="Presence.Gone"/> only when the file system says so. Every check in
+    /// the log engine that decides from a file's presence whether a log, a marker or a merge's file is
+    /// gone goes through here (round-6 review R5-M6), and the recovery reads open their file the same way
+    /// (<see cref="WriteAheadLog.OpenForRecovery"/>).
     /// </summary>
     private static Presence Look(string path)
     {
         if (LookFailsForTest.Value is { } fails && fails(path)) return Presence.Unknown;
         try
         {
+            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Look);
             File.GetAttributes(path);
             return Presence.There;
         }
@@ -6314,7 +6318,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     {
         ulong segId = flushingBlock;
         if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;
-        if (!File.Exists(walFile) || File.Exists(FlushMarkerPath(segId))) return false;
+        // Looks, not File.Exists (round-6 review R5-M6): a log that cannot be looked at is handed over
+        // (the despill reads it with its backoff), and so is one whose marker cannot be (the despill's
+        // own check waits for that look to answer); only a log that is gone, or one whose marker is
+        // there, is not.
+        if (Look(walFile) == Presence.Gone || Look(FlushMarkerPath(segId)) == Presence.There) return false;
 
         BeforeFailedReplayHandOffForTest.Value?.Invoke(walFile);
         byte published = 0;
@@ -6418,12 +6426,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // after the first one was read, and a first entry that could not be read — an
         // out-of-memory decoding its exception — failed, at every start, the replay of a log that
         // only had to be deleted.
-        if (segId != 0 && File.Exists(FlushMarkerPath(segId)))
+        //
+        // Asked as a look (round-6 review R5-M6): File.Exists answered false for a marker it could not
+        // look at as well, and the log was replayed — every level of a flushed block written a second
+        // time. A marker that cannot be looked at answers neither way: the log is read again, by the
+        // despill, whose own check waits for the look to answer (the catch hands it over).
+        if (segId != 0)
         {
-            reader.Dispose();
-            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
-            DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
-            return;
+            switch (Look(FlushMarkerPath(segId)))
+            {
+                case Presence.There:
+                    reader.Dispose();
+                    _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+                    DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
+                    return;
+                case Presence.Unknown:
+                    throw new IOException(
+                        $"Whether the flush of WAL {walFile} completed cannot be told: its completion marker could not be looked at");
+            }
         }
 
         // Empty or corrupt WAL — clean up

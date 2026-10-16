@@ -295,6 +295,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // false for a file it could not look at as well, and an existing log taken for a new one had
         // its header written over, its write offset back at 0 — the entries behind it unreachable.
         long fileSize = FileHeaderSize + initialCapacity;
+        FileRefusal.ThrowIfRefused(_filePath, FileRefusal.Access.Open);
         _fileStream  = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         long found   = _fileStream.Length;
         _foundAtOpen = found;
@@ -345,6 +346,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _lastFlushedOffset = FileHeaderSize + _writeOffset;
 
         // Open companion pool file (template index → string) for crash recovery
+        FileRefusal.ThrowIfRefused(_filePath + ".pool", FileRefusal.Access.Open);
         _poolStream = new FileStream(_filePath + ".pool",
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolStream.Seek(0, SeekOrigin.End);
@@ -1377,8 +1379,11 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     public static Dictionary<ushort, string> LoadPool(string poolPath)
     {
         var dict = new Dictionary<ushort, string>();
-        if (!File.Exists(poolPath)) return dict;
-        using var fs = new FileStream(poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        // No pool only when the file system says it is gone (round-6 review R5-M6): File.Exists answered
+        // false for a pool it could not look at as well, and the replay or the despill went on with no
+        // rows — every event of the block without its template or service — and then deleted the log.
+        using var fs = OpenForRecovery(poolPath, FileShare.ReadWrite);
+        if (fs is null) return dict;
         Span<byte> hdr = stackalloc byte[4];
         while (fs.ReadAtLeast(hdr, 4, throwOnEndOfStream: false) == 4)
         {
@@ -1426,6 +1431,24 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     /// <summary>Test seam: called by <see cref="LoadPool"/> with each row's index before it reads the row. Null in production.</summary>
     internal static readonly AsyncLocal<Action<ushort>?> BeforePoolRowForTest = new();
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for a recovery read: null when the file system says it is gone —
+    /// FileNotFoundException or DirectoryNotFoundException — and only then (round-6 review R5-M6). Any
+    /// other failure is thrown: a file that could not be opened is a read that failed, and recovery keeps
+    /// the log and reads it again; it is not a file that is not there. Asked of
+    /// <see cref="FileRefusal"/> first, which is how a test makes the open fail.
+    /// </summary>
+    internal static FileStream? OpenForRecovery(string path, FileShare share)
+    {
+        try
+        {
+            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Open);
+            return new FileStream(path, FileMode.Open, FileAccess.Read, share);
+        }
+        catch (FileNotFoundException)      { return null; }
+        catch (DirectoryNotFoundException) { return null; }
+    }
 
     /// <summary>The format this build writes, and the newest it reads (see WalVersion).</summary>
     public const ushort FormatVersion = WalVersion;
@@ -1511,14 +1534,33 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             HeaderRecordsEntries = recordsEntries;
         }
 
-        /// <summary>Opens <paramref name="walPath"/>; a missing, short or foreign file reads as a log of no entries.</summary>
+        /// <summary>
+        /// Opens <paramref name="walPath"/>; a short or foreign file reads as a log of no entries, and so
+        /// does a missing one — missing as the file system says it, FileNotFound or DirectoryNotFound
+        /// (round-6 review R5-M6). It asked File.Exists, which answers false for a file it could not look
+        /// at as well, and the callers delete a log that reads as empty: the startup replay's "empty or
+        /// corrupt WAL" branch deleted it with its pool and marker, and the despill an unreadable spill
+        /// file. Any other failure to open it is thrown now, and the callers keep the log and read it
+        /// again. Sized and mapped through the one handle it opened, not by path.
+        /// </summary>
         public static RecoveryReader Open(string walPath)
         {
-            if (!File.Exists(walPath)) return new RecoveryReader();
-            long fileSize = new FileInfo(walPath).Length;
-            if (fileSize < FileHeaderSize) return new RecoveryReader();
-
-            var mmf = MemoryMappedFile.CreateFromFile(walPath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.Read);
+            var fs = OpenForRecovery(walPath, FileShare.Read);
+            if (fs is null) return new RecoveryReader();
+            MemoryMappedFile mmf;
+            long fileSize;
+            try
+            {
+                fileSize = fs.Length;
+                if (fileSize < FileHeaderSize) { fs.Dispose(); return new RecoveryReader(); }
+                mmf = MemoryMappedFile.CreateFromFile(fs, null, fileSize, MemoryMappedFileAccess.Read,
+                                                      HandleInheritability.None, leaveOpen: false);
+            }
+            catch
+            {
+                fs.Dispose();
+                throw;
+            }
             MemoryMappedViewAccessor? view = null;
             byte* ptr = null;
             try

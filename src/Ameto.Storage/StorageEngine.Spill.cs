@@ -990,12 +990,19 @@ public sealed partial class StorageEngine
         HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
         try
         {
-            // Flushed in full by an earlier life, which stopped before the unlink.
-            if (File.Exists(FlushMarkerPath(file.SegId)))
+            // Flushed in full by an earlier life, which stopped before the unlink. Asked as a look (round-6
+            // review R5-M6): File.Exists answered false for a marker it could not look at as well, and the
+            // block was despilled — every level written a second time. One that cannot be looked at
+            // answers neither way: the block is tried again later, read by nothing meanwhile.
+            switch (Look(FlushMarkerPath(file.SegId)))
             {
-                DeleteSpillFiles(file);
-                settled = true;
-                return;
+                case Presence.There:
+                    DeleteSpillFiles(file);
+                    settled = true;
+                    return;
+                case Presence.Unknown:
+                    throw new IOException(
+                        $"Whether block {file.SegId} was flushed cannot be told: its completion marker could not be looked at");
             }
 
             // Of the levels an earlier run published, the ones the boot scan accepted (the loop takes

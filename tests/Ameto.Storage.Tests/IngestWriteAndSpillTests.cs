@@ -4128,6 +4128,167 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         Assert.Equal(100, ReadAll(next).Count);   // once: the marker said the block was published
     }
 
+    // ── A log the recovery reads cannot open (round-6 R5-M6) ─────────────────
+
+    /// <summary>A WAL an earlier run left (crashed, its block never flushed): <paramref name="count"/> events from <paramref name="from"/>.</summary>
+    private static string EarlierRunWal(ServerOptions opts, string dir, ulong block, int from, int count)
+    {
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string path = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.wal");
+        using var wal = WriteAheadLog.Open(path, opts.NodeId, new SegmentId(block), 1 << 20);
+        for (int i = from; i < from + count; i++)
+            wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                       serviceIndex: 41, service: "spill.svc");
+        return path;
+    }
+
+    /// <summary>Answers every look at and open of <paramref name="paths"/> as a share that does not answer.</summary>
+    private static void NotAnswering(params string[] paths) =>
+        FileRefusal.ForTest.Value = (p, _) => Array.IndexOf(paths, p) >= 0 ? new IOException($"test: the network path of {p} did not answer") : null;
+
+    /// <summary>
+    /// Round-6 review R5-M6. The startup replay opened a WAL after asking File.Exists, which answers false for a
+    /// file it could not look at as well; the log then read as one of no entries, and the replay's "empty or
+    /// corrupt WAL" branch deleted it with its pool. A WAL the start cannot open is kept now, and its events
+    /// come back once it can be read.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_the_startup_replay_cannot_open_is_kept_and_its_events_come_back()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        string wal  = EarlierRunWal(opts, dir, 9_000, 0, 10);
+
+        NotAnswering(wal);
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { FileRefusal.ForTest.Value = null; }
+        await engine.DisposeAsync();
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        await FlushEverythingAsync(next, ShortGuard);
+        var events = ReadAll(next);
+        Assert.True(events.Count == 10, $"{events.Count} of the WAL's 10 events: the start deleted a WAL it could not open");
+        Assert.All(events.Values, e => Assert.Equal("event {n}", e.Template));
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M6, at the despill: a spill file it cannot open is kept, not deleted as an empty one.
+    /// </summary>
+    [Fact]
+    public async Task A_spill_file_the_despill_cannot_open_is_kept_and_its_events_come_back()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 0, 10);
+        string spill  = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+
+        NotAnswering(spill);
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { FileRefusal.ForTest.Value = null; }
+        try { WaitFor(() => engine.DespillsCompletedForTest >= 1, "the despill's first attempt, under the refusal", ShortGuard); }
+        finally { await engine.DisposeAsync(); }
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        var events = ReadAll(next);
+        Assert.True(events.Count == 10, $"{events.Count} of the spill file's 10 events: the despill deleted a file it could not open");
+        Assert.All(events.Values, e => Assert.Equal("event {n}", e.Template));
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M6, the pool: a WAL whose pool the start cannot open is not replayed without it. It
+    /// was — every event without its template and its service — and then deleted.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_pool_the_startup_replay_cannot_open_keeps_its_templates()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        string wal  = EarlierRunWal(opts, dir, 9_000, 0, 10);
+
+        NotAnswering(wal + ".pool");
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { FileRefusal.ForTest.Value = null; }
+        await engine.DisposeAsync();
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        await FlushEverythingAsync(next, ShortGuard);
+        var events = ReadAll(next);
+        Assert.Equal(10, events.Count);
+        int without = events.Values.Count(e => e.Template != "event {n}");
+        Assert.True(without == 0, $"{without} of 10 events replayed without their template: the start read a pool it could not open as empty");
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M6, the completion marker: a WAL whose block was flushed in full — its marker beside
+    /// it, its events in segments — and whose marker the start cannot look at is neither replayed nor
+    /// deleted. File.Exists answered false for it, and the replay wrote the block's events a second time.
+    /// </summary>
+    [Fact]
+    public async Task A_flushed_wal_whose_marker_the_start_cannot_look_at_is_not_written_twice()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        await using (var earlier = Engine(opts))   // the events in segments, as the flush left them
+        {
+            using (var batch = Batch(earlier, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await earlier.WriteBatchAsync(batch, HangGuard));
+            await earlier.FlushHotTierAsync();
+        }
+        EarlierRunWal(opts, dir, 9_000, 0, 10);   // ...and the WAL a crash left beside its marker
+        string marker = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.flushed");
+        File.WriteAllBytes(marker, []);
+
+        NotAnswering(marker);
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { FileRefusal.ForTest.Value = null; }
+        await engine.DisposeAsync();
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
+        Assert.False(File.Exists(Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal")), "the flushed WAL outlived a start that could look at its marker");
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M6, the completion marker at the despill: a spill file whose block was flushed in
+    /// full, and whose marker the despill cannot look at, is not despilled a second time.
+    /// </summary>
+    [Fact]
+    public async Task A_flushed_spill_file_whose_marker_the_despill_cannot_look_at_is_not_written_twice()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        await using (var earlier = Engine(opts))
+        {
+            using (var batch = Batch(earlier, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await earlier.WriteBatchAsync(batch, HangGuard));
+            await earlier.FlushHotTierAsync();
+        }
+        EarlierRunSpill(opts, dir, 9_000, 0, 10);
+        string marker = Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.flushed");
+        File.WriteAllBytes(marker, []);
+
+        NotAnswering(marker);
+        StorageEngine engine;
+        try { engine = Engine(opts); }
+        finally { FileRefusal.ForTest.Value = null; }
+        try { WaitFor(() => engine.DespillsCompletedForTest >= 1, "the despill's first attempt, under the refusal", ShortGuard); }
+        finally { await engine.DisposeAsync(); }
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
+    }
+
     // ── The WAL flush loop (round-5 L-3) ──────────────────────────────────────
 
     /// <summary>

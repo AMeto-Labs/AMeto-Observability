@@ -490,6 +490,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         // R5-M6's class): that answers false for a file it could not look at as well, and an existing log
         // read as a new one is re-initialised below, its spans gone. A new file is empty, which
         // VersionOnDisk reads as no log at all.
+        FileRefusal.ThrowIfRefused(_filePath, FileRefusal.Access.Open);
         _fileStream  = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         long found   = _fileStream.Length;
         _foundAtOpen = found;

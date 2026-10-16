@@ -744,6 +744,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         // review R5-M6's class): that answers false for a file it could not look at as well, and an
         // existing log read as a new one is re-initialised below, its points gone. A new file is
         // empty, which VersionOnDisk reads as no log at all.
+        FileRefusal.ThrowIfRefused(_filePath, FileRefusal.Access.Open);
         _file = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         long found   = _file.Length;
         _foundAtOpen = found;
@@ -881,6 +882,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 "Metric WAL could not restore its mapping after a failed shrink at open — " +
                 "refusing to open a log that cannot accept an append. See the shrink error above.");
 
+        FileRefusal.ThrowIfRefused(_poolPath, FileRefusal.Access.Open);
         _poolStream      = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolFoundAtOpen = _poolStream.Seek(0, SeekOrigin.End);
 
