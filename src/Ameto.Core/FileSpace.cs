@@ -7,15 +7,16 @@ namespace Ameto.Core;
 /// RESERVES THE DISK BLOCKS OF A FILE A LOG HAS JUST SIZED, where the platform leaves them unallocated
 /// (round-5 review H-F).
 ///
-/// <para>The logs' write-ahead logs and spill files, and the metric WAL, are written through a memory
-/// mapping over a file sized with <see cref="FileStream.SetLength"/> (or a mapping's own capacity). On
-/// Linux that is <c>ftruncate</c>: the file is sparse, and a block is taken only when a write through the
-/// mapping first touches its page. On a volume that has filled meanwhile — segments, merges and other
-/// files take it — that write is SIGBUS, and the process dies: it never reaches the IOException that a
-/// failed append, a failed grow and the spill's free-space floor answer 503 with, and the writers had
-/// been answered 200 right up to it. NTFS allocates on SetLength, so there the same full volume fails
-/// the open or the grow, cleanly. This makes Linux do the same: the blocks are reserved where the size
-/// is set, and a volume that cannot hold them is an <see cref="IOException"/> there.</para>
+/// <para>The three write-ahead logs — the logs' WAL and its spill files, the span WAL (round-6 review
+/// R5-H1) and the metric WAL — are written through a memory mapping over a file sized with
+/// <see cref="FileStream.SetLength"/> (or a mapping's own capacity). On Linux that is <c>ftruncate</c>:
+/// the file is sparse, and a block is taken only when a write through the mapping first touches its
+/// page. On a volume that has filled meanwhile — segments, merges and other files take it — that write
+/// is SIGBUS, and the process dies: it never reaches the IOException that a failed append, a failed grow
+/// and the spill's free-space floor answer 503 with, and the writers had been answered 200 right up to
+/// it. NTFS allocates on SetLength, so there the same full volume fails the open or the grow, cleanly.
+/// This makes Linux do the same: the blocks are reserved where the size is set, and a volume that cannot
+/// hold them is an <see cref="IOException"/> there.</para>
 ///
 /// <para>What it costs: the space is taken at once, as NTFS takes it — a 64 MB WAL holds 64 MB of the
 /// volume from its open, not from its writes. It is <c>fallocate(2)</c> itself, mode 0, NOT

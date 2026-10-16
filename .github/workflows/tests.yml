@@ -355,22 +355,33 @@ jobs:
           done
 
       # THE WALS' BLOCKS, RESERVED WHERE THEY ARE SIZED, ON LINUX (round-5 H-F). The log WAL and its
-      # spill files and the metric WAL are mapped over files sized with SetLength — ftruncate here,
-      # which leaves them sparse — and a write through the mapping into a page of a full volume was
-      # SIGBUS: the server killed, where NTFS fails the open or the grow with an IOException the engine
-      # answers 503 with. FileSpace reserves the blocks (fallocate(2)) at each open and each growth;
-      # these facts read the blocks a log has on disk (stat) against its length. They return early off
-      # Linux, which the guard turns into a failure here if the filter stops reaching them.
+      # spill files, the span WAL (round-6 R5-H1) and the metric WAL are mapped over files sized with
+      # SetLength — ftruncate here, which leaves them sparse — and a write through the mapping into a
+      # page of a full volume was SIGBUS: the server killed, where NTFS fails the open or the grow with
+      # an IOException the engine answers 503 with. FileSpace reserves the blocks (fallocate(2)) at each
+      # open and each growth; the On_linux facts read the blocks a log has on disk (stat) against its
+      # length, and return early off Linux, which the guard turns into a failure here if the filter
+      # stops reaching them. The rest of WalReservationTests, and the upgrade facts, refuse a
+      # reservation through FileSpace's seam: the file must be left as the open found it, which is
+      # ftruncate and unlink here.
       - name: Test the WALs' block reservation (Debug)
         shell: bash
         run: |
           set -o pipefail
           dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
-            --filter "FullyQualifiedName~On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow|FullyQualifiedName~On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth" \
+            --filter "FullyQualifiedName~On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow|FullyQualifiedName~On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth|FullyQualifiedName~WalReservationTests|FullyQualifiedName~whose_copy_the_volume_cannot_hold" \
             --logger "console;verbosity=normal" 2>&1 | tee reserve-output.txt
 
           for t in WriteAheadLogTests.On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow \
-                   MetricWalTests.On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth; do
+                   MetricWalTests.On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth \
+                   WalReservationTests.On_linux_the_span_log_has_its_blocks_from_its_open_and_from_each_growth \
+                   WalReservationTests.On_linux_the_span_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.Every_open_of_the_span_log_reserves_its_whole_file \
+                   WalReservationTests.A_span_log_growth_reserves_what_it_adds \
+                   WalReservationTests.A_span_log_growth_the_volume_cannot_hold_fails_its_append_and_is_undone \
+                   WalReservationTests.A_span_log_open_the_volume_cannot_hold_throws_and_removes_the_file_it_created \
+                   WalReservationTests.A_span_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   SpanWalV3Tests.A_v2_log_whose_copy_the_volume_cannot_hold_stays_v2_and_loses_nothing; do
             if ! grep -q "Passed Ameto.Storage.Tests.$t" reserve-output.txt; then
               echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1

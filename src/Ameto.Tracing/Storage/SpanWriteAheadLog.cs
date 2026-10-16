@@ -392,8 +392,37 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     {
         var wal = new SpanWriteAheadLog(filePath, growthStepCap, logger);
         try { wal.OpenOrCreate(initialCapacity); }
-        catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
+        catch { wal.ReleaseFailedOpen(); throw; }        // the lifetime handle, not left to the finalizer
         return wal;
+    }
+
+    /// <summary>
+    /// The length the file had when <see cref="OpenOrCreate"/> opened it: 0 for a file the open created
+    /// (or found empty), -1 until the open has the file. What a failed open puts back.
+    /// </summary>
+    private long _foundAtOpen = -1;
+
+    /// <summary>
+    /// Releases a log whose open failed, leaving the file as the open found it (round-6 review R5-H2's
+    /// class): its handle closed, what the open added to an existing file cut away again — the extension
+    /// SetLength made, and the reservation behind it — and a file the open created removed (one it found
+    /// empty holds nothing either). A failed reservation left the extension sized and unreserved, and the
+    /// next start mapped it and wrote into its holes.
+    /// </summary>
+    private void ReleaseFailedOpen()
+    {
+        long found = _foundAtOpen;
+        lock (_writeLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Unmap();
+            if (found > 0 && _fileStream is not null)
+                try { if (_fileStream.Length > found) _fileStream.SetLength(found); } catch { /* the open's own exception is the one that matters */ }
+            try { _fileStream?.Dispose(); } catch { }
+            _fileStream = null;
+        }
+        if (found == 0) DeleteQuietly(_filePath);
     }
 
     /// <summary>
@@ -457,12 +486,17 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 
     private void OpenOrCreate(long initialCapacity)
     {
-        bool exists = File.Exists(_filePath);
-        _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        // What the file holds is read off the handle, never asked of File.Exists first (round-6 review
+        // R5-M6's class): that answers false for a file it could not look at as well, and an existing log
+        // read as a new one is re-initialised below, its spans gone. A new file is empty, which
+        // VersionOnDisk reads as no log at all.
+        _fileStream  = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        long found   = _fileStream.Length;
+        _foundAtOpen = found;
 
         // The version decides the header's size, and the header's size decides where the data starts
         // — so it is read off the handle before the mapping is sized.
-        ushort onDisk = exists ? VersionOnDisk(_fileStream) : (ushort)0;
+        ushort onDisk = VersionOnDisk(_fileStream);
         bool   known  = onDisk is WalVersion or WalVersionV2 or WalVersionV1;
         if (onDisk is WalVersionV2 or WalVersionV1)
         {
@@ -477,8 +511,17 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         }
 
         long fileSize = _headerSize + initialCapacity;
-        if (_fileStream.Length < fileSize) _fileStream.SetLength(fileSize);
-        else                               fileSize = _fileStream.Length;   // reopen an already-grown log at its size
+        if (found < fileSize) _fileStream.SetLength(fileSize);
+        else                  fileSize = found;   // reopen an already-grown log at its size
+
+        // The WHOLE file's blocks reserved, at every open, before anything is written through the mapping
+        // (round-6 review R5-H1): on Linux SetLength is ftruncate, the file sparse, and the first write into
+        // a page of a full volume was SIGBUS — trace ingest killed the process after ~600 spans once the
+        // volume filled. A reopened log is reserved too, not only what this open added: a log an earlier
+        // build left sparse has its holes filled here, and where the blocks are there already it is cheap.
+        // A volume that cannot hold them fails the open, and ReleaseFailedOpen puts the file back. See
+        // FileSpace.
+        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize);
 
         _capacity = fileSize - _headerSize;
         Map(fileSize);
@@ -568,6 +611,10 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 
             long capacity = Math.Max(_capacity, written + EntryHeaderSize);
             fs.SetLength(FileHeaderSize + capacity);
+            // Reserved before the rename commits the copy (round-6 review R5-H1): the open after it
+            // reserves the whole file anyway, and a volume that cannot hold it fails the upgrade here,
+            // where the old log stays open in its own layout, not that open, past the commit point.
+            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + capacity);
 
             var hdr = new WalFileHeader
             {
@@ -1571,6 +1618,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// no mapping, silently refusing every later append. The old mapping is therefore restored
     /// before the exception is allowed out, so a failed growth costs only the append that
     /// triggered it.
+    ///
+    /// <para>The extension's blocks are reserved before the re-map (round-6 review R5-H1), as the logs'
+    /// WAL reserves its own: a volume that cannot hold them fails this growth — the append that needed
+    /// it gets the IOException — where a write into the sparse extension was SIGBUS. The catch cuts the
+    /// file back to its old size whichever step failed: when SetLength landed and the reservation did
+    /// not, an extension left in place was an unreserved tail that the next open mapped.</para>
     /// </summary>
     private void Grow(long newCapacity)
     {
@@ -1581,6 +1634,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         try
         {
             _fileStream!.SetLength(newFileSize);
+            FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize);
             Map(newFileSize);
             _capacity = newCapacity;
         }
@@ -1588,7 +1642,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         {
             try
             {
-                if (_fileStream!.Length < oldFileSize) _fileStream.SetLength(oldFileSize);
+                if (_fileStream!.Length != oldFileSize) _fileStream.SetLength(oldFileSize);
                 Map(oldFileSize);
             }
             catch { /* nothing left to restore to — the throw below is the honest signal */ }

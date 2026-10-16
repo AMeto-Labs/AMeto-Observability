@@ -954,6 +954,38 @@ public sealed class SpanWalV3Tests : IDisposable
     }
 
     /// <summary>
+    /// A v2 LOG WHOSE v3 COPY THE VOLUME CANNOT HOLD STAYS v2 FOR THE RUN AND LOSES NOTHING (round-6 review
+    /// R5-H1). The copy's blocks are reserved before the rename commits it, so a full volume fails the
+    /// upgrade where the old log stays open in its own layout and the copy is removed — not at the open
+    /// after the commit point, which reserves the whole file and would have failed the trace engine's
+    /// start. Unreserved, the copy was renamed in with its tail sparse. The next start upgrades it.
+    /// </summary>
+    [Fact]
+    public void A_v2_log_whose_copy_the_volume_cannot_hold_stays_v2_and_loses_nothing()
+    {
+        WriteV2Log();
+        var logger = new CapturingLogger();
+        FileSpace.ReserveForTest.Value = (_, _, _) => File.Exists(TmpPath) ? new IOException("test: the volume is full") : null;
+        try
+        {
+            using var wal = Open(logger: logger);
+            Assert.True(wal.HeaderForTest.Version == 2, $"the upgrade committed a copy whose blocks could not be reserved: the log is v{wal.HeaderForTest.Version}");
+            Assert.Equal(Ids(101, 4), IdsOf(wal.ReadAll()));
+        }
+        finally { FileSpace.ReserveForTest.Value = null; }
+
+        Assert.False(File.Exists(TmpPath));
+        Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Error is IOException);
+
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)3, wal.HeaderForTest.Version);
+            Assert.Equal(Ids(101, 4), IdsOf(wal.ReadAll()));
+        }
+    }
+
+    /// <summary>
     /// A v1 LOG IS UPGRADED STRAIGHT TO v3: its entries get the checksum v1 never had, its header the
     /// record, and the live spans replay. (SpanWalV2Tests holds the v1 facts; this is the one hop.)
     /// </summary>
