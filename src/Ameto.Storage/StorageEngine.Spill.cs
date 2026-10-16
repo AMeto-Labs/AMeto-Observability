@@ -1217,7 +1217,7 @@ public sealed partial class StorageEngine
             return null;
         }
 
-        var rows    = WriteAheadLog.LoadPool(file.Path + ".pool");
+        var rows    = WriteAheadLog.LoadPool(file.Path + ".pool", reader.Version);   // as the replay (R5-M5)
         var tier    = CreateRecoveryTier(reader.DataBytes);
         int count   = 0;
         int refused = 0;

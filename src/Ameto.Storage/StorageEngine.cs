@@ -6512,7 +6512,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // row for an event it could not intern, a WAL every one of whose events arrived past a
         // SATURATED pool writes no rows either, and its .pool file stays at 0 bytes with nothing
         // wrong: those entries are unpooled, need no row, and are not counted.
-        var pool = WriteAheadLog.LoadPool(poolPath);
+        var pool = WriteAheadLog.LoadPool(poolPath, version);   // which rows a zero-fill can be told from (R5-M5)
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)

@@ -573,21 +573,56 @@ public sealed class WriteAheadLogTests
 
     /// <summary>Round-5 review L-1, the other side: a text that ends in a NUL of its own, with rows after it, is a row like any other.</summary>
     [Fact]
-    public void A_row_whose_text_ends_in_a_nul_of_its_own_is_kept()
+    public void A_pool_row_that_ends_in_a_nul_with_rows_after_it_is_kept()
     {
         string path = NewWalPath();
         try
         {
-            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
-            {
-                wal.Append(1_000, LogLevel.Information, 0, "ends in a NUL\0", [1]);
-                wal.Append(2_000, LogLevel.Information, 1, "second {n}", [2]);
-            }
+            // Written by hand: from v6 on the log writes no such row (R5-M5), and this pins the reader.
+            byte[] a = Encoding.UTF8.GetBytes("ends in a NUL\0"), b = Encoding.UTF8.GetBytes("second {n}");
+            var pool = new byte[4 + a.Length + 4 + b.Length];
+            BinaryPrimitives.WriteUInt16LittleEndian(pool.AsSpan(0), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(pool.AsSpan(2), (ushort)a.Length);
+            a.CopyTo(pool, 4);
+            BinaryPrimitives.WriteUInt16LittleEndian(pool.AsSpan(4 + a.Length), 1);
+            BinaryPrimitives.WriteUInt16LittleEndian(pool.AsSpan(6 + a.Length), (ushort)b.Length);
+            b.CopyTo(pool, 8 + a.Length);
+            File.WriteAllBytes(path + ".pool", pool);
 
             var rows = WriteAheadLog.LoadPool(path + ".pool");
             Assert.Equal(2, rows.Count);
             Assert.Equal("ends in a NUL\0", rows[0]);
             Assert.Equal("second {n}", rows[1]);
+        }
+        finally { File.Delete(path + ".pool"); }
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M5. A pool row whose text ends in a zero byte with only zeros after it reads as the
+    /// tail a power loss zero-filled (round-5 L-1) — and that is exactly what an intact pool looks like when
+    /// its NEWEST row is a client's NUL-ending service or template: every despill, and every replay after a
+    /// kill, dropped that row, and the events came back without their service. Such a text is never a row
+    /// now: the first entry of the log that uses its index carries it, as a text too long for a row is, and
+    /// recovery gives every entry of the index that text.
+    /// </summary>
+    [Fact]
+    public void A_newest_text_that_ends_in_a_nul_comes_back_whole()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
+                for (int i = 0; i < 10; i++)
+                    Assert.True(wal.Append(1_000 + i, LogLevel.Information, 40, "event {n}", [1], serviceIndex: 41, service: "row.svc\0"));
+
+            // What the replay and the despill do: the entry's own text, else its index's row.
+            var rows    = WriteAheadLog.LoadPool(path + ".pool");
+            var entries = WriteAheadLog.ReadForRecovery(path).Entries;
+            Assert.Equal(10, entries.Count);
+            var services = entries.ConvertAll(e => e.Service ?? (e.ServiceIndex >= 0 && rows.TryGetValue((ushort)e.ServiceIndex, out var s) ? s : null));
+            int lost = services.Count(s => s != "row.svc\0");
+            Assert.True(lost == 0, $"{lost} of 10 entries came back without their service \"row.svc\\0\", the pool's newest text: rows {string.Join(", ", rows.Keys)}");
+            Assert.Equal("event {n}", rows[40]);
         }
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }

@@ -42,8 +42,9 @@ namespace Ameto.Storage;
 ///           and no span id is logged without it, so the field costs nothing where it is empty.
 ///   bit 3 — InlineTemplate (v6): the event's template TEXT follows the trace context, because no
 ///           pool row can carry it. With Unpooled, the template is outside the pool, and every
-///           such entry carries its own. Without Unpooled, the template is pooled but longer than a
-///           row's 65 535 bytes, and the entry is the FIRST of this log to use its index: the later
+///           such entry carries its own. Without Unpooled, the template is pooled but no row holds it —
+///           longer than a row's 65 535 bytes, or ending in a NUL, which LoadPool could not tell from a
+///           power loss's zero-filled tail (round-6 R5-M5) — and the entry is the FIRST of this log to use its index: the later
 ///           ones carry the index alone, and recovery resolves it through this entry — a log holds
 ///           such a template once, as it holds a row once. (Carried by every entry, one 70 KB
 ///           template made a 70 MB log of 1 000 events, and its replay one string per entry.)
@@ -54,7 +55,8 @@ namespace Ameto.Storage;
 ///           length uint32, then UTF-8, under the checksum), because no pool row can carry it.
 ///           Without the Service bit, the service was outside the intern pool — a full pool answers
 ///           -1 — so no index and no row name it, and every such entry carries its own. With it, the
-///           service is pooled but longer than a row's 65 535 bytes, and the entry is the FIRST of
+///           service is pooled but no row holds it (longer than a row's 65 535 bytes, or ending in a NUL),
+///           and the entry is the FIRST of
 ///           this log to use its index, as for a long template (bit 3): the later ones carry the
 ///           index alone. Templates and services share the pool, so a long text carried once serves
 ///           both uses of its index. (Carried by every entry, one 70 KB service made a 70 MB log of
@@ -577,12 +579,20 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     }
 
     /// <summary>
-    /// Whether a pool row holds <paramref name="text"/> whole: a row's length is 16 bits. O(1) for
-    /// every text of at most 21 845 UTF-16 units (no unit encodes to more than three bytes); only a
-    /// longer one is measured.
+    /// Whether a pool row holds <paramref name="text"/> whole and as itself: a row's length is 16 bits,
+    /// and a text that ends in a NUL is never a row (round-6 review R5-M5). <see cref="LoadPool(string, ushort)"/>
+    /// reads a row whose text ends in a zero byte, with only zeros after it, as the tail a power loss
+    /// zero-filled (round-5 L-1) — which is also exactly what an intact pool looks like when its NEWEST
+    /// row is a client's NUL-ending template or service: every despill, and every replay after a kill,
+    /// dropped that row, and its events lost their template or service. Such a text is carried by the
+    /// first entry of the log that uses its index (InlineTemplate, InlineService), as a text too long for
+    /// a row is, so a v6 pool holds no row that ends in a NUL unless it was torn. O(1) for every text of
+    /// at most 21 845 UTF-16 units (no unit encodes to more than three bytes); only a longer one is measured.
     /// </summary>
     private static bool FitsPoolRow(string? text) =>
-        text is null || text.Length <= MaxPoolRowBytes / 3 || Encoding.UTF8.GetByteCount(text) <= MaxPoolRowBytes;
+        text is null
+        || ((text.Length == 0 || text[^1] != '\0')
+            && (text.Length <= MaxPoolRowBytes / 3 || Encoding.UTF8.GetByteCount(text) <= MaxPoolRowBytes));
 
     /// <summary>
     /// Writes the pool row <paramref name="index"/> → <paramref name="text"/> unless this WAL already
@@ -1376,9 +1386,21 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// the services those rows named, then deleted the log. The replay now keeps the WAL, and the
     /// despill backs off and reads the block again.
     /// </summary>
-    public static Dictionary<ushort, string> LoadPool(string poolPath)
+    /// <remarks>As <see cref="LoadPool(string, ushort)"/>, for a pool of a log in the format this build writes.</remarks>
+    public static Dictionary<ushort, string> LoadPool(string poolPath) => LoadPool(poolPath, FormatVersion);
+
+    /// <summary>
+    /// A log's pool rows (see <see cref="LoadPool(string)"/>), for a log of <paramref name="logVersion"/>,
+    /// its <see cref="RecoveryReader.Version"/>. Only a v6 log's pool reads a row whose text ends in a zero
+    /// byte, with only zeros after it, as the torn tail (round-6 review R5-M5): from v6 on no row is
+    /// written that ends in a NUL (see <see cref="FitsPoolRow"/>), so the rule cannot take a text for a
+    /// zero-fill. A v5 log, what every release before v6 wrote, may hold a client's NUL-ending text as its
+    /// newest row, and its pool is read as those releases read it.
+    /// </summary>
+    public static Dictionary<ushort, string> LoadPool(string poolPath, ushort logVersion)
     {
-        var dict = new Dictionary<ushort, string>();
+        bool nulEndsOnlyWhenTorn = logVersion >= WalVersion;
+        var  dict = new Dictionary<ushort, string>();
         // No pool only when the file system says it is gone (round-6 review R5-M6): File.Exists answered
         // false for a pool it could not look at as well, and the replay or the despill went on with no
         // rows — every event of the block without its template or service — and then deleted the log.
@@ -1400,9 +1422,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             // A text that ends in a zero byte with nothing but zeros after it in the file is the torn tail
             // too (round-5 review L-1): a power loss that zero-filled the file from inside a row's text kept
             // the row's header, and the row read as its text plus NULs — which the replay stamped on every
-            // event of its index (a service "Orders" and thirteen NULs). A text that ends in a NUL of its own
-            // is kept when anything but zeros follows it; as the file's very last row it reads as torn.
-            if (bytes[^1] == 0 && OnlyZerosToTheEnd(fs)) break;
+            // event of its index (a service "Orders" and thirteen NULs). In a v6 pool only: no v6 row ends
+            // in a NUL of its own, where an older pool's newest row can (see the summary).
+            if (nulEndsOnlyWhenTorn && bytes[^1] == 0 && OnlyZerosToTheEnd(fs)) break;
             dict[index] = Encoding.UTF8.GetString(bytes);
         }
         return dict;

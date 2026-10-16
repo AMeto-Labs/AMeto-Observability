@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Text;
 using MessagePack;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -4287,6 +4289,172 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         await using var next = Engine(opts);
         await FlushEverythingAsync(next, ShortGuard);
         Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
+    }
+
+    // ── A text that ends in a NUL (round-6 R5-M5) ────────────────────────────
+
+    /// <summary>
+    /// Round-6 review R5-M5. A pool row whose text ends in a zero byte, with only zeros after it, reads as the
+    /// tail a power loss zero-filled (round-5 L-1) — which is what an intact pool looks like when its newest
+    /// row is a client's NUL-ending service. Every despill dropped that row, and the block's events were
+    /// written with no service. No such text is a row now; the first entry that uses it carries it.
+    /// </summary>
+    [Fact]
+    public async Task A_despilled_blocks_newest_service_that_ends_in_a_nul_comes_back_whole()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill  = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(9_000), 1 << 20))
+            for (int i = 0; i < 10; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "row.svc\0");
+
+        await using var engine = Engine(opts);
+        await FlushEverythingAsync(engine, ShortGuard);
+        var events = ReadAll(engine);
+        Assert.Equal(10, events.Count);
+        int lost = events.Values.Count(e => e.Service != "row.svc\0");
+        Assert.True(lost == 0, $"{lost} of 10 despilled events lost their service \"row.svc\\0\", the pool's newest text");
+    }
+
+    /// <summary>Round-6 review R5-M5, the template: the despill of a block whose pool's newest text is a NUL-ending template.</summary>
+    [Fact]
+    public async Task A_despilled_blocks_newest_template_that_ends_in_a_nul_comes_back_whole()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill  = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(9_000), 1 << 20))
+        {
+            wal.Append(T0, LogLevel.Information, 40, "first {n}", Props(0), serviceIndex: 41, service: "svc.ok");
+            for (int i = 1; i < 10; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Error, 42, "Payment {n} failed\0", Props(i),
+                           serviceIndex: 41, service: "svc.ok");
+        }
+
+        await using var engine = Engine(opts);
+        await FlushEverythingAsync(engine, ShortGuard);
+        var events = ReadAll(engine);
+        Assert.Equal(10, events.Count);
+        int kept = events.Values.Count(e => e.Template == "Payment {n} failed\0");
+        Assert.True(kept == 9, $"{9 - kept} of 9 despilled events lost their template \"Payment {{n}} failed\\0\", the pool's newest text");
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M5, the replay after a kill: the live WAL's pool, whose newest row was a NUL-ending
+    /// service, is replayed with that service.
+    /// </summary>
+    [Fact]
+    public async Task A_replayed_wals_newest_service_that_ends_in_a_nul_comes_back_whole()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        var    engine = Engine(opts);
+        int    tmpl   = engine.TemplatePool.Intern("Payment {id} failed");
+        int    svc    = engine.TemplatePool.Intern("Orders.Api\0");   // the pool's newest text: its row is written last
+        for (int i = 0; i < 5; i++)
+            Assert.True(engine.TryWrite(new LogEventHeader
+            {
+                TimestampUtcTicks        = T0 + i * TimeSpan.TicksPerMillisecond,
+                Level                    = LogLevel.Error,
+                MessageTemplatePoolIndex = tmpl,
+                ServiceNamePoolIndex     = svc,
+            }, Props(i), "Payment {id} failed"));
+
+        // A kill: the WAL and its pool as they are now, and nothing the shutdown flush does.
+        static byte[] ReadShared(string p)
+        {
+            using var fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var bytes = new byte[fs.Length];
+            fs.ReadExactly(bytes);
+            return bytes;
+        }
+        ulong  block = engine.LiveWalSegmentId;
+        string wal   = Path.Combine(walDir, $"{opts.NodeId.Value}-{block}.wal");
+        byte[] log   = ReadShared(wal), pool = ReadShared(wal + ".pool");
+        await engine.DisposeAsync();
+        foreach (var f in Directory.GetFiles(Path.Combine(dir, "segments"), $"{opts.NodeId.Value}-*.seg"))
+        {
+            var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+            if (ulong.TryParse(parts[1], out var id) && id >= block && id < block + 6) File.Delete(f);
+        }
+        foreach (var marker in Directory.GetFiles(walDir, "*.flushed")) File.Delete(marker);
+        File.WriteAllBytes(wal, log);
+        File.WriteAllBytes(wal + ".pool", pool);
+
+        await using var restarted = Engine(opts);
+        await restarted.CatalogLoaded;
+        await FlushEverythingAsync(restarted, ShortGuard);
+        var events = ReadAll(restarted);
+        Assert.Equal(5, events.Count);
+        int lost = events.Values.Count(e => e.Service != "Orders.Api\0");
+        Assert.True(lost == 0, $"{lost} of 5 replayed events lost their service \"Orders.Api\\0\", the pool's newest text");
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M5, the logs the earlier releases left: a v5 WAL — every release before v6 wrote one,
+    /// and a start after the upgrade replays what a crash left — keeps a newest pool row that ends in a NUL.
+    /// Those releases wrote such texts as rows; only a v6 pool's NUL-ending row can be taken for torn.
+    /// </summary>
+    [Fact]
+    public async Task A_v5_wals_newest_pool_row_that_ends_in_a_nul_is_kept()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        const ulong Block = 9_000;
+        string wal = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}.wal");
+
+        // The v5 layout (WriteAheadLog's class doc): a 32-byte header, then 26-byte entries, Service flag set.
+        var entries = new List<byte[]>();
+        for (int i = 0; i < 5; i++)
+        {
+            byte[] payload = Props(i);
+            var e = new byte[26 + payload.Length];
+            BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(0), (uint)payload.Length);
+            BinaryPrimitives.WriteInt64LittleEndian (e.AsSpan(4), T0 + i * TimeSpan.TicksPerMillisecond);
+            e[12] = (byte)LogLevel.Information;
+            e[13] = 0x02;                                                     // Service
+            BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(14), 40);
+            BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(20), 41);
+            BinaryPrimitives.WriteUInt32LittleEndian(e.AsSpan(22), Crc32c.Append(Crc32c.Append(0, e.AsSpan(0, 22)), payload));
+            payload.CopyTo(e, 26);
+            entries.Add(e);
+        }
+        var file = new byte[32 + 64 * 1024];
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(0), 0x52_44_57_41);   // "RDWA"
+        BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(4), 5);
+        BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(8), opts.NodeId.Value);
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), Block);
+        BinaryPrimitives.WriteInt64LittleEndian (file.AsSpan(24), 32 + entries.Sum(static e => e.Length));
+        int at = 32;
+        foreach (var e in entries) { e.CopyTo(file, at); at += e.Length; }
+        File.WriteAllBytes(wal, file);
+
+        static byte[] Row(ushort index, string text)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(text), row = new byte[4 + bytes.Length];
+            BinaryPrimitives.WriteUInt16LittleEndian(row, index);
+            BinaryPrimitives.WriteUInt16LittleEndian(row.AsSpan(2), (ushort)bytes.Length);
+            bytes.CopyTo(row, 4);
+            return row;
+        }
+        File.WriteAllBytes(wal + ".pool", [.. Row(40, "event {n}"), .. Row(41, "legacy.svc\0")]);
+
+        await using var engine = Engine(opts);
+        await engine.CatalogLoaded;
+        await FlushEverythingAsync(engine, ShortGuard);
+        var events = ReadAll(engine);
+        Assert.Equal(5, events.Count);
+        int lost = events.Values.Count(e => e.Service != "legacy.svc\0");
+        Assert.True(lost == 0, $"{lost} of 5 events of a v5 WAL lost their service \"legacy.svc\\0\", its pool's newest row");
     }
 
     // ── The WAL flush loop (round-5 L-3) ──────────────────────────────────────
