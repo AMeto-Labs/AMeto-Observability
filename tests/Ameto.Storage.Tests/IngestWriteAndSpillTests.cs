@@ -3870,22 +3870,31 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// Round-5 review H-D, the frozen backlog's half. Each tier bounds the text its events carry of their
     /// own, but the frozen tiers were bounded only in number, by their native footprint against the
     /// physical limit — on a 384 MiB heap limit over a host's RAM, 30 frozen tiers of one 8 MB CLEF stack
-    /// each ran the heap out. They hold at most as many tiers' worth of that text as flushes run at once
-    /// now: with one flush, and the first tier's held, the second tier of text does not freeze beside it —
-    /// its events spill — and every event is there once the flush goes on.
+    /// each ran the heap out. They hold at most their budget of that text now (round-6 R5-M10: the build
+    /// share the width leaves unused, at least as many tiers' worth as flushes run at once): on a 128 MiB
+    /// heap limit that is one tier's and a little, so with one flush, and the first tier's held, the
+    /// second tier of text does not freeze beside it — its events spill — and every event is there once
+    /// the flush goes on.
     /// </summary>
     [Fact]
-    public async Task The_frozen_tiers_hold_no_more_of_their_events_own_text_than_their_flushes_run_at_once()
+    public async Task The_frozen_tiers_hold_no_more_of_their_events_own_text_than_their_budget()
     {
         // 40 KB of text each: four 8 MB tiers' worth — one frozen and held, one live and full, and more
         // than a tier's worth spilled.
         const int Events = 900, Chars = 20_000;
-        var engine = Engine(Options(NewDir(), tierBytes: 8 * MB));   // one flush at a time (FlushConcurrency 1)
+        var opts   = Options(NewDir(), tierBytes: 8 * MB);   // one flush at a time (FlushConcurrency 1)
+        var engine = new StorageEngine(
+            Microsoft.Extensions.Options.Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance,
+            MemoryBudgets.Derive(managedLimitBytes: 128 * MB, physicalLimitBytes: 1024 * MB));
         var gate   = HoldFirstFlush(engine);
         try
         {
             Assert.True(engine.FlushWidth == 1 && engine.FlushSlots > 2,
                         $"setup: width {engine.FlushWidth}, {engine.FlushSlots} slot(s) — the slots alone must leave room for more frozen tiers");
+            Assert.True(engine.FrozenTextBudgetForTest is >= 8 * MB and < 16 * MB,
+                        $"setup: a frozen-text budget of {engine.FrozenTextBudgetForTest / (double)MB:F1} MB — one tier's worth and less than two");
             for (int i = 0; i < Events; i++)
             {
                 using var batch = new LogWriteBatch();
@@ -3913,6 +3922,70 @@ public sealed class IngestWriteAndSpillTests : IDisposable
                             $"segment {s.Id} holds {s.EventCount} events of 40 KB of text each — past an 8 MB tier's");
         }
         finally { gate.Set(); await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M10. The frozen tiers' own text was bounded at as many tiers' worth as flushes run at
+    /// once: on the two-core stand (width 1) one tier — and text-bearing traffic spilled three to four times
+    /// sooner than before the bound (98 500 events absorbed with every flush held, against 262 500, for a
+    /// CLEF mix with 2 % of its events carrying a 6 000-character stack). They may hold the build share the
+    /// width leaves unused now: on the stand's budgets, with every flush held, more than three tiers of text
+    /// freeze before the first event spills.
+    /// </summary>
+    [Fact]
+    public async Task On_the_stands_budgets_the_frozen_tiers_hold_more_than_a_tier_of_text_before_a_spill()
+    {
+        const int Chars = 20_000;   // 40 KB of text each: an 8 MB tier holds about two hundred
+        var opts   = Options(NewDir(), tierBytes: 8 * MB);   // FlushConcurrency 1: the stand's two cores
+        var engine = new StorageEngine(
+            Microsoft.Extensions.Options.Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance,
+            MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB));
+        var permits = (SemaphoreSlim)typeof(StorageEngine)
+            .GetField("_flushConcurrency", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(engine)!;
+        int held = 0;
+        try
+        {
+            while (permits.Wait(0)) held++;   // every heavy phase waits: the swapped tiers stay frozen
+            int  frozen = -1;
+            long text   = 0;
+            for (int i = 0; i < 4_000 && frozen < 0; i++)
+            {
+                using var batch = new LogWriteBatch();
+                batch.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                }, Props(i), new string((char)('a' + i % 26), Chars) + i, exception: null);
+                Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
+                if (engine.SpilledEvents > 0)
+                {
+                    frozen = engine.FrozenTierCountForTest;
+                    text   = engine.FrozenTextBytesForTest;
+                }
+            }
+            Assert.True(frozen > 3, $"the first event spilled with {frozen} tier(s) frozen, {text / (double)MB:F1} MB of their events' own text " +
+                                    $"(width {engine.FlushWidth}, {engine.FlushSlots} slots)");
+        }
+        finally
+        {
+            if (held > 0) permits.Release(held);
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>The frozen-text budget's derivation, on the stand's figures and on a host's (round-6 review R5-M10).</summary>
+    [Theory]
+    [InlineData(1, 7, 16, 96, 43.75, 52.25)]    // the stand: one 43.75 MiB build of a 96 MiB share — the rest
+    [InlineData(3, 56, 64, 640, 183.5, 192)]     // a large host, width set by memory: as many tiers' worth as builds
+    [InlineData(1, 2, 16, 96, 8, 32)]            // never more than the slots' tiers hold
+    [InlineData(2, 7, 16, 32, 43.75, 32)]        // a share the builds overrun: the floor
+    public void The_frozen_text_budget_is_the_build_share_the_width_leaves_and_at_least_its_tiers(
+        int width, int slots, long tierMb, long buildMb, double perBuildMb, double expectedMb)
+    {
+        long budget = StorageEngine.FrozenTextBudget(width, slots, tierMb * MB, buildMb * MB, (long)(perBuildMb * MB));
+        Assert.Equal((long)(expectedMb * MB), budget);
     }
 
     /// <summary>

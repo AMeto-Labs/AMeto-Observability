@@ -521,15 +521,41 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private long _frozenTextBytes;
 
     /// <summary>
-    /// The most of that text the frozen tiers may hold: as many tiers' worth (<c>HotTier.MaxSizeBytes</c>)
-    /// as flushes run at once (<see cref="FlushWidth"/>). The tiers past the width only queue for a
-    /// flush; a tier whose freeze would take the backlog past this waits as for a slot — its events
-    /// spill, or wait in their requests — unless no frozen tier holds any, so one always can.
+    /// The most of that text the frozen tiers may hold (<see cref="FrozenTextBudget"/>). A tier whose
+    /// freeze would take the backlog past this waits as for a slot — its events spill, or wait in their
+    /// requests — and so does a spilled block's despill; unless no frozen tier holds any, so one always can.
     /// </summary>
     private readonly long _frozenTextBudgetBytes;
 
     /// <summary>Test hook: <see cref="_frozenTextBytes"/>.</summary>
     internal long FrozenTextBytesForTest => Volatile.Read(ref _frozenTextBytes);
+
+    /// <summary>Test hook: <see cref="_frozenTextBudgetBytes"/>.</summary>
+    internal long FrozenTextBudgetForTest => _frozenTextBudgetBytes;
+
+    /// <summary>
+    /// What the frozen tiers may hold of their events' own text (round-5 H-D; round-6 review R5-M10): the part of
+    /// the managed build share (<see cref="MemoryBudgets.ManagedBuildBytes"/>) the concurrent builds leave unused —
+    /// <paramref name="width"/> builds of <paramref name="perBuildBytes"/> each — and never less than as many tiers'
+    /// worth (<paramref name="tierBytes"/>) as flushes run at once, nor more than the slots' tiers could hold.
+    ///
+    /// <para>It was the width's tiers alone: on the two-core stand, width 1, one 16 MB tier of text — and
+    /// text-bearing traffic spilled three to four times sooner than before the bound (a CLEF mix with 2 % of its
+    /// events carrying a 6 000-character stack: 98 500 events absorbed in memory with every flush held, against
+    /// 262 500). The text lives on the managed heap, as the builds' state does, and the build share is sized for
+    /// as many builds as memory affords where the width is often held lower by the cores: what that leaves is
+    /// managed memory already counted against the heap, which the frozen tiers' text now holds — no new share of
+    /// the heap is taken (<see cref="MemoryBudgets"/>' managed shares stay at their total). The stand: 96 MiB of
+    /// build share, one 43.8 MiB build, 52.3 MiB of text — three tiers' worth where it was one. A host whose
+    /// width the memory sets keeps the floor: as many tiers' worth as builds.</para>
+    /// </summary>
+    internal static long FrozenTextBudget(int width, int slots, long tierBytes, long managedBuildBytes, long perBuildBytes)
+    {
+        long tier     = Math.Max(1L, tierBytes);
+        long floor    = width * tier;
+        long unused   = managedBuildBytes - width * perBuildBytes;
+        return Math.Max(floor, Math.Min(slots * tier, unused));
+    }
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -878,7 +904,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
         FlushWidth  = flushWidth;
         FlushSlots  = flushSlots;
-        _frozenTextBudgetBytes = flushWidth * Math.Max(1L, _options.HotTier.MaxSizeBytes);
+        _frozenTextBudgetBytes = FrozenTextBudget(flushWidth, flushSlots, _options.HotTier.MaxSizeBytes,
+                                                  _budgets.ManagedBuildBytes, perBuildManaged);
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
@@ -889,13 +916,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         _logger.LogInformation(
             "Flush budgets: width={Width} (×{PerBuild} MB managed = {ManagedCeiling} MB; " +
             "a flush holds {PerFlush} MB, a merge {PerMerge} MB in {GroupBudget} MB groups), " +
-            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), frozen text≤{FrozenText} MB, tier={Events} events / {Payload} MB payload; " +
             "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
             "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB ({Source}); " +
             "index cache≤{CacheBudget} MB ({CacheSource}), native≤{CacheNativeBudget} MB, idle evict {IdleEvict}",
             flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
             perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
-            flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
+            flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576, _frozenTextBudgetBytes / 1048576,
             eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
             _budgets.ManagedLimitBytes / 1048576,
             _budgets.PhysicalLimitBytes / 1048576,
