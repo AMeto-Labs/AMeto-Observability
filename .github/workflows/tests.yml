@@ -358,7 +358,7 @@ jobs:
       # spill files and the metric WAL are mapped over files sized with SetLength — ftruncate here,
       # which leaves them sparse — and a write through the mapping into a page of a full volume was
       # SIGBUS: the server killed, where NTFS fails the open or the grow with an IOException the engine
-      # answers 503 with. FileSpace reserves the blocks (posix_fallocate) at each open and each growth;
+      # answers 503 with. FileSpace reserves the blocks (fallocate(2)) at each open and each growth;
       # these facts read the blocks a log has on disk (stat) against its length. They return early off
       # Linux, which the guard turns into a failure here if the filter stops reaching them.
       - name: Test the WALs' block reservation (Debug)
