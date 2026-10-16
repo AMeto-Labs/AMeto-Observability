@@ -212,49 +212,19 @@ public sealed class IngestStoreBusyTests : IDisposable
     }
 
     /// <summary>
-    /// Round-3 review R1a-3. A commit's state machine is boxed at its first suspension, which is at
-    /// the write, after the write began; on a heap at its limit that allocation fails. The failure
-    /// left as a 500 while the write went on and wrote the batch: the counts were lost, and a Seq
-    /// client's retry wrote it a second time. The commit now waits the write out, allocating
-    /// nothing, and answers from what it did. (The body is read from memory, so the handler has not
-    /// suspended before the commit either: nothing above it is boxed yet.)
+    /// Round-6 review R5-M4. This test pinned the opposite — "a 500, then written" — as accepted. The
+    /// commit's first real suspension was its await of the write, after the write began; a box that
+    /// could not be allocated there (round-3 R1a-3) was waited out on the request's thread for the
+    /// write's wait and a second more, and then the failure went up — a 500 — while the write went on
+    /// and stored the batch, which a Seq client's retry stored a second time. The handler awaits the
+    /// write itself now, on the box it made first, and nothing between the write's start and its end
+    /// can fail but the write. Here every first suspension of a frame of the endpoint below the
+    /// handler fails, as the box allocation would; the store faults once, so the write waits, and its
+    /// next attempt lands only when the test says — two seconds on, past the write's 100 ms wait and
+    /// the second a commit used to wait it out for.
     /// </summary>
     [Fact]
-    public async Task A_commit_whose_await_cannot_suspend_waits_the_write_out_and_answers_what_it_wrote()
-    {
-        var opts = Options(backPressureWait: TimeSpan.FromSeconds(5));
-        await using var storage = Engine(opts);
-        var written = CaptureWrites(storage);
-        int failing = 1;
-        storage._afterWriteGate = () =>
-        {
-            if (Volatile.Read(ref failing) == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
-        };
-        var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
-        try
-        {
-            var ctx = Post(Clef(3));
-
-            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<CommitAsync>", () => Volatile.Write(ref failing, 0));   // the write's next attempt lands
-            try { await endpoint.HandleAsync(ctx); }
-            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
-
-            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
-            Assert.Equal((3, 0), Counts(ctx));
-            Assert.Equal(3, written.Count);
-            Assert.Equal(3, endpoint.AcceptedTotal);
-        }
-        finally { storage._afterWriteGate = null; }
-    }
-
-    /// <summary>
-    /// The new path R1a-3's wait-out adds: a write still going after its own wait and a second more
-    /// is not waited for any longer — the failure goes up as it did (a 500), with the thread
-    /// blocked about that long and no longer — and the write, left to end on its own, still holds
-    /// its batch (the request's dispose waits for it): every event written whole.
-    /// </summary>
-    [Fact]
-    public async Task A_commit_whose_write_outlives_its_wait_out_fails_as_before_and_the_write_keeps_its_batch()
+    public async Task A_commit_whose_write_outlives_its_wait_is_answered_from_what_the_write_did()
     {
         var opts = Options(backPressureWait: TimeSpan.FromMilliseconds(100));
         await using var storage = Engine(opts);
@@ -265,20 +235,29 @@ public sealed class IngestStoreBusyTests : IDisposable
         {
             int n = Interlocked.Increment(ref attempts);
             if (n == 1) throw new OutOfMemoryException("test: a fault, so the write waits");
-            if (n == 2) release.Wait(TimeSpan.FromSeconds(30));   // the retry lands only when the test says
+            if (n == 2) release.Wait(TimeSpan.FromSeconds(30));   // the next attempt lands only when the test says
         };
         var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
         try
         {
-            var ctx = Post(Clef(3));
-            var sw  = System.Diagnostics.Stopwatch.StartNew();
-            OwnerAsync.FirstSuspensionFailsForTest.Value = FirstSuspensionFailsOnce("<CommitAsync>");
-            try { await Assert.ThrowsAsync<OutOfMemoryException>(() => endpoint.HandleAsync(ctx)); }
+            var  ctx    = Post(Clef(3));
+            int  failed = 0;
+            Task handled;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = t =>
+            {
+                if (!BelowTheHandler(t)) return false;
+                Interlocked.Increment(ref failed);
+                return true;
+            };
+            try { handled = endpoint.HandleAsync(ctx); }
             finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
-            sw.Stop();
-            Assert.InRange(sw.ElapsedMilliseconds, 1_000, 10_000);   // the wait plus a second: waited for, then given up
 
+            bool   endedEarly = await Task.WhenAny(handled, Task.Delay(2_000)) == handled;
+            string how        = !endedEarly ? "" : handled.IsFaulted ? "a 500: " + handled.Exception!.InnerException!.GetType().Name
+                                                                     : ctx.Response.StatusCode.ToString();
             release.Set();
+            try { await handled.WaitAsync(TimeSpan.FromSeconds(30)); }
+            catch (OutOfMemoryException) when (endedEarly) { /* told below */ }
             var until = DateTime.UtcNow.AddSeconds(30);
             while (DateTime.UtcNow < until)
             {
@@ -286,8 +265,15 @@ public sealed class IngestStoreBusyTests : IDisposable
                 await Task.Delay(10);
             }
             await Task.Delay(100);   // nothing more comes
-            lock (written)
-                Assert.Equal(new[] { "busy probe {i}", "busy probe {i}", "busy probe {i}" }, written);
+            int stored;
+            lock (written) stored = written.Count;
+
+            Assert.True(!endedEarly, $"the request ended ({how}) while its write was still going, and the write then stored {stored} event(s): a Seq client's retry stores them a second time");
+            Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
+            Assert.Equal((3, 0), Counts(ctx));
+            Assert.Equal(3, stored);
+            Assert.Equal(3, endpoint.AcceptedTotal);
+            Assert.True(Volatile.Read(ref failed) == 0, "a frame of the endpoint below the handler was boxed after its write began");
         }
         finally
         {
@@ -297,8 +283,16 @@ public sealed class IngestStoreBusyTests : IDisposable
     }
 
     /// <summary>
+    /// A frame of the ingest endpoint below the CLEF handler, whose first suspension the seam fails: one that
+    /// stands between the request and the store (the commit's own, before round-6 R5-M4) is boxed there.
+    /// </summary>
+    internal static bool BelowTheHandler(Type stateMachine) =>
+        (stateMachine.DeclaringType == typeof(IngestionEndpoint) && !stateMachine.Name.Contains("<HandleAsync>", StringComparison.Ordinal))
+        || stateMachine.DeclaringType == typeof(LogIngestBatch);
+
+    /// <summary>
     /// OwnerAsync's seam, armed for one first suspension of the method whose state machine's name
-    /// carries <paramref name="method"/> (as "&lt;CommitAsync&gt;"): it throws there as a box that cannot
+    /// carries <paramref name="method"/> (as "&lt;HandleAsync&gt;"): it throws there as a box that cannot
     /// be allocated does, every finally of the method skipped. <paramref name="onFail"/> runs as it fires.
     /// </summary>
     private static Func<Type, bool> FirstSuspensionFailsOnce(string method, Action? onFail = null)

@@ -426,11 +426,23 @@ public sealed class IngestionEndpoint
     // ── Commit ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Writes a decoded batch into the store and says what became of it. Called by
-    /// <see cref="LogIngestBatch.CommitAsync"/>.
+    /// Begins writing a decoded batch into the store: what a commit does before the write's wait,
+    /// and the write itself, synchronously. Called by <see cref="LogIngestBatch.BeginCommit"/>; the
+    /// caller awaits <see cref="LogCommit.Write"/> and hands what it came to to <see cref="EndCommit"/>.
+    ///
+    /// <para><b>No frame of its own between the request and the write</b> (round-6 review R5-M4). The
+    /// commit was an async method, and its first real suspension — where its state machine is boxed —
+    /// was its await of the write, AFTER the write began. A box that could not be allocated threw there
+    /// with the write going on. It was waited out on the request's thread, for the write's wait and a
+    /// second more: a pool thread the write's own room-wait continuation needed, so on two cores a burst
+    /// of them stalled the whole pool (a trivial work item delayed 8.6–9.7 s at p99 in the review's
+    /// probe). Past that the failure went up — a 500 — while the write went on and stored the batch,
+    /// which a Seq client's retry then stored a second time (2 rounds in 10). The receivers await the
+    /// write themselves now, on the state machine they boxed before the batch was begun (round-5 H-G):
+    /// that await allocates nothing, so nothing between the write's start and its end can fail but the
+    /// write, which answers for what it did and never throws for a write that fails.</para>
     /// </summary>
-    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
-    internal async ValueTask<LogIngestResult> CommitAsync(LogIngestBatch batch, CancellationToken ct)
+    internal LogCommit BeginCommit(LogIngestBatch batch, CancellationToken ct)
     {
         // Decoded: for the wait for room, the batch keeps reserved what it holds and no more.
         batch.TrimReservation();
@@ -444,34 +456,27 @@ public sealed class IngestionEndpoint
         // What the answer is made of, read BEFORE the write: the write's lease ends inside it, and a
         // dispose asked meanwhile (deferred to that end) zeroes the batch — read after, the client's
         // event count was 0 and every marker counted as written.
-        int stagedCount   = staged.Count;
-        int clientEvents  = batch.StagedEvents;
-        int markerCount   = batch.MarkerCount;
-        int droppedAtDoor = batch.DroppedAtDoor;
-        bool malformed    = batch.Malformed;
-        if (stagedCount == 0)
-            return new LogIngestResult(0, droppedAtDoor, Busy: false);   // no marker staged, so nothing was refused
+        int stagedCount = staged.Count;
+        if (stagedCount == 0)   // no marker staged, so nothing was refused: nothing to write
+            return new LogCommit(default, 0, 0, 0, batch.DroppedAtDoor, batch.Malformed);
+        return new LogCommit(_storage.WriteBatchAsync(staged, _backPressureWait, ct),
+                             stagedCount, batch.StagedEvents, batch.MarkerCount, batch.DroppedAtDoor, batch.Malformed);
+    }
 
-        var pending = _storage.WriteBatchAsync(staged, _backPressureWait, ct);
-        LogBatchWriteResult r;
-        try
-        {
-            r = await pending.ConfigureAwait(false);
-        }
-        // The await could not suspend: this method's state machine is boxed at its first suspension,
-        // which is here — AFTER the write began, so part of the batch may be written — and a heap at
-        // its limit refuses that allocation too. It used to leave as a 500 (gRPC UNKNOWN) while the
-        // write went on: the counts were lost, and a Seq client's retry wrote what had been written a
-        // second time. The write ends by itself, within its wait, so it is waited out here with
-        // nothing to allocate (a blocked thread, but only on a heap that cannot box a state machine)
-        // and the request answered from what it did. A write still going after that is left to end
-        // on its own — it holds the batch (LogWriteBatch.Lease) — and the failure goes up as it did.
-        // Nothing below relies on a finally, which that failure would skip.
-        catch (OutOfMemoryException) when (!pending.IsCompleted || pending.IsCompletedSuccessfully)
-        {
-            if (!WaitOut(pending, _backPressureWait + CommitWaitOutGrace)) throw;
-            r = pending.Result;
-        }
+    /// <summary>
+    /// Says what became of a batch whose write (<see cref="LogCommit.Write"/>, begun by
+    /// <see cref="BeginCommit"/>) came to <paramref name="r"/>: the counts the answer gives, and the
+    /// lines its drops are named in. Called by <see cref="LogIngestBatch.EndCommit"/>. Synchronous; it
+    /// allocates nothing but those lines, each guarded — nothing here makes a written batch a failure.
+    /// </summary>
+    internal LogIngestResult EndCommit(LogIngestBatch batch, in LogCommit commit, LogBatchWriteResult r)
+    {
+        int droppedAtDoor = commit.DroppedAtDoor;
+        if (commit.Staged == 0)
+            return new LogIngestResult(0, droppedAtDoor, Busy: false);
+        int stagedCount  = commit.Staged;
+        int clientEvents = commit.ClientEvents;
+        int markerCount  = commit.Markers;
         Interlocked.Add(ref _acceptedTotal, r.Written);
 
         // Drop markers stand in for events refused at the door: they are written like any other
@@ -513,36 +518,13 @@ public sealed class IngestionEndpoint
         // decoded, a retried batch wrote one per attempt, and the count of drops in the next line
         // counted attempts (~170 for 20 drops). Guarded: a line that runs out of memory after the
         // write must not make a written batch a 500.
-        if (!busy || malformed)
+        if (!busy || commit.Malformed)
         {
             Interlocked.Add(ref _droppedOversized, droppedAtDoor);
             if (markerCount > 0) LogOversizedDrops(batch, markersWritten);
         }
         return new LogIngestResult(ingested, dropped, busy);
     }
-
-    /// <summary>
-    /// Blocks until <paramref name="pending"/> has completed, allocating nothing: false when it has
-    /// not within <paramref name="wait"/> — it is then not waited for any longer (a write queued
-    /// behind other writers for that long, or a continuation starved of a thread). For an await that
-    /// could not suspend (the awaiting method's box, out of memory): see <see cref="CommitAsync"/>.
-    /// </summary>
-    internal static bool WaitOut<T>(ValueTask<T> pending, TimeSpan wait)
-    {
-        long deadline = Environment.TickCount64 + Math.Max(0, (long)wait.TotalMilliseconds);
-        while (!pending.IsCompleted)
-        {
-            if (Environment.TickCount64 >= deadline) return false;
-            Thread.Sleep(CommitWaitOutPollMs);
-        }
-        return true;
-    }
-
-    /// <summary>How long past the write's own wait (BackPressureWait) a commit waits its write out.</summary>
-    internal static readonly TimeSpan CommitWaitOutGrace = TimeSpan.FromSeconds(1);
-
-    /// <summary>How often <see cref="WaitOut{T}"/> looks at what it waits for.</summary>
-    private const int CommitWaitOutPollMs = 5;
 
     /// <summary>
     /// The unwritten-marker Warnings a request writes on its own before the rest are summed up in one
@@ -768,9 +750,13 @@ public sealed class IngestionEndpoint
             bodyBuf = null;
 
             // ── 4. Write, then answer ─────────────────────────────────────────
-            // The batch is given back as soon as the commit has written it, before the answer, which a
-            // slow client can hold up. This await runs on the box made above: it allocates none.
-            LogIngestResult result = await batch.CommitAsync(ctx.RequestAborted);
+            // The write is awaited HERE, on the box made above (round-6 review R5-M4): that await
+            // allocates nothing, so nothing between the write's start and its end can fail but the
+            // write, which answers for what it did. The batch is given back as soon as it is written,
+            // before the answer, which a slow client can hold up.
+            var commit  = batch.BeginCommit(ctx.RequestAborted);
+            var written = await commit.Write;
+            LogIngestResult result = batch.EndCommit(commit, written);
             batch.Dispose();
             batch = null;
 
@@ -975,7 +961,7 @@ public sealed class IngestionEndpoint
     /// distinguish it from the client sink's own oversized marker.
     ///
     /// <para>Cold path, one per dropped event: the strings are worth their cost. The log line that
-    /// names the producer is written with the answer that ends the request (CommitAsync): the drop is
+    /// names the producer is written with the answer that ends the request (EndCommit): the drop is
     /// counted there, once, not per attempt, and a drop whose marker the store had no room for is
     /// named there. The service comes from the span when the caller passed one, else from the pool:
     /// a parser that interned the block's service.name once may hand over only the index.</para>
@@ -1020,7 +1006,7 @@ public sealed class IngestionEndpoint
         {
             // Cold path: the strings here are worth their cost — this is one marker event per
             // dropped event, not per event. The drop is COUNTED, and the line that names it written,
-            // with the answer that ends the request (CommitAsync), as in StageRaw.
+            // with the answer that ends the request (EndCommit), as in StageRaw.
             string  tmplStr = MarkerTemplate(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : StringInternPool.Decode(serviceUtf8);
 

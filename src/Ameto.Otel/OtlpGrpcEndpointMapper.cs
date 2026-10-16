@@ -426,7 +426,9 @@ public static class OtlpGrpcEndpointMapper
                     batch.MarkMalformed();
                     IngestBufferPool.Return(body);   // before the write, which may wait (see below)
                     body = null;
-                    await batch.CommitAsync(ctx.RequestAborted);
+                    var commit  = batch.BeginCommit(ctx.RequestAborted);
+                    var written = await commit.Write;   // on the handler's own box (see the commit below)
+                    batch.EndCommit(commit, written);
                     batch.Dispose();   // before the answer (see the commit below)
                     batch = null;
                 }
@@ -459,9 +461,13 @@ public static class OtlpGrpcEndpointMapper
                 // to hold its message twice, the body until the outer finally.
                 IngestBufferPool.Return(body);
                 body = null;
-                // The batch is given back as soon as the commit has written it, before the answer, which a
-                // client that stops reading can hold up. This await runs on the box the handler made first.
-                LogIngestResult result = await batch.CommitAsync(ctx.RequestAborted);
+                // The write is awaited HERE, on the box the handler made first (round-6 review R5-M4): that
+                // await allocates nothing, so nothing between the write's start and its end can fail but the
+                // write. The batch is given back as soon as it is written, before the answer, which a client
+                // that stops reading can hold up.
+                var commit  = batch.BeginCommit(ctx.RequestAborted);
+                var written = await commit.Write;
+                LogIngestResult result = batch.EndCommit(commit, written);
                 batch.Dispose();
                 batch = null;
                 if (result.Busy)

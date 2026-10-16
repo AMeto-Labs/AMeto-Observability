@@ -7,7 +7,7 @@ namespace Ameto.Ingestion;
 /// <summary>
 /// One ingest request's log events, decoded and waiting to be written: the sink the parsers write
 /// into (<see cref="IOtlpLogSink"/> for OTLP, <see cref="LogEventSerializer.IClefBatchSink"/> for
-/// CLEF), then <see cref="CommitAsync"/> to put them in the store. From
+/// CLEF), then <see cref="BeginCommit"/>, its write awaited, and <see cref="EndCommit"/> to put them in the store. From
 /// <see cref="IngestionEndpoint.TryBeginBatch"/>; dispose it when the request is done.
 ///
 /// <para>Every staging rule — the per-event size limit and its drop marker, template and service
@@ -154,11 +154,29 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     internal int MarkersBefore(int count) => Math.Clamp(count - StagedEvents, 0, MarkerCount);
 
     /// <summary>
-    /// Writes the staged events into the store and says what became of them. A receiver awaits it on a
-    /// state machine boxed before the batch was begun (round-5 H-G): its await of the commit is never the
-    /// first suspension whose box could fail while the commit ran on.
+    /// Begins writing the staged events into the store: what a commit does before the write's wait, and
+    /// the write, synchronously. The caller awaits <see cref="LogCommit.Write"/> ITSELF — a receiver on the
+    /// state machine it boxed before the batch was begun (round-5 H-G), where that await allocates nothing
+    /// — and hands what it came to to <see cref="EndCommit"/>. No method of the commit's own stands between
+    /// the request and the write (round-6 review R5-M4): one whose first suspension was its await of the
+    /// write could fail to box there with the write going on.
     /// </summary>
-    public ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default) => _owner.CommitAsync(this, ct);
+    public LogCommit BeginCommit(CancellationToken ct = default) => _owner.BeginCommit(this, ct);
+
+    /// <summary>What became of the staged events, from what <see cref="LogCommit.Write"/> came to. Synchronous.</summary>
+    public LogIngestResult EndCommit(in LogCommit commit, LogBatchWriteResult written) => _owner.EndCommit(this, in commit, written);
+
+    /// <summary>
+    /// <see cref="BeginCommit"/>, the write awaited HERE, then <see cref="EndCommit"/>: for a caller with
+    /// nothing to lose if this method's own box fails at that await — the tests. Not for a receiver (see
+    /// <see cref="BeginCommit"/>).
+    /// </summary>
+    internal async ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default)
+    {
+        var commit  = BeginCommit(ct);
+        var written = await commit.Write.ConfigureAwait(false);
+        return EndCommit(commit, written);
+    }
 
     /// <summary>
     /// Gives the batch's arrays back, and its reservation with them — when the write that holds the
@@ -266,7 +284,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         ReadOnlySpan<byte> serviceUtf8)
         => Count(_owner.StageOversized(this, tsTicks, level, templateUtf8, payloadBytes, traceHi, traceLo, spanId, serviceUtf8, serviceIdx: -1));
 
-    /// <summary>Nothing to wake: the batch is written by <see cref="CommitAsync"/>.</summary>
+    /// <summary>Nothing to wake: the batch is written by <see cref="BeginCommit"/>.</summary>
     public void NotifyBatchEnqueued() { }
 
     /// <inheritdoc/>
@@ -338,6 +356,48 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 /// answered for good, with its markers written if the store had room for them.
 /// </param>
 public readonly record struct LogIngestResult(int Ingested, int Dropped, bool Busy);
+
+/// <summary>
+/// A commit begun (<see cref="LogIngestBatch.BeginCommit"/>): the write, for the caller to await, and
+/// what the answer is made of, read before the write — whose lease ends inside it, where a dispose asked
+/// meanwhile zeroes the batch. Await <see cref="Write"/> once, then hand both to
+/// <see cref="LogIngestBatch.EndCommit"/>.
+/// </summary>
+public readonly struct LogCommit
+{
+    internal LogCommit(ValueTask<LogBatchWriteResult> write, int staged, int clientEvents, int markers, int droppedAtDoor, bool malformed)
+    {
+        Write         = write;
+        Staged        = staged;
+        ClientEvents  = clientEvents;
+        Markers       = markers;
+        DroppedAtDoor = droppedAtDoor;
+        Malformed     = malformed;
+    }
+
+    /// <summary>
+    /// The write, begun: it waits for room if it must, and never throws for a write that fails
+    /// (StorageEngine.WriteBatchAsync). A receiver awaits it on the state machine it boxed before the
+    /// batch was begun, where the await allocates nothing (round-6 review R5-M4). Awaited once, as any
+    /// <see cref="ValueTask{TResult}"/>; completed at once when nothing was staged.
+    /// </summary>
+    public ValueTask<LogBatchWriteResult> Write { get; }
+
+    /// <summary>Events written by <see cref="Write"/>: the client's, then the drop markers.</summary>
+    internal int Staged { get; }
+
+    /// <summary>The client's events among them.</summary>
+    internal int ClientEvents { get; }
+
+    /// <summary>The drop markers among them, after the client's events.</summary>
+    internal int Markers { get; }
+
+    /// <summary>Events refused at the door (<see cref="LogIngestBatch.DroppedAtDoor"/>).</summary>
+    internal int DroppedAtDoor { get; }
+
+    /// <summary>The body turned out malformed part way (<see cref="LogIngestBatch.Malformed"/>).</summary>
+    internal bool Malformed { get; }
+}
 
 /// <summary>
 /// A log batch whose decode passed <c>Ingestion.MaxDecodedLogBatchBytes</c> — weighed before it was

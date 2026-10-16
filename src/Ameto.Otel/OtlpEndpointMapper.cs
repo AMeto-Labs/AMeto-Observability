@@ -357,9 +357,12 @@ public static class OtlpEndpointMapper
 
                 // Answered only once the events are in the store — the hot tier and its WAL, or a
                 // spill file — so a 200 survives the death of this process (IngestionEndpoint). The
-                // batch is given back as soon as the commit has written it, before the answer. This await
-                // runs on the box the handler made first.
-                LogIngestResult result = await batch!.CommitAsync(ctx.RequestAborted);
+                // write is awaited HERE, on the box the handler made first (round-6 review R5-M4): that
+                // await allocates nothing, so nothing between the write's start and its end can fail
+                // but the write. The batch is given back as soon as it is written, before the answer.
+                var commit  = batch!.BeginCommit(ctx.RequestAborted);
+                var written = await commit.Write;
+                LogIngestResult result = batch.EndCommit(commit, written);
                 batch.Dispose();
                 batch = null;
                 if (malformed)
