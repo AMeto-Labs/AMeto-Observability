@@ -76,6 +76,61 @@ public sealed class ReceiverFirstSuspensionTests : IClassFixture<AmetoWebAppFact
     }
 
     /// <summary>
+    /// Round-6 review R5-M3 (M-C's class at the yield-first mechanism): the gRPC handler's box is made and the
+    /// first suspension then fails — the TPL event source's tracing, async debugging, after the box is stored.
+    /// Its catch answered UNAVAILABLE with an await (the response's completion, which on Kestrel's HTTP/2
+    /// completes asynchronously), and that await reused the box, whose copy of the state machine was taken at
+    /// the Yield: the stale copy then ran the whole handler and wrote the batch under a call already answered
+    /// UNAVAILABLE — which the exporter retries, storing it twice (the round-5 reviewer's P16, Release). The
+    /// catch answers synchronously now. The seam leaves Release's copy in the box in Debug too (fc652bd).
+    /// </summary>
+    [Fact]
+    public async Task A_grpc_receiver_whose_box_was_made_before_its_first_suspension_failed_writes_nothing()
+    {
+        var storage = _factory.Services.GetRequiredService<StorageEngine>();
+        int writes = 0, armed = 1, fired = 0;
+        storage._afterWriteGate = () => Interlocked.Increment(ref writes);
+        var answer = new SlowlyCompletedResponse();
+        try
+        {
+            var ctx = Context("application/grpc", Frame(LogsRequest(2), compressed: false));
+            ctx.Request.Protocol = "HTTP/2";
+            ctx.Features.Set<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>(answer);
+            Task handled;
+            OwnerAsync.BoxThenFailForTest.Value = t =>
+            {
+                if (!t.Name.Contains("<HandleCoreAsync>", StringComparison.Ordinal) || Interlocked.Exchange(ref armed, 0) == 0) return false;
+                Interlocked.Increment(ref fired);
+                return true;
+            };
+            try { handled = OtlpGrpcEndpointMapper.HandleLogsAsync(ctx, new OtlpInflateGate(1, TimeSpan.Zero), NoLog, NoMemoryLog); }
+            finally { OwnerAsync.BoxThenFailForTest.Value = null; }
+            await handled.WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.Delay(100);   // a completion the catch awaited, and a stale copy resumed by it
+
+            Assert.Equal(1, Volatile.Read(ref fired));   // setup: the box was made, then the suspension failed
+            int wrote = Volatile.Read(ref writes);
+            Assert.True(wrote == 0, $"{wrote} write(s) of a batch already answered UNAVAILABLE: a stale copy of the handler ran it whole");
+            Assert.Equal("14", ctx.Response.Headers["grpc-status"].ToString());   // UNAVAILABLE, which exporters retry
+        }
+        finally { storage._afterWriteGate = null; }
+    }
+
+    /// <summary>A response whose completion is asynchronous, as an HTTP/2 stream's is under Kestrel.</summary>
+    private sealed class SlowlyCompletedResponse : Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature
+    {
+        private readonly Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature _inner =
+            new StreamResponseBodyFeature(new MemoryStream());
+        public Stream Stream => _inner.Stream;
+        public System.IO.Pipelines.PipeWriter Writer => _inner.Writer;
+        public void DisableBuffering() => _inner.DisableBuffering();
+        public Task StartAsync(CancellationToken cancellationToken = default) => _inner.StartAsync(cancellationToken);
+        public Task SendFileAsync(string path, long offset, long? count, CancellationToken cancellationToken = default) =>
+            _inner.SendFileAsync(path, offset, count, cancellationToken);
+        public async Task CompleteAsync() => await Task.Delay(30);
+    }
+
+    /// <summary>
     /// Runs a handler with the store faulting throughout — a commit would wait its whole BackPressureWait —
     /// and the handler's first suspension failing where its state machine is boxed. Returns how long the
     /// caller's thread was held before it had the handler's task back, and how many writes were tried.

@@ -209,10 +209,18 @@ public static class OtlpGrpcEndpointMapper
         // the stand's two slots, and every compressed batch, HTTP or gRPC, was refused until a restart.
         // Or it was the commit, waited out on a pool thread the commit itself needed. Here a failure
         // takes nothing with it, and is answered UNAVAILABLE, which exporters retry.
+        //
+        // ANSWERED WITHOUT AN AWAIT (round-6 review R5-M3). A failure here can come after the box was made
+        // — the TPL event source's tracing, async debugging, a registration that allocates — and the box
+        // then holds a copy of the state machine taken at this Yield (Release's is a struct). An await in
+        // this catch reuses that box, and once it completed, the copy resumed after the Yield: the whole
+        // handler ran and wrote the batch under a call already answered UNAVAILABLE, which the exporter
+        // retries — stored twice (M-C's class). The status goes into the response headers instead, gRPC's
+        // own Trailers-Only answer, which hosting completes when the handler returns.
         try { await Task.Yield(); }
         catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
         {
-            await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
+            RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
             return;
         }
 
@@ -551,6 +559,26 @@ public static class OtlpGrpcEndpointMapper
         await FinishAsync(ctx, StatusUnavailable, IngestMemoryShortMessage);
         log.Note(ctx, ex);
     }
+
+    /// <summary>
+    /// <see cref="RefuseOutOfMemoryAsync"/> without an await, for the catch of the handler's first suspension
+    /// (see there): UNAVAILABLE in the response headers — the Trailers-Only answer, which hosting completes
+    /// when the handler returns — and the throttled line. The response has not started there; nothing has
+    /// been written.
+    /// </summary>
+    private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
+    {
+        if (!ctx.Response.HasStarted)
+        {
+            ctx.Response.Headers["grpc-status"]  = StatusUnavailableText;
+            ctx.Response.Headers["grpc-message"] = IngestMemoryShortMessage;
+        }
+        log.Note(ctx, ex);
+    }
+
+    /// <summary><see cref="StatusUnavailable"/> as the header carries it: a constant, so the answer allocates no string
+    /// and the class gains no static initializer (round-5 M-A: one that fails in an out of memory fails the type).</summary>
+    private const string StatusUnavailableText = "14";
 
     /// <summary>
     /// Writes the gRPC status.
