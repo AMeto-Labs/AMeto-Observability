@@ -212,6 +212,80 @@ public sealed class OtlpJsonRoomTests
         Assert.Equal(size, Assert.Single(under.Refused));
     }
 
+    // ── R5-M8: a "resource" key given twice ───────────────────────────────────
+
+    /// <summary>
+    /// Round-6 review R5-M8. A <c>"resource"</c> key given more than once in one resourceLogs element (JSON
+    /// allows it; OTLP does not send it) adds its attributes to the first's, as the protobuf parser merges a
+    /// resource field given twice: the scratch holds both. The budget was reset for each, so it counted only
+    /// the last: a record whose map passed the limit was assembled past it, and one under a first resource
+    /// cut part way was assembled with that cut map — answered 200, stored, and given back with no
+    /// properties (the review's P7M). One budget for the block now: what JSON makes of it is what protobuf
+    /// makes of its twin, map for map and size for size.
+    /// </summary>
+    [Theory]
+    [InlineData("a:60000,b:10000 | c:1")]            // the first past the limit part way, then one under it (P7M)
+    [InlineData("a:30000 | b:30000 | c:30000")]      // each under the limit, together past it
+    [InlineData("a:10 | b:20")]                      // together under it: one map with both
+    public void A_resource_given_twice_is_one_map_as_protobuf_makes_it(string resources)
+    {
+        // Each resource's attributes, as key:length (a string of that many 'v').
+        var attrs = resources.Split('|', StringSplitOptions.TrimEntries)
+                             .Select(r => r.Split(',').Select(p => (Key: p.Split(':')[0], Len: int.Parse(p.Split(':')[1]))).ToArray()).ToArray();
+
+        string json = "{\"resourceLogs\":[{" +
+                      string.Concat(attrs.Select(a => "\"resource\":{\"attributes\":[" + string.Join(",", a.Select(kv => StringAttr(kv.Key, new string('v', kv.Len)))) + "]},")) +
+                      "\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"rec\"},\"attributes\":[" + StringAttr("d", "7") + "]}]}]}]}";
+        byte[] proto = Pb(1, Cat(
+            Cat(attrs.Select(a => Pb(1, Cat(a.Select(kv => Pb(1, PbKv(kv.Key, new string('v', kv.Len)))).ToArray()))).ToArray()),
+            Pb(2, Pb(2, Cat(Pb(5, Pb(1, Utf8("rec"))), Pb(6, PbKv("d", "7")))))));
+
+        var fromJson  = new Sink();
+        var fromProto = new Sink();
+        var counts    = OtlpLogStreamParser.Parse(Utf8(json), fromJson);
+        Assert.Equal(OtlpLogProtoParser.Parse(proto, fromProto), counts);
+
+        Assert.Equal(fromProto.Refused, fromJson.Refused);
+        Assert.Equal(fromProto.Maps.Count, fromJson.Maps.Count);
+        for (int i = 0; i < fromProto.Maps.Count; i++) Assert.Equal(fromProto.Maps[i], fromJson.Maps[i]);
+    }
+
+    /// <summary>
+    /// R5-M8, its scratch: a resource given many times was written whole each time, past the limit — 130
+    /// resources of 60 KB took 16.6 MB at the stage against a 2.1 MB charge (the review's P3D). Past the
+    /// block's one budget nothing more is written.
+    /// </summary>
+    [Fact]
+    public void A_resource_given_many_times_takes_no_more_scratch_than_one_map()
+    {
+        var sb = new StringBuilder("{\"resourceLogs\":[{");
+        for (int i = 0; i < 64; i++) sb.Append("\"resource\":{\"attributes\":[").Append(StringAttr("r" + i, new string('v', 60_000))).Append("]},");
+        sb.Append("\"scopeLogs\":[{\"logRecords\":[{\"attributes\":[").Append(StringAttr("a", "x")).Append("]}]}]}]}");
+        byte[] body = Utf8(sb.ToString());
+
+        var sink = new Sink();
+        OtlpLogStreamParser.Parse(Body(StringAttr("warm", "w"), StringAttr("warm", "w")), new Sink());   // this thread's scratch
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Equal((0, 1), OtlpLogStreamParser.Parse(body, sink));
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        // map16 header, 64 × (the key "rN", str16 header, the text), then "a" and "x": the map it would have been.
+        Assert.Equal(3 + Enumerable.Range(0, 64).Sum(i => 1 + ("r" + i).Length + 3 + 60_000) + 2 + 2, Assert.Single(sink.Refused));
+        Assert.True(allocated < 512 * 1024, $"the parse allocated {allocated:N0} B for 64 resources of 60 KB, against a {Limit:N0} B limit");
+    }
+
+    /// <summary>A protobuf length-delimited field: tag, varint length, payload.</summary>
+    private static byte[] Pb(int field, byte[] payload)
+    {
+        var o = new List<byte> { (byte)(field << 3 | 2) };
+        for (ulong v = (ulong)payload.Length; ; v >>= 7) { if (v < 0x80) { o.Add((byte)v); break; } o.Add((byte)(v | 0x80)); }
+        o.AddRange(payload);
+        return o.ToArray();
+    }
+
+    /// <summary>A protobuf KeyValue with a string value.</summary>
+    private static byte[] PbKv(string key, string value) => Cat(Pb(1, Utf8(key)), Pb(2, Pb(1, Utf8(value))));
+
     // ── L-10: text that is not UTF-8 ──────────────────────────────────────────
 
     /// <summary>

@@ -190,11 +190,16 @@ public static class OtlpLogStreamParser
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                 {
-                    // Counted as they are written, once per block: past the limit they stop being
-                    // written, and every record under them is refused unassembled.
+                    // Counted as they are written, ONE budget for every resource of the block: past the
+                    // limit they stop being written, and every record under them is refused unassembled. A
+                    // "resource" key given twice (not OTLP, but JSON) adds its attributes to the first's —
+                    // resBuf holds both, as the protobuf parser merges a resource field given twice — so it
+                    // is counted on from the first's, never from zero (round-6 review R5-M8). Counted from
+                    // zero, a record was assembled past the limit, or with a map cut part way that the store
+                    // answered 200 for and gave back with no properties.
                     map.Base  = 0;
-                    map.Bytes = 0;
-                    map.Over  = false;
+                    map.Bytes = map.ResBytes;
+                    map.Over  = map.ResOver;
                     ParseResourceAttributes(ref reader, resBuf, ref resKeyCount, ref svc, ref map);
                     map.ResBytes = map.Bytes;
                     map.ResOver  = map.Over;
