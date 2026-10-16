@@ -4292,6 +4292,175 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Round-5 review L-4, the other side (round-6 review). L-4 kept a run's clock from going on while no slot was free
+    /// by stamping the last failure anew whenever a swap the writers waited on found none — and so revived a run that
+    /// had already aged out with a slot free: two failures nobody waited on, a quiet spell longer than the gap, then a
+    /// despill holding the only slot through a burst. The first failure after the release was the third "in a row": the
+    /// next block's despill took the slot before the swap's next try installed, and the writers, spilling off, waited
+    /// that despill out (round-4 L27's stale count, back; the review's probe: 4 s against 0.3 s). The clock follows the
+    /// time a slot is free now: a run that aged out stays over.
+    /// </summary>
+    [Fact]
+    public async Task A_run_of_swap_failures_that_aged_out_is_not_revived_by_a_despill_holding_the_slot()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+        EarlierRunSpill(opts, dir, 9_100, 200_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(100);   // a run ends after 1 s with a slot free
+        engine._roomRecheckMs  = 50;                               // the writers ask for their swap all along
+        int toFail = 2, failures = 0, installed = 0, installedAtSecond = -1;
+        engine._beforeFrozenListGrowForTest = () =>   // the swap has the slot, and installs
+        {
+            if (Interlocked.Decrement(ref toFail) < 0) { Volatile.Write(ref installed, 1); return; }
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: a transient failure creating the next WAL");
+        };
+        using var firstDespill = new ManualResetEventSlim(false);
+        using var firstGoesOn  = new ManualResetEventSlim(false);
+        engine._beforeLoadSpillForTest = block =>
+        {
+            if (block == 9_000) { firstDespill.Set(); firstGoesOn.Wait(HangGuard); }
+            else if (block == 9_100) Interlocked.CompareExchange(ref installedAtSecond, Volatile.Read(ref installed), -1);
+        };
+        Task<LogBatchWriteResult>? writer = null;
+        var batch = Batch(engine, 1, TierEvents + 10);
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);   // swaps nobody waits on
+            Thread.Sleep(1_500);   // the quiet spell, a slot free: the run is over
+
+            hold.SetResult();   // the despill loop: the tier is not refusing, so the first block's despill takes the slot
+            Assert.True(firstDespill.Wait(ShortGuard), "setup: the first block's despill never took the slot");
+            Volatile.Write(ref toFail, 1);   // the next swap that has the slot fails once, transiently
+            writer = Task.Run(async () => await engine.WriteBatchAsync(batch, HangGuard));
+            WaitFor(() => engine.LiveHotTierRefused, "the burst to fill the tier", ShortGuard);
+            await Task.Delay(500);   // its swap finds the slot held, the writers asking all along
+
+            firstGoesOn.Set();   // the first despill ends: the swap tries first, fails once, and installs at its next try
+            Assert.Equal(new LogBatchWriteResult(TierEvents + 10, 0, 0), await writer.WaitAsync(ShortGuard));
+            WaitFor(() => Volatile.Read(ref installedAtSecond) != -1, "the next block's despill", ShortGuard);
+            Assert.True(Volatile.Read(ref installedAtSecond) == 1,
+                        $"the next block's despill took the slot before the swap installed: {Volatile.Read(ref failures)} failure(s), the third " +
+                        "counted in a row with the two a quiet spell before it");
+        }
+        finally
+        {
+            Volatile.Write(ref toFail, 0);
+            firstGoesOn.Set();
+            hold.TrySetResult();
+            if (writer is not null) await writer.WaitAsync(HangGuard);
+            batch.Dispose();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-4, the frozen tiers' text (round-6 review: its half was pinned by nothing). A swap that finds the
+    /// frozen tiers at their budget of text cannot be tried either, until a flush gives text back with its slot: a live
+    /// run's clock stops there too, and a hold longer than the gap does not restart the run — the first failure after
+    /// it is still one in the run, and the backlog's despill takes a slot at once.
+    /// </summary>
+    [Fact]
+    public async Task A_swap_held_by_the_frozen_text_budget_longer_than_the_streak_gap_does_not_restart_a_run_of_swap_failures()
+    {
+        const int Chars = 20_000;   // 40 KB of text an event
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false, tierBytes: 8 * MB);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try
+        {
+            engine = new StorageEngine(
+                Microsoft.Extensions.Options.Options.Create(opts),
+                new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+                NullLogger<StorageEngine>.Instance,
+                MemoryBudgets.Derive(managedLimitBytes: 128 * MB, physicalLimitBytes: 1024 * MB));
+        }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        long budget = engine.FrozenTextBudgetForTest;
+        Assert.True(engine.FlushSlots > 2 && budget is > 6 * MB and < 12 * MB,
+                    $"setup: {engine.FlushSlots} slot(s), a frozen-text budget of {budget / (double)MB:F1} MB");
+        var gate = HoldFirstFlush(engine);
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(300);   // a run ends after 3 s with a swap that could be tried
+        engine._roomRecheckMs  = 50;
+        int failing = 0, failures = 0, atRelease = -1, atDespill = -1;
+        engine._beforeFrozenListGrowForTest = () =>
+        {
+            if (Volatile.Read(ref failing) == 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: the swap fails after it took a slot");
+        };
+        engine._beforeLoadSpillForTest = _ => Interlocked.CompareExchange(ref atDespill, Volatile.Read(ref failures), -1);
+
+        LogWriteBatch TextBatch(int from, int count)
+        {
+            var b = new LogWriteBatch();
+            for (int i = from; i < from + count; i++)
+                b.Add(new LogEventHeader
+                {
+                    TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                }, Props(i), new string((char)('a' + i % 26), Chars) + i, exception: null);
+            return b;
+        }
+
+        Task? firstFlush = null;
+        Task<LogBatchWriteResult>? writer = null;
+        var full = TextBatch(1_000, 210);   // a tier's text and more: the tier fills, and its swap finds the budget taken
+        try
+        {
+            // Tier 1: some 4 MB of text, swapped and frozen, its flush held with its slot and its text.
+            int first = (int)((budget - 6 * MB) / (2 * Chars)) + 1;   // frozen + a full tier's text is past the budget
+            using (var t = TextBatch(0, first))
+                Assert.Equal(first, (await engine.WriteBatchAsync(t, HangGuard)).Written);
+            firstFlush = Task.Run(() => engine.FlushHotTierAsync());
+            WaitFor(() => engine.FrozenTierCountForTest == 1 && engine.LiveHotTier.Count == 0, "tier 1 to swap", ShortGuard);
+
+            // Tier 2, little text: its swaps can be tried, and two fail — a live run.
+            Volatile.Write(ref failing, 1);
+            Assert.True(TryWriteOne(engine, 500));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);
+
+            // Its text fills it: the swap the full tier asks for finds the frozen tiers' text at its budget.
+            writer = Task.Run(async () => await engine.WriteBatchAsync(full, HangGuard));
+            WaitFor(() => engine.LiveHotTierRefused, "tier 2 to fill with text", ShortGuard);
+            Assert.True(engine.FrozenTextBytesForTest + engine.LiveHotTier.ManagedBytes > budget, "setup: the text budget has room for tier 2");
+            hold.SetResult();      // the despill loop: two failures and no spill, so it yields
+            await Task.Delay(3_500);   // longer than the gap, the swaps held by the text budget all along
+            Assert.Equal(2, Volatile.Read(ref failures));
+            Assert.Equal(-1, Volatile.Read(ref atDespill));
+
+            Volatile.Write(ref atRelease, Volatile.Read(ref failures));
+            gate.Set();   // tier 1's flush ends: its slot and its text come back, the swap tries and fails
+            WaitFor(() => Volatile.Read(ref atDespill) != -1, "the backlog's despill to take a slot", ShortGuard);
+            int between = Volatile.Read(ref atDespill) - Volatile.Read(ref atRelease);
+            Assert.True(between < 3, $"{between} swap failures after the text came back before the despill took a slot: the run restarted");
+        }
+        finally
+        {
+            Volatile.Write(ref failing, 0);
+            gate.Set();
+            hold.TrySetResult();
+            if (writer is not null) await writer.WaitAsync(HangGuard);
+            if (firstFlush is not null) await firstFlush.WaitAsync(HangGuard);
+            full.Dispose();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A volume slow to measure (round-5 L-5) ────────────────────────────────
 
     /// <summary>

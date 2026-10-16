@@ -2516,7 +2516,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // again. Never past a backlog that holds none, and never for the final flush.
             if (!finalFlush && !FrozenTextHasRoomFor(oldState.Hot))
             {
-                SwapCouldNotBeTried(oldState);
+                StopSwapRunClock();   // no swap can be tried until text comes back, with a slot (round-6 review, L-4)
                 SpillWithoutSlot(oldState);
                 return;
             }
@@ -2528,9 +2528,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // The final flush waits for a slot instead: every holder is a heavy phase or a retry
             // that shutdown's cancellation has already ended, and none of them takes this lock.
             // Never queued in the semaphore (OwnerPoll; round-5 M-B).
-            bool slot = _flushSlots.Wait(0);
+            bool slot = TryTakeFlushSlot();
             if (!slot && finalFlush)
-                for (int pause = 1; !(slot = _flushSlots.Wait(0)) && Environment.TickCount64 < waitDeadline; )
+                for (int pause = 1; !(slot = TryTakeFlushSlot()) && Environment.TickCount64 < waitDeadline; )
                     await OwnerPoll(_flushSlots, ref pause, waitDeadline, ct).ConfigureAwait(false);
             if (!slot)
             {
@@ -2539,10 +2539,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         "Final hot-tier flush skipped: no flush slot came free within the shutdown budget — " +
                         "the WAL replays the tier on the next start");
                 else
-                {
-                    SwapCouldNotBeTried(oldState);
-                    SpillWithoutSlot(oldState);
-                }
+                    SpillWithoutSlot(oldState);   // the run's clock stopped as the last slot was taken (TryTakeFlushSlot)
                 return;
             }
             WriteState? successor = null;
@@ -2579,15 +2576,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // left behind, an open 64 MB WAL with its mapping and id block and a tier's
                 // first chunk, at every attempt a request for the swap made.
                 if (successor is not null) DiscardSuccessor(successor);
-                try { _flushSlots.Release(); }
-                catch (Exception) { /* waking a waiter, which has the slot: the swap's own failure is the one that goes up */ }
+                ReleaseFlushSlot();   // never throws: the swap's own failure is the one that goes up
                 throw;
             }
 
             // Installed: whatever failed before has cleared.
             Volatile.Write(ref _swapFailedAt, 0);
             Volatile.Write(ref _swapRetryAt, 0);
-            Volatile.Write(ref _swapFailures, 0);
+            lock (_swapRunLock)
+            {
+                Volatile.Write(ref _swapFailures, 0);
+                _swapsUntriableSince = 0;
+            }
 
             // Frozen: its events' own text is the frozen backlog's until its slot goes back. Allocates
             // nothing, so nothing stands between the slot and the heavy phase below.
@@ -2816,12 +2816,32 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private int _swapFailures;
 
-    /// <summary><see cref="Environment.TickCount64"/> of the last failed swap, which nothing clears. Under <c>_flushLock</c> (<see cref="OnSwapFailed"/>).</summary>
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> of the last failed swap, moved on by the time no swap could be tried
+    /// since (<see cref="RestartSwapRunClockLocked"/>); nothing clears it. Under <see cref="_swapRunLock"/>.
+    /// </summary>
     private long _lastSwapFailureAt;
 
     /// <summary>
+    /// Since when no swap could be tried while a run of failed swaps was live — the last free flush slot taken, or the
+    /// frozen tiers' text at its budget — as <see cref="Environment.TickCount64"/>; 0 while one can, or no run is live.
+    /// Under <see cref="_swapRunLock"/>.
+    /// </summary>
+    private long _swapsUntriableSince;
+
+    /// <summary>
+    /// Guards a run's clock — <see cref="_lastSwapFailureAt"/>, <see cref="_swapsUntriableSince"/> and the count's
+    /// reset — across the slot's takers and givers, which hold different locks or none (a heavy phase gives its slot
+    /// back off the swap lock). The slot's take and release run under it, so a release and the take that follows it
+    /// are seen in order. Held for a few instructions; never across a wait.
+    /// </summary>
+    private readonly Lock _swapRunLock = new();
+
+    /// <summary>
     /// How long after a failed swap the next failure still counts as one in a row: ten of the longest
-    /// pauses between tries (round-4 L27). A swap that is wanted and keeps failing is tried again
+    /// pauses between tries (round-4 L27), of the time a swap could have been tried — a slot free, the
+    /// frozen tiers with room for a tier's text (see "A run's clock" below; round-5 L-4, round-6 review).
+    /// A swap that is wanted and keeps failing is tried again
     /// within <see cref="_swapRetryDelay"/> — by its own retry, sooner by a slot coming free — so a
     /// longer silence means nothing asked for it: the failures before it were of swaps no writer was
     /// waiting on (the age loop's, an explicit flush's, whose retries find nothing to swap). Their
@@ -2843,20 +2863,69 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>Failed swaps in a row after which the despill takes a free slot even with no spill to take the writers.</summary>
     private const int SwapFailuresBeforeDespillTakesTheSlot = 3;
 
+    // ── A run's clock (round-5 review L-4; round-6 review) ────────────────────
+    //
+    // The gap that ends a run (SwapFailureStreakGapMs) counts the time a swap could have been tried: a slot was free,
+    // and the frozen tiers had room for a tier's text. Not the time a despill or a flush held the last slot — a
+    // despill longer than the gap restarted the count at the first failure after it, and the despill then yielded
+    // the slot again (the "a release does not reset" decision, undone; L-4) — nor the time the text budget held the
+    // swaps. L-4 kept the run's clock going by stamping the last failure anew whenever a swap the writers waited on
+    // found no slot: a run that had already aged out with a slot free was revived by that stamp, and the first
+    // failure after it was the third "in a row" (round-4 L27's stale count, back: the despill took the slot for a
+    // whole block while the writers, spilling off, waited out BackPressureWait). The clock stops instead when the
+    // last free slot is taken while a run is live (or a swap finds the text budget full), and starts again — the
+    // last failure moved on by the time it stood — when a slot comes back. Stopping it never revives a run: the
+    // slot-free time before the stop still counts.
+
     /// <summary>
-    /// A swap the writers wait for found no slot free (or the frozen tiers at their share of text), and
-    /// was not tried: a run of failures does not age meanwhile (round-5 review L-4). The gap that ends a
-    /// run (<see cref="SwapFailureStreakGapMs"/>) counts the time when a slot was free — when the swap
-    /// could have been tried — and not the time a despill or a flush held the only one: a despill longer
-    /// than the gap restarted the count at the first failure after it, and the despill then yielded the
-    /// slot again (the "a release does not reset" decision, undone). Only a swap writers wait on: one
-    /// nothing waits on (the age loop's, an explicit flush's) is the silence the gap is there to see.
-    /// Under the swap lock, as <see cref="OnSwapFailed"/>.
+    /// Takes a flush slot if one is free — never queued (round-5 M-B) — and stops a live run's clock if that was the
+    /// last one (<see cref="StopSwapRunClockLocked"/>): until a slot comes back, no swap can be tried.
     /// </summary>
-    private void SwapCouldNotBeTried(WriteState state)
+    private bool TryTakeFlushSlot()
     {
-        if (Volatile.Read(ref _swapFailures) > 0 && Volatile.Read(ref state.HotRefused))
-            _lastSwapFailureAt = Environment.TickCount64;
+        lock (_swapRunLock)
+        {
+            if (!_flushSlots.Wait(0)) return false;
+            if (_flushSlots.CurrentCount == 0) StopSwapRunClockLocked();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Gives a flush slot back, starting a stopped run's clock again first (<see cref="RestartSwapRunClockLocked"/>).
+    /// Never throws: it ends the finally blocks and catches that own the slot.
+    /// </summary>
+    private void ReleaseFlushSlot()
+    {
+        lock (_swapRunLock)
+        {
+            RestartSwapRunClockLocked();
+            try { _flushSlots.Release(); }
+            catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
+        }
+    }
+
+    /// <summary>A swap found the frozen tiers' text at its budget, and was not tried: a live run's clock stops until a slot (with its text) comes back.</summary>
+    private void StopSwapRunClock()
+    {
+        lock (_swapRunLock) StopSwapRunClockLocked();
+    }
+
+    /// <summary>Stops a live run's clock now, unless it is stopped already. Under <see cref="_swapRunLock"/>.</summary>
+    private void StopSwapRunClockLocked()
+    {
+        long now = Environment.TickCount64;
+        if (_swapsUntriableSince == 0 && Volatile.Read(ref _swapFailures) > 0 && now - _lastSwapFailureAt <= SwapFailureStreakGapMs)
+            _swapsUntriableSince = now;
+    }
+
+    /// <summary>Starts a stopped run's clock again: the last failure is moved on by the time it stood. Under <see cref="_swapRunLock"/>.</summary>
+    private void RestartSwapRunClockLocked()
+    {
+        long since = _swapsUntriableSince;
+        if (since == 0) return;
+        _swapsUntriableSince  = 0;
+        _lastSwapFailureAt   += Environment.TickCount64 - since;
     }
 
     /// <summary>
@@ -2901,9 +2970,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         {
             _onSwapFailedForTest?.Invoke();
             long now = Environment.TickCount64;
-            if (now - _lastSwapFailureAt > SwapFailureStreakGapMs) Volatile.Write(ref _swapFailures, 0);   // not in a row
-            _lastSwapFailureAt = now;
-            long delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
+            long delay;
+            lock (_swapRunLock)
+            {
+                RestartSwapRunClockLocked();   // this swap was tried
+                if (now - _lastSwapFailureAt > SwapFailureStreakGapMs) Volatile.Write(ref _swapFailures, 0);   // not in a row
+                _lastSwapFailureAt = now;
+                delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
+            }
             Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
             Volatile.Write(ref _swapRetryAt, now + delay);
             if (Interlocked.Exchange(ref _swapRetryPending, 1) == 0)
@@ -3303,8 +3377,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             long text = tier.TakeFrozenTextCharge();
             if (text != 0) Interlocked.Add(ref _frozenTextBytes, -text);
         }
-        try { _flushSlots.Release(); }
-        catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
+        ReleaseFlushSlot();   // and a run's clock, stopped while no swap could be tried, goes on (L-4; round-6 review)
         if (endHeavyPhase)
         {
             try { EndHeavyPhase(); }

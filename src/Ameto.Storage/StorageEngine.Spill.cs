@@ -833,7 +833,7 @@ public sealed partial class StorageEngine
                     }
                     if (next.Path is null) break;
 
-                    if (!_flushSlots.Wait(0)) break;   // released by the despill, or by its retry
+                    if (!TryTakeFlushSlot()) break;   // released by the despill, or by its retry
                     lock (_spillQueueLock)
                         if (_spillQueue.TryGetValue(next.SegId, out var taken)) taken.InFlight = true;
 
