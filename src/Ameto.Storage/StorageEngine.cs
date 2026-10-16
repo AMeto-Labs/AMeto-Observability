@@ -3712,35 +3712,36 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// The segment ids of the levels a flush still owns, or null when there are none: every level of a
     /// frozen tier's block (swapped, with or without its retry), and of a queued spill's (a spill file, a
     /// WAL a crash cut short, a WAL whose replay failed; a despilled tier's block stays queued until it is
-    /// published) the levels its despill writes — not the ones an earlier run published
-    /// (<see cref="QueuedSpill.PublishedLevels"/>), registered segments the despill never writes, which a
-    /// merge may take meanwhile. The merge planner leaves these entries alone (see
-    /// <see cref="SelectMergeBatch"/>). Read under each list's lock, one at a time; off every hot path.
+    /// published). The merge planner leaves these entries alone (see <see cref="SelectMergeBatch"/>). Read
+    /// under each list's lock, one at a time; off every hot path.
+    ///
+    /// <para>The levels an earlier run published (<see cref="QueuedSpill.PublishedLevels"/>) are owned too
+    /// (round-6 review R5-M2). They are registered segments the despill never writes, and were left to
+    /// merges: one that took such a level before the block's despill, followed by a stop before that despill
+    /// finished, made the next start find the level gone from disk and write it again — its events twice,
+    /// 30 for 20 (the round-5 reviewer's R5-5). They are served as before, and merged once the block is
+    /// published, when it leaves the queue.</para>
     /// </summary>
     private HashSet<ulong>? LevelIdsAFlushOwns()
     {
-        HashSet<ulong>? ids    = null;
-        HashSet<ulong>? queued = null;
+        HashSet<ulong>? ids = null;
         lock (_spillQueueLock)
-            foreach (var (block, q) in _spillQueue)
-            {
-                (queued ??= new HashSet<ulong>()).Add(block);
-                AddLevels(ref ids, block, q.PublishedLevels);
-            }
+            foreach (var (block, _) in _spillQueue)
+                AddLevels(ref ids, block);
         lock (_frozenLock)
             foreach (var (_, block) in _frozenHot)
-                if (queued is null || !queued.Contains(block)) AddLevels(ref ids, block, keep: 0);
+                AddLevels(ref ids, block);   // a despilled tier's block is queued too: a set, so twice is once
         // And a block a failed startup replay left for the next start (round-6 review R5-M1): its levels
         // are the next start's to read, whatever the boot scan registered of them meanwhile.
         lock (_blocksLeftByReplay)
             foreach (var block in _blocksLeftByReplay)
-                AddLevels(ref ids, block, keep: 0);
+                AddLevels(ref ids, block);
         return ids;
 
-        static void AddLevels(ref HashSet<ulong>? ids, ulong block, byte keep)
+        static void AddLevels(ref HashSet<ulong>? ids, ulong block)
         {
             for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
-                if ((keep & (1 << lvl)) == 0) (ids ??= new HashSet<ulong>()).Add(block + (ulong)lvl);
+                (ids ??= new HashSet<ulong>()).Add(block + (ulong)lvl);
         }
     }
 

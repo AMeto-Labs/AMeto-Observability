@@ -30,9 +30,14 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch { /* best-effort */ }
     }
 
-    /// <summary>A merge takes the earlier run's level, with a neighbour, into another segment before the despill runs.</summary>
+    /// <summary>
+    /// The earlier run's level is not merged before the block's despill (round-6 review R5-M2): the merge
+    /// planner owns every level of a queued block, those an earlier run published included. It used to
+    /// leave them to merges, which a stop before the despill turned into events stored twice (the next
+    /// test). Once the block is despilled the level is a segment like any other, and merges.
+    /// </summary>
     [Fact]
-    public async Task A_level_an_earlier_run_published_is_not_written_again_when_a_merge_took_it_first()
+    public async Task A_level_an_earlier_run_published_is_not_merged_before_its_blocks_despill()
     {
         var opts = Options();
         var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
@@ -46,13 +51,48 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
             Assert.True(run2.TryWrite(Header(run2, i, LogLevel.Information), Props(i), "event {n}"));
         await run2.FlushHotTierAsync();
         run2._allowIndexlessMerge = true;
-        Assert.True(await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the earlier run's level did not merge");
-        Assert.False(File.Exists(infoLevel), "setup: the merge left the earlier run's level in place");
+        await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        Assert.True(File.Exists(infoLevel), "a merge took the level an earlier run published before its block's despill");
 
         hold.SetResult();
         WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+        Assert.True(await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the level stayed out of merges after its block was despilled");
+        Assert.False(File.Exists(infoLevel), "the merge left the despilled block's level in place");
 
         AssertEveryEventOnce(run2, 250);
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M2 (pre-existing): a merge took the earlier run's level while the block waited for its
+    /// despill, the process stopped before that despill, and the next start — no longer finding the level on
+    /// disk — wrote it again: its events twice (the round-5 reviewer's R5-5, 30 for 20). Owned until the block
+    /// is published, the level is still on disk at the next start, which keeps it.
+    /// </summary>
+    [Fact]
+    public async Task A_level_an_earlier_run_published_is_not_written_again_after_a_stop_before_the_despill()
+    {
+        var opts = Options();
+        var (spill, _) = await HalfDespilledBlockAsync(opts);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        var run2 = Engine(opts);
+        StorageEngine.HoldDespillForTest.Value = null;
+        try
+        {
+            await run2.CatalogLoaded;
+            for (int i = 150; i < 250; i++)
+                Assert.True(run2.TryWrite(Header(run2, i, LogLevel.Information), Props(i), "event {n}"));
+            await run2.FlushHotTierAsync();
+            run2._allowIndexlessMerge = true;
+            await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        }
+        finally { await run2.DisposeAsync(); }   // the despill was never let go: the stop comes before it
+
+        await using var run3 = Engine(opts);
+        await run3.CatalogLoaded;
+        WaitFor(() => run3.SpillFilesPending == 0 && !File.Exists(spill), "run 3 to despill the block");
+        AssertEveryEventOnce(run3, 250);
     }
 
     /// <summary>
