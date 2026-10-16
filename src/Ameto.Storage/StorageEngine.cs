@@ -511,8 +511,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// The managed text the frozen tiers hold of their events' own — templates and services the intern
-    /// pool did not take, CLEF exceptions (<see cref="HotTierSegment.ManagedBytes"/>) — as each swap
-    /// charged it, and each tier's flush slot gave it back (round-5 review H-D). A tier bounds its own
+    /// pool did not take, CLEF exceptions (<see cref="HotTierSegment.ManagedBytes"/>) — as each swap, and each
+    /// despill as it listed its tier (round-6 R5-M11), charged it, and each tier's flush slot gave it back
+    /// (round-5 review H-D). A tier bounds its own
     /// (<see cref="HotTierSegment.TryWrite"/>), and the slots bound how many tiers are frozen — by their
     /// NATIVE footprint, against the physical limit. Nothing bounded what they held on the managed heap:
     /// on a 384 MiB heap limit with a host's RAM behind the native budget, 30 frozen tiers of one 8 MB
@@ -2698,19 +2699,26 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// (<see cref="_frozenTextBytes"/>): yes when it holds none, when they hold none, or when both fit
     /// <see cref="_frozenTextBudgetBytes"/>.
     /// </summary>
-    private bool FrozenTextHasRoomFor(HotTierSegment tier)
+    private bool FrozenTextHasRoomFor(HotTierSegment tier) => FrozenTextHasRoomFor(tier.ManagedBytes);
+
+    /// <summary>As <see cref="FrozenTextHasRoomFor(HotTierSegment)"/>, for <paramref name="adding"/> bytes of a tier's own text.</summary>
+    private bool FrozenTextHasRoomFor(long adding)
     {
-        long adding = tier.ManagedBytes;
-        if (adding == 0) return true;
+        if (adding <= 0) return true;
         long frozen = Volatile.Read(ref _frozenTextBytes);
         return frozen == 0 || frozen + adding <= _frozenTextBudgetBytes;
     }
 
     /// <summary>Counts a tier just frozen against the frozen tiers' text, on the tier as well. Never throws.</summary>
-    private void ChargeFrozenText(HotTierSegment tier)
+    private void ChargeFrozenText(HotTierSegment tier) => ChargeFrozenText(tier, tier.ManagedBytes);
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> of <paramref name="tier"/>'s own text against the frozen tiers' — a despilled tier's,
+    /// which the tier does not count itself (R5-M11) — on the tier as well, so its slot gives it back. Never throws.
+    /// </summary>
+    private void ChargeFrozenText(HotTierSegment tier, long bytes)
     {
-        long bytes = tier.ManagedBytes;
-        if (bytes == 0) return;
+        if (bytes <= 0) return;
         tier.ChargeFrozenText(bytes);
         Interlocked.Add(ref _frozenTextBytes, bytes);
     }
@@ -3278,8 +3286,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// Gives a flush slot back — and the heavy-phase count with it when <paramref name="endHeavyPhase"/>,
-    /// and the frozen text <paramref name="tier"/> was charged with at its swap (a swap's tier; a
-    /// despill's never is) — then says the slot is free. Each step on its own: the slot's release
+    /// and the frozen text <paramref name="tier"/> was charged with at its swap, or as its despill listed
+    /// it (round-6 R5-M11) — then says the slot is free. Each step on its own: the slot's release
     /// allocates when it wakes a parked async waiter, and a throw from it skipped the count's end,
     /// which shutdown then waited for its whole budget. The text goes first, so the swap the free slot
     /// asks for finds it gone. Never throws; it ends the finally blocks that own all three.

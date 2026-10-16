@@ -93,6 +93,12 @@ public sealed partial class StorageEngine
 
         /// <summary>Despills of the block that failed in a row: each doubles the wait before the next. Under <see cref="_spillQueueLock"/>.</summary>
         public int Failures;
+
+        /// <summary>
+        /// The text of its events' own its tier held when a despill found no room for it beside the frozen tiers'
+        /// (round-6 review R5-M11), so the loop leaves it until there is: 0 when not known. Under <see cref="_spillQueueLock"/>.
+        /// </summary>
+        public long TextBytes;
     }
 
     /// <summary>Spilled blocks not yet in segments, oldest block first. Under <see cref="_spillQueueLock"/>.</summary>
@@ -560,6 +566,21 @@ public sealed partial class StorageEngine
         WakeDespill();   // the loop recomputes its wait from the new retry time
     }
 
+    /// <summary>
+    /// Queues a block again whose despill found no room for its tier's own text beside the frozen tiers' (round-6
+    /// review R5-M11): not a failure — no delay, nothing counted — but its text is kept, and the loop leaves the block
+    /// until the frozen tiers have room for that much (a slot given back with its text wakes the loop). Never throws.
+    /// </summary>
+    private void WaitForFrozenText(ulong segId, long textBytes)
+    {
+        lock (_spillQueueLock)
+        {
+            if (!_spillQueue.TryGetValue(segId, out var q)) return;
+            q.InFlight  = false;
+            q.TextBytes = textBytes;
+        }
+    }
+
     /// <summary>The wait after the <paramref name="failures"/>-th failure in a row: the first delay, doubled each time, capped.</summary>
     private TimeSpan DespillRetryDelayAfter(int failures)
     {
@@ -802,6 +823,9 @@ public sealed partial class StorageEngine
                             // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
                             // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes this.
                             if (q.PublishedLevels != 0 && !scanned) continue;
+                            // One whose tier's own text found no room beside the frozen tiers' waits for room
+                            // (R5-M11): a slot given back with its text wakes this. The others go on meanwhile.
+                            if (q.TextBytes > 0 && !FrozenTextHasRoomFor(q.TextBytes)) continue;
                             next = new SpillFile(segId, q.Path, q.PublishedLevels);
                             break;
                         }
@@ -1025,7 +1049,9 @@ public sealed partial class StorageEngine
         bool counted         = false;
         bool settled         = false;   // published, found published already, or not this release's to read
         bool parked          = false;   // given up with its marker kept: in flight until the next start (AbandonDespilledTier)
+        long noRoomForText   = 0;       // its tier's own text, when the frozen tiers had no room for it: queued to wait
         HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
+        HotTierSegment? charged  = null; // listed and counted against the frozen tiers' text: given back with the slot
         try
         {
             // The marker's paths, made here, before anything is owned: a give-up removes the marker in the
@@ -1052,7 +1078,7 @@ public sealed partial class StorageEngine
             if (file.PublishedLevels != 0) file = file with { PublishedLevels = LevelsTheScanKept(file.SegId, file.PublishedLevels) };
 
             _beforeLoadSpillForTest?.Invoke(file.SegId);
-            var tier = LoadSpill(file);
+            var tier = LoadSpill(file, out long ownText);
             if (tier is null)
             {
                 settled = true;
@@ -1072,6 +1098,17 @@ public sealed partial class StorageEngine
             try
             {
                 if (Volatile.Read(ref _writesClosed) != 0) return;   // never listed; the file is the next start's
+
+                // Its events' own text, against the frozen tiers' as a swapped tier's is, under the same lock (round-6
+                // review R5-M11). A despilled tier was never counted, and while flushes failed each one went to a
+                // retry that kept it, and the loop took the next block: 111.9 MB of text against a 16 MB budget in the
+                // stand's shape. With no room it is not listed: the block waits — queued again, not failed — until a
+                // slot given back with its text makes room; never past a backlog that holds none, so one always can.
+                if (!FrozenTextHasRoomFor(ownText))
+                {
+                    noRoomForText = ownText;
+                    return;
+                }
                 lock (_frozenLock)
                 {
                     _frozenHot.EnsureCapacity(_frozenHot.Count + 1);   // what can fail, before the count
@@ -1080,6 +1117,8 @@ public sealed partial class StorageEngine
                     _frozenHot.Add((tier, file.SegId));
                 }
                 unlisted = null;
+                ChargeFrozenText(tier, ownText);   // allocates nothing: given back with the slot, whoever gives it
+                charged = tier;
             }
             finally { ReleaseFlushLock(); }
 
@@ -1143,9 +1182,13 @@ public sealed partial class StorageEngine
                 // Before the slot goes back, so the loop that takes it sees this block as gone, or
                 // as not ready yet. A parked block stays in flight: its tier is kept, listed, and a
                 // despill of its file would serve its events twice.
-                if (settled)      SettleSpill(file.SegId);
-                else if (!parked) RetrySpillLater(file.SegId);
-                GiveBackSlot(endHeavyPhase: counted);
+                if (settled)                SettleSpill(file.SegId);
+                else if (noRoomForText > 0) WaitForFrozenText(file.SegId, noRoomForText);
+                else if (!parked)           RetrySpillLater(file.SegId);
+                // With its text (R5-M11), the frozen tiers' room comes back as the slot does. A parked tier's goes
+                // back too: it is held until shutdown, and kept counted it would close the frozen tiers to every
+                // tier of text until then — its text is outside the budget, at most FlushSlots tiers' (R5-M7).
+                GiveBackSlot(endHeavyPhase: counted, charged);
             }
             Interlocked.Increment(ref _despillsCompleted);
         }
@@ -1246,9 +1289,15 @@ public sealed partial class StorageEngine
     /// the live pool by their text, never force-interned by index: the live pool is in use, and a
     /// block from an earlier run numbered its strings in that run's pool. Ids are assigned here,
     /// from each event's own timestamp, as the live path does.</para>
+    ///
+    /// <para><paramref name="ownText"/> is the text the tier's events hold of their own, as a live tier counts it
+    /// (<see cref="HotTierSegment.ManagedBytes"/>; round-6 review R5-M11): the tier itself counts none — the block's
+    /// admission bounded it, and a recovery tier must refuse nothing — so the despill counts it against the frozen
+    /// tiers' text from this.</para>
     /// </summary>
-    private HotTierSegment? LoadSpill(SpillFile file)
+    private HotTierSegment? LoadSpill(SpillFile file, out long ownText)
     {
+        ownText = 0;
         // Read where it lies, one entry at a time, straight into the tier (see ReplayOrphanedWal):
         // the despill used to hold the whole block twice, a copy in the heap beside the tier.
         using var reader = WriteAheadLog.RecoveryReader.Open(file.Path);
@@ -1309,7 +1358,10 @@ public sealed partial class StorageEngine
                     SpanId                   = e.SpanId,
                 };
                 if (tier.TryWrite(header, e.Payload, tmpl, e.Exception, svcKept))
+                {
+                    ownText += OwnManagedBytes(in header, tmpl, e.Exception, svcKept);
                     NotifyEventWritten(in header, tmpl ?? string.Empty);
+                }
                 else
                     refused++;
             }

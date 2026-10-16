@@ -3975,6 +3975,118 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Round-6 review R5-M11. A despilled tier was never counted against the frozen tiers' text: while flushes
+    /// failed, each despill handed its tier to a retry that kept it, and the loop took the next block — 111.9 MB of
+    /// text against a 16 MB budget in the stand's shape. A despilled tier is counted as it is listed now, its text
+    /// given back with its slot, and a block whose tier would take the frozen tiers past their budget waits — queued,
+    /// not failed. Here the blocks are spilled with the first flush held, and then every level write fails: the tiers
+    /// the flushes and despills keep hold no more text than the budget; and once writes succeed again every event is
+    /// written and the text is all given back.
+    /// </summary>
+    [Fact]
+    public async Task Despills_whose_flushes_fail_keep_no_more_text_than_the_frozen_tiers_budget()
+    {
+        const long Tier = 2 * MB;
+        var opts   = Options(NewDir(), tierBytes: Tier);   // FlushConcurrency 1
+        var engine = new StorageEngine(
+            Microsoft.Extensions.Options.Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance,
+            MemoryBudgets.Derive(managedLimitBytes: 96 * MB, physicalLimitBytes: 256 * MB));
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(100);
+        long budget = engine.FrozenTextBudgetForTest;
+        using var hold = new ManualResetEventSlim(false);
+        int first = 1;
+        engine._beforeLevelWriteForTest = _ => { if (Interlocked.Exchange(ref first, 0) == 1) hold.Wait(HangGuard); };
+        try
+        {
+            Assert.True(budget < 2 * Tier && engine.FlushSlots > 4,
+                        $"setup: a {budget / (double)MB:F1} MB frozen-text budget (under two tiers' worth), {engine.FlushSlots} slots");
+
+            // Twelve tiers' worth of text, 50 KB an event: the first tier frozen with its flush held, the rest spilled.
+            int written = 0;
+            for (int i = 0; i < 12; i++)
+            {
+                using var batch = new LogWriteBatch();
+                for (int j = i * 40; j < (i + 1) * 40; j++)
+                    batch.Add(new LogEventHeader
+                    {
+                        TimestampUtcTicks = T0 + j * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                        MessageTemplatePoolIndex = -1, ServiceNamePoolIndex = -1,
+                    }, Props(j), new string((char)('a' + j % 26), 25_000) + j, exception: null);
+                written += (await engine.WriteBatchAsync(batch, HangGuard)).Written;
+            }
+            int blocks = engine.SpillFilesPending;
+            Assert.True(blocks >= 3, $"setup: {blocks} spilled block(s)");
+
+            // The despills wait at their read until the frozen tier and the live one have been written, their text
+            // given back — so no swapped tier's text stands in the despills' way, and theirs is all that is counted...
+            using var loads = new ManualResetEventSlim(false);
+            engine._beforeLoadSpillForTest  = _ => loads.Wait(HangGuard);
+            engine._beforeLevelWriteForTest = null;
+            hold.Set();
+            WaitFor(() => engine.FrozenTextBytesForTest == 0 && engine.FrozenTierCountForTest == 0, "the swapped tiers written", HangGuard);
+
+            // ...then every level write fails, and the despills go on: each one listed goes to a retry that keeps its tier.
+            engine._beforeLevelWriteForTest = _ => throw new IOException("test: the volume is full");
+            int  attemptsBefore = engine.DespillsCompletedForTest;
+            loads.Set();
+            long peak = 0;
+            int  peakTiers = 0;
+            var  until = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < until)
+            {
+                var (tiers, text) = FrozenTiersOwnText(engine);
+                if (text > peak) (peak, peakTiers) = (text, tiers);
+                await Task.Delay(20);
+            }
+            int attempts = engine.DespillsCompletedForTest - attemptsBefore;
+            Assert.True(peak <= Math.Max(budget, Tier + 64 * 1024),
+                        $"the frozen tiers kept {peak / (double)MB:F1} MB of their events' own text at the most ({peakTiers} tiers), against a " +
+                        $"{budget / (double)MB:F1} MB budget, with every flush failing");
+            Assert.True(attempts <= 2 * blocks + 2,
+                        $"{attempts} despills of {blocks} blocks in 3 s: a block with no room was read again and again while none came");
+
+            // And when the writes succeed again, the blocks that waited go on at once — they were not failures, with a
+            // retry's delay — every event is written, and every tier's text goes back with its slot.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            engine._beforeLevelWriteForTest = null;
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.FrozenTierCountForTest == 0, "every block despilled", HangGuard);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+                        $"the blocks that waited for room were despilled {sw.Elapsed.TotalSeconds:F1} s after it came: as failures, after a retry's delay");
+            await FlushEverythingAsync(engine, HangGuard);
+            Assert.Equal(written, ReadAll(engine).Count);
+            Assert.Equal(0, engine.FrozenTextBytesForTest);
+        }
+        finally
+        {
+            hold.Set();
+            engine._beforeLoadSpillForTest  = null;
+            engine._beforeLevelWriteForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>The frozen tiers and the text their events hold of their own, counted from the events (a despilled tier counts none of its own).</summary>
+    private static (int Tiers, long Text) FrozenTiersOwnText(StorageEngine engine)
+    {
+        const System.Reflection.BindingFlags Private = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        var list = (System.Collections.IList)typeof(StorageEngine).GetField("_frozenHot", Private)!.GetValue(engine)!;
+        int  tiers = 0;
+        long text  = 0;
+        // Under the engine's own lock: a tier leaves the list under it before it is retired, so none read here is freed meanwhile.
+        lock (typeof(StorageEngine).GetField("_frozenLock", Private)!.GetValue(engine)!)
+            foreach (var item in list)
+            {
+                var tier = (HotTierSegment)item.GetType().GetField("Item1")!.GetValue(item)!;
+                tiers++;
+                for (int e = 0; e < tier.Count; e++)
+                    if (tier.GetHeader(e).MessageTemplatePoolIndex < 0) text += HotTierSegment.ManagedBytesOf(tier.GetTemplate(e));
+            }
+        return (tiers, text);
+    }
+
     /// <summary>The frozen-text budget's derivation, on the stand's figures and on a host's (round-6 review R5-M10).</summary>
     [Theory]
     [InlineData(1, 7, 16, 96, 43.75, 52.25)]    // the stand: one 43.75 MiB build of a 96 MiB share — the rest
