@@ -71,6 +71,32 @@ internal static class OwnerAsync
     internal static bool BoxThenFail(Type stateMachine) =>
         Volatile.Read(ref s_boxThenFail)?.Value is { } boxThenFail && boxThenFail(stateMachine);
 
+    /// <summary>
+    /// Makes the box <see cref="BoxThenFailForTest"/> just made hold what a Release build's holds: a COPY of
+    /// the state machine as it was at this suspension (round-6 review, the LOW on M-C's test). In Release the
+    /// state machine is a struct, copied into the box, and the method goes on in its own copy; a later await
+    /// that reuses the box resumes the stale one. In Debug it is a class, the box holds the object itself,
+    /// and the same later await resumed where the method was — so a test of that road could not fail in
+    /// Debug, which is all CI runs. Here a class state machine is cloned member by member, after the box was
+    /// made (the clone's builder points at the box, as a Release copy's does), and the clone put in the box.
+    /// <paramref name="box"/> is what the builder made (its task); a box with no <c>StateMachine</c> field
+    /// is left as it is. Test-only: reached only when the seam fires.
+    /// </summary>
+    internal static void LeaveACopyInTheBox(object? box)
+    {
+        if (box is null) return;
+        const System.Reflection.BindingFlags Instance = System.Reflection.BindingFlags.Instance
+                                                      | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        var field = box.GetType().GetField("StateMachine", Instance);
+        if (field?.GetValue(box) is not { } stateMachine || stateMachine.GetType().IsValueType) return;
+        var clone = typeof(object).GetMethod("MemberwiseClone", Instance)!.Invoke(stateMachine, null);
+        field.SetValue(box, clone);
+    }
+
+    /// <summary>The box behind a <see cref="ValueTask{TResult}"/> an owner builder handed out (its <c>_obj</c>), for <see cref="LeaveACopyInTheBox"/>.</summary>
+    internal static object? BoxOf<TResult>(ValueTask<TResult> task) =>
+        typeof(ValueTask<TResult>).GetField("_obj", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(task);
+
     /// <summary>A task that never completes: the box <see cref="BoxThenFailForTest"/> makes is registered on it.</summary>
     internal static Task Never => (s_never ??= new TaskCompletionSource()).Task;
     private static TaskCompletionSource? s_never;
@@ -118,11 +144,15 @@ internal struct OwnerTaskMethodBuilder
         return OwnerAsync.BoxThenFail(typeof(TStateMachine));
     }
 
-    /// <summary>Makes the box — registered on a task that never completes — and throws as a registration that failed after it.</summary>
+    /// <summary>
+    /// Makes the box — registered on a task that never completes — and throws as a registration that failed
+    /// after it. The box holds a copy of the state machine in Debug too (<see cref="OwnerAsync.LeaveACopyInTheBox"/>).
+    /// </summary>
     private void BoxThenFail<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine
     {
         var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
         _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        OwnerAsync.LeaveACopyInTheBox(_inner.Task);
         throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
@@ -178,6 +208,7 @@ internal struct OwnerTaskMethodBuilder<TResult>
     {
         var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
         _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        OwnerAsync.LeaveACopyInTheBox(_inner.Task);
         throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
@@ -230,6 +261,7 @@ internal struct OwnerValueTaskMethodBuilder<TResult>
     {
         var never = OwnerAsync.Never.ConfigureAwait(false).GetAwaiter();
         _inner.AwaitUnsafeOnCompleted(ref never, ref stateMachine);
+        OwnerAsync.LeaveACopyInTheBox(OwnerAsync.BoxOf(_inner.Task));
         throw new OutOfMemoryException("test: the box was made, then the registration failed");
     }
 }
