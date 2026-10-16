@@ -4364,16 +4364,23 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // for its whole run (#114), so on Windows a merge that lands under a query over its
         // window ALWAYS finds sources held, on a perfectly healthy server; the parked retry
         // deletes them once the query ends, and is what warns if one outlives its window.
-        bool allGone = consumed.All(s => !File.Exists(s.FilePath));
-        if (allGone)
+        //
+        // Gone as the file system says it (Look; round-6 review R5-M6's class): File.Exists answered false
+        // for a source it could not look at as well, and the manifest went while that source was still on
+        // disk — the next start served it beside the output, its events twice.
+        int notGone = 0;
+        foreach (var s in consumed)
+            if (Look(s.FilePath) != Presence.Gone) notGone++;
+        if (notGone == 0)
             try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
         else
         {
             // Out of the planner while the manifest waits, or a merge of this output would leave
             // the manifest naming an output that is gone (see _outputsWithKeptManifest).
             _outputsWithKeptManifest.TryAdd(segPath, 0);
-            _logger.LogInformation("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
-                consumed.Count(s => File.Exists(s.FilePath)));
+            _logger.LogInformation(
+                "Merge: {Count} source file(s) still held open, or not to be looked at — manifest kept for the recovery sweep",
+                notGone);
         }
 
         _logger.LogInformation(
@@ -4819,8 +4826,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // not move the output aside — torn, or a newer format rolled back — is never decided by a read
         // again: a holder that lets nothing read the file answers any read with a failure that says
         // nothing about the bytes. Recorded with what it costs already counted (and the list set
-        // aside), so the sources it listed are free to merge.
-        if (File.Exists(output) && new FileInfo(manifest).Length == 0)
+        // aside), so the sources it listed are free to merge. An output that cannot be looked at goes on
+        // to ReadMergeOutput, whose look then defers the verdict (round-6 review R5-M6).
+        if (Look(output) == Presence.There && new FileInfo(manifest).Length == 0)
         {
             LetGoOfMergeOutput(output);
             RecoverTornMerge(manifest, output, SetAsideReason.EarlierVerdict);
@@ -4992,11 +5000,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         finally { ReleaseUntriedMergeGuards(guarded); }
 
         // The manifest goes once nothing it lists is left to it: no source parked, none on disk.
-        // File.Exists, the merge's own test for the same decision. A different segment served at a
-        // listed path is not the merge's to wait for.
+        // A look, the merge's own test for the same decision — gone only as the file system says it
+        // (round-6 review R5-M6): File.Exists answered false for a source it could not look at as well,
+        // and the manifest went with that source still on disk, served beside the output after the next
+        // start. A different segment served at a listed path is not the merge's to wait for.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
-            anyLeft = !foreign[i] && (_pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]));
+            anyLeft = !foreign[i] && (_pendingSegmentDeletes.ContainsKey(sources[i]) || Look(sources[i]) != Presence.Gone);
         if (!anyLeft)
         {
             _deleteMergeManifest(manifest);
@@ -5086,7 +5096,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     {
         proved     = null;
         unreadable = null;
-        if (!File.Exists(output)) return MergeOutputState.Absent;
+        // Absent only as the file system says it (round-6 review R5-M6): File.Exists answered false for an
+        // output it could not look at as well, and Absent lets the sources go free and deletes the
+        // manifest — the output, still on disk and whole, then served beside its own sources after the
+        // next start. One that cannot be looked at waits for its verdict, as one that cannot be read does.
+        switch (Look(output))
+        {
+            case Presence.Gone:
+                return MergeOutputState.Absent;
+            case Presence.Unknown:
+                unreadable = new IOException($"The merge output {output} could not be looked at");
+                return MergeOutputState.Unknown;
+        }
         if ((_segments.TryGetValue(KeyOfSegmentFileName(output), out var entry)
              && string.Equals(entry.FilePath, output, StringComparison.OrdinalIgnoreCase))
             || _pendingSegmentDeletes.ContainsKey(output))

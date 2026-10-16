@@ -2140,6 +2140,128 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         AssertSameEvents(expected, ReadEverything());
     }
 
+    // ── A merge's file the file system will not look at (round-6 R5-M6's class) ──
+
+    /// <summary>What a share that does not answer says to a look at, or an open of, <paramref name="path"/>.</summary>
+    private static void NotAnswering(string path) =>
+        FileRefusal.ForTest.Value = (p, _) => p == path ? new IOException($"test: the network path of {p} did not answer") : null;
+
+    /// <summary>
+    /// A segment the file system will not look at, and does open, opens. SegmentReader.Open asked
+    /// FileInfo.Exists first and turned its false — which a look that fails answers too — into a
+    /// FileNotFoundException, which every caller reads as a segment that is gone: merge recovery's proof
+    /// of an output among them (Absent: its sources freed, the manifest dropped, the output served beside
+    /// them after the next start).
+    /// </summary>
+    [Fact]
+    public async Task ASegmentTheFileSystemWillNotLookAt_IsNotReportedGone()
+    {
+        await WriteSegmentAsync(0, 60);
+        string path = Assert.Single(_engine.ListSegments()).FilePath;
+
+        FileRefusal.ForTest.Value = (p, a) =>
+            a == FileRefusal.Access.Look && p == path ? new IOException($"test: the network path of {p} did not answer") : null;
+        Exception? thrown;
+        try { thrown = Record.Exception(() => { using var reader = SegmentReader.Open(path); }); }
+        finally { FileRefusal.ForTest.Value = null; }
+        Assert.True(thrown is null, $"a segment the file system would not look at failed to open: {thrown?.GetType().Name}: {thrown?.Message}");
+    }
+
+    /// <summary>
+    /// An output the start cannot look at is not taken for absent. File.Exists answered false for it, and
+    /// Absent lets the sources go free and deletes the manifest: the output, whole on disk, was served beside
+    /// its own sources after that start — every event of the merge twice. It waits for its verdict now, as
+    /// an output that cannot be read does, and the next start commits it.
+    /// </summary>
+    [Fact]
+    public async Task AnOutputTheStartCannotLookAt_IsNotTakenForAbsent()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);                                        // the instant after the move
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+
+        NotAnswering(output);
+        try { await RestartAsync(); }
+        finally { FileRefusal.ForTest.Value = null; }
+        Assert.True(Manifests().Length == 1, "the start took an output it could not look at for absent: its manifest went, its sources were freed");
+        AssertSameEvents(before, ReadEverything());                      // the sources, once; the output waits
+
+        await RestartAsync();                                            // it answers: the merge is committed
+        Assert.Empty(Manifests());
+        Assert.Equal(output, Assert.Single(_engine.ListSegments()).FilePath);
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// A source the start's recovery cannot look at after its unlink keeps the manifest. The unlink can
+    /// return with the file still there (a delete Windows leaves pending, a share that answers late), and
+    /// the manifest went on a File.Exists that said no for a look that failed: the next start served that
+    /// source beside the output. The refusals here are seams, so this runs alike on every platform.
+    /// </summary>
+    [Fact]
+    public async Task ASourceTheRecoveryCannotLookAtAfterItsUnlink_KeepsTheManifest()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+        var snap   = SnapshotSources();
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing");
+        var output = Assert.Single(_engine.ListSegments()).FilePath;
+        Restore(snap, snap.Keys);
+        await File.WriteAllLinesAsync(output + ".mergemanifest", snap.Keys);
+        string victim = Path.Combine(SegDir, snap.Keys.Order(StringComparer.Ordinal).First());
+
+        NotAnswering(victim);
+        try { await RestartWithSeamsAsync(e => e._deleteSegmentFile = p => { if (p != victim) File.Delete(p); }); }
+        finally { FileRefusal.ForTest.Value = null; }
+        Assert.True(Manifests().Length == 1, "the manifest went while a source it lists could not be looked at");
+
+        await RestartAsync();                                            // it answers, and unlinks
+        Assert.False(File.Exists(victim), "the source outlived the recovery that could look at it");
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+    }
+
+    /// <summary>
+    /// A merge whose sources cannot be looked at after their unlinks keeps its manifest, and the recovery
+    /// sweep finishes it. The commit dropped the manifest on a File.Exists that said no for a look that
+    /// failed, and the next start served the sources beside the output. From the swap on, every segment's
+    /// unlink returns with the file still there and every look at one fails (which of them the planner
+    /// batches is its own call; before the swap the merge has read them).
+    /// </summary>
+    [Fact]
+    public async Task AMergeWhoseSourceCannotBeLookedAtAfterItsUnlink_KeepsItsManifest()
+    {
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 60);
+        var before = ReadEverything();
+
+        static bool Segment(string p) => p.EndsWith(".seg", StringComparison.OrdinalIgnoreCase);
+        _engine._deleteSegmentFile = p => { if (!Segment(p)) File.Delete(p); };
+        // Set in the merge's own flow, at its swap: an AsyncLocal, it stays with the merge.
+        _engine._beforeMergeSwap = static () => FileRefusal.ForTest.Value = static (p, a) =>
+            a == FileRefusal.Access.Look && Segment(p) ? new IOException($"test: the network path of {p} did not answer") : null;
+        try { Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the merge merged nothing"); }
+        finally
+        {
+            _engine._beforeMergeSwap = null;
+            FileRefusal.ForTest.Value = null;
+            _engine._deleteSegmentFile = File.Delete;
+        }
+        Assert.True(Manifests().Length == 1, "the merge dropped its manifest while its sources could not be looked at");
+
+        await RestartAsync();
+        Assert.Empty(Manifests());
+        AssertSameEvents(before, ReadEverything());
+    }
+
     /// <summary>
     /// Killed after the last unlink and before the manifest went: nothing is left to delete, so
     /// recovery drops the manifest and touches nothing else.
