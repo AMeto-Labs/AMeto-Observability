@@ -23,7 +23,9 @@ public sealed class LogWriteBatchLeaseTests
     /// cores this catches the revert in every run, as did the version before it; on two that are the
     /// hyperthreads of one core (the 2-core runs here: affinity 0x3), where a store's stay in the
     /// buffer is a few cycles, it caught it in 3 runs of 10 where the version before it caught it in
-    /// none.</para>
+    /// none. Stores to lines out of the caches, made just before the dispose, hold its unfenced store in
+    /// the buffer longer (round-6 review): the revert is caught in 10 runs of 10 on each placement now,
+    /// some 5 000 to 9 000 batches kept in a run.</para>
     /// </summary>
     [Fact]
     public void A_dispose_racing_the_end_of_the_write_that_holds_the_batch_gives_it_back()
@@ -50,6 +52,12 @@ public sealed class LogWriteBatchLeaseTests
 
         long races = 0, kept = 0;
         var batch = new LogWriteBatch();
+        // Store-buffer pressure (round-6 review: the race caught its revert in 3 to 5 runs of 10 on a hyperthread
+        // pair). Stores to lines out of the caches, made just before the dispose, queue ahead of the dispose's own:
+        // a store the dispose does not fence waits behind them while its read of the leases goes ahead — the window
+        // the revert opens, wide on two hyperthreads of one core as on two cores.
+        int[] pressure = new int[1 << 22];   // 16 MiB: past the caches, so each store a line to fetch
+        int   line     = 0;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.Elapsed < TimeSpan.FromSeconds(3))
         {
@@ -61,6 +69,11 @@ public sealed class LogWriteBatchLeaseTests
             Interlocked.Increment(ref round);
             while (Volatile.Read(ref touched) < 0) { }                                    // the ender has the line too
             for (int k = (int)(((races + 1) >> 3) & 7); k > 0; k--) Thread.SpinWait(1);   // offsets, both ways
+            for (int s = 0; s < 48; s++)                                                 // 48 lines, scattered over pages
+            {
+                pressure[line] = (int)races;
+                line = (line + 16 * 97) & (pressure.Length - 1);
+            }
             batch.Dispose();
             while (Volatile.Read(ref ended) == 0) { }
             races++;
