@@ -2516,6 +2516,42 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review R5-M4, with the §4 item "a room-wait slice that overruns on a starved pool is counted
+    /// only after it". After a pause for room the writer went round and wrote before it looked at anything:
+    /// a slice that timed out, then a client that went (its own timeout) before a starved pool resumed the
+    /// writer — and the batch was written for nobody, and stored again by the client's retry. The writer
+    /// looks at its cancellation before every run now. Here the pause ends, and the request is cancelled
+    /// before the writer goes round; the store has room by then.
+    /// </summary>
+    [Fact]
+    public async Task A_request_cancelled_as_its_pause_for_room_ends_writes_nothing_more()
+    {
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 50;
+        int attempts = 0;
+        using var cts = new CancellationTokenSource();
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1) throw new OutOfMemoryException("test: a fault, so the write pauses");
+        };
+        engine._afterRoomWaitForTest = () => cts.Cancel();   // the client goes as the pause ends: the slice timed out first
+        try
+        {
+            using var batch = Batch(engine, 0, 3);
+            var r = await Task.Run(async () => await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(2), cts.Token));
+            Assert.True(r.Written == 0, $"{r.Written} event(s) written after the request was cancelled during its pause for room: its client's retry stores them a second time");
+            Assert.Equal(new LogBatchWriteResult(0, 0, 3), r);
+            Assert.Equal(1, Volatile.Read(ref attempts));
+        }
+        finally
+        {
+            engine._afterWriteGate       = null;
+            engine._afterRoomWaitForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Ma, its second half: a request queued for the writer lock sees its cancellation. It blocked
     /// in Enter until the holder let go — behind a holder stuck in a collection, a client long gone
     /// kept its thread and its batch. Cancelled while another write holds the lock, it stops within

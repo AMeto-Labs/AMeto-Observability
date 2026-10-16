@@ -117,7 +117,8 @@ public sealed partial class StorageEngine
     /// as dropped in a 200 no client retries.
     /// </param>
     /// <param name="ct">The request's: a client that has gone stops the wait, and nothing after the
-    /// events already written is written.</param>
+    /// events already written is written — it is looked at before every run of writes, so a pause that a
+    /// starved pool ended late, past the client's going, writes nothing more either.</param>
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
     public async ValueTask<LogBatchWriteResult> WriteBatchAsync(LogWriteBatch batch, TimeSpan maxWait, CancellationToken ct = default)
     {
@@ -166,6 +167,14 @@ public sealed partial class StorageEngine
             while (next < batch.Count)
             {
                 int runFrom = next;
+
+                // A client that has gone has nothing more written (round-6 review R5-M4, with the §4 item "a
+                // room-wait slice that overruns on a starved pool is counted only after it"). After a pause for
+                // room the writer used to go round and write before it looked at anything: a slice that timed
+                // out, then a client that went — its own timeout, while a starved pool had not yet resumed the
+                // writer — and the batch was written for nobody, and stored again by the client's retry. Looked
+                // at before every run, the first included: one volatile read.
+                if (ct.IsCancellationRequested) break;
 
                 // While the store is faulting the lock is taken within what is left of the wait, its own
                 // wait counted from when the request came to it (even when the first fault is only seen
@@ -257,6 +266,14 @@ public sealed partial class StorageEngine
                     awaitable = false;
                     Thread.Sleep((int)thisSlice);
                 }
+                _afterRoomWaitForTest?.Invoke();
+
+                // A slice that ends late — a pool too starved to resume the writer on time — is counted here,
+                // after it, and the writer goes round and writes once more before it looks at its wait: the
+                // request can pass its wait by that slice. Kept (round-6 review R5-M4): the attempt after the
+                // last slice is the one the wait was for, and the receiver awaits the write to its end, so its
+                // answer is what the write did — the commit no longer gave up on a write that then landed
+                // (a 500, then written). A client that went meanwhile has nothing more written (above).
                 long elapsed = Environment.TickCount64 - began;
                 if (countFrom < 0) waitedMs += elapsed;
                 else
@@ -674,6 +691,9 @@ public sealed partial class StorageEngine
 
     /// <summary>Test hook: a writer with no room is about to wait for it; throwing from it is a wait that could not be set up.</summary>
     internal Action? _beforeRoomWaitForTest;
+
+    /// <summary>Test hook: a writer's pause for room has ended, however it ended, and the writer is about to go round.</summary>
+    internal Action? _afterRoomWaitForTest;
 
     // ── Ingest counters (/api/diagnostics) ────────────────────────────────────
 
