@@ -352,6 +352,38 @@ public sealed class OtlpJsonRoomTests
         Assert.Equal(MsgpackString(Utf8("v")), Pairs(sink.Maps[1])["\uFFFD\uFFFDxx"]);
     }
 
+    // ── The LOW on two passes: an escaped string, unescaped once ──────────────
+
+    /// <summary>
+    /// Round-6 review, the LOW on two passes. An escaped JSON string was walked twice — its length, then its text — which made
+    /// escape-heavy JSON 5–12 % slower in Release (1.6–2× in Debug) than the one CopyString it replaced. One that fits where it
+    /// goes at its escaped length — the map, the template scratch, the service buffer, the trace id buffer — is unescaped in
+    /// one pass now, and its length walked apart only where it may not fit. The text is the same.
+    /// </summary>
+    [Fact]
+    public void An_escaped_string_that_fits_is_unescaped_in_one_pass()
+    {
+        const string Escaped = "line one\\nline \\\"two\\\" \\u00e9\\u20ac \\ud83d\\ude00";
+        var records = Enumerable.Range(0, 10).Select(i =>
+            "{\"body\":{\"stringValue\":\"" + Escaped + i + "\"},\"traceId\":\"0123456789abcdef0123456789abcde\\u0066\"," +
+            "\"attributes\":[" + StringAttr("a", Escaped) + "]}");
+        byte[] body = Utf8("{\"resourceLogs\":[{\"resource\":{\"attributes\":[" + StringAttr("service.name", "svc\\tx") + "," + StringAttr("r", Escaped) + "]}," +
+                           "\"scopeLogs\":[{\"logRecords\":[" + string.Join(",", records) + "]}]}]}");
+        var sink = new Sink();
+
+        JsonStringText.UnescapedLengthWalksForTest = 0;
+        Assert.Equal((10, 0), OtlpLogStreamParser.Parse(body, sink));
+        int walks = JsonStringText.UnescapedLengthWalksForTest;
+
+        Assert.True(walks == 0, $"{walks} escaped string(s) walked twice: their length, then their text");
+        byte[] text = MsgpackString(Utf8("line one\nline \"two\" é€ 😀"));
+        Assert.Equal(text, Pairs(sink.Maps[0])["a"]);
+        Assert.Equal(text, Pairs(sink.Maps[0])["r"]);
+        Assert.Equal(Utf8("line one\nline \"two\" é€ 😀3"), sink.Templates[3]);
+        Assert.Equal(Utf8("svc\tx"), sink.Services[0]);
+        Assert.Equal(MsgpackString(Utf8("0123456789abcdef0123456789abcdef")), Pairs(sink.Maps[0])["@tr"]);
+    }
+
     // ── L-17: nested values, written in place ─────────────────────────────────
 
     /// <summary>

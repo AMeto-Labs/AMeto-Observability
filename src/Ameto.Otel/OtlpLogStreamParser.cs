@@ -550,6 +550,12 @@ public static class OtlpLogStreamParser
     {
         var  raw     = reader.ValueSpan;
         bool escaped = reader.ValueIsEscaped;
+
+        // One pass when the name fits whole at its escaped length (see WriteString).
+        if (escaped && raw.Length <= svc.Max && raw.Length <= svc.Buf.Length
+            && JsonStringText.TryUnescape(raw, svc.Buf.AsSpan(0, raw.Length), out int fitted))
+            return fitted;
+
         long full    = escaped ? JsonStringText.UnescapedLength(raw) : raw.Length;
         int  want    = (int)Math.Min(full, svc.Max);
         if (want > svc.Buf.Length)
@@ -766,6 +772,10 @@ public static class OtlpLogStreamParser
         var raw = reader.ValueSpan;
         if (!reader.ValueIsEscaped) return raw;
 
+        // One pass into the small scratch when the text fits it at its escaped length (see WriteString).
+        if (raw.Length <= tmpl.Small.Length && JsonStringText.TryUnescape(raw, tmpl.Small, out int fitted))
+            return tmpl.Small.AsSpan(0, fitted);
+
         long length = JsonStringText.UnescapedLength(raw);
         byte[] dest = tmpl.Small;
         if (length > dest.Length)
@@ -812,12 +822,48 @@ public static class OtlpLogStreamParser
             return;
         }
 
+        // One pass where the map has room for the text at its escaped length (round-6 review, the LOW on two passes): it is
+        // unescaped straight into the writer behind room for the str header that length would need — the text is no
+        // longer, unless it holds bytes that are not UTF-8 — and counted once its length is known. Not committed until
+        // then (Advance), so a text that turned out longer is written by the two-pass road below, from the same place.
+        long room = map.Limit - map.Base - map.Bytes;
+        if (!map.Over && raw.Length + 5 <= room)
+        {
+            int reserved = OtlpLogProtoParser.StrHeaderBytes(raw.Length);
+            Span<byte> span = w.GetSpan(reserved + raw.Length);
+            if (JsonStringText.TryUnescape(raw, span.Slice(reserved, raw.Length), out int length))
+            {
+                int header = OtlpLogProtoParser.StrHeaderBytes(length);
+                Room(ref map, header + length);   // within the room above: length <= raw.Length, header <= 5
+                if (header != reserved) span.Slice(reserved, length).CopyTo(span[header..]);
+                WriteStrHeader(span, length, header);
+                w.Advance(header + length);
+                return;
+            }
+        }
+
         long unescaped = JsonStringText.UnescapedLength(raw);
         if (!Room(ref map, OtlpLogProtoParser.StrHeaderBytes(unescaped) + unescaped)) return;
         w.WriteStringHeader((int)unescaped);
         int written = JsonStringText.Unescape(raw, w.GetSpan((int)unescaped));
         System.Diagnostics.Debug.Assert(written == unescaped, "the unescaped length counted is not the one written");
         w.Advance(written);
+    }
+
+    /// <summary>
+    /// A msgpack str header of <paramref name="header"/> bytes (<see cref="OtlpLogProtoParser.StrHeaderBytes"/>) for a text of
+    /// <paramref name="length"/> bytes, at the start of <paramref name="span"/> — as <see cref="MessagePackWriter.WriteStringHeader"/>
+    /// writes it.
+    /// </summary>
+    private static void WriteStrHeader(Span<byte> span, int length, int header)
+    {
+        switch (header)
+        {
+            case 1:  span[0] = (byte)(0xa0 | length); break;
+            case 2:  span[0] = 0xd9; span[1] = (byte)length; break;
+            case 3:  span[0] = 0xda; System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(span[1..], (ushort)length); break;
+            default: span[0] = 0xdb; System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(span[1..], (uint)length); break;
+        }
     }
 
     /// <summary>Copies the current string token (unescaped) into a fixed buffer; returns length (0 if it doesn't fit).</summary>
@@ -831,8 +877,7 @@ public static class OtlpLogStreamParser
             raw.CopyTo(dest);
             return raw.Length;
         }
-        if (JsonStringText.UnescapedLength(raw) > dest.Length) return 0;
-        return JsonStringText.Unescape(raw, dest);
+        return JsonStringText.TryUnescape(raw, dest, out int written) ? written : 0;   // one pass: 0 when it does not fit
     }
 
     private static long ReadUnixNano(ref Utf8JsonReader reader)
@@ -897,9 +942,14 @@ internal static class JsonStringText
         return Unescape(raw, unescaped) == text.Length && unescaped.SequenceEqual(text);
     }
 
-    /// <summary>The bytes <see cref="Unescape"/> writes for <paramref name="escaped"/>.</summary>
+    /// <summary>
+    /// The bytes <see cref="Unescape"/> writes for <paramref name="escaped"/>: a pass of its own over the text, taken
+    /// only where one pass cannot do (<see cref="TryUnescape"/>) — a text that may not fit where it goes, which must be
+    /// counted before it is written.
+    /// </summary>
     public static long UnescapedLength(ReadOnlySpan<byte> escaped)
     {
+        UnescapedLengthWalksForTest++;
         long length = 0;
         int  i      = 0;
         while (i < escaped.Length)
@@ -930,8 +980,27 @@ internal static class JsonStringText
     /// <see cref="UnescapedLength"/> long — or, shorter, as much of it as fits, stopping before a
     /// character that does not; returns the bytes written.
     /// </summary>
-    public static int Unescape(ReadOnlySpan<byte> escaped, Span<byte> dest)
+    public static int Unescape(ReadOnlySpan<byte> escaped, Span<byte> dest) => Unescape(escaped, dest, out _);
+
+    /// <summary>
+    /// Writes the text of <paramref name="escaped"/> into <paramref name="dest"/> in ONE pass (round-6 review, the LOW on
+    /// two): true, with its length, when all of it fit; false when it did not — and what was written is to be dropped. A
+    /// destination as long as <paramref name="escaped"/> holds its text unless the text holds bytes that are not UTF-8
+    /// (each three as U+FFFD): an escape only shortens it. The length used to be walked first (<see cref="UnescapedLength"/>),
+    /// then the text written: two passes over every escaped string, +5–12 % on escape-heavy JSON in Release.
+    /// </summary>
+    public static bool TryUnescape(ReadOnlySpan<byte> escaped, Span<byte> dest, out int written)
     {
+        written = Unescape(escaped, dest, out bool complete);
+        return complete;
+    }
+
+    /// <summary>Test hook: walks of <see cref="UnescapedLength"/> on this thread.</summary>
+    [ThreadStatic] internal static int UnescapedLengthWalksForTest;
+
+    private static int Unescape(ReadOnlySpan<byte> escaped, Span<byte> dest, out bool complete)
+    {
+        complete = false;
         int i = 0, o = 0;
         while (i < escaped.Length)
         {
@@ -949,7 +1018,7 @@ internal static class JsonStringText
                 {
                     var status = Rune.DecodeFromUtf8(run, out var rune, out int consumed);
                     int n = status == OperationStatus.Done ? consumed : 3;
-                    if (n > dest.Length - o) return o;
+                    if (n > dest.Length - o) return o;   // incomplete
                     if (status == OperationStatus.Done) run[..consumed].CopyTo(dest[o..]);
                     else ReplacementUtf8.CopyTo(dest[o..]);
                     o += n;
@@ -993,6 +1062,7 @@ internal static class JsonStringText
             o += r.EncodeToUtf8(dest[o..]);
             i += width;
         }
+        complete = true;
         return o;
     }
 
