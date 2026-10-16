@@ -5628,6 +5628,200 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A seam that runs out of memory once, at the first pause of a contended take of <paramref name="target"/> while
+    /// <paramref name="armed"/> says so — and lets go of it as it does, as the holder ending just then: a waiter
+    /// queued in the semaphore would be handed it, a poller leaves it to the next taker.
+    /// </summary>
+    private static Action<SemaphoreSlim> FailOnceWhileWaitingFor(SemaphoreSlim target, Func<bool> armed, Action onFailed, string what)
+    {
+        int failed = 0;
+        return s =>
+        {
+            if (s != target || !armed() || Interlocked.Exchange(ref failed, 1) != 0) return;
+            onFailed();
+            target.Release();
+            throw new OutOfMemoryException("test: no memory while " + what);
+        };
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the flush retry's permit (round-6: one of the five waits no test reached; a queued wait put
+    /// back there passed every test). Out of memory while a retry waits for the heavy-phase permit, the attempt fails
+    /// and the next one takes the permit; a queued waiter there was handed it and kept it, and with one permit no flush,
+    /// merge or despill ran again.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_a_flush_retry_waits_for_its_permit_leaves_the_permit_to_the_next()
+    {
+        var engine = Engine(Options(NewDir()));   // FlushConcurrency 1: one permit
+        engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int flushFailed = 0, taken = 0, failed = 0;
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref flushFailed, 1) == 0) throw new IOException("test: the swap's flush fails after a level");
+        };
+        // The retry's first attempt finds the permit taken (by the test), and runs out of memory at its first pause.
+        engine._beforeFlushRetryAttemptForTest = () =>
+        {
+            if (Interlocked.Exchange(ref taken, 1) == 0) Assert.True(engine.FlushConcurrencyForTest.Wait(HangGuard), "setup: the permit stayed taken");
+        };
+        engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushConcurrencyForTest, () => Volatile.Read(ref taken) == 1,
+                                                                 () => Volatile.Write(ref failed, 1), "the retry waits for its permit");
+        try
+        {
+            await WriteTwoLevelsAsync(engine);
+            await engine.FlushHotTierAsync();   // fails after its first level: a retry takes the tier
+
+            WaitFor(() => Volatile.Read(ref failed) == 1, "the retry to run out of memory waiting for its permit", ShortGuard);
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0,
+                    "the retry's next attempt to take the permit and publish the tier", ShortGuard);
+            Assert.Equal(500, ReadAll(engine).Count);
+            Assert.Equal(1, engine.FlushConcurrencyForTest.CurrentCount);
+        }
+        finally
+        {
+            engine._beforeOwnerPollForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the merge's heavy-phase permit (round-6: unreached, as the retry's). Out of memory while a
+    /// merge waits for the permit, the merge fails and the permit goes to the next taker — a flush's heavy phase, here.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_a_merge_waits_for_its_permit_leaves_the_permit_to_the_next()
+    {
+        var  engine = Engine(Options(NewDir()));   // one permit
+        long old    = DateTime.UtcNow.AddDays(-20).Date.Ticks;   // a sealed bucket: two small files are a batch
+        void Write(int from, int count)
+        {
+            for (int i = from; i < from + count; i++)
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks = old + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+                }, Props(i), "event {n}"));
+        }
+        using var cts = new CancellationTokenSource();   // the maintenance loop's waits carry a token
+        try
+        {
+            Write(0, 10);   await engine.FlushHotTierAsync();
+            Write(100, 10); await engine.FlushHotTierAsync();
+            engine._allowIndexlessMerge = true;
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "setup: the two flushes to end", ShortGuard);
+
+            // A heavy phase holds the permit as the merge comes for it.
+            Assert.True(engine.FlushConcurrencyForTest.Wait(HangGuard), "setup: the permit stayed taken");
+            engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushConcurrencyForTest, static () => true, static () => { },
+                                                                     "the merge waits for its permit");
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => engine.TryMergeSmallSegmentsOnceAsync(cts.Token));
+            engine._beforeOwnerPollForTest = null;
+            Assert.Equal(1, engine.FlushConcurrencyForTest.CurrentCount);
+
+            Write(200, 10);
+            var flush = engine.FlushHotTierAsync();   // its heavy phase is inline: it needs the permit
+            Assert.True(await Task.WhenAny(flush, Task.Delay(ShortGuard)) == flush, "the flush after the merge's failed wait never got the permit");
+            await flush;
+            Assert.True(await engine.TryMergeSmallSegmentsOnceAsync(cts.Token), "no merge ran after the failed one");
+        }
+        finally
+        {
+            engine._beforeOwnerPollForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the final flush's wait for the swap lock (round-6: unreached). Out of memory while shutdown's
+    /// final flush waits for the lock, the flush fails — its tier left to the WAL — and the teardown takes the lock and
+    /// frees the tiers; a queued waiter there was handed the lock, and the teardown waited out its whole budget for it,
+    /// leaving every tier allocated.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_the_final_flush_waits_for_the_swap_lock_leaves_the_lock_to_the_teardown()
+    {
+        string dir    = NewDir();
+        var    engine = Engine(Options(dir));
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(3);
+        int freed = 0, failed = 0;
+        engine._beforeTiersFreed = () => Volatile.Write(ref freed, 1);
+        try
+        {
+            using (var b = Batch(engine, 0, 10)) await engine.WriteBatchAsync(b, HangGuard);
+            Assert.True(engine.FlushLockForTest.Wait(HangGuard), "setup: the swap lock stayed taken");   // a swap holds it as shutdown begins
+            engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushLockForTest, static () => true,
+                                                                     () => Volatile.Write(ref failed, 1), "the final flush waits for the swap lock");
+            await engine.DisposeAsync();
+
+            Assert.Equal(1, Volatile.Read(ref failed));
+            Assert.True(Volatile.Read(ref freed) == 1, "the teardown never took the swap lock the final flush's failed wait had: the tiers were left allocated");
+        }
+        finally
+        {
+            engine._beforeOwnerPollForTest = null;
+            await engine.DisposeAsync();
+        }
+
+        // The final flush failed: the WAL gives the tier back at the next start.
+        var next = Engine(Options(dir));
+        try
+        {
+            await FlushEverythingAsync(next, ShortGuard);
+            Assert.Equal(10, ReadAll(next).Count);
+        }
+        finally { await next.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the final flush's wait for a flush slot (round-6: unreached). Out of memory while the final
+    /// flush waits for a slot, the flush fails and the slot stays free; a queued waiter there was handed it, and it was
+    /// nobody's from then on.
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_the_final_flush_waits_for_a_slot_leaves_the_slot_free()
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(3);
+        int failed = 0;
+        try
+        {
+            using (var b = Batch(engine, 0, 10)) await engine.WriteBatchAsync(b, HangGuard);
+            Assert.True(engine.FlushSlotsForTest.Wait(HangGuard), "setup: the slot stayed taken");   // a heavy phase holds the one slot
+            engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushSlotsForTest, static () => true,
+                                                                     () => Volatile.Write(ref failed, 1), "the final flush waits for a slot");
+            await engine.DisposeAsync();
+
+            Assert.Equal(1, Volatile.Read(ref failed));
+            Assert.True(engine.FlushSlotsForTest.CurrentCount == 1, "the slot the final flush waited for was kept by its failed wait");
+        }
+        finally
+        {
+            engine._beforeOwnerPollForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review M-B, the teardown's own wait for the swap lock (round-6: unreached). Out of memory while shutdown
+    /// waits for the lock, the shutdown fails — and the lock is free; a queued waiter there was handed it for good.
+    /// (The engine is left half torn down: the test's directory goes with the rest.)
+    /// </summary>
+    [Fact]
+    public async Task An_out_of_memory_while_shutdown_waits_for_the_swap_lock_leaves_the_lock_free()
+    {
+        var engine = Engine(Options(NewDir()));   // nothing written: no final flush, the teardown's wait is the first
+        engine._shutdownWaitBudget = TimeSpan.FromSeconds(3);
+        Assert.True(engine.FlushLockForTest.Wait(HangGuard), "setup: the swap lock stayed taken");   // a swap holds it as the teardown comes
+        engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushLockForTest, static () => true, static () => { },
+                                                                 "shutdown waits for the swap lock");
+
+        await Assert.ThrowsAsync<OutOfMemoryException>(async () => await engine.DisposeAsync());
+        engine._beforeOwnerPollForTest = null;
+        Assert.True(engine.FlushLockForTest.CurrentCount == 1, "the swap lock shutdown waited for was kept by its failed wait");
+    }
+
     // ── A publish that fails keeps its block (round-5 H-A) ────────────────────
 
     /// <summary>A spill file an earlier run left: block 9 000, 100 events — 60 Information, then 40 Error.</summary>
