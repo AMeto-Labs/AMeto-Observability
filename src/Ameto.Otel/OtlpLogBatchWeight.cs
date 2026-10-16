@@ -107,7 +107,7 @@ internal static class OtlpLogBatchWeight
             throw new InvalidDataException("an OTLP/JSON request is a JSON object");
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
-            bool blocks = reader.ValueTextEquals("resourceLogs"u8);
+            bool blocks = JsonStringText.NameIs(ref reader, "resourceLogs"u8);
             reader.Read();
             if (blocks && reader.TokenType == JsonTokenType.StartArray)
             {
@@ -135,20 +135,20 @@ internal static class OtlpLogBatchWeight
         long records = 0, resourceBytes = 0;
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
-            if (reader.ValueTextEquals("resource"u8))
+            if (JsonStringText.NameIs(ref reader, "resource"u8))
             {
                 reader.Read();
                 if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
                 while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
                 {
-                    bool attributes = reader.ValueTextEquals("attributes"u8);
+                    bool attributes = JsonStringText.NameIs(ref reader, "attributes"u8);
                     reader.Read();
                     if (attributes) resourceBytes += JsonLeafBytes(ref reader);
                     else reader.Skip();
                 }
                 continue;
             }
-            bool scopes = reader.ValueTextEquals("scopeLogs"u8);
+            bool scopes = JsonStringText.NameIs(ref reader, "scopeLogs"u8);
             reader.Read();
             if (scopes && reader.TokenType == JsonTokenType.StartArray)
             {
@@ -157,7 +157,7 @@ internal static class OtlpLogBatchWeight
                     if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
                     while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
                     {
-                        bool logRecords = reader.ValueTextEquals("logRecords"u8);
+                        bool logRecords = JsonStringText.NameIs(ref reader, "logRecords"u8);
                         reader.Read();
                         if (logRecords && reader.TokenType == JsonTokenType.StartArray)
                         {

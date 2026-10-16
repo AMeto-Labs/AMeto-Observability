@@ -27,10 +27,17 @@ public sealed class OtlpJsonFuzzTests
         Escapes     = 1,
         Nested      = 2,
         DupResource = 4,
+        /// <summary>Lone-surrogate escapes in string values.</summary>
+        Surrogates     = 8,
+        /// <summary>Lone-surrogate escapes in attribute keys.</summary>
+        SurrogateKeys  = 16,
+        /// <summary>Properties no parser knows, named with a lone-surrogate escape, at every level.</summary>
+        SurrogateNames = 32,
     }
 
     [Theory]
     [InlineData(Shape.Escapes | Shape.Nested | Shape.DupResource)]
+    [InlineData(Shape.Escapes | Shape.Nested | Shape.Surrogates | Shape.SurrogateKeys | Shape.SurrogateNames)]
     public void A_record_map_is_counted_to_the_byte_and_reads_as_its_pairs(Shape shape)
     {
         var failures = new List<string>();
@@ -115,7 +122,25 @@ public sealed class OtlpJsonFuzzTests
         private void A(string s) => _o.AddRange(Encoding.UTF8.GetBytes(s));
         private void B(params byte[] b) => _o.AddRange(b);
 
-        private void Str()
+        private void Str() => Str((shape & Shape.Surrogates) != 0);
+
+        private void Key() => Str((shape & Shape.SurrogateKeys) != 0);
+
+        /// <summary>A property no parser knows, named with a lone-surrogate escape (round-6 review, the LOW on L-10).</summary>
+        private void UnknownName()
+        {
+            A(rng.Next(4) switch { 0 => "\"\\ud800", 1 => "\"\\udc00", 2 => "\"\\ud800\\ud800\\ud800", _ => "\"x\\udfff" });
+            for (int i = rng.Next(0, 14); i > 0; i--) B((byte)('a' + rng.Next(26)));
+            A("\":1");
+        }
+
+        /// <summary>Now and then, such a property, and a comma after it.</summary>
+        private void MaybeUnknown()
+        {
+            if ((shape & Shape.SurrogateNames) != 0 && rng.Next(4) == 0) { UnknownName(); A(","); }
+        }
+
+        private void Str(bool surrogates)
         {
             int length = rng.Next(32) == 0 ? Lengths[rng.Next(Lengths.Length)] : rng.Next(0, 40);   // now and then across a str header's bounds
             A("\"");
@@ -132,6 +157,11 @@ public sealed class OtlpJsonFuzzTests
                     });
                     continue;
                 }
+                if (surrogates && k < 16)
+                {
+                    A(rng.Next(4) switch { 0 => "\\ud800", 1 => "\\udfff", 2 => "\\ud83dx", _ => "\\ude00\\ud83d" });
+                    continue;
+                }
                 switch (rng.Next(3)) { case 0: B(0xC3, 0xA9); break; case 1: B(0xE2, 0x82, 0xAC); break; default: B(0xF0, 0x9F, 0x98, 0x80); break; }
             }
             A("\"");
@@ -141,7 +171,7 @@ public sealed class OtlpJsonFuzzTests
         {
             switch (rng.Next((shape & Shape.Nested) != 0 && depth < 4 ? 8 : 6))
             {
-                case 0: case 5: A("{\"stringValue\":"); Str(); A("}"); break;
+                case 0: case 5: A("{"); MaybeUnknown(); A("\"stringValue\":"); Str(); A("}"); break;
                 case 1: A(rng.Next(2) == 0 ? "{\"boolValue\":true}" : "{\"boolValue\":false}"); break;
                 case 2: A(rng.Next(2) == 0 ? $"{{\"intValue\":\"{rng.NextInt64(long.MinValue, long.MaxValue)}\"}}" : $"{{\"intValue\":{rng.Next(-200000, 200000)}}}"); break;
                 case 3: A($"{{\"doubleValue\":{(rng.NextDouble() * 1e6).ToString(System.Globalization.CultureInfo.InvariantCulture)}}}"); break;
@@ -167,8 +197,8 @@ public sealed class OtlpJsonFuzzTests
 
         private void KeyValue(int depth)
         {
-            if (rng.Next(12) == 0) { A("{\"key\":"); Str(); A("}"); return; }   // a key with no value
-            A("{\"key\":"); Str(); A(",\"value\":"); Any(depth); A("}");
+            if (rng.Next(12) == 0) { A("{"); MaybeUnknown(); A("\"key\":"); Key(); A("}"); return; }   // a key with no value
+            A("{"); MaybeUnknown(); A("\"key\":"); Key(); A(",\"value\":"); Any(depth); A("}");
         }
 
         private void Attributes(int n)
@@ -180,7 +210,7 @@ public sealed class OtlpJsonFuzzTests
 
         private void Resource()
         {
-            A("\"resource\":{\"attributes\":[");
+            A("\"resource\":{"); MaybeUnknown(); A("\"attributes\":[");
             int n = rng.Next(4) == 0 ? 14 + rng.Next(4) : rng.Next(0, 4);
             bool first = true;
             if (rng.Next(2) == 0) { A("{\"key\":\"service.name\",\"value\":{\"stringValue\":"); Str(); A("}}"); first = false; }
@@ -198,6 +228,7 @@ public sealed class OtlpJsonFuzzTests
             if (n > 0) parts.Add(() => { A("\"attributes\":"); Attributes(n); });
             if (rng.Next(2) == 0) parts.Add(() => A($"\"traceId\":\"{Convert.ToHexString(Bytes(16)).ToLowerInvariant()}\""));
             if (rng.Next(2) == 0) parts.Add(() => A($"\"spanId\":\"{Convert.ToHexString(Bytes(8)).ToLowerInvariant()}\""));
+            if ((shape & Shape.SurrogateNames) != 0 && rng.Next(3) == 0) parts.Add(UnknownName);
             for (int i = parts.Count - 1; i > 0; i--) { int j = rng.Next(i + 1); (parts[i], parts[j]) = (parts[j], parts[i]); }
             A("{");
             for (int i = 0; i < parts.Count; i++) { if (i > 0) A(","); parts[i](); }
@@ -214,6 +245,7 @@ public sealed class OtlpJsonFuzzTests
             {
                 if (block > 0) A(",");
                 A("{");
+                MaybeUnknown();
                 Resource(); A(",");
                 // A "resource" key given again (or more), before the records: JSON allows it, OTLP does not send it.
                 if ((shape & Shape.DupResource) != 0)

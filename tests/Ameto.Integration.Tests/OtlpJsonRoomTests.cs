@@ -313,6 +313,45 @@ public sealed class OtlpJsonRoomTests
         Assert.Equal(MsgpackString(stored), Pairs(sink.Maps[0])["v"]);
     }
 
+    // ── The LOW on L-10: a lone surrogate escape in a name or a key ───────────
+
+    /// <summary>
+    /// Round-6 review, the LOW on L-10. A <c>\u</c> escape of a lone surrogate in a property NAME — a record's, a
+    /// KeyValue's, an AnyValue's — threw out of the parse (Utf8JsonReader.ValueTextEquals) after the weighing walk had
+    /// accepted the body: a 400 with the records before it written, where API.md says such an escape is no damage. Such
+    /// a name is none of the parser's now, skipped as any unknown one.
+    /// </summary>
+    [Theory]
+    [InlineData("{\"\\ud800\\ud800\\ud800\":1,\"body\":{\"stringValue\":\"second\"}}")]                                                             // a record's
+    [InlineData("{\"body\":{\"stringValue\":\"second\"},\"attributes\":[{\"\\udc00abcdefghijk\":\"x\",\"key\":\"a\",\"value\":{\"intValue\":1}}]}")]  // a KeyValue's
+    [InlineData("{\"body\":{\"stringValue\":\"second\"},\"attributes\":[{\"key\":\"a\",\"value\":{\"\\ud800xxxxxxxxxx\":\"x\"}}]}")]              // an AnyValue's
+    public void A_lone_surrogate_escape_in_a_name_is_no_damage(string second)
+    {
+        byte[] body = Utf8("{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"first\"}}," + second +
+                           ",{\"body\":{\"stringValue\":\"third\"}}]}]}]}");
+
+        Assert.True(OtlpLogBatchWeight.WeighJson(body) > 0);            // the walk takes it...
+        Assert.Equal((3, 0), OtlpLogStreamParser.Parse(body, new Sink()));   // ...and so does the parse, whole
+    }
+
+    /// <summary>
+    /// The same in a resource attribute KEY — compared with <c>service.name</c> before the service is known — and in the
+    /// name of a resourceLogs element's own property, which the weighing walk compares with <c>resource</c>: the walk threw
+    /// there, and the parse at the key. The key is an ordinary one, stored with U+FFFD for each lone surrogate.
+    /// </summary>
+    [Fact]
+    public void A_lone_surrogate_escape_in_a_resource_key_or_a_blocks_name_is_no_damage()
+    {
+        byte[] body = Utf8("{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"block 1\"}}]}]}," +
+                           "{\"\\ud800\\ud800\\ud800xx\":1,\"resource\":{\"attributes\":[{\"key\":\"\\ud800\\ud800xx\",\"value\":{\"stringValue\":\"v\"}}]}," +
+                           "\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"block 2\"}}]}]}]}");
+        var sink = new Sink();
+
+        Assert.True(OtlpLogBatchWeight.WeighJson(body) > 0);
+        Assert.Equal((2, 0), OtlpLogStreamParser.Parse(body, sink));
+        Assert.Equal(MsgpackString(Utf8("v")), Pairs(sink.Maps[1])["\uFFFD\uFFFDxx"]);
+    }
+
     // ── L-17: nested values, written in place ─────────────────────────────────
 
     /// <summary>
