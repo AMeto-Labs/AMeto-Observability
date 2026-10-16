@@ -6807,16 +6807,29 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             finally { StorageEngine.LevelWriteStartingForTest.Value = null; }
 
             WaitFor(() => Volatile.Read(ref started) == 1 && Volatile.Read(ref writes) == 2, "the first attempt's flush to run past its failed await", ShortGuard);
-            second = SpinWait.SpinUntil(() => Volatile.Read(ref attempts) >= 2, TimeSpan.FromSeconds(1));   // twenty retry delays
+            // Sixty retry delays (round-6: a second was twenty, and on two cores, the held write blocking a pool thread,
+            // a second attempt that would begin did not always begin within it).
+            second = SpinWait.SpinUntil(() => Volatile.Read(ref attempts) >= 2, TimeSpan.FromSeconds(3));
+            Assert.False(second, "a second retry attempt began while the first attempt's flush was still writing the block");
+
+            // The orphaned flush is let go, and ends - its completion marker the last thing it writes - before the engine
+            // stops (round-6: the stop raced it). The seam throws BEFORE the await, so the loop's finally runs and gives
+            // the heavy phase back, and shutdown freed the tier under a flush still reading it. A registration that
+            // fails on the loop's box - the trigger - skips that finally instead: the phase stays counted, and shutdown
+            // leaves the tier allocated at its budget rather than free it.
+            gate.Set();
+            WaitFor(() => Directory.EnumerateFiles(Path.Combine(dir, "wal"), "*.flushed").Any(), "the orphaned flush to end", ShortGuard);
         }
         finally
         {
             gate.Set();
             await engine.DisposeAsync();
         }
-        Assert.False(second, "a second retry attempt began while the first attempt's flush was still writing the block");
 
+        // The block is the next start's: its marker says it was flushed, and the boot scan registers its level (round-6:
+        // read before the scan, in the background, had registered it, it counted 0 under a loaded whole-suite run).
         await using var next = Engine(opts);
+        await next.CatalogLoaded;
         await FlushEverythingAsync(next, ShortGuard);
         Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
     }
