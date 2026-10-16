@@ -16,7 +16,9 @@ namespace Ameto.Core;
 /// and the spill's free-space floor answer 503 with, and the writers had been answered 200 right up to
 /// it. NTFS allocates on SetLength, so there the same full volume fails the open or the grow, cleanly.
 /// This makes Linux do the same: the blocks are reserved where the size is set, and a volume that cannot
-/// hold them is an <see cref="IOException"/> there.</para>
+/// hold them is an <see cref="IOException"/> there. Each log reserves its WHOLE file at every open, not
+/// only what the open adds (round-6 review R5-H2): a file an earlier build left sparse, or that a failed
+/// open left sized, has its holes filled before anything is written through its mapping.</para>
 ///
 /// <para>What it costs: the space is taken at once, as NTFS takes it — a 64 MB WAL holds 64 MB of the
 /// volume from its open, not from its writes. It is <c>fallocate(2)</c> itself, mode 0, NOT

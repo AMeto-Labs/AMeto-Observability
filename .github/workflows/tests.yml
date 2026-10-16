@@ -381,7 +381,16 @@ jobs:
                    WalReservationTests.A_span_log_growth_the_volume_cannot_hold_fails_its_append_and_is_undone \
                    WalReservationTests.A_span_log_open_the_volume_cannot_hold_throws_and_removes_the_file_it_created \
                    WalReservationTests.A_span_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
-                   SpanWalV3Tests.A_v2_log_whose_copy_the_volume_cannot_hold_stays_v2_and_loses_nothing; do
+                   SpanWalV3Tests.A_v2_log_whose_copy_the_volume_cannot_hold_stays_v2_and_loses_nothing \
+                   WalReservationTests.On_linux_the_metric_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.On_linux_the_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.Every_open_of_the_metric_log_reserves_its_whole_file \
+                   WalReservationTests.A_metric_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created \
+                   WalReservationTests.A_metric_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   WalReservationTests.Every_open_of_the_log_reserves_its_whole_file \
+                   WalReservationTests.A_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   WalReservationTests.A_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created \
+                   MetricWalV2Tests.A_v1_log_whose_copy_the_volume_cannot_hold_opens_as_v1_and_loses_nothing; do
             if ! grep -q "Passed Ameto.Storage.Tests.$t" reserve-output.txt; then
               echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1

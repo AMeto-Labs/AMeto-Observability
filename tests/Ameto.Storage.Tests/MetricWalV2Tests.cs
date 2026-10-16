@@ -1194,6 +1194,37 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A v1 LOG WHOSE v2 COPY THE VOLUME CANNOT HOLD OPENS AS v1 AND LOSES NOTHING (round-6 review R5-H2).
+    /// The copy's blocks are reserved before the move commits it, so a full volume fails the upgrade where
+    /// the v1 log stays open in its own layout and the copy is removed — not at the open after the commit
+    /// point, which reserves the whole file and would have failed the metric engine's start. Unreserved,
+    /// the copy was moved in with its tail sparse. The next start upgrades it.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_copy_the_volume_cannot_hold_opens_as_v1_and_loses_nothing()
+    {
+        WriteV1Log();
+        var logger = new CapturingLogger();
+        FileSpace.ReserveForTest.Value = (_, _, _) => File.Exists(TmpPath) ? new IOException("test: the volume is full") : null;
+        try
+        {
+            using var wal = Open(logger);
+            Assert.True(VersionOnDisk(WalPath) == 1, $"the upgrade committed a copy whose blocks could not be reserved: the log is v{VersionOnDisk(WalPath)}");
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+        finally { FileSpace.ReserveForTest.Value = null; }
+
+        Assert.False(File.Exists(TmpPath));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Error is IOException);
+
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+    }
+
+    /// <summary>
     /// A STALE COPY from an upgrade that died before its move is removed. Beside a v2 log it is
     /// garbage that nothing else would ever delete; beside a v1 log the upgrade overwrites it.
     /// </summary>

@@ -222,24 +222,57 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     public static WriteAheadLog Open(string filePath, NodeId nodeId, SegmentId segmentId, long initialCapacity = 64 * 1024 * 1024,
                                      bool spill = false)
     {
-        bool fileExisted = File.Exists(filePath);
-        bool poolExisted = File.Exists(filePath + ".pool");
-        var  wal         = new WriteAheadLog(filePath, spill);
+        var wal = new WriteAheadLog(filePath, spill);
         try
         {
             wal.OpenOrCreate(nodeId, segmentId, initialCapacity);
         }
         catch
         {
-            // Nothing is left behind by a log that could not be opened: its handles closed, and the
-            // files it created removed. It used to leave a 0-byte file whose FileStream stayed open
-            // until finalisation — on a full disk, one per attempt to open one.
-            try { wal.Dispose(); } catch { /* the original exception is the one that matters */ }
-            if (!fileExisted) try { File.Delete(filePath); } catch { /* best-effort */ }
-            if (!poolExisted) try { File.Delete(filePath + ".pool"); } catch { /* best-effort */ }
+            // Nothing is left behind by a log that could not be opened. It used to leave a 0-byte file
+            // whose FileStream stayed open until finalisation — on a full disk, one per attempt to open one.
+            wal.ReleaseFailedOpen();
             throw;
         }
         return wal;
+    }
+
+    /// <summary>
+    /// The lengths the log file and its pool had when <see cref="OpenOrCreate"/> opened them: 0 for a file
+    /// the open created (or found empty), -1 until the open has the file. What a failed open puts back.
+    /// </summary>
+    private long _foundAtOpen = -1, _poolFoundAtOpen = -1;
+
+    /// <summary>
+    /// Releases a log whose open failed, leaving its files as the open found them (round-6 review R5-H2's
+    /// class): the handles closed, what the open added to an existing log cut away again — the extension
+    /// SetLength made, and the reservation behind it — and a file the open created removed (one it found
+    /// empty holds nothing either). Which files the open created used to be asked of File.Exists before
+    /// it, which answers false for a file it could not look at as well (R5-M6's class): a look that failed
+    /// made a failed open delete an existing log, or its pool. Now the open's own handle says what it found.
+    /// </summary>
+    private void ReleaseFailedOpen()
+    {
+        long found = _foundAtOpen, poolFound = _poolFoundAtOpen;
+        lock (_writeLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _mapLock.EnterWriteLock();
+            try { Unmap(); } catch { /* the open's own exception is the one that matters */ }
+            finally { _mapLock.ExitWriteLock(); }
+            if (found > 0 && _fileStream is not null)
+                try { if (_fileStream.Length > found) _fileStream.SetLength(found); } catch { }
+            try { _fileStream?.Dispose(); } catch { }
+            _fileStream = null;
+        }
+        lock (_poolLock)
+        {
+            try { _poolStream?.Dispose(); } catch { }
+            _poolStream = null;
+        }
+        if (found == 0)     try { File.Delete(_filePath); } catch { /* best-effort */ }
+        if (poolFound == 0) try { File.Delete(_filePath + ".pool"); } catch { /* best-effort */ }
     }
 
     private WriteAheadLog(string filePath, bool spill)
@@ -253,32 +286,39 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     private unsafe void OpenOrCreate(NodeId nodeId, SegmentId segmentId, long initialCapacity)
     {
-        bool exists = File.Exists(_filePath);
-
         // Ensure file exists and has the right size. An existing file may be LARGER than
         // requested (it grew in a previous run) — the mapping must cover the whole file,
         // or a recovered WriteOffset beyond the requested size would walk off the view.
+        //
+        // Whether there was a log is read off the handle (a new file is empty, its header all
+        // zeros), never asked of File.Exists first (round-6 review R5-M6's class): that answers
+        // false for a file it could not look at as well, and an existing log taken for a new one had
+        // its header written over, its write offset back at 0 — the entries behind it unreachable.
         long fileSize = FileHeaderSize + initialCapacity;
-        _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        long found = _fileStream.Length;
-        if (found < fileSize)
-        {
-            _fileStream.SetLength(fileSize);
-            // Its blocks reserved, not left to the first write into each page (round-5 H-F): on Linux
-            // SetLength is ftruncate, the file sparse, and that write SIGBUS on a full volume — the
-            // process killed where NTFS fails this open with an IOException. See FileSpace.
-            FileSpace.Reserve(_fileStream.SafeFileHandle, found, fileSize - found);
-        }
-        else
-            fileSize = found;
+        _fileStream  = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        long found   = _fileStream.Length;
+        _foundAtOpen = found;
+        if (found < fileSize) _fileStream.SetLength(fileSize);
+        else                  fileSize = found;
+
+        // The WHOLE file's blocks reserved, at every open, not left to the first write into each page
+        // (round-5 H-F; round-6 review R5-H2): on Linux SetLength is ftruncate, the file sparse, and that
+        // write SIGBUS on a full volume — the process killed where NTFS fails this open with an
+        // IOException. Only what the open added used to be reserved, so a log reopened at its size — an
+        // earlier build's sparse one, or what a failed open left sized — was mapped over its holes. Cheap
+        // where the blocks are there already. A failure is undone by ReleaseFailedOpen. See FileSpace.
+        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize);
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
 
-        if (!exists)
+        ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+        if (hdr.Magic != MagicNumber || hdr.Version != WalVersion)
         {
-            // Write file header
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+            // A new file (all zeros), or an unknown or older version: live appends need the v6 layout,
+            // and pre-v3 entries are unreplayable by construction — (re)initialise in place.
+            // (Orphaned v5, v4 and v3 files are still replayed by ReadForRecovery, which
+            // handles their strides; this path is a same-name reopen, which recovery precedes.)
             hdr.Magic       = MagicNumber;
             hdr.Version     = WalVersion;
             hdr.NodeId      = nodeId.Value;
@@ -288,32 +328,15 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         }
         else
         {
-            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            if (hdr.Magic != MagicNumber || hdr.Version != WalVersion)
+            // Recover write position from header. A torn/corrupt header can claim
+            // any value — clamp to the mapped range so no append or read walks
+            // off the view (unclamped, the first Append after reopen wrote past
+            // the mapping: an uncatchable AccessViolation).
+            _writeOffset = hdr.WriteOffset - FileHeaderSize;
+            if (_writeOffset < 0 || _writeOffset > _capacity)
             {
-                // Unknown or older version: live appends need the v6 layout, and pre-v3
-                // entries are unreplayable by construction — reinitialise in place.
-                // (Orphaned v5, v4 and v3 files are still replayed by ReadForRecovery, which
-                // handles their strides; this path is a same-name reopen, which recovery precedes.)
-                hdr.Magic       = MagicNumber;
-                hdr.Version     = WalVersion;
-                hdr.NodeId      = nodeId.Value;
-                hdr.SegmentId   = segmentId.Value;
-                hdr.WriteOffset = FileHeaderSize;
                 _writeOffset    = 0;
-            }
-            else
-            {
-                // Recover write position from header. A torn/corrupt header can claim
-                // any value — clamp to the mapped range so no append or read walks
-                // off the view (unclamped, the first Append after reopen wrote past
-                // the mapping: an uncatchable AccessViolation).
-                _writeOffset = hdr.WriteOffset - FileHeaderSize;
-                if (_writeOffset < 0 || _writeOffset > _capacity)
-                {
-                    _writeOffset    = 0;
-                    hdr.WriteOffset = FileHeaderSize;
-                }
+                hdr.WriteOffset = FileHeaderSize;
             }
         }
 
@@ -325,7 +348,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         _poolStream = new FileStream(_filePath + ".pool",
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolStream.Seek(0, SeekOrigin.End);
-        _poolBytes = _poolStream.Length;
+        _poolBytes       = _poolStream.Length;
+        _poolFoundAtOpen = _poolBytes;
     }
 
     // ── Append ───────────────────────────────────────────────────────────────

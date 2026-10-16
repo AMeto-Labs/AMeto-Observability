@@ -1,17 +1,23 @@
 using Ameto.Core;
+using Ameto.Metrics;
+using Ameto.Metrics.Storage;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
+using LogLevel = Ameto.Core.LogLevel;
 
 namespace Ameto.Storage.Tests;
 
 /// <summary>
-/// THE SPAN WAL HAS ITS WHOLE FILE'S BLOCKS FROM EVERY OPEN AND EVERY GROWTH, AND A FAILED OPEN LEAVES THE
-/// FILE AS IT FOUND IT (round-6 review R5-H1).
+/// THE THREE WRITE-AHEAD LOGS HAVE THEIR WHOLE FILE'S BLOCKS FROM EVERY OPEN AND EVERY GROWTH, AND A FAILED
+/// OPEN LEAVES THE FILE AS IT FOUND IT (round-6 review R5-H1, R5-H2).
 ///
-/// <para>The span log is written through a mapping over a file sized with SetLength — on Linux ftruncate,
-/// a sparse file — and a write into a page of a full volume is SIGBUS. Round 5 reserved the logs' WAL and
-/// the metric WAL; the span WAL reserved nothing, and trace ingest killed the process (exit 135) after
-/// ~600 spans once the volume filled.</para>
+/// <para>Each log is written through a mapping over a file sized with SetLength — on Linux ftruncate, a
+/// sparse file — and a write into a page of a full volume is SIGBUS. Round 5 reserved the logs' WAL and
+/// only what the metric WAL's open added. The span WAL reserved nothing: trace ingest killed the process
+/// (exit 135) after ~600 spans once the volume filled. A log reopened at its size — every metric and
+/// span WAL at every start, an earlier build's sparse file, the sized file a failed reservation left —
+/// was mapped over its holes: the metric engine's Ingest died with AccessViolation (exit 134). A
+/// failed open left a sized, unreserved file for the next start to map.</para>
 ///
 /// <para>The platform-independent facts watch <see cref="FileSpace.Reserve"/> through its seam
 /// (<see cref="FileSpace.ReserveForTest"/>), which sees every call on every platform and refuses one as a
@@ -30,7 +36,9 @@ public sealed class WalReservationTests : IDisposable
         try { Directory.Delete(_dir, true); } catch { }
     }
 
-    private string SpanPath => Path.Combine(_dir, "spans.wal");
+    private string SpanPath   => Path.Combine(_dir, "spans.wal");
+    private string MetricPath => Path.Combine(_dir, "metrics.wal");
+    private string LogPath    => Path.Combine(_dir, "3-42.wal");
 
     private readonly record struct Reservation(long Offset, long Length, long FileLength);
 
@@ -74,10 +82,26 @@ public sealed class WalReservationTests : IDisposable
         AttributesBytes   = new byte[attrBytes],
     };
 
+    private static MetricIngestItem Gauge(int i) => new()
+    {
+        Name              = "cpu",
+        Kind              = MetricKind.Gauge,
+        Unit              = "ms",
+        Labels            = new LabelSet([new("service.name", "MintRoute.API")]),
+        TimestampUnixNano = 1_785_300_000_000_000_000L + i,
+        ScalarValue       = i,
+    };
+
     private static List<SpanIngestItem> ReadSpans(string path)
     {
         using var wal = SpanWriteAheadLog.Open(path, initialCapacity: 8 * 1024);
         return wal.ReadAll();
+    }
+
+    private static int CountPoints(string path)
+    {
+        using var wal = MetricWriteAheadLog.Open(path, 64 * 1024);
+        return wal.ReadAll(out _).Count;
     }
 
     // ── The span WAL (R5-H1) ──────────────────────────────────────────────────
@@ -217,6 +241,163 @@ public sealed class WalReservationTests : IDisposable
         finally { StopWatching(); }
     }
 
+    // ── The metric WAL (R5-H2) ────────────────────────────────────────────────
+
+    /// <summary>
+    /// A reopened metric log reserves its whole file, not only what the open added — at its full size it
+    /// added nothing, and was mapped over whatever holes it had. So does a reopen after a growth.
+    /// </summary>
+    [Fact]
+    public void Every_open_of_the_metric_log_reserves_its_whole_file()
+    {
+        try
+        {
+            var calls = Watch();
+            using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+            {
+                AssertWholeFileReserved(calls, MetricPath, "the metric log's first open");
+                wal.Append([Gauge(1)]);
+            }
+
+            calls.Clear();
+            using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+            {
+                AssertWholeFileReserved(calls, MetricPath, "the metric log's reopen");
+                for (int i = 0; i < 3_000; i++) wal.Append([Gauge(i)]);   // grows it: the reopen below finds it grown
+            }
+            Assert.True(new FileInfo(MetricPath).Length > 64 * 1024 + 64, "setup: the metric log did not grow");
+
+            calls.Clear();
+            using (MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+                AssertWholeFileReserved(calls, MetricPath, "the metric log's reopen after a growth");
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// An open whose reservation fails throws and removes the files it created. It only disposed: the
+    /// sized, unreserved file stayed, and the next start mapped it — Ingest then died with AccessViolation
+    /// once the volume was full.
+    /// </summary>
+    [Fact]
+    public void A_metric_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created()
+    {
+        try
+        {
+            Watch(refuse: static (_, _) => true);
+            MetricWriteAheadLog? opened = null;
+            var thrown = Record.Exception(() => opened = MetricWriteAheadLog.Open(MetricPath, 64 * 1024));
+            opened?.Dispose();
+
+            Assert.True(thrown is IOException, thrown is null ? "the open went on past a reservation that failed" : $"the open threw {thrown.GetType().Name}");
+            Assert.False(File.Exists(MetricPath), $"the failed open left a {(File.Exists(MetricPath) ? new FileInfo(MetricPath).Length : 0):N0}-byte metrics.wal behind");
+            Assert.False(File.Exists(MetricPath + ".pool"), "the failed open left a pool file behind");
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// An open of an existing metric log whose reservation fails leaves it as it found it — its length and
+    /// every byte — and the next open replays every point. The extension the open made used to stay.
+    /// </summary>
+    [Fact]
+    public void A_metric_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it()
+    {
+        try
+        {
+            using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+                for (int i = 0; i < 3; i++) wal.Append([Gauge(i)]);
+            byte[] found = File.ReadAllBytes(MetricPath);
+
+            Watch(refuse: static (_, _) => true);
+            MetricWriteAheadLog? opened = null;
+            var thrown = Record.Exception(() => opened = MetricWriteAheadLog.Open(MetricPath, 1024 * 1024));
+            opened?.Dispose();
+            StopWatching();
+
+            Assert.True(thrown is IOException, thrown is null ? "the open went on past a reservation that failed" : $"the open threw {thrown.GetType().Name}");
+            long left = new FileInfo(MetricPath).Length;
+            Assert.True(left == found.Length, $"the failed open left the metric log at {left:N0} bytes, where it found {found.Length:N0}");
+            Assert.Equal(found, File.ReadAllBytes(MetricPath));
+            Assert.Equal(3, CountPoints(MetricPath));
+        }
+        finally { StopWatching(); }
+    }
+
+    // ── The logs' WAL (R5-H2's class) ─────────────────────────────────────────
+
+    /// <summary>A reopened log reserves its whole file too. It reserved only what an open added: nothing, at its size.</summary>
+    [Fact]
+    public void Every_open_of_the_log_reserves_its_whole_file()
+    {
+        try
+        {
+            var calls = Watch();
+            using (var wal = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                AssertWholeFileReserved(calls, LogPath, "the log's first open");
+                Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", new byte[100]));
+            }
+
+            calls.Clear();
+            using (WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+                AssertWholeFileReserved(calls, LogPath, "the log's reopen");
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// An open of an existing log whose reservation fails leaves it as it found it, its entries readable.
+    /// It kept an existing file, at the size the open had extended it to.
+    /// </summary>
+    [Fact]
+    public void A_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it()
+    {
+        try
+        {
+            using (var wal = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
+                Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", new byte[100]));
+                Assert.True(wal.Append(2_000, LogLevel.Information, 1, "t", new byte[100]));
+            }
+            byte[] found = File.ReadAllBytes(LogPath);
+
+            Watch(refuse: static (_, _) => true);
+            WriteAheadLog? opened = null;
+            var thrown = Record.Exception(() => opened = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 4 * 1024 * 1024));
+            opened?.Dispose();
+            StopWatching();
+
+            Assert.True(thrown is IOException, thrown is null ? "the open went on past a reservation that failed" : $"the open threw {thrown.GetType().Name}");
+            long left = new FileInfo(LogPath).Length;
+            Assert.True(left == found.Length, $"the failed open left the log at {left:N0} bytes, where it found {found.Length:N0}");
+            Assert.Equal(found, File.ReadAllBytes(LogPath));
+            Assert.Equal(2, WriteAheadLog.ReadForRecovery(LogPath).Entries.Count);
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// The twin that was already right, pinned: a new log whose reservation fails is removed with its pool.
+    /// What changed is how the open knows it created them — off its own handle, not File.Exists before it.
+    /// </summary>
+    [Fact]
+    public void A_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created()
+    {
+        try
+        {
+            Watch(refuse: static (_, _) => true);
+            WriteAheadLog? opened = null;
+            var thrown = Record.Exception(() => opened = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024));
+            opened?.Dispose();
+
+            Assert.True(thrown is IOException, thrown is null ? "the open went on past a reservation that failed" : $"the open threw {thrown.GetType().Name}");
+            Assert.False(File.Exists(LogPath), "the failed open left the log file behind");
+            Assert.False(File.Exists(LogPath + ".pool"), "the failed open left a pool file behind");
+        }
+        finally { StopWatching(); }
+    }
+
     // ── Linux: the blocks on disk ─────────────────────────────────────────────
 
     /// <summary>
@@ -274,5 +455,41 @@ public sealed class WalReservationTests : IDisposable
         Assert.True(FileAllocation.AllocatedBytes(SpanPath) >= new FileInfo(SpanPath).Length,
             $"the reopened span log is sparse: {FileAllocation.AllocatedBytes(SpanPath):N0} of {new FileInfo(SpanPath).Length:N0} bytes on disk");
         Assert.Equal(3, reopened.ReadAll().Count);
+    }
+
+    /// <summary>
+    /// The metric log reopened over a file an earlier build left sparse has every block once it is open,
+    /// and replays what it held. The reopen reserved nothing — the open added nothing — and the metric
+    /// engine's Ingest then wrote into the holes of a full volume and died with AccessViolation.
+    /// </summary>
+    [Fact]
+    public void On_linux_the_metric_log_reopened_over_a_sparse_file_has_its_blocks()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+            for (int i = 0; i < 3; i++) wal.Append([Gauge(i)]);
+        MakeSparse(MetricPath);
+        Assert.True(FileAllocation.AllocatedBytes(MetricPath) < new FileInfo(MetricPath).Length, "setup: the metric log is not sparse");
+
+        using var reopened = MetricWriteAheadLog.Open(MetricPath, 64 * 1024);
+        Assert.True(FileAllocation.AllocatedBytes(MetricPath) >= new FileInfo(MetricPath).Length,
+            $"the reopened metric log is sparse: {FileAllocation.AllocatedBytes(MetricPath):N0} of {new FileInfo(MetricPath).Length:N0} bytes on disk");
+        Assert.Equal(3, reopened.ReadAll(out _).Count);
+    }
+
+    /// <summary>The log reopened over a file an earlier build left sparse has every block once it is open.</summary>
+    [Fact]
+    public void On_linux_the_log_reopened_over_a_sparse_file_has_its_blocks()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        using (var wal = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            for (int i = 0; i < 3; i++) Assert.True(wal.Append(1_000 + i, LogLevel.Information, 1, "t", new byte[100]));
+        MakeSparse(LogPath);
+        Assert.True(FileAllocation.AllocatedBytes(LogPath) < new FileInfo(LogPath).Length, "setup: the log is not sparse");
+
+        using (WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            Assert.True(FileAllocation.AllocatedBytes(LogPath) >= new FileInfo(LogPath).Length,
+                $"the reopened log is sparse: {FileAllocation.AllocatedBytes(LogPath):N0} of {new FileInfo(LogPath).Length:N0} bytes on disk");
+        Assert.Equal(3, WriteAheadLog.ReadForRecovery(LogPath).Entries.Count);
     }
 }
