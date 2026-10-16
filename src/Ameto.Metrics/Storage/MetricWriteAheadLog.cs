@@ -2893,7 +2893,10 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            try { _poolStream?.Flush(); _poolStream?.Dispose(); } catch { }
+            // Two tries: a write of the buffer that failed skipped the close in one, and left the pool's
+            // handle to the finalizer (round-6 review; the logs WAL's pool had the same shape).
+            try { _poolStream?.Flush(); } catch { /* its close below writes what it can */ }
+            try { _poolStream?.Dispose(); } catch { }
             _poolStream = null;
             Unmap();
             try { _file?.Dispose(); } catch { }

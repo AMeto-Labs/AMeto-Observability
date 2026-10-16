@@ -4926,6 +4926,179 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── fsyncs a write-ahead log kept to itself (round-4 L19; round-6 review) ──
+
+    /// <summary>Every line, with when it was said; <see cref="Kept"/> picks those of fsyncs the write-ahead logs kept to themselves.</summary>
+    private sealed class TimedLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<(long At, Microsoft.Extensions.Logging.LogLevel Level, string Line, Exception? Error)> _lines = new();
+
+        /// <summary>The lines that say kept fsync failures, in order, with the count each says.</summary>
+        public List<(long At, Microsoft.Extensions.Logging.LogLevel Level, int Count, string Line, Exception? Error)> Kept =>
+            _lines.Where(static l => l.Line.Contains(" fsync(s) of the write-ahead logs failed", StringComparison.Ordinal))
+                  .Select(static l => (l.At, l.Level, int.Parse(l.Line.AsSpan(0, l.Line.IndexOf(' '))), l.Line, l.Error))
+                  .ToList();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => _lines.Enqueue((Environment.TickCount64, logLevel, formatter(state, exception), exception));
+    }
+
+    /// <summary>
+    /// Round-4 L19, asked for by two round-5 reviewers. A template pool whose fsync fails — or its handle's getter,
+    /// which writes the stream's buffer out first — is kept dirty and tried again on the next tick, and that was
+    /// silent for as long as it went on, while acknowledged events' templates were not crash-durable. The engine says
+    /// it now, with the count since its last line: at most once an interval (a minute; 300 ms here), and what is not
+    /// said yet at shutdown, so each failure is said once.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_pool_fsync_that_keeps_failing_is_said_at_most_once_an_interval_and_the_rest_at_shutdown(bool getter)
+    {
+        const int IntervalMs = 300;
+        string dir    = NewDir();
+        var    logger = new TimedLogger();
+        var    opts   = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillMinFreeDiskBytes = 0,
+                WalFlushInterval = TimeSpan.FromMilliseconds(20),
+            },
+        };
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger);
+        engine.KeptFlushSayIntervalForTest = TimeSpan.FromMilliseconds(IntervalMs);
+        var wal      = engine.LiveWalForTest!;
+        int failures = 0;
+        if (getter)
+            wal.PoolHandleHookForTest = _ => { Interlocked.Increment(ref failures); throw new IOException("test: the pool's buffer could not be written out"); };
+        else
+            wal.PoolFlushHookForTest  = _ => { Interlocked.Increment(ref failures); throw new IOException("test: the pool's fsync failed"); };
+        bool disposed = false;
+        try
+        {
+            using (var b = Batch(engine, 0, 10))   // its template is a row for the pool to fsync
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            WaitFor(() => logger.Kept.Count >= 4, "four Warnings of a pool fsync that keeps failing", ShortGuard);
+
+            await engine.DisposeAsync();
+            disposed = true;
+            var lines = logger.Kept;
+            // The bound, for every pair but the last: the last may be shutdown's, which says what is left at once.
+            for (int i = 1; i < lines.Count - 1; i++)
+                Assert.True(lines[i].At - lines[i - 1].At >= IntervalMs - 100,   // less a timer tick and a pause before the line
+                            $"lines {i - 1} and {i} of {lines.Count} came {lines[i].At - lines[i - 1].At} ms apart, under the {IntervalMs} ms interval");
+            Assert.Equal(Volatile.Read(ref failures), lines.Sum(static l => l.Count));
+            Assert.All(lines, l =>
+            {
+                Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, l.Level);
+                Assert.Contains(wal.FilePath, l.Line);
+                Assert.IsType<IOException>(l.Error);
+            });
+            Assert.Equal(10, ReadAll(engine).Count);
+        }
+        finally
+        {
+            wal.PoolHandleHookForTest = null;
+            wal.PoolFlushHookForTest  = null;
+            if (!disposed) await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-6 review, round-4 L19's class. The last fsyncs a closing log makes, of itself and of its pool — a rotated
+    /// WAL's as its tier is flushed, the live one's at shutdown — have nobody to throw to, and were silent. The engine
+    /// says them: a rotated WAL is not ticked again, so its failures are taken as it closes, and shutdown says what is
+    /// left at once. And the rotated WAL's pool is deleted with it: a failed last fsync skipped the pool's close, and
+    /// on Windows its open handle kept the flush's delete from removing it.
+    /// </summary>
+    [Fact]
+    public async Task The_last_fsyncs_of_a_closed_wal_that_fail_are_said_and_its_pool_is_deleted_all_the_same()
+    {
+        string dir    = NewDir();
+        var    logger = new TimedLogger();
+        var    opts   = Options(dir, spill: false);
+        var    engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                          new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger);
+        static void Fail(bool pool) => throw new IOException(pool ? "test: the pool's last fsync failed" : "test: the log's last fsync failed");
+        var  first    = engine.LiveWalForTest!;
+        bool disposed = false;
+        first.EndOfLifeFlushHookForTest = Fail;
+        try
+        {
+            using (var b = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            await FlushEverythingAsync(engine, ShortGuard);   // the tier is flushed: its WAL closes
+
+            var line = Assert.Single(logger.Kept);
+            Assert.Equal(2, line.Count);
+            Assert.Contains(first.FilePath, line.Line);
+            Assert.Equal("test: the pool's last fsync failed", line.Error?.Message);
+            Assert.False(File.Exists(first.FilePath), "setup: the flushed tier's WAL is still on disk");
+            Assert.False(File.Exists(first.FilePath + ".pool"), "the flushed tier's WAL pool is still on disk: its close was skipped, and its handle held it");
+
+            var second = engine.LiveWalForTest!;
+            Assert.NotSame(first, second);
+            second.EndOfLifeFlushHookForTest = Fail;
+            using (var b = Batch(engine, 10, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+            await engine.DisposeAsync();   // its final flush closes the second within the minute: said at shutdown all the same
+            disposed = true;
+
+            var lines = logger.Kept;
+            Assert.Equal(2, lines.Count);
+            Assert.Equal(2, lines[1].Count);
+            Assert.Contains(second.FilePath, lines[1].Line);
+            Assert.Equal(20, ReadAll(engine).Count);
+        }
+        finally { if (!disposed) await engine.DisposeAsync(); }
+    }
+
+    /// <summary>
+    /// Round-6 review, the same for a spill file: a spill that ends has its file closed off the swap, with the last
+    /// fsyncs of the file and its pool, and their failures were silent. The engine says them as it closes it.
+    /// </summary>
+    [Fact]
+    public async Task The_last_fsyncs_of_a_spill_file_that_fail_are_said()
+    {
+        string dir    = NewDir();
+        var    logger = new TimedLogger();
+        var    engine = OneSlotEngine(Options(dir), logger);
+        var    gate   = HoldFirstFlush(engine);
+        const int Total = 2 * TierEvents + 1_000;
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            var spill = engine.LiveSpillWalForTest;
+            Assert.True(spill is not null, "setup: the engine is not spilling");
+            spill.EndOfLifeFlushHookForTest = static pool =>
+                throw new IOException(pool ? "test: the spill pool's last fsync failed" : "test: the spill file's last fsync failed");
+
+            gate.Set();   // the held flush ends, and the swap after it ends the spill: its file is closed
+            WaitFor(() => logger.Kept.Count > 0, "the Warning of a spill file's failed last fsyncs", ShortGuard);
+            var line = Assert.Single(logger.Kept);
+            Assert.Equal(2, line.Count);
+            Assert.Contains(spill.FilePath, line.Line);
+            Assert.Equal("test: the spill pool's last fsync failed", line.Error?.Message);
+
+            await FlushEverythingAsync(engine, ShortGuard);   // and its block is despilled from it all the same
+            Assert.Equal(Total, ReadAll(engine).Count);
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
     /// <summary>
     /// Round-5 review L-3, the same in the age loop: its Error line for a failed age flush, thrown (out of
     /// memory), ended the loop for good — no tier was flushed for its age again until a restart, the age

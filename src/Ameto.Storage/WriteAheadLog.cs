@@ -816,9 +816,39 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         catch (Exception ex)
         {
             lock (_poolLock) _poolDirty = true;
-            if (ex is IOException || walFailed) return;   // retried next interval; a WAL failure is the one reported
+            if (ex is IOException || walFailed)
+            {
+                // Retried next interval; a WAL failure is the one this tick reports. Counted for the engine's
+                // Warning (TakeKeptFlushFailures): it used to be silent for as long as it went on.
+                KeepFlushFailure(ex);
+                return;
+            }
             throw;
         }
+    }
+
+    /// <summary>
+    /// fsyncs this log failed and kept to itself rather than throw (round-4 L19; round-6 review): the pool's on a tick
+    /// that keeps it for the next one (<see cref="FlushPool"/>: an IOException, or anything on a tick whose WAL half
+    /// failed too), and either file's at <see cref="Dispose"/>, which has nobody to throw to. Counted, with the last,
+    /// for the engine's rate-limited Warning: they were silent, and while they go on, events acknowledged since the last
+    /// fsync that held may not survive a power loss, or come back without their message templates. One exception kept.
+    /// </summary>
+    private int        _keptFlushFailures;
+    private Exception? _lastKeptFlushFailure;
+
+    private void KeepFlushFailure(Exception ex)
+    {
+        Volatile.Write(ref _lastKeptFlushFailure, ex);
+        Interlocked.Increment(ref _keptFlushFailures);
+    }
+
+    /// <summary>The fsync failures this log kept to itself since the last call, and the last of them. Never throws.</summary>
+    internal int TakeKeptFlushFailures(out Exception? last)
+    {
+        int count = Interlocked.Exchange(ref _keptFlushFailures, 0);
+        last = count == 0 ? null : Volatile.Read(ref _lastKeptFlushFailure);
+        return count;
     }
 
     /// <summary>
@@ -1351,18 +1381,45 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             // and clamps the header's write offset to it; nothing past the offset is lost.
             if (_spill && _fileStream is not null)
                 try { _fileStream.SetLength(FileHeaderSize + _writeOffset); } catch { /* keeps its size; still valid */ }
-            try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
+            // The last fsync of either file has nobody to throw to: kept for the engine's Warning
+            // (TakeKeptFlushFailures; round-6 review, round-4 L19's class) — it was silent.
+            if (_fileStream is not null)
+            {
+                try
+                {
+                    EndOfLifeFlushHookForTest?.Invoke(false);
+                    _fileStream.Flush(flushToDisk: true);
+                }
+                catch (Exception ex) { KeepFlushFailure(ex); }
+            }
             try { _fileStream?.Dispose(); } catch { }
             _fileStream = null;
         }
         lock (_poolLock)
         {
             // fsync, not just OS-buffer: the WAL file outlives this handle until the
-            // flush marker lands, and recovery discards a WAL whose pool vanished.
-            try { _poolStream?.Flush(flushToDisk: true); _poolStream?.Dispose(); } catch { }
+            // flush marker lands, and recovery discards a WAL whose pool vanished. A failed
+            // fsync no longer skips the close: one try held both, and the pool's handle was left
+            // to the finalizer — on Windows a pool the flush's delete could not remove.
+            if (_poolStream is not null)
+            {
+                try
+                {
+                    EndOfLifeFlushHookForTest?.Invoke(true);
+                    _poolStream.Flush(flushToDisk: true);
+                }
+                catch (Exception ex) { KeepFlushFailure(ex); }
+                try { _poolStream.Dispose(); } catch { }
+            }
             _poolStream = null;
         }
     }
+
+    /// <summary>
+    /// Test seam: runs before each last fsync <see cref="Dispose"/> makes, with true for the pool's; throwing from it
+    /// is that fsync failing. Null in production.
+    /// </summary>
+    internal Action<bool>? EndOfLifeFlushHookForTest;
 
     public void Delete()
     {

@@ -442,6 +442,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal ulong LiveWalSegmentId => _write.WalSegId;
     /// <summary>Test hook: the live tier's WAL, which a test disposes to make the next append fail.</summary>
     internal WriteAheadLog? LiveWalForTest => _write.Wal;
+    /// <summary>Test hook: the open spill file's log, while the engine spills.</summary>
+    internal WriteAheadLog? LiveSpillWalForTest => _write.Spill?.Wal;
     /// <summary>
     /// Test hook: scales the merged-file target. What determines how many files a bucket ends
     /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor
@@ -2651,6 +2653,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // handles before the flush so File.Delete below succeeds afterwards. Inside the
             // try, so a WAL that throws on close still hands back the slot and the count.
             oldWal?.Dispose();
+            NoteKeptFlushFailures(oldWal);   // its last fsyncs: it is not ticked again (round-6 review)
 
             try
             {
@@ -7428,6 +7431,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         try { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
                         catch (Exception) { /* the line is lost; the loop is not */ }
                     }
+                    NoteKeptFlushFailures(w.Wal);
                     try { w.Spill?.Wal.Flush(); }
                     catch (ObjectDisposedException) { /* raced a rotation; its close writes it back */ }
                     catch (Exception ex)
@@ -7435,6 +7439,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         try { _logger.LogWarning(ex, "Periodic spill flush failed"); }
                         catch (Exception) { /* the line is lost; the loop is not */ }
                     }
+                    NoteKeptFlushFailures(w.Spill?.Wal);
                 }
                 return;
             }
@@ -7450,6 +7455,64 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>Test seam: runs before each periodic flush of the live WAL; throwing from it is a flush that failed.</summary>
     internal Action? _beforePeriodicWalFlushForTest;
+
+    /// <summary>
+    /// Takes the fsync failures a write-ahead log kept to itself (<see cref="WriteAheadLog.TakeKeptFlushFailures"/>: its
+    /// pool's on a tick, which it tries again on the next, and either file's at its close) and says them, at most once a
+    /// minute, or now with <paramref name="sayNow"/> (round-4 L19; round-6 review): they were silent for as long as they
+    /// went on, while events acknowledged since the last fsync that held were not crash-durable. Taken from the WAL at
+    /// every call, so a closed WAL's are not lost with it; held between lines as one count, the last failure and its
+    /// log. Called by the WAL loop for the live WAL and the spill file each tick, after each close of either, and at
+    /// shutdown with <paramref name="sayNow"/>. Never throws.
+    /// </summary>
+    private void NoteKeptFlushFailures(WriteAheadLog? wal, bool sayNow = false)
+    {
+        try
+        {
+            int        count = 0;
+            Exception? last  = null;
+            string?    path  = null;
+            if (wal is not null && (count = wal.TakeKeptFlushFailures(out last)) > 0) path = wal.FilePath;
+            lock (_keptFlushLock)
+            {
+                if (count > 0)
+                {
+                    _keptFlushUnsaid += count;
+                    _keptFlushLast    = last;
+                    _keptFlushPath    = path;
+                }
+                long now = Environment.TickCount64;
+                if (_keptFlushUnsaid == 0 || (!sayNow && now < _keptFlushSayFrom)) return;
+                _keptFlushSayFrom = now + _keptFlushSayIntervalMs;
+                (count, last, path) = (_keptFlushUnsaid, _keptFlushLast, _keptFlushPath);
+                _keptFlushUnsaid    = 0;
+                _keptFlushLast      = null;
+            }
+            _logger.LogWarning(last,
+                "{Count} fsync(s) of the write-ahead logs failed since this was last said, the last on {Wal}; a template pool's " +
+                "is tried again every flush interval, one at a close is not. Until one holds, events acknowledged since the last " +
+                "that did may not survive a power loss, or may come back without their message templates",
+                count, path);
+        }
+        catch (Exception) { /* the line is lost; the loop is not */ }
+    }
+
+    /// <summary>
+    /// <see cref="NoteKeptFlushFailures"/>'s state: the failures taken and not yet said, the last of them and its log,
+    /// and when the next line may be. Under <see cref="_keptFlushLock"/>: the WAL loop, a rotation's close and a spill's
+    /// close each note.
+    /// </summary>
+    private readonly Lock _keptFlushLock = new();
+    private int        _keptFlushUnsaid;
+    private Exception? _keptFlushLast;
+    private string?    _keptFlushPath;
+    private long       _keptFlushSayFrom;
+
+    /// <summary>The shortest gap between two of <see cref="NoteKeptFlushFailures"/>'s lines, but for one at shutdown.</summary>
+    private long _keptFlushSayIntervalMs = 60_000;
+
+    /// <summary>Test seam: <see cref="_keptFlushSayIntervalMs"/>.</summary>
+    internal TimeSpan KeptFlushSayIntervalForTest { set => _keptFlushSayIntervalMs = (long)value.TotalMilliseconds; }
 
     /// <summary>A background loop that had ended with a failure before shutdown awaited it: said, and the teardown goes on. Never throws.</summary>
     private void LoopDiedAtShutdown(Exception ex, string loop)
@@ -7688,6 +7751,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // the next start's despill, like the WAL beside it.
         try { live.Spill?.Wal.Dispose(); }
         catch (Exception ex) { _logger.LogWarning(ex, "Closing the open spill file failed at shutdown"); }
+        // Their last fsyncs, and any failure not said yet: now, as there is no next tick (round-6 review).
+        NoteKeptFlushFailures(live.Wal);
+        NoteKeptFlushFailures(live.Spill?.Wal, sayNow: true);
 
         // The three semaphores are deliberately NOT disposed. A SemaphoreSlim holds nothing to
         // release unless its wait handle was asked for, and disposing one turns a late

@@ -1283,6 +1283,48 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("header does not verify"));
     }
 
+    /// <summary>
+    /// Round-6 review (the logs WAL's pool had the same shape). The log's close wrote the pool's buffer out and closed
+    /// it in one try, so a write that failed skipped the close, and the pool's handle was left to the finalizer. Two
+    /// tries now: the pool is closed whatever its last write does.
+    /// </summary>
+    [Fact]
+    public void A_pool_whose_last_write_fails_is_closed_all_the_same()
+    {
+        var wal   = Open();
+        var field = typeof(MetricWriteAheadLog).GetField("_poolStream",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var real  = (FileStream)field.GetValue(wal)!;
+        var pool  = new WriteFailsOncePool(Path.Combine(_dir, "stand-in.pool"));
+        field.SetValue(wal, pool);
+        real.Dispose();
+
+        wal.Dispose();
+
+        Assert.True(pool.Failed, "setup: the pool's last write did not fail");
+        Assert.True(pool.Closed, "the pool whose last write failed was not closed: its handle is left to the finalizer");
+    }
+
+    /// <summary>A pool file whose first flush fails, and which says whether it was closed.</summary>
+    private sealed class WriteFailsOncePool(string path) : FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.Read)
+    {
+        private int _armed = 1;
+        public bool Failed { get; private set; }
+        public bool Closed { get; private set; }
+
+        public override void Flush()
+        {
+            if (Interlocked.Exchange(ref _armed, 0) == 1) { Failed = true; throw new IOException("test: the pool's last write failed"); }
+            base.Flush();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) Closed = true;
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         public readonly List<(LogLevel Level, string Text, Exception? Error)> Entries = [];

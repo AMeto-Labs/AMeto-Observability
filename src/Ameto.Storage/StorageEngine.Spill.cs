@@ -527,6 +527,7 @@ public sealed partial class StorageEngine
             }
             try { s.Wal.Dispose(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Closing the spill file {File} failed", s.Path); }
+            NoteKeptFlushFailures(s.Wal);   // its last fsyncs: it is not ticked again (round-6 review)
             if (Volatile.Read(ref _writesClosed) != 0) return;
             try { EnqueueSpill(new SpillFile(s.SegId, s.Path)); }
             catch (Exception ex)

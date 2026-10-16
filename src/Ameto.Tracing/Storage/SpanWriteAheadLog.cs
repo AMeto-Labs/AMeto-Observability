@@ -1793,11 +1793,34 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             if (_disposed) return;
             _disposed = true;
             Unmap();   // the view flushes its dirty pages as it is disposed
-            try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
+            if (_fileStream is not null)
+            {
+                // The log's last fsync — what the engine's shutdown leaves the spans since the last segment flush
+                // to — has nobody to throw to, and it failed silently (round-6 review, round-4 L19's class): said,
+                // once, as a log is closed once.
+                try
+                {
+                    EndOfLifeFlushHookForTest?.Invoke();
+                    _fileStream.Flush(flushToDisk: true);
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        _logger?.LogWarning(ex,
+                            "Span WAL at {Path}: its last fsync, as it closed, failed; the spans written to it since the " +
+                            "last segment flush may not survive a power loss before the OS writes them back.", _filePath);
+                    }
+                    catch (Exception) { /* the line is lost; the close is not */ }
+                }
+            }
             try { _fileStream?.Dispose(); } catch { }
             _fileStream = null;
         }
     }
+
+    /// <summary>Test seam: runs before the last fsync <see cref="Dispose"/> makes; throwing from it is that fsync failing. Null in production.</summary>
+    internal Action? EndOfLifeFlushHookForTest;
 
     /// <summary>Closes and removes the log file. Used by tests and by a data-directory reset.</summary>
     public void Delete()

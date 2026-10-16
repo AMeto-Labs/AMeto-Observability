@@ -366,6 +366,80 @@ public sealed class WalFlushTickTests : IDisposable
         Assert.Equal(1, wal.PoolFlushCount);
     }
 
+    /// <summary>
+    /// Round-4 L19 (round-6 review): a pool fsync the log keeps for the next tick rather than throw — an
+    /// IOException, or anything on a tick whose WAL half failed too — was silent for as long as it went on. It
+    /// is counted now, with the last, for the engine's Warning; one the tick throws is the loop's to say, and
+    /// is not counted again.
+    /// </summary>
+    [Fact]
+    public void A_pool_fsync_kept_for_the_next_tick_is_counted_for_the_engine_to_say()
+    {
+        using var wal = Open();
+        Exception? poolFails = null;
+        bool       walFails  = false;
+        wal.HandleFlushHookForTest = h =>
+        {
+            if (walFails) throw new IOException("simulated FlushFileBuffers failure");
+            h.Flush(flushToDisk: true);
+        };
+        wal.PoolFlushHookForTest = h =>
+        {
+            if (poolFails is { } ex) throw ex;
+            RandomAccess.FlushToDisk(h);
+        };
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
+
+        poolFails = new IOException("simulated pool fsync failure");                  // kept: an IOException
+        wal.Flush();
+        poolFails = new UnauthorizedAccessException("simulated pool refusal");         // kept: the WAL half's is thrown
+        walFails  = true;
+        wal.Append(101, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 4 });  // a tail for the WAL half to fail on
+        Assert.Equal("simulated FlushFileBuffers failure", Assert.Throws<IOException>(wal.Flush).Message);
+        walFails  = false;
+        Assert.Equal(2, wal.TakeKeptFlushFailures(out Exception? last));
+        Assert.Same(poolFails, last);
+        Assert.Equal(0, wal.TakeKeptFlushFailures(out last));                          // taken once
+        Assert.Null(last);
+
+        Assert.Throws<UnauthorizedAccessException>(wal.Flush);                         // thrown: the loop says it
+        Assert.Equal(0, wal.TakeKeptFlushFailures(out _));
+
+        poolFails = null;
+        wal.Flush();
+        Assert.Equal(1, wal.PoolFlushCount);
+        Assert.Equal(0, wal.TakeKeptFlushFailures(out _));
+    }
+
+    /// <summary>
+    /// Round-6 review (round-4 L19's class). The last fsyncs a closing log makes, of the log and of its pool, have
+    /// nobody to throw to, and failed silently: they are counted for the engine's Warning now. And the pool's no
+    /// longer skips its close — the two were in one try, and the pool's handle was left to the finalizer, which on
+    /// Windows kept the pool from being deleted after its tier was flushed.
+    /// </summary>
+    [Fact]
+    public void A_last_fsync_that_fails_is_counted_and_both_files_are_closed_all_the_same()
+    {
+        var wal = Open();
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
+        var made = new List<bool>();
+        wal.EndOfLifeFlushHookForTest = pool =>
+        {
+            made.Add(pool);
+            throw new IOException(pool ? "simulated last pool fsync failure" : "simulated last log fsync failure");
+        };
+
+        wal.Dispose();
+
+        Assert.Equal([false, true], made);
+        Assert.Equal(2, wal.TakeKeptFlushFailures(out Exception? last));
+        Assert.Equal("simulated last pool fsync failure", last!.Message);
+
+        // Closed: a file cannot be opened unshared while a handle to it is open (on Windows; elsewhere this holds anyway).
+        using (new FileStream(_path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        using (new FileStream(_path + ".pool", FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+    }
+
     [Fact]
     public void FlushedEntriesSurviveAndReplay()
     {

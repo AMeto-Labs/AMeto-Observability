@@ -1004,6 +1004,29 @@ public sealed class SpanWalV3Tests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Round-6 review, round-4 L19's class. The log's last fsync as it closes — the trace engine's shutdown leaves the
+    /// spans since the last segment flush to it — has nobody to throw to, and failed silently. It is said now, once.
+    /// </summary>
+    [Fact]
+    public void A_last_fsync_that_fails_as_the_log_closes_is_said()
+    {
+        var logger = new CapturingLogger();
+        var wal    = Open(logger: logger);
+        wal.Append(Span(100));
+        wal.EndOfLifeFlushHookForTest = static () => throw new IOException("test: the last fsync failed");
+
+        wal.Dispose();
+        wal.Dispose();   // a log is closed once
+
+        var said = Assert.Single(logger.Entries, static e => e.Error is IOException { Message: "test: the last fsync failed" });
+        Assert.Equal(LogLevel.Warning, said.Level);
+        Assert.Contains(WalPath, said.Text);
+        using (new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }   // and closed all the same
+        using (var reopened = Open())
+            Assert.Equal(Ids(100, 1), IdsOf(reopened.ReadAll()));
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         public readonly List<(LogLevel Level, string Text, Exception? Error)> Entries = [];
