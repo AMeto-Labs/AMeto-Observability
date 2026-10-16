@@ -1200,7 +1200,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     ReleaseMaintenanceMemory();
                 }
 
-                try { await Task.Delay(_maintenancePauseForTest ?? PauseAfter(outcome), ct); }
+                try { _beforeLoopWaitForTest?.Invoke("maintenance"); await Task.Delay(_maintenancePauseForTest ?? PauseAfter(outcome), ct); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             }
             catch (Exception)
@@ -2372,7 +2372,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         {
             try
             {
-                while (await timer.WaitForNextTickAsync(ct))
+                while (await NextTick(timer, "age", ct))
                 {
                     try { _beforeAgeFlushForTest?.Invoke(); await TryFlushAsync(ct); }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -2398,6 +2398,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>Test seam: runs before each age flush; throwing from it is a flush that failed.</summary>
     internal Action? _beforeAgeFlushForTest;
+
+    /// <summary>A loop's wait for its timer's next tick, <see cref="_beforeLoopWaitForTest"/> first.</summary>
+    private ValueTask<bool> NextTick(PeriodicTimer timer, string loop, CancellationToken ct)
+    {
+        _beforeLoopWaitForTest?.Invoke(loop);
+        return timer.WaitForNextTickAsync(ct);
+    }
+
+    /// <summary>
+    /// Test seam: runs before each wait of the WAL ("wal"), age ("age") and maintenance ("maintenance") loops, with
+    /// the loop's name; throwing from it is a wait that could not be set up — the failure only a loop's outer
+    /// catch-all handles (round-5 L-3; round-6 review).
+    /// </summary>
+    internal Action<string>? _beforeLoopWaitForTest;
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
@@ -7492,7 +7506,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         {
             try
             {
-                while (await timer.WaitForNextTickAsync(ct))
+                while (await NextTick(timer, "wal", ct))
                 {
                     // The live tier's WAL and, while the engine spills, the spill target's: both hold
                     // acknowledged events, and the window this loop bounds is the same for both.

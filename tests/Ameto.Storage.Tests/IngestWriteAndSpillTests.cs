@@ -5359,6 +5359,168 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
+    // ── What pins each of L-3's guards (round-6 review) ───────────────────────
+    //
+    // The three tests above pass with either of a loop's two guards: the one on its line, or its outer catch-all
+    // (the review's mutants M10-M12 and M14 each stayed green). Each guard is pinned on its own below, where it
+    // is the one that makes the difference — but the age loop's line guard: with it or with the outer catch-all
+    // the loop ticks alike (its PeriodicTimer keeps the schedule through the catch-all's pause), and what the
+    // guard saves is a pool thread blocked for that pause (up to a second) after each failed age flush.
+
+    /// <summary>
+    /// Round-5 review L-3 (round-6 review: the outer catch-alls were pinned by nothing). A loop's wait that cannot
+    /// be set up — out of memory — is handled by its outer catch-all alone: a blocked pause, and the loop goes
+    /// round. Without it the loop ended for good on its first failed wait, and nothing failed.
+    /// </summary>
+    [Theory]
+    [InlineData("wal")]
+    [InlineData("age")]
+    [InlineData("maintenance")]
+    public async Task A_loop_whose_wait_fails_goes_round(string loop)
+    {
+        string dir  = NewDir();
+        var    opts = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillMinFreeDiskBytes = 0,
+                WalFlushInterval = loop == "wal" ? TimeSpan.FromMilliseconds(20) : TimeSpan.FromSeconds(2),
+                MaxAge           = loop == "age" ? TimeSpan.FromMilliseconds(20) : TimeSpan.FromMinutes(5),
+            },
+        };
+        var scan   = new TaskCompletionSource();
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), NullLogger<StorageEngine>.Instance,
+                                       maintenanceStartDelay: loop == "maintenance" ? TimeSpan.Zero : StorageEngine.DefaultMaintenanceStartDelay,
+                                       bootScanHeldUntil: scan.Task);
+        engine._maintenancePauseForTest = TimeSpan.FromMilliseconds(20);
+        int ticks = 0, failed = 0, atFailure = -1;
+        int Ticks() => loop == "maintenance" ? engine.ColdMaintenancePassesStarted : Volatile.Read(ref ticks);
+        engine._beforePeriodicWalFlushForTest = () => { if (loop == "wal") Interlocked.Increment(ref ticks); };   // this loop's work alone
+        engine._beforeAgeFlushForTest         = () => { if (loop == "age") Interlocked.Increment(ref ticks); };
+        engine._beforeLoopWaitForTest = l =>
+        {
+            if (l != loop || Interlocked.Exchange(ref failed, 1) != 0) return;
+            Volatile.Write(ref atFailure, Ticks());
+            throw new OutOfMemoryException("test: no memory to set the loop's wait up");
+        };
+        try
+        {
+            scan.SetResult();
+            WaitFor(() => Volatile.Read(ref failed) == 1, "the loop's wait to fail", ShortGuard);
+            WaitFor(() => Ticks() - Volatile.Read(ref atFailure) >= 3, $"the {loop} loop to go round after its wait failed", ShortGuard);
+        }
+        finally
+        {
+            engine._beforeLoopWaitForTest = null;
+            scan.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-3 (round-6 review: the WAL loop's was pinned by nothing, as its loop cannot die now). Shutdown
+    /// awaits each background loop before its final flush, and a loop that had died anyway — of what its own guards
+    /// do not reach — must not stop the teardown there: said, and the final flush runs. (The loop's task is replaced
+    /// with a faulted one: a loop with its guards does not end on a failure.)
+    /// </summary>
+    [Theory]
+    [InlineData("_flushLoop")]
+    [InlineData("_walFlushLoop")]
+    [InlineData("_maintenanceLoop")]
+    [InlineData("_despillLoop")]
+    public async Task A_loop_that_died_before_shutdown_does_not_keep_the_final_flush_from_running(string field)
+    {
+        var logger = new RecordingLogger();
+        var opts   = Options(NewDir());
+        var engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger);
+        using (var b = Batch(engine, 0, 10))
+            Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+        typeof(StorageEngine).GetField(field, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                             .SetValue(engine, Task.FromException(new OutOfMemoryException("test: the loop died")));
+
+        await engine.DisposeAsync();   // does not throw
+
+        Assert.Equal(10, ReadAll(engine).Count);   // the final flush ran
+        Assert.Contains(logger.Lines, static l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error && l.Line.Contains("had failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Round-5 review L-3 (round-6 review: the guard on the WAL loop's line was pinned by nothing, its outer catch-all
+    /// catching what it would). A live WAL whose flush keeps failing, and whose Warning throws, must not keep the
+    /// spill file beside it from its flush: the line's own guard goes on to the spill file on the same tick; the outer
+    /// catch-all would end every tick there, and the spilled events' window a power loss takes was no longer bounded.
+    /// </summary>
+    [Fact]
+    public async Task A_live_wal_whose_failed_flush_cannot_be_said_does_not_keep_the_spill_file_from_its_flush()
+    {
+        var logger = new ThrowingLogger(line => line.StartsWith("Periodic WAL flush failed", StringComparison.Ordinal));
+        var opts   = new ServerOptions
+        {
+            DataDirectory = NewDir(),
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillEnabled = true, SpillMinFreeDiskBytes = 0,
+                WalFlushInterval = TimeSpan.FromMilliseconds(20),
+            },
+        };
+        var engine = OneSlotEngine(opts, logger);
+        var gate   = HoldFirstFlush(engine);
+        const int Total = 2 * TierEvents + 1_000;   // A in its flush, B full, the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            var spill = engine.LiveSpillWalForTest;
+            Assert.True(spill is not null, "setup: the engine is not spilling");
+            engine._beforePeriodicWalFlushForTest = static () => throw new IOException("test: the live WAL's msync failed");
+
+            WaitFor(() => logger.Thrown >= 2 && spill.HandleFlushCount >= 1,
+                    "the spill file to be flushed on ticks whose live WAL line threw", ShortGuard);
+        }
+        finally
+        {
+            engine._beforePeriodicWalFlushForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-3 (round-6 review: the guard on the maintenance loop's line was pinned by nothing). A failed
+    /// pass whose line throws keeps the loop's own pause: the line's guard goes on to it; the outer catch-all would
+    /// pause a second instead, after every pass — merges and sweeps fifty times rarer here.
+    /// </summary>
+    [Fact]
+    public async Task A_maintenance_pass_whose_failure_cannot_be_said_keeps_the_loops_pause()
+    {
+        string dir    = NewDir();
+        var    logger = new ThrowingLogger(line => line.StartsWith("Segment merge pass failed", StringComparison.Ordinal));
+        var    opts   = Options(dir);
+        var    scan   = new TaskCompletionSource();
+        var    engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                          new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger,
+                                          maintenanceStartDelay: TimeSpan.Zero, bootScanHeldUntil: scan.Task);
+        engine._maintenancePauseForTest = TimeSpan.FromMilliseconds(20);
+        engine._beforeMaintenanceSweeps = () => throw new IOException("test: the pass failed");
+        try
+        {
+            scan.SetResult();
+            WaitFor(() => engine.ColdMaintenancePassesStarted >= 1, "the first pass", ShortGuard);
+            int from = engine.ColdMaintenancePassesStarted;
+            WaitFor(() => engine.ColdMaintenancePassesStarted - from >= 10, "ten more passes at the loop's 20 ms pause", TimeSpan.FromSeconds(3));
+            Assert.True(logger.Thrown >= 10, "setup: the line of a failed pass did not throw");
+        }
+        finally
+        {
+            engine._beforeMaintenanceSweeps = null;
+            scan.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
     // ── A box made before its registration failed (round-5 M-C) ───────────────
 
     /// <summary>
