@@ -137,7 +137,7 @@ Ingest a batch of log events.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `@t` | ISO-8601 string | Timestamp (UTC). |
+| `@t` | ISO-8601 string | Timestamp (UTC). An event without one, or with one that does not parse as a date and time (one longer than 256 bytes of UTF-8, past the whitespace around it, is not read at all), takes the time the server decoded it: the event is kept, not refused. |
 | `@mt` | string | Message template, e.g. `"User {UserId} logged in"`. |
 | `@l` | string | Level: `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`. |
 | `@m` | string | Ingest-only fallback for `@mt`. Never re-emitted by the server. |
