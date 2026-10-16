@@ -2564,26 +2564,44 @@ public sealed class IngestWriteAndSpillTests : IDisposable
     /// up (out of memory) the fallback slept the re-check interval every time instead, so a request
     /// that kept faulting went round twenty times in a 2 s wait where five would do. It sleeps the
     /// pause it would have waited now.
+    ///
+    /// <para>Timed on a precise clock (round-6 review: counted, the attempts flaked on Linux, 2-3 runs of 8). The write
+    /// path keeps its time on Environment.TickCount64, which steps coarsely — 15.6 ms on Windows, the kernel's tick on
+    /// Linux (10 ms in the WSL here) — and the last slices of a wait, shorter than a step, can count as nothing: a few
+    /// attempts more inside that step, at the wait's end (2005, 2006 … 2012 ms in fix-report-5's trace). The pauses are
+    /// what the test is about, so it times them; the attempts at the wait's end are not counted, and the request is
+    /// held to ending there.</para>
     /// </summary>
     [Fact]
     public async Task A_faulting_write_whose_pause_cannot_be_set_up_still_pauses_twice_as_long_each_time()
     {
+        const int WaitMs = 2_000;
         var engine = Engine(Options(NewDir()));
         engine._roomRecheckMs = 100;
-        int attempts = 0;
+        var sw = new System.Diagnostics.Stopwatch();
+        var at = new System.Collections.Concurrent.ConcurrentQueue<double>();
         engine._afterWriteGate = () =>
         {
-            Interlocked.Increment(ref attempts);
+            at.Enqueue(sw.Elapsed.TotalMilliseconds);
             throw new OutOfMemoryException("test: every write faults");
         };
         engine._beforeRoomWaitForTest = () => throw new OutOfMemoryException("test: no memory to set up the pause");
         try
         {
             using var batch = Batch(engine, 0, 1);
-            var r = await Task.Run(async () => await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(2)));
+            var r = await Task.Run(async () =>
+            {
+                sw.Start();
+                return await engine.WriteBatchAsync(batch, TimeSpan.FromMilliseconds(WaitMs));
+            });
             Assert.Equal(new LogBatchWriteResult(0, 0, 1), r);
-            // 100 + 200 + 400 + 800 ms of pauses spend the 2 s wait in about six attempts.
-            Assert.InRange(Volatile.Read(ref attempts), 3, 8);
+            double[] t     = at.ToArray();
+            string   times = string.Join(", ", t.Select(static x => x.ToString("F0")));
+            // 100 + 200 + 400 + 800 ms of pauses, each twice the last, spend the 2 s wait in about five attempts before its end.
+            for (int i = 1; i < Math.Min(t.Length, 5); i++)
+                Assert.True(t[i] - t[i - 1] >= 0.8 * (100 << (i - 1)), $"pause {i} took {t[i] - t[i - 1]:F0} ms, not {100 << (i - 1)}: attempts at {times} ms");
+            Assert.True(t.Count(static x => x < WaitMs - 50) is >= 3 and <= 6, $"attempts at {times} ms: not about five before the wait's end");
+            Assert.True(t[^1] < WaitMs + 200, $"the request went on to {t[^1]:F0} ms of a {WaitMs} ms wait: attempts at {times} ms");
         }
         finally
         {
