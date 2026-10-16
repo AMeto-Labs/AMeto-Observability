@@ -882,7 +882,7 @@ public sealed class IngestionEndpoint
         string? service = null;
         if (serviceIdx < 0 && !serviceUtf8.IsEmpty)
         {
-            serviceIdx = _pool.Intern(serviceUtf8, out string svcText);
+            serviceIdx = _pool.Intern(serviceUtf8, out string svcText, ref batch.Share);
             if (serviceIdx < 0 && svcText.Length != 0) service = svcText;
         }
 
@@ -891,7 +891,7 @@ public sealed class IngestionEndpoint
 
         // Intern hands back the pool's OWN instance, so the tier stores the shared string
         // rather than a per-event duplicate — and one dictionary probe does the work of two.
-        int     tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
+        int     tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl, ref batch.Share); // -1 when empty, or past the request's share
         // Attach on CONTENT, not on the index. A full pool answers -1 with the template
         // materialised in canonicalTmpl, and past that point the attached string is the only
         // copy of it anywhere: the header says -1 and pool.Get(-1) is "". Keying this on
@@ -949,7 +949,7 @@ public sealed class IngestionEndpoint
         string? service = null;
         if (serviceIdx < 0 && !serviceUtf8.IsEmpty)
         {
-            serviceIdx = _pool.Intern(serviceUtf8, out string svcText);
+            serviceIdx = _pool.Intern(serviceUtf8, out string svcText, ref batch.Share);
             if (serviceIdx < 0 && svcText.Length != 0) service = svcText;
         }
         return StageOversizedCore(batch, tsTicks, level, templateUtf8, payloadBytes, traceHi, traceLo, spanId, serviceUtf8, serviceIdx, service);
@@ -1010,7 +1010,7 @@ public sealed class IngestionEndpoint
             string  tmplStr = MarkerTemplate(templateUtf8);
             string? svcStr  = serviceUtf8.IsEmpty  ? null         : StringInternPool.Decode(serviceUtf8);
 
-            int markerSvcIdx = svcStr is not null ? _pool.Intern(svcStr) : -1;
+            int markerSvcIdx = svcStr is not null ? _pool.Intern(svcStr, out _, ref batch.Share) : -1;
             StageServerDropMarker(
                 batch, tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
                 markerSvcIdx, markerSvcIdx < 0 ? svcStr : null,
@@ -1020,9 +1020,9 @@ public sealed class IngestionEndpoint
 
         // Intern returns the pool's own instance, so the hot tier shares one string per
         // template instead of retaining this event's copy (see StageRaw).
-        int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical); // -1 when empty
+        int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical, ref batch.Share); // -1 when empty, or past the share
         string? tmpl     = canonical.Length != 0 ? canonical : null;   // see StageRaw: kept past saturation, never ""
-        int     svcIdx   = _pool.Intern(serviceUtf8, out string svcText);   // -1 when empty
+        int     svcIdx   = _pool.Intern(serviceUtf8, out string svcText, ref batch.Share);   // -1 when empty
         string? service  = svcIdx < 0 && svcText.Length != 0 ? svcText : null;   // see StageRaw: kept past saturation
 
         // Charged as in StageRaw — and the event's @x, decoded into a tree of strings for it alone.

@@ -86,7 +86,15 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         _limit    = limit;
         _bounded  = bounded;
         _staged   = new LogWriteBatch(payloadSizeHint, this);
+        Share     = owner.Pool.NewRequestShare();
     }
+
+    /// <summary>
+    /// What this request may still add to the intern pool its templates and services go into (round-6 review R5-M9):
+    /// past it a new text is kept beside its event, unpooled, as on a full pool — and charged to the batch as such.
+    /// A field, taken from by reference as the staging interns.
+    /// </summary>
+    internal InternShare Share;
 
     /// <summary>
     /// The events to write: the client's, then the drop markers. The markers join only when the
@@ -254,7 +262,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         => Count(_owner.StageRaw(this, tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8, serviceIdx));
 
     /// <inheritdoc/>
-    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _owner.Pool.Intern(IngestionEndpoint.ServiceName(serviceUtf8));
+    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _owner.Pool.Intern(IngestionEndpoint.ServiceName(serviceUtf8), out _, ref Share);
 
     /// <inheritdoc cref="IOtlpLogSink.MaxEventPayloadBytes"/>
     public int MaxEventPayloadBytes => _owner.MaxEventPayloadBytes;
