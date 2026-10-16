@@ -5517,6 +5517,7 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             Assert.NotNull(moved);                                                      // setup: the replay had moved its Information level
             Assert.False(File.Exists(moved), "setup: the hand-off did not delete the level the replay moved");
             Assert.Equal(1, engine.SpillFilesPending);
+            Assert.Equal(0, engine.BlocksLeftByReplayForTest);   // handed over: the despill queue owns the block, not that set (R5-M1)
             var stale = engine.ListSegments().Where(s => !File.Exists(s.FilePath)).Select(s => Path.GetFileName(s.FilePath)).ToList();
             Assert.True(stale.Count == 0, $"the catalog names a level file the failed replay's hand-off deleted: {string.Join(", ", stale)}");
 
@@ -5525,6 +5526,85 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             WaitFor(() => engine.SpillFilesPending == 0, "the WAL to be written by the despill", ShortGuard);
             AssertThreeEventsWhole(ReadAll(engine));
         }
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M1: H-C's hole when the hand-off itself throws. A startup replay fails after moving
+    /// its Information and Warning levels into place, the boot scan registers them, and the hand-off to the
+    /// despill throws (its marker removal allocates, and on Linux fsyncs) — the WAL is left for the next
+    /// start with the scan's entries owned by nobody. A merge took the Information level with a neighbour,
+    /// and the next start wrote it again: 30 Information events for 20. The block is out of merges from
+    /// before the hand-off can throw.
+    /// </summary>
+    [Fact]
+    public async Task A_block_whose_failed_replay_could_not_be_handed_over_is_not_merged_meanwhile()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string segDir = Path.Combine(dir, "segments");
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(segDir);
+        Directory.CreateDirectory(walDir);
+        const ulong Block = 9_000;
+        long old = DateTime.UtcNow.AddDays(-20).Date.Ticks;   // a sealed bucket: a merge takes two small files
+        using (var wal = WriteAheadLog.Open(Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}.wal"), opts.NodeId, new SegmentId(Block),
+                                            initialCapacity: 1 << 20))
+        {
+            for (int i = 0; i < 10; i++) wal.Append(old + i, LogLevel.Information, -1, "info {n}", Props(i));
+            for (int i = 0; i < 10; i++) wal.Append(old + 100 + i, LogLevel.Warning, -1, "warn {n}", Props(100 + i));
+            wal.Append(old + 10_000, LogLevel.Error, -1, "error", Props(10_000));
+        }
+        // The replay fails on its Error level, after moving the Information and Warning ones into place.
+        string blocker = Path.Combine(segDir, $"{opts.NodeId.Value}-{Block + (int)LogLevel.Error}-{old + 10_000}-{old + 10_000}.seg");
+        Directory.CreateDirectory(blocker);
+
+        var  scan    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var  logger  = new CountingLogger(line => line.StartsWith("Loaded ", StringComparison.Ordinal) && line.Contains(" segments from ", StringComparison.Ordinal));
+        bool scanned = false;
+        StorageEngine.BeforeFailedReplayHandOffForTest.Value = _ =>
+        {
+            scan.SetResult();   // the boot scan lists and registers the levels the replay moved
+            scanned = SpinWait.SpinUntil(() => logger.Count == 1, HangGuard);
+            throw new IOException("test: the hand-off fails (the fsync of wal/, an allocation)");
+        };
+        StorageEngine engine;
+        try
+        {
+            engine = new StorageEngine(Microsoft.Extensions.Options.Options.Create(opts),
+                                       new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger,
+                                       maintenanceStartDelay: TimeSpan.FromHours(1), bootScanHeldUntil: scan.Task);
+        }
+        finally { StorageEngine.BeforeFailedReplayHandOffForTest.Value = null; }
+        await using (engine)
+        {
+            await engine.CatalogLoaded;
+            Assert.True(scanned, "setup: the boot scan did not finish before the hand-off");
+            Assert.Contains(engine.ListSegments(), s => s.Id.Value == Block + (ulong)LogLevel.Information);   // setup: registered
+            Assert.Equal(1, engine.BlocksLeftByReplayForTest);   // the bound: one per WAL whose hand-off failed
+            for (int i = 0; i < 10; i++)   // a neighbour Information segment in the same sealed bucket
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks        = old + 50 + i,
+                    Level                    = LogLevel.Information,
+                    MessageTemplatePoolIndex = engine.TemplatePool.Intern("info {n}"),
+                }, Props(50 + i), "info {n}"));
+            await engine.FlushHotTierAsync();
+            engine._allowIndexlessMerge = true;
+            await engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        }
+        Directory.Delete(blocker);
+
+        await using var next = Engine(opts);
+        await next.CatalogLoaded;
+        await FlushEverythingAsync(next, ShortGuard);
+        var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+        int info = 0;
+        foreach (var seg in next.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup)) if (ev.Level == (byte)LogLevel.Information) info++;
+        }
+        Assert.True(info == 20, $"{info} Information events for 20 written: a merge took a level of the block left for the next start");
     }
 
     /// <summary>

@@ -3730,6 +3730,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         lock (_frozenLock)
             foreach (var (_, block) in _frozenHot)
                 if (queued is null || !queued.Contains(block)) AddLevels(ref ids, block, keep: 0);
+        // And a block a failed startup replay left for the next start (round-6 review R5-M1): its levels
+        // are the next start's to read, whatever the boot scan registered of them meanwhile.
+        lock (_blocksLeftByReplay)
+            foreach (var block in _blocksLeftByReplay)
+                AddLevels(ref ids, block, keep: 0);
         return ids;
 
         static void AddLevels(ref HashSet<ulong>? ids, ulong block, byte keep)
@@ -6243,7 +6248,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private void ReplayOrphanedWals()
     {
-        foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
+        // Listed first, so the set a failed hand-off adds its block to has room for every one of them
+        // before any replay runs: the add then allocates nothing (round-6 review R5-M1).
+        var walFiles = Directory.GetFiles(_walDir, "*.wal");
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.EnsureCapacity(walFiles.Length);
+        foreach (var walFile in walFiles)
         {
             // Per WAL, so one unreadable log cannot strand the others behind it.
             ulong flushing = 0;
@@ -6366,6 +6375,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // there, is not.
         if (Look(walFile) == Presence.Gone || Look(FlushMarkerPath(segId)) == Presence.There) return false;
 
+        // Out of merges from here, before anything below can throw (round-6 review R5-M1): the boot
+        // scan may have registered levels the failed replay moved into place, and a hand-off that
+        // throws — the marker's removal allocates, and on Linux fsyncs — left the WAL for the next start
+        // with those entries owned by nobody: a merge took one, and the next start wrote it again, its
+        // events twice (30 for 20). In the set the merge planner skips (LevelIdsAFlushOwns), sized for
+        // every WAL of the start before the first replay, so the add allocates nothing. A block that is
+        // handed over leaves it below, the despill queue owning it from there; one that is not stays.
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.Add(segId);
+
         BeforeFailedReplayHandOffForTest.Value?.Invoke(walFile);
         byte published = 0;
         if (flushingBlock != 0)
@@ -6379,9 +6397,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         {
             if (!_spillQueue.ContainsKey(segId)) _spillQueue[segId] = new QueuedSpill(walFile, published);
         }
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.Remove(segId);   // queued: the queue owns it now
         WakeDespill();
         return true;
     }
+
+    /// <summary>
+    /// Blocks a failed startup replay left for the next start because their hand-off to the despill threw
+    /// (see <see cref="HandFailedReplayToDespill"/>): their levels are owned — the merge planner skips them
+    /// (<see cref="LevelIdsAFlushOwns"/>) — for the life of the process. At most one per WAL the start
+    /// found: <see cref="ReplayOrphanedWals"/> sizes the set for all of them before the first replay
+    /// (round-6 review R5-M1). Under its own lock.
+    /// </summary>
+    private readonly HashSet<ulong> _blocksLeftByReplay = new();
+
+    /// <summary>Test hook: the blocks a failed replay left for the next start (<see cref="_blocksLeftByReplay"/>).</summary>
+    internal int BlocksLeftByReplayForTest { get { lock (_blocksLeftByReplay) return _blocksLeftByReplay.Count; } }
 
     /// <summary>
     /// Test seam: called with the WAL's path as a failed startup replay is about to be handed to the
