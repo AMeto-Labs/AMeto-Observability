@@ -199,4 +199,49 @@ public sealed class LogFileLookTests : IDisposable
         finally { Answer(); }
         Assert.True(replayed == 3, $"the open took a metric log it could not look at for a new one: {replayed} of 3 points replayed");
     }
+
+    // ── The metric WAL's pool ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// A metric log whose pool the file system will not read fails its open, and the pool is not cut. The
+    /// walk asked File.Exists first and swallowed every failure; both ended it at offset 0, and the open
+    /// then cut the pool there as a torn tail: every series the log's points name, gone with the file, and
+    /// the points replayed as unresolved.
+    /// </summary>
+    [Fact]
+    public void A_metric_pool_the_open_cannot_read_fails_the_open_and_is_not_cut()
+    {
+        string pool = MetricPath + ".pool";
+        using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+            for (int i = 0; i < 3; i++)
+                wal.Append([new MetricIngestItem
+                {
+                    Name = "cpu." + i, Kind = MetricKind.Gauge, Unit = "ms", Labels = new LabelSet([new("service.name", "svc")]),
+                    TimestampUnixNano = 1_785_300_000_000_000_000L + i, ScalarValue = i,
+                }]);
+        long poolLength = new FileInfo(pool).Length;
+        Assert.True(poolLength > 0, "setup: the pool is empty");
+
+        // The open opens the pool twice: its own handle, then the walk's read — the one refused.
+        int opens = 0;
+        FileRefusal.ForTest.Value = (p, a) => a == FileRefusal.Access.Open && p == pool && ++opens == 2 ? NotAnswering(p) : null;
+        Exception? thrown;
+        try
+        {
+            MetricWriteAheadLog? opened = null;
+            thrown = Record.Exception(() => opened = MetricWriteAheadLog.Open(MetricPath, 64 * 1024));
+            opened?.Dispose();
+        }
+        finally { Answer(); }
+
+        long left = new FileInfo(pool).Length;
+        Assert.True(thrown is IOException,
+            thrown is null ? $"the open went on past a pool it could not read, which it cut from {poolLength:N0} to {left:N0} bytes"
+                           : $"the open threw {thrown.GetType().Name}");
+        Assert.Equal(poolLength, left);
+        using var reopened = MetricWriteAheadLog.Open(MetricPath, 64 * 1024);
+        var points = reopened.ReadAll(out int unresolved);
+        Assert.Equal(0, unresolved);
+        Assert.Equal(3, points.Count);
+    }
 }

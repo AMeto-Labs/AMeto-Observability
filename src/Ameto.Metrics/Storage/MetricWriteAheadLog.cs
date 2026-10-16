@@ -2511,6 +2511,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// unresolved and let the open cut them off the file. <paramref name="skipped"/> counts them.
     /// Only broken framing ends the walk. A v1 record (see <see cref="PoolRecordTagV2"/>) has only
     /// the length check it always had, and its body is still stepped over unread.</para>
+    ///
+    /// <para><b>A read that FAILS is not a torn record</b> (round-6 review R5-M6's class). Only the file
+    /// system's FileNotFound or DirectoryNotFound means there is no pool; any other failure to open or
+    /// read it — a share that did not answer, an access check, an out of memory — is thrown. It asked
+    /// File.Exists first, which answers false for a pool it could not look at as well, and swallowed
+    /// every failure of the walk; both ended the walk early, and <see cref="OpenOrCreate"/> then cut the
+    /// pool at the clean end it had reached — at offset 0 for a pool it could not look at: every series
+    /// the log's points name, gone with the file. A failed walk now fails the open, which leaves the
+    /// files as it found them, and fails <see cref="ReadAll"/>, whose caller keeps the log.</para>
     /// </summary>
     private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling,
                                                      out int skipped)
@@ -2519,13 +2528,21 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         cleanEnd     = 0;
         indexCeiling = 0;
         skipped      = 0;
-        if (!File.Exists(_poolPath)) return bodies;
+
+        _poolStream?.Flush();
+        FileStream? opened;
+        try
+        {
+            FileRefusal.ThrowIfRefused(_poolPath, FileRefusal.Access.Open);
+            opened = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (FileNotFoundException)      { return bodies; }
+        catch (DirectoryNotFoundException) { return bodies; }
 
         byte[]? scratch = null;
         try
         {
-            _poolStream?.Flush();
-            using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var fs = opened;
             long length = fs.Length;
             Span<byte> head = stackalloc byte[PoolHeadV2];
 
@@ -2598,7 +2615,6 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 cleanEnd = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
-        catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
         finally { if (scratch is not null) ArrayPool<byte>.Shared.Return(scratch); }
 
         return bodies;
