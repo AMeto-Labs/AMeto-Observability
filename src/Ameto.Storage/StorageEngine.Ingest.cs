@@ -155,6 +155,13 @@ public sealed partial class StorageEngine
             // (round-5 review L-6).
             long ownFrom     = -1;
             long countSlices = 0;
+            // What a landing dropped of that counting — the episode's queueing — kept as a debt (round-6 review, the
+            // LOW on L-6): charged again when the request faults within WriteFaultEpisodeMs of the landing, as one
+            // episode; forgiven past that. Dropped for good, a request that queued about its whole wait through the
+            // episode, landed one event and then faulted spent about the wait again: 2.3 x BackPressureWait in the
+            // review's probe, ~4.6 s at the default against a Collector's 5 s timeout.
+            long debt   = 0;
+            long debtAt = 0;
             // False once anything was caught at the await for room below: from then on this call never
             // awaits again (round-5 review M-C). A suspension whose box was made and whose registration
             // then threw — the TPL event source, async debugging, a second continuation — left the box in
@@ -196,8 +203,18 @@ public sealed partial class StorageEngine
                     // waits it did. The whole of its queueing behind the episode stayed charged, and a
                     // healthy request then gave up at a routine wait for room later in its batch: a 200
                     // with its tail dropped, which no client retries (round-5 review L-6).
+                    // What is dropped is a debt for the rest of the episode (see debt).
                     if (countFrom >= 0)
-                        waitedMs = countWaited + (ownFrom >= 0 ? Math.Max(0, runStart - ownFrom) : countSlices);
+                    {
+                        long kept    = countWaited + (ownFrom >= 0 ? Math.Max(0, runStart - ownFrom) : countSlices);
+                        long reached = countWaited + Math.Max(0, runStart - countFrom);
+                        if (reached > kept)
+                        {
+                            debt   = reached - kept;
+                            debtAt = Environment.TickCount64;
+                        }
+                        waitedMs = kept;
+                    }
                     countFrom   = -1;
                     ownFrom     = -1;
                     countSlices = 0;
@@ -219,6 +236,10 @@ public sealed partial class StorageEngine
                     {
                         countFrom   = runStart;
                         countWaited = waitedMs;
+                        // In the episode of a landing that dropped queueing — this fault within WriteFaultEpisodeMs of
+                        // it, in the same run or a later one — the dropped part is charged again (see debt).
+                        if (debt > 0 && Environment.TickCount64 - debtAt <= WriteFaultEpisodeMs) countWaited += debt;
+                        debt = 0;
                     }
                     if (ownFrom < 0) ownFrom = runStart;
                     faults++;

@@ -2376,8 +2376,65 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             sw.Stop();
 
             Assert.Equal(new LogBatchWriteResult(256, 0, 744), result);
-            Assert.True(sw.ElapsedMilliseconds < WaitMs + 500,
+            // About its wait and one attempt (the attempt after the last pause is counted when it ends), with room for a
+            // second one and for a loaded host (2 651 ms once on two cores under a whole-class run, against WaitMs + 500).
+            // Forgotten, the faults before the landing give about FaultFirstMs more: 3 200 ms and over.
+            Assert.True(sw.ElapsedMilliseconds < WaitMs + 2 * FaultMs + 300,
                         $"the request took {sw.ElapsedMilliseconds} ms of a {WaitMs} ms wait: the faults before its write landed were forgotten");
+        }
+        finally
+        {
+            engine._afterWriteGate = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-6 review, the LOW on L-6. A landing drops the store's episode from a request's count (L-6: a healthy
+    /// request then gave up at a routine wait for room later in its batch), but a request that queued through the
+    /// episode, landed one event and then faulted counted afresh from that fault and spent about its wait again —
+    /// 2.3 × BackPressureWait in the review's probe (P4b), ~4.6 s at the default against a Collector's 5 s timeout,
+    /// whose resend writes the prefix twice. The dropped queueing is a debt now, charged again by a fault in the
+    /// same episode: the request ends within about its wait from when it came. Here it queues 400 ms behind a fault
+    /// that holds the writer lock, lands its first event, and then every write of its faults.
+    /// </summary>
+    [Fact]
+    public async Task A_request_that_queued_through_an_episode_then_landed_and_faulted_ends_within_its_wait()
+    {
+        const int WaitMs = 600, HolderMs = 400;
+        var engine = Engine(Options(NewDir()));
+        engine._roomRecheckMs = 20;
+        using var holding = new ManualResetEventSlim(false);
+        int calls = 0;
+        engine._afterWriteGate = () =>
+        {
+            int n = Interlocked.Increment(ref calls);
+            if (n == 1) throw new OutOfMemoryException("test: the store faults");   // the episode begins
+            if (n == 2)
+            {
+                holding.Set();
+                Thread.Sleep(HolderMs);                                             // a fault that holds the lock: a full GC
+                throw new OutOfMemoryException("test: the store faults again");
+            }
+            if (n == 3) return;                                                     // the request's first event lands
+            Thread.Sleep(20);
+            throw new OutOfMemoryException("test: the request's next writes fault");
+        };
+        try
+        {
+            using var other  = Batch(engine, 0, 1);
+            var       holder = Task.Run(async () => await engine.WriteBatchAsync(other, TimeSpan.FromMilliseconds(200)));
+            Assert.True(holding.Wait(HangGuard), "setup: the other request's second attempt");
+
+            using var r      = Batch(engine, 100, 50);
+            var       sw     = System.Diagnostics.Stopwatch.StartNew();
+            var       result = await Task.Run(async () => await engine.WriteBatchAsync(r, TimeSpan.FromMilliseconds(WaitMs)));
+            sw.Stop();
+            await holder.WaitAsync(HangGuard);
+
+            Assert.Equal(1, result.Written);   // setup: it landed one event, then faulted
+            Assert.True(sw.ElapsedMilliseconds < WaitMs + HolderMs / 2,
+                        $"the request took {sw.ElapsedMilliseconds} ms of a {WaitMs} ms wait: its {HolderMs} ms of queueing through the episode was forgotten when it landed");
         }
         finally
         {
