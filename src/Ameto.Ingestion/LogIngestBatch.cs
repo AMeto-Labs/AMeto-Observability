@@ -116,6 +116,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     internal LogWriteBatch Seal()
     {
         if (_sealed) return _staged;
+        _staged.ClientEvents = _staged.Count;   // the markers go in after them (see LogWriteBatch.ClientEvents)
         if (_markers is not null)
             foreach (var m in _markers)
                 _staged.AddReserved(m.Header, m.Payload.Span, m.Template, exception: null, m.Service);
@@ -177,8 +178,11 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>
     /// <see cref="BeginCommit"/>, the write awaited HERE, then <see cref="EndCommit"/>: for a caller with
     /// nothing to lose if this method's own box fails at that await — the tests. Not for a receiver (see
-    /// <see cref="BeginCommit"/>).
+    /// <see cref="BeginCommit"/>). Built with the owner builder (round-6 review, the LOW on 84deced): a receiver
+    /// that called it would put this frame back between the request and the write, and the receivers' seam tests
+    /// then see it — on the runtime's builder they could not.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerValueTaskMethodBuilder<>))]
     internal async ValueTask<LogIngestResult> CommitAsync(CancellationToken ct = default)
     {
         var commit  = BeginCommit(ct);
@@ -386,8 +390,10 @@ public readonly struct LogCommit
     /// <summary>
     /// The write, begun: it waits for room if it must, and never throws for a write that fails
     /// (StorageEngine.WriteBatchAsync). A receiver awaits it on the state machine it boxed before the
-    /// batch was begun, where the await allocates nothing (round-6 review R5-M4). Awaited once, as any
-    /// <see cref="ValueTask{TResult}"/>; completed at once when nothing was staged.
+    /// batch was begun, where the await allocates nothing but its continuation's registration (round-6
+    /// review R5-M4); a receiver whose await throws — that registration out of memory, while the write
+    /// runs on — disposes the batch there (round-6 review R6-M5): the dispose is deferred to the write's
+    /// end. Awaited once, as any <see cref="ValueTask{TResult}"/>; completed at once when nothing was staged.
     /// </summary>
     public ValueTask<LogBatchWriteResult> Write { get; }
 

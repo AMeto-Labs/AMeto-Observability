@@ -210,6 +210,8 @@ public static class DiagnosticsEndpointMapper
                 // failing). A request that wrote none of its batch was answered 503 and its client
                 // retries; one that wrote part of it reported the rest as dropped.
                 ingestNotWritten         = storage.IngestNotWritten,
+                // A client's events its request gave up on because the client went away (cancelled) mid-write.
+                ingestNotWrittenCancelled = storage.IngestNotWrittenCancelled,
                 // Writes that threw (out of memory in the tier) and wrote nothing: each was waited
                 // out and tried again; the log says why.
                 ingestWriteFaults        = storage.IngestWriteFaults,

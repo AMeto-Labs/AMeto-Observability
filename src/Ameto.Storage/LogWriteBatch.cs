@@ -108,6 +108,14 @@ public sealed class LogWriteBatch : IDisposable
     /// <summary>Events staged.</summary>
     public int Count => _count;
 
+    /// <summary>
+    /// How many of the events, from the first, are the client's own; the rest are drop markers a receiver added
+    /// after them. -1 (the default): all of them. What a write gives up on is counted of the client's events only
+    /// (round-6 review, the LOW on b720efa): a marker stands for a drop already counted at the door, and counted
+    /// again as not written it made one oversized event two drops in the diagnostics.
+    /// </summary>
+    public int ClientEvents { get; set; } = -1;
+
     /// <summary>Payload bytes staged.</summary>
     public long PayloadBytes => _payloadLength;
 
@@ -328,6 +336,13 @@ public sealed class LogWriteBatch : IDisposable
 /// </param>
 /// <param name="NotWritten">
 /// Events after the prefix that were not written: the engine had no room for them within the wait,
-/// or it is shutting down. Retrying them later can succeed.
+/// or it is shutting down, or the request was cancelled (<see cref="Cancelled"/>). Retrying them later can succeed.
 /// </param>
-public readonly record struct LogBatchWriteResult(int Written, int Refused, int NotWritten);
+public readonly record struct LogBatchWriteResult(int Written, int Refused, int NotWritten)
+{
+    /// <summary>
+    /// The write stopped short because its request was cancelled — its client went away — not for want of room
+    /// (round-6 review, the LOW on b720efa): what it did not write is counted apart, and said so.
+    /// </summary>
+    public bool Cancelled { get; init; }
+}

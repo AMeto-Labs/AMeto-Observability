@@ -86,7 +86,7 @@ public sealed class ApiDocsTests
                      "indexBuildPooledBytes",
                      "ingestBufferPooledBytes", "logsQuarantinedBytes",
                      // The log ingest path's own: what it gave up on, and the spill backlog on disk.
-                     "ingestNotWritten", "logsSpillFilesPending",
+                     "ingestNotWritten", "ingestNotWrittenCancelled", "logsSpillFilesPending",
                  })
             Assert.Contains(field, doc, StringComparison.Ordinal);
     }

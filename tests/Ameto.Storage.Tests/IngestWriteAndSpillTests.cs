@@ -2571,6 +2571,10 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// attempts more inside that step, at the wait's end (2005, 2006 … 2012 ms in fix-report-5's trace). The pauses are
     /// what the test is about, so it times them; the attempts at the wait's end are not counted, and the request is
     /// held to ending there.</para>
+    ///
+    /// <para>With a written prefix (round-6 review R6-M4): a write that has written nothing when its pause cannot be
+    /// set up ends at once, answered as not written (A_wait_for_room_that_cannot_be_set_up_with_nothing_written_is_answered_at_once).
+    /// The batch's first event lands, and every write after it faults.</para>
     /// </summary>
     [Fact]
     public async Task A_faulting_write_whose_pause_cannot_be_set_up_still_pauses_twice_as_long_each_time()
@@ -2580,21 +2584,23 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         engine._roomRecheckMs = 100;
         var sw = new System.Diagnostics.Stopwatch();
         var at = new System.Collections.Concurrent.ConcurrentQueue<double>();
+        int calls = 0;
         engine._afterWriteGate = () =>
         {
+            if (Interlocked.Increment(ref calls) == 1) return;   // the prefix: the first event lands
             at.Enqueue(sw.Elapsed.TotalMilliseconds);
-            throw new OutOfMemoryException("test: every write faults");
+            throw new OutOfMemoryException("test: every write after the first faults");
         };
         engine._beforeRoomWaitForTest = () => throw new OutOfMemoryException("test: no memory to set up the pause");
         try
         {
-            using var batch = Batch(engine, 0, 1);
+            using var batch = Batch(engine, 0, 2);
             var r = await Task.Run(async () =>
             {
                 sw.Start();
                 return await engine.WriteBatchAsync(batch, TimeSpan.FromMilliseconds(WaitMs));
             });
-            Assert.Equal(new LogBatchWriteResult(0, 0, 1), r);
+            Assert.Equal(new LogBatchWriteResult(1, 0, 1), r);
             double[] t     = at.ToArray();
             string   times = string.Join(", ", t.Select(static x => x.ToString("F0")));
             // 100 + 200 + 400 + 800 ms of pauses, each twice the last, spend the 2 s wait in about five attempts before its end.
@@ -2636,7 +2642,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             using var batch = Batch(engine, 0, 3);
             var r = await Task.Run(async () => await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(2), cts.Token));
             Assert.True(r.Written == 0, $"{r.Written} event(s) written after the request was cancelled during its pause for room: its client's retry stores them a second time");
-            Assert.Equal(new LogBatchWriteResult(0, 0, 3), r);
+            Assert.Equal(new LogBatchWriteResult(0, 0, 3) { Cancelled = true }, r);
             Assert.Equal(1, Volatile.Read(ref attempts));
         }
         finally
@@ -2680,7 +2686,10 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             cts.Cancel();
 
             var r = await waiting.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.Equal(new LogBatchWriteResult(0, 0, 5), r);
+            Assert.Equal(new LogBatchWriteResult(0, 0, 5) { Cancelled = true }, r);
+            // Counted apart: the client went away, the store was not short of room (round-6 review, the LOW on b720efa).
+            Assert.Equal(0, engine.IngestNotWritten);
+            Assert.Equal(5, engine.IngestNotWrittenCancelled);
             Assert.False(held.IsCompleted);   // the holder still has the lock: the queued request did not wait it out
         }
         finally

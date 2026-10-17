@@ -496,8 +496,12 @@ public sealed class IngestionEndpoint
         {
             try
             {
-                _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
-                    r.NotWritten, stagedCount, _backPressureWait);
+                if (r.Cancelled)
+                    _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the request was cancelled (its client went away)",
+                        r.NotWritten, stagedCount);
+                else
+                    _logger.LogDebug("Log batch: {NotWritten} of {Staged} event(s) not written — the store had no room within {Wait}",
+                        r.NotWritten, stagedCount, _backPressureWait);
             }
             catch (Exception) { /* the line is lost; the answer is not */ }
         }
@@ -758,11 +762,23 @@ public sealed class IngestionEndpoint
 
             // ── 4. Write, then answer ─────────────────────────────────────────
             // The write is awaited HERE, on the box made above (round-6 review R5-M4): that await
-            // allocates nothing, so nothing between the write's start and its end can fail but the
-            // write, which answers for what it did. The batch is given back as soon as it is written,
-            // before the answer, which a slow client can hold up.
-            var commit  = batch.BeginCommit(ctx.RequestAborted);
-            var written = await commit.Write;
+            // allocates nothing but its continuation's registration, so nothing between the write's start
+            // and its end can fail but the write, which answers for what it did — or that registration,
+            // caught below. The batch is given back as soon as it is written, before the answer, which a
+            // slow client can hold up.
+            var commit = batch.BeginCommit(ctx.RequestAborted);
+            LogBatchWriteResult written;
+            try { written = await commit.Write; }
+            catch
+            {
+                // The AWAIT failed, not the write, which never throws (round-6 review R6-M5): its continuation's
+                // registration ran out of memory, and the write runs on and lands. The finally that gives the batch
+                // back is skipped on that road, its reservation with it: it goes back here, at the write's end (its
+                // lease defers the dispose). The request is answered by the throw while the write lands (API.md).
+                batch.Dispose();
+                batch = null;
+                throw;
+            }
             LogIngestResult result = batch.EndCommit(commit, written);
             batch.Dispose();
             batch = null;
@@ -773,10 +789,18 @@ public sealed class IngestionEndpoint
                 // it did not" is an operator's problem, and the element index is what makes it
                 // findable in the sender. ElementIndex -1 is the array header itself (the reply
                 // then omits failedAtElement).
-                _logger.LogWarning(malformed,
-                    "Malformed ingestion payload at element {ElementIndex} (-1 = the array header) of {ElementCount}: "
-                  + "{Ingested} event(s) already ingested, {Dropped} dropped — batch refused",
-                    progress.ElementIndex, progress.ElementCount, result.Ingested, result.Dropped);
+                //
+                // Guarded (round-6 review, the LOW on 84deced): it runs after the write, and a line that ran out of
+                // memory (its arguments box) made a written prefix a 500, which a Seq client retries — that prefix
+                // stored twice. The answer, not the line, is what the client acts on.
+                try
+                {
+                    _logger.LogWarning(malformed,
+                        "Malformed ingestion payload at element {ElementIndex} (-1 = the array header) of {ElementCount}: "
+                      + "{Ingested} event(s) already ingested, {Dropped} dropped — batch refused",
+                        progress.ElementIndex, progress.ElementCount, result.Ingested, result.Dropped);
+                }
+                catch (Exception) { /* the line is lost; the answer is not */ }
 
                 await WriteCountsAsync(ctx, StatusCodes.Status400BadRequest, result.Ingested, result.Dropped,
                                        failedAtElement: progress.ElementIndex);

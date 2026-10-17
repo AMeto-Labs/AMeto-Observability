@@ -502,6 +502,48 @@ public sealed class IngestStoreBusyTests : IDisposable
         };
     }
 
+    /// <summary>
+    /// Round-6 review R6-M5. The receiver's own await of the write can fail at its registration — out of memory,
+    /// past the runtime's own catch — while the write runs on and lands. The request is answered by the throw (a
+    /// 500; API.md names it), but the finally that gives the batch back was skipped on that road, and the batch's
+    /// reservation of the decoded budget with it: a batch's worth of the budget lost for good, per such request. A
+    /// catch around the await gives the batch back, at the write's end (its lease defers the dispose).
+    /// </summary>
+    [Fact]
+    public async Task A_receiver_whose_await_of_the_write_fails_gives_its_batch_back_when_the_write_ends()
+    {
+        var opts = Options(backPressureWait: TimeSpan.FromSeconds(2));
+        await using var storage = Engine(opts);
+        int faults = 0;
+        storage._afterWriteGate = () =>
+        {
+            if (Interlocked.Increment(ref faults) <= 2) throw new OutOfMemoryException("test: a fault, so the write waits");
+        };
+        try
+        {
+            var endpoint = new IngestionEndpoint(storage, storage.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+            var ctx      = Post(Clef(3));
+            int armed    = 1;
+            Task handled;
+            OwnerAsync.LaterSuspensionFailsForTest.Value = (sm, awaiter) =>
+                sm.Name.Contains("<HandleAsync>", StringComparison.Ordinal)
+                && awaiter == typeof(System.Runtime.CompilerServices.ValueTaskAwaiter<LogBatchWriteResult>)
+                && Interlocked.Exchange(ref armed, 0) == 1;
+            try { handled = endpoint.HandleAsync(ctx); }
+            finally { OwnerAsync.LaterSuspensionFailsForTest.Value = null; }
+
+            await Assert.ThrowsAsync<OutOfMemoryException>(() => handled);   // answered by the throw: a 500
+            Assert.Equal(0, Volatile.Read(ref armed));
+            // The write runs on and lands; then the batch is given back.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (endpoint.DecodedBytesInFlight != 0 && sw.Elapsed < TimeSpan.FromSeconds(15)) await Task.Delay(20);
+            Assert.True(endpoint.DecodedBytesInFlight == 0,
+                        $"{endpoint.DecodedBytesInFlight} B of the decoded budget still reserved: the batch was never given back");
+            Assert.True(Volatile.Read(ref faults) > 2, "the write did not go on after the await failed");
+        }
+        finally { storage._afterWriteGate = null; }
+    }
+
     private static StorageEngine Engine(ServerOptions opts) => new(
         Microsoft.Extensions.Options.Options.Create(opts),
         new RetentionStore(opts, NullLogger<RetentionStore>.Instance),

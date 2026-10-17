@@ -358,10 +358,22 @@ public static class OtlpEndpointMapper
                 // Answered only once the events are in the store — the hot tier and its WAL, or a
                 // spill file — so a 200 survives the death of this process (IngestionEndpoint). The
                 // write is awaited HERE, on the box the handler made first (round-6 review R5-M4): that
-                // await allocates nothing, so nothing between the write's start and its end can fail
-                // but the write. The batch is given back as soon as it is written, before the answer.
-                var commit  = batch!.BeginCommit(ctx.RequestAborted);
-                var written = await commit.Write;
+                // await allocates nothing but its continuation's registration (caught below), so nothing
+                // between the write's start and its end can fail but the write. The batch is given back as
+                // soon as it is written, before the answer.
+                var commit = batch!.BeginCommit(ctx.RequestAborted);
+                Ameto.Storage.LogBatchWriteResult written;
+                try { written = await commit.Write; }
+                catch
+                {
+                    // The AWAIT failed, not the write, which never throws (round-6 review R6-M5): its continuation's
+                    // registration ran out of memory, and the write runs on and lands. The finally that gives the batch
+                    // back is skipped on that road, its reservation with it: it goes back here, at the write's end (its
+                    // lease defers the dispose). The request is answered by the throw while the write lands (API.md).
+                    batch.Dispose();
+                    batch = null;
+                    throw;
+                }
                 LogIngestResult result = batch.EndCommit(commit, written);
                 batch.Dispose();
                 batch = null;

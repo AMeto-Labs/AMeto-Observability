@@ -312,8 +312,18 @@ public sealed partial class StorageEngine
             }
 
             int notWritten = batch.Count - next;
-            if (notWritten > 0) Interlocked.Add(ref _ingestNotWritten, notWritten);
-            result = new LogBatchWriteResult(written, refused, notWritten);
+            // Of the client's events only, and a cancelled request's tail apart (round-6 review, the LOW on b720efa):
+            // a drop marker not written stands for a drop already counted at the door, and a client that went away
+            // was not refused for want of room.
+            bool cancelled        = notWritten > 0 && ct.IsCancellationRequested;
+            int  clientEvents     = batch.ClientEvents >= 0 ? Math.Min(batch.ClientEvents, batch.Count) : batch.Count;
+            int  clientNotWritten = Math.Max(0, clientEvents - next);
+            if (clientNotWritten > 0)
+            {
+                if (cancelled) Interlocked.Add(ref _ingestNotWrittenCancelled, clientNotWritten);
+                else           Interlocked.Add(ref _ingestNotWritten, clientNotWritten);
+            }
+            result = new LogBatchWriteResult(written, refused, notWritten) { Cancelled = cancelled };
         }
         catch
         {
@@ -727,6 +737,7 @@ public sealed partial class StorageEngine
 
     private long _ingestRoomWaits;
     private long _ingestNotWritten;
+    private long _ingestNotWrittenCancelled;
     private long _ingestRefusedTooLarge;
     private long _ingestWalAppendFailures;
 
@@ -737,10 +748,17 @@ public sealed partial class StorageEngine
     public long IngestRoomWaits => Interlocked.Read(ref _ingestRoomWaits);
 
     /// <summary>
-    /// Events a batch gave up on: no room within <c>Ingestion.BackPressureWait</c> (or writes that
-    /// kept failing for that long — <see cref="IngestWriteFaults"/>), or shutdown.
+    /// A client's events a batch gave up on: no room within <c>Ingestion.BackPressureWait</c> (or writes that
+    /// kept failing for that long — <see cref="IngestWriteFaults"/>), or shutdown. Drop markers are not counted
+    /// (their drops are, at the door), nor a cancelled request's tail (<see cref="IngestNotWrittenCancelled"/>).
     /// </summary>
     public long IngestNotWritten => Interlocked.Read(ref _ingestNotWritten);
+
+    /// <summary>
+    /// A client's events its request gave up on because the client went away (the request was cancelled) part way
+    /// through the write; not in <see cref="IngestNotWritten"/> (round-6 review, the LOW on b720efa).
+    /// </summary>
+    public long IngestNotWrittenCancelled => Interlocked.Read(ref _ingestNotWrittenCancelled);
 
     /// <summary>Events refused because no tier can hold them (a payload over one hot-tier chunk).</summary>
     public long IngestRefusedTooLarge => Interlocked.Read(ref _ingestRefusedTooLarge);
