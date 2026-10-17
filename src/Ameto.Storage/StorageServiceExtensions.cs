@@ -75,10 +75,20 @@ public sealed class RetentionBackgroundService : BackgroundService
 /// </summary>
 public static class StorageServiceExtensions
 {
+    /// <summary>How long the server's engine lets its despill wait for the index sink at startup (see <c>StorageEngine._indexSinkWait</c>).</summary>
+    internal static readonly TimeSpan ServerIndexSinkWait = TimeSpan.FromSeconds(30);
+
     public static IServiceCollection AddAmetoStorage(this IServiceCollection services)
     {
         services.AddSingleton<RetentionStore>();
-        services.AddSingleton<StorageEngine>(); 
+        // The server's engine: its despill waits (bounded) for the indexing layer to wire the index
+        // sink, which happens only once the hosted services start — see StorageEngine._indexSinkWait.
+        services.AddSingleton(static sp => new StorageEngine(
+            sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ServerOptions>>(),
+            sp.GetRequiredService<RetentionStore>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<StorageEngine>>(),
+            MemoryBudgets.Current(),
+            indexSinkWait: ServerIndexSinkWait));
         services.AddSingleton<ISegmentProvider>(sp => sp.GetRequiredService<StorageEngine>());
         services.AddSingleton<ISegmentManager>(sp => sp.GetRequiredService<StorageEngine>());
         // Expose the engine's shared intern pool so Ingestion can inject it directly

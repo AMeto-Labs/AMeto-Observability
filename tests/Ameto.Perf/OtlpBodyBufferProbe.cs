@@ -10,7 +10,7 @@ namespace Ameto.Perf;
 /// What the ingest receivers pay to get a buffer for one request body.
 ///
 /// <para>A batch of 1.4 MB rounds up to the 2 MiB bucket, and each OTLP receiver rents one per
-/// request; so does the CLEF receiver, measured through its handler in ClefBodyBufferProbe.
+/// request; so does the CLEF receiver.
 /// <see cref="ArrayPool{T}.Shared"/> keeps one array per thread plus at most eight per core in
 /// each bucket, so past that depth each concurrent request gets a fresh, zeroed
 /// 2 MiB array straight on the large object heap. It also drops what it holds on a gen2

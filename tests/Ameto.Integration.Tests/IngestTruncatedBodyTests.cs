@@ -47,8 +47,8 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
         byte[] body, long declaredLength)
     {
         _factory.CreateClient().Dispose();   // makes the factory seed its API key
-        var ring     = _factory.Services.GetRequiredService<IngestionRingBuffer>();
-        long before  = ring.AcceptedTotal;
+        var ingest   = _factory.Services.GetRequiredService<IngestionEndpoint>();
+        long before  = ingest.AcceptedTotal;
 
         var response = await _factory.Server.SendAsync(ctx =>
         {
@@ -61,7 +61,7 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
         });
 
         using var reader = new StreamReader(response.Response.Body);
-        return (response.Response.StatusCode, ring.AcceptedTotal - before,
+        return (response.Response.StatusCode, ingest.AcceptedTotal - before,
                 response.Response.ContentType, await reader.ReadToEndAsync());
     }
 

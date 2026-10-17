@@ -919,6 +919,28 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(n - 1, replayed[^1].Point.Value);
     }
 
+    /// <summary>
+    /// Round-5 review H-F, the metric log: as the logs' WAL, it is mapped over a file sized with SetLength
+    /// (and grown by a mapping's own capacity), which on Linux leaves it sparse — a write into a page of a
+    /// full volume is SIGBUS. Its blocks are reserved at the open and at each growth now.
+    /// </summary>
+    [Fact]
+    public void On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth()
+    {
+        if (!OperatingSystem.IsLinux()) return;   // NTFS allocates on SetLength; this is Linux's road
+        var wal = OpenWal(4 * 1024);
+        long sized = new FileInfo(WalPath).Length;
+        Assert.True(FileAllocation.AllocatedBytes(WalPath) >= sized,
+            $"the metric log is sparse from its open: {FileAllocation.AllocatedBytes(WalPath):N0} of {sized:N0} bytes on disk");
+
+        for (int i = 0; i < 2_000; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
+        long grown = new FileInfo(WalPath).Length;
+        Assert.True(grown > sized, "setup: the metric log did not grow");
+        Assert.True(FileAllocation.AllocatedBytes(WalPath) >= grown,
+            $"the metric log is sparse past its growth: {FileAllocation.AllocatedBytes(WalPath):N0} of {grown:N0} bytes on disk");
+        wal.Dispose();
+    }
+
     // ── The regression this change is about ───────────────────────────────────
 
     private static MetricIngestItem[] Minute(long nano, int metricNames, int seriesPerName)
@@ -993,6 +1015,41 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Contains(engine.GetCatalog(), e => e.Name == "cpu.utilisation");
         Assert.Contains("service", engine.GetLabelKeys("cpu.utilisation"));
 
+        await engine.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Round-6 review R6-M3. A WAL whose replay fails at the start is not given up for an empty hot tier: the engine went
+    /// on, and its next flush — its shutdown's, here — committed the log, every point the replay had not read with it
+    /// (0 of a crash's 10 in the review's probe). The start fails now, the log kept, and the next start replays it.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_replay_fails_fails_the_start_and_the_next_start_replays_it()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var labels = Labels(("service", "MintRoute.API"));
+        var crashed = OpenWal();
+        for (int i = 0; i < 10; i++)
+            Append(crashed, Scalar("cpu.utilisation", baseNano + i * 1_000_000L, i, labels));
+        crashed.Dispose();
+
+        MetricStorageEngine? went = null;
+        Exception? failed;
+        MetricStorageEngine.ReplayFailsForTest.Value = static () => new IOException("test: the replay could not read the log");
+        try { failed = Record.Exception(() => went = NewEngine()); }
+        finally { MetricStorageEngine.ReplayFailsForTest.Value = null; }
+        if (went is not null)
+        {
+            // The road it took: on with an empty hot tier, a new point, and the flush that commits the log (its close's).
+            went.Ingest([Scalar("cpu.other", baseNano + 60_000_000_000L, 1.0, labels)]);
+            await went.DisposeAsync();
+        }
+
+        var engine = NewEngine();
+        var series = engine.QueryAsync("cpu.utilisation").ToBlockingEnumerable().ToList();
+        Assert.True(series.Count == 1 && series[0].Points.Count == 10,
+                    $"{(series.Count == 0 ? 0 : series[0].Points.Count)} of the crash's 10 points replayed by the next start");
+        Assert.IsType<IOException>(failed);
         await engine.DisposeAsync();
     }
 
@@ -1386,6 +1443,65 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.True(Volatile.Read(ref opened) == 1,
             $"{opened} generations were opened for one flush worth of points: the tick behind the " +
             "gate opened one over an empty tier and abandoned it");
+    }
+
+    /// <summary>
+    /// Round-5 review L-16, the metric engine. A flush that found the gate held awaited it, and that
+    /// await was its first real suspension: a box that could not be allocated there threw with the
+    /// wait still queued, and the release that ended the flush ahead granted the gate to it — to
+    /// nobody. No metric flush ran again: every later one waited on the gate for ever. Boxed before
+    /// it waits now, the failure takes nothing, and the next flush gets the gate.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_whose_first_suspension_cannot_be_boxed_leaves_the_gate_to_the_next()
+    {
+        // Outside the registry: with the gate lost, the class's teardown would wait on the engine's
+        // final flush for ever, and so would the test run. Disposed below, with a bound.
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance, PinnedThresholds);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(held);    // a red assertion below must not strand a thread
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int opened  = 0;
+        engine.OnGenerationOpenedForTest = () =>
+        {
+            if (Interlocked.Increment(ref opened) != 1) return;   // only the first flush is held
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+        Task? next = null;
+        try
+        {
+            engine.Ingest(SlowFlushBatch(baseNano, "a", series: 400, pointsPerSeries: 150));
+            var writing = engine.ScheduleThresholdFlushForTest();
+            await reached.Task;                       // the flush ahead holds the gate
+
+            int armed = 1;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = t =>
+                t.DeclaringType == typeof(MetricStorageEngine) && t.Name.Contains("<FlushHotTierAsync>", StringComparison.Ordinal)
+                && Interlocked.Exchange(ref armed, 0) == 1;
+            Exception? failed;
+            try { failed = await Record.ExceptionAsync(() => engine.FlushPeriodicForTest()); }
+            finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
+
+            held.SetResult();
+            await writing;
+
+            engine.Ingest(SlowFlushBatch(baseNano + 3_600_000_000_000L, "b", series: 400, pointsPerSeries: 150));
+            next = engine.FlushPeriodicForTest();
+            Assert.True(await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(15))) == next,
+                        "the next flush never got the gate: the failed one's wait took it");
+            await next;
+            Assert.IsType<OutOfMemoryException>(failed);
+            Assert.Equal(0, engine.HotPointCount);
+        }
+        finally
+        {
+            // Not waited on for ever: with the gate lost, the final flush would wait on it too.
+            var dispose = engine.DisposeAsync().AsTask();
+            await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(15)));
+        }
     }
 
     /// <summary>

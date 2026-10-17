@@ -137,6 +137,18 @@ public sealed class LogVolumeAggregator
         if (svc >= 0) Record(timestampTicks, level, svc);
     }
 
+    /// <summary>
+    /// Counts one in-window hot-tier header whose service has no pool index — the pool was full
+    /// when it arrived, and the tier keeps the name beside the event instead
+    /// (<c>HotTierSegment.GetService</c>). An empty name is "(unknown)".
+    /// </summary>
+    public void AddByServiceName(long timestampTicks, LogLevel level, string serviceName)
+    {
+        _scanned++;
+        int svc = GetOrAddByName(string.IsNullOrEmpty(serviceName) ? UnknownService : serviceName);
+        if (svc >= 0) Record(timestampTicks, level, svc);
+    }
+
     // ── Cold-tier entry point (service is the raw UTF-8 slice from the seg block) ──
 
     /// <summary>Counts one in-window cold-tier event given the UTF-8 bytes of its service name

@@ -963,14 +963,31 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// spans are NOT re-appended to the log — they are already in it, and the log keeps
     /// writing after the last valid entry.
     /// </summary>
+    /// <summary>
+    /// Test seam: asked as the start replays the WAL; an exception it returns is thrown there, as a replay that cannot
+    /// read the log throws. An <see cref="AsyncLocal{T}"/>, so it reaches only the engines its test constructs. Null in
+    /// production.
+    /// </summary>
+    internal static readonly AsyncLocal<Func<Exception>?> ReplayFailsForTest = new();
+
     private void RecoverFromWal()
     {
         List<SpanIngestItem> recovered;
-        try { recovered = _wal.ReadAll(); }
+        try
+        {
+            if (ReplayFailsForTest.Value?.Invoke() is { } failure) throw failure;
+            recovered = _wal.ReadAll();
+        }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Span WAL replay failed — continuing with an empty hot tier");
-            return;
+            // The start fails (round-6 review R6-M3's span twin), as the open's failed walk does. It went on "with an
+            // empty hot tier", and its next flush (SpanWriteAheadLog.BeginFlush, then the commit) reclaimed every span
+            // the replay had not read. The log is closed as it is, and the next start replays it.
+            try { _logger.LogCritical(ex, "Span WAL replay failed — the trace engine does not start; the WAL is kept for the next start to replay"); }
+            catch (Exception) { /* the throw below says it */ }
+            try { _wal.Dispose(); }
+            catch (Exception) { /* the process is ending its start; the handle goes with it */ }
+            throw new IOException("The span WAL could not be replayed; it is kept for the next start (see the inner exception)", ex);
         }
 
         if (recovered.Count == 0) return;

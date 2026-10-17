@@ -1,6 +1,4 @@
 using SlabArena = Ameto.Core.SlabArena;
-using Ameto.Ingestion;
-using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace Ameto.Perf;
@@ -37,33 +35,6 @@ public sealed class HugePageOptOutDecisionTests
     }
 
     /// <summary>
-    /// The startup message follows the decision: nothing for a kernel without THP, nothing for an
-    /// arena that was advised or never attempted, one Information line naming the result
-    /// otherwise — and a host without a logger does not throw.
-    /// </summary>
-    [Fact]
-    public void The_startup_message_is_logged_only_when_the_opt_out_failed()
-    {
-        foreach (int silent in new[] { 0, -1, 22 })
-        {
-            var quiet = new CapturingLogger();
-            IngestionServiceExtensions.ReportHugePageOptOut(quiet, silent);
-            Assert.True(quiet.Entries.Count == 0, $"madvise result {silent} was logged: {string.Join(" | ", quiet.Entries)}");
-        }
-
-        foreach (int failed in new[] { 12, -2 })
-        {
-            var log = new CapturingLogger();
-            IngestionServiceExtensions.ReportHugePageOptOut(log, failed);
-            var entry = Assert.Single(log.Entries);
-            Assert.Equal(LogLevel.Information, entry.Level);
-            Assert.Equal(failed, entry.Result);
-        }
-
-        IngestionServiceExtensions.ReportHugePageOptOut(null, 12);
-    }
-
-    /// <summary>
     /// An allocation that holds no whole page gets no madvise call, and must not say it was
     /// advised: the answer is "not attempted", so <see cref="SlabArena.HugePagesDisabled"/> stays
     /// false. It used to be 0. The address is never dereferenced — no whole page means the
@@ -85,28 +56,5 @@ public sealed class HugePageOptOutDecisionTests
         using var tiny = SlabArena.Create(100, 100, reserve: false);
         Assert.Equal(SlabArena.NoHugePageOptOut, tiny.HugePageOptOutErrno);
         Assert.False(tiny.HugePagesDisabled);
-    }
-
-    private sealed record Entry(LogLevel Level, object? Result)
-    {
-        public override string ToString() => $"{Level} {Result}";
-    }
-
-    private sealed class CapturingLogger : ILogger
-    {
-        public readonly List<Entry> Entries = [];
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
-                                Func<TState, Exception?, string> formatter)
-        {
-            object? result = null;
-            if (state is IReadOnlyList<KeyValuePair<string, object?>> kvs)
-                foreach (var kv in kvs)
-                    if (kv.Key == "Result") result = kv.Value;
-            Entries.Add(new Entry(logLevel, result));
-        }
     }
 }

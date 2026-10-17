@@ -7,8 +7,7 @@ namespace Ameto.Otel;
 
 /// <summary>
 /// Maps an OTLP <see cref="ExportLogsServiceRequest"/> (JSON model) to
-/// <see cref="LogEvent"/> objects ready for ingestion via
-/// <see cref="Ameto.Ingestion.IngestionEndpoint.IngestEvents"/>.
+/// <see cref="LogEvent"/> objects.
 ///
 /// Mapping rules:
 /// - <c>body.stringValue</c>     → <c>@mt</c> (message template)

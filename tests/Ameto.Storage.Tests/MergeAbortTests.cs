@@ -165,6 +165,9 @@ public sealed class MergeAbortTests : IAsyncLifetime
     /// up to <c>MergeMaxSources</c> = 512 mapped views open for the life of the process. On
     /// Windows those files can then be neither unlinked by retention nor rewritten by compaction.
     ///
+    /// <para>Round 7: the merge runs in its caller's frame now (MergeToCold, no Task.Run), so it always
+    /// enters its body; the test stays, for the contract it pins either way.</para>
+    ///
     /// <para>Driven directly, because through a whole merge pass this is invisible: the caller
     /// closes the readers on its own abort paths too, so the pass-level test above passes
     /// identically whether the delegate ran or not — VERIFIED by putting the token back on
@@ -193,12 +196,51 @@ public sealed class MergeAbortTests : IAsyncLifetime
         string segPath = Path.Combine(SegDir, "no-such-directory", "merged.seg");
         try
         {
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => _engine.MergeToColdAsync(readers, new SegmentId(9_999UL), segPath, expect, cts.Token));
+            Assert.ThrowsAny<OperationCanceledException>(
+                () => _engine.MergeToCold(readers, new SegmentId(9_999UL), segPath, expect, cts.Token));
 
             foreach (var f in sources) AssertNotHeldOpen(f);
         }
         finally { foreach (var r in readers) r.Dispose(); }
+    }
+
+    /// <summary>
+    /// Round 7, the registration class at merges. The batch awaited its merge (a Task.Run), and a registration of that
+    /// await's continuation that ran out of memory threw into the batch with the merge streaming on: its catch closed the
+    /// readers under the stream — mapped views — its finally gave the heavy-phase permit back early, and its return let
+    /// the planner's state go while the stream still used it. The merge runs in the batch's frame now (MergeToCold): from
+    /// the moment it begins, the batch does not suspend at all. Both of the owner builder's seams record any suspension
+    /// of the batch after that moment — the await of a Task.Run was its first — and fail none of them: a failure there,
+    /// with the stream running, would close the readers under it.
+    /// </summary>
+    [Fact]
+    public async Task A_merge_batch_does_not_suspend_while_its_merge_streams()
+    {
+        var sources = await WriteFourSourcesAsync();
+        int     armed     = 0;
+        string? suspended = null;
+        _engine._beforeMergeStream = () => Volatile.Write(ref armed, 1);
+        OwnerAsync.FirstSuspensionFailsForTest.Value = sm => Record(sm);
+        OwnerAsync.LaterSuspensionFailsForTest.Value = (sm, _) => Record(sm);
+        try { Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)); }
+        finally
+        {
+            OwnerAsync.FirstSuspensionFailsForTest.Value = null;
+            OwnerAsync.LaterSuspensionFailsForTest.Value = null;
+            _engine._beforeMergeStream = null;
+        }
+
+        Assert.True(suspended is null, $"{suspended} suspended while its merge streamed");
+        Assert.Single(_engine.ListSegments());
+        foreach (var f in sources) Assert.False(File.Exists(f), $"{Path.GetFileName(f)} was merged and is still there");
+        Assert.Equal(_engine.FlushWidth, _engine.FlushConcurrencyForTest.CurrentCount);
+
+        bool Record(Type sm)
+        {
+            if (Volatile.Read(ref armed) == 1 && sm.Name.Contains("<MergeOneBatchAsync>", StringComparison.Ordinal))
+                suspended = sm.Name;
+            return false;
+        }
     }
 
     /// <summary>

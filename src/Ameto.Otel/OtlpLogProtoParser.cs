@@ -8,7 +8,7 @@ using Ameto.Ingestion;
 namespace Ameto.Otel;
 
 /// <summary>
-/// Parses OTLP/protobuf <c>ExportLogsServiceRequest</c> straight into the ingestion ring —
+/// Parses OTLP/protobuf <c>ExportLogsServiceRequest</c> straight into a log batch (<see cref="IOtlpLogSink"/>) —
 /// the protobuf counterpart of <see cref="OtlpLogStreamParser"/>, and the encoding SDK
 /// exporters and the collector actually send.
 ///
@@ -48,10 +48,13 @@ namespace Ameto.Otel;
 ///   the more forgiving of the two readings and the one <see cref="ProtoReader"/> already gave
 ///   the metric path. (The trace path still decodes through <c>CodedInputStream</c> and still
 ///   throws — <c>OtlpGrpcMessageSegmentTests</c> relies on exactly that.)</item>
-///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
-///   already in the ring when the caller answers 400. The DOM path decoded the whole request
-///   before ingesting any of it. This matches the JSON path, which has always behaved this
-///   way, and a client that gets a 400 is expected to resend the batch.</item>
+///   <item>Damage inside a record aborts the batch mid-way, so records before the bad byte are
+///   already staged — and the receiver writes them — when it answers 400. The DOM path decoded the
+///   whole request before ingesting any of it. Damage in the request's framing never gets here: the
+///   receivers weigh the body first (<c>OtlpLogBatchWeight</c>), a walk that follows resource_logs,
+///   resource, scope_logs and log_records and refuses what it cannot frame with nothing ingested.
+///   The JSON path is refused whole for any malformed document, as its walk reads all of it
+///   (docs/API.md states the one rule for every road).</item>
 /// </list>
 /// </summary>
 public static class OtlpLogProtoParser
@@ -87,7 +90,26 @@ public static class OtlpLogProtoParser
         public int Depth;                        // nested array_value / kvlist_value levels open
         public int Ingested;
         public int Dropped;
+
+        // ── What the map being built would take (see Room) ──
+        /// <summary>The sink's limit on a record's property map (<see cref="IOtlpLogSink.MaxEventPayloadBytes"/>).</summary>
+        public long Limit;
+        /// <summary>Bytes of the map already in another buffer: the resource's, while a record's attributes are written.</summary>
+        public long Base;
+        /// <summary>Bytes counted into the buffer being written — all of them, written or not once <see cref="Over"/>.</summary>
+        public long Bytes;
+        /// <summary>The map passed <see cref="Limit"/>: nothing more is written into the buffer, only counted.</summary>
+        public bool Over;
+        /// <summary>The resource's attribute bytes, and whether they alone passed the limit.</summary>
+        public long ResBytes;
+        public bool ResOver;
     }
+
+    /// <summary>
+    /// Scratch a request grew past this is let go at its end rather than kept on the thread for the
+    /// next one: four requests that grew it to tens of megabytes held that on their threads for good.
+    /// </summary>
+    private const int KeepScratchBytes = 1 << 20;
 
     /// <summary>
     /// How deep an attribute value may nest before the payload is refused.
@@ -116,6 +138,7 @@ public static class OtlpLogProtoParser
             RecBuf = _tRec ??= new ArrayBufferWriter<byte>(8192),
             OutBuf = _tOut ??= new ArrayBufferWriter<byte>(8192),
             Hex    = _tHex ??= new byte[MaxIdBytes * 2],
+            Limit  = sink.MaxEventPayloadBytes,
         };
         st.ResBuf.ResetWrittenCount();
         st.RecBuf.ResetWrittenCount();
@@ -133,19 +156,45 @@ public static class OtlpLogProtoParser
         }
         finally
         {
-            // IN A FINALLY, because this parser ingests as it walks. A batch that turns
-            // hostile part way through — a value nested past MaxValueDepth, a malformed tail —
-            // throws with its intact prefix ALREADY in the ring, and the caller answers 400 /
-            // INVALID_ARGUMENT without coming back here. Those events would then wait out the
-            // drain loop's 1 s missed-signal timeout, invisible to queries and the live tail.
-            // The CLEF receiver wakes the drainer from inside its malformed-payload catch for
-            // exactly this reason (IngestionEndpoint); ParseState is a ref struct whose counts
-            // survive the unwind at this frame, so the same promise is kept here.
+            // IN A FINALLY, because this parser hands records over as it walks. A batch that
+            // turns hostile part way through — a value nested past MaxValueDepth, a malformed
+            // tail — throws with its intact prefix ALREADY in the sink, and a sink that acts on
+            // the notification must hear it then too. ParseState is a ref struct whose counts
+            // survive the unwind at this frame. (The log receivers' own sink, LogIngestBatch,
+            // writes when it is committed and ignores this.)
             if (st.Ingested > 0) sink.NotifyBatchEnqueued();
+
+            if (_tRes is { Capacity: > KeepScratchBytes }) _tRes = null;
+            if (_tRec is { Capacity: > KeepScratchBytes }) _tRec = null;
+            if (_tOut is { Capacity: > KeepScratchBytes }) _tOut = null;
         }
 
         return (st.Ingested, st.Dropped);
     }
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> more of the property map being built; false once the map —
+    /// with what is already in another buffer (<see cref="ParseState.Base"/>) — passes the sink's
+    /// limit: the caller then writes nothing more of it, and the record is refused as oversized
+    /// before it is assembled. Everything is still counted, for the size the drop reports.
+    /// </summary>
+    private static bool Room(ref ParseState st, long bytes)
+    {
+        st.Bytes += bytes;
+        if (!st.Over && st.Base + st.Bytes > st.Limit) st.Over = true;
+        return !st.Over;
+    }
+
+    /// <summary>The bytes of a msgpack str header for a string of <paramref name="length"/> bytes.</summary>
+    internal static int StrHeaderBytes(long length) => length < 32 ? 1 : length < 256 ? 2 : length < 65_536 ? 3 : 5;
+
+    /// <summary>The bytes of a msgpack array or map header for <paramref name="count"/> entries.</summary>
+    internal static int CollectionHeaderBytes(int count) => count < 16 ? 1 : count < 65_536 ? 3 : 5;
+
+    /// <summary>The bytes <c>MessagePackWriter.Write(long)</c> encodes <paramref name="v"/> in.</summary>
+    internal static int IntBytes(long v) =>
+        v >= 0 ? (v <= 127 ? 1 : v <= byte.MaxValue ? 2 : v <= ushort.MaxValue ? 3 : v <= uint.MaxValue ? 5 : 9)
+               : (v >= -32 ? 1 : v >= sbyte.MinValue ? 2 : v >= short.MinValue ? 3 : v >= int.MinValue ? 5 : 9);
 
     /// <summary>
     /// Resource first, then the records: the wire format does not guarantee field order, and
@@ -159,6 +208,11 @@ public static class OtlpLogProtoParser
         st.ServiceSeen = false;
         st.ServiceIdx  = -1;
 
+        // The resource's attributes are counted as they are written, once per block: past the
+        // limit they stop being written, and every record under them is refused unassembled.
+        st.Base  = 0;
+        st.Bytes = 0;
+        st.Over  = false;
         var pass1 = new ProtoReader(bytes);
         uint tag;
         while ((tag = pass1.ReadTag()) != 0)
@@ -166,6 +220,8 @@ public static class OtlpLogProtoParser
             if (tag == 10) ReadResource(pass1.ReadLengthDelimited(), ref st);   // field 1
             else pass1.SkipField(tag);
         }
+        st.ResBytes = st.Bytes;
+        st.ResOver  = st.Over;
 
         // Pass 1 has walked the whole resource, so this block's service.name is final HERE —
         // the same point the JSON parser interns at, and before pass 2 reads a single record.
@@ -209,7 +265,7 @@ public static class OtlpLogProtoParser
         }
     }
 
-    // ── one LogRecord → one ring entry ─────────────────────────────────────────
+    // ── one LogRecord → one staged event ───────────────────────────────────────
 
     private static void ReadLogRecord(ReadOnlySpan<byte> bytes, ref ParseState st)
     {
@@ -223,6 +279,9 @@ public static class OtlpLogProtoParser
         st.RecBuf.ResetWrittenCount();
         var w = new MessagePackWriter(st.RecBuf);
         int recKeyCount = 0;
+        st.Base  = st.ResBytes;
+        st.Bytes = 0;
+        st.Over  = st.ResOver;
 
         var r = new ProtoReader(bytes);
         uint tag;
@@ -246,17 +305,9 @@ public static class OtlpLogProtoParser
 
         // @tr / @sp, from the raw bytes — the mapper wrote lowercase hex of whatever the
         // client sent, including a non-conformant length, so that is what goes in the map.
-        if (!traceId.IsEmpty && traceId.Length <= MaxIdBytes) { WriteHex(ref w, "@tr"u8, traceId, st.Hex); recKeyCount++; }
-        if (!spanId.IsEmpty  && spanId.Length  <= MaxIdBytes) { WriteHex(ref w, "@sp"u8, spanId,  st.Hex); recKeyCount++; }
+        if (!traceId.IsEmpty && traceId.Length <= MaxIdBytes) { WriteHex(ref w, "@tr"u8, traceId, st.Hex, ref st); recKeyCount++; }
+        if (!spanId.IsEmpty  && spanId.Length  <= MaxIdBytes) { WriteHex(ref w, "@sp"u8, spanId,  st.Hex, ref st); recKeyCount++; }
         w.Flush();
-
-        // Assemble the final msgpack map: header(total) + resource KV bytes + record KV bytes.
-        st.OutBuf.ResetWrittenCount();
-        var ow = new MessagePackWriter(st.OutBuf);
-        ow.WriteMapHeader(st.ResKeyCount + recKeyCount);
-        if (st.ResKeyCount > 0) ow.WriteRaw(st.ResBuf.WrittenSpan);
-        if (recKeyCount   > 0) ow.WriteRaw(st.RecBuf.WrittenSpan);
-        ow.Flush();
 
         // The correlation columns take the ids as numbers; only conformant lengths parse,
         // which is exactly what TryParseTraceId's 32-hex-character check did.
@@ -274,6 +325,26 @@ public static class OtlpLogProtoParser
         long tsTicks = nanos > 0
             ? DateTimeOffset.FromUnixTimeMilliseconds(nanos / 1_000_000).UtcTicks
             : DateTimeOffset.UtcNow.UtcTicks;
+
+        // Past the limit — the resource's attributes alone, or with the record's — the map is not
+        // assembled: the record is refused as oversized with the size it would have had. It used to
+        // be built whole, in every record under such a resource, and refused only then.
+        long mapBytes = CollectionHeaderBytes(st.ResKeyCount + recKeyCount) + st.ResBytes + st.Bytes;
+        if (st.Over || mapBytes > st.Limit)
+        {
+            st.Sink.TryIngestOversized(tsTicks, (byte)MapSeverity(sev, sevText), ReadBodyString(body), mapBytes,
+                                       trHi, trLo, sp, st.Service, st.ServiceIdx);
+            st.Dropped++;
+            return;
+        }
+
+        // Assemble the final msgpack map: header(total) + resource KV bytes + record KV bytes.
+        st.OutBuf.ResetWrittenCount();
+        var ow = new MessagePackWriter(st.OutBuf);
+        ow.WriteMapHeader(st.ResKeyCount + recKeyCount);
+        if (st.ResKeyCount > 0) ow.WriteRaw(st.ResBuf.WrittenSpan);
+        if (recKeyCount   > 0) ow.WriteRaw(st.RecBuf.WrittenSpan);
+        ow.Flush();
 
         bool ok = st.Sink.TryIngestRaw(
             tsTicks, (byte)MapSeverity(sev, sevText),
@@ -346,9 +417,9 @@ public static class OtlpLogProtoParser
             if (!st.Service.IsEmpty) return false;
         }
 
-        WriteUtf8(ref w, key);
-        if (haveValue) WriteAnyValue(value, ref w, ref st);
-        else w.WriteNil();
+        WriteUtf8(ref w, key, ref st);
+        if (haveValue)             WriteAnyValue(value, ref w, ref st);
+        else if (Room(ref st, 1)) w.WriteNil();
         return true;
     }
 
@@ -396,13 +467,13 @@ public static class OtlpLogProtoParser
             }
         }
 
-        if (haveStr)       WriteUtf8(ref w, str);
-        else if (haveBool) w.Write(boolVal);
-        else if (haveDbl)  w.Write(dblVal);
-        else if (haveInt)  w.Write(intVal);
+        if (haveStr)       WriteUtf8(ref w, str, ref st);
+        else if (haveBool) { if (Room(ref st, 1))              w.Write(boolVal); }
+        else if (haveDbl)  { if (Room(ref st, 9))              w.Write(dblVal); }
+        else if (haveInt)  { if (Room(ref st, IntBytes(intVal))) w.Write(intVal); }
         else if (haveArr)  WriteArrayValue(array, ref w, ref st);
         else if (haveKvl)  WriteKvlistValue(kvlist, ref w, ref st);
-        else               w.WriteNil();
+        else if (Room(ref st, 1)) w.WriteNil();
     }
 
     /// <summary>
@@ -424,7 +495,7 @@ public static class OtlpLogProtoParser
             else count.SkipField(tag);
         }
 
-        w.WriteArrayHeader(n);
+        if (Room(ref st, CollectionHeaderBytes(n))) w.WriteArrayHeader(n);
         var r = new ProtoReader(bytes);
         while ((tag = r.ReadTag()) != 0)
         {
@@ -449,7 +520,7 @@ public static class OtlpLogProtoParser
             else count.SkipField(tag);
         }
 
-        w.WriteMapHeader(n);
+        if (Room(ref st, CollectionHeaderBytes(n))) w.WriteMapHeader(n);
         var r = new ProtoReader(bytes);
         while ((tag = r.ReadTag()) != 0)
         {
@@ -490,7 +561,8 @@ public static class OtlpLogProtoParser
     // ── Small helpers ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Writes a protobuf <c>string</c> field as a msgpack str holding the text the DOM path stored.
+    /// Writes a protobuf <c>string</c> field as a msgpack str holding the text the DOM path stored —
+    /// counted first (<see cref="Room"/>), and not written once the map is past the limit.
     ///
     /// <para>Protobuf does not guarantee valid UTF-8 on the wire, and an exporter sending Latin-1
     /// or cp1251 text sends invalid sequences. <c>CodedInputStream.ReadString()</c> decoded
@@ -501,31 +573,52 @@ public static class OtlpLogProtoParser
     /// entries).</para>
     ///
     /// <para>Valid input, which is every conformant exporter, costs one vectorised check and the
-    /// same raw copy as before. Only invalid input is decoded and re-encoded, through a pooled
-    /// char buffer.</para>
+    /// same raw copy as before. Invalid input is re-encoded UTF-8 to UTF-8, U+FFFD for each invalid
+    /// sequence, straight into the writer: it went through a pooled char buffer as long as the
+    /// value — body-sized for a hostile one, and kept by the pool after.</para>
     /// </summary>
-    private static void WriteUtf8(ref MessagePackWriter w, ReadOnlySpan<byte> utf8)
+    private static void WriteUtf8(ref MessagePackWriter w, ReadOnlySpan<byte> utf8, ref ParseState st)
     {
-        if (System.Text.Unicode.Utf8.IsValid(utf8)) w.WriteString(utf8);
-        else WriteReplacingInvalid(ref w, utf8);
+        bool valid = System.Text.Unicode.Utf8.IsValid(utf8);
+        // Longer than the limit in bytes, it passes it whatever it decodes to: not decoded at all.
+        long length = valid || utf8.Length > st.Limit ? utf8.Length : ReplacedLength(utf8);
+        if (!Room(ref st, StrHeaderBytes(length) + length)) return;
+        if (valid) w.WriteString(utf8);
+        else WriteReplacingInvalid(ref w, utf8, (int)length);
+    }
+
+    /// <summary>The length of <paramref name="utf8"/> with each invalid sequence replaced by U+FFFD (three bytes). Allocates nothing.</summary>
+    internal static long ReplacedLength(ReadOnlySpan<byte> utf8)
+    {
+        long length = 0;
+        while (!utf8.IsEmpty)
+        {
+            var status = System.Text.Rune.DecodeFromUtf8(utf8, out _, out int consumed);
+            length += status == OperationStatus.Done ? consumed : 3;
+            utf8 = utf8[consumed..];
+        }
+        return length;
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void WriteReplacingInvalid(ref MessagePackWriter w, ReadOnlySpan<byte> utf8)
+    internal static void WriteReplacingInvalid(ref MessagePackWriter w, ReadOnlySpan<byte> utf8, int replacedLength)
     {
-        // Decoding never yields more chars than there are bytes: an invalid sequence becomes one
-        // U+FFFD per maximal invalid subsequence, and a valid sequence is never longer in UTF-16.
-        char[] chars = ArrayPool<char>.Shared.Rent(utf8.Length);
-        try
+        w.WriteStringHeader(replacedLength);
+        int run = 0, pos = 0;
+        while (pos < utf8.Length)
         {
-            int n = Encoding.UTF8.GetChars(utf8, chars);
-            w.Write(chars.AsSpan(0, n));
+            var status = System.Text.Rune.DecodeFromUtf8(utf8[pos..], out _, out int consumed);
+            if (status != OperationStatus.Done)
+            {
+                if (pos > run) w.WriteRaw(utf8[run..pos]);
+                w.WriteRaw("�"u8);
+                run = pos + consumed;
+            }
+            pos += consumed;
         }
-        finally
-        {
-            ArrayPool<char>.Shared.Return(chars);
-        }
+        if (pos > run) w.WriteRaw(utf8[run..pos]);
     }
+
 
     /// <summary>Longest id the stack hex buffer below covers; conformant ones are 16 and 8.</summary>
     private const int MaxIdBytes = 32;
@@ -540,8 +633,9 @@ public static class OtlpLogProtoParser
     /// span handed to it could be stored in it, and a stack buffer is refused outright. A
     /// per-thread array costs nothing per request and satisfies the rule.</para>
     /// </summary>
-    private static void WriteHex(ref MessagePackWriter w, ReadOnlySpan<byte> key, ReadOnlySpan<byte> raw, byte[] scratch)
+    private static void WriteHex(ref MessagePackWriter w, ReadOnlySpan<byte> key, ReadOnlySpan<byte> raw, byte[] scratch, ref ParseState st)
     {
+        if (!Room(ref st, StrHeaderBytes(key.Length) + key.Length + StrHeaderBytes(raw.Length * 2) + raw.Length * 2)) return;
         var digits = HexDigits;
         for (int i = 0; i < raw.Length; i++)
         {

@@ -9,12 +9,12 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Ameto.Integration.Tests;
 
 /// <summary>
-/// A batch that arrives in full and turns malformed part way through leaves its intact prefix
-/// in the ring. Two things then have to happen, and neither used to:
+/// A batch that arrives in full and turns malformed part way through has its intact prefix
+/// written. Two things then have to hold:
 ///
 /// <list type="bullet">
-/// <item>the drainer is woken for that prefix — otherwise it sits in the ring until the drain
-/// loop's 1 s missed-signal timeout notices it;</item>
+/// <item>the prefix is in the store when the 400 is answered — it used to sit in the ingest ring
+/// until a drainer got to it;</item>
 /// <item>the 400 says how much landed and where it stopped, in the log at Warning and in the
 /// response body, so an operator does not have to guess whether a refused batch was a no-op.</item>
 /// </list>
@@ -96,18 +96,21 @@ public sealed class IngestMalformedBatchReportingTests : IClassFixture<AmetoWebA
         Assert.Equal(1, doc.RootElement.GetProperty("failedAtElement").GetInt32());
     }
 
+    /// <summary>
+    /// The prefix is in the store — the hot tier and its WAL — by the time the 400 is answered, not
+    /// merely accepted into a buffer for later: the request writes its own events and answers after.
+    /// </summary>
     [Fact]
-    public async Task MalformedTail_WakesTheDrainerForThePrefix()
+    public async Task MalformedTail_ThePrefixIsInTheStoreWhenThe400Arrives()
     {
         _factory.CreateClient().Dispose();
-        var drainer = _factory.Services.GetRequiredService<IngestionDrainer>();
+        var endpoint = _factory.Services.GetRequiredService<IngestionEndpoint>();
 
-        long before = drainer.NotifyCount;
+        long before = endpoint.AcceptedTotal;
         var resp = await _factory.CreateClient().PostAsync("/api/events", Content(BatchWithBadTail(5)));
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
 
-        Assert.True(drainer.NotifyCount > before,
-            "the prefix is in the ring; the drainer must be woken for it rather than left to time out");
+        Assert.Equal(before + 5, endpoint.AcceptedTotal);
     }
 
     /// <summary>

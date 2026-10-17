@@ -142,7 +142,7 @@ public static class HotTierScan
             for (int si = 0; si < headers.Length; si++)
             {
                 ref readonly var h = ref headers[si];
-                if (!scan.Matches(in h)) continue;
+                if (!scan.Matches(in h, tier, first + si)) continue;
 
                 if (n == buf.Length) Grow(ref buf);
                 buf[n++] = new Candidate(tierOrdinal, first + si, h.TimestampUtcTicks, h.Id);
@@ -258,8 +258,10 @@ public static class HotTierScan
             return mask;
         }
 
+        /// <param name="tier">The tier the header is in, and <paramref name="eventIndex"/> its place there:
+        /// a service with no pool index is the string the tier keeps beside the event.</param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool Matches(in LogEventHeader h)
+        public bool Matches(in LogEventHeader h, HotTierSegment tier, int eventIndex)
         {
             long ts = h.TimestampUtcTicks;
             if (ts < FromTicks || ts > ToTicks) return false;
@@ -274,7 +276,10 @@ public static class HotTierScan
             if (Pred is not null)
             {
                 if (!Pred.MayMatch(in h)) return false;
-                if (HasService && !ServiceMayMatch(h.ServiceNamePoolIndex)) return false;
+                if (HasService && !(h.ServiceNamePoolIndex >= 0
+                                      ? ServiceMayMatch(h.ServiceNamePoolIndex)
+                                      : Pred.ServiceMayMatch(tier.GetService(eventIndex))))   // not memoised: one per event
+                    return false;
             }
             return true;
         }

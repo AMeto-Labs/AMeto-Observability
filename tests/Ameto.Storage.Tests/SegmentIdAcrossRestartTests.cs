@@ -63,6 +63,137 @@ public sealed class SegmentIdAcrossRestartTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A log the startup replay fails to read keeps its block — and so its file and its events — for
+    /// the next start. The block used to be reserved only once the read had worked, from the header:
+    /// after a failed read the first log the run opened was handed that same block, and with it the
+    /// same file name. It reopened the file, appended after the entries no replay had read, and its
+    /// own flush deleted them: acknowledged events lost. (Since round 4 the despill reads such a log
+    /// again in the same run, into the same block; it is held here, so the log waits for the next
+    /// start, as it did.)
+    /// </summary>
+    [Fact]
+    public async Task A_log_the_replay_fails_to_read_keeps_its_block_and_its_events_for_the_next_start()
+    {
+        StorageEngine.HoldDespillForTest.Value = new TaskCompletionSource().Task;   // never released: cancelled at dispose
+        string dir    = Dir("unread");
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        // An orphaned log of the block a fresh store hands out first, holding three events.
+        string orphan = Path.Combine(walDir, "0-1.wal");
+        long   t      = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(orphan, new NodeId(0), new SegmentId(1), initialCapacity: 1 << 20))
+            for (int i = 0; i < 3; i++)
+                wal.Append(t + i, LogLevel.Information, -1, "orphan {n}", Props(i));
+
+        StorageEngine.BeforeWalReplayReadForTest.Value = path =>
+        {
+            if (Path.GetFileName(path) == "0-1.wal") throw new OutOfMemoryException("test: the replay could not read it");
+        };
+        try
+        {
+            await using var first = NewEngine(dir);
+            Assert.True(first.LiveWalSegmentId >= 1 + Slots,
+                $"the run opened block {first.LiveWalSegmentId} — the unread log's own");
+            Write(first, t + TimeSpan.TicksPerSecond, 1);
+        }
+        finally
+        {
+            StorageEngine.BeforeWalReplayReadForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value         = null;
+        }
+        Assert.True(File.Exists(orphan), "the unread log is gone");
+
+        await using var next = NewEngine(dir);
+        await next.CatalogLoaded;
+        int events = 0, orphans = 0;
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seg in next.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                events++;
+                if (ev.Template == "orphan {n}") orphans++;
+            }
+        }
+        Assert.Equal(3, orphans);   // replayed by the start that could read it
+        Assert.Equal(4, events);    // and the one event the run between took
+    }
+
+    /// <summary>
+    /// Round-4 L12, the review's probe. An orphaned log named after block <c>long.MaxValue − 2</c> — a
+    /// usable block, its levels within the id space — raised the allocator past the last usable block
+    /// id, and the run's live log was named after a block past it. Killed, the next start left that
+    /// log alone ("past the last block id this store can use") and its events were in no segment: 1 of
+    /// 101 served. The allocator refuses such a floor now: the live log takes the block after the ones
+    /// on disk, and every event comes back.
+    /// </summary>
+    [Fact]
+    public async Task A_log_named_near_the_end_of_the_id_space_leaves_the_allocator_where_it_was()
+    {
+        const ulong NearEnd = long.MaxValue - 2;
+        string dir    = Dir("near-end");
+        string walDir = Path.Combine(dir, "wal");
+        string segDir = Path.Combine(dir, "segments");
+        Directory.CreateDirectory(walDir);
+        long t = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(Path.Combine(walDir, $"0-{NearEnd}.wal"), new NodeId(0), new SegmentId(NearEnd), initialCapacity: 1 << 20))
+            for (int i = 0; i < 100; i++)
+                wal.Append(t + i, LogLevel.Information, -1, "orphan {n}", Props(i));
+
+        var first = NewEngine(dir);
+        ulong live;
+        try
+        {
+            await first.CatalogLoaded;
+            live = first.LiveWalSegmentId;
+            Assert.InRange(live, 1UL, 1UL << 20);   // after the ones on disk — not past the end of the id space
+            Write(first, t + TimeSpan.TicksPerSecond, 1);
+
+            // kill -9: the live log keeps its event, the shutdown flush is undone.
+            string liveWal = Path.Combine(walDir, $"0-{live}.wal");
+            File.Copy(liveWal, liveWal + ".crash", overwrite: true);
+            File.Copy(liveWal + ".pool", liveWal + ".pool.crash", overwrite: true);
+            await first.DisposeAsync();
+            foreach (var f in Directory.GetFiles(segDir, "*.seg"))
+            {
+                var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+                if (ulong.TryParse(parts[1], out var id) && id >= live && id < live + Slots) File.Delete(f);
+            }
+            File.Move(liveWal + ".crash", liveWal, overwrite: true);
+            File.Move(liveWal + ".pool.crash", liveWal + ".pool", overwrite: true);
+        }
+        finally { await first.DisposeAsync(); }
+
+        await using var next = NewEngine(dir);
+        await next.CatalogLoaded;
+        int events = 0, orphans = 0;
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seg in next.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                events++;
+                if (ev.Template == "orphan {n}") orphans++;
+            }
+        }
+        Assert.Equal(100, orphans);
+        Assert.Equal(101, events);
+        Assert.Empty(Directory.GetFiles(walDir, $"0-{live}.wal"));   // replayed, not left alone
+    }
+
+    private static byte[] Props(int n)
+    {
+        var buf = new ArrayBufferWriter<byte>(32);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write("n"); w.Write((long)n);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
     /// <summary>A run that took no event: its boot log is the whole record of how far it got.</summary>
     [Fact]
     public async Task A_clean_stop_that_took_no_event_does_not_hand_its_block_out_again()

@@ -22,8 +22,9 @@ namespace Ameto.Storage.Tests;
 /// <para>Writing no pool row fixed that side and moved the bug to the other one. The unpooled
 /// event was still logged as index 0, so a replay whose pool file held any row resolved it and
 /// gave the unpooled event index 0's template. The entry now carries an Unpooled flag in the
-/// header byte that used to be padding, and recovery gives a flagged event no template: its
-/// text was never stored.</para>
+/// header byte that used to be padding, and recovery does not resolve a flagged event's index.
+/// Since v6 the entry also carries the unpooled text itself (InlineTemplate), so the event comes
+/// back with its own template; before that it came back with none.</para>
 /// </summary>
 public sealed class WalUnpooledTemplateTests : IAsyncLifetime
 {
@@ -132,10 +133,173 @@ public sealed class WalUnpooledTemplateTests : IAsyncLifetime
         // The genuine index-0 event keeps its template: the unpooled event wrote no row 0.
         Assert.Equal(IndexZeroTemplate, events[pooledTicks].Template);
 
-        // The unpooled event gets NO template: the WAL never stored its text, and its logged
-        // index of 0 must not be resolved against the pool rows that did survive.
-        Assert.True(string.IsNullOrEmpty(events[unpooledTicks].Template),
-            $"the unpooled event was recovered with template '{events[unpooledTicks].Template}'");
+        // The unpooled event gets ITS OWN template — the text its v6 entry carries — and never the
+        // one its logged index of 0 would resolve to among the pool rows that did survive. (Before
+        // v6 carried the text it came back with none: the WAL had never stored it.)
+        Assert.Equal(UnpooledTemplate, events[unpooledTicks].Template);
+    }
+
+    /// <summary>
+    /// A pooled template longer than a pool row, used by several events of one log, comes back
+    /// whole on every one of them after a crash: the log holds the text once, in the first entry of
+    /// its index, and the replay resolves the others through that entry.
+    /// </summary>
+    [Fact]
+    public async Task Every_event_of_a_long_pooled_template_recovers_it_from_the_one_entry_that_carries_it()
+    {
+        string longTemplate = new string('é', 40_000) + " {n}";   // 80 004 UTF-8 bytes: more than a row holds
+        int    longIdx      = _engine.TemplatePool.Intern(longTemplate);
+        int    shortIdx     = _engine.TemplatePool.Intern("short {n}");
+        long   t            = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < 3; i++)
+            Write(t + i * TimeSpan.TicksPerSecond, longIdx, longTemplate, i);
+        Write(t + 3 * TimeSpan.TicksPerSecond, shortIdx, "short {n}", 3);
+
+        await CrashAndRestartAsync();
+
+        var events = ReadAllByTicks();
+        Assert.Equal(4, events.Count);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(longTemplate, events[t + i * TimeSpan.TicksPerSecond].Template);
+        Assert.Equal("short {n}", events[t + 3 * TimeSpan.TicksPerSecond].Template);
+    }
+
+    /// <summary>
+    /// A WAL whose events all carry their templates in their entries — every one outside a saturated
+    /// pool — has no pool rows, and that loses nothing: they replay with their templates, and the
+    /// replay does not say otherwise. It warned that every event was replayed without its template.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_with_no_pool_rows_whose_events_carry_their_templates_replays_without_a_false_warning()
+    {
+        await _engine.DisposeAsync();
+        const ulong SegId = 2_000;
+        string walPath = Path.Combine(WalDir, $"0-{SegId}.wal");
+        long   t       = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(walPath, new NodeId(0), new SegmentId(SegId), initialCapacity: 1 << 20))
+        {
+            wal.Append(t,                           LogLevel.Information, -1, "unpooled one {n}", Props(1));
+            wal.Append(t + TimeSpan.TicksPerSecond, LogLevel.Information, -1, "unpooled two {n}", Props(2));
+        }
+        Assert.Equal(0, new FileInfo(walPath + ".pool").Length);
+
+        var log  = new WarningLog();
+        var opts = new ServerOptions { DataDirectory = _dir };
+        _engine  = new StorageEngine(Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance), log);
+        await _engine.CatalogLoaded;
+
+        var events = ReadAllByTicks();
+        Assert.Equal("unpooled one {n}", events[t].Template);
+        Assert.Equal("unpooled two {n}", events[t + TimeSpan.TicksPerSecond].Template);
+        Assert.DoesNotContain(log.Warnings, w => w.Contains("without", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The other side of the line above (R2-4): a WAL whose pool rows were lost — its .pool file
+    /// zeroed by a power loss before it was fsynced — replays its pooled events without their
+    /// templates, and says how many of how many; an event carrying its template in its entry still
+    /// comes back with it and is not counted.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_pool_rows_were_lost_says_how_many_of_its_events_replay_without_a_template()
+    {
+        await _engine.DisposeAsync();
+        const ulong SegId = 2_000;
+        string walPath = Path.Combine(WalDir, $"0-{SegId}.wal");
+        long   t       = DateTime.UtcNow.Ticks;
+        using (var wal = WriteAheadLog.Open(walPath, new NodeId(0), new SegmentId(SegId), initialCapacity: 1 << 20))
+        {
+            wal.Append(t,                               LogLevel.Information, 7,  "pooled one {n}",   Props(1));
+            wal.Append(t + TimeSpan.TicksPerSecond,     LogLevel.Information, 8,  "pooled two {n}",   Props(2));
+            wal.Append(t + 2 * TimeSpan.TicksPerSecond, LogLevel.Information, -1, "unpooled {n}",     Props(3));
+        }
+        Assert.True(new FileInfo(walPath + ".pool").Length > 0);
+        File.WriteAllBytes(walPath + ".pool", []);   // the rows lost to a power loss
+
+        var log  = new WarningLog();
+        var opts = new ServerOptions { DataDirectory = _dir };
+        _engine  = new StorageEngine(Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance), log);
+        await _engine.CatalogLoaded;
+
+        var events = ReadAllByTicks();
+        Assert.Equal(3, events.Count);
+        Assert.Equal("", events[t].Template);
+        Assert.Equal("", events[t + TimeSpan.TicksPerSecond].Template);
+        Assert.Equal("unpooled {n}", events[t + 2 * TimeSpan.TicksPerSecond].Template);
+        Assert.Single(log.Warnings, w => w.Contains("2 of its 3 event(s) replay without a template", StringComparison.Ordinal));
+    }
+
+    /// <summary>The engine's Warning lines.</summary>
+    private sealed class WarningLog : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _warnings = new();
+
+        public string[] Warnings => _warnings.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Warning) _warnings.Enqueue(formatter(state, exception));
+        }
+    }
+
+    /// <summary>
+    /// An event whose <c>@service</c> is outside a full intern pool keeps it — in the tier, which keeps
+    /// the name beside the event as it keeps the template; in its segment once flushed; and through a
+    /// crash, its WAL entry carrying the name. A full pool answers -1 for the service, and the name was
+    /// lost from the live event, its segment and its replay alike.
+    /// </summary>
+    [Fact]
+    public async Task An_events_service_outside_a_full_pool_survives_the_tier_the_flush_and_a_crash()
+    {
+        for (int i = 0; _engine.TemplatePool.Intern("filler " + i) >= 0; i++) { }
+        Assert.Equal(-1, _engine.TemplatePool.Intern("svc.past.saturation"));
+        long t = DateTime.UtcNow.Ticks;
+
+        WriteWithService(t, "svc.past.saturation", 1);
+        Assert.Equal("svc.past.saturation", _engine.LiveHotTier.Materialise(0, _engine.TemplatePool).ServiceName);
+        await _engine.FlushHotTierAsync();                     // through the tier into a segment
+
+        WriteWithService(t + TimeSpan.TicksPerSecond, "svc.after.the.crash", 2);
+        await CrashAndRestartAsync();                          // and through the WAL
+
+        var events = ReadAllByTicks();
+        Assert.Equal("svc.past.saturation", events[t].Service);
+        Assert.Equal("svc.after.the.crash", events[t + TimeSpan.TicksPerSecond].Service);
+    }
+
+    private void WriteWithService(long ticks, string service, int n) =>
+        Assert.True(_engine.TryWrite(new LogEventHeader
+        {
+            TimestampUtcTicks        = ticks,
+            Level                    = LogLevel.Information,
+            MessageTemplatePoolIndex = -1,
+            ServiceNamePoolIndex     = -1,
+        }, Props(n), "service probe {n}", exception: null, service: service));
+
+    /// <summary>kill -9: keep the live WAL's bytes, let shutdown flush and unlink them, undo that flush, and start again.</summary>
+    private async Task CrashAndRestartAsync()
+    {
+        ulong  walId = _engine.LiveWalSegmentId;
+        string wal   = Directory.GetFiles(WalDir, "*.wal").Single();
+        File.Copy(wal, wal + ".crash", overwrite: true);
+        File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+
+        await _engine.DisposeAsync();
+        foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
+        {
+            var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+        }
+        File.Move(wal + ".crash", wal, overwrite: true);
+        File.Move(wal + ".pool.crash", wal + ".pool", overwrite: true);
+
+        _engine = NewEngine();
+        await _engine.CatalogLoaded;
     }
 
     /// <summary>

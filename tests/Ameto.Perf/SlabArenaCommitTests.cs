@@ -1,21 +1,21 @@
 using System.Globalization;
 using Ameto.Core;
-using Ameto.Ingestion;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace Ameto.Perf;
 
 /// <summary>
-/// The ingest payload arena is sized to the back-pressure ceiling — 512 MB by default — on the
-/// stated assumption that it is reserved address space whose pages fault in on demand. That held
-/// on Linux, where a large NativeMemory.Alloc is an anonymous mapping, and not on Windows, where
-/// a block that size is VirtualAlloc(MEM_COMMIT): the server took the whole commit charge at
+/// The span ring's payload arena (<see cref="SlabArena"/>) is sized to a back-pressure ceiling on
+/// the stated assumption that it is reserved address space whose pages fault in on demand. That
+/// held on Linux, where a large NativeMemory.Alloc is an anonymous mapping, and not on Windows,
+/// where a block that size is VirtualAlloc(MEM_COMMIT): the server took the whole commit charge at
 /// startup, before a single event had arrived.
 ///
 /// <para>These pin the property that replaces it — the arena is paid for as the buffer grows into
-/// it — and, more importantly, that payloads still round-trip byte for byte, because a slab handed
-/// out before its pages exist is an access violation, not a slow path.</para>
+/// it — and, more importantly, that bytes written into it read back exactly, because a range handed
+/// out before its pages exist is an access violation, not a slow path. (They drove the arena through
+/// the log ingest ring until that ring was removed; they now drive it directly.)</para>
 /// </summary>
 public sealed class SlabArenaCommitTests
 {
@@ -24,154 +24,128 @@ public sealed class SlabArenaCommitTests
     private readonly ITestOutputHelper _out;
     public SlabArenaCommitTests(ITestOutputHelper output) => _out = output;
 
-    private static byte[] Payload(int len, byte seed)
+    private static unsafe void Fill(SlabArena arena, long offset, int len, byte seed)
     {
-        var p = new byte[len];
-        for (int i = 0; i < len; i++) p[i] = (byte)(seed + i);
-        return p;
+        var span = new Span<byte>(arena.Base + offset, len);
+        for (int i = 0; i < len; i++) span[i] = (byte)(seed + i);
     }
 
-    private static bool Enqueue(IngestionRingBuffer ring, byte[] payload) =>
-        ring.TryEnqueue(DateTimeOffset.UtcNow.UtcTicks, (byte)LogLevel.Information, 0, "t", null, payload);
-
-    /// <summary>Drains everything and returns the payloads in order.</summary>
-    private static List<byte[]> DrainAll(IngestionRingBuffer ring, int maxPayload)
+    private static unsafe bool Holds(SlabArena arena, long offset, int len, byte seed)
     {
-        var got = new List<byte[]>();
-        var buf = new byte[maxPayload];
-        while (ring.TryDequeue(out _, out _, out _, out _, out _, buf, out int len,
-                               out _, out _, out _, out _))
-            got.Add(buf.AsSpan(0, len).ToArray());
-        return got;
+        var span = new ReadOnlySpan<byte>(arena.Base + offset, len);
+        for (int i = 0; i < len; i++)
+            if (span[i] != (byte)(seed + i)) return false;
+        return true;
     }
 
     [Fact]
     public void A_fresh_arena_commits_nothing()
     {
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 256 * MB);
-        _out.WriteLine($"commit-on-demand={ring.ArenaCommitsOnDemand} committed={ring.ArenaCommittedBytes:N0} B " +
-                       $"slabs={ring.SlabCapacity}");
+        using var arena = SlabArena.Create((nuint)(256 * MB), (nuint)MB);
+        _out.WriteLine($"commit-on-demand={arena.IsCommitOnDemand} committed={arena.CommittedBytes:N0} B");
 
-        Assert.True(ring.SlabCapacity > 1000, "the arena must still OFFER its full capacity");
-        if (!ring.ArenaCommitsOnDemand) return;   // platforms where the pages were already lazy
-
-        Assert.Equal(0, ring.ArenaCommittedBytes);
+        if (!arena.IsCommitOnDemand) return;   // platforms where the pages were already lazy
+        Assert.Equal(0, arena.CommittedBytes);
     }
 
     [Fact]
     public void Commit_tracks_the_high_water_mark_not_the_ceiling()
     {
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 256 * MB);
-        long ceiling = (long)ring.SlabCapacity * 64 * 1024;
+        const long ceiling = 256 * MB;
+        using var arena = SlabArena.Create((nuint)ceiling, (nuint)MB);
 
-        for (int i = 0; i < 64; i++) Assert.True(Enqueue(ring, Payload(100, (byte)i)));
-        _out.WriteLine($"64 small events: committed {ring.ArenaCommittedBytes:N0} B of a {ceiling:N0} B ceiling");
+        Assert.True(arena.TryEnsureCommitted((nuint)(64 * 64 * 1024)));
+        _out.WriteLine($"4 MB reached: committed {arena.CommittedBytes:N0} B of a {ceiling:N0} B ceiling");
 
-        if (!ring.ArenaCommitsOnDemand) return;
+        if (!arena.IsCommitOnDemand) return;
 
-        Assert.True(ring.ArenaCommittedBytes > 0, "64 enqueued payloads must have committed something");
-        Assert.True(ring.ArenaCommittedBytes < ceiling / 4,
-            $"committed {ring.ArenaCommittedBytes} of {ceiling} for 64 small events");
+        Assert.True(arena.CommittedBytes > 0, "reaching 4 MB must have committed something");
+        Assert.True(arena.CommittedBytes < ceiling / 4, $"committed {arena.CommittedBytes} of {ceiling} for 4 MB");
     }
 
     /// <summary>
-    /// The failure this change could introduce is a slab handed out before its pages exist, so
-    /// the bytes have to come back exactly — across enough events to cross several commit chunks.
+    /// The failure the commit-on-demand change could introduce is a range handed out before its
+    /// pages exist, so the bytes have to come back exactly — across enough of the arena to cross
+    /// several commit chunks.
     /// </summary>
     [Fact]
-    public void Payloads_round_trip_across_many_commit_chunks()
+    public void Bytes_round_trip_across_many_commit_chunks()
     {
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 256 * MB);
+        using var arena = SlabArena.Create((nuint)(256 * MB), (nuint)MB);
 
-        const int n = 600;
+        const int n = 600, len = 4096;
         for (int i = 0; i < n; i++)
-            Assert.True(Enqueue(ring, Payload(1024, (byte)i)), $"enqueue {i} was refused");
-
-        var got = DrainAll(ring, 64 * 1024);
-        Assert.Equal(n, got.Count);
-        for (int i = 0; i < n; i++) Assert.Equal(Payload(1024, (byte)i), got[i]);
+        {
+            long at = (long)i * len;
+            Assert.True(arena.TryEnsureCommitted((nuint)(at + len)), $"commit up to {at + len} was refused");
+            Fill(arena, at, len, (byte)i);
+        }
+        for (int i = 0; i < n; i++) Assert.True(Holds(arena, (long)i * len, len, (byte)i), $"range {i} did not read back");
     }
 
-    /// <summary>
-    /// A LIFO free list re-hands the slabs it already committed, so draining and refilling must
-    /// not walk any deeper into the arena.
-    /// </summary>
+    /// <summary>A range already committed is not committed again: going back below the mark grows nothing.</summary>
     [Fact]
-    public void Reuse_does_not_grow_the_commit()
+    public void Reaching_below_the_high_water_mark_does_not_grow_the_commit()
     {
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 256 * MB);
+        using var arena = SlabArena.Create((nuint)(256 * MB), (nuint)MB);
 
-        for (int i = 0; i < 200; i++) Enqueue(ring, Payload(512, (byte)i));
-        DrainAll(ring, 64 * 1024);
-        long afterFirstBurst = ring.ArenaCommittedBytes;
+        Assert.True(arena.TryEnsureCommitted((nuint)(8 * MB)));
+        long afterFirst = arena.CommittedBytes;
 
         for (int round = 0; round < 10; round++)
-        {
-            for (int i = 0; i < 200; i++) Enqueue(ring, Payload(512, (byte)i));
-            DrainAll(ring, 64 * 1024);
-        }
+            Assert.True(arena.TryEnsureCommitted((nuint)((round % 8 + 1) * MB)));
 
-        Assert.Equal(afterFirstBurst, ring.ArenaCommittedBytes);
+        Assert.Equal(afterFirst, arena.CommittedBytes);
     }
 
     /// <summary>
-    /// Every slab is still reachable and back-pressure still arrives where it did: the
-    /// reservation must bound nothing the committed allocation did not.
+    /// Concurrent callers cross the commit boundary together — the growth path is the only place
+    /// in the arena that takes a lock, and it must be idempotent under a race.
     /// </summary>
     [Fact]
-    public void The_whole_arena_is_still_usable_and_back_pressure_is_unchanged()
+    public void Concurrent_callers_crossing_a_commit_boundary_lose_nothing()
     {
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 16L * 64 * 1024);
-        Assert.Equal(16, ring.SlabCapacity);
+        using var arena = SlabArena.Create((nuint)(256 * MB), (nuint)MB);
 
-        for (int i = 0; i < 16; i++)
-            Assert.True(Enqueue(ring, Payload(64 * 1024, (byte)i)), $"slab {i} should be available");
-
-        Assert.False(Enqueue(ring, Payload(64 * 1024, 99)));     // no slab left: refused, not crashed
-        Assert.Equal(1, ring.DroppedNoSlab);
-
-        var got = DrainAll(ring, 64 * 1024);
-        Assert.Equal(16, got.Count);
-        for (int i = 0; i < 16; i++) Assert.Equal(Payload(64 * 1024, (byte)i), got[i]);
-    }
-
-    /// <summary>
-    /// Concurrent producers cross the commit boundary together — the growth path is the only
-    /// place in this buffer that takes a lock, and it must be idempotent under a race.
-    /// </summary>
-    [Fact]
-    public void Concurrent_producers_crossing_a_commit_boundary_lose_nothing()
-    {
-        using var ring = new IngestionRingBuffer(1 << 14, 64 * 1024, 256 * MB);
-
-        const int threads = 8, each = 200;
-        var start = new Barrier(threads);
-        int accepted = 0;
+        const int threads = 8, each = 200, len = 4096;
+        var start   = new Barrier(threads);
         var workers = new Thread[threads];
+        int refused = 0;
         for (int t = 0; t < threads; t++)
         {
             int id = t;
             workers[t] = new Thread(() =>
             {
-                var payload = Payload(4096, (byte)id);
                 start.SignalAndWait();
                 for (int i = 0; i < each; i++)
-                    if (Enqueue(ring, payload)) Interlocked.Increment(ref accepted);
+                {
+                    long at = ((long)i * threads + id) * len;
+                    if (!arena.TryEnsureCommitted((nuint)(at + len))) { Interlocked.Increment(ref refused); continue; }
+                    Fill(arena, at, len, (byte)(id + i));
+                }
             });
             workers[t].Start();
         }
         foreach (var w in workers) w.Join();
 
-        var got = DrainAll(ring, 64 * 1024);
-        _out.WriteLine($"{threads}x{each}: accepted {accepted}, drained {got.Count}, " +
-                       $"committed {ring.ArenaCommittedBytes:N0} B");
+        _out.WriteLine($"{threads}x{each}: refused {refused}, committed {arena.CommittedBytes:N0} B");
+        Assert.Equal(0, refused);
+        for (int t = 0; t < threads; t++)
+            for (int i = 0; i < each; i++)
+                Assert.True(Holds(arena, ((long)i * threads + t) * len, len, (byte)(t + i)));
+    }
 
-        Assert.Equal(accepted, got.Count);
-        foreach (var p in got)
-        {
-            Assert.Equal(4096, p.Length);
-            Assert.Equal(Payload(4096, p[0]), p);        // the seed is the first byte
-        }
+    /// <summary>
+    /// A plain allocation (the arena everywhere but Windows) commits nothing on demand and counts
+    /// nothing, so it reports -1 — not its whole size as if it were memory in use, which would show
+    /// every idle Linux container holding the arena's whole ceiling.
+    /// </summary>
+    [Fact]
+    public void A_plain_arena_reports_no_commit_figure_rather_than_its_size()
+    {
+        using var plain = SlabArena.Create((nuint)(4 * MB), 1 << 20, reserve: false);
+        Assert.False(plain.IsCommitOnDemand);
+        Assert.Equal(-1, plain.CommittedBytes);
     }
 
     // ── Transparent huge pages (Linux) ─────────────────────────────────────────
@@ -282,9 +256,6 @@ public sealed class SlabArenaCommitTests
                 Assert.Contains("nh", flags.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             }
         }
-
-        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 64 * MB);
-        Assert.Equal(0, ring.ArenaHugePageOptOutErrno);
     }
 
     /// <summary>

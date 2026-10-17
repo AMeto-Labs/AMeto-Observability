@@ -654,15 +654,32 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// points are NOT written back to the log — they are already in it, and it keeps
     /// appending after the last valid entry.
     /// </summary>
+    /// <summary>
+    /// Test seam: asked as the start replays the WAL; an exception it returns is thrown there, as a replay that cannot
+    /// read the log throws. An <see cref="AsyncLocal{T}"/>, so it reaches only the engines its test constructs. Null in
+    /// production.
+    /// </summary>
+    internal static readonly AsyncLocal<Func<Exception>?> ReplayFailsForTest = new();
+
     private void RecoverFromWal()
     {
         List<MetricWriteAheadLog.RecoveredPoint> recovered;
         int unresolved;
-        try { recovered = _wal.ReadAll(out unresolved); }
+        try
+        {
+            if (ReplayFailsForTest.Value?.Invoke() is { } failure) throw failure;
+            recovered = _wal.ReadAll(out unresolved);
+        }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Metric WAL replay failed — continuing with an empty hot tier");
-            return;
+            // The start fails (round-6 review R6-M3), as the open's failed walk does. It went on "with an empty hot
+            // tier", and its next flush committed the log: every point the replay had not read went with it — 0 of a
+            // crash's 10 in the review's probe. The log is closed as it is, and the next start replays it.
+            try { _logger.LogCritical(ex, "Metric WAL replay failed — the metric engine does not start; the WAL is kept for the next start to replay"); }
+            catch (Exception) { /* the throw below says it */ }
+            try { _wal.Dispose(); }
+            catch (Exception) { /* the process is ending its start; the handle goes with it */ }
+            throw new IOException("The metric WAL could not be replayed; it is kept for the next start (see the inner exception)", ex);
         }
 
         if (unresolved > 0)
@@ -1781,6 +1798,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         if (due) await FlushHotTierAsync().ConfigureAwait(false);
     }
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(Ameto.Core.OwnerTaskMethodBuilder))]
     private async Task FlushHotTierAsync()
     {
         // Cheap pre-check, deliberately OUTSIDE the gate: an empty tier has nothing to flush,
@@ -1788,6 +1806,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // turn every tick during a long write into a wait. _hot keeps its keys after a drain,
         // so the point count — not _hot.IsEmpty — is what "nothing to flush" means here.
         if (_hot.IsEmpty || Volatile.Read(ref _hotPointCount) == 0) return;
+
+        // Boxed before it waits for the gate (round-5 review L-16). A flush that found the gate held
+        // awaited it, and that await was its first real suspension: a box that could not be allocated
+        // there threw with the wait still queued, and the next release granted the gate to it — to
+        // nobody. No metric flush ran again, every later one waiting on the gate for ever, and the hot
+        // tier and the log grew until a restart. A failure here owns nothing.
+        await Task.Yield();
 
         // One flush at a time, from the snapshot through to the commit.
         //

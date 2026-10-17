@@ -97,9 +97,11 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
 
         Assert.Null(thrown);
         Assert.Equal(StatusCodes.Status200OK, ctx.Response.StatusCode);
-        Assert.Equal(1, ledger.Rents);                     // sized from Content-Length, never grown
+        // Two, neither grown: the body, sized from Content-Length, and the decoded batch's
+        // payloads, sized from the body (a CLEF event's properties are part of its map).
+        Assert.Equal(2, ledger.Rents);
         Assert.True(ledger.LargestRent >= body.Length);
-        ledger.AssertEveryBufferCameBackOnce(minRents: 1);
+        ledger.AssertEveryBufferCameBackOnce(minRents: 2);
     }
 
     [Fact]
@@ -208,11 +210,14 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
     [Fact]
     public async Task SinkFault_EscapingTheHandler_StillReturnsItsBuffer()
     {
-        // One event over the 64 KB per-event limit sends the sink down its warning path, and the
-        // logger there throws: a server fault, which leaves the handler rather than answering 400.
-        var ctx = Post(new MemoryStream(OversizedEventBatch()), declaredLength: null, fixLength: true);
+        // The sink underneath throws as it stages the event: a server fault, which leaves the handler
+        // rather than answering 400. (It used to be the drop Warning's logger, which the sink called as
+        // it staged an oversized event; that line is written with the answer now, and guarded.)
+        var ctx      = Post(new MemoryStream(OversizedEventBatch()), declaredLength: null, fixLength: true);
+        var endpoint = Endpoint();
+        endpoint.BeforeStageForTest = () => throw new InvalidOperationException("sink fault: a dependency under TryIngestClef failed");
 
-        var (thrown, ledger) = await DriveAsync(Endpoint(new ThrowingLogger()), ctx);
+        var (thrown, ledger) = await DriveAsync(endpoint, ctx);
 
         Assert.IsType<InvalidOperationException>(thrown);
         ledger.AssertEveryBufferCameBackOnce(minRents: 1);
@@ -251,9 +256,8 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
     {
         var sp = _factory.Services;
         return new IngestionEndpoint(
-            sp.GetRequiredService<IngestionRingBuffer>(),
+            sp.GetRequiredService<StorageEngine>(),
             sp.GetRequiredService<StringInternPool>(),
-            sp.GetRequiredService<IngestionDrainer>(),
             options ?? sp.GetRequiredService<ServerOptions>(),
             logger ?? NullLogger<IngestionEndpoint>.Instance);
     }
@@ -411,15 +415,6 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
-
-    private sealed class ThrowingLogger : ILogger<IngestionEndpoint>
-    {
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
-                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-            => throw new InvalidOperationException("sink fault: the logger under TryIngestClef failed");
-    }
 }
 
 /// <summary>
@@ -446,6 +441,9 @@ internal sealed class IngestBufferPoolLedger : IDisposable
 
     public int Rents           { get { lock (_gate) return _rents; } }
     public int PeakOutstanding { get { lock (_gate) return _peak; } }
+
+    /// <summary>Buffers this flow holds from the pool right now.</summary>
+    public int Outstanding     { get { lock (_gate) return _out.Count; } }
     public int LargestRent     { get { lock (_gate) return _largest; } }
 
     /// <summary>

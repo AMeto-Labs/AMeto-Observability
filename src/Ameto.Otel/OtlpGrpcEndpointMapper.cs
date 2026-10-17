@@ -27,8 +27,18 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpGrpcEndpointMapper
 {
-    /// <summary>One string for the one reason logs and traces refuse: TryIngest's bounded ring was full.</summary>
+    /// <summary>Why spans were refused: the trace ingest ring was full.</summary>
     private const string BufferFullReason = "the ingest buffer was full";
+
+    /// <summary>
+    /// Why log records were refused: over the per-event size limit (each leaves a marker event in
+    /// its place), or not written because the store had no room for them within the wait.
+    /// </summary>
+    internal const string LogsRefusedReason =
+        "log records over the per-event size limit, or that the store had no room for within the wait, were refused";
+
+    /// <summary>What UNAVAILABLE says when the log store had no room for any of the batch — retried by every OTLP exporter.</summary>
+    internal const string LogStoreBusyMessage = "the log store is behind and had no room for this batch; retry";
 
     private const string GrpcContentType = "application/grpc";
 
@@ -57,13 +67,10 @@ public static class OtlpGrpcEndpointMapper
         OtlpGzipTooLargeLog tooLargeLog    = app.Services.GetRequiredService<OtlpGzipTooLargeLog>();
         OtlpOutOfMemoryLog  outOfMemoryLog = app.Services.GetRequiredService<OtlpOutOfMemoryLog>();
 
+        // Logs decode into a batch that is written — and the call answered — only once its records
+        // are in the store (see HandleCoreAsync), so OK means they survive the death of this process.
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog, static (c, msg) =>
-            {
-                var (_, dropped) = OtlpLogProtoParser.Parse(
-                    msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
-                return (true, dropped, BufferFullReason);
-            }));
+            (HttpContext ctx) => HandleLogsAsync(ctx, inflateGate, tooLargeLog, outOfMemoryLog));
 
         if (enableTraces)
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
@@ -154,19 +161,72 @@ public static class OtlpGrpcEndpointMapper
     /// the protobuf to that signal's own decoder, and answer in trailers. Internal so the
     /// gate's answer can be tested over a plain context — see <c>OtlpInflateGateTests</c>.
     /// </summary>
-    internal static async Task HandleAsync(
+    internal static Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
         OtlpInflateGate inflateGate,
         OtlpGzipTooLargeLog tooLargeLog,
         OtlpOutOfMemoryLog outOfMemoryLog,
         Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
+        => HandleCoreAsync(ctx, required, inflateGate, tooLargeLog, outOfMemoryLog, decode, logs: false);
+
+    /// <summary>
+    /// The logs Export, as the route serves it (see <see cref="HandleCoreAsync"/>). Internal so a test
+    /// can drive it over a plain context, as <see cref="HandleAsync"/> is.
+    /// </summary>
+    internal static Task HandleLogsAsync(
+        HttpContext ctx, OtlpInflateGate inflateGate, OtlpGzipTooLargeLog tooLargeLog, OtlpOutOfMemoryLog outOfMemoryLog)
+        => HandleCoreAsync(ctx, ApiKeyPermissions.Logs, inflateGate, tooLargeLog, outOfMemoryLog, decode: null, logs: true);
+
+    /// <summary>
+    /// <see cref="HandleAsync"/>, and the logs Export: with <paramref name="logs"/> the message is
+    /// decoded into a <see cref="LogIngestBatch"/> (<paramref name="decode"/> unused), the inflate
+    /// buffer and its slot go back, and the batch is then written into the store — waiting for room
+    /// if it must — before the call is answered: OK once its records are in a WAL, UNAVAILABLE when
+    /// the store had no room for any of them — and so wrote nothing of the batch, whose drop markers
+    /// go in after its records — so the retry duplicates nothing.
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
+    private static async Task HandleCoreAsync(
+        HttpContext ctx,
+        ApiKeyPermissions required,
+        OtlpInflateGate inflateGate,
+        OtlpGzipTooLargeLog tooLargeLog,
+        OtlpOutOfMemoryLog outOfMemoryLog,
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)>? decode,
+        bool logs)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
         // rather than reading the status this method is about to send.
         ctx.Response.StatusCode  = StatusCodes.Status200OK;
         ctx.Response.ContentType = GrpcContentType;
+
+        // Boxed first, owning nothing (round-5 H-G, M-D). A state machine is boxed at its first real
+        // suspension, and a box that cannot be allocated throws there with every finally skipped while
+        // what it awaited runs on. That was the inflate gate's wait (a message read whole, the gate
+        // full): answered UNAVAILABLE, and the wait took the next freed slot for nobody — two such on
+        // the stand's two slots, and every compressed batch, HTTP or gRPC, was refused until a restart.
+        // Or it was the commit, waited out on a pool thread the commit itself needed. Here a failure
+        // takes nothing with it, and is answered UNAVAILABLE, which exporters retry.
+        //
+        // ANSWERED WITHOUT AN AWAIT (round-6 review R5-M3). A failure here can come after the box was made
+        // — the TPL event source's tracing, async debugging, a registration that allocates — and the box
+        // then holds a copy of the state machine taken at this Yield (Release's is a struct). An await in
+        // this catch reuses that box, and once it completed, the copy resumed after the Yield: the whole
+        // handler ran and wrote the batch under a call already answered UNAVAILABLE, which the exporter
+        // retries — stored twice (M-C's class). The status goes into the response headers instead, gRPC's
+        // own Trailers-Only answer, which hosting completes when the handler returns.
+        //
+        // AND ONLY ONCE THE FRAMES ABOVE HAVE SUSPENDED on it (round-6 review R6-H2; IngestFramesGate): queued by a
+        // yield, it ran on after a frame above failed at its suspension, in a context reused for the next call on
+        // the connection. Closed, it returns touching nothing more.
+        try { if (!await IngestFramesGate.PassAsync(ctx)) return; }
+        catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+        {
+            RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+            return;
+        }
 
         // gRPC IS HTTP/2. Serving these paths over HTTP/1.1 looked harmless and was not: once a
         // response body has gone out on HTTP/1.1 there are no trailers to carry the status and no
@@ -218,6 +278,7 @@ public static class OtlpGrpcEndpointMapper
 
         byte[]? inflated = null;
         bool holdsSlot   = false;
+        LogIngestBatch? batch = null;
         try
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
@@ -231,16 +292,29 @@ public static class OtlpGrpcEndpointMapper
             if (OtlpGrpcFraming.WillInflate(body.AsSpan(0, bodyLen), encoding))
             {
                 bool entered;
+                OtlpInflateGate.Claim? claim = null;
                 try
                 {
-                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted);
+                    entered = await inflateGate.TryEnterAsync(ctx.RequestAborted, out claim);
                 }
-                catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
+                catch (Exception ex)
                 {
+                    // Whatever ended the await, a slot the wait has taken or takes later goes back (round-6
+                    // review, the LOW on R5-M12's guard). This await is not the handler's first suspension
+                    // (the yield above is), so its box exists; but registering the continuation can still
+                    // throw with the wait pending — the TPL event source's wrapper, a wait that completed
+                    // meanwhile queued to a pool queue that must grow — and the wait then took the next
+                    // freed slot for nobody. The claim needs nothing to wait for (OtlpInflateGate.Claim).
+                    claim?.Abandon();
+                    if (!OtlpOutOfMemoryLog.IsOutOfMemory(ex)) throw;
+
                     // The wait itself ran out — its timer, the doorbell's queue node (#126 review
                     // NEW-4): the server's failure, answered as the read's is, UNAVAILABLE. It used to
                     // leave the handler, which hosting answered 500 and a client reads as UNKNOWN,
-                    // never retried. No slot was taken; the body goes back in the finally below.
+                    // never retried. The body goes back before the answer: a registration that threw
+                    // leaves this method's finally guarded off until an await suspends again (L-7).
+                    IngestBufferPool.Return(body);
+                    body = null;
                     await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                     return;
                 }
@@ -293,7 +367,26 @@ public static class OtlpGrpcEndpointMapper
             string? why;
             try
             {
-                (ok, rejected, why) = decode(ctx, segment);
+                if (logs)
+                {
+                    // Weighed before a record is staged (OtlpLogBatchWeight), as on the HTTP route: plainly
+                    // over the limit, RESOURCE_EXHAUSTED; the decoded budget spent, UNAVAILABLE. The decode
+                    // then counts what it takes and throws the same two the moment the batch passes either
+                    // bound, with nothing of it written. A message the walk cannot frame throws into the
+                    // INVALID_ARGUMENT below with no batch begun, so nothing of it is written.
+                    var  endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
+                    long weight   = OtlpLogBatchWeight.WeighProto(segment.AsSpan());
+                    if (weight > endpoint.MaxDecodedBatchBytes)
+                        throw new LogBatchTooHeavyException(weight, endpoint.MaxDecodedBatchBytes);
+                    batch = endpoint.TryBeginBatch(payloadSizeHint: segment.Count, weight)
+                         ?? throw new LogBatchBudgetFullException();
+                    OtlpLogProtoParser.Parse(segment.AsSpan(), batch);
+                    (ok, rejected, why) = (true, 0, null);
+                }
+                else
+                {
+                    (ok, rejected, why) = decode!(ctx, segment);
+                }
             }
             catch (OtlpMetricPointBudget.TooManyPointsException)
             {
@@ -303,6 +396,26 @@ public static class OtlpGrpcEndpointMapper
                 await FinishAsync(ctx, StatusResourceExhausted, OtlpMetricPointBudget.RefusalMessage);
                 return;
             }
+            catch (LogBatchTooHeavyException ex)
+            {
+                // The same for a logs batch that decodes past Ingestion.MaxDecodedLogBatchBytes — weighed
+                // so before it was decoded, or counted so while it was. Nothing of it is written: the
+                // batch is given back in the finally, never committed. Logged: the exporter does not retry.
+                ctx.RequestServices.GetRequiredService<IngestionEndpoint>().NoteTooHeavy(ctx.Request.Path.Value, ex.Weight);
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
+                await FinishAsync(ctx, StatusResourceExhausted, OtlpLogBatchWeight.RefusalMessage);
+                return;
+            }
+            catch (LogBatchBudgetFullException)
+            {
+                // The batches held decoded at once are at their limit — the store is behind and
+                // requests are waiting for room. Nothing decoded, nothing written: retried.
+                ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
+                await FinishAsync(ctx, StatusUnavailable, OtlpLogBatchWeight.BudgetFullMessage);
+                return;
+            }
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {
                 // It used to be the INVALID_ARGUMENT below, and an exporter drops a batch it is told
@@ -310,6 +423,7 @@ public static class OtlpGrpcEndpointMapper
                 // in; a sink's own log call that ran out arrives wrapped in an AggregateException
                 // (#126 review F3). The buffer and the slot go back before the answer, as below.
                 ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);
+                GiveBack(ref batch);
                 await RefuseOutOfMemoryAsync(ctx, outOfMemoryLog, ex);
                 return;
             }
@@ -319,6 +433,30 @@ public static class OtlpGrpcEndpointMapper
                 ctx.RequestServices.GetRequiredService<ILoggerFactory>()
                    .CreateLogger("Ameto.Otel.Grpc")
                    .LogWarning(ex, "OTLP/gRPC: failed to decode {Bytes} bytes", segment.Count);
+                // The records decoded before the fault are written, as they always were: OTLP
+                // defines INVALID_ARGUMENT as not retryable, so they would not come again.
+                if (batch is not null)
+                {
+                    batch.MarkMalformed();
+                    IngestBufferPool.Return(body);   // before the write, which may wait (see below)
+                    body = null;
+                    var commit = batch.BeginCommit(ctx.RequestAborted);   // on the handler's own box (see the commit below)
+                    Ameto.Storage.LogBatchWriteResult written;
+                    try { written = await commit.Write; }
+                    catch
+                    {
+                        // The AWAIT failed, not the write, which never throws (round-6 review R6-M5): its continuation's
+                        // registration ran out of memory, and the write runs on and lands. The finally that gives the batch
+                        // back is skipped on that road, its reservation with it: it goes back here, at the write's end (its
+                        // lease defers the dispose). The request is answered by the throw while the write lands (API.md).
+                        batch.Dispose();
+                        batch = null;
+                        throw;
+                    }
+                    batch.EndCommit(commit, written);
+                    batch.Dispose();   // before the answer (see the commit below)
+                    batch = null;
+                }
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
                 return;
             }
@@ -339,6 +477,44 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
+            if (batch is not null)
+            {
+                // Logs: answered once the records are in the store — the hot tier and its WAL, or a
+                // spill file. After the inflate slot went back (above), since this may wait for room;
+                // and after the request body, which for an identity frame IS the message: the batch
+                // holds its own copy of all it keeps, and a request waiting out BackPressureWait used
+                // to hold its message twice, the body until the outer finally.
+                IngestBufferPool.Return(body);
+                body = null;
+                // The write is awaited HERE, on the box the handler made first (round-6 review R5-M4): that
+                // await allocates nothing but its continuation's registration (caught below), so nothing
+                // between the write's start and its end can fail but the write. The batch is given back as
+                // soon as it is written, before the answer, which a client that stops reading can hold up.
+                var commit = batch.BeginCommit(ctx.RequestAborted);
+                Ameto.Storage.LogBatchWriteResult written;
+                try { written = await commit.Write; }
+                catch
+                {
+                    // The AWAIT failed, not the write, which never throws (round-6 review R6-M5): its continuation's
+                    // registration ran out of memory, and the write runs on and lands. The finally that gives the batch
+                    // back is skipped on that road, its reservation with it: it goes back here, at the write's end (its
+                    // lease defers the dispose). The request is answered by the throw while the write lands (API.md).
+                    batch.Dispose();
+                    batch = null;
+                    throw;
+                }
+                LogIngestResult result = batch.EndCommit(commit, written);
+                batch.Dispose();
+                batch = null;
+                if (result.Busy)
+                {
+                    await FinishAsync(ctx, StatusUnavailable, LogStoreBusyMessage);
+                    return;
+                }
+                rejected = result.Dropped;
+                why      = LogsRefusedReason;
+            }
+
             // Accepted — and it says how much was dropped, and why: each signal's decode lambda
             // supplies its own reason (traces/logs: the ingest buffer was full; metrics: a
             // far-future timestamp), so this no longer reports a clean success — or the wrong
@@ -349,9 +525,24 @@ public static class OtlpGrpcEndpointMapper
         }
         finally
         {
-            IngestBufferPool.Return(body);
+            if (body is not null) IngestBufferPool.Return(body);         // a logs batch gave it back before its write
             ReleaseInflate(ref inflated, ref holdsSlot, inflateGate);     // whatever an exception left held
+            batch?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Gives a logs batch back before a refusal's answer is awaited, and clears it, so the finally does
+    /// nothing more (round-5 review L-7). An await whose registration fails — the TPL event source, async
+    /// debugging — skips the handler's finally, and with it the batch's dispose: its reservation of the
+    /// decoded budget was lost for good. Never throws.
+    /// </summary>
+    private static void GiveBack(ref LogIngestBatch? batch)
+    {
+        var held = batch;
+        batch = null;
+        try { held?.Dispose(); }
+        catch (Exception) { /* its arrays and its reservation go back in its own finally */ }
     }
 
     /// <summary>
@@ -410,6 +601,26 @@ public static class OtlpGrpcEndpointMapper
         await FinishAsync(ctx, StatusUnavailable, IngestMemoryShortMessage);
         log.Note(ctx, ex);
     }
+
+    /// <summary>
+    /// <see cref="RefuseOutOfMemoryAsync"/> without an await, for the catch of the handler's first suspension
+    /// (see there): UNAVAILABLE in the response headers — the Trailers-Only answer, which hosting completes
+    /// when the handler returns — and the throttled line. The response has not started there; nothing has
+    /// been written.
+    /// </summary>
+    private static void RefuseOutOfMemory(HttpContext ctx, OtlpOutOfMemoryLog log, Exception ex)
+    {
+        if (!ctx.Response.HasStarted)
+        {
+            ctx.Response.Headers["grpc-status"]  = StatusUnavailableText;
+            ctx.Response.Headers["grpc-message"] = IngestMemoryShortMessage;
+        }
+        log.Note(ctx, ex);
+    }
+
+    /// <summary><see cref="StatusUnavailable"/> as the header carries it: a constant, so the answer allocates no string
+    /// and the class gains no static initializer (round-5 M-A: one that fails in an out of memory fails the type).</summary>
+    private const string StatusUnavailableText = "14";
 
     /// <summary>
     /// Writes the gRPC status.

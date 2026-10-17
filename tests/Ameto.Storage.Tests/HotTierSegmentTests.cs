@@ -193,6 +193,34 @@ public sealed class HotTierSegmentTests : IDisposable
         Assert.Equal(late, seg.ChunkHeaders(1, 9)[8].TimestampUtcTicks);
     }
 
+    /// <summary>
+    /// Round-5 review H-D, the tier's half. The managed text an event brings of its own (a template or a
+    /// service the pool did not take, an exception) counts against the payload limit: the tier reads full
+    /// once it holds that much, and refuses an event that would take it past the limit — the writer waits
+    /// for the next tier, as for a full one. An empty tier takes any event, or one larger than a tier
+    /// could never be written.
+    /// </summary>
+    [Fact]
+    public void The_text_an_event_brings_of_its_own_counts_against_the_tiers_size()
+    {
+        const long Limit = 64 * 1024;
+        using var tier = new HotTierSegment(64, Limit);
+        Assert.True(tier.TryWrite(MakeHeader(LogLevel.Information, 0), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: Limit - 100));
+        Assert.False(tier.IsFull, "a tier short of its limit read full");
+        Assert.False(tier.TryWrite(MakeHeader(LogLevel.Information, 1), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 101),
+                     "an event past the limit was taken");
+        Assert.Equal(1, tier.Count);
+        Assert.True(tier.TryWrite(MakeHeader(LogLevel.Information, 2), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 100),
+                    "an event up to the limit was refused");
+        Assert.True(tier.IsFull, "a tier holding its limit of its events' own text did not read full");
+        Assert.Equal(Limit, tier.ManagedBytes);
+
+        using var empty = new HotTierSegment(64, Limit);
+        Assert.True(empty.TryWrite(MakeHeader(LogLevel.Information, 0), ReadOnlySpan<byte>.Empty, "t", ownManagedBytes: 4 * Limit),
+                    "an empty tier refused an event larger than a tier");
+        Assert.True(empty.IsFull);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEventHeader MakeHeader(
@@ -241,6 +269,31 @@ public sealed class HotTierSlotArrayRecyclingTests
         var events = fresh.ReadAll().ToList();
         Assert.Equal(16, events.Count);
         Assert.All(events.Where(e => e.Id.RawValue != new EventId(0u, 3u).RawValue), e => Assert.Null(e.Exception));
+    }
+
+    /// <summary>
+    /// A write that throws stored nothing — the caller takes the throw for exactly that and writes
+    /// the event again. The template used to be stored in its slot before the exception array was
+    /// rented, so a rent that ran out of memory left it there, and the next event written into the
+    /// slot, with no template of its own, came back with it.
+    /// </summary>
+    [Fact]
+    public void A_write_that_throws_renting_its_exception_array_leaves_its_template_to_no_later_event()
+    {
+        var ex = new ExceptionInfo { Type = "T", Message = "m" };
+        using var tier = new HotTierSegment(64, 64 * 1024);
+        tier._beforeSlotRentForTest = t =>
+        {
+            if (t == typeof(ExceptionInfo)) throw new OutOfMemoryException("test: no 128 KB array for the exceptions");
+        };
+        Assert.Throws<OutOfMemoryException>(() => tier.TryWrite(Header(0), ReadOnlySpan<byte>.Empty, "the failed write's {n}", ex));
+        Assert.Equal(0, tier.Count);
+
+        tier._beforeSlotRentForTest = null;
+        Assert.True(tier.TryWrite(Header(1), ReadOnlySpan<byte>.Empty, template: null, exception: null));   // the same slot
+
+        Assert.Null(tier.GetTemplate(0));
+        Assert.Null(tier.GetException(0));
     }
 
     private static LogEventHeader Header(int seq) => new()

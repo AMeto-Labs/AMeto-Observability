@@ -285,9 +285,11 @@ public sealed class HotTierEventSource : ISegmentEventSource
         string template = hot.GetTemplate(i)
                        ?? memo.Template.Resolve(pool, h.MessageTemplatePoolIndex)
                        ?? string.Empty;
+        // A service with no pool index (the pool was full when it arrived) is the string the tier
+        // keeps beside the event, as for a template; a flush used to write such an event with none.
         string? service = h.ServiceNamePoolIndex >= 0
             ? memo.Service.Resolve(pool, h.ServiceNamePoolIndex)
-            : null;
+            : hot.GetService(i);
         return new SegmentEventRef(
             h.Id, h.TimestampUtcTicks, h.Level,
             h.TraceIdHi, h.TraceIdLo, h.SpanId,

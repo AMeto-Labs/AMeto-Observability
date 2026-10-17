@@ -50,6 +50,44 @@ public sealed class OversizedDropMarkerTests : IClassFixture<AmetoWebAppFactory>
         Assert.Equal("Information", GetProp(marker, "OriginalLevel").GetString());
     }
 
+    /// <summary>
+    /// The marker is written after the batch's own events (so a request answered 503 wrote nothing
+    /// of its batch), but it keeps the dropped event's timestamp, and the store orders by timestamp
+    /// before event id: it still sits between the events sent before and after the one it stands for.
+    /// </summary>
+    [Fact]
+    public async Task The_marker_sits_where_the_event_it_stands_for_was_sent()
+    {
+        var client = _factory.CreateClient();
+        // A window of this test's own: whole seconds, hours back, apart from every other test's events.
+        long nowSec = DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond;
+        var  t0     = new DateTimeOffset((nowSec - 3 * 3600 - Random.Shared.Next(100_000)) * TimeSpan.TicksPerSecond, TimeSpan.Zero);
+
+        var resp = await TestHelpers.IngestAsync(client,
+            TestHelpers.MakeEvent("order probe before", ts: t0),
+            TestHelpers.MakeEvent("order probe {Blob}", ts: t0.AddSeconds(1),
+                                  props: new Dictionary<string, object?> { ["Blob"] = new string('x', 100_000) }),
+            TestHelpers.MakeEvent("order probe after", ts: t0.AddSeconds(2)));
+        Assert.Equal(2, resp.GetProperty("ingested").GetInt32());
+        Assert.Equal(1, resp.GetProperty("dropped").GetInt32());
+
+        string url = TestHelpers.EventsUrl(count: 10, dir: "forward",
+                                           from: t0.AddSeconds(-1).ToString("O"), to: t0.AddSeconds(3).ToString("O"));
+        var events   = await TestHelpers.StreamEventsAsync(client, url);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (events.Count < 3 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+            events = await TestHelpers.StreamEventsAsync(client, url);
+        }
+
+        Assert.Equal(3, events.Count);
+        Assert.Equal("order probe before", events[0].GetProperty("@mt").GetString());
+        Assert.Contains("dropped an oversized log event", events[1].GetProperty("@mt").GetString());
+        Assert.Equal(t0.AddSeconds(1), DateTimeOffset.Parse(events[1].GetProperty("@t").GetString()!));
+        Assert.Equal("order probe after", events[2].GetProperty("@mt").GetString());
+    }
+
     /// <summary>Reads a property whether the server nested it under "props" or flattened it.</summary>
     private static JsonElement GetProp(JsonElement ev, string name)
     {

@@ -150,7 +150,8 @@ jobs:
   # This job runs that test's class, and the span ring's arena facts (its trim gives memory back with
   # madvise(MADV_DONTNEED) on Linux — see the second step), and the span bloom under invariant
   # globalization, the Docker image's mode (the third step), and the WALs' durable upgrade rename and
-  # the span WAL's relocation record (the fourth), and log-merge recovery (the fifth). The whole
+  # the span WAL's relocation record (the fourth), the log WAL's flush tick (the fifth), the WALs'
+  # block reservation (the sixth), and log-merge recovery (the seventh). The whole
   # suite already runs above; this job exists for the code that only does anything on Linux, or only
   # in production's mode, or whose tests were written on Windows' share modes.
   #
@@ -280,6 +281,126 @@ jobs:
                    SpanWalV3Tests.A_process_killed_anywhere_inside_a_commit_replays_every_surviving_span_once \
                    SpanWalV3Tests.The_open_that_finishes_a_relocation_forces_it_to_disk; do
             if ! grep -q "Passed Ameto.Storage.Tests.$t" wal-output.txt; then
+              echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE LOG WAL'S FLUSH TICK, ON LINUX. A tick writes the appended tail back OFF the appender's
+      # lock, and how differs by platform: on Linux it issues no msync at all — a shared mapping's
+      # pages are the file's page cache, and the fsync that already ran outside the lock writes them —
+      # while the backend job above runs Windows' FlushViewOfFile outside the lock, under the view's
+      # read lock that a grow and a dispose wait for. The Linux road is production's (the Docker
+      # image, the stands), and no CI run took it. Same guard as above: each named fact must appear
+      # as Passed.
+      - name: Test the log WAL's flush tick (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~WalFlushTickTests|FullyQualifiedName~WalWriterPathTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee walflush-output.txt
+
+          for t in CleanTick_DoesNoIoAtAll \
+                   DirtyTick_FlushesTheWrittenRange_NotTheWholeMapping \
+                   TickAfterMoreAppends_FlushesAgain_AndOnlyTheNewTail \
+                   An_append_goes_through_while_a_tick_writes_the_mapping_back \
+                   A_grow_waits_out_a_tick_writing_the_old_view_back \
+                   A_dispose_waits_out_a_tick_writing_the_view_back \
+                   FailedHandleFlush_IsRetriedByTheNextIdleTick \
+                   FlushedEntriesSurviveAndReplay \
+                   ReopenedWal_DoesNotReflushWhatIsAlreadyOnDisk \
+                   FlushAcrossAGrow_StillReplaysEverything; do
+            if ! grep -q "Passed Ameto.Storage.Tests.WalFlushTickTests.$t" walflush-output.txt; then
+              echo "::error::WalFlushTickTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+          # The appender's path (round-3 R3-1): the pool's fsync off its lock (and a dispose closing the
+          # pool under it), and a grow's unmap without the view's write-back (munmap here,
+          # UnmapViewOfFile on Windows); and the tick's own failures (round 4): the handle of a log a
+          # failed grow left unmapped, and a pool claim that fails (named here since round-5 L-20 — the
+          # filter ran them, and nothing would have said had it stopped).
+          for t in An_append_that_needs_a_new_pool_row_goes_through_while_a_tick_fsyncs_the_pool \
+                   A_dispose_while_a_tick_fsyncs_the_pool_is_not_the_ticks_error \
+                   A_grow_unmaps_the_old_view_without_writing_it_back \
+                   A_tick_flushes_the_handle_of_a_log_a_failed_grow_left_unmapped \
+                   A_pool_claim_that_fails_is_retried_and_never_replaces_the_wals_failure; do
+            if ! grep -q "Passed Ameto.Storage.Tests.WalWriterPathTests.$t" walflush-output.txt; then
+              echo "::error::WalWriterPathTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE STARTUP SWEEPS, ON LINUX (round-5 L-20). The sweeps that delete what a gone log leaves —
+      # its pool (round-4 L18), its completion marker — and the flush that keeps a marker while its log
+      # stays: on Windows a pool outlives its log under a tick's open handle, and the look that says a
+      # log is gone (round-5 L-18) reads a file system's answer, which is the platform's. These ran in
+      # the Windows job alone. Same guard as above: each named fact must appear as Passed.
+      - name: Test the startup sweeps (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker|FullyQualifiedName~_cannot_open_is_kept_and_its_events_come_back|FullyQualifiedName~whose_marker_the_|FullyQualifiedName~whose_pool_the_startup_replay_cannot_open|FullyQualifiedName~On_linux_a_block_without_a_marker_is_cleaned_up" \
+            --logger "console;verbosity=normal" 2>&1 | tee sweep-output.txt
+
+          # And (round 6) the recovery reads and the marker checks that a look or an open the file system
+          # refuses must not read as "gone" (R5-M6), and the removal of a marker that is not there, which
+          # fsynced the directory here and failed with it (R5-M7's LOW).
+          for t in Pool_files_whose_log_is_gone_are_swept_at_the_start \
+                   A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker \
+                   A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker \
+                   A_wal_the_startup_replay_cannot_open_is_kept_and_its_events_come_back \
+                   A_spill_file_the_despill_cannot_open_is_kept_and_its_events_come_back \
+                   A_wal_whose_pool_the_startup_replay_cannot_open_keeps_its_templates \
+                   A_flushed_wal_whose_marker_the_start_cannot_look_at_is_not_written_twice \
+                   A_flushed_spill_file_whose_marker_the_despill_cannot_look_at_is_not_written_twice \
+                   On_linux_a_block_without_a_marker_is_cleaned_up_whatever_the_directory_fsync_says; do
+            if ! grep -q "Passed Ameto.Storage.Tests.IngestWriteAndSpillTests.$t" sweep-output.txt; then
+              echo "::error::IngestWriteAndSpillTests.$t did not run and pass on Linux; the filter no longer reaches it."
+              exit 1
+            fi
+          done
+
+      # THE WALS' BLOCKS, RESERVED WHERE THEY ARE SIZED, ON LINUX (round-5 H-F). The log WAL and its
+      # spill files, the span WAL (round-6 R5-H1) and the metric WAL are mapped over files sized with
+      # SetLength — ftruncate here, which leaves them sparse — and a write through the mapping into a
+      # page of a full volume was SIGBUS: the server killed, where NTFS fails the open or the grow with
+      # an IOException the engine answers 503 with. FileSpace reserves the blocks (fallocate(2)) at each
+      # open and each growth; the On_linux facts read the blocks a log has on disk (stat) against its
+      # length, and return early off Linux, which the guard turns into a failure here if the filter
+      # stops reaching them. The rest of WalReservationTests, and the upgrade facts, refuse a
+      # reservation through FileSpace's seam: the file must be left as the open found it, which is
+      # ftruncate and unlink here.
+      - name: Test the WALs' block reservation (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow|FullyQualifiedName~On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth|FullyQualifiedName~WalReservationTests|FullyQualifiedName~whose_copy_the_volume_cannot_hold" \
+            --logger "console;verbosity=normal" 2>&1 | tee reserve-output.txt
+
+          for t in WriteAheadLogTests.On_linux_a_log_has_its_blocks_from_its_open_and_from_each_grow \
+                   MetricWalTests.On_linux_the_metric_log_has_its_blocks_from_its_open_and_from_each_growth \
+                   WalReservationTests.On_linux_the_span_log_has_its_blocks_from_its_open_and_from_each_growth \
+                   WalReservationTests.On_linux_the_span_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.Every_open_of_the_span_log_reserves_its_whole_file \
+                   WalReservationTests.A_span_log_growth_reserves_what_it_adds \
+                   WalReservationTests.A_span_log_growth_the_volume_cannot_hold_fails_its_append_and_is_undone \
+                   WalReservationTests.A_span_log_open_the_volume_cannot_hold_throws_and_removes_the_file_it_created \
+                   WalReservationTests.A_span_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   SpanWalV3Tests.A_v2_log_whose_copy_the_volume_cannot_hold_stays_v2_and_loses_nothing \
+                   WalReservationTests.On_linux_the_metric_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.On_linux_the_log_reopened_over_a_sparse_file_has_its_blocks \
+                   WalReservationTests.Every_open_of_the_metric_log_reserves_its_whole_file \
+                   WalReservationTests.A_metric_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created \
+                   WalReservationTests.A_metric_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   WalReservationTests.Every_open_of_the_log_reserves_its_whole_file \
+                   WalReservationTests.A_log_open_the_volume_cannot_hold_leaves_an_existing_log_as_it_found_it \
+                   WalReservationTests.A_log_open_the_volume_cannot_hold_throws_and_removes_the_files_it_created \
+                   MetricWalV2Tests.A_v1_log_whose_copy_the_volume_cannot_hold_opens_as_v1_and_loses_nothing; do
+            if ! grep -q "Passed Ameto.Storage.Tests.$t" reserve-output.txt; then
               echo "::error::$t did not run and pass on Linux; the filter no longer reaches it."
               exit 1
             fi

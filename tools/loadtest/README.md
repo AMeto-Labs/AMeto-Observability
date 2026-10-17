@@ -73,8 +73,8 @@ a full 100k/s × 60 s run:
 
 Final run: **6 001 000 / 6 001 000 ingested (99 947/s), zero drops**, batch
 p95 5.2 ms, max 74 ms, RSS steady ~1 GB. The drop threshold was never the ring
-slot count but the payload slab pool — see `Ingestion.RingCapacity` /
-`Ingestion.PayloadPoolBytes` in [CONFIGURATION.md](../../docs/CONFIGURATION.md).
+slot count but the payload slab pool. (The log ingest ring is gone since: a request now writes
+its events into the store itself and spills to disk when the flush is behind — see "Log ingest: acknowledged means written" in [CONFIGURATION.md](../../docs/CONFIGURATION.md).)
 
 ## Measured: v1.0.10 (installed service), 2026-07-18
 

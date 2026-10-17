@@ -57,6 +57,10 @@ internal sealed class BoundedByteArrayPool
 
     private static int BucketOf(int length) => BitOperations.Log2((uint)length) - BitOperations.Log2(MinLength);
 
+    /// <summary>The length <see cref="Rent"/> hands back for <paramref name="minimumLength"/>: its bucket's, or exactly it past the largest.</summary>
+    public int RentLength(int minimumLength) =>
+        minimumLength > MaxLength ? minimumLength : (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(minimumLength, MinLength));
+
     /// <summary>
     /// An array of at least <paramref name="minimumLength"/> bytes, contents undefined. Past
     /// <see cref="MaxLength"/> it is allocated at exactly the length asked for — correct, just

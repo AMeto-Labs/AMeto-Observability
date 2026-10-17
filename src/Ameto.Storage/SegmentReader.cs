@@ -106,13 +106,31 @@ public sealed class SegmentReader : ISegmentReader
     /// </param>
     public static SegmentReader Open(string filePath, bool computeUncompressedBytes = false)
     {
-        var fi = new FileInfo(filePath);
-        if (!fi.Exists) throw new FileNotFoundException("Segment file not found", filePath);
-
-        long fileSize = fi.Length;
-        ThrowIfShorterThanFooter(filePath, fileSize);
-        var mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        return Map(mmf, filePath, fileSize, computeUncompressedBytes, fi.LastWriteTimeUtc.Ticks);
+        // The file is opened, not looked at first (round-6 review R5-M6's class). FileInfo.Exists answers
+        // false for a file it could not look at as well (a share that did not answer, an access check),
+        // and this turned that false into a FileNotFoundException, which its callers read as "the segment
+        // is gone": merge recovery took a whole output for one that never landed, freed its sources and
+        // dropped the manifest, and the next start served the output beside them. The open says what the
+        // file system says — FileNotFound only for a file that is not there — and the size and the write
+        // time come off its handle. The share mode is what CreateFromFile by path opened with (Read).
+        FileRefusal.ThrowIfRefused(filePath, FileRefusal.Access.Open);
+        var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1);
+        MemoryMappedFile mmf;
+        long fileSize, lastWriteTicks;
+        try
+        {
+            fileSize = fs.Length;
+            ThrowIfShorterThanFooter(filePath, fileSize);
+            lastWriteTicks = File.GetLastWriteTimeUtc(fs.SafeFileHandle).Ticks;
+            mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read,
+                                                  HandleInheritability.None, leaveOpen: false);
+        }
+        catch
+        {
+            fs.Dispose();
+            throw;
+        }
+        return Map(mmf, filePath, fileSize, computeUncompressedBytes, lastWriteTicks);   // the mapping owns the handle now
     }
 
     /// <summary>
@@ -1123,7 +1141,7 @@ public sealed class SegmentReader : ISegmentReader
     /// the same caveats as <see cref="PooledSectionRents"/> — a test that reads it needs the
     /// assembly's parallelisation switched off.
     ///
-    /// <para>Opening a segment is a <c>FileInfo</c> stat, a <c>CreateFromFile</c>, a
+    /// <para>Opening a segment is a file open, a <c>CreateFromFile</c>, a
     /// <c>CreateViewAccessor</c> over the whole file and a block-index read and parse. A query
     /// used to do all of it TWICE per surviving segment — once to prefilter, once to scan —
     /// which is invisible in a wall clock next to the decode but is 40 mappings for a

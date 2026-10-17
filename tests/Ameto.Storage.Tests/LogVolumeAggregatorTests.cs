@@ -185,6 +185,39 @@ public sealed class LogVolumeAggregatorTests
         Assert.Equal(events.Count, filtered.Scanned);
     }
 
+    /// <summary>
+    /// An event whose service has no pool index — the pool was full when it arrived — is counted
+    /// under the name the tier keeps beside it, not as "(unknown)", and a service filter finds it.
+    /// </summary>
+    [Fact]
+    public void HotAggregate_CountsAServiceKeptBesideTheEvent()
+    {
+        long t0   = new DateTimeOffset(2026, 10, 11, 12, 0, 0, TimeSpan.Zero).UtcTicks;
+        var  pool = new StringInternPool();
+        using var hot = new HotTierSegment(maxEvents: 64, maxPayloadBytes: 1024 * 1024);
+        for (int i = 0; i < 3; i++)
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)i).RawValue,
+                TimestampUtcTicks        = t0 + i * TimeSpan.TicksPerSecond,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = -1,
+                ServiceNamePoolIndex     = -1,
+            }, ReadOnlySpan<byte>.Empty, service: "kept.svc"));
+        long toTicks = t0 + 3 * TimeSpan.TicksPerSecond;
+        var (minB, nBuckets) = Axis(t0, toTicks);
+
+        var all = new LogVolumeAggregator(t0, toTicks, minB, BucketSeconds, nBuckets, null, pool);
+        hot.AggregateInto(all, t0, toTicks);
+        var built = all.Build();
+        var svc   = Assert.Single(built.Services);
+        Assert.Equal("kept.svc", svc.Name);
+
+        var filtered = new LogVolumeAggregator(t0, toTicks, minB, BucketSeconds, nBuckets, "kept.svc", pool);
+        hot.AggregateInto(filtered, t0, toTicks);
+        Assert.Equal(3, filtered.Build().Total);
+    }
+
     [Fact]
     public void HotAggregate_WindowExcludesOutOfRange()
     {

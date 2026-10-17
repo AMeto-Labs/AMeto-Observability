@@ -89,11 +89,24 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
                 services.AddSingleton<ISpanSink>(sp =>
                     new FailingSpanSink(this, sp.GetRequiredService<Ameto.Tracing.Ingestion.SpanIngestionEndpoint>()));
                 services.AddSingleton(sp => new IngestionEndpoint(
-                    sp.GetRequiredService<IngestionRingBuffer>(),
+                    sp.GetRequiredService<Ameto.Storage.StorageEngine>(),
                     sp.GetRequiredService<StringInternPool>(),
-                    sp.GetRequiredService<IngestionDrainer>(),
                     sp.GetRequiredService<ServerOptions>(),
-                    _sinkLoggers.CreateLogger<IngestionEndpoint>()));
+                    _sinkLoggers.CreateLogger<IngestionEndpoint>())
+                {
+                    // The log fault is the decode running out of memory as it stages a record — it
+                    // was injected through the oversized-drop Warning the sink logged as it staged
+                    // one, a line now written with the answer instead (and guarded there). Wrapped,
+                    // as Microsoft.Extensions.Logging's logger wraps a provider's failure.
+                    BeforeStageForTest = () =>
+                    {
+                        if (Failing == "logs")
+                            throw new AggregateException(new OutOfMemoryException("injected: the log decode ran out"));
+                    },
+                    // The answer's drop lines go through the failing provider too: no once-a-second
+                    // limit, so each of this class's batches reaches it — it must not change the answer.
+                    OversizedWarningInterval = TimeSpan.Zero,
+                });
             });
         }
 

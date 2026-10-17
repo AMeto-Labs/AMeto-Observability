@@ -334,6 +334,57 @@ public sealed class WalRecoveredServiceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-4 L16, the template twin of the test above. A power loss kept the entry and lost the pool
+    /// row its TEMPLATE needed. The event replays with no template — not with whatever the restarted
+    /// process's pool holds at that index, here another orphaned WAL's template, force-interned at the
+    /// same index by its replay, which ran first. The replay resolved a pooled template through the
+    /// live pool whenever the file held any row at all, and stamped that template on the event, in its
+    /// segment, for good.
+    /// </summary>
+    [Fact]
+    public async Task A_template_whose_pool_row_was_lost_replays_without_one_not_as_another_wals_template()
+    {
+        const string Kept     = "kept {n}";
+        const string Lost     = "lost {n}";
+        const string Stale    = "stale template {n}";
+        const ulong  StaleSeg = 1_000;
+        long t       = DateTime.UtcNow.Ticks;
+        int  keptIdx = _engine.TemplatePool.Intern(Kept);
+        int  lostIdx = _engine.TemplatePool.Intern(Lost);
+        foreach (var (ticks, index, template, n) in new[] { (t, keptIdx, Kept, 0), (t + TimeSpan.TicksPerSecond, lostIdx, Lost, 1) })
+            Assert.True(_engine.TryWrite(new LogEventHeader
+            {
+                TimestampUtcTicks        = ticks,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = index,
+                ServiceNamePoolIndex     = -1,
+            }, Props(n), template));
+
+        await CrashAndRestartAsync(tamper: wal =>
+        {
+            // The first template's row reached disk; the second's did not.
+            var rows = WriteAheadLog.LoadPool(wal + ".pool");
+            Assert.Equal([Kept, Lost], rows.OrderBy(kv => kv.Key).Select(kv => kv.Value));
+            using (var pool = File.Create(wal + ".pool"))
+                foreach (var (index, text) in rows)
+                    if (text != Lost) WritePoolRow(pool, index, text);
+
+            CreateListedBefore(wal, path =>
+            {
+                using var stale = WriteAheadLog.Open(path, NodeId.Local, new SegmentId(StaleSeg), 64 * 1024);
+                stale.Append(t - TimeSpan.TicksPerSecond, LogLevel.Information, lostIdx, Stale, Props(99));
+            });
+        });
+
+        var events = ReadAllByTicks();
+        Assert.Equal(3, events.Count);
+        Assert.Equal(Stale, events[t - TimeSpan.TicksPerSecond].Template);   // the other WAL's event keeps its own
+        Assert.Equal(Kept, events[t].Template);
+        Assert.True(string.IsNullOrEmpty(events[t + TimeSpan.TicksPerSecond].Template),
+            $"a template with no pool row was resolved anyway: '{events[t + TimeSpan.TicksPerSecond].Template}'");
+    }
+
+    /// <summary>
     /// Creates a WAL (through <paramref name="create"/>) under a name the directory lists BEFORE
     /// <paramref name="other"/>, so the engine's replay, which walks that listing, replays it first.
     /// The order is the file system's — by name on NTFS, by hash on ext4, newest first on tmpfs — so
@@ -400,6 +451,69 @@ public sealed class WalRecoveredServiceTests : IAsyncLifetime
         Assert.Equal(2, events.Count);
         Assert.All(events.Values, e => Assert.True(string.IsNullOrEmpty(e.Service), $"service '{e.Service}'"));
         Assert.All(events.Values, e => Assert.Equal(IndexZeroTemplate, e.Template));
+    }
+
+    /// <summary>
+    /// Round-4 H2, the replay's memory. A log whose every entry carries the same service by its text —
+    /// a service outside a full pool, and every long pooled one in a log written before such a service
+    /// was carried once — replays holding ONE copy of it, and builds no other. The walk made a string
+    /// per entry and the recovery tier kept each one beside its event: 3 500 events of a 65 600-character
+    /// service held ~460 MB, and the replay ran a 384 MiB heap out at every start (0 served, the log
+    /// kept). Measured on the replaying thread — the constructor's — between the two replay seams, so
+    /// no other test's allocations count; and as the instances the tier holds.
+    /// </summary>
+    [Fact]
+    public async Task A_log_whose_every_entry_carries_one_long_service_replays_holding_one_copy_of_it()
+    {
+        await _engine.DisposeAsync();
+
+        const ulong SegId   = 3_000;
+        const int   Events  = 400;
+        string      service = "Svc." + new string('s', 64 * 1024);   // 128 KB a copy: 50 MB for one per event
+        long        t       = DateTime.UtcNow.Ticks;
+        string      walPath = Path.Combine(WalDir, $"0-{SegId}.wal");
+        using (var wal = WriteAheadLog.Open(walPath, NodeId.Local, new SegmentId(SegId), initialCapacity: 1024 * 1024))
+        {
+            for (int i = 0; i < Events; i++)
+                Assert.True(wal.Append(t + i, LogLevel.Information, 0, IndexZeroTemplate, Props(i), serviceIndex: -1, service: service));
+        }
+        using (var pool = File.Create(walPath + ".pool"))
+            WritePoolRow(pool, 0, IndexZeroTemplate);
+
+        HotTierSegment? tier      = null;
+        long            before    = 0, allocated = -1;
+        int             held      = -1, events = -1;
+        StorageEngine.RecoveryTierCreatedForTest.Value = created => tier ??= created;
+        StorageEngine.BeforeWalReplayReadForTest.Value = _ => before = GC.GetAllocatedBytesForCurrentThread();
+        StorageEngine.AfterWalReplayReadForTest.Value  = _ =>
+        {
+            allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            var copies = new HashSet<string>(ReferenceEqualityComparer.Instance);
+            for (int i = 0; i < tier!.Count; i++)
+                if (tier.GetService(i) is { } s) copies.Add(s);
+            held   = copies.Count;
+            events = tier.Count;
+        };
+        try
+        {
+            _engine = NewEngine();
+        }
+        finally
+        {
+            StorageEngine.RecoveryTierCreatedForTest.Value = null;
+            StorageEngine.BeforeWalReplayReadForTest.Value = null;
+            StorageEngine.AfterWalReplayReadForTest.Value  = null;
+        }
+        await _engine.CatalogLoaded;
+
+        Assert.Equal(Events, events);
+        Assert.Equal(1, held);
+        Assert.True(allocated < 8L << 20, $"the replay allocated {allocated:N0} B for {Events} events of one {service.Length:N0}-char service");
+
+        var replayed = ReadAllByTicks();
+        Assert.Equal(Events, replayed.Count);
+        Assert.All(replayed.Values, e => Assert.Equal(service, e.Service));
+        Assert.Empty(Directory.GetFiles(WalDir, $"0-{SegId}.wal"));   // replayed, and the log gone
     }
 
     /// <summary>

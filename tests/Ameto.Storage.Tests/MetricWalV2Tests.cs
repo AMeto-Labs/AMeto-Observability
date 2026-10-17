@@ -1194,6 +1194,37 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A v1 LOG WHOSE v2 COPY THE VOLUME CANNOT HOLD OPENS AS v1 AND LOSES NOTHING (round-6 review R5-H2).
+    /// The copy's blocks are reserved before the move commits it, so a full volume fails the upgrade where
+    /// the v1 log stays open in its own layout and the copy is removed — not at the open after the commit
+    /// point, which reserves the whole file and would have failed the metric engine's start. Unreserved,
+    /// the copy was moved in with its tail sparse. The next start upgrades it.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_copy_the_volume_cannot_hold_opens_as_v1_and_loses_nothing()
+    {
+        WriteV1Log();
+        var logger = new CapturingLogger();
+        FileSpace.ReserveForTest.Value = (_, _, _) => File.Exists(TmpPath) ? new IOException("test: the volume is full") : null;
+        try
+        {
+            using var wal = Open(logger);
+            Assert.True(VersionOnDisk(WalPath) == 1, $"the upgrade committed a copy whose blocks could not be reserved: the log is v{VersionOnDisk(WalPath)}");
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+        finally { FileSpace.ReserveForTest.Value = null; }
+
+        Assert.False(File.Exists(TmpPath));
+        Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Error is IOException);
+
+        using (var wal = Open())
+        {
+            Assert.Equal((ushort)2, VersionOnDisk(WalPath));
+            AssertTheV1Points(wal.ReadAll(out int unresolved), unresolved);
+        }
+    }
+
+    /// <summary>
     /// A STALE COPY from an upgrade that died before its move is removed. Beside a v2 log it is
     /// garbage that nothing else would ever delete; beside a v1 log the upgrade overwrites it.
     /// </summary>
@@ -1250,6 +1281,48 @@ public sealed class MetricWalV2Tests : IAsyncLifetime
         }
         Assert.Contains(logger.Entries, static e => e.Level == LogLevel.Error && e.Text.Contains("pre-release"));
         Assert.DoesNotContain(logger.Entries, static e => e.Text.Contains("header does not verify"));
+    }
+
+    /// <summary>
+    /// Round-6 review (the logs WAL's pool had the same shape). The log's close wrote the pool's buffer out and closed
+    /// it in one try, so a write that failed skipped the close, and the pool's handle was left to the finalizer. Two
+    /// tries now: the pool is closed whatever its last write does.
+    /// </summary>
+    [Fact]
+    public void A_pool_whose_last_write_fails_is_closed_all_the_same()
+    {
+        var wal   = Open();
+        var field = typeof(MetricWriteAheadLog).GetField("_poolStream",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var real  = (FileStream)field.GetValue(wal)!;
+        var pool  = new WriteFailsOncePool(Path.Combine(_dir, "stand-in.pool"));
+        field.SetValue(wal, pool);
+        real.Dispose();
+
+        wal.Dispose();
+
+        Assert.True(pool.Failed, "setup: the pool's last write did not fail");
+        Assert.True(pool.Closed, "the pool whose last write failed was not closed: its handle is left to the finalizer");
+    }
+
+    /// <summary>A pool file whose first flush fails, and which says whether it was closed.</summary>
+    private sealed class WriteFailsOncePool(string path) : FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.Read)
+    {
+        private int _armed = 1;
+        public bool Failed { get; private set; }
+        public bool Closed { get; private set; }
+
+        public override void Flush()
+        {
+            if (Interlocked.Exchange(ref _armed, 0) == 1) { Failed = true; throw new IOException("test: the pool's last write failed"); }
+            base.Flush();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) Closed = true;
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class CapturingLogger : ILogger

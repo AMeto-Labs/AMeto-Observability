@@ -54,11 +54,14 @@ public sealed class IngestTemplatePoolExhaustionTests : IClassFixture<ExhaustedT
 
         // The OTLP JSON streaming sink — TryIngestRaw.
         var endpoint = _factory.Services.GetRequiredService<IngestionEndpoint>();
-        Assert.True(endpoint.TryIngestRaw(
-            DateTimeOffset.UtcNow.UtcTicks, (byte)LogLevel.Information,
-            Encoding.UTF8.GetBytes(RawTemplate), ProbeProps("r1-raw"),
-            0, 0, 0, default));
-        endpoint.NotifyBatchEnqueued();
+        using (var batch = endpoint.BeginBatch())
+        {
+            Assert.True(batch.TryIngestRaw(
+                DateTimeOffset.UtcNow.UtcTicks, (byte)LogLevel.Information,
+                Encoding.UTF8.GetBytes(RawTemplate), ProbeProps("r1-raw"),
+                0, 0, 0, default));
+            Assert.Equal(1, (await batch.CommitAsync()).Ingested);
+        }
 
         // Every read is checked before anything is asserted, so a failure names all four.
         var failures = new List<string>();

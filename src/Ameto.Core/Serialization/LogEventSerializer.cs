@@ -98,6 +98,25 @@ public static class LogEventSerializer
             ReadOnlySpan<byte> msgpackProps,
             ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8);
+
+        /// <summary>
+        /// The longest property map an event may have: past it the batch reader stops copying the
+        /// event's properties into its scratch and hands the event to <see cref="TryIngestOversizedClef"/>.
+        /// Unbounded for a sink that keeps everything.
+        /// </summary>
+        int MaxEventPayloadBytes => int.MaxValue;
+
+        /// <summary>
+        /// An event whose property map would be <paramref name="payloadBytes"/> long — past
+        /// <see cref="MaxEventPayloadBytes"/> — refused before it was copied. Returns false: dropped.
+        /// </summary>
+        bool TryIngestOversizedClef(
+            long tsTicks,
+            byte level,
+            ReadOnlySpan<byte> templateUtf8,
+            long payloadBytes,
+            ulong traceHi, ulong traceLo, ulong spanId,
+            ReadOnlySpan<byte> serviceUtf8) => false;
     }
 
     // Second scratch for the streaming path: map header + raw pairs, contiguous, so the
@@ -141,8 +160,8 @@ public static class LogEventSerializer
     /// <summary>
     /// How far a batch got. A struct passed by ref, so the counts SURVIVE the exception a
     /// malformed element throws — the caller needs them: events already handed to the sink
-    /// are in the ring and their drainer still has to be woken, and an operator reading the
-    /// 400 needs to know that some of the batch landed, and where it stopped.
+    /// are still written, and an operator reading the 400 needs to know that some of the batch
+    /// landed, and where it stopped.
     /// </summary>
     public struct ClefBatchProgress
     {
@@ -182,17 +201,30 @@ public static class LogEventSerializer
     // method, and its remark "use the ClefBatchProgress overload" onto the overload that IS one.
     public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
-        var reader = new MessagePackReader(body);
-        progress.ElementIndex = -1;   // the header read below is not "element 0"
-        progress.ElementCount = reader.ReadArrayHeader();
-
-        for (int i = 0; i < progress.ElementCount; i++)
+        try
         {
-            progress.ElementIndex = i;
-            if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
-            else                                             progress.Dropped++;
+            var reader = new MessagePackReader(body);
+            progress.ElementIndex = -1;   // the header read below is not "element 0"
+            progress.ElementCount = reader.ReadArrayHeader();
+
+            for (int i = 0; i < progress.ElementCount; i++)
+            {
+                progress.ElementIndex = i;
+                if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
+                else                                             progress.Dropped++;
+            }
+        }
+        finally
+        {
+            // Scratch a request grew past this is let go, not kept on the thread for the next one:
+            // requests that grew it to megabytes held that on their threads for good.
+            if (_tRawPairs is { Capacity: > KeepScratchBytes }) _tRawPairs = null;
+            if (_tPropsOut is { Capacity: > KeepScratchBytes }) _tPropsOut = null;
         }
     }
+
+    /// <summary>Scratch a request grew past this is let go at its end rather than kept on the thread.</summary>
+    private const int KeepScratchBytes = 1 << 20;
 
     private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
@@ -206,10 +238,17 @@ public static class LogEventSerializer
         ReadOnlySpan<byte> svcUtf8   = default;   // @service
         ReadOnlySpan<byte> legacySvc = default;   // service.name — see ServiceTieRule
         ExceptionInfo? exception     = null;
+        // Where @x is: decoded once the event is known to be kept (round-5 review L-17). Decoded where
+        // it stood, an event then refused as oversized had built its exception for nothing, charged to
+        // nothing — 15.6 MB of strings for an 8.4 MB @x.
+        SequencePosition exceptionAt = default;
+        bool             hasException = false;
         ulong traceIdHi = 0, traceIdLo = 0, spanId = 0;
 
         ArrayBufferWriter<byte>? rawPropsBuf = null;
         int                      rawPropsCount = 0;
+        long                     rawPropsBytes = 0;
+        bool                     oversized     = false;
 
         for (int i = 0; i < mapCount; i++)
         {
@@ -228,7 +267,9 @@ public static class LogEventSerializer
                 case ClefField.ServiceName:       svcUtf8   = ReadUtf8Value(ref reader); break;
                 case ClefField.LegacyServiceName: legacySvc = ReadUtf8Value(ref reader); break;
                 case ClefField.Exception:
-                    exception = ExceptionInfo.Read(ref reader);
+                    exceptionAt  = reader.Position;
+                    hasException = true;
+                    reader.Skip();
                     break;
                 case ClefField.TraceId:
                     TraceIdHelper.TryParseTraceId(ReadUtf8Value(ref reader), out traceIdHi, out traceIdLo);
@@ -238,17 +279,27 @@ public static class LogEventSerializer
                     break;
                 default:
                     // Unrecognised key: copy the (key, value) pair verbatim — the bytes that
-                    // end up in the ring must be identical to the non-streaming path's.
+                    // end up in the ring must be identical to the non-streaming path's. Counted,
+                    // and no longer copied once the map passes the sink's limit: the event is then
+                    // refused unassembled (below), where its scratch grew to the whole map first.
                     reader.Skip();
                     SequencePosition pairEnd = reader.Position;
+                    var pair = sourceSequence.Slice(pairStart, pairEnd);
+                    rawPropsBytes += pair.Length;
+                    rawPropsCount++;
+                    // The map's header as it stands (round-5 review L-9): it only grows with the count,
+                    // so a map past the limit now is past it at the end. The largest header, 5 B, was
+                    // counted from the first pair, and a map within 4 B of the limit was refused.
+                    if (!oversized && (rawPropsCount < 16 ? 1 : rawPropsCount < 65_536 ? 3 : 5) + rawPropsBytes > sink.MaxEventPayloadBytes)
+                        oversized = true;
+                    if (oversized) break;
                     if (rawPropsBuf is null)
                     {
                         rawPropsBuf = _tRawPairs ??= new ArrayBufferWriter<byte>(256);
                         rawPropsBuf.ResetWrittenCount();
                     }
-                    foreach (var segment in sourceSequence.Slice(pairStart, pairEnd))
+                    foreach (var segment in pair)
                         rawPropsBuf.Write(segment.Span);
-                    rawPropsCount++;
                     break;
             }
         }
@@ -260,6 +311,28 @@ public static class LogEventSerializer
         long tsTicks = TryParseTimestampUtf8(tsUtf8, out DateTimeOffset parsed)
             ? parsed.UtcTicks
             : DateTimeOffset.UtcNow.UtcTicks;
+
+        // CLEF @m fallback: a client that sent only a rendered message gets it as template.
+        ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
+
+        // ServiceTieRule: @service, unless it is absent or empty, then service.name.
+        if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
+
+        // The last @x, as the field loop's assignment kept the last; never for an event refused below.
+        if (hasException && !oversized)
+        {
+            var at = new MessagePackReader(sourceSequence.Slice(exceptionAt));
+            exception = ExceptionInfo.Read(ref at);
+        }
+
+        if (oversized)
+        {
+            long mapBytes = (rawPropsCount < 16 ? 1 : rawPropsCount < 65_536 ? 3 : 5) + rawPropsBytes;
+            progress.InSink = true;
+            bool kept = sink.TryIngestOversizedClef(tsTicks, (byte)level, template, mapBytes, traceIdHi, traceIdLo, spanId, svcUtf8);
+            progress.InSink = false;
+            return kept;
+        }
 
         // header(N) + raw pairs, contiguous in per-thread scratch — no per-event byte[].
         ReadOnlySpan<byte> props = default;
@@ -273,12 +346,6 @@ public static class LogEventSerializer
             outBuf.Write(rawPropsBuf.WrittenSpan);
             props = outBuf.WrittenSpan;
         }
-
-        // CLEF @m fallback: a client that sent only a rendered message gets it as template.
-        ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
-
-        // ServiceTieRule: @service, unless it is absent or empty, then service.name.
-        if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
 
         // Every read of the body is behind us: from here to the end of the call, a throw is the
         // sink's. Deliberately not cleared in a finally — the caller reads the flag AFTER the
@@ -334,13 +401,21 @@ public static class LogEventSerializer
         if (Utf8Parser.TryParse(value, out result, out int consumed, 'O') && consumed == value.Length)
             return true;
 
-        // Non-"O" shape: decode and use the general parser, which is what the batch path
-        // has always used. Short and rare, so the transient string is acceptable.
-        Span<char> chars = value.Length <= 64 ? stackalloc char[64] : new char[value.Length];
+        // Non-"O" shape: decode and use the general parser, which is what the batch path has always
+        // used — into the stack, never into a buffer as long as the value (round-5 review L-17): a
+        // 7.9 MB @t took a 15.9 MB char[], charged to nothing. The parser skips the whitespace around a
+        // value, so that is trimmed first; a value still longer than MaxTimestampChars is no timestamp a
+        // client sends (the round-trip shape is 33 characters) and is answered as one that does not parse.
+        value = value.Trim(" \t\r\n\v\f"u8);
+        if (value.IsEmpty || value.Length > MaxTimestampChars) { result = default; return false; }
+        Span<char> chars = stackalloc char[MaxTimestampChars];
         int written = Encoding.UTF8.GetChars(value, chars);
         return DateTimeOffset.TryParse(
             chars[..written], null, System.Globalization.DateTimeStyles.RoundtripKind, out result);
     }
+
+    /// <summary>The longest CLEF <c>@t</c>, past the whitespace around it, the general parser is asked to read.</summary>
+    private const int MaxTimestampChars = 256;
 
 
 

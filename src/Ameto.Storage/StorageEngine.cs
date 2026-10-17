@@ -42,8 +42,9 @@ public enum SegmentImportOutcome
     /// <summary>
     /// Refused. The id falls inside the span this node's own allocator has already handed out:
     /// a local flush, merge or WAL replay holds it or is about to publish under it, and none of
-    /// those can give a key back. Same deployment fault as above, different evidence — split so
-    /// the endpoint can tell the sender which one it saw.
+    /// those can give a key back — or it is at or past the highest id the allocator can be raised
+    /// to, where nothing keeps the allocator from handing it out later. Same deployment fault as
+    /// above, different evidence — split so the endpoint can tell the sender which one it saw.
     /// </summary>
     ConflictAllocatedLocally,
 
@@ -61,7 +62,7 @@ public enum SegmentImportOutcome
 /// This class is the central coordinator — it implements ISegmentProvider for
 /// the query layer and ISegmentManager for the admin API.
 /// </summary>
-public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAvailability, IAsyncDisposable
+public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAvailability, IAsyncDisposable
 {
     /// <summary>
     /// Creates the index sink for ONE INDEX GROUP. Injected by the Indexing layer at startup to
@@ -72,13 +73,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// emit posting-list offsets as the FILE ordinals the writer hands it, not group-local
     /// ones.</para>
     /// </summary>
-    public SegmentIndexSinkFactory? IndexSinkFactory { get; set; }
+    public SegmentIndexSinkFactory? IndexSinkFactory
+    {
+        get => _indexSinkFactory;
+        set
+        {
+            _indexSinkFactory = value;
+            if (value is not null) _indexSinkWired.TrySetResult();
+        }
+    }
+    private SegmentIndexSinkFactory? _indexSinkFactory;
+
+    /// <summary>Completed once <see cref="IndexSinkFactory"/> is first set — what the despill's first block waits for.</summary>
+    private readonly TaskCompletionSource _indexSinkWired = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// How long the despill loop waits, at its start, for <see cref="IndexSinkFactory"/>. The loop
+    /// starts with the engine, and the indexing layer wires the sink only in its hosted service's
+    /// StartAsync, after every hosted service has been built — so a block an earlier run left could
+    /// be despilled into segments with no index sections. The server's registration asks for the
+    /// wait (<see cref="StorageServiceExtensions.AddAmetoStorage"/>); an engine built directly, with
+    /// no indexing layer to come, has none. Past it the despill goes on without an index, and says so.
+    /// </summary>
+    private readonly TimeSpan _indexSinkWait;
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
     /// Used by the Alerts layer to evaluate rules without a circular project reference.
     /// The callback must be fast and non-blocking.
     /// Provides the event header and resolved message template string.
+    ///
+    /// <para>Called by the request writing the event, under the writer lock, and by a despill as it
+    /// makes spilled events visible — not under that lock — so it must be thread-safe. A spilled
+    /// event is announced when it becomes visible, not when it was acknowledged.</para>
     /// </summary>
     public Action<LogEventHeader, string>? EventWritten { get; set; }
 
@@ -103,10 +130,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     // tear, so a writer always sees a tier WITH the WAL that journals it.
     private volatile WriteState                           _write;
 
-    private sealed class WriteState(HotTierSegment hot, WriteAheadLog? wal, ulong walSegId)
+    private sealed class WriteState(HotTierSegment hot, WriteAheadLog? wal, ulong walSegId, SpillTarget? spill = null)
     {
         public readonly HotTierSegment Hot = hot;
         public readonly WriteAheadLog? Wal = wal;
+
+        /// <summary>
+        /// Where writes go while the engine SPILLS (see <see cref="SpillTarget"/>): set, every write
+        /// goes to this block's WAL and none to <see cref="Hot"/>, which is full and stays the live
+        /// tier — queryable, unfrozen — until a flush slot lets the swap freeze it. Null otherwise.
+        /// </summary>
+        public readonly SpillTarget? Spill = spill;
+
+        /// <summary>
+        /// Set, under the writer lock, once <see cref="Hot"/> has refused a write. What tells a swap
+        /// that finds no flush slot whether to spill: a timed flush of a tier with room left must
+        /// not send the events after it to a block nobody can search yet.
+        /// </summary>
+        public bool HotRefused;
+
+        /// <summary>
+        /// Set, under the writer lock, once an append to <see cref="Wal"/> has failed. From then on
+        /// <see cref="Hot"/> takes no more events (and <see cref="HotRefused"/> is set with it): an
+        /// event written into the tier now would be acknowledged as durable while it is in memory
+        /// only. Cleared by replacement — the swap installs a state with a fresh WAL.
+        /// </summary>
+        public bool WalFaulted;
         /// <summary>
         /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will
         /// occupy once they are flushed. The WAL file is named from it, and startup uses
@@ -123,7 +172,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         public readonly ulong WalSegId = walSegId;
     }
     // Serialises only the fast hot-tier/WAL *swap* — NOT the heavy cold-segment write.
-    // WaitAsync(0) drops a redundant trigger: whoever holds it swaps the whole tier.
+    // WaitAsync(0) drops a trigger that finds it held; a write's trigger is asked again when the
+    // holder releases it (ReleaseFlushLock), since the holder may be a merge or a despill, or a
+    // swap that has already made its decision.
     private readonly SemaphoreSlim                        _flushLock  = new(1, 1);
     // Bounds how many cold-segment builds (index + compress + write) run concurrently.
     // The swap hands off to this so multiple segments persist in parallel on idle cores
@@ -131,8 +182,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     private readonly SemaphoreSlim                        _flushConcurrency;
     // Back-pressure gate: caps how many frozen-but-not-yet-persisted hot tiers may be
     // in flight, bounding RAM (≈ slots × HotTier.MaxSizeBytes). When exhausted the swap
-    // is skipped, so the full hot tier back-pressures the drainer instead of buffering
-    // unbounded tiers in memory. Acquired non-blocking at swap, released after persist.
+    // is skipped, so writes spill to disk (or wait) instead of buffering unbounded tiers
+    // in memory. Acquired non-blocking at swap, released after persist.
     private readonly SemaphoreSlim                        _flushSlots;
     // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
     // tiers they read are freed. Self-pruning via ContinueWith on completion.
@@ -234,6 +285,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <summary>Test hook: the live hot tier.</summary>
     internal HotTierSegment LiveHotTier => _write.Hot;
 
+    /// <summary>Test hook: the live tier has refused a write — a writer is waiting for the swap (or the spill) it asked for.</summary>
+    internal bool LiveHotTierRefused { get { var w = _write; return Volatile.Read(ref w.HotRefused); } }
+
     /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
     internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
 
@@ -314,8 +368,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     internal int MergedAwaySegmentCap = 8 * MergeMaxSources;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
-    /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
-    private bool _walFaulted;
+    /// <summary>The pause a frozen tier's flush retry waits between attempts: <see cref="FlushRetryDelay"/>, but for a test that shortens it.</summary>
+    internal TimeSpan _flushRetryDelay = FlushRetryDelay;
     /// <summary>EventWritten subscriber faults, for throttled logging (writer thread only).</summary>
     private long _hookFaults;
     private readonly CancellationTokenSource               _cts        = new();
@@ -334,6 +388,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// between two <c>File.Move</c>s without needing a second process.
     /// </summary>
     internal Action<int>? _afterLevelPublished;
+
+    /// <summary>Test seam: runs as a flush is about to write a level (its argument); throwing from it is that write failing.</summary>
+    internal Action<int>? _beforeLevelWriteForTest;
+
     /// <summary>
     /// Test hook: called with the manifest on disk and the sources owned but not yet streamed —
     /// the window in which a merge can be cancelled or fail transiently. Cancelling a token from
@@ -382,6 +440,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     internal Action<SegmentInfo>? _beforeUnreadableSegmentWarned;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _write.WalSegId;
+    /// <summary>Test hook: the live tier's WAL, which a test disposes to make the next append fail.</summary>
+    internal WriteAheadLog? LiveWalForTest => _write.Wal;
+    /// <summary>Test hook: the open spill file's log, while the engine spills.</summary>
+    internal WriteAheadLog? LiveSpillWalForTest => _write.Spill?.Wal;
     /// <summary>
     /// Test hook: scales the merged-file target. What determines how many files a bucket ends
     /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor
@@ -402,7 +464,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <summary>
     /// Managed index-build state ONE MERGE holds per byte of its group payload budget.
     ///
-    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToColdAsync</c>)
+    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToCold</c>)
     /// but is not sized by the tier: its writer forecasts a group from the GROUP PAYLOAD BUDGET,
     /// and its source hint is every source segment's event count, so the tier-shaped figure above
     /// does not bound it. MEASURED (<c>tests/Ameto.Perf/IndexBuildPoolProbe</c>, prop-dense
@@ -449,6 +511,55 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// same reason as <see cref="FlushWidth"/>.
     /// </summary>
     internal int FlushSlots { get; }
+
+    /// <summary>
+    /// The managed text the frozen tiers hold of their events' own — templates and services the intern
+    /// pool did not take, CLEF exceptions (<see cref="HotTierSegment.ManagedBytes"/>) — as each swap, and each
+    /// despill as it listed its tier (round-6 R5-M11), charged it, and each tier's flush slot gave it back
+    /// (round-5 review H-D). A tier bounds its own
+    /// (<see cref="HotTierSegment.TryWrite"/>), and the slots bound how many tiers are frozen — by their
+    /// NATIVE footprint, against the physical limit. Nothing bounded what they held on the managed heap:
+    /// on a 384 MiB heap limit with a host's RAM behind the native budget, 30 frozen tiers of one 8 MB
+    /// CLEF stack each ran it out. See <see cref="_frozenTextBudgetBytes"/>.
+    /// </summary>
+    private long _frozenTextBytes;
+
+    /// <summary>
+    /// The most of that text the frozen tiers may hold (<see cref="FrozenTextBudget"/>). A tier whose
+    /// freeze would take the backlog past this waits as for a slot — its events spill, or wait in their
+    /// requests — and so does a spilled block's despill; unless no frozen tier holds any, so one always can.
+    /// </summary>
+    private readonly long _frozenTextBudgetBytes;
+
+    /// <summary>Test hook: <see cref="_frozenTextBytes"/>.</summary>
+    internal long FrozenTextBytesForTest => Volatile.Read(ref _frozenTextBytes);
+
+    /// <summary>Test hook: <see cref="_frozenTextBudgetBytes"/>.</summary>
+    internal long FrozenTextBudgetForTest => _frozenTextBudgetBytes;
+
+    /// <summary>
+    /// What the frozen tiers may hold of their events' own text (round-5 H-D; round-6 review R5-M10): the part of
+    /// the managed build share (<see cref="MemoryBudgets.ManagedBuildBytes"/>) the concurrent builds leave unused —
+    /// <paramref name="width"/> builds of <paramref name="perBuildBytes"/> each — and never less than as many tiers'
+    /// worth (<paramref name="tierBytes"/>) as flushes run at once, nor more than the slots' tiers could hold.
+    ///
+    /// <para>It was the width's tiers alone: on the two-core stand, width 1, one 16 MB tier of text — and
+    /// text-bearing traffic spilled three to four times sooner than before the bound (a CLEF mix with 2 % of its
+    /// events carrying a 6 000-character stack: 98 500 events absorbed in memory with every flush held, against
+    /// 262 500). The text lives on the managed heap, as the builds' state does, and the build share is sized for
+    /// as many builds as memory affords where the width is often held lower by the cores: what that leaves is
+    /// managed memory already counted against the heap, which the frozen tiers' text now holds — no new share of
+    /// the heap is taken (<see cref="MemoryBudgets"/>' managed shares stay at their total). The stand: 96 MiB of
+    /// build share, one 43.8 MiB build, 52.3 MiB of text — three tiers' worth where it was one. A host whose
+    /// width the memory sets keeps the floor: as many tiers' worth as builds.</para>
+    /// </summary>
+    internal static long FrozenTextBudget(int width, int slots, long tierBytes, long managedBuildBytes, long perBuildBytes)
+    {
+        long tier     = Math.Max(1L, tierBytes);
+        long floor    = width * tier;
+        long unused   = managedBuildBytes - width * perBuildBytes;
+        return Math.Max(floor, Math.Min(slots * tier, unused));
+    }
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -739,9 +850,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// </summary>
     internal StorageEngine(
         IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
-        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null, Task? bootScanHeldUntil = null)
+        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null, Task? bootScanHeldUntil = null,
+        TimeSpan indexSinkWait = default)
     {
         _maintenanceStartDelay = maintenanceStartDelay ?? DefaultMaintenanceStartDelay;
+        _indexSinkWait         = indexSinkWait;
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
@@ -795,6 +908,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
         FlushWidth  = flushWidth;
         FlushSlots  = flushSlots;
+        _frozenTextBudgetBytes = FrozenTextBudget(flushWidth, flushSlots, _options.HotTier.MaxSizeBytes,
+                                                  _budgets.ManagedBuildBytes, perBuildManaged);
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
@@ -805,13 +920,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         _logger.LogInformation(
             "Flush budgets: width={Width} (×{PerBuild} MB managed = {ManagedCeiling} MB; " +
             "a flush holds {PerFlush} MB, a merge {PerMerge} MB in {GroupBudget} MB groups), " +
-            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), frozen text≤{FrozenText} MB, tier={Events} events / {Payload} MB payload; " +
             "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
             "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB ({Source}); " +
             "index cache≤{CacheBudget} MB ({CacheSource}), native≤{CacheNativeBudget} MB, idle evict {IdleEvict}",
             flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
             perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
-            flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
+            flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576, _frozenTextBudgetBytes / 1048576,
             eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
             _budgets.ManagedLimitBytes / 1048576,
             _budgets.PhysicalLimitBytes / 1048576,
@@ -857,12 +972,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         Directory.CreateDirectory(_segDir);
 
         // Surface intern-pool saturation: past it, every event stores its own template
-        // string instead of a pool index, so per-event memory rises permanently.
+        // string instead of a pool index, so per-event memory rises permanently. Either limit
+        // saturates it — the count of strings or the text they hold (round-5 M-E: the line named
+        // only the count, and a pool spent by a few long texts read as one built by interpolation).
         TemplatePool.PoolExhausted += size => _logger.LogWarning(
-            "Message-template intern pool exhausted at {Size} entries. Templates and service " +
-            "names are no longer de-duplicated — per-event memory will rise. This usually means " +
-            "message templates are being built by interpolation (a distinct template per event) " +
-            "rather than passed as structured parameters.", size);
+            "Message-template intern pool exhausted: {Count} of {Size} entries, {Chars} of {MaxChars} characters of text. " +
+            "New templates and service names are no longer de-duplicated — each event carries its own, and per-event " +
+            "memory and WAL size rise for good. Many entries usually means templates built by interpolation (a distinct " +
+            "template per event) rather than passed as structured parameters; much text, long templates (a text over " +
+            "{MaxText} characters is never pooled).",
+            TemplatePool.ClaimedCount, size, TemplatePool.PooledChars, TemplatePool.MaxPooledChars, TemplatePool.MaxTextChars);
 
         _write = new WriteState(CreateHotTier(), null, 0);
         // The next segment id MUST be known before any flush, but it lives in the
@@ -898,7 +1017,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // and #95's AsyncLocal for one that gets it from the container (the host's DI).
         var heldUntil = bootScanHeldUntil ?? HoldCatalogScanForTest.Value;
         _catalogLoad  = heldUntil is null ? Task.Run(LoadSegmentCatalog) : LoadSegmentCatalogOnceReleasedAsync(heldUntil);
+        // A block an earlier run half-despilled waits for the scan (RunDespillLoopAsync): wake the loop when it ends.
+        _catalogLoad.ContinueWith(static (_, s) => ((StorageEngine)s!).WakeDespill(), this,
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         ReplayOrphanedWals();
+        // After the replay, before the first WAL opens: their blocks must be reserved before
+        // anything new is handed one. They are despilled in the background, not here — a long
+        // spill can be gigabytes, and the server takes ingest from second zero.
+        DiscoverSpillFiles();
         var (bootWal, bootSegId) = OpenWalCore();
         _write = new WriteState(_write.Hot, bootWal, bootSegId);
 
@@ -908,6 +1034,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         _walFlushLoop = RunWalFlushLoopAsync(_cts.Token);
         // Cold-tier maintenance: interrupted-merge recovery + small-segment merges
         _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
+        // Spilled blocks into segments, as flush slots come free. Started OFF the constructor: the
+        // loop's first pass reads and registers a whole block (a tier's worth) before its first
+        // real await, and called inline it did that here, delaying the engine — and always before
+        // the indexing layer had wired IndexSinkFactory, so that block's segments were written
+        // without index sections. On the pool it usually starts after the wiring; the window is
+        // narrowed to the hosted services' start, not closed.
+        var despillHeld = HoldDespillForTest.Value;
+        _despillLoop = Task.Run(() => RunDespillLoopAsync(despillHeld, _cts.Token));
+        // The spill volume's free space, measured off every lock (SpillVolumeFreeBytes): the first
+        // measurement now, so the floor check has one by the time a spill is wanted.
+        StartSpillFreeMeasure();
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
@@ -1004,6 +1141,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// and rewrote none — see the commit that deleted it for why a v7-capable transform is
     /// not worth having.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunColdMaintenanceLoopAsync(CancellationToken ct)
     {
         // Wait for the catalog ENUMERATION, not for a guess at how long it takes. It opens every
@@ -1015,42 +1153,68 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // resurrected entry becomes a merge candidate, fails to open and is skip-listed until
         // restart.)
         try { await _catalogLoad.WaitAsync(ct); }
-        catch (OperationCanceledException) { return; }
-        catch (Exception ex) { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception ex)
+        {
+            try { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
+            catch (Exception) { /* the line is lost; maintenance is not */ }
+        }
 
         try { await Task.Delay(_maintenanceStartDelay, ct); } // let startup settle
-        catch (OperationCanceledException) { return; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception) { /* the pause could not be set up: start now */ }
 
+        // Round again whatever fails, as the WAL loop (round-5 review L-3, the same here): the line that
+        // says a pass failed allocates, and so does the pause, and a throw out of either ended the loop
+        // for good — no segment merged, no interrupted merge finished, no parked delete swept again until
+        // a restart.
         while (!ct.IsCancellationRequested)
         {
-            // One batch per iteration, short pause while a backlog exists.
-            MergeOutcome outcome;
-            Interlocked.Increment(ref _coldMaintenancePasses);
-            try { outcome = await RunColdMaintenancePassAsync(ct); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); outcome = MergeOutcome.NothingToMerge; }
-            if (outcome == MergeOutcome.Merged)
+            try
             {
-                // A merge briefly holds the batch, its native tier copy and the
-                // index builders. Hand that back to the OS instead of letting the
-                // allocator sit on it until the next burst (RSS otherwise ratchets
-                // up across passes and never comes down on an idle server).
-                //
-                // Gated on a merge having HAPPENED, which is what keeps an idle server from
-                // paying for this. The removed HC sweep had its own release behind a bytes
-                // floor for the same reason: its idle pass rewrote the one or two tiny
-                // segments flushed since the last tick ("saved 0.0 MB") and a day's log
-                // showed that shape paying a blocking compacting gen2 plus a working-set
-                // dump six times an hour, around the clock, the working set sawing between
-                // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
-                // there is nothing to release and no floor to test.
-                ReleaseMaintenanceMemory();
-            }
+                // One batch per iteration, short pause while a backlog exists.
+                MergeOutcome outcome;
+                Interlocked.Increment(ref _coldMaintenancePasses);
+                try { outcome = await RunColdMaintenancePassAsync(ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "Segment merge pass failed"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    outcome = MergeOutcome.NothingToMerge;
+                }
+                if (outcome == MergeOutcome.Merged)
+                {
+                    // A merge briefly holds the batch, its native tier copy and the
+                    // index builders. Hand that back to the OS instead of letting the
+                    // allocator sit on it until the next burst (RSS otherwise ratchets
+                    // up across passes and never comes down on an idle server).
+                    //
+                    // Gated on a merge having HAPPENED, which is what keeps an idle server from
+                    // paying for this. The removed HC sweep had its own release behind a bytes
+                    // floor for the same reason: its idle pass rewrote the one or two tiny
+                    // segments flushed since the last tick ("saved 0.0 MB") and a day's log
+                    // showed that shape paying a blocking compacting gen2 plus a working-set
+                    // dump six times an hour, around the clock, the working set sawing between
+                    // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
+                    // there is nothing to release and no floor to test.
+                    ReleaseMaintenanceMemory();
+                }
 
-            try { await Task.Delay(PauseAfter(outcome), ct); }
-            catch (OperationCanceledException) { break; }
+                try { _beforeLoopWaitForTest?.Invoke("maintenance"); await Task.Delay(_maintenancePauseForTest ?? PauseAfter(outcome), ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+            catch (Exception)
+            {
+                // Anything else — the pause could not be set up, out of memory: a blocked pause, with
+                // nothing to allocate, then round again.
+                Thread.Sleep(1000);
+            }
         }
     }
+
+    /// <summary>Test seam: the maintenance loop's pause after every pass, in place of <see cref="PauseAfter"/>'s.</summary>
+    internal TimeSpan? _maintenancePauseForTest;
 
     /// <summary>
     /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge
@@ -1668,108 +1832,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     // ── Write path (called by ingestion) ──────────────────────────────────────
 
-    /// <summary>
-    /// Writes a single event header + properties payload into the hot tier and WAL.
-    /// Assigns a monotonic <see cref="EventId"/> to the header before writing.
-    /// Returns false if the hot tier is full (caller should trigger async flush).
-    /// <paramref name="template"/>: optional message-template string. When supplied
-    /// it is stored alongside the event so cold-tier flush can persist it even if
-    /// the <see cref="TemplatePool"/> entry is later missing.
-    /// </summary>
-    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
-    {
-        // Shut by DisposeAsync. Refused like back-pressure — the caller keeps the event — and
-        // before anything else, so a refused write neither takes an id nor schedules a flush.
-        // A write already past this line when the path closes is fenced by the tier's Freeze.
-        if (Volatile.Read(ref _writesClosed) != 0)
-            return false;
-
-        _afterWriteGate?.Invoke();
-
-        // Assign time-sortable, monotonic event id.
-        // Time component is derived from the event's own @t (TimestampUtcTicks), not
-        // server ingest time, so sorting by Id matches the timestamp shown in the UI.
-        // The generator clamps to prevMs+1 for late-arriving events, preserving
-        // strict per-node monotonicity (cursor pagination by Id remains correct).
-        var h = header;
-        h.Id  = _idGen.Next(header.TimestampUtcTicks);
-
-        // ONE capture: tier and WAL are used from the same immutable state, so the event
-        // can never land in a tier whose WAL this call does not also hold.
-        var w = _write;
-
-        if (!w.Hot.TryWrite(h, propertiesPayload, template, exception))
-        {
-            // Hot tier full (or frozen mid-swap) — schedule async flush and signal
-            // back-pressure; the caller retries the SAME event (drainer pending slot).
-            ScheduleFlush();
-            return false;
-        }
-
-        // ── The event is COMMITTED from here on. Nothing below may throw out of TryWrite:
-        //    the drainer treats a thrown TryWrite as "not written" and retries the same
-        //    event — which would insert another copy (fresh id) into the tier per attempt.
-        // The WAL entry's index is 16 bits and all 65 536 values are real pool ids, so an event
-        // outside the pool (-1 once it is full, or a claim at/past 65 536) is passed through
-        // as-is and Append logs it with the Unpooled flag instead of an index. It writes NO
-        // pool row for it: a row 0 carrying the unpooled text would be force-interned by
-        // recovery and become every genuine index-0 event's template. And without the flag,
-        // recovery gave the unpooled event itself index 0's template whenever the pool file
-        // held any row. The hook still gets the attached text; the WAL never stores it.
-        string tmplStr = template
-                         ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
-        // The service is logged the way the header holds it, by pool index, and its text goes into
-        // the WAL's pool file the first time that WAL logs the index — resolved here exactly as the
-        // flush resolves it, so a replayed event carries the service the flushed one would have.
-        string? svcStr = h.ServiceNamePoolIndex >= 0 ? TemplatePool.Get(h.ServiceNamePoolIndex) : null;
-        try
-        {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception,
-                          h.ServiceNamePoolIndex, svcStr);
-            _walFaulted = false;
-        }
-        catch (ObjectDisposedException)
-        {
-            // Extreme descheduling only: this state was captured just before a rotation
-            // and the flush thread disposed the old WAL between our hot-tier write and
-            // this append. The event IS in the (now frozen) tier, so the flush persists
-            // it — only the crash-recovery copy of this one event is missing.
-        }
-        catch (Exception ex)
-        {
-            // Disk full growing the WAL, a wedged mapping after a failed grow, a pool-file
-            // write error. The flush persists the event regardless — only crash-durability
-            // is degraded until rotation replaces the WAL, so force one and say so once per
-            // episode (the age loop keeps re-attempting the swap until the disk recovers).
-            if (!_walFaulted)
-            {
-                _walFaulted = true;
-                _logger.LogError(ex,
-                    "WAL append failed — ingest continues with reduced crash-durability until the WAL rotates");
-                ScheduleFlush();
-            }
-        }
-
-        // Notify subscribers (e.g. alert evaluator) — must be fast, and must not be able
-        // to fault ingest: a throwing subscriber used to kill the drain task outright.
-        var hook = EventWritten;
-        if (hook is not null)
-        {
-            try { hook(h, tmplStr); }
-            catch (Exception ex)
-            {
-                long n = ++_hookFaults;
-                if (n == 1 || n % 10_000 == 0)
-                    _logger.LogWarning(ex, "EventWritten subscriber threw ({Count} total) — subscriber faults are ignored", n);
-            }
-        }
-
-        // Check size threshold
-        if (w.Hot.IsFull)
-            ScheduleFlush();
-
-        return true;
-    }
+    // TryWrite, WriteBatchAsync and the spill live in StorageEngine.Ingest.cs and StorageEngine.Spill.cs.
 
     // ── ISegmentManager ───────────────────────────────────────────────────────
 
@@ -1986,6 +2049,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// bytes (see <see cref="ReadCatalogSegmentInfo"/>).
     /// </summary>
     internal Action<string>? _beforeScanOpensSegment;
+
+    /// <summary>Test seam: runs as the boot scan moves a torn segment aside; throwing from it is a move that failed (the file held by another process). Null in production.</summary>
+    internal Action<string>? _beforeQuarantineMoveForTest;
 
     /// <summary>
     /// Test hook: called by <see cref="LoadSegmentCatalog"/> before the scan begins, inside its
@@ -2296,36 +2362,73 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
 
     // ── Flush loop ────────────────────────────────────────────────────────────
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunFlushLoopAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(_options.HotTier.MaxAge);
-        try
+        var maxAge = _options.HotTier.MaxAge;
+        using var timer = new PeriodicTimer(maxAge);
+        // Round again whatever fails, as the WAL loop (round-5 review L-3, the same here): the line that
+        // says a flush failed allocates, and so does the wait, and a throw out of either ended the loop
+        // for good — no tier was flushed for its age again until a restart.
+        while (true)
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            try
             {
-                try { await TryFlushAsync(ct); }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+                while (await NextTick(timer, "age", ct))
                 {
-                    // A full disk fails the SWAP itself (creating the successor 64 MB WAL).
-                    // The loop must survive it: this tick is the retry mechanism for swap
-                    // failures, and a faulted loop would also detonate DisposeAsync's await.
-                    _logger.LogError(ex, "Age-based flush failed — retried next tick");
+                    try { _beforeAgeFlushForTest?.Invoke(); await TryFlushAsync(ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                    catch (Exception ex)
+                    {
+                        // A full disk fails the SWAP itself (creating the successor 64 MB WAL).
+                        // The loop must survive it: this tick is the retry mechanism for swap
+                        // failures, and a faulted loop would also detonate DisposeAsync's await.
+                        try { _logger.LogError(ex, "Age-based flush failed — retried next tick"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
                 }
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception)
+            {
+                // The wait itself failed: a blocked pause, with nothing to allocate, then round again.
+                Thread.Sleep((int)Math.Min(maxAge.TotalMilliseconds, 1000));
             }
         }
-        catch (OperationCanceledException) { }
     }
+
+    /// <summary>Test seam: runs before each age flush; throwing from it is a flush that failed.</summary>
+    internal Action? _beforeAgeFlushForTest;
+
+    /// <summary>A loop's wait for its timer's next tick, <see cref="_beforeLoopWaitForTest"/> first.</summary>
+    private ValueTask<bool> NextTick(PeriodicTimer timer, string loop, CancellationToken ct)
+    {
+        _beforeLoopWaitForTest?.Invoke(loop);
+        return timer.WaitForNextTickAsync(ct);
+    }
+
+    /// <summary>
+    /// Test seam: runs before each wait of the WAL ("wal"), age ("age") and maintenance ("maintenance") loops, with
+    /// the loop's name; throwing from it is a wait that could not be set up — the failure only a loop's outer
+    /// catch-all handles (round-5 L-3; round-6 review).
+    /// </summary>
+    internal Action<string>? _beforeLoopWaitForTest;
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Fire-and-forget a parallel flush, tracked so shutdown can await it.</summary>
+    /// <summary>
+    /// Fire-and-forget a parallel flush, tracked so shutdown can await it — the swap a write asks
+    /// for: it swaps only while its reason still holds (<see cref="SwapWanted"/>), and a request
+    /// that finds the swap lock held is asked again when the lock is released
+    /// (<see cref="ReleaseFlushLock"/>).
+    /// </summary>
     private void ScheduleFlush()
     {
         // After shutdown shut the write path there is nothing a new flush may swap.
         if (Volatile.Read(ref _writesClosed) != 0) return;
 
-        var t = Task.Run(() => TryFlushAsync());
+        var t = Task.Run(() => TryFlushAsync(onlyIfStillWanted: true));
         _inFlightFlushes[t] = 0;
         _ = t.ContinueWith(
             static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
@@ -2339,8 +2442,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// both until this <see cref="Environment.TickCount64"/> deadline — dropping out there left
     /// the live tier unflushed whenever a racing flush held the lock.
     /// </param>
-    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0)
+    /// <param name="onlyIfStillWanted">
+    /// True for the swap a write asked for (<see cref="ScheduleFlush"/>): it swaps only while the
+    /// reason it was asked for still holds, read under the lock (<see cref="SwapWanted"/>). False —
+    /// the age loop, <see cref="FlushHotTierAsync"/>, the final flush — swaps any non-empty tier.
+    /// </param>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
+    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0, bool onlyIfStillWanted = false)
     {
+        // Boxed first, owning nothing. A state machine is boxed at its first real suspension, and that
+        // allocation can run out of memory like any other — with every finally of the method skipped,
+        // since the compiler guards them with the state the suspension has already set. That first
+        // suspension was the heavy phase's await of the flush, which always suspends: its failure was
+        // caught as a failed FLUSH while the flush ran on — handed to a retry that flushed the same tier
+        // beside it, and the finallys that give back the heavy-phase permit, the slot and the count
+        // skipped (with one permit, every later heavy phase waited for ever). Or it was the final
+        // flush's wait for the swap lock or a slot, which then stayed taken. Here nothing is owned yet.
+        //
+        // Its LATER suspensions throw the same way when their continuation cannot be registered (round 7):
+        // the final flush's waits for the swap lock and for a slot, and the heavy phase's wait for its
+        // permit. Each has a catch that gives back what this frame holds there, as the finally would — the
+        // swap lock at the wait for a slot, the slot and the count at the wait for the permit. The flush
+        // itself is not awaited (FlushTierByLevel): nothing of it runs on when this method ends.
+        await Task.Yield();
+
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
         //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
         //    rotates the WAL, then releases the lock so the NEXT full tier can be
@@ -2353,33 +2478,114 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         bool finalFlush = waitDeadline != 0;
         if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return; // shutdown owns the tiers now
 
-        if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
-            return; // a swap is already in progress
+        // Said BEFORE trying the lock, so a holder that is releasing it sees the request and asks
+        // again (ReleaseFlushLock): dropping it was safe only for a writer that re-checks, and the
+        // swap that ends a spill — asked for once, by the flush that freed a slot — was lost to
+        // whichever swap, merge or despill held the lock at that instant, leaving the engine
+        // spilling beside an idle slot until the spill file filled or MaxAge came round.
+        if (onlyIfStillWanted) Volatile.Write(ref _swapRequested, 1);
+        ct.ThrowIfCancellationRequested();
+        if (!_flushLock.Wait(0))
+        {
+            if (!finalFlush) return; // a swap is already in progress — and its release asks again for this one
+            // The final flush waits its turn, never queued in the lock (OwnerPoll; round-5 M-B).
+            bool locked = false;
+            for (int pause = 1; !(locked = _flushLock.Wait(0)) && Environment.TickCount64 < waitDeadline; )
+                await OwnerPoll(_flushLock, ref pause, waitDeadline, ct).ConfigureAwait(false);
+            if (!locked) return;
+        }
+        bool swapFailed = false, lockReleased = false;
         try
         {
+            // Every request made before this line is answered by the state read below.
+            Volatile.Write(ref _swapRequested, 0);
+
             // Again under the lock: shutdown takes this lock after closing, so a flush that got
             // here first either sees the close or swaps before shutdown counts what is running.
             if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
 
+            // A swap that failed a moment ago is not tried again by every write's request: each
+            // writer waiting for room asks ten times a second, and each attempt would create a
+            // 64 MB WAL on a disk that has just refused one, or allocate a tier that has just failed
+            // to be. The failure has asked for its own retry (OnSwapFailed). With no slot free there
+            // is nothing to hold back: the spill below may still take the events.
+            if (onlyIfStillWanted && SwapBackingOff() && _flushSlots.CurrentCount != 0) return;
+
             _beforeSwap?.Invoke();
 
             var oldState = _write;
-            if (oldState.Hot.Count == 0) return;
 
-            // Back-pressure gate: if the in-flight tier budget is exhausted, skip the swap.
-            // The hot tier stays full → TryWrite returns false → the drainer parks (ring
-            // back-pressure) rather than letting frozen tiers pile up unbounded in RAM.
+            // A write's request is answered by the swap it asked for or by one before it, and a
+            // request answered already is stale: acted on, it swapped the FRESH tier — a segment
+            // of a few events, for nothing, whenever a second slot was free.
+            if (onlyIfStillWanted && !SwapWanted(oldState)) return;
+
+            if (oldState.Hot.Count == 0)
+            {
+                // Nothing to freeze. A spill is entered only past a tier that refused a write, so
+                // one beside an empty tier cannot arise — but if it did, it simply ends here.
+                if (oldState.Spill is { } idle)
+                {
+                    InstallWriteState(new WriteState(oldState.Hot, oldState.Wal, oldState.WalSegId));
+                    SpillEnded(idle);
+                }
+                return;
+            }
+
+            // The same for the text the frozen tiers hold of their events' own (round-5 H-D): a tier
+            // whose freeze would take it past its budget waits as for a slot, and so do its events —
+            // until a flush gives text back with its slot (GiveBackSlot), which asks for this swap
+            // again. Never past a backlog that holds none, and never for the final flush.
+            if (!finalFlush && !FrozenTextHasRoomFor(oldState.Hot))
+            {
+                if (SwapWanted(oldState)) StopSwapRunClock();   // no swap can be tried until text comes back, with a slot (round-6 review, L-4)
+                SpillWithoutSlot(oldState);
+                return;
+            }
+
+            // Back-pressure gate: if the in-flight tier budget is exhausted, no new tier. The
+            // frozen tiers stay within their RAM budget, and the events that the full tier
+            // refuses go to a spill file instead (SpillWithoutSlot) — or, with spilling off or
+            // the disk at its floor, wait in their requests for a slot to come free.
             // The final flush waits for a slot instead: every holder is a heavy phase or a retry
             // that shutdown's cancellation has already ended, and none of them takes this lock.
-            if (!_flushSlots.Wait(0) &&
-                (!finalFlush || !await _flushSlots.WaitAsync(Until(waitDeadline), ct).ConfigureAwait(false)))
+            // Never queued in the semaphore (OwnerPoll; round-5 M-B).
+            bool slot = TryTakeFlushSlot();
+            if (!slot && finalFlush)
+            {
+                try
+                {
+                    for (int pause = 1; !(slot = TryTakeFlushSlot()) && Environment.TickCount64 < waitDeadline; )
+                        await OwnerPoll(_flushSlots, ref pause, waitDeadline, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The swap lock goes back HERE, as the finally below would give it back (round 7). A pause whose
+                    // continuation could not be registered (out of memory) throws into this method with that finally
+                    // skipped, and the lock stayed taken for good: shutdown waited its whole budget to take it, then
+                    // left every tier allocated. A catch runs on every road.
+                    lockReleased = true;
+                    ReleaseFlushLock();
+                    throw;
+                }
+            }
+            if (!slot)
             {
                 if (finalFlush)
                     _logger.LogWarning(
                         "Final hot-tier flush skipped: no flush slot came free within the shutdown budget — " +
                         "the WAL replays the tier on the next start");
+                else
+                {
+                    // A swap the writers wait on found no slot: a live run's clock stops until one comes back (round-6
+                    // review, L27's stale count). It stopped as the last slot was taken, wanted or not, and a run of
+                    // failures nobody waited on did not age through a quiet spell spent under a despill.
+                    if (SwapWanted(oldState)) StopSwapRunClock();
+                    SpillWithoutSlot(oldState);
+                }
                 return;
             }
+            WriteState? successor = null;
             try
             {
                 // Open the SUCCESSOR first, so the swap installs a complete (tier, WAL)
@@ -2390,48 +2596,98 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // names the ids ITS events will occupy. The OLD WAL is disposed in the
                 // heavy phase, off the swap lock — disposing flushes up to 64 MB of
                 // dirty mmap pages to disk, and doing that here stalled every writer
-                // long enough to overflow the ingest ring under sustained 100k/s load.
+                // (under sustained 100k/s load, long enough to overflow the ingest ring
+                // logs then passed through).
                 var (newWal, newSegId) = OpenWalCore();
-                WriteState newState;
-                try { newState = new WriteState(CreateHotTier(), newWal, newSegId); }
+                try { successor = new WriteState(CreateHotTier(), newWal, newSegId); }
                 catch { try { newWal.Delete(); } catch { } throw; }
 
                 reservedSegId = oldState.WalSegId;
-                oldState.Hot.Freeze();
 
-                // Counted in the step that publishes the tier to the frozen list, and under
-                // _flushLock: from here on the heavy phase below owns reading this tier, and the
-                // decrement at its end is what lets shutdown free it. Nothing between this line
-                // and the try that decrements can throw.
-                Interlocked.Increment(ref _heavyPhases);
-
-                // Publish oldHot AND install the successor under the lock queries snapshot
-                // from, so a concurrent query sees oldHot exactly once — as current before
-                // the store, as frozen after it, never both — and skips the reserved cold
-                // segment ids (no duplicates during the register/remove overlap). A tier
-                // flushes to ONE SEGMENT PER LEVEL, and the block of ids for exactly that
-                // was reserved when this tier's WAL was opened — the level's segment is
-                // always firstId + (byte)level. Levels absent from the tier simply never
-                // become files; a burnt id costs nothing.
-                lock (_frozenLock)
-                {
-                    _frozenHot.Add((oldState.Hot, reservedSegId));
-                    _write = newState;
-                }
-
-                oldHot     = oldState.Hot;
-                oldWal     = oldState.Wal;
-                oldWalPath = oldWal?.FilePath;
+                // Freeze, count, list as frozen and install the successor in one hold of the
+                // writer lock (see InstallSwap for why each of those is where it is). It throws
+                // only before the freeze, and it is the LAST step of this try: the catch below
+                // means "nothing was swapped", and is wrong about anything that runs after it.
+                InstallSwap(successor, oldState.Hot, reservedSegId);
             }
             catch
             {
                 // Successor could not be built (disk full creating the WAL, native OOM on
-                // the tier): nothing was swapped, so the slot must not stay consumed.
-                _flushSlots.Release();
+                // the tier), or not installed: nothing was swapped, so the slot must not stay
+                // consumed — and a successor built but not installed (InstallSwap throws only
+                // before the install) is no one's: its tier is freed and its WAL deleted. It was
+                // left behind, an open 64 MB WAL with its mapping and id block and a tier's
+                // first chunk, at every attempt a request for the swap made.
+                if (successor is not null) DiscardSuccessor(successor);
+                ReleaseFlushSlot();   // never throws: the swap's own failure is the one that goes up
                 throw;
             }
+
+            // Installed: whatever failed before has cleared. The run's reset under its lock — guarded (round-6 review,
+            // the LOW on d9abd2f's audit): a Lock's first contended enter allocates its wait, and a throw here, after the
+            // install, skipped the hand-off of the slot and the count to the heavy phase below. The count goes to 0
+            // without it.
+            Volatile.Write(ref _swapFailedAt, 0);
+            Volatile.Write(ref _swapRetryAt, 0);
+            try
+            {
+                lock (_swapRunLock)
+                {
+                    Volatile.Write(ref _swapFailures, 0);
+                    _swapsUntriableSince = 0;
+                }
+            }
+            catch (Exception) { Volatile.Write(ref _swapFailures, 0); /* the clock's mark stays; it only ages a run */ }
+
+            // Frozen: its events' own text is the frozen backlog's until its slot goes back. Allocates
+            // nothing, so nothing stands between the slot and the heavy phase below.
+            ChargeFrozenText(oldState.Hot);
+
+            // ── SWAPPED. The heavy phase below owns the slot and the count from here, and nothing
+            //    may stand between them and it. Ending a spill used to sit inside the try above —
+            //    a Task.Run, a dictionary insert, a log line — so an out-of-memory there gave the
+            //    slot back and left the frozen tier unflushed, unfreed and counted, with shutdown
+            //    waiting its whole budget for a heavy phase that would never end.
+            oldHot     = oldState.Hot;
+            oldWal     = oldState.Wal;
+            oldWalPath = oldWal?.FilePath;
+            _spillFloorReported = false;   // a swap that had a slot ends any episode at the floor too
+
+            // A spill ends with the swap that had a slot for a fresh tier: the full tier it
+            // spilled beside is the one just frozen, and its block goes to the despill.
+            if (oldState.Spill is { } last)
+            {
+                try { SpillEnded(last); }
+                catch (Exception ex)
+                {
+                    // CloseSpill closes the block inline when it cannot queue the close, so what is
+                    // lost here is at most the line that says the spill ended.
+                    try { _logger.LogError(ex, "Ending the spill into {File} failed after the swap", last.Path); }
+                    catch { /* the swap stands; the heavy phase below must still run */ }
+                }
+            }
         }
-        finally { _flushLock.Release(); }
+        catch when (!finalFlush)
+        {
+            // Nothing was swapped: everything that can throw above runs before the install, and
+            // nothing after it throws (the spill's end is guarded). Shutdown's final flush is not
+            // asked again — its WAL replays the tier.
+            swapFailed = true;
+            throw;
+        }
+        finally
+        {
+            // The failure first: the release below re-asks for a swap a write requested meanwhile,
+            // and that request is held back like every other after a failure. Released first, it
+            // went round at once — a second attempt at what had failed a moment before, and a
+            // second count of one failure in the run that decides when the despill may take the slot.
+            // And the release whatever the failure's bookkeeping does: OnSwapFailed throws nothing
+            // now, but it once did — its retry's closure was allocated before its try — and a throw
+            // here left the swap lock held for good: no swap, spill end, despill or merge ever again,
+            // every request answered 503 until a restart, and shutdown without its final flush.
+            try { if (swapFailed) OnSwapFailed(); }
+            finally { if (!lockReleased) ReleaseFlushLock(); }
+        }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
 
@@ -2447,43 +2703,474 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             // handles before the flush so File.Delete below succeeds afterwards. Inside the
             // try, so a WAL that throws on close still hands back the slot and the count.
             oldWal?.Dispose();
+            NoteKeptFlushFailures(oldWal);   // its last fsyncs: it is not ticked again (round-6 review)
 
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
-            List<SegmentInfo> written;
+            bool permit = false;
             try
             {
-                written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
+                ct.ThrowIfCancellationRequested();
+                // Never queued in it (OwnerPoll; round-5 M-B). The final flush waits only until its deadline (ultra
+                // review #7): it polled with none, and with a token nothing cancelled, so a permit another heavy phase
+                // held past the shutdown budget — a slow disk, a large tier — held DisposeAsync for good, and the
+                // service's stop timed out.
+                for (int pause = 1; !(permit = _flushConcurrency.Wait(0)) && (!finalFlush || Environment.TickCount64 < waitDeadline); )
+                    await OwnerPoll(_flushConcurrency, ref pause, finalFlush ? waitDeadline : 0, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no
-                // retry for the life of the process, while its back-pressure slot was
-                // released — so under a full disk the engine leaked one native tier per
-                // interval, unboundedly, precisely when a log store must ride the pressure
-                // out. Now the slot's ownership moves to a background retry task (bounded
-                // RAM: slot exhaustion skips further swaps → ring back-pressure) that
-                // re-attempts until the disk recovers or the engine shuts down — in which
-                // case the tier's WAL replays it on the next start.
-                _logger.LogError(ex,
-                    "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
-                    FlushRetryDelay.TotalSeconds);
-                ScheduleFlushRetry(oldHot, oldWalPath, reservedSegId);
-                slotTransferred = true;
+                // Out of memory waiting for the permit, the tier unread: a retry flushes it (and owns the
+                // slot and the count from here). It used to stay listed, unflushed, until shutdown.
+                //
+                // And when no retry can start, the slot and the count go back HERE (ultra review #3). This
+                // catch runs on every road; the finally below does not when the pause's continuation could
+                // not be registered (round 7): that skips it, and the slot and the count were held for good —
+                // one slot fewer, and shutdown waited its whole budget for a heavy phase that would never end.
+                if (!HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId)) GiveBackSlot(endHeavyPhase: true, oldHot);
+                slotTransferred = true;   // given up either way, by the retry or just now: not the finally's
                 return;
             }
-            finally { _flushConcurrency.Release(); }
+            if (!permit)
+            {
+                // The final flush's budget ran out with no permit. Its tier stays listed and unread, its WAL on disk
+                // for the next start's replay; the slot and the count go back (the finally below), so shutdown frees
+                // it: nothing reads it.
+                try
+                {
+                    _logger.LogWarning(
+                        "Final hot-tier flush skipped: no heavy-phase permit came free within the shutdown budget — " +
+                        "the WAL replays the tier on the next start");
+                }
+                catch (Exception) { /* the line is lost */ }
+                return;
+            }
+            // The flush runs in this frame (FlushTierByLevel): a throw here is the flush's own, and nothing of it
+            // runs on — the tier goes to a retry. The flush was awaited, and a registration of that await's
+            // continuation that ran out of memory threw here with the flush running on and the finally that gave
+            // the permit back skipped — c42b5d4's filter let that throw out of the method — so the permit never
+            // came back, and at width 1 no flush, despill or merge ran again (R6-M6). It goes back by plain code
+            // and in the catches now, not in a finally: the compiler guards EVERY finally of an async method with
+            // its state, one whose try holds no await too, and one left after a catch that took such a throw is
+            // skipped until a suspension resumes (round 7; ReleaseHeavyPermit never throws).
+            List<SegmentInfo> written;
+            try { written = FlushTierByLevel(oldHot, reservedSegId, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);   // never throws
+                ReleaseHeavyPermit();
+                return;
+            }
+            catch
+            {
+                ReleaseHeavyPermit();
+                throw;
+            }
+            ReleaseHeavyPermit();
 
-            PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
+            // Published all or nothing (PublishFlushedTier): one that failed registered nothing, and its
+            // tier goes to a retry as a failed flush's does. Left to the finally, the tier stayed listed
+            // until shutdown beside whatever the failed registration had got in.
+            try { PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId); }
+            catch (Exception ex) { slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId); }
         }
         finally
         {
             if (!slotTransferred)
-            {
-                _flushSlots.Release();
-                EndHeavyPhase();
-            }
+                GiveBackSlot(endHeavyPhase: true, oldHot);
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="tier"/> may be frozen beside the frozen tiers' text of their events' own
+    /// (<see cref="_frozenTextBytes"/>): yes when it holds none, when they hold none, or when both fit
+    /// <see cref="_frozenTextBudgetBytes"/>.
+    /// </summary>
+    private bool FrozenTextHasRoomFor(HotTierSegment tier) => FrozenTextHasRoomFor(tier.ManagedBytes);
+
+    /// <summary>As <see cref="FrozenTextHasRoomFor(HotTierSegment)"/>, for <paramref name="adding"/> bytes of a tier's own text.</summary>
+    private bool FrozenTextHasRoomFor(long adding)
+    {
+        if (adding <= 0) return true;
+        long frozen = Volatile.Read(ref _frozenTextBytes);
+        return frozen == 0 || frozen + adding <= _frozenTextBudgetBytes;
+    }
+
+    /// <summary>Counts a tier just frozen against the frozen tiers' text, on the tier as well. Never throws.</summary>
+    private void ChargeFrozenText(HotTierSegment tier) => ChargeFrozenText(tier, tier.ManagedBytes);
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> of <paramref name="tier"/>'s own text against the frozen tiers' — a despilled tier's,
+    /// which the tier does not count itself (R5-M11) — on the tier as well, so its slot gives it back. Never throws.
+    /// </summary>
+    private void ChargeFrozenText(HotTierSegment tier, long bytes)
+    {
+        if (bytes <= 0) return;
+        tier.ChargeFrozenText(bytes);
+        Interlocked.Add(ref _frozenTextBytes, bytes);
+    }
+
+    /// <summary>
+    /// A swapped tier whose flush — or whose publishing — failed goes to a background retry, which
+    /// takes its slot and heavy-phase count over. True when it did; false when no retry could be
+    /// started, and the caller still owns all three. Never throws.
+    ///
+    /// <para>A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no retry for the
+    /// life of the process, while its back-pressure slot was released — so under a full disk the
+    /// engine leaked one native tier per interval, unboundedly, precisely when a log store must ride
+    /// the pressure out. The retry (bounded RAM: slot exhaustion skips further swaps → spill, or
+    /// ingest waits) re-attempts until the disk recovers or the engine shuts down — in which case the
+    /// tier's WAL replays it on the next start. Nothing in here may throw past the hand-over: the line
+    /// below used to be unguarded, and a throw from it left the tier listed and never flushed while
+    /// the caller gave its slot and heavy phase back.</para>
+    /// </summary>
+    private bool HandFailedFlushToRetry(Exception ex, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    {
+        try
+        {
+            _logger.LogError(ex,
+                "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
+                FlushRetryDelay.TotalSeconds);
+        }
+        catch (Exception) { /* the line is lost; the hand-over below is not */ }
+        if (TryScheduleFlushRetry(oldHot, oldWalPath, reservedSegId)) return true;
+
+        // No retry could be started (out of memory): the tier stays listed, and queries go on serving
+        // it, until shutdown frees it — under the kept tiers' cap (round-6 review R6-M7), past which it is
+        // let go, unlisted and retired, its events unserved until then; its WAL stays on disk either way
+        // and the next start replays it, skipping the levels the failed attempt got out. Its slot and heavy
+        // phase go back — holding them for a tier nothing will flush would wedge ingest behind it.
+        bool kept = TryKeepTier();
+        if (!kept) LetGoOfTier(oldHot);
+        try
+        {
+            if (kept)
+                _logger.LogError(
+                    "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
+                    "until shutdown, and its WAL replays it at the next start", reservedSegId);
+            else
+                _logger.LogError(
+                    "No flush retry could be started for block {Block}: with the most tiers kept in memory so already, its " +
+                    "tier is let go — its events are unserved until the next start replays its WAL", reservedSegId);
+        }
+        catch (Exception) { /* the line is lost */ }
+        return false;
+    }
+
+    /// <summary>
+    /// Frees a successor the swap built and did not install: no writer and no reader ever saw it.
+    /// Never throws — it runs in the catch that gives the slot back.
+    /// </summary>
+    private void DiscardSuccessor(WriteState successor)
+    {
+        try { successor.Hot.Dispose(); }
+        catch (Exception) { /* its native memory is lost; the slot still goes back */ }
+        try { successor.Wal?.Delete(); }
+        catch (Exception) { /* an empty WAL the next start deletes */ }
+    }
+
+    /// <summary>
+    /// 1 while a swap a write asked for (<see cref="ScheduleFlush"/>) may be waiting on
+    /// <see cref="_flushLock"/>'s holder: set by the request before it tries the lock, cleared by
+    /// the swap that takes the lock, and turned into a fresh request by
+    /// <see cref="ReleaseFlushLock"/> when it is still set there.
+    /// </summary>
+    private int _swapRequested;
+
+    /// <summary>Test hook: a write's request for a swap is waiting on <see cref="_flushLock"/>'s holder.</summary>
+    internal bool SwapRequestedForTest => Volatile.Read(ref _swapRequested) != 0;
+
+    /// <summary>Failed swaps in a row, as the last failure counted them (<see cref="_swapFailures"/>).</summary>
+    internal int SwapFailuresInARowForTest => Volatile.Read(ref _swapFailures);
+
+    /// <summary>Whether a run's clock is stopped (<see cref="_swapsUntriableSince"/>).</summary>
+    internal bool SwapRunClockStoppedForTest
+    {
+        get { lock (_swapRunLock) return _swapsUntriableSince != 0; }
+    }
+
+    // ── A swap that fails ─────────────────────────────────────────────────────
+    //
+    // The successor's WAL could not be created (an NTFS volume too full for the next 64 MB file),
+    // or its tier not allocated. Nothing was swapped and the slot went back — and that used to be
+    // all: nothing asked for the swap again but a writer that came back to find the tier still
+    // refusing, the despill went on yielding its slot to the live tier for as long as the tier
+    // refused, and a spill that the failed swap was to end went on beside an idle slot. With the
+    // writers gone (answered 503), the backlog that would have freed the disk was never despilled.
+
+    /// <summary><see cref="Environment.TickCount64"/> of the last swap that failed; 0 once one installs, or a slot comes free.</summary>
+    private long _swapFailedAt;
+
+    /// <summary><see cref="Environment.TickCount64"/> before which a write's request does not try a swap again; 0 for none.</summary>
+    private long _swapRetryAt;
+
+    /// <summary>1 while the retry a failed swap asked for is waiting to ask (<see cref="OnSwapFailed"/>).</summary>
+    private int _swapRetryPending;
+
+    /// <summary>The longest pause after a failed swap before it is tried again. Internal so a test can change it.</summary>
+    internal TimeSpan _swapRetryDelay = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Swaps failed in a row: 0 once one installs, and counted from 1 again by a failure more than
+    /// <see cref="SwapFailureStreakGapMs"/> after the one before. A slot coming free does not reset it.
+    /// </summary>
+    private int _swapFailures;
+
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> of the last failed swap, moved on by the time no swap could be tried
+    /// since (<see cref="RestartSwapRunClockLocked"/>); nothing clears it. Under <see cref="_swapRunLock"/>.
+    /// </summary>
+    private long _lastSwapFailureAt;
+
+    /// <summary>
+    /// Since when a swap the writers wait on could not be tried while a run of failed swaps was live — no flush slot
+    /// free, or the frozen tiers' text at its budget — as <see cref="Environment.TickCount64"/>; 0 from the next slot's
+    /// release, or while no run is live. Under <see cref="_swapRunLock"/>.
+    /// </summary>
+    private long _swapsUntriableSince;
+
+    /// <summary>
+    /// Guards a run's clock — <see cref="_lastSwapFailureAt"/>, <see cref="_swapsUntriableSince"/> and the count's
+    /// reset — across the slot's takers and givers, which hold different locks or none (a heavy phase gives its slot
+    /// back off the swap lock). The slot's take and release run under it, so a release and the take that follows it
+    /// are seen in order. Held for a few instructions; never across a wait.
+    /// </summary>
+    private readonly Lock _swapRunLock = new();
+
+    /// <summary>
+    /// How long after a failed swap the next failure still counts as one in a row: ten of the longest
+    /// pauses between tries (round-4 L27), of the time a swap could have been tried — a slot free, the
+    /// frozen tiers with room for a tier's text (see "A run's clock" below; round-5 L-4, round-6 review).
+    /// A swap that is wanted and keeps failing is tried again
+    /// within <see cref="_swapRetryDelay"/> — by its own retry, sooner by a slot coming free — so a
+    /// longer silence means nothing asked for it: the failures before it were of swaps no writer was
+    /// waiting on (the age loop's, an explicit flush's, whose retries find nothing to swap). Their
+    /// count used to stand for good, and one transient failure hours later, the first of a busy
+    /// spell, was the third "in a row": the despill took the slot at once, for a whole block, with
+    /// spilling off the writers were answered 503 though the swap installed at its next try (R4-3's
+    /// case again), and the hold-back started at its long end.
+    ///
+    /// <para>A slot coming free does not reset the count, deliberately. It says nothing of the cause —
+    /// the flush that ended freed what it held, which may or may not be what the swap failed on, and
+    /// the release already lets the swap try first — and the count is what carries a failure that
+    /// persists across the flushes ending around it: the first failure after a release is then the
+    /// third or later, and hands the slot to the backlog's despill at once, the backlog whose despill
+    /// frees the disk the swap fails on (M4). Reset there, a run of flushes ending would hold that
+    /// despill back after each of them.</para>
+    /// </summary>
+    private long SwapFailureStreakGapMs => 10 * (long)_swapRetryDelay.TotalMilliseconds;
+
+    /// <summary>Failed swaps in a row after which the despill takes a free slot even with no spill to take the writers.</summary>
+    private const int SwapFailuresBeforeDespillTakesTheSlot = 3;
+
+    // ── A run's clock (round-5 review L-4; round-6 review) ────────────────────
+    //
+    // The gap that ends a run (SwapFailureStreakGapMs) counts the time a swap could have been tried: a slot was free,
+    // and the frozen tiers had room for a tier's text. Not the time a despill or a flush held the last slot — a
+    // despill longer than the gap restarted the count at the first failure after it, and the despill then yielded
+    // the slot again (the "a release does not reset" decision, undone; L-4) — nor the time the text budget held the
+    // swaps. L-4 kept the run's clock going by stamping the last failure anew whenever a swap the writers waited on
+    // found no slot: a run that had already aged out with a slot free was revived by that stamp, and the first
+    // failure after it was the third "in a row" (round-4 L27's stale count, back: the despill took the slot for a
+    // whole block while the writers, spilling off, waited out BackPressureWait). The clock stops instead when a swap
+    // the writers wait on (SwapWanted) finds no slot, or the text budget full, while a run is live, and starts again
+    // — the last failure moved on by the time it stood — when a slot comes back. Stopping it never revives a run: the
+    // time before the stop still counts. It stopped at every take of the last slot, wanted or not, and so a run of
+    // failures nobody waited on did not age through a quiet spell spent under a despill (round-6 review: L27's stale
+    // count, back). A failure leaves a stop as it is (OnSwapFailed).
+
+    /// <summary>
+    /// Takes a flush slot if one is free — never queued (round-5 M-B). Under the run's lock, so a release and the take
+    /// that follows it are seen in order. The take of the last slot no longer stops a run's clock: the swap the writers
+    /// wait on that then finds none does (see "A run's clock").
+    /// </summary>
+    private bool TryTakeFlushSlot()
+    {
+        lock (_swapRunLock) return _flushSlots.Wait(0);
+    }
+
+    /// <summary>
+    /// Gives a flush slot back, starting a stopped run's clock again first (<see cref="RestartSwapRunClockLocked"/>).
+    /// Never throws: it ends the finally blocks and catches that own the slot.
+    /// </summary>
+    private void ReleaseFlushSlot()
+    {
+        // The lock's enter can throw — a Lock's first contended enter allocates its wait — and this must not (round-6
+        // review, the LOW on d9abd2f's audit): without the lock the clock's restart is lost, and the slot goes back.
+        bool locked = false;
+        try
+        {
+            try
+            {
+                _releaseSlotLockForTest?.Invoke();
+                _swapRunLock.Enter();
+                locked = true;
+            }
+            catch (Exception) { /* below, without the clock */ }
+            if (locked) RestartSwapRunClockLocked();
+            try { _flushSlots.Release(); }
+            catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
+        }
+        finally { if (locked) _swapRunLock.Exit(); }
+    }
+
+    /// <summary>Test seam: runs as a slot's release enters the run's lock; throwing from it is that enter running out of memory.</summary>
+    internal Action? _releaseSlotLockForTest;
+
+    /// <summary>
+    /// A swap the writers wait on found no slot, or the frozen tiers' text at its budget, and was not tried: a live run's
+    /// clock stops until a slot (with its text) comes back. Never throws: a Lock's first contended enter allocates its
+    /// wait, and the swap goes on to its spill; the clock then runs on, which only ages a run.
+    /// </summary>
+    private void StopSwapRunClock()
+    {
+        try
+        {
+            lock (_swapRunLock) StopSwapRunClockLocked();
+        }
+        catch (Exception) { /* the clock runs on */ }
+    }
+
+    /// <summary>Stops a live run's clock now, unless it is stopped already. Under <see cref="_swapRunLock"/>.</summary>
+    private void StopSwapRunClockLocked()
+    {
+        long now = Environment.TickCount64;
+        if (_swapsUntriableSince == 0 && Volatile.Read(ref _swapFailures) > 0 && now - _lastSwapFailureAt <= SwapFailureStreakGapMs)
+            _swapsUntriableSince = now;
+    }
+
+    /// <summary>Starts a stopped run's clock again: the last failure is moved on by the time it stood. Under <see cref="_swapRunLock"/>.</summary>
+    private void RestartSwapRunClockLocked()
+    {
+        long since = _swapsUntriableSince;
+        if (since == 0) return;
+        _swapsUntriableSince  = 0;
+        _lastSwapFailureAt   += Environment.TickCount64 - since;
+    }
+
+    /// <summary>
+    /// The despill may take a free slot from a live tier whose swap cannot install (see
+    /// RunDespillLoopAsync): the last swap attempt failed, no slot has come free since — and either
+    /// the failures persist (<see cref="SwapFailuresBeforeDespillTakesTheSlot"/> in a row), or a
+    /// spill can take the writers meanwhile (<see cref="SpillCanTakeTheWriters"/>). It used to take
+    /// the slot at the first failure, for a whole block: one transient failure, and with spilling off
+    /// the writers were answered 503 while the swap would have installed at its next try.
+    /// </summary>
+    private bool SwapFailing =>
+        Volatile.Read(ref _swapFailedAt) != 0
+        && (Volatile.Read(ref _swapFailures) >= SwapFailuresBeforeDespillTakesTheSlot || SpillCanTakeTheWriters);
+
+    /// <summary>
+    /// The pause after the <paramref name="failures"/>-th failed swap in a row: from the writers'
+    /// re-check interval, doubling, up to <see cref="_swapRetryDelay"/>. It was a fixed second from
+    /// the first failure, which held a transient one's writers back that long.
+    /// </summary>
+    private long SwapRetryDelayMs(int failures) =>
+        Math.Min((long)_roomRecheckMs << Math.Clamp(failures - 1, 0, 16), (long)_swapRetryDelay.TotalMilliseconds);
+
+    /// <summary>Whether a write's request for a swap is held back after a failure (see TryFlushAsync).</summary>
+    private bool SwapBackingOff()
+    {
+        long at = Volatile.Read(ref _swapRetryAt);
+        return at != 0 && Environment.TickCount64 < at;
+    }
+
+    /// <summary>
+    /// A swap failed before it installed anything; called with the swap lock still held, by the
+    /// finally that releases it. Asks for the swap again itself, after <see cref="SwapRetryDelayMs"/>
+    /// — one retry waiting at a time — and wakes the despill, which may now take the slot the swap
+    /// could not use. Never throws, and allocates nothing outside its try: the retry's closure is
+    /// built in <see cref="StartSwapRetry"/>. Captured by a lambda here, the delay was hoisted into a
+    /// closure allocated on entry, before any of this ran, and an out-of-memory there left the swap
+    /// lock held for good.
+    /// </summary>
+    private void OnSwapFailed()
+    {
+        try
+        {
+            _onSwapFailedForTest?.Invoke();
+            long now = Environment.TickCount64;
+            long delay;
+            lock (_swapRunLock)
+            {
+                // A stopped clock stays stopped (round-6 review): only a slot coming back starts it again. This failure
+                // restarted it, and a slot the despill took between this swap's release and here was then held with the
+                // clock running — L-4's hole. The time it stood is left out of the gap all the same, and the stop is
+                // moved on to this failure, which is the run's last now.
+                long since = _swapsUntriableSince;
+                long last  = since == 0 ? _lastSwapFailureAt : _lastSwapFailureAt + (now - since);
+                if (now - last > SwapFailureStreakGapMs) Volatile.Write(ref _swapFailures, 0);   // not in a row
+                _lastSwapFailureAt = now;
+                if (since != 0) _swapsUntriableSince = now;
+                delay = SwapRetryDelayMs(Interlocked.Increment(ref _swapFailures));
+            }
+            Volatile.Write(ref _swapFailedAt, Math.Max(1, now));
+            Volatile.Write(ref _swapRetryAt, now + delay);
+            if (Interlocked.Exchange(ref _swapRetryPending, 1) == 0)
+            {
+                try { StartSwapRetry(delay); }
+                catch (Exception)
+                {
+                    // No retry of its own: the writers' requests, a released slot and the age loop
+                    // still ask, and the hold-back above lets them once its time is up.
+                    Volatile.Write(ref _swapRetryPending, 0);
+                }
+            }
+        }
+        catch (Exception) { /* the bookkeeping is lost; the swap lock is released all the same */ }
+        WakeDespill();
+    }
+
+    /// <summary>
+    /// Starts the retry a failed swap asks for, <paramref name="delay"/> ms from now. Its own method
+    /// so the closure over the delay is allocated in here, inside <see cref="OnSwapFailed"/>'s try.
+    /// </summary>
+    private void StartSwapRetry(long delay)
+    {
+        _swapRetryClosureForTest?.Invoke();
+        var t = Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false); }
+            catch (Exception) { Volatile.Write(ref _swapRetryPending, 0); return; }   // shutdown
+            Volatile.Write(ref _swapRetryPending, 0);
+            // The wait is over, whatever the two clocks say: the request below is not held back.
+            Volatile.Write(ref _swapRetryAt, 0);
+            ScheduleFlush();
+        });
+        _inFlightFlushes[t] = 0;
+        _ = t.ContinueWith(
+            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+            _inFlightFlushes, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>Test seam: runs where a failed swap's retry allocates its closure; throwing from it is that allocation failing.</summary>
+    internal Action? _swapRetryClosureForTest;
+
+    /// <summary>Test seam: runs as a failed swap's bookkeeping starts, inside its try; a test stretches the bookkeeping with it.</summary>
+    internal Action? _onSwapFailedForTest;
+
+    /// <summary>
+    /// Releases <see cref="_flushLock"/> and, if a write's request for a swap found it held in the
+    /// meantime, asks again — so that request is answered by the next holder, not dropped. Every
+    /// holder but shutdown's (which keeps the lock) releases through here: the swap, a merge
+    /// reserving its id, a despill registering its tier. Never throws: it runs in finally blocks
+    /// whose callers own a flush slot or a heavy phase.
+    /// </summary>
+    private void ReleaseFlushLock()
+    {
+        _flushLock.Release();
+        if (Interlocked.Exchange(ref _swapRequested, 0) == 0) return;
+        try { ScheduleFlush(); }
+        catch (Exception) { Volatile.Write(ref _swapRequested, 1); /* the next release asks again */ }
+    }
+
+    /// <summary>
+    /// Whether the swap a write asked for still has its reason: a spill is installed (its block is
+    /// full, or a slot has come free to end it), the tier has refused a write (full, wedged on a
+    /// chunk, its WAL faulted) or has reached its limit. What every <see cref="ScheduleFlush"/>
+    /// caller asks from; read under <see cref="_flushLock"/>.
+    /// </summary>
+    private static bool SwapWanted(WriteState s) =>
+        s.Spill is not null || Volatile.Read(ref s.HotRefused) || s.Hot.IsFull;
 
     /// <summary>Ends one counted heavy phase and wakes shutdown if it was the last.</summary>
     private void EndHeavyPhase()
@@ -2503,31 +3190,94 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// </summary>
     private void PublishFlushedTier(List<SegmentInfo> written, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
     {
-        // Register the cold segments AND drop oldHot from the frozen list atomically.
+        // Register the cold segments AND drop oldHot from the frozen list atomically — under the lock,
+        // and all or nothing. A registration that ran out of memory part way (a dictionary node, the
+        // displaced-segment line) left the levels before it registered while its caller took the
+        // throw for "not published": the flush retry's next attempt then unlinked their files as
+        // leftovers — registered segments, gone from disk under the catalog. What a failed attempt
+        // registered is taken back now, allocating nothing, so the throw means what its caller takes
+        // it for; the entries each registration displaced (null for none) are kept here first, for
+        // that. A loop, not RemoveAll(lambda): the lambda was allocated after the segments were
+        // registered.
+        var displaced = new SegmentInfo?[written.Count];
         lock (_frozenLock)
         {
-            foreach (var w in written) PublishLocalSegment(w);
-            _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
+            int registered = 0;
+            try
+            {
+                for (; registered < written.Count; registered++)
+                {
+                    _beforeSegmentPublishForTest?.Invoke(written[registered]);
+                    displaced[registered] = PublishLocalSegment(written[registered]);
+                }
+            }
+            catch
+            {
+                for (int i = registered - 1; i >= 0; i--) UnpublishLocalSegment(written[i], displaced[i]);
+                throw;
+            }
+            for (int i = _frozenHot.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_frozenHot[i].Tier, oldHot)) _frozenHot.RemoveAt(i);
         }
-        _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
-            written.Count, written.Sum(w => (long)w.EventCount));
 
-        foreach (var w in written) SegmentFlushed?.Invoke(w);
-
-        if (oldWalPath is not null)
+        // PUBLISHED. Nothing below throws: a caller takes a throw for "not published", and the flush
+        // retry then went round again — unlinking the level files just registered and flushing a
+        // tier handed to be freed. Each step is best-effort and says so when it fails.
+        try
         {
-            try { File.Delete(oldWalPath); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
-            try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
-            // The marker is what AUTHORISES the delete above, so it outlives it: dropping
-            // it first would leave a WAL that recovery has to replay to find out its
-            // levels are all published. A crash in between leaves a marker with no WAL,
-            // which the startup sweep clears.
-            try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
+            long events = 0;
+            foreach (var w in written) events += w.EventCount;
+            _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total", written.Count, events);
+        }
+        catch (Exception) { /* the line is lost */ }
+
+        foreach (var w in written)
+        {
+            try { SegmentFlushed?.Invoke(w); }
+            catch (Exception ex)
+            {
+                try { _logger.LogWarning(ex, "A subscriber to SegmentFlushed failed for {File}", w.FilePath); }
+                catch (Exception) { /* the line is lost */ }
+            }
         }
 
-        RetireHotTier(oldHot);
+        if (oldWalPath is not null) DeleteLogAndMarker(oldWalPath, reservedSegId);
+
+        try { RetireHotTier(oldHot); }
+        catch (Exception) { /* out of memory growing the retire list: the tier's native memory is lost, never freed under a reader */ }
     }
+
+    /// <summary>
+    /// Deletes a flushed block's log — a WAL, or a spill file — with its pool, and then its
+    /// completion marker, but only once the log is gone.
+    ///
+    /// <para>The marker is what AUTHORISES the delete, so it outlives it: dropping it first would
+    /// leave a log that recovery has to replay to find out its levels are all published. A crash in
+    /// between leaves a marker with no log, which the startup sweep clears. And it outlives a delete
+    /// that FAILED — a scanner holding the file on Windows, say: the marker used to go regardless,
+    /// and the next start then found the log with no marker and wrote its block again, where a merge
+    /// may since have taken a level into another segment — the same events twice, for good. With
+    /// the marker kept, that start finds the block published and only deletes the log.</para>
+    /// </summary>
+    private void DeleteLogAndMarker(string logPath, ulong segId)
+    {
+        // Never throws: it runs after a block was published (PublishFlushedTier).
+        bool gone = true;
+        try { _deleteWalFile(logPath); }
+        catch (Exception ex)
+        {
+            gone = Look(logPath) == Presence.Gone;   // a log that cannot be looked at is not gone (L-18)
+            if (!gone)
+                try { _logger.LogWarning(ex, "Failed to delete {Path} — its completion marker is kept, and the next start deletes both", logPath); }
+                catch (Exception) { /* the line is lost; the marker is kept all the same */ }
+        }
+        try { _deleteWalFile(logPath + ".pool"); } catch { /* best-effort */ }
+        if (gone)
+            try { File.Delete(FlushMarkerPath(segId)); } catch { /* swept at startup */ }
+    }
+
+    /// <summary>Test seam: deletes a flushed block's log file and its pool. <see cref="File.Delete"/> in production.</summary>
+    internal Action<string> _deleteWalFile = File.Delete;
 
     /// <summary>
     /// Background retry for a frozen tier whose flush failed. Owns the tier's back-pressure
@@ -2535,69 +3285,380 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// (then both are released and the tier's WAL replays it on the next start). Tracked in
     /// <see cref="_inFlightFlushes"/> as well, so DisposeAsync awaits it after cancelling.
     /// </summary>
-    private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    /// <param name="onPublished">
+    /// Called with the segments once the retry has published the tier — how a despill's retry
+    /// counts its events and takes its block out of the spill queue. It used to do neither.
+    /// </param>
+    /// <param name="publishedLevels">
+    /// A despill's levels an earlier run published (see <c>FlushTierByLevelAsync</c>): kept on disk
+    /// and not written again. The retry used to unlink them as leftovers and rewrite every level.
+    /// </param>
+    /// <param name="onAbandoned">
+    /// Called, at most once, if the retry ends without giving its owners back itself — it could not be
+    /// queued, or one of its suspensions ran out of memory (its box at the first; the registration of its
+    /// continuation at a later one, round 7), which skips its finally — before the slot and the count go
+    /// back: how a despill's retry gives its tier up and queues its block again, as the despill does when
+    /// no retry starts. Nothing of the retry runs then (see <c>FlushRetryOwners</c>). A swap's tier stays
+    /// listed, served, until shutdown frees it, and its WAL replays it at the next start.
+    /// </param>
+    /// <returns>
+    /// True once the retry is handed the tier: from then on it — or, if it ends without giving them
+    /// back, its continuation — owns the tier, its slot and its heavy-phase count, and nothing here
+    /// throws. False when nothing was handed over (out of memory before the start): nothing of it
+    /// runs, and the caller still owns all three — exactly one of the two gives them up. Never throws.
+    /// </returns>
+    private bool TryScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                       Action<List<SegmentInfo>>? onPublished = null, byte publishedLevels = 0,
+                                       Action? onAbandoned = null)
     {
-        var t = Task.Run(async () =>
+        // Everything the retry needs is allocated BEFORE it starts: its task, the promise DisposeAsync
+        // awaits, its owners and the continuation that gives them back if the retry cannot (and
+        // forgets it), and its entry in _inFlightFlushes. Task.Run allocated its promise after
+        // queueing the work, and the bookkeeping came after that: an out-of-memory there reached the
+        // caller as "not started" while the retry was running, and the caller freed the tier the
+        // retry went on to flush.
+        Task<Task> start;
+        Task?      retry = null;
+        try
         {
-            try
+            _beforeFlushRetryStartForTest?.Invoke();
+            var owners = new FlushRetryOwners(this, reservedSegId, onAbandoned, oldHot);
+            start = NewFlushRetryTask(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels, owners);
+            retry = start.Unwrap();
+            _ = retry.ContinueWith(
+                static (x, s) => ((FlushRetryOwners)s!).RetryEnded(x),
+                owners, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            _inFlightFlushes[retry] = 0;
+        }
+        catch (Exception)
+        {
+            // Not started. An entry the dictionary took before it threw must not outlive this:
+            // DisposeAsync awaits every entry, and this one would never complete.
+            if (retry is not null) _inFlightFlushes.TryRemove(retry, out _);
+            return false;
+        }
+
+        // The hand-over. From here the retry owns the tier, its slot and its count — or, when it ends
+        // without giving them back, the continuation above does. Start throws only when the work could
+        // not be queued: the task is then faulted and never runs, and its continuation, run as the
+        // fault completes it, has already given the owners back (onAbandoned) — so that is handed over
+        // too. It used to be the caller's to give up as well, and with the continuation that was twice.
+        try { start.Start(_flushRetrySchedulerForTest ?? TaskScheduler.Default); }
+        catch (Exception)
+        {
+            if (!start.IsCompleted)
             {
-                while (true)
+                // Not even faulted (out of memory recording why it was not queued): it never runs and
+                // its continuation never comes, so the owners are still the caller's.
+                _inFlightFlushes.TryRemove(retry, out _);
+                return false;
+            }
+        }
+
+        // Anything here runs after the hand-over and must not undo it.
+        try { _afterFlushRetryStartForTest?.Invoke(); }
+        catch (Exception) { /* the retry has the tier, its slot and its count */ }
+        return true;
+    }
+
+    /// <summary>Test seam: runs before a flush retry is set up; throwing from it is a retry that could not be started.</summary>
+    internal Action? _beforeFlushRetryStartForTest;
+
+    /// <summary>
+    /// Test seam: runs right after a flush retry has started, where Task.Run's promise and the
+    /// bookkeeping used to allocate; throwing from it must not undo the hand-over.
+    /// </summary>
+    internal Action? _afterFlushRetryStartForTest;
+
+    /// <summary>Test seam: the scheduler a flush retry is started on; one that refuses the task is a start that failed.</summary>
+    internal TaskScheduler? _flushRetrySchedulerForTest;
+
+    /// <summary>Test seam: runs as a flush retry begins an attempt, before it touches the tier.</summary>
+    internal Action? _beforeFlushRetryAttemptForTest;
+
+    /// <summary>
+    /// The retry's task, not started. Its own method so the closure over the arguments is allocated
+    /// in here, inside the caller's try — captured by a lambda in the caller, they were allocated
+    /// on entry, before any of its code ran.
+    /// </summary>
+    private Task<Task> NewFlushRetryTask(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                         Action<List<SegmentInfo>>? onPublished, byte publishedLevels,
+                                         FlushRetryOwners owners) =>
+        new(() => FlushRetryLoopAsync(oldHot, oldWalPath, reservedSegId, onPublished, publishedLevels, owners));
+
+    /// <summary>
+    /// What a started flush retry owns — its tier's flush slot and heavy-phase count — given back
+    /// exactly once: by the retry itself as it ends, or, when it ended without, by the continuation
+    /// that sees the retry's task end (registered before the retry started). The retry's finally does
+    /// not run when one of its suspensions runs out of memory — the first, where its state machine is
+    /// boxed, or a later one, whose continuation's registration fails (round 7): the compiler guards it
+    /// with the state the suspension has already set. The slot and the count were then held for good,
+    /// and the tier never flushed.
+    ///
+    /// <para>A retry that ended that way has nothing of it running (round 7): the attempt's flush runs
+    /// in the loop's own frame, so its suspensions are pauses — the wait before an attempt, the wait for
+    /// the permit — and no flush runs across one. c42b5d4's audit, and 788264c's, said the opposite road
+    /// left the phase counted; it did not: the loop awaited its attempt's flush, a registration that
+    /// failed there ended it with the flush running on, and this gave the slot, the count and the text
+    /// back and gave a despill's tier up under the flush (round-6 review R6-H3).</para>
+    /// </summary>
+    private sealed class FlushRetryOwners(StorageEngine engine, ulong block, Action? onAbandoned, HotTierSegment tier)
+    {
+        private int _givenBack;
+
+        /// <summary>The retry's finally: it ended — published, or shut down — and gives them back.</summary>
+        internal void GiveBack()
+        {
+            if (Interlocked.Exchange(ref _givenBack, 1) == 0) engine.ReleaseFlushRetryOwners(tier);
+        }
+
+        /// <summary>The retry's task ended. Never throws: it runs as that task's continuation.</summary>
+        internal void RetryEnded(Task retry)
+        {
+            try { engine._inFlightFlushes.TryRemove(retry, out _); }
+            catch (Exception) { /* DisposeAsync's wait for it is bounded */ }
+            if (Interlocked.Exchange(ref _givenBack, 1) != 0) return;
+            // Ended without giving them back: nothing of it runs now, so its tier is given up as when
+            // no retry starts — a swap's left listed until shutdown (its WAL replays it), a despill's
+            // unlisted and its block queued again (onAbandoned).
+            try { engine._logger.LogError("The flush retry of block {Block} ended without finishing; its slot is given back", block); }
+            catch (Exception) { /* the line is lost */ }
+            try { onAbandoned?.Invoke(); }
+            catch (Exception) { /* each step of it is guarded */ }
+            // A swap's tier is kept under the kept tiers' cap, or let go past it (round-6 review R6-M7; its WAL replays it).
+            if (onAbandoned is null && !engine.TryKeepTier()) engine.LetGoOfTier(tier);
+            engine.ReleaseFlushRetryOwners(tier);
+        }
+    }
+
+    // ── Waiting for an owner semaphore (round-5 review M-B) ────────────────────
+    //
+    // SemaphoreSlim.WaitAsync with a token or a timeout links its waiter into the semaphore's queue and
+    // only then allocates — WaitUntilCountOrTimeoutAsync's box, the registration, the timer, the
+    // promise. An out of memory there faulted the wait with its waiter still queued, and the next
+    // Release granted the permit, or the swap lock, to that waiter, which nobody would ever give back:
+    // with one heavy-phase permit no flush, merge or despill ran again; with the swap lock no swap, and
+    // every request was answered 503 until a restart. The owner semaphores (_flushLock, _flushSlots,
+    // _flushConcurrency) are never waited on that way. A contended take tries Wait(0), which never
+    // queues, and pauses between tries with a Task.Delay, whose allocations own nothing: an out of
+    // memory there is a failed wait and no more. The pause carries the cancellation and the deadline.
+    // (WaitAsync with neither returns its queued waiter itself, allocating nothing after the link, but
+    // a cancellation or a deadline would still need a way to take a waiter out of the queue.)
+    //
+    // The cost, stated (round-6 review). The waiters are not ordered, and the order is against the one that has
+    // waited longest: a taker that comes as the semaphore is let go takes it with its first try, while a poller's
+    // next try is up to a pause away. Under a stream of takers each arriving within a timer tick of the release
+    // before it — fresh heavy phases under sustained overload on a width-1 host — a merge or the oldest tier's
+    // heavy phase polling for the permit is passed by every one of them until the stream breaks (a synthetic
+    // chain of 200 ms holders, successors 1-8 ms after each release: passed by 25 of 25 in 4-5 trials of 6, at
+    // an 8 ms pause as at 16 — the pause below does not change it;
+    // the round-5 review measured merges about halving on such a host, with no cost in throughput, 503s,
+    // shutdown or idle CPU). And a contended take is up to a pause late: Windows rounds every pause up to its
+    // 15.6 ms timer tick, so a pause of 16 ms was two ticks (31 ms measured, p50 and max alike), 8 ms is one
+    // (16 ms) — hence OwnerPollMaxMs; elsewhere the timer is ~1 ms, and a waiter polls at most 125 times a
+    // second, one Task.Delay each. A ticket would order the waiters, but one that dies with its turn — an out
+    // of memory at its pause — would hold every waiter behind it: M-B's failure, which polling rules out.
+
+    /// <summary>
+    /// The longest pause between two tries at an owner semaphore: under one tick of the Windows timer (15.6 ms),
+    /// which rounds a pause up to a whole tick — at 16 ms two (round-6 review).
+    /// </summary>
+    private const int OwnerPollMaxMs = 8;
+
+    /// <summary>
+    /// The pause before the next try at <paramref name="semaphore"/>: <paramref name="pauseMs"/>, which
+    /// doubles up to <see cref="OwnerPollMaxMs"/>, cut to <paramref name="deadline"/>
+    /// (<see cref="Environment.TickCount64"/>; 0 for none). Not an async method: the caller awaits the
+    /// delay itself and takes the semaphore in its own frame, so nothing takes it on behalf of a caller
+    /// whose await has failed.
+    /// </summary>
+    private Task OwnerPoll(SemaphoreSlim semaphore, ref int pauseMs, long deadline, CancellationToken ct)
+    {
+        _beforeOwnerPollForTest?.Invoke(semaphore);
+        int pause = NextOwnerPollPause(ref pauseMs);
+        if (deadline != 0) pause = (int)Math.Clamp(deadline - Environment.TickCount64, 0, pause);
+        return Task.Delay(pause, ct);
+    }
+
+    /// <summary>The pause before a contended take's next try, from 1 ms, and the one after it: doubled, up to <see cref="OwnerPollMaxMs"/>.</summary>
+    internal static int NextOwnerPollPause(ref int pauseMs)
+    {
+        int pause = pauseMs;
+        pauseMs = Math.Min(2 * pause, OwnerPollMaxMs);
+        return pause;
+    }
+
+    /// <summary>
+    /// Test seam: runs before each pause of a contended take of an owner semaphore, with the semaphore;
+    /// throwing from it is an out of memory while waiting for it.
+    /// </summary>
+    internal Action<SemaphoreSlim>? _beforeOwnerPollForTest;
+
+    /// <summary>
+    /// Test hook: on the calling thread, whether it holds the writer lock or the frozen-tier list's, and whether the swap
+    /// lock (a semaphore, held by no thread in particular) is taken — what a flush in its owner's frame must find (round 7).
+    /// </summary>
+    internal (bool WriterLockHeld, bool FrozenLockHeld, bool SwapLockTaken) LocksAsSeenHereForTest =>
+        (_writerLock.IsHeldByCurrentThread, Monitor.IsEntered(_frozenLock), _flushLock.CurrentCount == 0);
+
+    /// <summary>Test hooks: the owner semaphores, for a seam to tell apart and a test to count.</summary>
+    internal SemaphoreSlim FlushLockForTest        => _flushLock;
+    internal SemaphoreSlim FlushConcurrencyForTest => _flushConcurrency;
+    internal SemaphoreSlim FlushSlotsForTest       => _flushSlots;
+
+    /// <summary>Gives a flush retry's slot, its tier's frozen text and its heavy-phase count back. Never throws.</summary>
+    private void ReleaseFlushRetryOwners(HotTierSegment tier) => GiveBackSlot(endHeavyPhase: true, tier);
+
+    /// <summary>
+    /// Gives a heavy-phase permit (<see cref="_flushConcurrency"/>) back. Never throws: a release that
+    /// fails waking a parked waiter has handed that waiter the permit, and a throw out of the finally
+    /// it ends skipped the publish or the slot's release after it.
+    /// </summary>
+    private void ReleaseHeavyPermit()
+    {
+        try { _flushConcurrency.Release(); }
+        catch (Exception) { /* the waiter has it */ }
+    }
+
+    /// <summary>
+    /// Gives a flush slot back — and the heavy-phase count with it when <paramref name="endHeavyPhase"/>,
+    /// and the frozen text <paramref name="tier"/> was charged with at its swap, or as its despill listed
+    /// it (round-6 R5-M11) — then says the slot is free. Each step on its own: the slot's release
+    /// allocates when it wakes a parked async waiter, and a throw from it skipped the count's end,
+    /// which shutdown then waited for its whole budget. The text goes first, so the swap the free slot
+    /// asks for finds it gone. Never throws; it ends the finally blocks that own all three.
+    /// </summary>
+    private void GiveBackSlot(bool endHeavyPhase, HotTierSegment? tier = null)
+    {
+        if (tier is not null)
+        {
+            long text = tier.TakeFrozenTextCharge();
+            if (text != 0) Interlocked.Add(ref _frozenTextBytes, -text);
+        }
+        ReleaseFlushSlot();   // and a run's clock, stopped while no swap could be tried, goes on (L-4; round-6 review)
+        if (endHeavyPhase)
+        {
+            try { EndHeavyPhase(); }
+            catch (Exception) { /* the count fell; only shutdown's wake is lost, and its wait is bounded */ }
+        }
+        OnFlushSlotReleased();
+    }
+
+    /// <summary>The flush retry itself (see <see cref="TryScheduleFlushRetry"/>).</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
+    private async Task FlushRetryLoopAsync(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId,
+                                           Action<List<SegmentInfo>>? onPublished, byte publishedLevels,
+                                           FlushRetryOwners owners)
+    {
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
+                List<SegmentInfo> written;
+                try
                 {
-                    await Task.Delay(FlushRetryDelay, _cts.Token).ConfigureAwait(false);
+                    _beforeFlushRetryAttemptForTest?.Invoke();
+                    _cts.Token.ThrowIfCancellationRequested();
+                    for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
+                        await OwnerPoll(_flushConcurrency, ref pause, 0, _cts.Token).ConfigureAwait(false);
                     try
                     {
-                        await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
-                        List<SegmentInfo> written;
-                        try
-                        {
-                            // The failed attempt may have MOVED some level files into place
-                            // without registering them (the publish block never ran, so no
-                            // query, merge or replication can hold them). Delete the
-                            // leftovers and rewrite the whole block — simpler to prove
-                            // correct than resuming, and the block's ids are reserved to
-                            // this WAL so nothing else can have produced these files.
-                            DeleteUnpublishedLevelFiles(reservedSegId);
-                            written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token);
-                        }
-                        finally { _flushConcurrency.Release(); }
-
-                        PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
-                        _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId);
-                        return;
+                        // The failed attempt may have MOVED some level files into place
+                        // without registering them (the publish block never ran, so no
+                        // query, merge or replication can hold them). Delete the
+                        // leftovers and rewrite the whole block — simpler to prove
+                        // correct than resuming, and the block's ids are reserved to
+                        // this WAL so nothing else can have produced these files. Save
+                        // a despill's levels an EARLIER run published: those are
+                        // registered segments, and are kept and not rewritten.
+                        DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
+                        // In this frame, not awaited (see FlushTierByLevel): when an attempt ends, nothing of it runs.
+                        written = FlushTierByLevel(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
                     }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
+                    catch
+                    {
+                        ReleaseHeavyPermit();
+                        throw;
+                    }
+                    // By plain code and the catch, as at every heavy phase's end (R6-M6; see TryFlushAsync's): a finally
+                    // is guarded by the compiler's state, which an attempt that caught a failed registration leaves set
+                    // until a suspension resumes — or until the loop re-enters this attempt's try, whose dispatch resumes
+                    // the failed wait (round 7). Plain code does not depend on which.
+                    ReleaseHeavyPermit();
+
+                    PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
+                }
+                catch (OperationCanceledException) { throw; }
+                // The attempt failed, and nothing of it runs on: its flush ran in this frame. It was awaited, and a
+                // registration of that await's continuation that ran out of memory left it running: the next attempt
+                // voided the marker and unlinked the levels it was writing (21eb088's LOW), and c42b5d4's filter,
+                // which let such a throw out of the loop, handed the loop's end to RetryEnded with every finally
+                // skipped — the slot, the count and the text given back, and a despill's tier freed, its levels
+                // unlinked and its block queued again, all under the running flush (round-6 review R6-H3; c42b5d4's
+                // audit and 788264c said the phase stayed counted: it did not).
+                catch (Exception ex)
+                {
+                    try
                     {
                         _logger.LogError(ex,
                             "Frozen-tier flush retry failed for block {Block} — next attempt in {Delay}s",
                             reservedSegId, FlushRetryDelay.TotalSeconds);
                     }
+                    catch (Exception) { /* the line is lost; the next attempt is not */ }
+                    continue;
                 }
+
+                // Published: the block is registered and the tier retired. Nothing from here goes
+                // round again — the success line used to sit inside the attempt, and a throw from it
+                // sent the loop into a second attempt, which unlinked the level files just
+                // published (registered segments) and flushed a tier already handed to be freed.
+                try { _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId); }
+                catch (Exception) { /* the line is lost */ }
+                try { onPublished?.Invoke(written); }
+                catch (Exception ex)
+                {
+                    try { _logger.LogWarning(ex, "Bookkeeping after the retry of block {Block} failed", reservedSegId); }
+                    catch (Exception) { /* the line is lost */ }
+                }
+                // Given back here, by plain code, and in the catches below; the finally only backs them up (round 7).
+                // An attempt whose pause for the permit failed at its registration is caught above, and the loop goes
+                // round with the compiler's state still that suspension's: a finally is skipped until a suspension
+                // resumes, or until the next attempt's try resets the state as it re-enters (its dispatch resumes the
+                // failed wait). Had neither happened, the loop would have returned through a skipped finally, and
+                // RetryEnded taken that for a retry that ended unfinished — for a despill, a give-up that unlinks the
+                // levels just published. Plain code does not depend on the dispatch.
+                owners.GiveBack();
+                return;
             }
-            catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
-            catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
-            finally
-            {
-                // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
-                try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
-                EndHeavyPhase();
-            }
-        });
-        _inFlightFlushes[t] = 0;
-        _ = t.ContinueWith(
-            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-            _inFlightFlushes, CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+        catch (OperationCanceledException) { owners.GiveBack(); /* shutdown — WAL replays the tier next start */ }
+        catch (ObjectDisposedException)    { owners.GiveBack(); /* raced DisposeAsync's CTS teardown — same outcome */ }
+        finally { owners.GiveBack(); }   // once: GiveBack gives them back only the first time
     }
 
     /// <summary>
     /// Removes level files of a reserved block that were moved into place by a flush attempt that
     /// failed before publishing. internal so a test can run it under the boot scan.
+    ///
+    /// <para>The block's completion marker goes first, durably, or nothing does (round-5 H-A; see
+    /// <see cref="RemoveFlushMarkerDurably"/>): an attempt whose flush completed and whose publish
+    /// failed left one, and a level unlinked under it was a level the next start, or the block's next
+    /// despill, took for written — and deleted the only other copy of. Throws when the marker may
+    /// still be there.</para>
     /// </summary>
-    internal void DeleteUnpublishedLevelFiles(ulong firstSegId)
+    /// <param name="keepLevels">
+    /// Levels an EARLIER run published (a despill's; see <c>FlushTierByLevelAsync</c>): the boot
+    /// scan registered their files as ordinary segments, and unlinking them left the catalog naming
+    /// files that were gone, for a merge or a query to trip over.
+    /// </param>
+    internal void DeleteUnpublishedLevelFiles(ulong firstSegId, byte keepLevels = 0)
     {
+        RemoveFlushMarkerDurably(firstSegId);
         for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
         {
+            if ((keepLevels & (1 << (int)s)) != 0) continue;
             foreach (var f in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{firstSegId + s}-*.seg"))
             {
                 // Recorded for a running catalog scan before the unlink, as every other delete of a
@@ -2606,11 +3667,40 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // place before the scan listed the directory met the scan's open as a file gone with
                 // no delete of ours: left unread, the store Degraded until a restart, over our own
                 // unlink. The record makes it the delete it is: skipped at Debug.
-                lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(f);
+                //
+                // And unregistered, if the scan got there first (round-5 H-C). The scan runs beside
+                // the startup replay and beside every flush of its first minutes, and may have
+                // registered the file already: the entry outlived the unlink, naming a path the
+                // despill or the retry later filled again with the same level, and a merge that took
+                // it while that file was there stored the level's events a second time once the block
+                // was published. Only the scan registers an unpublished level, and only under this
+                // gate: a scan that comes later finds the record and skips the file; one that came
+                // earlier left the entry that goes here — the same step as a delete of a segment.
+                lock (_importLock)
+                lock (_scanDeleteGate)
+                {
+                    _deletedDuringCatalogScan?.Add(f);
+                    UnregisterScannedLevel(f);
+                }
                 try { File.Delete(f); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete unpublished level file {File}", f); }
             }
         }
+    }
+
+    /// <summary>
+    /// Takes out of the catalog the entry the boot scan registered for an unpublished level file that is
+    /// about to be unlinked (see <see cref="DeleteUnpublishedLevelFiles"/>), if there is one: the entry under
+    /// the file's key whose path is the file. The caller holds <c>_importLock</c> and
+    /// <see cref="_scanDeleteGate"/>, as for every removal (<see cref="ForgetRemovedSegment"/>).
+    /// </summary>
+    private void UnregisterScannedLevel(string file)
+    {
+        var key = KeyOfSegmentFileName(file);
+        if (key.Equals(default(SegmentKey)) || !_segments.TryGetValue(key, out var entry)) return;
+        if (!string.Equals(entry.FilePath, file, StringComparison.OrdinalIgnoreCase)) return;
+        if (_segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, entry)))
+            ForgetRemovedSegment(key, file);
     }
 
     /// <summary>
@@ -2921,6 +4011,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         Math.Max(s.UncompressedBytes, s.CompressedBytes);
 
     /// <summary>
+    /// The segment ids of the levels a flush still owns, or null when there are none: every level of a
+    /// frozen tier's block (swapped, with or without its retry), and of a queued spill's (a spill file, a
+    /// WAL a crash cut short, a WAL whose replay failed; a despilled tier's block stays queued until it is
+    /// published). The merge planner leaves these entries alone (see <see cref="SelectMergeBatch"/>). Read
+    /// under each list's lock, one at a time; off every hot path.
+    ///
+    /// <para>The levels an earlier run published (<see cref="QueuedSpill.PublishedLevels"/>) are owned too
+    /// (round-6 review R5-M2). They are registered segments the despill never writes, and were left to
+    /// merges: one that took such a level before the block's despill, followed by a stop before that despill
+    /// finished, made the next start find the level gone from disk and write it again — its events twice,
+    /// 30 for 20 (the round-5 reviewer's R5-5). They are served as before, and merged once the block is
+    /// published, when it leaves the queue.</para>
+    /// </summary>
+    private HashSet<ulong>? LevelIdsAFlushOwns()
+    {
+        HashSet<ulong>? ids = null;
+        lock (_spillQueueLock)
+            foreach (var (block, _) in _spillQueue)
+                AddLevels(ref ids, block);
+        lock (_frozenLock)
+            foreach (var (_, block) in _frozenHot)
+                AddLevels(ref ids, block);   // a despilled tier's block is queued too: a set, so twice is once
+        // And a block a failed startup replay left for the next start (round-6 review R5-M1): its levels
+        // are the next start's to read, whatever the boot scan registered of them meanwhile.
+        lock (_blocksLeftByReplay)
+            foreach (var block in _blocksLeftByReplay)
+                AddLevels(ref ids, block);
+        return ids;
+
+        static void AddLevels(ref HashSet<ulong>? ids, ulong block)
+        {
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                (ids ??= new HashSet<ulong>()).Add(block + (ulong)lvl);
+        }
+    }
+
+    /// <summary>
     /// Picks the next batch: the oldest (level, expiry bucket) group that holds a mergeable run,
     /// and as many of that run's segments as one merged file affords. Null when nothing is worth
     /// merging — which is the steady state, not a failure: every bucket has either reached
@@ -2949,15 +4076,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         var  buckets  = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
         bool anyKept  = !_outputsWithKeptManifest.IsEmpty;
         bool anyWait  = !_undecidedMergeOutputs.IsEmpty;
-        foreach (var s in _segments.Values)
+        // The catalog's snapshot first, then the blocks a flush owns: an entry a publish registered is
+        // in the snapshot only once that publish holds _frozenLock, and the owners are read under it —
+        // after a commit (the block unlisted, the entry final) or a rollback (the block still listed).
+        var  catalog  = _segments.Values;
+        var  owned    = LevelIdsAFlushOwns();
+        foreach (var s in catalog)
         {
             if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
+            // Not a level a flush still owns (round-5 H-C, L-19): of a frozen tier's block, swapped or
+            // despilled, with or without its retry, or a queued spill's — save the levels an earlier run
+            // published, which no despill writes. Such an entry is not the block's publication — the
+            // boot scan registered a level a failed attempt had moved into place, or a publish is being
+            // rolled back — and the block's own flush writes that level again: merged meanwhile, its
+            // events were stored twice, once in the merged file.
+            if (owned is not null && s.NodeId.Value == _options.NodeId.Value && owned.Contains(s.Id.Value)) continue;
             // Not while its manifest waits for a held source: see _outputsWithKeptManifest.
             if (anyKept && _outputsWithKeptManifest.ContainsKey(s.FilePath)) continue;
             // Nor inside the span of an output whose verdict is not carried out yet: see _undecidedMergeOutputs.
             if (anyWait && OverlapsUndecidedMergeOutput(s)) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
-            // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
+            // MergeToCold stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
             // is no longer recognised as already held: its events land a second time, permanently,
             // since nothing on this node can ever match the re-pushed pair against the merged copy.
@@ -3207,20 +4346,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// and the tests that call it — seventy-odd sites — merge straight after building an engine,
     /// where Busy would be a race against the engine's own background scan.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
         await _catalogLoad.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         return await MergeSmallSegmentsOnceAsync(ct).ConfigureAwait(false) == MergeOutcome.Merged;
     }
 
-    /// <summary>One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.</summary>
+    /// <summary>
+    /// One merge batch, entered with the merge gate taken; lets go of it when the batch ends, however it ends.
+    ///
+    /// <para>Boxed first (round-5 review L-16). Its first real suspension was its await of the batch, and a
+    /// box that could not be allocated there skipped the finally that lets go of the gate — while the batch
+    /// ran on: the gate stayed taken for the life of the process, every later pass and merge Busy, and
+    /// compaction stopped without a word. A failure at the yield runs its catch, which lets go of the gate
+    /// before any batch has begun.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<MergeOutcome> MergeUnderGateAsync(CancellationToken ct)
     {
+        try { await Task.Yield(); }
+        catch
+        {
+            Volatile.Write(ref _mergeGate, 0);
+            throw;
+        }
         try { return await MergeOneBatchAsync(ct).ConfigureAwait(false) ? MergeOutcome.Merged : MergeOutcome.NothingToMerge; }
         finally { Volatile.Write(ref _mergeGate, 0); }
     }
 
-    /// <summary>The body of <see cref="MergeSmallSegmentsOnceAsync"/>: true when a batch was merged; the caller holds the merge gate.</summary>
+    /// <summary>
+    /// The body of <see cref="MergeSmallSegmentsOnceAsync"/>: true when a batch was merged; the caller holds the merge gate.
+    ///
+    /// <para>Its waits are the two polls (round 7): the manifest is written and the merge streamed in this frame, and
+    /// each poll's catch gives back what the frame holds there. Built with the owner builder, whose registrations on a
+    /// task are made again when they run out of memory.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<bool> MergeOneBatchAsync(CancellationToken ct)
     {
         // Never produce index-less segments: the builder is wired by a hosted
@@ -3352,7 +4514,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         ulong reserved;
         try
         {
-            await _flushLock.WaitAsync(ct);
+            // Never queued in the lock (OwnerPoll; round-5 M-B): a queued waiter whose wait ran out of
+            // memory after it was linked was granted the lock by the next release — no swap, despill or
+            // merge ever again.
+            ct.ThrowIfCancellationRequested();
+            for (int pause = 1; !_flushLock.Wait(0); )
+                await OwnerPoll(_flushLock, ref pause, 0, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -3363,7 +4530,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             throw;
         }
         try { reserved = AllocateSegmentId(); }
-        finally { _flushLock.Release(); }
+        finally { ReleaseFlushLock(); }
 
         var  segId        = new SegmentId(reserved);
         long expectEvents = 0, minTs = long.MaxValue, maxTs = long.MinValue;
@@ -3387,20 +4554,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         //    Written THROUGH to the platter, for the same reason the merged file is: the whole
         //    protocol is an ordering between this file and a set of unlinks, and an ordering
         //    only the page cache observes does not survive a power loss.
+        //    Written in this frame (round 7): its writes were awaited, and a registration of one of those awaits
+        //    that ran out of memory skipped the usings' disposal — the manifest held open, so its delete below failed.
         try
         {
-            await using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
-                                                 4096, FileOptions.WriteThrough))
+            using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                           4096, FileOptions.WriteThrough))
             using (var mw = new StreamWriter(mf))
             {
-                foreach (var s in consumed) await mw.WriteLineAsync(Path.GetFileName(s.FilePath));
-                await mw.FlushAsync(ct);
+                foreach (var s in consumed) mw.WriteLine(Path.GetFileName(s.FilePath));
+                mw.Flush();
                 mf.Flush(flushToDisk: true);
             }
         }
         catch
         {
-            // The readers were opened by the planner; MergeToColdAsync takes ownership of them
+            // The readers were opened by the planner; MergeToCold takes ownership of them
             // and it is never reached from here.
             foreach (var r in readers) r.Dispose();
             try { File.Delete(manifestPath); } catch { }
@@ -3416,7 +4585,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         SegmentInfo info;
         try
         {
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
+                await OwnerPoll(_flushConcurrency, ref pause, 0, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -3424,13 +4595,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             try { File.Delete(manifestPath); } catch { }
             throw;
         }
+        // The merge runs in this frame (MergeToCold), and the permit goes back by plain code and in the catches, not in
+        // a finally (round 7; see TryFlushAsync's heavy phase): nothing of the merge runs on when this method goes on.
         try
         {
             _beforeMergeStream?.Invoke();
-            info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
+            info = MergeToCold(readers, segId, segPath, expectEvents, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            ReleaseHeavyPermit();
             // Shutdown is not a verdict on the batch. Swept up with everything else it logged a
             // WARNING on every single stop, swallowed the cancellation the maintenance loop
             // stops on, and quarantined the window — so the segments a clean restart had every
@@ -3441,6 +4615,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
         catch (Exception ex)
         {
+            ReleaseHeavyPermit();
             // Nothing has been deleted and the merged file never reached segPath, so the only
             // state to undo is the manifest.
             //
@@ -3454,11 +4629,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             // the process, and the small-file backlog those segments form is the exact thing the
             // sweep exists to remove. Left in the candidate set, the next pass simply retries.
             //
-            // Disposing here as well as in the merge task is deliberate, and it is the same
-            // discipline the two waits above follow: MergeToColdAsync only takes ownership of the
-            // readers once its delegate is entered, and from out here there is no way to know
-            // whether it was. Dispose is idempotent, so the rule can simply be that every exit
-            // from this method that does not publish closes them.
+            // Disposing here as well as in the merge is deliberate, and it is the same discipline
+            // the two waits above follow: every exit from this method that does not publish closes
+            // them. Dispose is idempotent, and MergeToCold has ended by now: it runs in this frame.
             foreach (var r in readers) r.Dispose();
             if (IsSourceCorruption(ex))
             {
@@ -3482,7 +4655,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
             return false;
         }
-        finally { _flushConcurrency.Release(); }
+        ReleaseHeavyPermit();
 
         var outputKey  = SegmentKey.Of(info);
         var sourceKeys = new SegmentKey[consumed.Count];
@@ -3511,16 +4684,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // for its whole run (#114), so on Windows a merge that lands under a query over its
         // window ALWAYS finds sources held, on a perfectly healthy server; the parked retry
         // deletes them once the query ends, and is what warns if one outlives its window.
-        bool allGone = consumed.All(s => !File.Exists(s.FilePath));
-        if (allGone)
+        //
+        // Gone as the file system says it (Look; round-6 review R5-M6's class): File.Exists answered false
+        // for a source it could not look at as well, and the manifest went while that source was still on
+        // disk — the next start served it beside the output, its events twice.
+        int notGone = 0;
+        foreach (var s in consumed)
+            if (Look(s.FilePath) != Presence.Gone) notGone++;
+        if (notGone == 0)
             try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
         else
         {
             // Out of the planner while the manifest waits, or a merge of this output would leave
             // the manifest naming an output that is gone (see _outputsWithKeptManifest).
             _outputsWithKeptManifest.TryAdd(segPath, 0);
-            _logger.LogInformation("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
-                consumed.Count(s => File.Exists(s.FilePath)));
+            _logger.LogInformation(
+                "Merge: {Count} source file(s) still held open, or not to be looked at — manifest kept for the recovery sweep",
+                notGone);
         }
 
         _logger.LogInformation(
@@ -3748,96 +4928,93 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// unverified merge and recovery would then finish deleting its sources for it.
     /// </param>
     /// <remarks>
+    /// <para><b>Synchronous, in its caller's frame</b> (round 7, the registration class; see
+    /// <see cref="FlushTierByLevel"/>). It was a Task.Run its caller awaited: a registration of that
+    /// await's continuation that ran out of memory threw into <see cref="MergeOneBatchAsync"/> with the
+    /// merge reading on — its catch closed the readers under it (mapped views), its finally gave the
+    /// heavy-phase permit back early, and its return let the planner's state go while the merge still
+    /// used it. With no await there is nothing left running when the caller goes on.</para>
     /// Internal rather than private so its reader-ownership contract can be tested where it is
     /// actually made. Driven through <see cref="TryMergeSmallSegmentsOnceAsync"/> the contract is
     /// invisible: that method's own abort paths close the readers too, deliberately, so a test
     /// that cancels a whole merge pass cannot tell which of the two did it — and passes just as
     /// well when this one does nothing at all.
     /// </remarks>
-    internal Task<SegmentInfo> MergeToColdAsync(
+    internal SegmentInfo MergeToCold(
         List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
-        var  sinkFactory = IndexSinkFactory;
-        long groupBudget = _groupPayloadBudgetBytes;
-
-        return Task.Run(() =>
+        // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
+        // startup, so a crash any time before the Move leaves nothing to recover from.
+        string tmpPath = segPath + ".tmp";
+        MergingSegmentEventSource? source = null;
+        try
         {
-            // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
-            // startup, so a crash any time before the Move leaves nothing to recover from.
-            string tmpPath = segPath + ".tmp";
-            MergingSegmentEventSource? source = null;
-            try
-            {
-                // Cancellation is observed HERE, and the token is deliberately NOT handed to
-                // Task.Run: a Task.Run whose token is already signalled transitions the task
-                // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
-                // the only place the readers this method took ownership of are closed. Cancelling
-                // in the window between _flushConcurrency.WaitAsync returning and the delegate
-                // being scheduled therefore left up to MergeMaxSources mapped views alive for the
-                // life of the process, and a mapped file on Windows can be neither compacted nor
-                // unlinked by retention. That is the very hazard the wait's own catch guards
-                // against one step earlier; this closes the second door into it.
-                ct.ThrowIfCancellationRequested();
+            // Cancellation is observed HERE, inside the try whose finally closes the readers this
+            // method took ownership of. It was a Task.Run, and a Task.Run whose token was already
+            // signalled went straight to Canceled without running its delegate — up to
+            // MergeMaxSources mapped views alive for the life of the process, which on Windows can
+            // be neither compacted nor unlinked by retention. A method in its caller's frame always
+            // enters its body.
+            ct.ThrowIfCancellationRequested();
 
-                SegmentInfo info;
-                source = new MergingSegmentEventSource(readers);
-                // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
-                // it is off the ingest path, and its output is the long-lived file — so the extra
-                // encode is paid once, on a background pass, against a file that is read and kept
-                // until retention deletes it. The flush path stays on the fast level: its output
-                // is short-lived and this merge is what rewrites it.
-                //
-                // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
-                // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
-                // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
-                // clock — on the stand's volume, seconds of one core a day.
-                using (var writer = new SegmentWriter(tmpPath, groupBudget, SegmentCompression.High))
-                {
-                    writer.WriteEvents(source, sinkFactory, ct);
-                    info = writer.Finalise(_options.NodeId, segId);
-                }
-                // Close the readers BEFORE the caller starts deleting sources: on Windows a
-                // mapped file cannot be unlinked, and a leaked view would leave the merge
-                // permanently stuck in its "sources still held open" recovery path.
-                source.Dispose();
-                source = null;
-                foreach (var r in readers) r.Dispose();
-
-                // Refuse to publish unless every source event is in the merged file. Counts come
-                // from file headers on both sides, so a mismatch means the stream lost or
-                // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
-                // catalog, deleted by the startup sweep — and the caller drops the manifest, so
-                // the pre-merge state is restored exactly.
-                if (info.EventCount != expectEvents)
-                    throw new InvalidDataException(
-                        $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
-
-                ct.ThrowIfCancellationRequested();
-                File.Move(tmpPath, segPath, overwrite: false);
-                return new SegmentInfo
-                {
-                    Id                = info.Id,
-                    NodeId            = info.NodeId,
-                    FilePath          = segPath,
-                    MinTimestampTicks = info.MinTimestampTicks,
-                    MaxTimestampTicks = info.MaxTimestampTicks,
-                    EventCount        = info.EventCount,
-                    MinLevel          = info.MinLevel,
-                    CompressedBytes   = info.CompressedBytes,
-                    UncompressedBytes = info.UncompressedBytes,
-                };
-            }
-            catch
+            SegmentInfo info;
+            source = new MergingSegmentEventSource(readers);
+            // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
+            // it is off the ingest path, and its output is the long-lived file — so the extra
+            // encode is paid once, on a background pass, against a file that is read and kept
+            // until retention deletes it. The flush path stays on the fast level: its output
+            // is short-lived and this merge is what rewrites it.
+            //
+            // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
+            // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
+            // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
+            // clock — on the stand's volume, seconds of one core a day.
+            using (var writer = new SegmentWriter(tmpPath, _groupPayloadBudgetBytes, SegmentCompression.High))
             {
-                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
-                throw;
+                writer.WriteEvents(source, IndexSinkFactory, ct);
+                info = writer.Finalise(_options.NodeId, segId);
             }
-            finally
+            // Close the readers BEFORE the caller starts deleting sources: on Windows a
+            // mapped file cannot be unlinked, and a leaked view would leave the merge
+            // permanently stuck in its "sources still held open" recovery path.
+            source.Dispose();
+            source = null;
+            foreach (var r in readers) r.Dispose();
+
+            // Refuse to publish unless every source event is in the merged file. Counts come
+            // from file headers on both sides, so a mismatch means the stream lost or
+            // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
+            // catalog, deleted by the startup sweep — and the caller drops the manifest, so
+            // the pre-merge state is restored exactly.
+            if (info.EventCount != expectEvents)
+                throw new InvalidDataException(
+                    $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
+
+            ct.ThrowIfCancellationRequested();
+            File.Move(tmpPath, segPath, overwrite: false);
+            return new SegmentInfo
             {
-                source?.Dispose();
-                foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
-            }
-        });
+                Id                = info.Id,
+                NodeId            = info.NodeId,
+                FilePath          = segPath,
+                MinTimestampTicks = info.MinTimestampTicks,
+                MaxTimestampTicks = info.MaxTimestampTicks,
+                EventCount        = info.EventCount,
+                MinLevel          = info.MinLevel,
+                CompressedBytes   = info.CompressedBytes,
+                UncompressedBytes = info.UncompressedBytes,
+            };
+        }
+        catch
+        {
+            try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+            throw;
+        }
+        finally
+        {
+            source?.Dispose();
+            foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
+        }
     }
 
     /// <summary>
@@ -3848,7 +5025,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// <para>COMMITTED is decided on the output alone. The manifest is written through before the
     /// output exists anywhere but at <c>.seg.tmp</c>, and the output reaches its final name only by
     /// the rename that follows the writer's fsync and its event-count check
-    /// (<see cref="MergeToColdAsync"/>). So a manifest without its output is a merge that never
+    /// (<see cref="MergeToCold"/>). So a manifest without its output is a merge that never
     /// committed — killed while streaming, or before the rename: its sources are the only copy and
     /// stay in service, the constructor has swept the <c>.seg.tmp</c>, and the manifest goes. With
     /// its output, every source still on disk is a duplicate of events the output holds.</para>
@@ -3966,8 +5143,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // not move the output aside — torn, or a newer format rolled back — is never decided by a read
         // again: a holder that lets nothing read the file answers any read with a failure that says
         // nothing about the bytes. Recorded with what it costs already counted (and the list set
-        // aside), so the sources it listed are free to merge.
-        if (File.Exists(output) && new FileInfo(manifest).Length == 0)
+        // aside), so the sources it listed are free to merge. An output that cannot be looked at goes on
+        // to ReadMergeOutput, whose look then defers the verdict (round-6 review R5-M6).
+        if (Look(output) == Presence.There && new FileInfo(manifest).Length == 0)
         {
             LetGoOfMergeOutput(output);
             RecoverTornMerge(manifest, output, SetAsideReason.EarlierVerdict);
@@ -4139,11 +5317,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         finally { ReleaseUntriedMergeGuards(guarded); }
 
         // The manifest goes once nothing it lists is left to it: no source parked, none on disk.
-        // File.Exists, the merge's own test for the same decision. A different segment served at a
-        // listed path is not the merge's to wait for.
+        // A look, the merge's own test for the same decision — gone only as the file system says it
+        // (round-6 review R5-M6): File.Exists answered false for a source it could not look at as well,
+        // and the manifest went with that source still on disk, served beside the output after the next
+        // start. A different segment served at a listed path is not the merge's to wait for.
         bool anyLeft = false;
         for (int i = 0; i < sources.Count && !anyLeft; i++)
-            anyLeft = !foreign[i] && (_pendingSegmentDeletes.ContainsKey(sources[i]) || File.Exists(sources[i]));
+            anyLeft = !foreign[i] && (_pendingSegmentDeletes.ContainsKey(sources[i]) || Look(sources[i]) != Presence.Gone);
         if (!anyLeft)
         {
             _deleteMergeManifest(manifest);
@@ -4233,7 +5413,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     {
         proved     = null;
         unreadable = null;
-        if (!File.Exists(output)) return MergeOutputState.Absent;
+        // Absent only as the file system says it (round-6 review R5-M6): File.Exists answered false for an
+        // output it could not look at as well, and Absent lets the sources go free and deletes the
+        // manifest — the output, still on disk and whole, then served beside its own sources after the
+        // next start. One that cannot be looked at waits for its verdict, as one that cannot be read does.
+        switch (Look(output))
+        {
+            case Presence.Gone:
+                return MergeOutputState.Absent;
+            case Presence.Unknown:
+                unreadable = new IOException($"The merge output {output} could not be looked at");
+                return MergeOutputState.Unknown;
+        }
         if ((_segments.TryGetValue(KeyOfSegmentFileName(output), out var entry)
              && string.Equals(entry.FilePath, output, StringComparison.OrdinalIgnoreCase))
             || _pendingSegmentDeletes.ContainsKey(output))
@@ -4637,8 +5828,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// a data directory written by the previous build (complete flush, no marker anywhere) be
     /// replayed without producing a single duplicate.
     /// </param>
-    private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
-        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false)
+    /// <param name="publishedLevels">
+    /// A despill's: the levels of the block an earlier run published, as found when this run
+    /// STARTED (bit <c>1 &lt;&lt; level</c>; see <c>DiscoverSpillFiles</c>). Skipped whether or not
+    /// their file is still there — a merge or retention pass may have taken it since, and asking
+    /// the disk now would write those events a second time.
+    /// </param>
+    /// <remarks>
+    /// <para><b>Synchronous, on the caller's thread</b> (round-7, the registration class). Every caller — the swap's
+    /// heavy phase, a despill, a flush retry, the startup replay — runs on a pool thread of its own and runs this in
+    /// its own frame, so nothing awaits a flush while the flush reads the tier. It was an async method that queued
+    /// each level's write (a Task.Run) and awaited it, and its callers awaited it in turn: an await whose
+    /// continuation could not be registered (out of memory under the TPL event source or async debugging, or a task
+    /// completed meanwhile queued to a pool queue that must grow) threw into the awaiting method with every finally
+    /// skipped while the flush ran on. Round 5 boxed this method first (H-B) and round 6 filtered its callers'
+    /// catches (c42b5d4), but a LATER suspension's registration was the same road: the retry loop's task faulted
+    /// and its RetryEnded gave the slot, the count and the text back and freed a despill's tier, unlinking its
+    /// levels, under the running flush (R6-H3); the heavy phase's permit was never given back, so at width 1 no
+    /// flush, despill or merge ran again (R6-M6); this method's own await of a level write faulted it while the
+    /// write read on, and the startup replay's <c>using</c> or a despill whose retry could not start freed the tier
+    /// under the write. With no await there is no orphan to free anything under: the method returns, or throws,
+    /// once nothing of it runs. The thread a level's write used to run on is the caller's now: the same one
+    /// blocked thread per flush, one hop fewer.</para>
+    /// </remarks>
+    private List<SegmentInfo> FlushTierByLevel(
+        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false, byte publishedLevels = 0)
     {
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
@@ -4655,6 +5869,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 if (n == 0) continue;
 
                 var segId = new SegmentId(firstSegId + (ulong)lvl);
+                if ((publishedLevels & (1 << lvl)) != 0)
+                {
+                    _logger.LogInformation(
+                        "Despill: level {Level} of block {Block} was published by an earlier run — {Count} event(s) not rewritten",
+                        (Ameto.Core.LogLevel)lvl, firstSegId, n);
+                    continue;
+                }
                 if (skipPublishedLevels && SegmentFileExists(segId.Value))
                 {
                     _logger.LogInformation(
@@ -4663,19 +5884,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                     continue;
                 }
 
+                _beforeLevelWriteForTest?.Invoke(lvl);
+
                 // A RENTED array is longer than its level's event count, so every consumer
                 // below is told how much of it is real. The writer would otherwise stage the
                 // rent's tail — stale tier indices from a previous flush — as events.
                 var subset  = perLevel[lvl];
                 var segPath = BuildSegmentPath(segId, hot, subset, n);
-                written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset, n));
+                // Where the level's Task.Run took its token: a level not begun is not begun after a cancellation.
+                ct.ThrowIfCancellationRequested();
+                written.Add(FlushToCold(hot, segId, segPath, subset, n));
                 _afterLevelPublished?.Invoke(lvl);
             }
         }
         finally
         {
             // Returned only here: each level's array is read by the write it was handed to,
-            // and that write is awaited inside the loop, so nothing below still holds one.
+            // and that write runs inside the loop, so nothing below still holds one.
             for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
                 if (perLevel[lvl] is { } a) ArrayPool<int>.Shared.Return(a);
         }
@@ -4775,70 +6000,139 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path);
+            // Never throws (round-6 review R5-M7): the marker is the flush's last step, so a flush that
+            // failed has written none of its own — what a despill's give-up relies on to give up without
+            // a removal (AbandonDespilledTier) — and a throw from this line was a failed flush with one.
+            try { _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path); }
+            catch (Exception) { /* the line is lost */ }
         }
     }
 
+    /// <summary>
+    /// Round-5 H-A. Removes a block's completion marker so that no power loss brings it back, before
+    /// anything its presence would make wrong: the unlink of a level it vouches for. The marker is
+    /// written last in <see cref="FlushTierByLevelAsync"/>, BEFORE the publish, so a publish that failed
+    /// left a marker over levels nobody registered; the retry and the despill's give-up then unlinked
+    /// those levels under it, and the next start's replay ("already flushed"), or the block's next
+    /// despill, deleted the WAL or the spill file unread — the whole block lost. Throws when it cannot
+    /// say the marker is gone for good; the caller then unlinks nothing.
+    ///
+    /// <para>Durable, because recovery reads the marker's NAME and nothing else. Elsewhere than Windows
+    /// an unlink and an fsync of the directory; on Windows, where a delete is committed lazily, a
+    /// write-through move to a name nothing reads (<see cref="VoidedMarkerPath"/>) and then a plain
+    /// delete of that, which the next start sweeps if it is lost.</para>
+    ///
+    /// <para>A marker that is not there — gone, as the file system says it (<see cref="Look"/>) — is the
+    /// common case, a give-up whose flush never wrote one, and needs neither (round-6 review, the LOW of
+    /// two reviewers): the directory was fsynced, and a failed fsync thrown, for a marker that never was,
+    /// so on a mount whose directory fsync fails every retry failed for good at its first step, every
+    /// despill give-up parked and every failed-replay hand-off threw. A look that fails is not "gone":
+    /// the removal is tried, and made durable, as for a marker that is there.</para>
+    ///
+    /// <para><paramref name="marker"/> and <paramref name="voided"/>, when the caller has them: made
+    /// before the despill whose give-up runs this in an out of memory (round-6 review R5-M7).</para>
+    /// </summary>
+    private void RemoveFlushMarkerDurably(ulong firstSegId, string? marker = null, string? voided = null)
+    {
+        _removeFlushMarkerForTest?.Invoke(firstSegId);
+        marker ??= FlushMarkerPath(firstSegId);
+        if (Look(marker) == Presence.Gone) return;
+        if (OperatingSystem.IsWindows())
+        {
+            voided ??= VoidedMarkerPath(firstSegId);
+            try { DurableFile.Replace(marker, voided); }
+            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070002)) { return; }   // ERROR_FILE_NOT_FOUND: gone since the look
+            try { File.Delete(voided); }
+            catch (Exception) { /* a name nothing reads; swept at the next start */ }
+            return;
+        }
+
+        File.Delete(marker);   // a file that is not there is no error; anything else throws
+        if ((OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) && !SyncWalDirectory())
+            throw new IOException($"The removal of {marker} could not be made durable: the fsync of {_walDir} failed");
+    }
+
+    /// <summary>fsync of the WAL directory (<see cref="DurableFile.SyncDirectory"/>), or the test's answer.</summary>
+    private bool SyncWalDirectory() => _syncWalDirectoryForTest?.Invoke() ?? DurableFile.SyncDirectory(_walDir);
+
+    /// <summary>Test seam: answers the WAL directory's fsync (false: it failed). Null in production.</summary>
+    internal Func<bool>? _syncWalDirectoryForTest;
+
+    /// <summary>Where <see cref="RemoveFlushMarkerDurably"/> moves a marker on Windows: a name no recovery reads, swept at the start.</summary>
+    private string VoidedMarkerPath(ulong firstSegId) =>
+        Path.Combine(_walDir, $"{_options.NodeId.Value}-{firstSegId}{VoidedMarkerExtension}");
+
+    /// <summary>The extension of a completion marker a retry or a give-up voided (see <see cref="RemoveFlushMarkerDurably"/>).</summary>
+    private const string VoidedMarkerExtension = ".voided";
+
+    /// <summary>Test seam: runs as a block's marker is about to be removed; throwing from it is a marker that cannot be. Null in production.</summary>
+    internal Action<ulong>? _removeFlushMarkerForTest;
+
+    /// <summary>
+    /// Test seam: called with the tier as a level write begins, on its thread, before it reads anything
+    /// — how a test holds a write and sees whether its tier is freed or written again beside it. An
+    /// <see cref="AsyncLocal{T}"/>: the startup replay's flush runs in the constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<HotTierSegment>?> LevelWriteStartingForTest = new();
+
+    /// <summary>
+    /// Writes one level of a frozen tier into its segment, on the calling thread (see <see cref="FlushTierByLevel"/>:
+    /// it was a Task.Run its caller awaited, and a failed registration of that await left it reading the tier for
+    /// nobody).
+    /// </summary>
     /// <param name="orderCount">
     /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
     /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
     /// </param>
-    private Task<SegmentInfo> FlushToColdAsync(
-        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct,
-        int[]? order_ = null, int orderCount = -1)
+    private SegmentInfo FlushToCold(HotTierSegment hot, SegmentId segId, string segPath, int[]? order_ = null, int orderCount = -1)
     {
-        // Capture delegate reference before entering Task.Run
-        var sinkFactory  = IndexSinkFactory;
-        long groupBudget = _groupPayloadBudgetBytes;
-        return Task.Run(() =>
+        LevelWriteStartingForTest.Value?.Invoke(hot);
+        // One sort order shared by the index build and the block writer: posting-list
+        // offsets become file ordinals, which the reader maps back to blocks/rows.
+        // A caller-supplied order may be a SUBSET of the tier (level-split flush).
+        int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
+        int   count = orderCount >= 0 ? orderCount : order.Length;
+
+        // The writer drives the index build now, one INDEX GROUP at a time: it knows
+        // where the group's payload budget falls, and only it can interleave a group's
+        // sections between its own blocks. Building the whole file up front is what
+        // made index memory scale with segment size — the ceiling that kept segments
+        // small in the first place.
+
+        // Write to a temp file first; rename to final path only after Finalise()
+        // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
+        string tmpPath = segPath + ".tmp";
+        try
         {
-            // One sort order shared by the index build and the block writer: posting-list
-            // offsets become file ordinals, which the reader maps back to blocks/rows.
-            // A caller-supplied order may be a SUBSET of the tier (level-split flush).
-            int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
-            int   count = orderCount >= 0 ? orderCount : order.Length;
-
-            // The writer drives the index build now, one INDEX GROUP at a time: it knows
-            // where the group's payload budget falls, and only it can interleave a group's
-            // sections between its own blocks. Building the whole file up front is what
-            // made index memory scale with segment size — the ceiling that kept segments
-            // small in the first place.
-
-            // Write to a temp file first; rename to final path only after Finalise()
-            // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
-            string tmpPath = segPath + ".tmp";
-            try
+            SegmentInfo info;
+            using (var writer = new SegmentWriter(tmpPath, _groupPayloadBudgetBytes))
             {
-                SegmentInfo info;
-                using (var writer = new SegmentWriter(tmpPath, groupBudget))
-                {
-                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), sinkFactory);
-                    info = writer.Finalise(_options.NodeId, segId);
-                } // FileStream closed here before Move
-                File.Move(tmpPath, segPath, overwrite: false);
-                // SegmentWriter captured tmpPath as FilePath; rewrite it to
-                // point at the final segment file so subsequent queries can
-                // open it. Without this, queries silently fail (file not
-                // found) until the next restart re-scans the segment dir.
-                return new SegmentInfo
-                {
-                    Id                = info.Id,
-                    NodeId            = info.NodeId,
-                    FilePath          = segPath,
-                    MinTimestampTicks = info.MinTimestampTicks,
-                    MaxTimestampTicks = info.MaxTimestampTicks,
-                    EventCount        = info.EventCount,
-                    MinLevel          = info.MinLevel,
-                    CompressedBytes   = info.CompressedBytes,
-                    UncompressedBytes = info.UncompressedBytes,
-                };
-            }
-            catch
+                writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), IndexSinkFactory);
+                info = writer.Finalise(_options.NodeId, segId);
+            } // FileStream closed here before Move
+            File.Move(tmpPath, segPath, overwrite: false);
+            // SegmentWriter captured tmpPath as FilePath; rewrite it to
+            // point at the final segment file so subsequent queries can
+            // open it. Without this, queries silently fail (file not
+            // found) until the next restart re-scans the segment dir.
+            return new SegmentInfo
             {
-                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
-                throw;
-            }
-        }, ct);
+                Id                = info.Id,
+                NodeId            = info.NodeId,
+                FilePath          = segPath,
+                MinTimestampTicks = info.MinTimestampTicks,
+                MaxTimestampTicks = info.MaxTimestampTicks,
+                EventCount        = info.EventCount,
+                MinLevel          = info.MinLevel,
+                CompressedBytes   = info.CompressedBytes,
+                UncompressedBytes = info.UncompressedBytes,
+            };
+        }
+        catch
+        {
+            try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+            throw;
+        }
     }
 
     // ── Retention ─────────────────────────────────────────────────────────────
@@ -4882,7 +6176,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         {
             // {nodeId}-{segId}-{minTs}-{maxTs}.seg, or {nodeId}-{segId}.seg for a replica
             var parts = Path.GetFileNameWithoutExtension(file).Split('-');
-            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId))
+            // An id near the end of the id space is no file this store wrote, and would wrap the floor
+            // (see ReserveWalBlock): the catalog scan decides what the file is; the allocator ignores it.
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId) && IsUsableBlockId(segId))
                 AdvanceSegmentIdFloor(segId + 1);
         }
     }
@@ -5126,11 +6422,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // the next start. Error, not Warning: an operator must decide what a
                 // .seg.corrupt file is worth, and nothing else will ever mention it again --
                 // the catalog scan, the merge planner and retention all enumerate *.seg.
+                // A level of a half-flushed block among them — a spill file's, or a WAL's a crash cut
+                // short (ReplayOrphanedWal) — is written again by its despill (LevelsTheScanKept),
+                // which waits for this scan before it decides. Recorded as REJECTED, before the
+                // rename is tried: it used to be recorded only once the rename had worked, and a
+                // torn level the rename could not move (held by another process, on Windows) stayed
+                // in the mask, was skipped, and its events were in no segment anyone serves.
+                if (TryParseLocalSegmentId(file, out ulong torn))
+                    lock (_bootQuarantined) _bootQuarantined.Add(torn);
                 _logger.LogError(ex, "Quarantining unreadable segment {File} as .corrupt — kept on disk, served by nobody", file);
                 try
                 {
                     string aside = file + ".corrupt";
                     if (File.Exists(aside)) File.Delete(aside);   // keep one generation of quarantine
+                    _beforeQuarantineMoveForTest?.Invoke(file);
                     File.Move(file, aside);
                 }
                 catch (Exception mvEx) { _logger.LogWarning(mvEx, "Failed to quarantine corrupt segment {File}", file); }
@@ -5233,6 +6538,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     }
 
     /// <summary>
+    /// Test seam: called with each orphaned WAL's path just before the startup replay reads it —
+    /// throwing from it is a read that failed. An <see cref="AsyncLocal{T}"/>, as
+    /// <see cref="HoldCatalogScanForTest"/> is: the replay runs in the constructor, before a test
+    /// could set anything on the instance. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> BeforeWalReplayReadForTest = new();
+
+    /// <summary>
+    /// Test seam: called with the WAL's path once the startup replay has read every entry into its
+    /// recovery tier, before the tier is flushed — on the thread that read them, as
+    /// <see cref="BeforeWalReplayReadForTest"/> is, so the two bracket the read. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> AfterWalReplayReadForTest = new();
+
+    /// <summary>
     /// Replays every WAL left behind by a previous process, one at a time, then clears markers
     /// whose WAL is already gone.
     ///
@@ -5246,28 +6566,221 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// </summary>
     private void ReplayOrphanedWals()
     {
-        foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
+        // Listed first, so the set a failed hand-off adds its block to has room for every one of them
+        // before any replay runs: the add then allocates nothing (round-6 review R5-M1).
+        var walFiles = Directory.GetFiles(_walDir, "*.wal");
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.EnsureCapacity(walFiles.Length);
+        foreach (var walFile in walFiles)
         {
             // Per WAL, so one unreadable log cannot strand the others behind it.
-            try { ReplayOrphanedWal(walFile); }
-            catch (Exception ex) { _logger.LogError(ex, "WAL recovery failed for {File}", walFile); }
+            ulong flushing = 0;
+            try { ReplayOrphanedWal(walFile, ref flushing); }
+            catch (Exception ex)
+            {
+                // Read again in THIS process, by the despill, with its backoff — not left for the next
+                // start, its events served by nobody until a restart however soon the cause cleared
+                // (a read the heap could not hold, a file a scanner held, a flush the disk refused).
+                bool retried = false;
+                try { retried = HandFailedReplayToDespill(walFile, flushing); }
+                catch (Exception) { /* left for the next start */ }
+                try
+                {
+                    _logger.LogError(ex, retried
+                        ? "WAL recovery failed for {File} — the log is kept and read again in the background, backing off while it fails, until its events are in segments"
+                        : "WAL recovery failed for {File} — the log is kept for the next start",
+                        walFile);
+                }
+                catch (Exception) { /* the line is lost; the log is not */ }
+            }
         }
 
         // Markers whose WAL is gone: the delete pair is WAL-then-marker, so a crash between
-        // them leaves this. Harmless but unbounded if never collected.
+        // them leaves this. Harmless but unbounded if never collected. A spilled block's marker
+        // sits beside its .spill rather than a .wal, and is the despill's to read: it says the
+        // block is in segments already.
         foreach (var marker in Directory.EnumerateFiles(_walDir, "*.flushed"))
         {
-            string wal = marker[..^".flushed".Length] + ".wal";
-            if (File.Exists(wal)) continue;
+            string stem = marker[..^".flushed".Length];
+            if (Look(stem + ".wal") != Presence.Gone || Look(stem + SpillExtension) != Presence.Gone) continue;
             try { File.Delete(marker); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
         }
+
+        // Markers a retry or a give-up voided whose delete was lost (RemoveFlushMarkerDurably, on
+        // Windows): a name no recovery reads, so nothing hangs on them; they only take a directory entry.
+        foreach (var voided in Directory.EnumerateFiles(_walDir, "*" + VoidedMarkerExtension))
+        {
+            try { File.Delete(voided); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete voided flush marker {File}", voided); }
+        }
+
+        // Pool files whose log is gone (round-4 L18). A log's pool goes with it (DeleteLogAndMarker),
+        // but that delete is best-effort, and on Windows it fails while any handle to the file is
+        // open: the tick fsyncs a pool off the pool's lock, a log disposed meanwhile closes its stream
+        // while that fsync still holds the handle, and the delete right behind met a sharing
+        // violation. The .pool then stayed for good — nothing else lists them. Swept here, for the
+        // logs and the spill files alike: nothing writes a log yet (the first opens after this), and a
+        // log is created before its pool, so a pool without its log is never one being written.
+        foreach (var pool in Directory.EnumerateFiles(_walDir, "*.pool"))
+        {
+            string log = pool[..^".pool".Length];
+            if (!log.EndsWith(".wal", StringComparison.OrdinalIgnoreCase)
+                && !log.EndsWith(SpillExtension, StringComparison.OrdinalIgnoreCase)) continue;
+            if (Look(log) != Presence.Gone) continue;
+            try { File.Delete(pool); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete pool file {File}, whose log is gone", pool); }
+        }
     }
 
-    private void ReplayOrphanedWal(string walFile)
+    /// <summary>What a look at a path found (<see cref="Look"/>).</summary>
+    private enum Presence { There, Gone, Unknown }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is there (round-5 review L-18). <see cref="File.Exists"/> answers
+    /// false for a file it could not look at as well as for one that is gone, and the sweeps that delete
+    /// what a gone log leaves — its pool, its completion marker — took a failure to look (a share that
+    /// did not answer, an access check) for the log's absence: a live log's pool deleted, its templates
+    /// lost to its replay. <see cref="Presence.Gone"/> only when the file system says so. Every check in
+    /// the log engine that decides from a file's presence whether a log, a marker or a merge's file is
+    /// gone goes through here (round-6 review R5-M6), and the recovery reads open their file the same way
+    /// (<see cref="WriteAheadLog.OpenForRecovery"/>).
+    /// </summary>
+    private static Presence Look(string path)
     {
-        string poolPath   = walFile + ".pool";
-        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile, out ushort version, out bool recordsEntries);
+        if (LookFailsForTest.Value is { } fails && fails(path)) return Presence.Unknown;
+        try
+        {
+            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Look);
+            File.GetAttributes(path);
+            return Presence.There;
+        }
+        catch (FileNotFoundException)      { return Presence.Gone; }
+        catch (DirectoryNotFoundException) { return Presence.Gone; }
+        catch (Exception)                  { return Presence.Unknown; }
+    }
+
+    /// <summary>Test seam: true for a path whose look fails (<see cref="Presence.Unknown"/>). A static
+    /// AsyncLocal, so it reaches the constructor's startup sweeps, and only the test's flows.</summary>
+    internal static readonly AsyncLocal<Func<string, bool>?> LookFailsForTest = new();
+
+    /// <summary>
+    /// Round-4 L14: hands a WAL whose startup replay failed to the despill, which reads it again in
+    /// this process — with its backoff (M5) — until its events are in segments, as it does a spill
+    /// file or a WAL whose flush a crash cut short. It was left for the next start: its events served
+    /// by nobody until a restart, however soon the cause cleared. Counted in
+    /// <see cref="SpillFilesPending"/> meanwhile, which is what a rollback waits on.
+    ///
+    /// <para>False — left for the next start, as before — for a file the despill cannot take: one whose
+    /// name carries no block, or a block past the last usable id; and for one whose flush completed,
+    /// its marker beside it: the next start removes it, and the levels it wrote are the boot scan's.</para>
+    ///
+    /// <para>The levels on disk. A replay that failed before it looked (<paramref name="flushingBlock"/>
+    /// 0) may have found levels an EARLIER run published: they are kept, as the branch that despills a
+    /// crash-cut WAL keeps them. One that failed while reading or flushing a block with none
+    /// (<paramref name="flushingBlock"/> set) wrote any there are itself — moved into place, registered
+    /// by nobody — and they are deleted (recorded for a running boot scan, as every such delete is):
+    /// the despill writes the whole block again, and never moves a level over a file that is there. A
+    /// delete that fails is done again by the despill's own failure path, which runs whenever such a
+    /// file stops its flush.</para>
+    /// </summary>
+    private bool HandFailedReplayToDespill(string walFile, ulong flushingBlock)
+    {
+        ulong segId = flushingBlock;
+        if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;   // allocates nothing
+
+        // Out of merges from here, before anything below can throw (round-6 review R5-M1): the boot
+        // scan may have registered levels the failed replay moved into place, and a hand-off that
+        // throws — the marker's removal allocates, and on Linux fsyncs — left the WAL for the next start
+        // with those entries owned by nobody: a merge took one, and the next start wrote it again, its
+        // events twice (30 for 20). In the set the merge planner skips (LevelIdsAFlushOwns), sized for
+        // every WAL of the start before the first replay, so the add allocates nothing. A block that is
+        // handed over leaves it below, the despill queue owning it from there; one that is not stays.
+        // Before the looks too (round-7): the marker's path and the looks allocate, and an out of memory
+        // there was the same hole.
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.Add(segId);
+
+        // Looks, not File.Exists (round-6 review R5-M6): a log that cannot be looked at is handed over
+        // (the despill reads it with its backoff), and so is one whose marker cannot be (the despill's
+        // own check waits for that look to answer); only a log that is gone, or one whose marker is
+        // there, is not — and its levels are the boot scan's.
+        if (Look(walFile) == Presence.Gone || Look(FlushMarkerPath(segId)) == Presence.There)
+        {
+            lock (_blocksLeftByReplay) _blocksLeftByReplay.Remove(segId);
+            return false;
+        }
+
+        BeforeFailedReplayHandOffForTest.Value?.Invoke(walFile);
+        byte published = 0;
+        if (flushingBlock != 0)
+            DeleteUnpublishedLevelFiles(segId);
+        else
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (SegmentFileExists(segId + (ulong)lvl)) published |= (byte)(1 << lvl);
+
+        ReserveWalBlock(segId);
+        lock (_spillQueueLock)
+        {
+            if (!_spillQueue.ContainsKey(segId)) _spillQueue[segId] = new QueuedSpill(walFile, published);
+        }
+        lock (_blocksLeftByReplay) _blocksLeftByReplay.Remove(segId);   // queued: the queue owns it now
+        WakeDespill();
+        return true;
+    }
+
+    /// <summary>
+    /// Blocks a failed startup replay left for the next start because their hand-off to the despill threw
+    /// (see <see cref="HandFailedReplayToDespill"/>): their levels are owned — the merge planner skips them
+    /// (<see cref="LevelIdsAFlushOwns"/>) — for the life of the process. At most one per WAL the start
+    /// found: <see cref="ReplayOrphanedWals"/> sizes the set for all of them before the first replay
+    /// (round-6 review R5-M1). Under its own lock.
+    /// </summary>
+    private readonly HashSet<ulong> _blocksLeftByReplay = new();
+
+    /// <summary>Test hook: the blocks a failed replay left for the next start (<see cref="_blocksLeftByReplay"/>).</summary>
+    internal int BlocksLeftByReplayForTest { get { lock (_blocksLeftByReplay) return _blocksLeftByReplay.Count; } }
+
+    /// <summary>
+    /// Test seam: called with the WAL's path as a failed startup replay is about to be handed to the
+    /// despill — before it deletes the levels the replay moved into place. An <see cref="AsyncLocal{T}"/>:
+    /// the replay runs in the constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action<string>?> BeforeFailedReplayHandOffForTest = new();
+
+    /// <param name="flushing">
+    /// Set to the block once the replay is past the check for levels an earlier run published, and so
+    /// reads and flushes a block with no level on disk: a failure from there on leaves only level files
+    /// of its own (see <see cref="HandFailedReplayToDespill"/>). Left 0 before that.
+    /// </param>
+    private void ReplayOrphanedWal(string walFile, ref ulong flushing)
+    {
+        // The block the file is NAMED after is spent before a byte of it is read. It used to be
+        // reserved only once a read had worked (from the header, below — still done), so a read that
+        // failed — out of memory, the file held by a scanner — left it free: the first WAL this run
+        // opened could be handed that block, and with it the same file name. It reopened the file,
+        // appended after the entries no replay had read, and its own flush deleted them:
+        // acknowledged events lost. The file is now left for the next start whatever happens here.
+        if (TryParseBlockId(walFile, out ulong namedBlock)) ReserveWalBlock(namedBlock);
+        BeforeWalReplayReadForTest.Value?.Invoke(walFile);
+
+        string poolPath = walFile + ".pool";
+        // Read where it lies, one entry at a time, straight into the tier below: the replay used to
+        // collect every entry first, payloads copied into the heap, and held the log twice — that
+        // list beside the tier it filled. Disposed (unmapped) before the file is deleted: on Windows
+        // a mapped file cannot be.
+        using var reader = WriteAheadLog.RecoveryReader.Open(walFile);
+        ulong  segId          = reader.SegmentId;
+        ushort version        = reader.Version;
+        bool   recordsEntries = reader.HeaderRecordsEntries;
+
+        // A block past the last usable id, by its name or its header: its levels' ids would wrap past
+        // zero onto other blocks. Not this store's — left in place, not replayed, never deleted.
+        if ((namedBlock != 0 && !IsUsableBlockId(namedBlock)) || !IsUsableBlockId(segId))
+        {
+            _logger.LogError(
+                "WAL {File} names block {Block}, past the last block id this store can use: left in place, not replayed",
+                walFile, IsUsableBlockId(segId) ? namedBlock : segId);
+            return;
+        }
 
         // Written by a LATER release, in a format this one cannot read — a rollback is how one gets
         // here. Cleaning it up as the branch below does with what it cannot read is what every
@@ -5297,57 +6810,86 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             return;
         }
 
-        // Empty or corrupt WAL — clean up
-        if (segId == 0 || entries.Count == 0)
-        {
-            try { File.Delete(walFile); } catch { }
-            try { File.Delete(poolPath); } catch { }
-            if (segId != 0)
-            {
-                ReserveWalBlock(segId);
-                try { File.Delete(FlushMarkerPath(segId)); } catch { }
-            }
-            return;
-        }
-
         // The block this WAL names is spent whatever happens next — its levels are either
         // already on disk or about to be written below. Burning it here stops a later flush or
         // merge being handed an id that already carries a file: the allocator is seeded from
         // segment file NAMES, and a block whose flush never produced one leaves it behind.
-        ReserveWalBlock(segId);
+        if (segId != 0) ReserveWalBlock(segId);
 
         // The flush of this WAL completed — every level reached disk before the marker did.
         // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
         // (it opens every file), so a catalog lookup here races the enumeration that would
-        // answer it, and losing that race replays a WAL whose events are already cold.
-        string marker = FlushMarkerPath(segId);
-        if (File.Exists(marker))
+        // answer it, and losing that race replays a WAL whose events are already cold. Asked
+        // before the log is read at all: a flushed log needs nothing from its entries. It was asked
+        // after the first one was read, and a first entry that could not be read — an
+        // out-of-memory decoding its exception — failed, at every start, the replay of a log that
+        // only had to be deleted.
+        //
+        // Asked as a look (round-6 review R5-M6): File.Exists answered false for a marker it could not
+        // look at as well, and the log was replayed — every level of a flushed block written a second
+        // time. A marker that cannot be looked at answers neither way: the log is read again, by the
+        // despill, whose own check waits for the look to answer (the catch hands it over).
+        if (segId != 0)
         {
-            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+            switch (Look(FlushMarkerPath(segId)))
+            {
+                case Presence.There:
+                    reader.Dispose();
+                    _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+                    DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
+                    return;
+                case Presence.Unknown:
+                    throw new IOException(
+                        $"Whether the flush of WAL {walFile} completed cannot be told: its completion marker could not be looked at");
+            }
+        }
+
+        // Empty or corrupt WAL — clean up
+        bool any = reader.TryReadNext(out var record);
+        if (segId == 0 || !any)
+        {
+            reader.Dispose();
             try { File.Delete(walFile); } catch { }
             try { File.Delete(poolPath); } catch { }
-            try { File.Delete(marker); } catch { }
+            if (segId != 0)
+                try { File.Delete(FlushMarkerPath(segId)); } catch { }
             return;
         }
+
+        // Some of the block's levels reached disk before the crash cut the flush short. Which of them
+        // are whole is the boot scan's to say, and it runs in the background: trusting their presence,
+        // the replay skipped a level the scan then set aside as torn, and its events were in no
+        // segment anyone serves. Such a WAL is despilled instead, as a half-written spill file an
+        // earlier run left is: once the scan has run, keeping only the levels it accepted, its
+        // strings interned by their text (the live pool is in use by then).
+        byte published = 0;
+        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+            if (SegmentFileExists(segId + (ulong)lvl)) published |= (byte)(1 << lvl);
+        if (published != 0)
+        {
+            reader.Dispose();
+            lock (_spillQueueLock) _spillQueue[segId] = new QueuedSpill(walFile, published);
+            _logger.LogInformation(
+                "WAL {File}: its flush got some levels out before the process stopped; the rest are written by the " +
+                "despill once the boot scan has read the ones on disk", walFile);
+            return;
+        }
+
+        // No level of the block is on disk: every one this replay writes is its own (HandFailedReplayToDespill).
+        flushing = segId;
 
         // Load template pool. An empty pool used to discard the ENTIRE WAL — dropping events
         // whose payloads DID reach disk because their template strings did not. Replay them
         // template-less instead: timestamp, level, properties and exception all survive,
         // only @mt is lost, and the index below must not alias a live pool entry.
         //
-        // Empty has TWO causes and the warning must name both. Pool writes are only fsynced
-        // periodically, so power loss can zero the file — that is the one this started as. But
-        // since the template pool stopped writing a row for an event it could not intern, a WAL
-        // every one of whose events arrived past a SATURATED pool writes no rows either, and its
-        // .pool file stays at 0 bytes with nothing wrong. The replay is right in both cases;
-        // only an operator reading "no template pool" as corruption would be wrong.
-        var pool         = WriteAheadLog.LoadPool(poolPath);
-        bool poolMissing = pool.Count == 0;
-        if (poolMissing)
-            _logger.LogWarning(
-                "Orphaned WAL {File}: no template pool rows — either power loss before the pool was fsynced, "
-              + "or every event in it was outside a saturated template pool. Replaying {Count} events without templates",
-                walFile, entries.Count);
+        // Empty has TWO causes. Pool writes are only fsynced periodically, so power loss can zero
+        // the file, or keep only part of it — that is the one this started as, and the warning
+        // below counts the events whose rows it lost. But since the template pool stopped writing a
+        // row for an event it could not intern, a WAL every one of whose events arrived past a
+        // SATURATED pool writes no rows either, and its .pool file stays at 0 bytes with nothing
+        // wrong: those entries are unpooled, need no row, and are not counted.
+        var pool = WriteAheadLog.LoadPool(poolPath, version);   // which rows a zero-fill can be told from (R5-M5)
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)
@@ -5358,23 +6900,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // marker protocol as the live flush. Pooling several WALs into one tier could not: their
         // events would land in some other block, no marker would ever be written for the WAL's
         // own, and a crash before the WAL was unlinked would replay it into duplicates.
-        using var recoveredHot = CreateHotTier();
-        int replayed = 0;
-        foreach (var entry in entries)
+        //
+        // Sized from the WAL, not only from today's HotTier.MaxSizeBytes: a restart that lowered
+        // the setting used to replay into a tier that refused the WAL's tail, and a refused event
+        // was simply not counted as replayed — lost without a word. From its bytes, which bound
+        // its payloads and its entries: the tier allocates its chunks as events arrive, so the
+        // bound costs nothing the events themselves do not.
+        using var recoveredHot = CreateRecoveryTier(reader.DataBytes);
+        int count = 0, replayed = 0, withoutTemplate = 0;
+        var undecoded = new UndecodedExceptions();
+        do
         {
-            // Unpooled: the event was outside a saturated pool when it was logged. Its index
-            // field is 0 and names nothing, and its template text was never stored, so it
-            // replays with no template. Resolving the 0 attached index 0's template to it.
-            bool noTemplate = poolMissing || entry.Unpooled;
+            count++;
+            undecoded.Note(in record);
+            // Unpooled: the event's template had no pool row when it was logged. Its index field
+            // is 0 and names nothing — resolving the 0 attached index 0's template to it. A v6
+            // entry carries the text itself (InlineTemplate), attached here with no pool index —
+            // claiming one could take a slot a later WAL's rows are force-interned into — and an
+            // older entry never stored it, so that event replays with no template.
+            //
+            // Pooled: its index's row in THIS log's pool file, and only there — as the service is
+            // (ServiceIndexIn). A row the file lost (a power loss before the pool was fsynced, a
+            // torn tail) used to be resolved through the LIVE pool, whose slot holds whatever is
+            // there — another orphaned log's row, force-interned by the replay before this one — and
+            // the event was stamped with that template, in its segment, for good. It replays with
+            // none (-1, persisted as an empty @mt) and is counted below.
+            string? rowTemplate = null;
+            bool    fromRow     = !record.Unpooled && pool.TryGetValue(record.TemplateIndex, out rowTemplate);
+            if (!record.Unpooled && !fromRow) withoutTemplate++;
             var header = new LogEventHeader
             {
-                Id                       = _idGen.Next(entry.TimestampTicks),
-                TimestampUtcTicks        = entry.TimestampTicks,
-                Level                    = entry.Level,
-                // With no pool the stored index points at whatever the LIVE pool holds
-                // at that slot — resolving it would stamp a random template onto every
-                // recovered event. -1 = "no template", persisted as an empty @mt.
-                MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
+                Id                       = _idGen.Next(record.TimestampTicks),
+                TimestampUtcTicks        = record.TimestampTicks,
+                Level                    = record.Level,
+                // Without its row the stored index points at whatever the LIVE pool holds at that
+                // slot — resolving it would stamp another template onto the recovered event.
+                // -1 = "no template", persisted as an empty @mt.
+                MessageTemplatePoolIndex = fromRow ? record.TemplateIndex : -1,
                 // The service the event was logged with (WAL v5): its pool index, whose text
                 // is one of the rows force-interned above — templates and services share the
                 // pool — so the flush below resolves it to the string a normal flush would
@@ -5388,14 +6950,40 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 // (`ServiceNamePoolIndex >= 0`). Slot 0 is ordinarily this WAL's first
                 // template, and that is what every recovered event was once stamped with,
                 // permanently, in its segment's @svc column.
-                ServiceNamePoolIndex     = entry.ServiceIndexIn(pool),
+                ServiceNamePoolIndex     = record.ServiceIndexIn(pool),
+                // WAL v6 keeps the trace context; an older entry has none to give back, and an
+                // event replayed out of one comes back unlinked from its trace, as it always did.
+                TraceIdHi                = record.TraceIdHi,
+                TraceIdLo                = record.TraceIdLo,
+                SpanId                   = record.SpanId,
             };
-            // Resolve template via the freshly restored pool and attach it
-            // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
-            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
+            // The template's text — the entry's own, or its row, the string force-interned above —
+            // attached to the hot tier so the recovery flush persists @mt correctly.
+            string tmpl = record.Template ?? rowTemplate ?? string.Empty;
+            // A service logged outside a full pool comes back by the text its entry carries, kept
+            // beside the event with no pool index — as the unpooled template is, and for the same reason.
+            if (recoveredHot.TryWrite(header, record.Payload, tmpl, record.Exception, record.Service))
                 replayed++;
         }
+        while (reader.TryReadNext(out record));
+        AfterWalReplayReadForTest.Value?.Invoke(walFile);
+        reader.Dispose();   // the tier holds its own copy now; the mapping goes before the flush
+        undecoded.Report(_logger, walFile);
+
+        // Counted, not assumed: a v6 log carries the text of every template no row can hold — one
+        // outside a saturated pool, one too long for a row — and those events replay with it. Only
+        // the pooled ones whose rows the pool file lost come back without one. (The line used to say
+        // every event replayed without its template, which a log of nothing but such events made
+        // false for every one of them; and it was said only when the file held no row at all.)
+        if (withoutTemplate > 0)
+            _logger.LogWarning(
+                "Orphaned WAL {File}: its pool file holds {Rows} template row(s), and not the rows of some of its "
+              + "events — a power loss before the pool was fsynced, or a torn tail. {Without} of its {Count} "
+              + "event(s) replay without a template",
+                walFile, pool.Count, withoutTemplate, count);
+        if (replayed < count)
+            _logger.LogError("WAL recovery: {Refused} of {Count} event(s) in {File} did not fit the recovery tier and were not replayed",
+                count - replayed, count, walFile);
         _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
 
         // Flush recovered events to cold segments (no index — acceptable for crash recovery),
@@ -5412,8 +7000,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         // all: its complete flush replays to zero new segments and the WAL is simply dropped.
         if (recoveredHot.Count > 0)
         {
-            var written = FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true)
-                              .GetAwaiter().GetResult();
+            // In this frame (see FlushTierByLevel): the `using` above frees the tier only once nothing reads it.
+            var written = FlushTierByLevel(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true);
             long recovered = 0;
             for (int i = 0; i < written.Count; i++)
             {
@@ -5425,9 +7013,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
         // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
 
-        try { File.Delete(walFile); } catch { }
-        try { File.Delete(poolPath); } catch { }
-        try { File.Delete(FlushMarkerPath(segId)); } catch { }
+        DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
     }
 
     // ── Segment-id allocator ──────────────────────────────────────────────────
@@ -5469,14 +7055,56 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// is spent from somewhere other than the allocator — a file name on disk, a WAL's reserved
     /// block, a segment received from a peer. Monotonic: it can only ever move forward, so a
     /// caller arriving with stale information cannot hand out an id twice.
+    ///
+    /// <para>Never past <see cref="MaxAllocatorFloor"/> (round-4 L12): such a floor is refused, and
+    /// the first refusal logged. Every caller checked the id it came from against the last usable
+    /// block id, but not what the raise did next: a WAL at <c>long.MaxValue − 2</c> raised the floor
+    /// past that bound, the live WAL was named after a block past it, and the next start left that
+    /// log alone — after a crash, its events were in no segment (the review's probe: 1 of 101 served).
+    /// Below the ceiling the allocator would need 2^32 more ids to reach the bound: one a flush, no
+    /// store gets there. An id that high was not handed out by this allocator — a copied or edited
+    /// file, or another system's segment — and nothing it names can be handed out again before then.</para>
     /// </summary>
     internal void AdvanceSegmentIdFloor(ulong floor)
     {
+        if (floor > MaxAllocatorFloor)
+        {
+            RefuseSegmentIdFloor(floor);
+            return;
+        }
         lock (_segIdLock)
         {
             if (floor > _nextSegmentId) _nextSegmentId = floor;
         }
     }
+
+    /// <summary>
+    /// The highest floor <see cref="AdvanceSegmentIdFloor"/> takes: <see cref="MaxUsableBlockId"/>
+    /// less 2^32 ids, so that every block the allocator hands out after it is one a replay reads back.
+    /// </summary>
+    internal const ulong MaxAllocatorFloor = MaxUsableBlockId - (1UL << 32);
+
+    private int _segmentIdFloorRefused;
+
+    /// <summary>Says, once per engine, that a floor past <see cref="MaxAllocatorFloor"/> was refused.</summary>
+    private void RefuseSegmentIdFloor(ulong floor)
+    {
+        if (Interlocked.Exchange(ref _segmentIdFloorRefused, 1) != 0) return;
+        try
+        {
+            _logger.LogError(
+                "A segment id floor of {Floor} — from a segment file's name, a log's header or a replicated segment — is past " +
+                "the highest the id allocator is raised to ({Ceiling}): the allocator stays where it is. Raised there, the blocks " +
+                "it handed out next would pass the last block id a log is replayed from, and their events would be lost to the " +
+                "first crash. Ids grow by one block per flush, so no store reaches this; the id was not handed out here — a " +
+                "copied or edited file, or another system's segment. Logged once",
+                floor, MaxAllocatorFloor);
+        }
+        catch (Exception) { /* the line is lost; the allocator is unchanged either way */ }
+    }
+
+    /// <summary>Test seam: the id the allocator hands out next.</summary>
+    internal ulong NextSegmentIdForTest { get { lock (_segIdLock) return _nextSegmentId; } }
 
     /// <summary>
     /// Claims <paramref name="id"/> for a segment that arrived carrying THIS node's own NodeId,
@@ -5501,19 +7129,59 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// handed out, and refusing the whole span costs nothing a correct deployment can notice: a
     /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
     /// deployment error the 409 exists to report.</para>
+    ///
+    /// <para>At or past <see cref="MaxAllocatorFloor"/> the raise that claims an id, <c>id + 1</c>, cannot be
+    /// made: it wrapped the floor past zero for an id at the end of the id space (the blocks handed out next
+    /// were ids already used), as a log's name did (see <see cref="ReserveWalBlock"/>), and below the end it
+    /// left the allocator handing out blocks no replay reads back (see <see cref="AdvanceSegmentIdFloor"/>).
+    /// So an id there that the allocator can still reach — up to <see cref="MaxUsableBlockId"/> — is refused,
+    /// whether it has been handed out or not (round-5 review L-2; round-6, its rest): the floor itself may sit
+    /// at the ceiling and the allocator hand out blocks past it, and an id claimed there without a raise
+    /// stayed the allocator's to hand out — an import wearing this node's id was registered, answered 204,
+    /// and displaced by the local flush of the block handed out next (or at once, when that block was the
+    /// live WAL's). No store reaches the ceiling by flushing: such an id under this node's NodeId is the
+    /// deployment error the refusal reports, or a copied file. Past the last usable block id the allocator
+    /// never reaches it: taken with no raise, as before (round-3 R2-2).</para>
     /// </summary>
     private bool TryClaimLocalSegmentId(ulong id)
     {
         lock (_segIdLock)
         {
             if (id < _nextSegmentId) return false;
-            _nextSegmentId = id + 1;
-            return true;
+            if (id < MaxAllocatorFloor)
+            {
+                _nextSegmentId = id + 1;
+                return true;
+            }
         }
+        if (id <= MaxUsableBlockId) return false;
+        RefuseSegmentIdFloor(id < ulong.MaxValue ? id + 1 : id);
+        return true;
     }
 
     /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
-    private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
+    private void ReserveWalBlock(ulong walSegId)
+    {
+        // A block near the end of the id space cannot be one this store wrote: reserving one at
+        // ulong.MaxValue - 2 wrapped the floor to 3, and the next blocks were handed out again; one
+        // a little lower left the allocator to wrap at its next block instead.
+        if (!IsUsableBlockId(walSegId)) return;
+        AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
+    }
+
+    /// <summary>
+    /// The highest block id this store takes from a name or a header: <see cref="long.MaxValue"/>.
+    /// Ids grow by one block a flush, so a store reaches it in no lifetime; past it, a block's levels
+    /// — or the blocks the allocator hands out after it — would wrap past zero onto other blocks.
+    /// </summary>
+    private const ulong MaxUsableBlockId = long.MaxValue;
+
+    /// <summary>
+    /// Whether a block id, from a log's name or header, is one this store can have written: one past
+    /// <see cref="MaxUsableBlockId"/> is not, and its log is left alone, with an Error, by the replay
+    /// and the despill.
+    /// </summary>
+    private static bool IsUsableBlockId(ulong segId) => segId <= MaxUsableBlockId;
 
     /// <summary>
     /// Registers a segment file received from a peer, taking ownership of it. The file is STAGED
@@ -5607,7 +7275,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         bool claimed = true;
         if (staged.NodeId.Value == _options.NodeId.Value)
             claimed = TryClaimLocalSegmentId(staged.Id.Value);
-        else
+        else if (IsUsableBlockId(staged.Id.Value))   // an id near the end would wrap the floor (see ReserveWalBlock)
             AdvanceSegmentIdFloor(staged.Id.Value + 1);
 
         bool inPlace = string.Equals(stagedPath, finalPath, StringComparison.OrdinalIgnoreCase);
@@ -5713,9 +7381,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
                 {
                     _logger.LogError(
                         "Refused replicated segment {File}: {Key} names a segment id this node has " +
-                        "already allocated for itself, so a local flush, merge or WAL replay either " +
-                        "holds it or is about to publish under it — and none of those can give a key " +
-                        "back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
+                        "already allocated for itself, or one past the highest it can reserve, so a local " +
+                        "flush, merge or WAL replay holds it or may publish under it — and none of those can " +
+                        "give a key back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
                         "registered and the body was left where it was staged.",
                         staged.FilePath, key, info.NodeId);
                     return SegmentImportOutcome.ConflictAllocatedLocally;
@@ -5889,13 +7557,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// renumber either of them — so it is logged with both paths, and the file itself is left
     /// alone: its owner still holds it and can push it again once the ids are fixed.</para>
     /// </summary>
-    private void PublishLocalSegment(SegmentInfo written)
+    /// <returns>The entry it displaced under the key, or null when it added one (see <see cref="UnpublishLocalSegment"/>).</returns>
+    private SegmentInfo? PublishLocalSegment(SegmentInfo written)
     {
         var key = SegmentKey.Of(written);
 
         while (true)
         {
-            if (_segments.TryAdd(key, written)) return;
+            if (_segments.TryAdd(key, written)) return null;
 
             // TryAdd lost, so somebody holds the key — read WHO, and exchange against that exact
             // reference. A plain store would decide on a value another writer can replace in
@@ -5905,9 +7574,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             if (!IsTheSameSegment(existing, written))
                 LogDisplacedLocalSegment(written, existing);
 
-            if (_segments.TryUpdate(key, written, existing)) return;
+            if (_segments.TryUpdate(key, written, existing)) return existing;
         }
     }
+
+    /// <summary>
+    /// Takes back what <see cref="PublishLocalSegment"/> registered — the entry it displaced put back,
+    /// or its own removed — while it is still the one under the key. Allocates nothing: a reference
+    /// value is updated in place, and a removal unlinks a node.
+    /// </summary>
+    private void UnpublishLocalSegment(SegmentInfo written, SegmentInfo? displaced)
+    {
+        var key = SegmentKey.Of(written);
+        if (displaced is not null) _segments.TryUpdate(key, displaced, written);
+        else                       _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, written));
+    }
+
+    /// <summary>Test seam: runs as a flushed tier's segment is about to be registered; throwing from it is that registration failing.</summary>
+    internal Action<SegmentInfo>? _beforeSegmentPublishForTest;
 
     /// <summary>
     /// Says, at Error, that registering a segment this node wrote displaced a different one under
@@ -5979,22 +7663,121 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// msync per interval bounds that loss window at the interval, Elasticsearch-translog
     /// style, without an fsync per event.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunWalFlushLoopAsync(CancellationToken ct)
     {
         var interval = _options.HotTier.WalFlushInterval;
         if (interval <= TimeSpan.Zero) return; // explicitly disabled
 
         using var timer = new PeriodicTimer(interval);
-        try
+        // Round again whatever fails (round-5 review L-3): the line that says a flush failed allocates,
+        // and so does the wait, and a throw out of either ended the loop for good — no live WAL was
+        // msynced again until a restart, and shutdown's await of the loop threw before its final flush.
+        while (true)
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            try
             {
-                try { _write.Wal?.Flush(); }
-                catch (ObjectDisposedException) { /* raced a rotation — next tick hits the new WAL */ }
-                catch (Exception ex) { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
+                while (await NextTick(timer, "wal", ct))
+                {
+                    // The live tier's WAL and, while the engine spills, the spill target's: both hold
+                    // acknowledged events, and the window this loop bounds is the same for both.
+                    var w = _write;
+                    try { _beforePeriodicWalFlushForTest?.Invoke(); w.Wal?.Flush(); }
+                    catch (ObjectDisposedException) { /* raced a rotation — next tick hits the new WAL */ }
+                    catch (Exception ex)
+                    {
+                        try { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
+                    NoteKeptFlushFailures(w.Wal);
+                    try { w.Spill?.Wal.Flush(); }
+                    catch (ObjectDisposedException) { /* raced a rotation; its close writes it back */ }
+                    catch (Exception ex)
+                    {
+                        try { _logger.LogWarning(ex, "Periodic spill flush failed"); }
+                        catch (Exception) { /* the line is lost; the loop is not */ }
+                    }
+                    NoteKeptFlushFailures(w.Spill?.Wal);
+                    RefreshSpillFreeMeasure();   // the floor check's measurement, fresh with nothing spilling (L-5; round-6 review)
+                }
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception)
+            {
+                // The wait itself failed (out of memory setting it up): a blocked pause, with nothing
+                // to allocate — a second at the most, so shutdown is not kept waiting — then round again.
+                Thread.Sleep((int)Math.Min(interval.TotalMilliseconds, 1000));
             }
         }
-        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>Test seam: runs before each periodic flush of the live WAL; throwing from it is a flush that failed.</summary>
+    internal Action? _beforePeriodicWalFlushForTest;
+
+    /// <summary>
+    /// Takes the fsync failures a write-ahead log kept to itself (<see cref="WriteAheadLog.TakeKeptFlushFailures"/>: its
+    /// pool's on a tick, which it tries again on the next, and either file's at its close) and says them, at most once a
+    /// minute, or now with <paramref name="sayNow"/> (round-4 L19; round-6 review): they were silent for as long as they
+    /// went on, while events acknowledged since the last fsync that held were not crash-durable. Taken from the WAL at
+    /// every call, so a closed WAL's are not lost with it; held between lines as one count, the last failure and its
+    /// log. Called by the WAL loop for the live WAL and the spill file each tick, after each close of either, and at
+    /// shutdown with <paramref name="sayNow"/>. Never throws.
+    /// </summary>
+    private void NoteKeptFlushFailures(WriteAheadLog? wal, bool sayNow = false)
+    {
+        try
+        {
+            int        count = 0;
+            Exception? last  = null;
+            string?    path  = null;
+            if (wal is not null && (count = wal.TakeKeptFlushFailures(out last)) > 0) path = wal.FilePath;
+            lock (_keptFlushLock)
+            {
+                if (count > 0)
+                {
+                    _keptFlushUnsaid += count;
+                    _keptFlushLast    = last;
+                    _keptFlushPath    = path;
+                }
+                long now = Environment.TickCount64;
+                if (_keptFlushUnsaid == 0 || (!sayNow && now < _keptFlushSayFrom)) return;
+                _keptFlushSayFrom = now + _keptFlushSayIntervalMs;
+                (count, last, path) = (_keptFlushUnsaid, _keptFlushLast, _keptFlushPath);
+                _keptFlushUnsaid    = 0;
+                _keptFlushLast      = null;
+            }
+            _logger.LogWarning(last,
+                "{Count} fsync(s) of the write-ahead logs failed since this was last said, the last on {Wal}; a template pool's " +
+                "is tried again every flush interval, one at a close is not. Until one holds, events acknowledged since the last " +
+                "that did may not survive a power loss, or may come back without their message templates",
+                count, path);
+        }
+        catch (Exception) { /* the line is lost; the loop is not */ }
+    }
+
+    /// <summary>
+    /// <see cref="NoteKeptFlushFailures"/>'s state: the failures taken and not yet said, the last of them and its log,
+    /// and when the next line may be. Under <see cref="_keptFlushLock"/>: the WAL loop, a rotation's close and a spill's
+    /// close each note.
+    /// </summary>
+    private readonly Lock _keptFlushLock = new();
+    private int        _keptFlushUnsaid;
+    private Exception? _keptFlushLast;
+    private string?    _keptFlushPath;
+    private long       _keptFlushSayFrom;
+
+    /// <summary>The shortest gap between two of <see cref="NoteKeptFlushFailures"/>'s lines, but for one at shutdown.</summary>
+    private long _keptFlushSayIntervalMs = 60_000;
+
+    /// <summary>Test seam: <see cref="_keptFlushSayIntervalMs"/>.</summary>
+    internal TimeSpan KeptFlushSayIntervalForTest { set => _keptFlushSayIntervalMs = (long)value.TotalMilliseconds; }
+
+    /// <summary>A background loop that had ended with a failure before shutdown awaited it: said, and the teardown goes on. Never throws.</summary>
+    private void LoopDiedAtShutdown(Exception ex, string loop)
+    {
+        try { _logger.LogError(ex, "The {Loop} loop had failed before shutdown — the teardown goes on", loop); }
+        catch (Exception) { /* the line is lost; the teardown is not */ }
     }
 
     /// <param name="order">
@@ -6054,20 +7837,38 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
     /// → wait for readers → free. Each wait shares one budget, and running out of it leaves the
     /// tier that might still be in use allocated, with an Error, rather than freeing it.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task DisposeCoreAsync()
     {
         long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
 
         await _cts.CancelAsync();
+        // A loop that died of anything else must not stop the teardown here, before the final flush
+        // (round-5 review L-3: the WAL loop's own warning, thrown, ended it, and this await rethrew it).
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "hot-tier age"); }
         try { await _walFlushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "WAL flush"); }
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        catch (Exception ex) { LoopDiedAtShutdown(ex, "maintenance"); }
+        // The despill loop: cancellation ends its wait at once. A despill in its heavy phase is
+        // counted like a flush and waited for below; one that had not reached it leaves its file
+        // for the next start.
+        try { await _despillLoop; }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            // A loop that died anyway (it survives its own failures now) must not stop the teardown here,
+            // before the final flush: its blocks are on disk for the next start.
+            try { _logger.LogError(ex, "The despill loop had failed; shutdown goes on"); } catch { /* the line is lost */ }
+        }
         // Deferred segment deletes: cancellation ends the retry loop's delay at once, so this
         // waits out at most one pass in progress, never a backoff. Then one last attempt each;
         // what is still held stays on disk and the next start's retention pass expires it again.
@@ -6075,11 +7876,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         try { RetryPendingSegmentDeletes(); } catch { /* best-effort */ }
 
         // Flushes scheduled before shutdown. Not the guarantee (see _inFlightFlushes) — only a
-        // way to let them finish before the final flush competes with them for the lock.
-        try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
+        // way to let them finish before the final flush competes with them for the lock. Within the
+        // budget: an entry whose task never started cannot hold shutdown for good.
+        try { await CompletesBy(Task.WhenAll(_inFlightFlushes.Keys.ToArray()), deadline).ConfigureAwait(false); }
+        catch { /* best-effort */ }
 
         // ── Final flush. Waits for its turn at the lock and for a slot rather than dropping out
         //    when a racing flush holds either: dropping out left the live tier to the WAL replay.
+        //
+        //    Its WAITS are within the budget (ultra review #7): the swap lock, a slot and the heavy-phase permit
+        //    are each polled until the deadline, and past it the final flush gives the tier up to the WAL's
+        //    replay. The permit was polled with no deadline, and a permit another heavy phase held past the
+        //    budget held this await for good. The flush itself runs in its own frame (FlushTierByLevel) to its
+        //    end, as the level's Task.Run it awaited did: a level begun is written. One level's write is
+        //    bounded by the tier — at most MaxSizeBytes of its events and their index, written in sequence to
+        //    a local file, waiting on no thread and no lock but the disk — and only a disk that stops
+        //    answering holds it, as it held that Task.Run.
         if (_write.Hot.Count > 0)
         {
             try { await TryFlushAsync(waitDeadline: deadline); }
@@ -6090,17 +7902,29 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
 
         // ── Close the write path. A full fence, because the other half of this handshake is a
-        //    lock-free read: TryWrite and ScheduleFlush load the flag, and a store that sank below
-        //    those loads could let a flush swap a tier after shutdown stopped counting.
+        //    lock-free read: ScheduleFlush loads the flag, and a store that sank below those loads
+        //    could let a flush swap a tier after shutdown stopped counting. Writers read it under
+        //    the writer lock, and the fence below takes that lock. Writers waiting for room are
+        //    woken to find it closed rather than sit out their wait.
         Interlocked.Exchange(ref _writesClosed, 1);
         Interlocked.MemoryBarrier();
+        SignalRoom();
+
+        // Spill files a swap closed off its lock: closed and on disk before the teardown goes on,
+        // for the next start to despill. One the final flush ended is among them.
+        try { await Task.WhenAll(_spillCloses.Keys.ToArray()); } catch { /* best-effort */ }
 
         // ── Take the swap lock and KEEP it. A flush that holds it now finishes its swap (and is
         //    counted) first; every later one finds the close, or the lock taken, and swaps nothing.
-        var swapLockTaken = _flushLock.WaitAsync(Until(deadline));
-        if (!swapLockTaken.IsCompleted)
+        //    Never queued in the lock (OwnerPoll; round-5 M-B).
+        bool swapLockTaken = _flushLock.Wait(0);
+        if (!swapLockTaken)
+        {
             _onWaitingForFlushLock?.Invoke();
-        if (!await swapLockTaken.ConfigureAwait(false))
+            for (int pause = 1; !(swapLockTaken = _flushLock.Wait(0)) && Environment.TickCount64 < deadline; )
+                await OwnerPoll(_flushLock, ref pause, deadline, CancellationToken.None).ConfigureAwait(false);
+        }
+        if (!swapLockTaken)
         {
             _logger.LogError(
                 "Shutdown could not take the hot-tier swap lock within {Budget}s — every hot tier is left " +
@@ -6109,10 +7933,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
             return;
         }
 
-        // ── Fence the writer. A TryWrite that passed the close check before it was set is either
-        //    finished with the tier when Freeze returns, or finds it frozen and refuses.
-        var live = _write;
-        live.Hot.Freeze();
+        // ── Fence the writers. Every write checks the close under the writer lock, so once this
+        //    hold has the lock no write is in progress and none can start: a write that passed the
+        //    check before the close finished first — in the live tier AND its WAL, or in a spill
+        //    file, so the next start replays it — and every later one found the path closed.
+        WriteState live;
+        EnterWriterLock();
+        try
+        {
+            live = _write;
+            live.Hot.Freeze();
+        }
+        finally { _writerLock.Exit(); }
 
         // ── Wait for every heavy phase: the ones scheduled after the snapshot above, the inline
         //    FlushHotTierAsync one, the retries shutdown's cancellation is ending. Only the swap
@@ -6184,6 +8016,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IQueryAva
         }
 
         live.Wal?.Dispose();
+        // A spill still open — the final flush found no slot to end it with — stays on disk for
+        // the next start's despill, like the WAL beside it.
+        try { live.Spill?.Wal.Dispose(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Closing the open spill file failed at shutdown"); }
+        // Their last fsyncs, and any failure not said yet: now, as there is no next tick (round-6 review).
+        NoteKeptFlushFailures(live.Wal);
+        NoteKeptFlushFailures(live.Spill?.Wal, sayNow: true);
 
         // The three semaphores are deliberately NOT disposed. A SemaphoreSlim holds nothing to
         // release unless its wait handle was asked for, and disposing one turns a late

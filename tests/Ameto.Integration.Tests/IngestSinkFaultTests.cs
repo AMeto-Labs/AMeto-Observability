@@ -11,8 +11,8 @@ namespace Ameto.Integration.Tests;
 
 /// <summary>
 /// The catch around StreamBatch decides whose fault a failed batch was. A body the reader
-/// rejects is the client's: 400, with the counts. A throw out of the SINK underneath (the ring,
-/// the intern pool, the logger, or the ObjectDisposedException a shutdown mid-batch raises) is
+/// rejects is the client's: 400, with the counts. A throw out of the SINK underneath (the intern
+/// pool, or the logger) is
 /// the server's. It must leave the handler, so hosting answers 500 and logs it, rather than be
 /// reported to the client as a "malformed payload".
 ///
@@ -20,9 +20,10 @@ namespace Ameto.Integration.Tests;
 /// widening the catch back to <c>catch (Exception)</c> makes the sink-fault test fail, which
 /// a predicate-only pin never did.</para>
 ///
-/// <para>The sink fault is a logger that throws on its first call, reached through the
-/// oversized-event path inside TryIngestClef. A logger is the one sink dependency that can be
-/// faulted safely: a disposed ring does not throw, it reads freed native memory.</para>
+/// <para>The sink fault is thrown by the staging seam inside TryIngestClef
+/// (<see cref="IngestionEndpoint.BeforeStageForTest"/>), standing in for a dependency there that
+/// fails. It used to be the logger of the oversized-drop Warning, which the sink called as it staged
+/// such an event; that line is written with the answer now, after the write, and guarded.</para>
 /// </summary>
 public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
 {
@@ -32,13 +33,14 @@ public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task SinkFault_EscapesTheHandler_InsteadOfAnswering400()
     {
-        var logger   = new ThrowOnFirstLogCall();
-        var endpoint = EndpointWith(logger);
+        var fault    = new InvalidOperationException("sink fault: a dependency under TryIngestClef failed");
+        var endpoint = EndpointWith(Microsoft.Extensions.Logging.Abstractions.NullLogger<IngestionEndpoint>.Instance);
+        endpoint.BeforeStageForTest = () => throw fault;
         var ctx      = Post(OversizedEventBatch());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => endpoint.HandleAsync(ctx));
 
-        Assert.Same(logger.Thrown, ex);
+        Assert.Same(fault, ex);
         Assert.NotEqual(StatusCodes.Status400BadRequest, ctx.Response.StatusCode);
         Assert.Equal(0, ctx.Response.Body.Length);   // no "malformed payload" counts body
     }
@@ -64,9 +66,8 @@ public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
     {
         var sp = _factory.Services;
         return new IngestionEndpoint(
-            sp.GetRequiredService<IngestionRingBuffer>(),
+            sp.GetRequiredService<StorageEngine>(),
             sp.GetRequiredService<StringInternPool>(),
-            sp.GetRequiredService<IngestionDrainer>(),
             sp.GetRequiredService<ServerOptions>(),
             logger);
     }
@@ -93,28 +94,5 @@ public sealed class IngestSinkFaultTests : IClassFixture<AmetoWebAppFactory>
         w.Write("Big"); w.Write(new string('x', 100_000));
         w.Flush();
         return buf.WrittenSpan.ToArray();
-    }
-
-    /// <summary>
-    /// Throws from its FIRST call only, which is the oversized-drop warning inside the sink. Any
-    /// later call succeeds, so a catch that swallowed the fault could log its own warning and
-    /// answer 400 — which is exactly what the test must be able to see.
-    /// </summary>
-    private sealed class ThrowOnFirstLogCall : Microsoft.Extensions.Logging.ILogger<IngestionEndpoint>
-    {
-        private int _calls;
-        public InvalidOperationException? Thrown { get; private set; }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
-            TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-        {
-            if (Interlocked.Increment(ref _calls) != 1) return;
-            Thrown = new InvalidOperationException("sink fault: the logger under TryIngestClef failed");
-            throw Thrown;
-        }
     }
 }

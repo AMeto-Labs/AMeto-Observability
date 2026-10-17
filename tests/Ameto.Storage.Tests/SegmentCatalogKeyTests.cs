@@ -427,6 +427,58 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-3 review R2-2, the import's own-identity road. A segment wearing THIS node's id claims
+    /// its id from the allocator, which set the floor to id + 1 unchecked: an id near the end of
+    /// the id space put the floor there, and the blocks handed out next wrapped past zero onto ids
+    /// already used. Past the last usable block id the allocator never reaches it, so the import
+    /// takes it with no raise, and the next blocks follow the ones before.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_wearing_our_identity_with_an_id_past_the_last_usable_one_wraps_nothing()
+    {
+        const ulong Past = ulong.MaxValue - 2;
+        long  now  = DateTime.UtcNow.Ticks;
+        ulong prev = _engine.LiveWalSegmentId;
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(WritePeerSegment(NodeId.Local, Past, now)));
+
+        for (int swap = 0; swap < 2; swap++)
+        {
+            Write(5, now);
+            await _engine.FlushHotTierAsync();   // the next WAL takes the next block
+            ulong next = _engine.LiveWalSegmentId;
+            Assert.InRange(next, prev + 1, Past - 1);
+            prev = next;
+        }
+    }
+
+    /// <summary>
+    /// Round-4 L12, the other-node road. A segment from ANOTHER node raises this node's allocator past
+    /// its id (so the two never share a file name), and one numbered near the end of the id space —
+    /// <c>long.MaxValue − 2</c>, a usable id — raised it there: the blocks handed out next were past the
+    /// last one a replay reads back, and a crash lost what their logs held. The allocator refuses that
+    /// floor now; the segment is registered, and the next blocks follow the ones before.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_from_another_node_numbered_near_the_end_leaves_the_allocator_where_it_was()
+    {
+        const ulong NearEnd = long.MaxValue - 2;
+        long  now  = DateTime.UtcNow.Ticks;
+        ulong prev = _engine.LiveWalSegmentId;
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(WritePeerSegment(new NodeId(7), NearEnd, now)));
+
+        for (int swap = 0; swap < 2; swap++)
+        {
+            Write(5, now);
+            await _engine.FlushHotTierAsync();   // the next WAL takes the next block
+            ulong next = _engine.LiveWalSegmentId;
+            Assert.InRange(next, prev + 1, prev + 1_000);
+            prev = next;
+        }
+    }
+
+    /// <summary>
     /// The one ambiguity the key cannot resolve — two nodes CONFIGURED with the same NodeId — and
     /// therefore the last place in the engine where registering a segment could still remove one.
     /// The import used to log a warning saying, correctly, that "one of the two files will not be
@@ -769,6 +821,70 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
             new DateTimeOffset(now, TimeSpan.Zero).AddHours(4),
             minBucket: 0, bucketSeconds: 60, nBuckets: 600, serviceFilter: null);
         Assert.Equal(20, counts.Total);
+    }
+
+    /// <summary>
+    /// Round-5 review L-2: the same refusal once the allocator has reached the ceiling. The floor may
+    /// sit at <see cref="StorageEngine.MaxAllocatorFloor"/> (a segment, a WAL or another node's segment
+    /// numbered just under the ceiling puts it there), and the allocator then hands out blocks past it;
+    /// an id at or past the ceiling was claimed without asking it, and an import wearing this node's id
+    /// was registered into the live WAL's reserved block — answered 204, then displaced by the local
+    /// flush, its file in no catalog.
+    /// </summary>
+    [Fact]
+    public async Task A_peer_wearing_our_id_at_the_ceiling_cannot_take_a_block_handed_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        _engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor);   // accepted: not past the ceiling
+        Write(5, now);
+        await _engine.FlushHotTierAsync();                                 // the next WAL takes the block there
+        ulong live = _engine.LiveWalSegmentId;
+        Assert.True(live >= StorageEngine.MaxAllocatorFloor, $"setup: the live block is {live}");
+
+        ulong  reserved  = live + (ulong)LogLevel.Information;
+        string staged    = Path.Combine(_dir, "pushed-ceiling.body");
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{reserved}.seg");
+        WritePeerSegment(NodeId.Local, reserved, now, events: 4, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.ConflictAllocatedLocally, _engine.ImportSegment(staged, finalPath));
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();
+        var under = Assert.Single(_engine.ListSegments(), s => s.Id.Value == reserved);
+        Assert.Equal(20u, under.EventCount);   // the local flush's, alone under its key
+    }
+
+    /// <summary>
+    /// Round-6 review, the rest of L-2: an id at or past the ceiling the allocator has NOT handed out yet was
+    /// claimed with no raise — the floor cannot be raised there — and so stayed the allocator's to hand out:
+    /// registered, answered 204, then displaced by the local flush of the block handed out next, its file in no
+    /// catalog (the review's R5Probe_L2). Every id at or past the ceiling under this node's NodeId is refused now.
+    /// </summary>
+    [Fact]
+    public async Task A_peer_wearing_our_id_at_the_ceiling_cannot_take_a_block_not_yet_handed_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        _engine.AdvanceSegmentIdFloor(StorageEngine.MaxAllocatorFloor);
+        Write(5, now);
+        await _engine.FlushHotTierAsync();
+        ulong next = _engine.NextSegmentIdForTest;                        // the block the allocator hands out next
+        Assert.True(next >= StorageEngine.MaxAllocatorFloor, $"setup: the next block is {next}");
+
+        ulong  target    = next + (ulong)LogLevel.Information;
+        string staged    = Path.Combine(_dir, "pushed-next.body");
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{target}.seg");
+        WritePeerSegment(NodeId.Local, target, now, events: 4, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.ConflictAllocatedLocally, _engine.ImportSegment(staged, finalPath));
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();                                 // the next WAL takes block `next`
+        Write(30, now + 2 * TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();                                 // and that block's Information level is `target`
+        var under = Assert.Single(_engine.ListSegments(), s => s.Id.Value == target);
+        Assert.Equal(30u, under.EventCount);   // the local flush's, alone under its key
     }
 
     /// <summary>

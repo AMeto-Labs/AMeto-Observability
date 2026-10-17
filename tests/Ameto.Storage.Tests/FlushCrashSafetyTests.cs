@@ -219,6 +219,12 @@ public sealed class FlushCrashSafetyTests : IAsyncLifetime
 
         await RestartAsync(2);
 
+        // A WAL whose levels are on disk is the despill's since round 3 (R4-2): it goes once the boot
+        // scan has read them — all of them, here, so it writes nothing and drops the WAL.
+        await _engine.CatalogLoaded;
+        for (int i = 0; i < 400 && Directory.GetFiles(WalDir, $"*-{walId}.wal").Length != 0; i++)
+            await Task.Delay(25);
+
         var events = ColdEvents();
         Assert.Equal(60, events.Count);
         Assert.Equal(60, events.Select(e => e.Id).Distinct().Count());

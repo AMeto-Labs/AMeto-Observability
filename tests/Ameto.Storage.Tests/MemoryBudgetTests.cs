@@ -135,98 +135,6 @@ public sealed class MemoryBudgetTests
     }
 
     /// <summary>
-    /// The ingest payload arena's BYTE-SHARE term: a share of the PHYSICAL limit, like the frozen
-    /// tiers and for the same reason — it is native memory, not under the GC's hard limit. It is
-    /// one of two terms of the arena's default, not the default itself (the slab floor is the
-    /// other, tested below), so the 76 MB figure here is the share and no longer what a 512 MB
-    /// container's ring gets.
-    /// </summary>
-    [Fact]
-    public void The_ingest_arena_byte_share_is_a_share_of_the_physical_limit()
-    {
-        var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
-
-        Assert.Equal((long)(512 * MB * 0.15), stand.IngestArenaBytes);              // 76 MB
-        Assert.True(stand.IngestArenaBytes < MemoryBudgets.IngestArenaCapBytes);
-
-        // A host with room keeps the 512 MB cap; an unknown limit falls back to it.
-        Assert.Equal(MemoryBudgets.IngestArenaCapBytes, MemoryBudgets.Derive(64 * GB).IngestArenaBytes);
-        Assert.Equal(MemoryBudgets.IngestArenaCapBytes, MemoryBudgets.Derive(0).IngestArenaBytes);
-        Assert.True(MemoryBudgets.Derive(32 * MB).IngestArenaBytes >= 16 * MB);     // the floor
-    }
-
-    /// <summary>
-    /// The review scenario: an OpenTelemetry collector sends 8 192 records a batch by default, a
-    /// pending event holds a slab whatever its size, and the parser fills the ring faster than the
-    /// drainer empties it. With the byte share alone a 512 MB container's arena was ~76 MB — about
-    /// 1 200 slabs at 64 KB — so one ordinary batch could hit DroppedNoSlab part way through, where
-    /// main's flat 512 MB (8 192 slabs) absorbed it. The default now holds a batch's worth of slabs.
-    /// </summary>
-    [Fact]
-    public void The_default_arena_holds_a_collector_batch_of_slabs_in_a_512_mb_container()
-    {
-        var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
-        var ingestion = new IngestionOptions();
-
-        long arena = IngestionOptions.DefaultPayloadPoolBytesFor(stand, ingestion.MaxEventPayloadBytes);
-        // The ring's own slab arithmetic: min(ring slots, budget / slab size).
-        long slabs = Math.Min(ingestion.RingCapacity, arena / ingestion.MaxEventPayloadBytes);
-
-        Assert.True(slabs >= 8192, $"a 512 MB container's default arena holds {slabs} slabs; one collector batch is 8 192");
-        Assert.True(arena <= MemoryBudgets.IngestArenaCapBytes);
-    }
-
-    /// <summary>
-    /// The floor is a slab COUNT, so it scales with the slab size — and a raised
-    /// MaxEventPayloadBytes must not turn it into a multi-gigabyte reservation. 8 192 slabs of
-    /// 1 MB would be 8 GB; the default never goes above the 512 MB the flat default was.
-    /// </summary>
-    [Theory]
-    [InlineData(256 * 1024)]
-    [InlineData(1024 * 1024)]
-    [InlineData(16 * 1024 * 1024)]
-    public void A_raised_slab_size_never_pushes_the_default_arena_above_512_mb(int slabBytes)
-    {
-        foreach (var host in (MemoryBudgets[])[
-                     MemoryBudgets.Derive(384 * MB, 512 * MB), MemoryBudgets.Derive(768 * MB, 1 * GB),
-                     MemoryBudgets.Derive(64 * GB), MemoryBudgets.Derive(0)])
-        {
-            Assert.Equal(MemoryBudgets.IngestArenaCapBytes, IngestionOptions.DefaultPayloadPoolBytesFor(host, slabBytes));
-        }
-    }
-
-    /// <summary>
-    /// The byte share is still the other term: with a small slab, 8 192 slabs come to less than the
-    /// share, and the larger figure wins. Big hosts are unchanged at 512 MB.
-    /// </summary>
-    [Fact]
-    public void The_default_arena_is_the_larger_of_the_slab_floor_and_the_byte_share()
-    {
-        var stand = MemoryBudgets.Derive(384 * MB, 512 * MB);
-
-        // 4 KB slabs: floor 32 MB, share 76 MB.
-        Assert.Equal(stand.IngestArenaBytes, IngestionOptions.DefaultPayloadPoolBytesFor(stand, 4 * 1024));
-        // 16 KB slabs at 32 GB: floor 128 MB, share capped at 512 MB.
-        Assert.Equal(MemoryBudgets.IngestArenaCapBytes,
-                     IngestionOptions.DefaultPayloadPoolBytesFor(MemoryBudgets.Derive(24 * GB, 32 * GB), 16 * 1024));
-
-        foreach (var big in (MemoryBudgets[])[MemoryBudgets.Derive(24 * GB, 32 * GB), MemoryBudgets.Derive(64 * GB), MemoryBudgets.Derive(0)])
-            Assert.Equal(MemoryBudgets.IngestArenaCapBytes, IngestionOptions.DefaultPayloadPoolBytesFor(big, 64 * 1024));
-    }
-
-    /// <summary>
-    /// An explicit Ingestion.PayloadPoolBytes always wins — including a value BELOW the slab floor,
-    /// which is how a small host that expects large events buys a hard ceiling.
-    /// </summary>
-    [Fact]
-    public void An_explicit_payload_pool_wins_over_the_default_rule()
-    {
-        Assert.Equal(96 * MB, new IngestionOptions { PayloadPoolBytes = 96 * MB }.EffectivePayloadPoolBytes);
-        Assert.Equal(16 * MB, new IngestionOptions { PayloadPoolBytes = 16 * MB }.EffectivePayloadPoolBytes);
-        Assert.Equal(2 * GB,  new IngestionOptions { PayloadPoolBytes = 2 * GB, MaxEventPayloadBytes = 1024 * 1024 }.EffectivePayloadPoolBytes);
-    }
-
-    /// <summary>
     /// A big host that caps its managed heap with GCHeapHardLimit has said nothing about native
     /// memory, so the native budget must not shrink with the heap.
     /// </summary>
@@ -263,7 +171,7 @@ public sealed class MemoryBudgetTests
     /// THE RE-CUT IS FREE ABOVE THE STAND, which is the claim that made it safe to make. The
     /// managed logs shares went 0.30 / 0.15 / 0.10 -> 0.25 / 0.12 / 0.05 to pay for the metric
     /// and trace tiers that WP3 appended beside them, and a fraction change is only ever a
-    /// behaviour change where the fraction BINDS. Every one of the nine ceilings is
+    /// behaviour change where the fraction BINDS. Every one of the eight ceilings is
     /// <c>min(cap, share)</c>, and the first share to stop binding is the largest — 640 MB of a
     /// 16 GB limit is 3.9 %, six times below the smallest fraction here — so every derived figure
     /// on a host with room is its constant, before and after.
@@ -284,7 +192,6 @@ public sealed class MemoryBudgetTests
         Assert.Equal(MemoryBudgets.IngestBufferCapBytes,     b.IngestBufferBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,       b.NativeTierBytes);
         Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes);
-        Assert.Equal(MemoryBudgets.IngestArenaCapBytes,      b.IngestArenaBytes);
         Assert.Equal(MemoryBudgets.MetricHotTierCapBytes,    b.MetricHotTierBytes);
         Assert.Equal(MemoryBudgets.TraceHotTierCapBytes,     b.TraceHotTierBytes);
         Assert.Equal(MemoryBudgets.TraceMergeCapBytes,       b.TraceMergeBytes);
@@ -584,11 +491,6 @@ public sealed class MemoryBudgetTests
         // and the difference is managed headroom spent on bytes the GC never sees.
         Assert.Equal(expected.IndexCacheNativeBytes, child.IndexCacheNative);
         Assert.Equal(26_843_545L, child.IndexCacheNative);
-
-        // The ring's default arena, as the options the server binds compute it in this container:
-        // a collector batch of 64 KB slabs (512 MB), not the 76 MB byte share alone.
-        Assert.Equal(512 * MB, child.IngestArenaDefault);
-        Assert.True(child.IngestArenaDefault / (64 * 1024) >= 8192);
     }
 
     /// <summary>
@@ -636,7 +538,7 @@ public sealed class MemoryBudgetTests
 
     private readonly record struct ChildBudgets(
         long ManagedLimit, long PhysicalLimit, long ManagedBuild, long NativeTier, long IndexCache,
-        long IndexCacheNative, long IngestArenaDefault);
+        long IndexCacheNative);
 
     /// <summary>Runs this test assembly's own entry point (<see cref="ChildProcessEntry"/>) under the given GC settings.</summary>
     private static ChildBudgets RunChild(params ReadOnlySpan<(string Name, string Value)> gcSettings)
@@ -685,6 +587,6 @@ public sealed class MemoryBudgetTests
         return new ChildBudgets(
             values["managedLimit"], values["physicalLimit"],
             values["managedBuild"], values["nativeTier"], values["indexCache"],
-            values["indexCacheNative"], values["ingestArenaDefault"]);
+            values["indexCacheNative"]);
     }
 }

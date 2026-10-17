@@ -1,0 +1,334 @@
+using System.Buffers;
+using MessagePack;
+using Microsoft.Extensions.Logging.Abstractions;
+using Ameto.Core;
+
+namespace Ameto.Storage.Tests;
+
+/// <summary>
+/// A despill the process died in has moved some of its block's levels into place. The next start
+/// despills the block again and must not write those levels a second time, whatever has happened to
+/// their files meanwhile: the boot scan registers them as ordinary segments, a merge may take one
+/// into another segment before the despill — in the background, behind other blocks or a new spill —
+/// gets to the block, and a failed despill's retry used to unlink every level file of the block as a
+/// leftover. The despill used to ask the disk only when it ran; the start now notes which levels an
+/// earlier run published, and the despill and its retry skip exactly those.
+/// </summary>
+public sealed class DespillHalfFlushedBlockTests : IDisposable
+{
+    /// <summary>Weeks back: the merge planner merges only inside a sealed bucket.</summary>
+    private static readonly long Base = new DateTimeOffset(2026, 8, 20, 9, 0, 0, TimeSpan.Zero).UtcTicks;
+
+    private const ulong Block = 9_000;
+
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(60);
+
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-despill-half-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// The earlier run's level is not merged before the block's despill (round-6 review R5-M2): the merge
+    /// planner owns every level of a queued block, those an earlier run published included. It used to
+    /// leave them to merges, which a stop before the despill turned into events stored twice (the next
+    /// test). Once the block is despilled the level is a segment like any other, and merges.
+    /// </summary>
+    [Fact]
+    public async Task A_level_an_earlier_run_published_is_not_merged_before_its_blocks_despill()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        await using var run2 = Engine(opts);
+        StorageEngine.HoldDespillForTest.Value = null;
+        await run2.CatalogLoaded;
+        for (int i = 150; i < 250; i++)
+            Assert.True(run2.TryWrite(Header(run2, i, LogLevel.Information), Props(i), "event {n}"));
+        await run2.FlushHotTierAsync();
+        run2._allowIndexlessMerge = true;
+        await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        Assert.True(File.Exists(infoLevel), "a merge took the level an earlier run published before its block's despill");
+
+        hold.SetResult();
+        WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+        Assert.True(await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "the level stayed out of merges after its block was despilled");
+        Assert.False(File.Exists(infoLevel), "the merge left the despilled block's level in place");
+
+        AssertEveryEventOnce(run2, 250);
+    }
+
+    /// <summary>
+    /// Round-6 review R5-M2 (pre-existing): a merge took the earlier run's level while the block waited for its
+    /// despill, the process stopped before that despill, and the next start — no longer finding the level on
+    /// disk — wrote it again: its events twice (the round-5 reviewer's R5-5, 30 for 20). Owned until the block
+    /// is published, the level is still on disk at the next start, which keeps it.
+    /// </summary>
+    [Fact]
+    public async Task A_level_an_earlier_run_published_is_not_written_again_after_a_stop_before_the_despill()
+    {
+        var opts = Options();
+        var (spill, _) = await HalfDespilledBlockAsync(opts);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        var run2 = Engine(opts);
+        StorageEngine.HoldDespillForTest.Value = null;
+        try
+        {
+            await run2.CatalogLoaded;
+            for (int i = 150; i < 250; i++)
+                Assert.True(run2.TryWrite(Header(run2, i, LogLevel.Information), Props(i), "event {n}"));
+            await run2.FlushHotTierAsync();
+            run2._allowIndexlessMerge = true;
+            await run2.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+        }
+        finally { await run2.DisposeAsync(); }   // the despill was never let go: the stop comes before it
+
+        await using var run3 = Engine(opts);
+        await run3.CatalogLoaded;
+        WaitFor(() => run3.SpillFilesPending == 0 && !File.Exists(spill), "run 3 to despill the block");
+        AssertEveryEventOnce(run3, 250);
+    }
+
+    /// <summary>
+    /// The despill's own flush fails (after it has moved its Error level): its retry used to delete
+    /// every level file of the block as a leftover of the failed attempt — the earlier run's
+    /// Information level, a registered segment, among them — and write them all again, while the
+    /// catalog still named the deleted file. It keeps that level now, and writes only the rest.
+    /// </summary>
+    [Fact]
+    public async Task The_retry_of_a_failed_despill_keeps_the_levels_an_earlier_run_published()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        var infoWritten = File.GetLastWriteTimeUtc(infoLevel);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        await using var run2 = Engine(opts);
+        StorageEngine.HoldDespillForTest.Value = null;
+        await run2.CatalogLoaded;
+        run2._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        int armed = 1;
+        run2._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) throw new IOException("test: the despill's flush fails after a level");
+        };
+
+        hold.SetResult();
+        WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the retry to despill the block");
+
+        Assert.True(File.Exists(infoLevel), "the retry deleted the level an earlier run published");
+        Assert.Equal(infoWritten, File.GetLastWriteTimeUtc(infoLevel));
+        Assert.Equal(50, run2.DespilledEvents);   // the Error level, written by the retry and counted by it
+        AssertEveryEventOnce(run2, 150);
+    }
+
+    /// <summary>
+    /// A level the earlier run published that the boot scan finds torn, and sets aside as
+    /// <c>.seg.corrupt</c>, is written again by the despill. The levels to keep were noted before the
+    /// scan ran, so the despill skipped it — once at once, before the scan, and once after it, alike —
+    /// and its events were left in a file served by nobody. The despill of such a block now waits
+    /// for the scan, and keeps only the levels the scan accepted.
+    /// </summary>
+    [Fact]
+    public async Task A_level_the_boot_scan_sets_aside_as_torn_is_written_again_by_the_despill()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);   // too short for its footer: the scan sets it aside
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        try
+        {
+            // A despill that did not wait for the scan would be done well within this.
+            SpinWait.SpinUntil(() => run2.SpillFilesPending == 0, TimeSpan.FromSeconds(1));
+
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            Assert.True(File.Exists(infoLevel + ".corrupt"), "setup: the scan did not set the torn level aside");
+
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+            AssertEveryEventOnce(run2, 150);
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R4-2. The same torn level, which the boot scan rejects but cannot move aside — held by another
+    /// process, on Windows. The scan recorded a level only once its move had worked: this one stayed
+    /// in the mask, the despill skipped it, and its 100 events were in no segment anyone serves. It is
+    /// recorded as rejected before the move is tried; the despill writes it again (once the file can
+    /// be replaced, by its retry).
+    /// </summary>
+    [Fact]
+    public async Task A_torn_level_the_boot_scan_cannot_move_aside_is_still_written_again_by_the_despill()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        run2._flushRetryDelay = TimeSpan.FromMilliseconds(50);
+        run2._beforeQuarantineMoveForTest = _ => throw new IOException("test: the torn level is held by another process");
+        try
+        {
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            Assert.False(File.Exists(infoLevel + ".corrupt"), "setup: the torn level was moved aside");
+
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(spill), "the block to be despilled");
+            AssertEveryEventOnce(run2, 150);
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// R4-2, the replay. A WAL whose flush a crash cut short — one level moved into place — has the
+    /// same race: the replay runs in the constructor while the boot scan runs in the background, and
+    /// it skipped every level whose file was there. A torn one, which the scan then set aside, was
+    /// skipped: its events were in no segment anyone serves, and the WAL that held them was deleted.
+    /// Such a WAL is despilled now, after the scan, keeping only the levels the scan accepted.
+    /// </summary>
+    [Fact]
+    public async Task A_torn_level_of_a_wal_the_crash_cut_short_is_written_again_after_the_boot_scan()
+    {
+        var opts = Options();
+        var (spill, infoLevel) = await HalfDespilledBlockAsync(opts);
+        string wal = Path.ChangeExtension(spill, ".wal");   // the same log, as a crash leaves a live WAL
+        File.Move(spill, wal);
+        File.Move(spill + ".pool", wal + ".pool");
+        using (var torn = new FileStream(infoLevel, FileMode.Open, FileAccess.Write))
+            torn.SetLength(16);
+
+        var scan = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally { StorageEngine.HoldCatalogScanForTest.Value = null; }
+        try
+        {
+            bool keptForTheScan = File.Exists(wal);
+            scan.SetResult();
+            await run2.CatalogLoaded;
+            WaitFor(() => run2.SpillFilesPending == 0 && !File.Exists(wal), "the WAL to be written after the scan");
+            AssertEveryEventOnce(run2, 150);
+            Assert.True(keptForTheScan, "the WAL was replayed before the scan had read its levels");
+        }
+        finally
+        {
+            scan.TrySetResult();
+            await run2.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Writes the spilled block — events 0..99 at Information, 100..149 at Error — and runs an engine
+    /// whose despill moves the Information level into place and then "dies": the throw stands in for
+    /// the kill, and the shutdown cancels the retry it schedules. Returns the spill file, still on
+    /// disk, and the level file the despill left beside it.
+    /// </summary>
+    private async Task<(string Spill, string InfoLevel)> HalfDespilledBlockAsync(ServerOptions opts)
+    {
+        string walDir = Path.Combine(_dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(Block), 1 << 20))
+            for (int i = 0; i < 150; i++)
+                wal.Append(At(i), i < 100 ? LogLevel.Information : LogLevel.Error, 0, "event {n}", Props(i));
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        var run1 = Engine(opts);
+        StorageEngine.HoldDespillForTest.Value = null;
+        // Disposed whatever happens: a failed wait used to leave run 1 running, its files open, and the
+        // test's directory undeletable.
+        try
+        {
+            run1._afterLevelPublished = _ => throw new IOException("test: the process dies after its first level's move");
+            hold.SetResult();
+            WaitFor(() => run1.DespillsCompletedForTest == 1, "run 1's despill to stop after its first level");
+        }
+        finally
+        {
+            hold.TrySetResult();
+            await run1.DisposeAsync();
+        }
+
+        string infoLevel = Assert.Single(Directory.GetFiles(Path.Combine(_dir, "segments"), $"{opts.NodeId.Value}-{Block + 2}-*.seg"));
+        Assert.True(File.Exists(spill), "the spill file must outlive run 1");
+        return (spill, infoLevel);
+    }
+
+    private static void AssertEveryEventOnce(StorageEngine engine, int expected)
+    {
+        var seen  = new HashSet<long>();
+        var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seg in engine.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                long n = (ev.TsTicks - Base) / TimeSpan.TicksPerMillisecond;
+                Assert.True(seen.Add(n), $"event {n} is in the segments twice");
+            }
+        }
+        Assert.Equal(expected, seen.Count);
+    }
+
+    private ServerOptions Options()
+    {
+        Directory.CreateDirectory(_dir);
+        return new ServerOptions { DataDirectory = _dir };
+    }
+
+    private static long At(int i) => Base + i * TimeSpan.TicksPerMillisecond;
+
+    private static LogEventHeader Header(StorageEngine engine, int i, LogLevel level) => new()
+    {
+        TimestampUtcTicks        = At(i),
+        Level                    = level,
+        MessageTemplatePoolIndex = engine.TemplatePool.Intern("event {n}"),
+    };
+
+    private static byte[] Props(long n)
+    {
+        var buf = new ArrayBufferWriter<byte>(32);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write("n"); w.Write(n);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
+    private static StorageEngine Engine(ServerOptions opts) => new(
+        Microsoft.Extensions.Options.Options.Create(opts),
+        new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+        NullLogger<StorageEngine>.Instance);
+
+    private static void WaitFor(Func<bool> condition, string what) =>
+        Assert.True(SpinWait.SpinUntil(condition, HangGuard), $"timed out waiting for {what}");
+}

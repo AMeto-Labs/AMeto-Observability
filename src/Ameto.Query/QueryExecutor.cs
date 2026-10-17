@@ -1329,7 +1329,7 @@ public sealed class QueryExecutor : IQueryExecutor
     /// method does NOT dispose it — <see cref="MergeSourcesAsync"/> owns every prefilter reader
     /// and closes them all in one place, because a segment that never primes has no iterator to
     /// close it. Opening the file twice per segment per query was the cost being removed: a
-    /// FileInfo stat, a CreateFromFile, a CreateViewAccessor over the whole file and a
+    /// file open, a CreateFromFile, a CreateViewAccessor over the whole file and a
     /// block-index parse, 40 of them for a 20-segment query.
     /// </param>
     /// <param name="pin">

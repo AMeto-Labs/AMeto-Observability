@@ -561,8 +561,42 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             OnPendingStoredForTest  = t_pendingStoredForNextOpenForTest,
         };
         try { wal.OpenOrCreate(initialCapacity); }
-        catch { wal.Dispose(); throw; }                  // the lifetime handle, not left to the finalizer
+        catch { wal.ReleaseFailedOpen(); throw; }        // the lifetime handle, not left to the finalizer
         return wal;
+    }
+
+    /// <summary>
+    /// The lengths the log file and its pool had when <see cref="OpenOrCreate"/> opened them: 0 for a file
+    /// the open created (or found empty), -1 until the open has the file. What a failed open puts back.
+    /// </summary>
+    private long _foundAtOpen = -1, _poolFoundAtOpen = -1;
+
+    /// <summary>
+    /// Releases a log whose open failed, leaving its files as the open found them (round-6 review R5-H2):
+    /// the handles closed, what the open added to an existing log cut away again — the extension SetLength
+    /// made, and the reservation behind it — and a file the open created removed (one it found empty holds
+    /// nothing either). It only disposed: a reservation that failed left a sized, unreserved file, which
+    /// the next start mapped and wrote into until the volume was full (AccessViolation, exit 134). A log
+    /// the open SHRANK (see <see cref="ShrinkLocked"/>) is not put back: the cut was past its data.
+    /// </summary>
+    private void ReleaseFailedOpen()
+    {
+        long found = _foundAtOpen, poolFound = _poolFoundAtOpen;
+        lock (_resizeLock)
+        lock (_writeLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { _poolStream?.Dispose(); } catch { }
+            _poolStream = null;
+            Unmap();
+            if (found > 0 && _file is not null)
+                try { if (_file.Length > found) _file.SetLength(found); } catch { /* the open's own exception is the one that matters */ }
+            try { _file?.Dispose(); } catch { }
+            _file = null;
+        }
+        if (found == 0)     DeleteQuietly(_filePath);
+        if (poolFound == 0) DeleteQuietly(_poolPath);
     }
 
     /// <summary>
@@ -672,6 +706,10 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             }
 
             fs.SetLength(FileHeaderSize + FitCapacity(written));
+            // Reserved before the move commits the copy (round-6 review R5-H2): the open after it
+            // reserves the whole file anyway, and a volume that cannot hold it fails the upgrade here,
+            // where the v1 log stays open in its own layout, not that open, past the commit point.
+            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + FitCapacity(written), tmpPath);
 
             var hdr = new WalFileHeader
             {
@@ -693,7 +731,6 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     private void OpenOrCreate(long initialCapacity)
     {
         _floorCapacity = Math.Max(initialCapacity, 1);
-        bool exists   = File.Exists(_filePath);
 
         // ONE handle, held until Dispose, and every mapping is created over it. Reopening by
         // path on each resize is a race with anything that reads the file — and "anything"
@@ -702,11 +739,19 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         // violation, the restore reopen throw the same one, and the log go permanently dark on
         // what was a routine resize. Measured, not imagined: a retrying reader killed it on its
         // first attempt. Resizes now run against this handle, which nothing can contend.
+        //
+        // What the file holds is read off this handle, never asked of File.Exists first (round-6
+        // review R5-M6's class): that answers false for a file it could not look at as well, and an
+        // existing log read as a new one is re-initialised below, its points gone. A new file is
+        // empty, which VersionOnDisk reads as no log at all.
+        FileRefusal.ThrowIfRefused(_filePath, FileRefusal.Access.Open);
         _file = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        long found   = _file.Length;
+        _foundAtOpen = found;
 
         // The version decides the header's size, and the header's size decides where the data
         // starts — so it is read off the handle before the mapping is sized.
-        ushort onDisk = exists ? VersionOnDisk(_file) : (ushort)0;
+        ushort onDisk = VersionOnDisk(_file);
         bool   known  = onDisk is WalVersion or WalVersionV1;
         if (onDisk == WalVersionV1)
         {
@@ -719,8 +764,17 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         }
 
         long fileSize = _headerSize + initialCapacity;
-        if (_file.Length < fileSize) _file.SetLength(fileSize);
-        else                         fileSize = _file.Length;   // reopen an already-grown log
+        if (found < fileSize) _file.SetLength(fileSize);
+        else                  fileSize = found;   // reopen an already-grown log
+
+        // The WHOLE file's blocks reserved, at every open, before anything is written through the
+        // mapping (round-5 H-F; round-6 review R5-H2): on Linux SetLength leaves the file sparse, and the
+        // first write through the mapping into a page of a full volume is SIGBUS. Only what the open
+        // added used to be reserved, so a log at its full size — every reopen, an earlier build's sparse
+        // log, the file a failed reservation left sized — was mapped over its holes, and the engine's
+        // Ingest died with them (AccessViolation, exit 134). Cheap where the blocks are there already. A
+        // volume that cannot hold them fails the open, and ReleaseFailedOpen puts the file back.
+        FileSpace.Reserve(_file.SafeFileHandle, 0, fileSize, _filePath);
 
         _capacity = fileSize - _headerSize;
         Map(fileSize);
@@ -828,8 +882,9 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 "Metric WAL could not restore its mapping after a failed shrink at open — " +
                 "refusing to open a log that cannot accept an append. See the shrink error above.");
 
-        _poolStream = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        _poolStream.Seek(0, SeekOrigin.End);
+        FileRefusal.ThrowIfRefused(_poolPath, FileRefusal.Access.Open);
+        _poolStream      = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        _poolFoundAtOpen = _poolStream.Seek(0, SeekOrigin.End);
 
         // An empty log references nothing, so a pool carried over from before it emptied is
         // pure weight — the stand's was 29.5 MB, kept alive because truncation only ever ran
@@ -2456,6 +2511,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
     /// unresolved and let the open cut them off the file. <paramref name="skipped"/> counts them.
     /// Only broken framing ends the walk. A v1 record (see <see cref="PoolRecordTagV2"/>) has only
     /// the length check it always had, and its body is still stepped over unread.</para>
+    ///
+    /// <para><b>A read that FAILS is not a torn record</b> (round-6 review R5-M6's class). Only the file
+    /// system's FileNotFound or DirectoryNotFound means there is no pool; any other failure to open or
+    /// read it — a share that did not answer, an access check, an out of memory — is thrown. It asked
+    /// File.Exists first, which answers false for a pool it could not look at as well, and swallowed
+    /// every failure of the walk; both ended the walk early, and <see cref="OpenOrCreate"/> then cut the
+    /// pool at the clean end it had reached — at offset 0 for a pool it could not look at: every series
+    /// the log's points name, gone with the file. A failed walk now fails the open, which leaves the
+    /// files as it found them, and fails <see cref="ReadAll"/>, whose caller keeps the log.</para>
     /// </summary>
     private Dictionary<uint, byte[]> ReadPoolRecords(HashSet<uint>? keep, out long cleanEnd, out ulong indexCeiling,
                                                      out int skipped)
@@ -2464,13 +2528,21 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         cleanEnd     = 0;
         indexCeiling = 0;
         skipped      = 0;
-        if (!File.Exists(_poolPath)) return bodies;
+
+        _poolStream?.Flush();
+        FileStream? opened;
+        try
+        {
+            FileRefusal.ThrowIfRefused(_poolPath, FileRefusal.Access.Open);
+            opened = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (FileNotFoundException)      { return bodies; }
+        catch (DirectoryNotFoundException) { return bodies; }
 
         byte[]? scratch = null;
         try
         {
-            _poolStream?.Flush();
-            using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var fs = opened;
             long length = fs.Length;
             Span<byte> head = stackalloc byte[PoolHeadV2];
 
@@ -2543,7 +2615,6 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
                 cleanEnd = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
-        catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
         finally { if (scratch is not null) ArrayPool<byte>.Shared.Return(scratch); }
 
         return bodies;
@@ -2634,7 +2705,23 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
         long target = capacity;
         while (target < needed) target = NextCapacity(target);
+        long fit = (needed + 4095) & ~4095L;
+        // A step the volume cannot hold is tried again at what the append needs (round-6 review R6-H1's class): the
+        // volume that refused the step — doubling, then 64 MiB at a time — had room for the points, which were refused
+        // with it. A failure leaves the log as it was (below).
+        try { GrowToCapacity(capacity, target); }
+        catch (IOException) when (target > fit) { GrowToCapacity(capacity, fit); }
+    }
+
+    /// <summary>The body of <see cref="GrowTo"/>: from <paramref name="capacity"/> to <paramref name="target"/>.</summary>
+    private void GrowToCapacity(long capacity, long target)
+    {
         long newFileSize = _headerSize + target;
+        // The view takes the file whole when it is longer: a growth that failed had already extended it
+        // (CreateFromFile below does), and a mapping cannot be smaller than its file — the retry at what the
+        // append needs (GrowTo) threw ArgumentOutOfRangeException. Only [.., target) is reserved, and the capacity
+        // goes no further: nothing writes past it, and a later growth reserves the rest from there.
+        long mapSize = Math.Max(newFileSize, _file!.Length);
 
         MemoryMappedFile?         mmf  = null;
         MemoryMappedViewAccessor? view = null;
@@ -2645,9 +2732,15 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
             // A capacity past the file's length extends the file (both platforms) — with the old
             // mapping still in place, which an explicit SetLength could not be sure of on Windows.
-            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, newFileSize, MemoryMappedFileAccess.ReadWrite,
+            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, mapSize, MemoryMappedFileAccess.ReadWrite,
                                                    HandleInheritability.None, leaveOpen: true);
-            view = mmf.CreateViewAccessor(0, newFileSize, MemoryMappedFileAccess.ReadWrite);
+            // The extension's blocks reserved before anything is written through the new view (round-5
+            // H-F): on Linux the mapping extended the file sparse, and a write into a page of a full volume
+            // is SIGBUS. From the old mapping's end, not the file's: a growth that failed after extending the
+            // file left its tail unreserved. A volume that cannot hold them fails this growth, the old
+            // mapping still in place.
+            FileSpace.Reserve(_file!.SafeFileHandle, _headerSize + capacity, target - capacity, _filePath);
+            view = mmf.CreateViewAccessor(0, mapSize, MemoryMappedFileAccess.ReadWrite);
             byte* ptr = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
             acquired = true;
@@ -2816,7 +2909,10 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            try { _poolStream?.Flush(); _poolStream?.Dispose(); } catch { }
+            // Two tries: a write of the buffer that failed skipped the close in one, and left the pool's
+            // handle to the finalizer (round-6 review; the logs WAL's pool had the same shape).
+            try { _poolStream?.Flush(); } catch { /* its close below writes what it can */ }
+            try { _poolStream?.Dispose(); } catch { }
             _poolStream = null;
             Unmap();
             try { _file?.Dispose(); } catch { }

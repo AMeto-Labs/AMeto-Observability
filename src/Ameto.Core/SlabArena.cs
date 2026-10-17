@@ -4,11 +4,12 @@ using System.Runtime.InteropServices;
 namespace Ameto.Core;
 
 /// <summary>
-/// The ingest payload arena: one contiguous address range whose pages are paid for only as
-/// the buffer actually grows into them.
+/// The span ring's payload arena: one contiguous address range whose pages are paid for only as
+/// the buffer actually grows into them. (It was written for the log ingest ring, which is gone:
+/// logs are written straight into the store by the request that carries them.)
 ///
-/// <para>Why this exists. The arena is sized to the back-pressure ceiling — 512 MB by default —
-/// on the assumption stated in <c>IngestionRingBuffer</c> that it is "reserved virtual
+/// <para>Why this exists. The arena was sized to the back-pressure ceiling — 512 MB by default —
+/// on the assumption stated in the log ingest ring that it was "reserved virtual
 /// memory; only pages actually written become resident". That is true of
 /// <c>NativeMemory.Alloc</c> on Linux, where a large malloc is an anonymous mmap and pages fault
 /// in lazily. It is NOT true on Windows: a block that large goes straight to
@@ -34,8 +35,8 @@ namespace Ameto.Core;
 /// above the high-water mark would need a background sweep — a timer wake on an idle server,
 /// which is the thing this work package is removing — to reclaim memory that a LIFO free list
 /// will ask for again on the next burst of the same size. The high-water mark IS the residency,
-/// and it is the true peak, not the ceiling. (The SPAN ring does trim — <see cref="TryDecommitTail"/> — from
-/// the drainer's existing idle wake, not a timer of its own; the log ring still does not.)</para>
+/// and it is the true peak, not the ceiling. (The span ring does trim — <see cref="TryDecommitTail"/> — from
+/// its drainer's existing idle wake, not a timer of its own.)</para>
 ///
 /// <para><b>Why it lives in Ameto.Core, and why it is still <c>internal</c>.</b> It was written
 /// for the log ring and lived beside it in <c>Ameto.Ingestion</c>; the span ring needs the same

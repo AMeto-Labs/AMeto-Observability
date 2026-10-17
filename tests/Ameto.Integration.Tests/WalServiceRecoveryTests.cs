@@ -18,7 +18,7 @@ namespace Ameto.Integration.Tests;
 /// whose service is given as <c>@service</c> or as <c>service.name</c> (the Serilog sink's
 /// spelling) or not at all, and OTLP/JSON records whose resource names it — interned once per
 /// resource block, the road that lost the service outright once #113 stopped keeping a copy of it
-/// in the properties. Every event goes ring → drainer → <see cref="StorageEngine.TryWrite"/> → WAL;
+/// in the properties. Every event goes request → batch → <see cref="StorageEngine.WriteBatchAsync"/> → WAL;
 /// the process is "killed" while the events are still only in the WAL, and the next start replays
 /// it. Each event must then answer an <c>@service</c> filter with its own service, as it would have
 /// had the flush written it.
@@ -62,29 +62,28 @@ public sealed class WalServiceRecoveryTests : IDisposable
         };
 
         var engine = NewEngine(opts);
-        int slab   = opts.Ingestion.MaxEventPayloadBytes;
-        var ring   = new IngestionRingBuffer(1024, slab, 16L * slab);
-        IngestionDrainer? drainer = null;
         try
         {
             int written = 0;
-            var all     = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            engine.EventWritten = (_, _) =>
+            engine.EventWritten = (_, _) => Interlocked.Increment(ref written);
+
+            var endpoint = new IngestionEndpoint(engine, engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+
+            using (var clef = endpoint.BeginBatch())
             {
-                if (Interlocked.Increment(ref written) == expected.Count) all.TrySetResult();
-            };
+                Assert.Equal(4, LogEventSerializer.StreamBatch(ClefBatch(At), clef, out int clefDropped));
+                Assert.Equal(0, clefDropped);
+                Assert.Equal(new LogIngestResult(4, 0, Busy: false), await clef.CommitAsync());
+            }
 
-            drainer      = new IngestionDrainer(ring, engine, opts, NullLogger<IngestionDrainer>.Instance);
-            var endpoint = new IngestionEndpoint(ring, engine.TemplatePool, drainer, opts, NullLogger<IngestionEndpoint>.Instance);
+            using (var otlp = endpoint.BeginBatch())
+            {
+                Assert.Equal((4, 0), OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJson(At)), otlp));
+                Assert.Equal(new LogIngestResult(4, 0, Busy: false), await otlp.CommitAsync());
+            }
 
-            Assert.Equal(4, LogEventSerializer.StreamBatch(ClefBatch(At), endpoint, out int clefDropped));
-            Assert.Equal(0, clefDropped);
-            drainer.NotifyEnqueued();
-
-            Assert.Equal((4, 0), OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJson(At)), endpoint));
-            endpoint.NotifyBatchEnqueued();
-
-            await all.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            // Answered means written: every event is in the tier and the WAL already.
+            Assert.Equal(expected.Count, Volatile.Read(ref written));
 
             // kill -9: the events are in the WAL (and the hot tier) only. Keep the WAL's bytes,
             // let the shutdown flush and unlink it, then undo that flush.
@@ -93,8 +92,6 @@ public sealed class WalServiceRecoveryTests : IDisposable
             File.Copy(wal, wal + ".crash", overwrite: true);
             File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
 
-            await drainer.DisposeAsync();
-            drainer = null;
             await engine.DisposeAsync();
             foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
             {
@@ -106,8 +103,6 @@ public sealed class WalServiceRecoveryTests : IDisposable
         }
         finally
         {
-            if (drainer is not null) await drainer.DisposeAsync();
-            ring.Dispose();
             await engine.DisposeAsync();
         }
 
@@ -130,10 +125,178 @@ public sealed class WalServiceRecoveryTests : IDisposable
         }
     }
 
-    private static async Task<List<LogEvent>> QueryAsync(QueryExecutor q, string? filter)
+    /// <summary>
+    /// Round-4 H2 at the door. An <c>@service</c> past <see cref="IngestionEndpoint.MaxServiceNameBytes"/>
+    /// is cut — at a whole character — before it is interned, so the WAL logs it as one pool row, and
+    /// every event keeps the cut name through a crash replay. The review's probe: 1 000 CLEF events with
+    /// a 70 KB service made a 70 MB live WAL, and 3 500 a log whose replay ran a 384 MiB heap out at
+    /// every start. (A service is an identifier; 1 KiB is far past any real one.)
+    /// </summary>
+    [Fact]
+    public async Task A_service_past_the_limit_is_cut_at_the_door_and_logged_once()
+    {
+        Directory.CreateDirectory(_dir);
+        var opts = new ServerOptions { DataDirectory = _dir };
+        long t0  = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond * TimeSpan.TicksPerMillisecond;
+        const int Events = 200;
+        // 1 023 bytes of 'a', then a two-byte 'é' across the cut, then 70 KB more: cut to the 'a's.
+        string service = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1) + "é" + new string('b', 70_000);
+        string cut     = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1);
+
+        var engine = NewEngine(opts);
+        try
+        {
+            var endpoint = new IngestionEndpoint(engine, engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+            using (var clef = endpoint.BeginBatch())
+            {
+                Assert.Equal(Events, LogEventSerializer.StreamBatch(LongServiceBatch(t0, Events, service), clef, out int dropped));
+                Assert.Equal(0, dropped);
+                Assert.Equal(new LogIngestResult(Events, 0, Busy: false), await clef.CommitAsync());
+            }
+
+            long walBytes = engine.LiveWalForTest!.WrittenBytes;
+            Assert.True(walBytes < 64 * 1024, $"{walBytes:N0} B logged for {Events} events of one {service.Length:N0}-char service");
+
+            // kill -9, as above: the events are in the WAL only when the next start comes.
+            ulong  walId = engine.LiveWalSegmentId;
+            string wal   = Directory.GetFiles(WalDir, "*.wal").Single();
+            File.Copy(wal, wal + ".crash", overwrite: true);
+            File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+            await engine.DisposeAsync();
+            foreach (var f in Directory.GetFiles(SegDir, "*.seg"))
+            {
+                var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+                if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+            }
+            File.Move(wal + ".crash", wal, overwrite: true);
+            File.Move(wal + ".pool.crash", wal + ".pool", overwrite: true);
+        }
+        finally
+        {
+            await engine.DisposeAsync();
+        }
+
+        await using var restarted = NewEngine(opts);
+        await restarted.CatalogLoaded;
+        var query  = new QueryExecutor(restarted, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        var events = await QueryAsync(query, filter: null, count: Events + 1);
+        Assert.Equal(Events, events.Count);
+        Assert.All(events, ev => Assert.Equal(cut, ev.ServiceName));
+    }
+
+    /// <summary>
+    /// Round-5 review L-8: the same cut on the OTLP roads, which no test reached — removed from either
+    /// place it is made, every test passed. The parsers intern a resource's <c>service.name</c> once per
+    /// block (<see cref="LogIngestBatch.InternService"/>), and a record's stage interns it itself when that
+    /// gave no index — a full pool (<see cref="IngestionEndpoint.StageRaw"/>). The name is 4 KB, so that
+    /// uncut it would still be pooled (a pool takes a text of up to 16 Ki units).
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true,  false)]
+    [InlineData(false, true)]
+    [InlineData(true,  true)]
+    public async Task An_otlp_service_past_the_limit_is_cut_at_the_door(bool json, bool fullPool)
+    {
+        Directory.CreateDirectory(_dir);
+        var opts = new ServerOptions { DataDirectory = _dir };
+        // 1 023 bytes of 'a', then a two-byte 'é' across the cut, then 3 000 more: cut to the 'a's.
+        string service = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1) + "é" + new string('b', 3_000);
+        string cut     = new string('a', IngestionEndpoint.MaxServiceNameBytes - 1);
+        var    pool    = new StringInternPool(1);
+        pool.Intern("the one string this pool takes");   // full: every name past it is the event's own
+
+        await using var engine = NewEngine(opts);
+        var endpoint = new IngestionEndpoint(engine, fullPool ? pool : engine.TemplatePool, opts, NullLogger<IngestionEndpoint>.Instance);
+        using (var batch = endpoint.BeginBatch())
+        {
+            var (ingested, dropped) = json
+                ? OtlpLogStreamParser.Parse(Encoding.UTF8.GetBytes(OtlpJsonOfService(service, 3)), batch)
+                : OtlpLogProtoParser.Parse(OtlpProtoOfService(service, 3), batch);
+            Assert.Equal((3, 0), (ingested, dropped));
+            Assert.Equal(new LogIngestResult(3, 0, Busy: false), await batch.CommitAsync());
+        }
+
+        var query  = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        var events = await QueryAsync(query, filter: null, count: 10);
+        Assert.Equal(3, events.Count);
+        Assert.All(events, ev => Assert.Equal(cut, ev.ServiceName));
+    }
+
+    /// <summary>An OTLP/JSON request of <paramref name="records"/> records under one resource named <paramref name="service"/>.</summary>
+    private static string OtlpJsonOfService(string service, int records) =>
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"" + service +
+        "\"}}]},\"scopeLogs\":[{\"logRecords\":[" +
+        string.Join(",", Enumerable.Range(0, records).Select(i => "{\"body\":{\"stringValue\":\"otlp " + i + "\"}}")) +
+        "]}]}]}";
+
+    /// <summary>The same request in protobuf.</summary>
+    private static byte[] OtlpProtoOfService(string service, int records)
+    {
+        static byte[] Pb(int field, byte[] payload)
+        {
+            var o = new List<byte> { (byte)(field << 3 | 2) };
+            for (ulong v = (ulong)payload.Length; ; v >>= 7)
+            {
+                if (v < 0x80) { o.Add((byte)v); break; }
+                o.Add((byte)(v | 0x80));
+            }
+            o.AddRange(payload);
+            return o.ToArray();
+        }
+        static byte[] Str(int field, string text) => Pb(field, Encoding.UTF8.GetBytes(text));
+
+        byte[] resource = Pb(1, Pb(1, [.. Str(1, "service.name"), .. Pb(2, Str(1, service))]));   // Resource.attributes
+        var    logs     = new List<byte>();
+        for (int i = 0; i < records; i++) logs.AddRange(Pb(2, Pb(5, Str(1, "otlp " + i))));       // ScopeLogs.log_records: body
+        return Pb(1, [.. resource, .. Pb(2, logs.ToArray())]);                                    // resource_logs { resource, scope_logs }
+    }
+
+    /// <summary>
+    /// The cut falls at the start of the character it would split — two-, three- and four-byte ones,
+    /// at each byte they can be split on — and a name within the limit is kept whole.
+    /// </summary>
+    [Theory]
+    [InlineData(0,    "",   1024)]   // 1 024 ASCII: whole
+    [InlineData(1,    "",   1024)]   // 1 025 ASCII: the last byte goes
+    [InlineData(-1,   "é",  1023)]   // 'é' over bytes 1023-1024
+    [InlineData(-1,   "€",  1023)]   // '€' over 1023-1025
+    [InlineData(-2,   "€",  1022)]   // '€' over 1022-1024
+    [InlineData(-1,   "💳", 1023)]   // '💳' over 1023-1026
+    [InlineData(-3,   "💳", 1021)]   // '💳' over 1021-1024
+    [InlineData(-4,   "💳", 1024)]   // '💳' over 1020-1023: within the limit, whole
+    public void ServiceName_cuts_at_the_start_of_the_character_it_would_split(int asciiPastLimit, string character, int expectedBytes)
+    {
+        byte[] name = Encoding.UTF8.GetBytes(new string('a', IngestionEndpoint.MaxServiceNameBytes + asciiPastLimit) + character + "tail");
+        if (character.Length == 0) name = name[..(IngestionEndpoint.MaxServiceNameBytes + asciiPastLimit)];
+        var cut = IngestionEndpoint.ServiceName(name);
+        Assert.Equal(expectedBytes, cut.Length);
+        Assert.Equal(name.AsSpan(0, expectedBytes).ToArray(), cut.ToArray());
+        Assert.DoesNotContain('�', Encoding.UTF8.GetString(cut));
+    }
+
+    /// <summary><paramref name="count"/> CLEF events, one millisecond apart, all with <paramref name="service"/> as <c>@service</c>.</summary>
+    private static ReadOnlyMemory<byte> LongServiceBatch(long t0, int count, string service)
+    {
+        var buf = new ArrayBufferWriter<byte>(1024);
+        var w   = new MessagePackWriter(buf);
+        w.WriteArrayHeader(count);
+        for (int i = 0; i < count; i++)
+        {
+            w.WriteMapHeader(4);
+            w.Write("@t");       w.Write(new DateTimeOffset(t0 + i * TimeSpan.TicksPerMillisecond, TimeSpan.Zero).ToString("O", CultureInfo.InvariantCulture));
+            w.Write("@mt");      w.Write("clef {N}");
+            w.Write("N");        w.Write(i);
+            w.Write("@service"); w.Write(service);
+        }
+        w.Flush();
+        return buf.WrittenMemory.ToArray();
+    }
+
+    private static async Task<List<LogEvent>> QueryAsync(QueryExecutor q, string? filter, int count = 100)
     {
         var res = new List<LogEvent>();
-        await foreach (var ev in q.ExecuteAsync(new QueryRequest { Filter = filter, Count = 100 }))
+        await foreach (var ev in q.ExecuteAsync(new QueryRequest { Filter = filter, Count = count }))
             res.Add(ev);
         return res;
     }
