@@ -310,7 +310,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // IOException. Only what the open added used to be reserved, so a log reopened at its size — an
         // earlier build's sparse one, or what a failed open left sized — was mapped over its holes. Cheap
         // where the blocks are there already. A failure is undone by ReleaseFailedOpen. See FileSpace.
-        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize);
+        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize, _filePath);
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
@@ -1284,7 +1284,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 _fileStream!.SetLength(newFileSize);
                 // Reserved, as at the open (round-5 H-F): a full volume fails this grow, which the
                 // catch undoes, and not the first append into a new page, with SIGBUS.
-                FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize);
+                FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize, _filePath);
                 Map(newFileSize);
                 _capacity = newCapacity;
             }

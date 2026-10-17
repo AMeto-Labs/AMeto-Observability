@@ -40,7 +40,7 @@ public sealed class FileSpaceTests
                 File.SetLastWriteTimeUtc(path, long_ago);
 
                 var took = Stopwatch.StartNew();
-                FileSpace.Reserve(fs.SafeFileHandle, 0, size);
+                FileSpace.Reserve(fs.SafeFileHandle, 0, size, path);
                 took.Stop();
 
                 DateTime modified = File.GetLastWriteTimeUtc(path);
@@ -50,5 +50,45 @@ public sealed class FileSpaceTests
             }
         }
         finally { try { File.Delete(path); } catch { } }
+    }
+
+    /// <summary>
+    /// The system call's answers, through its seam on every platform (round-6 review: the classification had no
+    /// CI coverage, and a refused start named neither the file nor the room). A full volume or a file too large
+    /// throws, naming the file and the bytes its volume has free; a file system that cannot reserve, and an
+    /// interrupted call answered next time, return.
+    /// </summary>
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(FileSpace.ErrnoNotSupported, null)]
+    [InlineData(FileSpace.ErrnoNoSpace, "the volume is full")]
+    [InlineData(FileSpace.ErrnoTooLarge, "the file would be too large")]
+    [InlineData(FileSpace.ErrnoIo, "fallocate failed with errno 5")]
+    public void A_reservation_says_what_the_call_answered_and_names_the_file_and_its_room(int errno, string? says)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ameto-reserve-{Guid.NewGuid():N}.bin");
+        int calls = 0;
+        FileSpace.FallocateForTest.Value = () => ++calls == 1 ? FileSpace.ErrnoInterrupted : errno;   // interrupted once, as a signal does
+        try
+        {
+            using var fs = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite);
+            fs.SetLength(4096);
+            var thrown = Record.Exception(() => FileSpace.Reserve(fs.SafeFileHandle, 0, 4096, path));
+            Assert.Equal(2, calls);
+            if (says is null)
+            {
+                Assert.Null(thrown);
+                return;
+            }
+            var io = Assert.IsType<IOException>(thrown);
+            Assert.Contains(says, io.Message);
+            Assert.Contains(path, io.Message);
+            Assert.Matches(@"\(\d[\d,. \u00a0]* bytes free on its volume\)", io.Message);
+        }
+        finally
+        {
+            FileSpace.FallocateForTest.Value = null;
+            try { File.Delete(path); } catch { }
+        }
     }
 }

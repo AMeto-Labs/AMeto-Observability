@@ -709,7 +709,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // Reserved before the move commits the copy (round-6 review R5-H2): the open after it
             // reserves the whole file anyway, and a volume that cannot hold it fails the upgrade here,
             // where the v1 log stays open in its own layout, not that open, past the commit point.
-            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + FitCapacity(written));
+            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + FitCapacity(written), tmpPath);
 
             var hdr = new WalFileHeader
             {
@@ -774,7 +774,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
         // log, the file a failed reservation left sized — was mapped over its holes, and the engine's
         // Ingest died with them (AccessViolation, exit 134). Cheap where the blocks are there already. A
         // volume that cannot hold them fails the open, and ReleaseFailedOpen puts the file back.
-        FileSpace.Reserve(_file.SafeFileHandle, 0, fileSize);
+        FileSpace.Reserve(_file.SafeFileHandle, 0, fileSize, _filePath);
 
         _capacity = fileSize - _headerSize;
         Map(fileSize);
@@ -2739,7 +2739,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // is SIGBUS. From the old mapping's end, not the file's: a growth that failed after extending the
             // file left its tail unreserved. A volume that cannot hold them fails this growth, the old
             // mapping still in place.
-            FileSpace.Reserve(_file!.SafeFileHandle, _headerSize + capacity, target - capacity);
+            FileSpace.Reserve(_file!.SafeFileHandle, _headerSize + capacity, target - capacity, _filePath);
             view = mmf.CreateViewAccessor(0, mapSize, MemoryMappedFileAccess.ReadWrite);
             byte* ptr = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);

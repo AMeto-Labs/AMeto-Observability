@@ -40,7 +40,10 @@ public sealed class WalReservationTests : IDisposable
     private string MetricPath => Path.Combine(_dir, "metrics.wal");
     private string LogPath    => Path.Combine(_dir, "3-42.wal");
 
-    private readonly record struct Reservation(long Offset, long Length, long FileLength);
+    /// <summary>A reservation, and the first bytes its file held then (<see cref="HeadBytes"/> of them).</summary>
+    private readonly record struct Reservation(long Offset, long Length, long FileLength, byte[] Head);
+
+    private const int HeadBytes = 4096;
 
     /// <summary>Records every reservation of this flow; <paramref name="refuse"/> says which to refuse, as a full volume.</summary>
     private static List<Reservation> Watch(Func<long, long, bool>? refuse = null)
@@ -48,7 +51,10 @@ public sealed class WalReservationTests : IDisposable
         var calls = new List<Reservation>();
         FileSpace.ReserveForTest.Value = (handle, offset, length) =>
         {
-            lock (calls) calls.Add(new Reservation(offset, length, RandomAccess.GetLength(handle)));
+            long fileLength = RandomAccess.GetLength(handle);
+            var  head       = new byte[(int)Math.Min(HeadBytes, fileLength)];
+            RandomAccess.Read(handle, head, 0);   // what the file holds as it is reserved: mapped writes are seen here
+            lock (calls) calls.Add(new Reservation(offset, length, fileLength, head));
             return refuse is not null && refuse(offset, length)
                 ? new IOException($"test: could not reserve {length:N0} bytes at {offset:N0}: the volume is full")
                 : null;
@@ -57,6 +63,23 @@ public sealed class WalReservationTests : IDisposable
     }
 
     private static void StopWatching() => FileSpace.ReserveForTest.Value = null;
+
+    /// <summary>
+    /// The open's whole-file reservation came before anything was written through its mapping (round-6 review:
+    /// nothing pinned the order, and an open that wrote its header first gave the SIGBUS the reservation is for):
+    /// the file then held what the open found, and zeros past it.
+    /// </summary>
+    private static void AssertReservedBeforeWriting(List<Reservation> calls, byte[] found, string what)
+    {
+        var whole = calls.Find(static c => c.Offset == 0 && c.Length == c.FileLength);
+        Assert.True(whole.Head is not null, $"{what} reserved nothing of its whole file");
+        for (int i = 0; i < whole.Head.Length; i++)
+        {
+            byte expected = i < found.Length ? found[i] : (byte)0;
+            Assert.True(whole.Head[i] == expected,
+                $"{what} wrote byte {i} of its file ({whole.Head[i]:X2}, found {expected:X2}) before it reserved it: on a full volume that write is SIGBUS");
+        }
+    }
 
     /// <summary>The open reserved the whole file it mapped: [0, its length then).</summary>
     private static void AssertWholeFileReserved(List<Reservation> calls, string path, string what)
@@ -119,12 +142,17 @@ public sealed class WalReservationTests : IDisposable
             using (var wal = SpanWriteAheadLog.Open(SpanPath, initialCapacity: 64 * 1024))
             {
                 AssertWholeFileReserved(calls, SpanPath, "the span log's first open");
+                AssertReservedBeforeWriting(calls, [], "the span log's first open");
                 wal.Append(Span(1));
             }
 
             calls.Clear();
+            byte[] found = File.ReadAllBytes(SpanPath);
             using (SpanWriteAheadLog.Open(SpanPath, initialCapacity: 64 * 1024))
+            {
                 AssertWholeFileReserved(calls, SpanPath, "the span log's reopen");
+                AssertReservedBeforeWriting(calls, found, "the span log's reopen");
+            }
         }
         finally { StopWatching(); }
     }
@@ -347,13 +375,16 @@ public sealed class WalReservationTests : IDisposable
             using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
             {
                 AssertWholeFileReserved(calls, MetricPath, "the metric log's first open");
+                AssertReservedBeforeWriting(calls, [], "the metric log's first open");
                 wal.Append([Gauge(1)]);
             }
 
             calls.Clear();
+            byte[] found = File.ReadAllBytes(MetricPath);
             using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
             {
                 AssertWholeFileReserved(calls, MetricPath, "the metric log's reopen");
+                AssertReservedBeforeWriting(calls, found, "the metric log's reopen");
                 for (int i = 0; i < 3_000; i++) wal.Append([Gauge(i)]);   // grows it: the reopen below finds it grown
             }
             Assert.True(new FileInfo(MetricPath).Length > 64 * 1024 + 64, "setup: the metric log did not grow");
@@ -427,12 +458,17 @@ public sealed class WalReservationTests : IDisposable
             using (var wal = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
             {
                 AssertWholeFileReserved(calls, LogPath, "the log's first open");
+                AssertReservedBeforeWriting(calls, [], "the log's first open");
                 Assert.True(wal.Append(1_000, LogLevel.Information, 1, "t", new byte[100]));
             }
 
             calls.Clear();
+            byte[] found = File.ReadAllBytes(LogPath);
             using (WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
+            {
                 AssertWholeFileReserved(calls, LogPath, "the log's reopen");
+                AssertReservedBeforeWriting(calls, found, "the log's reopen");
+            }
         }
         finally { StopWatching(); }
     }

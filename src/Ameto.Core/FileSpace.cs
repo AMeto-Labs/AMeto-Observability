@@ -35,34 +35,38 @@ public static partial class FileSpace
     /// <summary>
     /// Reserves bytes [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="length"/>) of
     /// <paramref name="file"/>, which its size already covers. Throws <see cref="IOException"/> when the volume
-    /// cannot hold them (or the reservation fails outright); returns having done nothing on Windows (SetLength
-    /// allocated), on platforms other than Linux, and on a filesystem that cannot reserve. Blocks a range
-    /// already has are kept as they are: reserving an allocated range is cheap and changes nothing in it.
+    /// cannot hold them (or the reservation fails outright), naming <paramref name="path"/> and the bytes its
+    /// volume has free (round-6 review: a start that refused said neither); returns having done nothing on
+    /// Windows (SetLength allocated), on platforms other than Linux, and on a filesystem that cannot reserve.
+    /// Blocks a range already has are kept as they are: reserving an allocated range is cheap and changes
+    /// nothing in it.
     /// </summary>
-    public static void Reserve(SafeFileHandle file, long offset, long length)
+    public static void Reserve(SafeFileHandle file, long offset, long length, string path)
     {
         if (length <= 0 || offset < 0) return;
         if (Volatile.Read(ref s_reserveForTest)?.Value is { } seam && seam(file, offset, length) is { } refused)
             throw refused;
-        if (!OperatingSystem.IsLinux()) return;
+        Func<int>? answers = Volatile.Read(ref s_fallocateForTest)?.Value;
+        if (answers is null && !OperatingSystem.IsLinux()) return;
 
         bool added = false;
         try
         {
-            file.DangerousAddRef(ref added);
-            int fd = (int)file.DangerousGetHandle();
             int error;
-            do { error = Native.Fallocate(fd, 0, offset, length) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
-            while (error == EINTR);
+            if (answers is not null)
+            {
+                do error = answers(); while (error == EINTR);
+            }
+            else
+            {
+                file.DangerousAddRef(ref added);
+                int fd = (int)file.DangerousGetHandle();
+                do { error = Native.Fallocate(fd, 0, offset, length) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
+                while (error == EINTR);
+            }
 
             if (error == 0 || error is EOPNOTSUPP or EINVAL or ENODEV or ESPIPE or ENOSYS) return;
-            string what = error switch
-            {
-                ENOSPC or EDQUOT => "the volume is full",
-                EFBIG            => "the file would be too large",
-                _                => $"fallocate failed with errno {error}",
-            };
-            throw new IOException($"Could not reserve {length:N0} bytes at {offset:N0} of a log file: {what}");
+            throw Refusal(error, offset, length, path);
         }
         catch (EntryPointNotFoundException) { /* no fallocate in this libc: left as it was */ }
         catch (DllNotFoundException)        { /* no libc to call: left as it was */ }
@@ -70,6 +74,27 @@ public static partial class FileSpace
         {
             if (added) file.DangerousRelease();
         }
+    }
+
+    /// <summary>What a reservation the volume refused says: the file, the range, the cause, and the bytes the volume has free.</summary>
+    private static IOException Refusal(int error, long offset, long length, string path)
+    {
+        string what = error switch
+        {
+            ENOSPC or EDQUOT => "the volume is full",
+            EFBIG            => "the file would be too large",
+            _                => $"fallocate failed with errno {error}",
+        };
+        long free = FreeBytesBeside(path);
+        string room = free >= 0 ? $"{free:N0} bytes free on its volume" : "its volume's free space could not be read";
+        return new IOException($"Could not reserve {length:N0} bytes at {offset:N0} of the log file {path} ({room}): {what}");
+    }
+
+    /// <summary>The bytes free to this process on the volume that holds <paramref name="path"/>, by its directory (statvfs on Linux); -1 when it cannot be read.</summary>
+    private static long FreeBytesBeside(string path)
+    {
+        try { return new DriveInfo(Path.GetDirectoryName(Path.GetFullPath(path)) ?? path).AvailableFreeSpace; }
+        catch (Exception) { return -1; }
     }
 
     /// <summary>
@@ -86,6 +111,22 @@ public static partial class FileSpace
 
     /// <summary>What <see cref="ReserveForTest"/> made; null until a test asks for it.</summary>
     private static AsyncLocal<Func<SafeFileHandle, long, long, Exception?>?>? s_reserveForTest;
+
+    /// <summary>
+    /// Test seam: the system call's answer — 0, or the errno it set — in place of the call itself, on every
+    /// platform, so the classification of its answers runs where no file system refuses (round-6 review: it had
+    /// no CI coverage). Called again for EINTR, as the call is. Made as <see cref="ReserveForTest"/> is.
+    /// </summary>
+    internal static AsyncLocal<Func<int>?> FallocateForTest =>
+        Volatile.Read(ref s_fallocateForTest)
+        ?? Interlocked.CompareExchange(ref s_fallocateForTest, new AsyncLocal<Func<int>?>(), null)
+        ?? s_fallocateForTest!;
+
+    /// <summary>What <see cref="FallocateForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<int>?>? s_fallocateForTest;
+
+    internal const int ErrnoInterrupted = EINTR, ErrnoNoSpace = ENOSPC, ErrnoTooLarge = EFBIG, ErrnoNotSupported = EOPNOTSUPP,
+                       ErrnoIo = 5;
 
     private const int EINTR = 4, ENODEV = 19, EINVAL = 22, EFBIG = 27, ENOSPC = 28, ESPIPE = 29, ENOSYS = 38,
                       EOPNOTSUPP = 95, EDQUOT = 122;

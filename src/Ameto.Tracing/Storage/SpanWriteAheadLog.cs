@@ -522,7 +522,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         // build left sparse has its holes filled here, and where the blocks are there already it is cheap.
         // A volume that cannot hold them fails the open, and ReleaseFailedOpen puts the file back. See
         // FileSpace.
-        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize);
+        FileSpace.Reserve(_fileStream.SafeFileHandle, 0, fileSize, _filePath);
 
         _capacity = fileSize - _headerSize;
         Map(fileSize);
@@ -615,7 +615,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             // Reserved before the rename commits the copy (round-6 review R5-H1): the open after it
             // reserves the whole file anyway, and a volume that cannot hold it fails the upgrade here,
             // where the old log stays open in its own layout, not that open, past the commit point.
-            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + capacity);
+            FileSpace.Reserve(fs.SafeFileHandle, 0, FileHeaderSize + capacity, tmpPath);
 
             var hdr = new WalFileHeader
             {
@@ -1643,7 +1643,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         try
         {
             _fileStream!.SetLength(newFileSize);
-            FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize);
+            FileSpace.Reserve(_fileStream.SafeFileHandle, oldFileSize, newFileSize - oldFileSize, _filePath);
             Map(newFileSize);
             _capacity = newCapacity;
         }
