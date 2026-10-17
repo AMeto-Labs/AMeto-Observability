@@ -464,7 +464,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>
     /// Managed index-build state ONE MERGE holds per byte of its group payload budget.
     ///
-    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToColdAsync</c>)
+    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToCold</c>)
     /// but is not sized by the tier: its writer forecasts a group from the GROUP PAYLOAD BUDGET,
     /// and its source hint is every source segment's event count, so the tier-shaped figure above
     /// does not bound it. MEASURED (<c>tests/Ameto.Perf/IndexBuildPoolProbe</c>, prop-dense
@@ -1141,6 +1141,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// and rewrote none — see the commit that deleted it for why a v7-capable transform is
     /// not worth having.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunColdMaintenanceLoopAsync(CancellationToken ct)
     {
         // Wait for the catalog ENUMERATION, not for a guess at how long it takes. It opens every
@@ -2361,6 +2362,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     // ── Flush loop ────────────────────────────────────────────────────────────
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunFlushLoopAsync(CancellationToken ct)
     {
         var maxAge = _options.HotTier.MaxAge;
@@ -4036,7 +4038,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // Nor inside the span of an output whose verdict is not carried out yet: see _undecidedMergeOutputs.
             if (anyWait && OverlapsUndecidedMergeOutput(s)) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
-            // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
+            // MergeToCold stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
             // is no longer recognised as already held: its events land a second time, permanently,
             // since nothing on this node can ever match the re-pushed pair against the merged copy.
@@ -4286,6 +4288,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// and the tests that call it — seventy-odd sites — merge straight after building an engine,
     /// where Busy would be a race against the engine's own background scan.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
         await _catalogLoad.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
@@ -4314,7 +4317,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         finally { Volatile.Write(ref _mergeGate, 0); }
     }
 
-    /// <summary>The body of <see cref="MergeSmallSegmentsOnceAsync"/>: true when a batch was merged; the caller holds the merge gate.</summary>
+    /// <summary>
+    /// The body of <see cref="MergeSmallSegmentsOnceAsync"/>: true when a batch was merged; the caller holds the merge gate.
+    ///
+    /// <para>Its waits are the two polls (round 7): the manifest is written and the merge streamed in this frame, and
+    /// each poll's catch gives back what the frame holds there. Built with the owner builder, whose registrations on a
+    /// task are made again when they run out of memory.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
     private async Task<bool> MergeOneBatchAsync(CancellationToken ct)
     {
         // Never produce index-less segments: the builder is wired by a hosted
@@ -4486,20 +4496,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         //    Written THROUGH to the platter, for the same reason the merged file is: the whole
         //    protocol is an ordering between this file and a set of unlinks, and an ordering
         //    only the page cache observes does not survive a power loss.
+        //    Written in this frame (round 7): its writes were awaited, and a registration of one of those awaits
+        //    that ran out of memory skipped the usings' disposal — the manifest held open, so its delete below failed.
         try
         {
-            await using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
-                                                 4096, FileOptions.WriteThrough))
+            using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                           4096, FileOptions.WriteThrough))
             using (var mw = new StreamWriter(mf))
             {
-                foreach (var s in consumed) await mw.WriteLineAsync(Path.GetFileName(s.FilePath));
-                await mw.FlushAsync(ct);
+                foreach (var s in consumed) mw.WriteLine(Path.GetFileName(s.FilePath));
+                mw.Flush();
                 mf.Flush(flushToDisk: true);
             }
         }
         catch
         {
-            // The readers were opened by the planner; MergeToColdAsync takes ownership of them
+            // The readers were opened by the planner; MergeToCold takes ownership of them
             // and it is never reached from here.
             foreach (var r in readers) r.Dispose();
             try { File.Delete(manifestPath); } catch { }
@@ -4525,13 +4537,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             try { File.Delete(manifestPath); } catch { }
             throw;
         }
+        // The merge runs in this frame (MergeToCold), and the permit goes back by plain code and in the catches, not in
+        // a finally (round 7; see TryFlushAsync's heavy phase): nothing of the merge runs on when this method goes on.
         try
         {
             _beforeMergeStream?.Invoke();
-            info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
+            info = MergeToCold(readers, segId, segPath, expectEvents, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            ReleaseHeavyPermit();
             // Shutdown is not a verdict on the batch. Swept up with everything else it logged a
             // WARNING on every single stop, swallowed the cancellation the maintenance loop
             // stops on, and quarantined the window — so the segments a clean restart had every
@@ -4542,6 +4557,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         }
         catch (Exception ex)
         {
+            ReleaseHeavyPermit();
             // Nothing has been deleted and the merged file never reached segPath, so the only
             // state to undo is the manifest.
             //
@@ -4555,11 +4571,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // the process, and the small-file backlog those segments form is the exact thing the
             // sweep exists to remove. Left in the candidate set, the next pass simply retries.
             //
-            // Disposing here as well as in the merge task is deliberate, and it is the same
-            // discipline the two waits above follow: MergeToColdAsync only takes ownership of the
-            // readers once its delegate is entered, and from out here there is no way to know
-            // whether it was. Dispose is idempotent, so the rule can simply be that every exit
-            // from this method that does not publish closes them.
+            // Disposing here as well as in the merge is deliberate, and it is the same discipline
+            // the two waits above follow: every exit from this method that does not publish closes
+            // them. Dispose is idempotent, and MergeToCold has ended by now: it runs in this frame.
             foreach (var r in readers) r.Dispose();
             if (IsSourceCorruption(ex))
             {
@@ -4583,7 +4597,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
             return false;
         }
-        finally { _flushConcurrency.Release(); }
+        ReleaseHeavyPermit();
 
         var outputKey  = SegmentKey.Of(info);
         var sourceKeys = new SegmentKey[consumed.Count];
@@ -4856,96 +4870,93 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// unverified merge and recovery would then finish deleting its sources for it.
     /// </param>
     /// <remarks>
+    /// <para><b>Synchronous, in its caller's frame</b> (round 7, the registration class; see
+    /// <see cref="FlushTierByLevel"/>). It was a Task.Run its caller awaited: a registration of that
+    /// await's continuation that ran out of memory threw into <see cref="MergeOneBatchAsync"/> with the
+    /// merge reading on — its catch closed the readers under it (mapped views), its finally gave the
+    /// heavy-phase permit back early, and its return let the planner's state go while the merge still
+    /// used it. With no await there is nothing left running when the caller goes on.</para>
     /// Internal rather than private so its reader-ownership contract can be tested where it is
     /// actually made. Driven through <see cref="TryMergeSmallSegmentsOnceAsync"/> the contract is
     /// invisible: that method's own abort paths close the readers too, deliberately, so a test
     /// that cancels a whole merge pass cannot tell which of the two did it — and passes just as
     /// well when this one does nothing at all.
     /// </remarks>
-    internal Task<SegmentInfo> MergeToColdAsync(
+    internal SegmentInfo MergeToCold(
         List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
-        var  sinkFactory = IndexSinkFactory;
-        long groupBudget = _groupPayloadBudgetBytes;
-
-        return Task.Run(() =>
+        // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
+        // startup, so a crash any time before the Move leaves nothing to recover from.
+        string tmpPath = segPath + ".tmp";
+        MergingSegmentEventSource? source = null;
+        try
         {
-            // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
-            // startup, so a crash any time before the Move leaves nothing to recover from.
-            string tmpPath = segPath + ".tmp";
-            MergingSegmentEventSource? source = null;
-            try
-            {
-                // Cancellation is observed HERE, and the token is deliberately NOT handed to
-                // Task.Run: a Task.Run whose token is already signalled transitions the task
-                // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
-                // the only place the readers this method took ownership of are closed. Cancelling
-                // in the window between taking the heavy-phase permit and the delegate
-                // being scheduled therefore left up to MergeMaxSources mapped views alive for the
-                // life of the process, and a mapped file on Windows can be neither compacted nor
-                // unlinked by retention. That is the very hazard the wait's own catch guards
-                // against one step earlier; this closes the second door into it.
-                ct.ThrowIfCancellationRequested();
+            // Cancellation is observed HERE, inside the try whose finally closes the readers this
+            // method took ownership of. It was a Task.Run, and a Task.Run whose token was already
+            // signalled went straight to Canceled without running its delegate — up to
+            // MergeMaxSources mapped views alive for the life of the process, which on Windows can
+            // be neither compacted nor unlinked by retention. A method in its caller's frame always
+            // enters its body.
+            ct.ThrowIfCancellationRequested();
 
-                SegmentInfo info;
-                source = new MergingSegmentEventSource(readers);
-                // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
-                // it is off the ingest path, and its output is the long-lived file — so the extra
-                // encode is paid once, on a background pass, against a file that is read and kept
-                // until retention deletes it. The flush path stays on the fast level: its output
-                // is short-lived and this merge is what rewrites it.
-                //
-                // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
-                // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
-                // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
-                // clock — on the stand's volume, seconds of one core a day.
-                using (var writer = new SegmentWriter(tmpPath, groupBudget, SegmentCompression.High))
-                {
-                    writer.WriteEvents(source, sinkFactory, ct);
-                    info = writer.Finalise(_options.NodeId, segId);
-                }
-                // Close the readers BEFORE the caller starts deleting sources: on Windows a
-                // mapped file cannot be unlinked, and a leaked view would leave the merge
-                // permanently stuck in its "sources still held open" recovery path.
-                source.Dispose();
-                source = null;
-                foreach (var r in readers) r.Dispose();
-
-                // Refuse to publish unless every source event is in the merged file. Counts come
-                // from file headers on both sides, so a mismatch means the stream lost or
-                // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
-                // catalog, deleted by the startup sweep — and the caller drops the manifest, so
-                // the pre-merge state is restored exactly.
-                if (info.EventCount != expectEvents)
-                    throw new InvalidDataException(
-                        $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
-
-                ct.ThrowIfCancellationRequested();
-                File.Move(tmpPath, segPath, overwrite: false);
-                return new SegmentInfo
-                {
-                    Id                = info.Id,
-                    NodeId            = info.NodeId,
-                    FilePath          = segPath,
-                    MinTimestampTicks = info.MinTimestampTicks,
-                    MaxTimestampTicks = info.MaxTimestampTicks,
-                    EventCount        = info.EventCount,
-                    MinLevel          = info.MinLevel,
-                    CompressedBytes   = info.CompressedBytes,
-                    UncompressedBytes = info.UncompressedBytes,
-                };
-            }
-            catch
+            SegmentInfo info;
+            source = new MergingSegmentEventSource(readers);
+            // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
+            // it is off the ingest path, and its output is the long-lived file — so the extra
+            // encode is paid once, on a background pass, against a file that is read and kept
+            // until retention deletes it. The flush path stays on the fast level: its output
+            // is short-lived and this merge is what rewrites it.
+            //
+            // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
+            // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
+            // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
+            // clock — on the stand's volume, seconds of one core a day.
+            using (var writer = new SegmentWriter(tmpPath, _groupPayloadBudgetBytes, SegmentCompression.High))
             {
-                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
-                throw;
+                writer.WriteEvents(source, IndexSinkFactory, ct);
+                info = writer.Finalise(_options.NodeId, segId);
             }
-            finally
+            // Close the readers BEFORE the caller starts deleting sources: on Windows a
+            // mapped file cannot be unlinked, and a leaked view would leave the merge
+            // permanently stuck in its "sources still held open" recovery path.
+            source.Dispose();
+            source = null;
+            foreach (var r in readers) r.Dispose();
+
+            // Refuse to publish unless every source event is in the merged file. Counts come
+            // from file headers on both sides, so a mismatch means the stream lost or
+            // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
+            // catalog, deleted by the startup sweep — and the caller drops the manifest, so
+            // the pre-merge state is restored exactly.
+            if (info.EventCount != expectEvents)
+                throw new InvalidDataException(
+                    $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
+
+            ct.ThrowIfCancellationRequested();
+            File.Move(tmpPath, segPath, overwrite: false);
+            return new SegmentInfo
             {
-                source?.Dispose();
-                foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
-            }
-        });
+                Id                = info.Id,
+                NodeId            = info.NodeId,
+                FilePath          = segPath,
+                MinTimestampTicks = info.MinTimestampTicks,
+                MaxTimestampTicks = info.MaxTimestampTicks,
+                EventCount        = info.EventCount,
+                MinLevel          = info.MinLevel,
+                CompressedBytes   = info.CompressedBytes,
+                UncompressedBytes = info.UncompressedBytes,
+            };
+        }
+        catch
+        {
+            try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+            throw;
+        }
+        finally
+        {
+            source?.Dispose();
+            foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
+        }
     }
 
     /// <summary>
@@ -4956,7 +4967,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <para>COMMITTED is decided on the output alone. The manifest is written through before the
     /// output exists anywhere but at <c>.seg.tmp</c>, and the output reaches its final name only by
     /// the rename that follows the writer's fsync and its event-count check
-    /// (<see cref="MergeToColdAsync"/>). So a manifest without its output is a merge that never
+    /// (<see cref="MergeToCold"/>). So a manifest without its output is a merge that never
     /// committed — killed while streaming, or before the rename: its sources are the only copy and
     /// stay in service, the constructor has swept the <c>.seg.tmp</c>, and the manifest goes. With
     /// its output, every source still on disk is a duplicate of events the output holds.</para>
@@ -7587,6 +7598,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// msync per interval bounds that loss window at the interval, Elasticsearch-translog
     /// style, without an fsync per event.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunWalFlushLoopAsync(CancellationToken ct)
     {
         var interval = _options.HotTier.WalFlushInterval;
@@ -7760,6 +7772,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// → wait for readers → free. Each wait shares one budget, and running out of it leaves the
     /// tier that might still be in use allocated, with an Error, rather than freeing it.
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task DisposeCoreAsync()
     {
         long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;

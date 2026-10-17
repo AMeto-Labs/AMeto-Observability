@@ -570,4 +570,44 @@ public sealed partial class IngestWriteAndSpillTests
             Assert.Equal(engine.FlushWidth, engine.FlushConcurrencyForTest.CurrentCount);
         }
     }
+
+    /// <summary>
+    /// Round 7: the despill loop's await of a despill fails at its registration — past the owner builder's tries, the road
+    /// the later-suspension seam stands for — and the loop's catch takes it and goes on, the compiler's state still that
+    /// suspension's. Every finally the loop then leaves is skipped until a suspension resumes, a lock statement's exit
+    /// with them: the catch asked the queue for the block's failures under <c>_spillQueueLock</c>, and the loop's pool
+    /// thread kept the monitor for good — the running despill then blocked settling its block, and so did every spill,
+    /// despill and settle after it. The loop walks the queue in methods of its own now.
+    /// </summary>
+    [Fact]
+    public async Task A_despill_loop_whose_await_of_a_despill_fails_keeps_no_lock_and_the_despill_settles()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+        var hold = new TaskCompletionSource();
+        StorageEngine engine;
+        int failed = 0;
+        // The first later suspension of the loop on a Task — the await of the despill (the signal's wait is a Task<bool>).
+        OwnerAsync.LaterSuspensionFailsForTest.Value = (sm, awaiter) =>
+            sm.Name.Contains("<RunDespillLoopAsync>", StringComparison.Ordinal)
+            && awaiter == typeof(System.Runtime.CompilerServices.ConfiguredTaskAwaitable.ConfiguredTaskAwaiter)
+            && Interlocked.Exchange(ref failed, 1) == 0;
+        try { engine = HeldOneSlotEngine(opts, hold); }
+        finally { OwnerAsync.LaterSuspensionFailsForTest.Value = null; }
+
+        // Not disposed on failure: with the lock kept, the shutdown waits on it for good. And lock-free first — anything
+        // that takes the lock (SpillFilesPending too) blocked as well — so the test fails rather than hangs.
+        var read = new ManualResetEventSlim();
+        engine._beforeLoadSpillForTest = _ => read.Wait(TimeSpan.FromSeconds(5));   // the despill suspends the loop's await
+        hold.SetResult();
+        WaitFor(() => Volatile.Read(ref failed) == 1, "the loop's await of the despill to fail", ShortGuard);
+        read.Set();
+        WaitFor(() => engine.DespillsCompletedForTest >= 1, "the despill to end (it settles its block under the queue's lock)", ShortGuard);
+        Assert.True(Monitor.TryEnter(engine.SpillQueueLockForTest, TimeSpan.FromSeconds(5)), "the spill queue's lock was kept");
+        Monitor.Exit(engine.SpillQueueLockForTest);
+        WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 50, "the despill to settle its block", ShortGuard);
+        Assert.Equal(50, ReadAll(engine).Count);
+        await engine.DisposeAsync();
+    }
 }

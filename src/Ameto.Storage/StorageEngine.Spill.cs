@@ -762,13 +762,6 @@ public sealed partial class StorageEngine
                                           System.Globalization.CultureInfo.InvariantCulture, out segId) && segId != 0;
     }
 
-    /// <summary>The spill file of the block <paramref name="segId"/>, or null when there is none.</summary>
-    private string? SpillFileOf(ulong segId)
-    {
-        string path = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId}{SpillExtension}");
-        return File.Exists(path) ? path : null;
-    }
-
     // ── Despill ───────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -777,7 +770,16 @@ public sealed partial class StorageEngine
     /// slot that comes free then goes to the swap, so new events are searchable again first and the
     /// backlog drains behind them — unless that swap has just failed (OnSwapFailed), when the slot
     /// would otherwise sit idle.
+    ///
+    /// <para>Built with the owner builder (round 7): a registration on a task that runs out of memory is made again.
+    /// One that still fails reaches a catch below and the loop goes on with the compiler's state still that
+    /// suspension's, which skips every finally — a lock statement's exit too — until a suspension resumes: so the
+    /// queue is walked and changed only in methods of their own (<see cref="NextDespillable"/>,
+    /// <see cref="MarkDespillInFlight"/>, <see cref="DespillFailuresOf"/>), whose locks are theirs. The catch after the
+    /// await of a despill took <c>_spillQueueLock</c> itself, and on that road kept its monitor for good: no spill,
+    /// despill or settle again.</para>
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task RunDespillLoopAsync(Task? heldUntil, CancellationToken ct)
     {
         if (heldUntil is not null)
@@ -833,29 +835,11 @@ public sealed partial class StorageEngine
                     var live = _write;
                     if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
 
-                    SpillFile next = default;
-                    bool scanned = _catalogLoad.IsCompleted;
-                    lock (_spillQueueLock)
-                    {
-                        long now = Environment.TickCount64;
-                        foreach (var (segId, q) in _spillQueue)
-                        {
-                            if (q.InFlight || q.NotBefore > now) continue;
-                            // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
-                            // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes this.
-                            if (q.PublishedLevels != 0 && !scanned) continue;
-                            // One whose tier's own text found no room beside the frozen tiers' waits for room
-                            // (R5-M11): a slot given back with its text wakes this. The others go on meanwhile.
-                            if (q.TextBytes > 0 && !FrozenTextHasRoomFor(q.TextBytes)) continue;
-                            next = new SpillFile(segId, q.Path, q.PublishedLevels);
-                            break;
-                        }
-                    }
+                    SpillFile next = NextDespillable(_catalogLoad.IsCompleted);
                     if (next.Path is null) break;
 
                     if (!TryTakeFlushSlot()) break;   // released by the despill, or by its retry
-                    lock (_spillQueueLock)
-                        if (_spillQueue.TryGetValue(next.SegId, out var taken)) taken.InFlight = true;
+                    MarkDespillInFlight(next.SegId);
 
                     try { await DespillAsync(next, ct).ConfigureAwait(false); }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -869,8 +853,7 @@ public sealed partial class StorageEngine
                         // a row, and only the first of them is an Error with its stack: a block that
                         // cannot be read now usually cannot be read in 15 s either, and the same Error
                         // every 15 s, for ever, buried the line that said why.
-                        int failures;
-                        lock (_spillQueueLock) failures = _spillQueue.TryGetValue(next.SegId, out var q) ? q.Failures : 0;
+                        int failures = DespillFailuresOf(next.SegId);
                         try
                         {
                             if (failures <= 1)
@@ -907,6 +890,44 @@ public sealed partial class StorageEngine
         }
     }
 
+    /// <summary>
+    /// The oldest queued block a despill may take now: not in flight, not waiting out a retry delay, not one an earlier
+    /// run half-wrote while the boot scan has not completed (<paramref name="scanned"/>), and not one whose own text finds
+    /// no room beside the frozen tiers'. None (no path) when there is no such block.
+    /// </summary>
+    private SpillFile NextDespillable(bool scanned)
+    {
+        lock (_spillQueueLock)
+        {
+            long now = Environment.TickCount64;
+            foreach (var (segId, q) in _spillQueue)
+            {
+                if (q.InFlight || q.NotBefore > now) continue;
+                // A block an earlier run half-wrote waits for the boot scan: the levels it keeps
+                // are the ones the scan accepted (LevelsTheScanKept). The scan's end wakes the loop.
+                if (q.PublishedLevels != 0 && !scanned) continue;
+                // One whose tier's own text found no room beside the frozen tiers' waits for room
+                // (R5-M11): a slot given back with its text wakes the loop. The others go on meanwhile.
+                if (q.TextBytes > 0 && !FrozenTextHasRoomFor(q.TextBytes)) continue;
+                return new SpillFile(segId, q.Path, q.PublishedLevels);
+            }
+        }
+        return default;
+    }
+
+    /// <summary>Marks a queued block as taken by a despill (see <see cref="RunDespillLoopAsync"/>).</summary>
+    private void MarkDespillInFlight(ulong segId)
+    {
+        lock (_spillQueueLock)
+            if (_spillQueue.TryGetValue(segId, out var taken)) taken.InFlight = true;
+    }
+
+    /// <summary>The failures in a row of a queued block's despills; 0 when it is not queued.</summary>
+    private int DespillFailuresOf(ulong segId)
+    {
+        lock (_spillQueueLock) return _spillQueue.TryGetValue(segId, out var q) ? q.Failures : 0;
+    }
+
     /// <summary>The pause after the despill loop itself failed (see <see cref="RunDespillLoopAsync"/>).</summary>
     private static readonly TimeSpan DespillLoopFaultPause = TimeSpan.FromSeconds(1);
 
@@ -935,6 +956,9 @@ public sealed partial class StorageEngine
     /// constructs. Null in production.
     /// </summary>
     internal static readonly AsyncLocal<Task?> HoldDespillForTest = new();
+
+    /// <summary>Test hook: the spill queue's lock, for a test to see that nothing kept it.</summary>
+    internal object SpillQueueLockForTest => _spillQueueLock;
 
     /// <summary>Test hook: the despills that have completed, including those that found nothing to write.</summary>
     internal int DespillsCompletedForTest => Volatile.Read(ref _despillsCompleted);
