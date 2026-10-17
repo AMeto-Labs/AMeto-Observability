@@ -384,6 +384,26 @@ public sealed class OtlpJsonRoomTests
         Assert.Equal(MsgpackString(Utf8("0123456789abcdef0123456789abcdef")), Pairs(sink.Maps[0])["@tr"]);
     }
 
+    /// <summary>
+    /// Round-6 review, NameIs on an escaped name. An escape spells a byte in six at the most (a), so an escaped name
+    /// more than six times a known name's length is not it, and is not walked to be told so: a long escaped name was walked
+    /// whole for every known name it was compared with (3–4× slower). A name escaped at exactly six to a byte is still
+    /// read as the name it spells.
+    /// </summary>
+    [Fact]
+    public void An_escaped_name_is_walked_only_where_it_can_spell_the_name_it_is_compared_with()
+    {
+        string records = "\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"x\"}}]}]}]}";
+        byte[] longName = Utf8("{\"\\u0061" + new string('b', 400) + "\":1,\"resourceLogs\":[{" + records);
+        JsonStringText.UnescapedLengthWalksForTest = 0;
+        Assert.Equal((1, 0), OtlpLogStreamParser.Parse(longName, new Sink()));
+        int walks = JsonStringText.UnescapedLengthWalksForTest;
+        Assert.True(walks == 0, $"a 406-byte escaped name was walked {walks} time(s) to be told from names of a few bytes");
+
+        string spelled = string.Concat("resourceLogs".Select(static c => $"\\u{(int)c:x4}"));   // 72 bytes for 12
+        Assert.Equal((1, 0), OtlpLogStreamParser.Parse(Utf8("{\"" + spelled + "\":[{" + records), new Sink()));
+    }
+
     // ── L-17: nested values, written in place ─────────────────────────────────
 
     /// <summary>

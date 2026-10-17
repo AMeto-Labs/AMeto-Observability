@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Text;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Unicode;
@@ -932,12 +933,22 @@ internal static class JsonStringText
     /// threw on it, out of a parse the weighing walk had accepted: a 400 with the records before it written, where a
     /// lone surrogate in a value was stored with U+FFFD. Allocates nothing. The reader is over one span.
     /// </summary>
-    public static bool NameIs(scoped ref Utf8JsonReader reader, ReadOnlySpan<byte> text)
+    /// <remarks>
+    /// The unescaped name, by far the common one, is compared inline (round-6 review: not inlinable, NameIs cost the
+    /// JSON parse 12 %); an escaped one is compared out of line.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool NameIs(scoped ref Utf8JsonReader reader, ReadOnlySpan<byte> text) =>
+        !reader.ValueIsEscaped ? reader.ValueSpan.SequenceEqual(text) : NameIsEscaped(ref reader, text);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool NameIsEscaped(scoped ref Utf8JsonReader reader, ReadOnlySpan<byte> text)
     {
         var raw = reader.ValueSpan;
-        if (!reader.ValueIsEscaped) return raw.SequenceEqual(text);
-        // An escape spells one byte in two at the least, so a name that unescapes to `text` is longer than it.
-        if (raw.Length <= text.Length || UnescapedLength(raw) != text.Length) return false;
+        // An escape spells one byte in two at the least, so a name that unescapes to `text` is longer than it — and in
+        // six at the most (A), so one past six times its length is not it, uncounted (round-6 review: a long
+        // escaped name was walked whole for every name it was compared with, 3–4× slower).
+        if (raw.Length <= text.Length || raw.Length > 6 * text.Length || UnescapedLength(raw) != text.Length) return false;
         Span<byte> unescaped = stackalloc byte[text.Length];
         return Unescape(raw, unescaped) == text.Length && unescaped.SequenceEqual(text);
     }
