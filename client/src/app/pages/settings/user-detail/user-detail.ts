@@ -13,7 +13,7 @@ import { LucideAngularModule } from 'lucide-angular';
 import { ApiService } from '../../../core/services/api.service';
 import { AuthService } from '../../../core/services/auth.service';
 import {
-  ALL_VIEW_PERMISSIONS, UserDto, UserRole, ViewPermission,
+  ALL_VIEW_PERMISSIONS, UserDetailDto, UserRole, ViewPermission,
 } from '../../../core/models/auth.model';
 import { PageHeaderComponent, SectionComponent } from '../../../shared/components/ui';
 
@@ -30,7 +30,7 @@ export class UserDetailComponent implements OnInit {
   private readonly api = inject(ApiService);
   readonly authService = inject(AuthService);
 
-  readonly user = signal<UserDto | null>(null);
+  readonly user = signal<UserDetailDto | null>(null);
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
 
@@ -51,6 +51,18 @@ export class UserDetailComponent implements OnInit {
 
   /** Only local-provider accounts have a password to reset. */
   readonly isLocal = computed(() => this.user()?.provider === 'local');
+
+  // ── Access: block / end sessions ──────────────────────────────────────────
+  readonly blocking = signal(false);
+  readonly endingSessions = signal(false);
+  readonly accessError = signal<string | null>(null);
+  readonly accessNotice = signal<string | null>(null);
+
+  /** The provider's display name, for the note on how a block there reaches Ameto. */
+  readonly providerName = computed(() => {
+    const p = this.user()?.provider;
+    return p === 'google' ? 'Google' : p === 'microsoft' ? 'Microsoft' : null;
+  });
 
   readonly userId = signal('');
 
@@ -167,6 +179,68 @@ export class UserDetailComponent implements OnInit {
         this.pwError.set(e?.error?.error ?? 'Failed to change password.');
       },
     });
+  }
+
+  // ── Access ────────────────────────────────────────────────────────────────
+  toggleBlocked(): void {
+    const u = this.user();
+    if (!u) return;
+    const block = !u.blocked;
+    const name = u.displayName || u.email || u.username;
+    if (block && !confirm(`Block "${name}"? They are signed out everywhere at once and cannot sign in until unblocked.`)) return;
+    this.accessError.set(null);
+    this.accessNotice.set(null);
+    this.blocking.set(true);
+    this.api.setUserBlocked(this.userId(), block).subscribe({
+      next: () => {
+        // Blocking ended every session on the server.
+        this.user.update(cur => (cur ? { ...cur, blocked: block, sessions: block ? [] : cur.sessions } : cur));
+        this.blocking.set(false);
+      },
+      error: (e) => {
+        this.blocking.set(false);
+        this.accessError.set(e?.error?.error ?? (block ? 'Failed to block the user.' : 'Failed to unblock the user.'));
+      },
+    });
+  }
+
+  endSessions(): void {
+    const u = this.user();
+    if (!u) return;
+    if (!confirm(`Sign "${u.displayName || u.email || u.username}" out on every device? They can sign in again.`)) return;
+    this.accessError.set(null);
+    this.accessNotice.set(null);
+    this.endingSessions.set(true);
+    this.api.endUserSessions(this.userId()).subscribe({
+      next: ({ ended }) => {
+        this.user.update(cur => (cur ? { ...cur, sessions: [] } : cur));
+        this.endingSessions.set(false);
+        this.accessNotice.set(ended === 1 ? 'Ended 1 session.' : `Ended ${ended} sessions.`);
+      },
+      error: () => {
+        this.endingSessions.set(false);
+        this.accessError.set('Failed to end the sessions.');
+      },
+    });
+  }
+
+  /** "Chrome on Windows" out of a user-agent string; the raw string is in the cell's tooltip. */
+  describeAgent(userAgent: string): string {
+    const ua = userAgent || '';
+    const browser =
+      /Edg\//.test(ua) ? 'Edge' :
+      /OPR\/|Opera/.test(ua) ? 'Opera' :
+      /Firefox\//.test(ua) ? 'Firefox' :
+      /Chrome\//.test(ua) ? 'Chrome' :
+      /Safari\//.test(ua) ? 'Safari' : null;
+    const os =
+      /Windows/.test(ua) ? 'Windows' :
+      /Android/.test(ua) ? 'Android' :
+      /iPhone|iPad|iPod/.test(ua) ? 'iOS' :
+      /Mac OS X|Macintosh/.test(ua) ? 'macOS' :
+      /Linux/.test(ua) ? 'Linux' : null;
+    if (browser && os) return `${browser} on ${os}`;
+    return browser ?? os ?? (ua ? ua.slice(0, 40) : 'Unknown device');
   }
 
   remove(): void {

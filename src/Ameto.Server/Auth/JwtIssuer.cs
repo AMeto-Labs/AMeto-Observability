@@ -8,29 +8,44 @@ namespace Ameto.Server.Auth;
 internal sealed class JwtIssuer
 {
     private readonly SymmetricSecurityKey _key;
-    public const int ExpiresInSeconds = 2 * 3600; // 2 hours
+
+    /// <summary>
+    /// Lifetime of an access token. Short because the sign-in is not: the page trades its session
+    /// cookie for a fresh token (see <see cref="AuthSessions"/>), so this bounds only how long a
+    /// token lifted out of the page stays usable. A revoked session's tokens are refused at once
+    /// regardless (see <see cref="AuthRevocations"/>).
+    /// </summary>
+    public const int ExpiresInSeconds = 15 * 60;
+
+    /// <summary>
+    /// The claim naming the session a token was issued under. The long URI rather than "sid",
+    /// like Name and Role here: a short name is rewritten on the way in by the bearer handler's
+    /// claim map, and this way the type read back is the type written.
+    /// </summary>
+    public const string SessionClaim = ClaimTypes.Sid;
 
     public JwtIssuer(string secret)
     {
         _key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
     }
 
-    public string Issue(string username, string role, string email = "", string displayName = "",
-        ViewPermissions permissions = ViewPermissions.All)
+    /// <summary>Issues an access token for <paramref name="user"/> under session <paramref name="sessionId"/>.</summary>
+    public string Issue(UserRecord user, string sessionId)
     {
         // Admins always carry the full scope regardless of the stored bitmask.
-        var effective = role == "admin" ? ViewPermissions.All : permissions;
+        var effective = user.Role == "admin" ? ViewPermissions.All : user.Permissions;
 
         var claims = new List<Claim>
         {
-            new(ClaimTypes.Name, username),
-            new(ClaimTypes.Role, role),
+            new(ClaimTypes.Name, user.Username),
+            new(ClaimTypes.Role, user.Role),
             new(ClaimsPrincipalExtensions.PermClaim, ((int)effective).ToString()),
+            new(SessionClaim, sessionId),
         };
-        if (!string.IsNullOrEmpty(email))
-            claims.Add(new Claim(ClaimTypes.Email, email));
-        if (!string.IsNullOrEmpty(displayName))
-            claims.Add(new Claim("display_name", displayName));
+        if (!string.IsNullOrEmpty(user.Email))
+            claims.Add(new Claim(ClaimTypes.Email, user.Email));
+        if (!string.IsNullOrEmpty(user.DisplayName))
+            claims.Add(new Claim("display_name", user.DisplayName));
 
         var token = new JwtSecurityToken(
             claims:    claims,
@@ -44,7 +59,10 @@ internal sealed class JwtIssuer
         ValidateIssuer           = false,
         ValidateAudience         = false,
         ValidateLifetime         = true,
-        ClockSkew                = TimeSpan.FromMinutes(1),
+        ClockSkew                = AllowedClockSkew,
         IssuerSigningKey         = _key,
     };
+
+    /// <summary>How far past its expiry a token is still accepted.</summary>
+    public static readonly TimeSpan AllowedClockSkew = TimeSpan.FromMinutes(1);
 }

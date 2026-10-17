@@ -9,7 +9,7 @@ import {
 import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
-import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/auth.model';
+import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDetailDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
 import { SearchHistoryDto, SearchScope } from '../models/search-history.model';
@@ -242,7 +242,7 @@ export class ApiService {
     connectionMessage: string,
     report: (message: string) => void,
   ): () => void {
-    if (!this.auth.isAuthenticated()) { report(connectionMessage); return () => {}; }
+    if (!this.auth.hasSession()) { report(connectionMessage); return () => {}; }
 
     const p = new URLSearchParams();
     if (params.filter) p.set('filter', params.filter);
@@ -428,7 +428,15 @@ export class ApiService {
 
   // ── Users ──────────────────────────────────────────────────────────────────
   getUsers(): Observable<UserDto[]> { return this.http.get<UserDto[]>('/api/users'); }
-  getUser(id: string): Observable<UserDto> { return this.http.get<UserDto>(`/api/users/${encodeURIComponent(id)}`); }
+  getUser(id: string): Observable<UserDetailDto> { return this.http.get<UserDetailDto>(`/api/users/${encodeURIComponent(id)}`); }
+  /** Blocks (ending every session at once) or unblocks an account. */
+  setUserBlocked(id: string, blocked: boolean): Observable<void> {
+    return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}/blocked`, { blocked });
+  }
+  /** Signs a user out everywhere without blocking them. */
+  endUserSessions(id: string): Observable<{ ended: number }> {
+    return this.http.delete<{ ended: number }>(`/api/users/${encodeURIComponent(id)}/sessions`);
+  }
   createUser(username: string, password: string, role: string): Observable<UserDto> {
     return this.http.post<UserDto>('/api/users', { username, password, role });
   }

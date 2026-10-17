@@ -105,6 +105,17 @@ builder.Services.AddSingleton(serverOptions.HotTier);
 builder.Services.AddSingleton<Microsoft.Extensions.Options.IOptions<ServerOptions>>(
     _ => Microsoft.Extensions.Options.Options.Create(serverOptions));
 
+// Reversible encryption for secrets Ameto must present back to a third party: alert-channel
+// credentials (bot tokens, SMTP passwords, webhook auth headers) and the OAuth providers'
+// refresh tokens (see ProviderAccessCheck). Unconditional, since sign-in needs it with alerts off.
+builder.Services.AddSingleton<Ameto.Core.ISecretProtector>(sp =>
+    Ameto.Core.SecretProtectorFactory.Create(
+        serverOptions.DataDirectory,
+        builder.Configuration["Ameto:MasterKey"],
+        path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
+            "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
+            path)));
+
 // ── Auth services (SQLite) ──────────────────────────────────────────────────────
 var authOptions = builder.Configuration.GetSection("Ameto:Auth").Get<Ameto.Server.Auth.AuthOptions>() ?? new Ameto.Server.Auth.AuthOptions();
 builder.Services.AddAmetoAuth(serverOptions.DataDirectory, authOptions);
@@ -219,14 +230,7 @@ if (enableAlerts)
     builder.Services.ConfigureHttpJsonOptions(o =>
         o.SerializerOptions.Converters.Add(new Ameto.Server.AlertChannelResponseConverter()));
 
-    // Reversible encryption for channel secrets (bot tokens, SMTP passwords, webhook auth headers).
-    builder.Services.AddSingleton<Ameto.Core.ISecretProtector>(sp =>
-        Ameto.Core.SecretProtectorFactory.Create(
-            serverOptions.DataDirectory,
-            builder.Configuration["Ameto:MasterKey"],
-            path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
-                "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
-                path)));
+    // Channel secrets are encrypted with the ISecretProtector registered above, beside auth.
     // Read beside Ameto:Alerts:Enabled, the one other alert setting: see AlertEvaluatorOptions.
     builder.Services.AddAmetoAlerts(serverOptions.DataDirectory, new Ameto.Alerts.AlertEvaluatorOptions
     {
@@ -358,6 +362,20 @@ app.UseWhen(static ctx => !IngestRoutes.IsIngestRequest(ctx), static branch =>
 {
     branch.UseRateLimiter();
     branch.UseAuthentication();
+    // An event stream outlives a revoked session by hours unless something cuts it: a live tail
+    // authenticates once, at connect. Registered here, after authentication has named its session,
+    // and aborted by AuthRevocations when that session ends or its user is blocked.
+    branch.Use(static async (ctx, next) =>
+    {
+        if (ctx.User.Identity?.IsAuthenticated != true
+            || !ctx.Request.Headers.Accept.ToString().Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
+        {
+            await next(ctx);
+            return;
+        }
+        using var tracked = ctx.RequestServices.GetRequiredService<Ameto.Server.Auth.AuthRevocations>().TrackStream(ctx);
+        await next(ctx);
+    });
     branch.UseAuthorization();
 });
 // The SPA entry document is the one file whose bytes depend on configuration, so it does not
@@ -379,6 +397,7 @@ app.UseStaticFiles();
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 app.MapAuthEndpoints();
+app.MapAuthSessionEndpoints();
 app.MapSearchHistoryEndpoints();
 app.MapAmetoEndpoints();
 if (enableAlerts)

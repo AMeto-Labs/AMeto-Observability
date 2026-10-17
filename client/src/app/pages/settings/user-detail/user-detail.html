@@ -135,9 +135,75 @@
       </app-section>
     }
 
+    <app-section title="Access">
+      <div class="row">
+        <span class="sublabel access-state">
+          @if (u.blocked) {
+            <span class="state-badge blocked">Blocked</span>
+            Cannot sign in, and every session has been ended. Unblock to let them back.
+          } @else {
+            <span class="state-badge active">Active</span>
+            @if (providerName(); as provider) {
+              Disabling the account in {{ provider }} also signs them out here within about an hour.
+            } @else {
+              Blocking signs them out everywhere at once.
+            }
+          }
+        </span>
+        <button class="btn" [class.danger]="!u.blocked" (click)="toggleBlocked()" [disabled]="blocking()">
+          <lucide-icon [name]="blocking() ? 'loader-circle' : (u.blocked ? 'check' : 'ban')" [size]="13" />
+          {{ u.blocked ? 'Unblock' : 'Block user' }}
+        </button>
+      </div>
+
+      <div class="sessions">
+        <div class="row">
+          <span class="label">Signed-in sessions</span>
+          <button class="btn" (click)="endSessions()" [disabled]="endingSessions() || u.sessions.length === 0">
+            <lucide-icon [name]="endingSessions() ? 'loader-circle' : 'log-out'" [size]="13" />
+            Sign out everywhere
+          </button>
+        </div>
+        @if (u.sessions.length === 0) {
+          <span class="sublabel">No active sessions.</span>
+        } @else {
+          <table class="data-table sessions-table">
+            <thead>
+              <tr>
+                <th>Device</th>
+                <th>IP</th>
+                <th>Last active</th>
+                <th>Signed in</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (s of u.sessions; track $index) {
+                <tr>
+                  <td [title]="s.userAgent">{{ describeAgent(s.userAgent) }}</td>
+                  <td class="mono-sm">{{ s.ip || '—' }}</td>
+                  <td class="muted">{{ s.lastUsedAt | date: 'yyyy-MM-dd HH:mm' }}</td>
+                  <td class="muted">{{ s.createdAt | date: 'yyyy-MM-dd HH:mm' }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        }
+      </div>
+
+      @if (accessError(); as err) {
+        <span class="form-error">{{ err }}</span>
+      }
+      @if (accessNotice(); as note) {
+        <span class="form-success"><lucide-icon name="check" [size]="12" /> {{ note }}</span>
+      }
+    </app-section>
+
     <app-section title="Danger zone">
       <div class="row">
-        <span class="sublabel">Permanently delete this user. OAuth allowlist entries can be re-added later.</span>
+        <span class="sublabel">
+          Permanently delete this user. To keep someone out, block them instead: a deleted user can be
+          added again by an OAuth domain rule at their next sign-in.
+        </span>
         <button class="btn danger" (click)="remove()" [disabled]="deleting()">
           <lucide-icon [name]="deleting() ? 'loader-circle' : 'trash-2'" [size]="13" />
           {{ deleting() ? 'Deleting…' : 'Delete user' }}

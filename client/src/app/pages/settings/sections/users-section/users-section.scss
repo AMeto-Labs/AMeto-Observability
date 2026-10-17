@@ -32,6 +32,17 @@
   &.admin { border-color: var(--primary); color: var(--primary); }
 }
 
+.blocked-badge {
+  margin-left: 4px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  border: 1px solid var(--error);
+  color: var(--error);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
 .domain-table {
   margin-top: 8px;
 }

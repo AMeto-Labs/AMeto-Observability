@@ -22,7 +22,19 @@ internal sealed record UserRecord(
     /// users; empty for local accounts and for OAuth rows created before subject binding.
     /// </summary>
     public string ProviderSubject { get; init; } = "";
+
+    /// <summary>
+    /// Blocked by an admin: refused at sign-in, at refresh and — through
+    /// <see cref="AuthRevocations"/> — on every request, while the row itself stays.
+    /// </summary>
+    public bool Disabled { get; init; }
 }
+
+/// <summary>
+/// What <see cref="ProviderAccessCheck"/> keeps per OAuth account: the provider's refresh token,
+/// still encrypted, and when the provider last vouched for the account (unix ms; 0 = never).
+/// </summary>
+internal readonly record struct ProviderAccessState(string ProtectedRefreshToken, long CheckedAtMs);
 
 internal sealed record ApiKeyRecord(
     string Id,
@@ -94,7 +106,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject, disabled
             FROM users
             WHERE email = @e COLLATE NOCASE AND provider = @p
             """;
@@ -109,7 +121,8 @@ internal sealed class AuthStore
     /// Resolves an OAuth sign-in: exact per-email allowlist first, then the
     /// domain allowlist. When only a domain rule matches, the user is
     /// auto-provisioned (so subsequent sign-ins and admin management use the
-    /// per-email path). Returns null when neither matches (sign-in refused).
+    /// per-email path). Returns null when neither matches (sign-in refused). A blocked account
+    /// comes back with <see cref="UserRecord.Disabled"/> set, for the caller to refuse by name.
     /// </summary>
     /// <param name="subject">
     /// The provider's immutable subject id for this identity (Google <c>sub</c>, Entra
@@ -128,6 +141,10 @@ internal sealed class AuthStore
         {
             if (existing.ProviderSubject.Length == 0)
             {
+                // A blocked row is refused by the caller, and left unbound: binding it here would
+                // give it to whichever identity happened to try while it was blocked.
+                if (existing.Disabled) return existing;
+
                 // Row predates subject binding (or was created from the admin allowlist):
                 // adopt this subject as the account's identity from here on.
                 //
@@ -208,7 +225,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject, disabled
             FROM users
             WHERE username = @u COLLATE NOCASE
                OR (email != '' AND email = @e COLLATE NOCASE)
@@ -226,7 +243,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject, disabled
             FROM users ORDER BY created_at
             """;
         using var r    = cmd.ExecuteReader();
@@ -240,7 +257,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject, disabled
             FROM users WHERE id = @id
             """;
         cmd.Parameters.AddWithValue("@id", id);
@@ -363,6 +380,68 @@ internal sealed class AuthStore
         cmd.Parameters.AddWithValue("@s",  Convert.ToBase64String(salt));
         cmd.Parameters.AddWithValue("@id", id);
         return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Blocks or unblocks an account. False when there is no such user.</summary>
+    public bool SetDisabled(string id, bool disabled)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE users SET disabled = @d WHERE id = @id";
+        cmd.Parameters.AddWithValue("@d",  disabled ? 1 : 0);
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Usernames of every blocked account: the set <see cref="AuthRevocations"/> starts from.</summary>
+    public IReadOnlyList<string> ListDisabledUsernames()
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "SELECT username FROM users WHERE disabled != 0";
+        using var r = cmd.ExecuteReader();
+        var result = new List<string>();
+        while (r.Read()) result.Add(r.GetString(0));
+        return result;
+    }
+
+    // ── Provider access (see ProviderAccessCheck) ─────────────────────────────
+
+    public ProviderAccessState GetProviderAccess(string id)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "SELECT provider_refresh_token, provider_checked_at FROM users WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id", id);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? new ProviderAccessState(r.GetString(0), r.GetInt64(1)) : default;
+    }
+
+    /// <summary>
+    /// Records that the provider vouched for the account at <paramref name="checkedAtMs"/>.
+    /// A null <paramref name="protectedRefreshToken"/> keeps the stored token; an empty one clears it.
+    /// </summary>
+    public void SetProviderAccess(string id, string? protectedRefreshToken, long checkedAtMs)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = protectedRefreshToken is null
+            ? "UPDATE users SET provider_checked_at = @at WHERE id = @id"
+            : "UPDATE users SET provider_checked_at = @at, provider_refresh_token = @t WHERE id = @id";
+        cmd.Parameters.AddWithValue("@at", checkedAtMs);
+        cmd.Parameters.AddWithValue("@id", id);
+        if (protectedRefreshToken is not null) cmd.Parameters.AddWithValue("@t", protectedRefreshToken);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Forgets the provider's refresh token after the provider refused it.</summary>
+    public void ClearProviderToken(string id)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE users SET provider_refresh_token = '' WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id", id);
+        cmd.ExecuteNonQuery();
     }
 
     public string? GetRole(string username)
@@ -528,6 +607,7 @@ internal sealed class AuthStore
         DateTimeOffset.Parse(r.GetString(6)))
     {
         ProviderSubject = r.IsDBNull(8) ? "" : r.GetString(8),
+        Disabled        = r.GetInt64(9) != 0,
     };
 
     private static string HashPassword(string password, byte[] salt)
