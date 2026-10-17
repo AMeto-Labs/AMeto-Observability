@@ -4835,6 +4835,47 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review R6-M7. A swapped tier whose flush failed and whose retry could not start stayed listed, served,
+    /// until shutdown, with its slot, its count and its text given back — and with no cap: every swap under the out of
+    /// memory that stops a retry kept one more (12 of them held 117 MB native and 172 MB of heap in the review's probe,
+    /// against a budget that counted none). One cap now holds them and the despilled tiers kept for their markers:
+    /// past it a tier is let go, and its WAL brings its events back at the next start.
+    /// </summary>
+    [Fact]
+    public async Task Swapped_tiers_kept_with_no_retry_are_no_more_than_the_kept_tiers_cap()
+    {
+        const int Tiers = 4;
+        string dir    = NewDir();
+        var    opts   = Options(dir, spill: false);
+        var    engine = OneSlotEngine(opts);
+        int kept;
+        try
+        {
+            engine._beforeLevelWriteForTest      = _ => throw new IOException("test: the flush's level write fails");
+            engine._beforeFlushRetryStartForTest = () => throw new OutOfMemoryException("test: no retry can be set up");
+            for (int t = 0; t < Tiers; t++)
+            {
+                using (var batch = Batch(engine, t * TierEvents, TierEvents))
+                    Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+                await engine.FlushHotTierAsync();
+                WaitFor(() => engine.HeavyPhasesInFlight == 0, "the failed flush to give its slot back", ShortGuard);
+            }
+            kept = engine.FrozenTierCountForTest;
+        }
+        finally
+        {
+            engine._beforeLevelWriteForTest = null;
+            await engine.DisposeAsync();
+        }
+        Assert.True(kept <= StorageEngine.KeptTiersCap,
+            $"{kept} swapped tiers kept in memory with no retry, past the cap of {StorageEngine.KeptTiersCap}");
+
+        await using var next = Engine(opts);
+        await FlushEverythingAsync(next, ShortGuard);
+        Assert.Equal(Tiers * TierEvents, ReadAll(next).Count);   // every one back from its WAL, none twice
+    }
+
+    /// <summary>
     /// Round-6 review R5-M7: a despill whose FLUSH failed wrote no marker — the marker is the flush's last step
     /// — and gives up without keeping its tier, whatever a marker's removal would do. It kept one whenever the
     /// removal threw, and the removal allocated (and on Linux fsynced) with or without a marker.

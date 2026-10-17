@@ -981,7 +981,7 @@ public sealed partial class StorageEngine
     /// took the marker for a block written by an earlier life and deleted the spill file unread — every
     /// event of the block lost. A marker that cannot be removed for good is kept, and with it all it
     /// vouches for: the levels, whole on disk; the tier, listed — served — until shutdown frees it, as a
-    /// swapped tier with no retry is; and the block, in flight, despilled by nobody in this run. False
+    /// swapped tier with no retry is, under the same cap (<see cref="KeptTiersCap"/>); and the block, in flight, despilled by nobody in this run. False
     /// then. The next start finds the block's levels (and the marker, if it is still there) and finishes
     /// it as it finishes a block a crash left: the despill keeps the levels the boot scan accepted and
     /// writes the rest, or, under the marker, only removes the spill file.</para>
@@ -992,8 +992,8 @@ public sealed partial class StorageEngine
     /// that ended. It parked on any throw of the removal, which allocated (and on Linux fsynced) whether or
     /// not there was a marker: in an out of memory every despilled block parked, a tier each, until the
     /// process was killed. The marker's paths are made before the despill (<paramref name="marker"/>,
-    /// <paramref name="voided"/>), and at most <see cref="FlushSlots"/> tiers are parked: past that a tier
-    /// is let go — unlisted and retired — and the block waits for the next start all the same, whole on
+    /// <paramref name="voided"/>), and at most <see cref="KeptTiersCap"/> tiers are kept, swapped ones included: past
+    /// that a tier is let go — unlisted and retired — and the block waits for the next start all the same, whole on
     /// disk (its spill file, and its levels with the marker over them), its events unserved meanwhile.</para>
     /// </summary>
     private bool AbandonDespilledTier(HotTierSegment tier, SpillFile file, bool mayHaveMarker, string? marker, string? voided)
@@ -1003,19 +1003,15 @@ public sealed partial class StorageEngine
             try { RemoveFlushMarkerDurably(file.SegId, marker, voided); }
             catch (Exception ex)
             {
-                bool kept = Interlocked.Increment(ref _parkedDespillTiers) <= FlushSlots;
-                if (!kept)
-                {
-                    Interlocked.Decrement(ref _parkedDespillTiers);
-                    LetGoOfTier(tier);
-                }
+                bool kept = TryKeepTier();
+                if (!kept) LetGoOfTier(tier);
                 try
                 {
                     _logger.LogError(ex, kept
                         ? "Despill of {File}: its completion marker could not be removed after the despill failed — its tier stays in " +
                           "memory, served, until shutdown, and the block is finished by the next start"
-                        : "Despill of {File}: its completion marker could not be removed after the despill failed — with every flush slot's " +
-                          "worth of tiers kept so already, its tier is let go: the block's events are on disk and come back at the next start",
+                        : "Despill of {File}: its completion marker could not be removed after the despill failed — with the most tiers " +
+                          "kept so already, its tier is let go: the block's events are on disk and come back at the next start",
                         file.Path);
                 }
                 catch (Exception) { /* the line is lost; the tier and the block are kept all the same */ }
@@ -1043,13 +1039,34 @@ public sealed partial class StorageEngine
     }
 
     /// <summary>
-    /// The despilled tiers kept listed, with their blocks in flight, by <see cref="AbandonDespilledTier"/>
-    /// until shutdown frees them — at most <see cref="FlushSlots"/> (round-6 review R5-M7).
+    /// The tiers kept listed — served — with no flush to come, until shutdown frees them: a despilled tier whose
+    /// marker could not be removed (<see cref="AbandonDespilledTier"/>, round-6 review R5-M7), and a swapped tier no
+    /// retry could flush (<see cref="HandFailedFlushToRetry"/>, or a retry that ended unfinished). One cap for both,
+    /// <see cref="KeptTiersCap"/> (round-6 review R6-M7): a swapped tier was kept with no cap at all — 12 of them held
+    /// 117 MB of native memory and 172 MB of heap, with their slots, counts and text given back, against a budget
+    /// that counted none of it — and the despill's cap, a flush slot's worth, sat on top of the slots in flight, up to
+    /// twice the native budget.
     /// </summary>
-    private int _parkedDespillTiers;
+    private int _keptTiers;
 
-    /// <summary>Test hook: the despilled tiers parked so far (see <see cref="_parkedDespillTiers"/>).</summary>
-    internal int ParkedDespillTiersForTest => Volatile.Read(ref _parkedDespillTiers);
+    /// <summary>
+    /// The most tiers kept with no flush to come (see <see cref="_keptTiers"/>): one, beyond the flush slots' tiers —
+    /// what the budget derivation holds one extra tier to. Past it a tier is let go, unlisted and retired: its events
+    /// are unserved until the next start reads them back from disk (a swap's WAL, a despill's spill file and levels),
+    /// where they stay either way.
+    /// </summary>
+    internal const int KeptTiersCap = 1;
+
+    /// <summary>Counts one more kept tier when the cap allows it; false — nothing counted — when it does not. Never throws.</summary>
+    private bool TryKeepTier()
+    {
+        if (Interlocked.Increment(ref _keptTiers) <= KeptTiersCap) return true;
+        Interlocked.Decrement(ref _keptTiers);
+        return false;
+    }
+
+    /// <summary>Test hook: the tiers kept with no flush to come (see <see cref="_keptTiers"/>).</summary>
+    internal int KeptTiersForTest => Volatile.Read(ref _keptTiers);
 
     private int _despillsCompleted;
 

@@ -2821,14 +2821,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (TryScheduleFlushRetry(oldHot, oldWalPath, reservedSegId)) return true;
 
         // No retry could be started (out of memory): the tier stays listed, and queries go on serving
-        // it, until shutdown frees it; its WAL stays on disk and the next start replays it, skipping
-        // the levels the failed attempt got out. Its slot and heavy phase go back — holding them for a
-        // tier nothing will flush would wedge ingest behind it.
+        // it, until shutdown frees it — under the kept tiers' cap (round-6 review R6-M7), past which it is
+        // let go, unlisted and retired, its events unserved until then; its WAL stays on disk either way
+        // and the next start replays it, skipping the levels the failed attempt got out. Its slot and heavy
+        // phase go back — holding them for a tier nothing will flush would wedge ingest behind it.
+        bool kept = TryKeepTier();
+        if (!kept) LetGoOfTier(oldHot);
         try
         {
-            _logger.LogError(
-                "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
-                "until shutdown, and its WAL replays it at the next start", reservedSegId);
+            if (kept)
+                _logger.LogError(
+                    "No flush retry could be started for block {Block}: its tier stays in memory, queryable, " +
+                    "until shutdown, and its WAL replays it at the next start", reservedSegId);
+            else
+                _logger.LogError(
+                    "No flush retry could be started for block {Block}: with the most tiers kept in memory so already, its " +
+                    "tier is let go — its events are unserved until the next start replays its WAL", reservedSegId);
         }
         catch (Exception) { /* the line is lost */ }
         return false;
@@ -3370,6 +3378,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             catch (Exception) { /* the line is lost */ }
             try { onAbandoned?.Invoke(); }
             catch (Exception) { /* each step of it is guarded */ }
+            // A swap's tier is kept under the kept tiers' cap, or let go past it (round-6 review R6-M7; its WAL replays it).
+            if (onAbandoned is null && !engine.TryKeepTier()) engine.LetGoOfTier(tier);
             engine.ReleaseFlushRetryOwners(tier);
         }
     }
