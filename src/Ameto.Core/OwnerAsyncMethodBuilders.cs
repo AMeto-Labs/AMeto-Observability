@@ -28,6 +28,19 @@ namespace Ameto.Core;
 /// method goes on, the finallys it leaves after the catch — while the catches run.
 /// <see cref="OwnerAsync.LaterSuspensionFailsForTest"/> makes a later suspension throw there.</para>
 ///
+/// <para><b>So a registration on a task that runs out of memory is made again</b> (round 7), up to
+/// <see cref="OwnerAsync.RegistrationAttempts"/> times over about four seconds, before the failure is let into the
+/// method. Every finally the method holds — and every <c>lock</c> and <c>using</c>, which are finallys — is skipped
+/// from a failure that reaches it until a suspension resumes, and a lock statement whose exit is skipped keeps its
+/// monitor for good; the per-site catches that give owners back cannot reach the code after them. Made again, the
+/// registration is not made twice: on a <see cref="Task"/> awaiter everything that can run out of memory — the
+/// box at the first suspension, the TPL event source's and async debugging's wrapper, a second continuation's
+/// list, the pool queue a task that completed meanwhile is queued to — allocates before the continuation is
+/// published, and a failure leaves nothing registered. Not for any other awaiter: the runtime catches those
+/// awaiters' failures itself (it rethrows them on the pool), and one that reaches here, its rethrow having run out
+/// of memory too, may have been registered first. A failure past the last try reaches the method, as before: the
+/// seams above stand for that road.</para>
+///
 /// <para>In production they are the runtime's builders: a suspension reads one field, null in production.</para>
 /// </summary>
 internal static class OwnerAsync
@@ -134,6 +147,75 @@ internal static class OwnerAsync
     /// <summary>A task that never completes: the box <see cref="BoxThenFailForTest"/> makes is registered on it.</summary>
     internal static Task Never => (s_never ??= new TaskCompletionSource()).Task;
     private static TaskCompletionSource? s_never;
+
+    // ── A registration made again (round 7) ──────────────────────────────────
+
+    /// <summary>
+    /// How many times an owner builder makes a suspension's registration on a task before a failure that ran out of
+    /// memory is let into the method: the first, and 47 more after pauses of 1, 2, 4 … 64 ms and then 100 ms
+    /// (<see cref="PauseBeforeRetry"/>) — about four seconds, for the collector to free what the failure needed.
+    /// </summary>
+    internal const int RegistrationAttempts = 48;
+
+    /// <summary>
+    /// Whether the registration that just ran out of memory is made again: on a task's awaiter (see the builders'
+    /// remarks), and not past <see cref="RegistrationAttempts"/>. Asked in a filter — nothing is caught otherwise.
+    /// </summary>
+    internal static bool RetriesRegistration<TAwaiter>(int attempt) => attempt + 1 < RegistrationAttempts && OnATask(typeof(TAwaiter));
+
+    /// <summary>A <see cref="Task"/>'s awaiter, configured or not, with or without a result.</summary>
+    private static bool OnATask(Type awaiter)
+    {
+        if (awaiter == typeof(TaskAwaiter) || awaiter == typeof(ConfiguredTaskAwaitable.ConfiguredTaskAwaiter)) return true;
+        if (!awaiter.IsGenericType) return false;
+        var definition = awaiter.GetGenericTypeDefinition();
+        return definition == typeof(TaskAwaiter<>) || definition == typeof(ConfiguredTaskAwaitable<>.ConfiguredTaskAwaiter);
+    }
+
+    /// <summary>
+    /// The pause before the next try, on the suspending thread: in the catch, once the runtime's finallys have
+    /// given back what they hold, never in the filter. Allocates nothing.
+    /// </summary>
+    internal static void PauseBeforeRetry(int attempt)
+    {
+        int ms = attempt < 7 ? 1 << attempt : 100;
+        if (Volatile.Read(ref s_registrationRetryPause)?.Value is { } pause) ms = pause(attempt);
+        if (ms > 0) Thread.Sleep(ms);
+    }
+
+    /// <summary>
+    /// Test seam: asked at every registration an owner builder makes — each suspension's, each try — with the state
+    /// machine's type, the awaiter's and the try's number from 0; true makes that try throw
+    /// <see cref="OutOfMemoryException"/> where the runtime's registration would, inside the builder's retry. Created
+    /// by the first test that asks for it, like <see cref="FirstSuspensionFailsForTest"/>; null in production.
+    /// </summary>
+    internal static AsyncLocal<Func<Type, Type, int, bool>?> RegistrationFailsForTest =>
+        Volatile.Read(ref s_registrationFails)
+        ?? Interlocked.CompareExchange(ref s_registrationFails, new AsyncLocal<Func<Type, Type, int, bool>?>(), null)
+        ?? s_registrationFails!;
+
+    /// <summary>What <see cref="RegistrationFailsForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<Type, Type, int, bool>?>? s_registrationFails;
+
+    /// <summary>Throws where the runtime's registration would, when <see cref="RegistrationFailsForTest"/> says so.</summary>
+    internal static void Registering(Type stateMachine, Type awaiter, int attempt)
+    {
+        if (Volatile.Read(ref s_registrationFails)?.Value is { } fails && fails(stateMachine, awaiter, attempt))
+            throw new OutOfMemoryException("test: the runtime's registration of a suspension's continuation failed");
+    }
+
+    /// <summary>
+    /// Test seam: the pause before each try after the first, in milliseconds, by the number of the try that failed —
+    /// how a test reaches <see cref="RegistrationAttempts"/> without waiting four seconds. Created by the first test
+    /// that asks for it; null in production.
+    /// </summary>
+    internal static AsyncLocal<Func<int, int>?> RegistrationRetryPauseForTest =>
+        Volatile.Read(ref s_registrationRetryPause)
+        ?? Interlocked.CompareExchange(ref s_registrationRetryPause, new AsyncLocal<Func<int, int>?>(), null)
+        ?? s_registrationRetryPause!;
+
+    /// <summary>What <see cref="RegistrationRetryPauseForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<int, int>?>? s_registrationRetryPause;
 }
 
 /// <summary><see cref="AsyncTaskMethodBuilder"/> with <see cref="OwnerAsync"/>'s seam.</summary>
@@ -160,7 +242,19 @@ internal struct OwnerTaskMethodBuilder
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
@@ -168,7 +262,19 @@ internal struct OwnerTaskMethodBuilder
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     /// <summary>The seams, at the first suspension: true when <see cref="OwnerAsync.BoxThenFailForTest"/> asks for the box and then a failure.</summary>
@@ -221,7 +327,19 @@ internal struct OwnerTaskMethodBuilder<TResult>
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
@@ -229,7 +347,19 @@ internal struct OwnerTaskMethodBuilder<TResult>
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
@@ -276,7 +406,19 @@ internal struct OwnerValueTaskMethodBuilder<TResult>
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
@@ -284,7 +426,19 @@ internal struct OwnerValueTaskMethodBuilder<TResult>
     {
         if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
         else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
-        _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                OwnerAsync.Registering(typeof(TStateMachine), typeof(TAwaiter), attempt);
+                _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
+                return;
+            }
+            catch (OutOfMemoryException) when (OwnerAsync.RetriesRegistration<TAwaiter>(attempt))
+            {
+                OwnerAsync.PauseBeforeRetry(attempt);   // made again: see the type's remarks
+            }
+        }
     }
 
     /// <summary>See <see cref="OwnerTaskMethodBuilder"/>.</summary>
