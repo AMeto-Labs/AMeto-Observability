@@ -284,6 +284,13 @@ public sealed partial class StorageEngine
                     // timer), and counts what it waited — the slice it would have waited, so the pause
                     // after each fault in a row still doubles (it slept the re-check interval, every time).
                     // And it does not await again (see awaitable).
+                    //
+                    // But only for a written prefix, whose tail is what the wait is for (round-6 review R6-M4). With
+                    // nothing written the request is answered at once: a 503, of which a retry duplicates nothing. It
+                    // used to block its pool thread for the rest of its wait, and N such requests stalled the pool as
+                    // the commit's wait-out had (R5-M4): health p99 7.9-8.9 s in the review's probe, 0-13 ms answered
+                    // at once.
+                    if (written == 0) break;
                     awaitable = false;
                     Thread.Sleep((int)thisSlice);
                 }

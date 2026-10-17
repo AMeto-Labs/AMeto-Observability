@@ -2764,12 +2764,48 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
-    /// The same wait, failing where its state machine is boxed — this method's first real suspension
-    /// — caught and slept out as above. But the compiler guards every finally of the method with the
-    /// state that suspension had set, so each one after it was skipped: the next run's release of the
-    /// writer lock (held for good: every other writer waited for ever) and the lease's end (the batch
-    /// never given back). The lock is released in a method with no await now, and the lease by plain
-    /// code.
+    /// Round-6 review R6-M4. A wait for room that cannot be set up, with nothing of the batch written, is
+    /// answered at once as not written — a 503, of which a retry duplicates nothing. It was slept out on the
+    /// request's pool thread for the rest of its wait (BackPressureWait), the way the commit's wait-out had
+    /// been (R5-M4), and sixteen such requests stalled the pool for seconds. A written prefix still waits
+    /// (the test above).
+    /// </summary>
+    [Fact]
+    public async Task A_wait_for_room_that_cannot_be_set_up_with_nothing_written_is_answered_at_once()
+    {
+        var engine = OneSlotEngine(Options(NewDir(), spill: false));
+        var gate   = HoldFirstFlush(engine);
+        try
+        {
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+            using (var b = Batch(engine, TierEvents, TierEvents))   // the live tier full: no room left for C
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
+
+            engine._beforeRoomWaitForTest = () => throw new OutOfMemoryException("test: no memory to set up the wait");
+            using var c  = Batch(engine, 2 * TierEvents, 10);
+            var       sw = System.Diagnostics.Stopwatch.StartNew();
+            var result = await Task.Run(() => engine.WriteBatchAsync(c, TimeSpan.FromSeconds(3)).AsTask()).WaitAsync(ShortGuard);
+            sw.Stop();
+            Assert.Equal(new LogBatchWriteResult(0, 0, 10), result);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1), $"answered after {sw.Elapsed.TotalMilliseconds:F0} ms of a 3 s wait");
+        }
+        finally
+        {
+            engine._beforeRoomWaitForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The same wait, failing where its state machine is boxed — this method's first real suspension.
+    /// The compiler guards every finally of the method with the state that suspension had set, so each
+    /// one after it was skipped: the next run's release of the writer lock (held for good: every other
+    /// writer waited for ever) and the lease's end (the batch never given back). The lock is released in
+    /// a method with no await now, and the lease by plain code. With nothing written when the wait fails,
+    /// the write ends at once (round-6 review R6-M4): the batch is answered as not written.
     /// </summary>
     [Fact]
     public async Task A_write_whose_first_suspension_cannot_be_boxed_releases_the_writer_lock_and_its_batch()
@@ -2788,7 +2824,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             OwnerAsync.FirstSuspensionFailsForTest.Value = FailFirstSuspensionOnce("<WriteBatchAsync>");
             try { result = await engine.WriteBatchAsync(batch, TimeSpan.FromSeconds(5)); }
             finally { OwnerAsync.FirstSuspensionFailsForTest.Value = null; }
-            Assert.Equal(new LogBatchWriteResult(10, 0, 0), result);
+            Assert.Equal(new LogBatchWriteResult(0, 0, 10), result);   // its first attempt faulted: nothing written
 
             using var other  = Batch(engine, 10, 5);
             var       second = Task.Run(async () => await engine.WriteBatchAsync(other, TimeSpan.FromSeconds(5)));
