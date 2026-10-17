@@ -4458,6 +4458,119 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review, L27's stale count (its finding 3). The clock stopped at every take of the last slot while a run
+    /// was live, wanted or not: two failures nobody waited on, then a despill holding the only slot through a quiet
+    /// spell longer than the gap — and the run had not aged. The first failure after it was the third "in a row", and
+    /// the despill took the slot at once, for a whole block. The clock stops only where a swap the writers wait on
+    /// finds no slot: through a quiet spell the run ages, despill or not.
+    /// </summary>
+    [Fact]
+    public async Task A_run_of_swap_failures_nobody_waited_on_ages_through_a_quiet_spell_spent_under_a_despill()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(100);   // a run ends after 1 s
+        int failing = 1, failures = 0;
+        engine._beforeFrozenListGrowForTest = () =>   // the swap has the slot
+        {
+            if (Volatile.Read(ref failing) == 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: a transient failure creating the next WAL");
+        };
+        using var despilling = new ManualResetEventSlim(false);
+        using var goesOn     = new ManualResetEventSlim(false);
+        engine._beforeLoadSpillForTest = _ => { despilling.Set(); goesOn.Wait(HangGuard); };
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);   // swaps nobody waits on: a live run
+            Assert.Equal(2, engine.SwapFailuresInARowForTest);
+
+            hold.SetResult();   // the tier is not refusing: the despill takes the only slot at once
+            Assert.True(despilling.Wait(ShortGuard), "setup: the despill never took the slot");
+            Thread.Sleep(1_500);   // the quiet spell, under the despill: nothing asks for a swap
+            goesOn.Set();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.HeavyPhasesInFlight == 0, "the despill to end", ShortGuard);
+
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 3);
+            Assert.True(engine.SwapFailuresInARowForTest == 1,
+                        $"the failure after the quiet spell counted {engine.SwapFailuresInARowForTest} in a row: the run had not aged under the despill");
+        }
+        finally
+        {
+            Volatile.Write(ref failing, 0);
+            goesOn.Set();
+            hold.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-6 review, the clock's stop and its restart at a release (its findings 3 and 6; ML3 survived every test).
+    /// The take of the only slot by a despill does not stop a live run's clock — nothing waits on a swap yet; the swap
+    /// the writers wait on — the tier full — that then finds the slot held does; and the slot's release starts it
+    /// again. Without the restart, the stop lasted until the next failure, which moved the last one on by the time
+    /// since the release as well.
+    /// </summary>
+    [Fact]
+    public async Task A_run_clock_stops_where_a_wanted_swap_finds_no_slot_and_starts_again_when_the_slot_comes_back()
+    {
+        string dir  = NewDir();
+        var    opts = Options(dir, spill: false);
+        EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
+
+        var hold = new TaskCompletionSource();
+        StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine engine;
+        try { engine = OneSlotEngine(opts); }
+        finally { StorageEngine.HoldDespillForTest.Value = null; }
+
+        engine._swapRetryDelay = TimeSpan.FromMilliseconds(500);   // a run ends after 5 s
+        int failing = 1, failures = 0;
+        engine._beforeFrozenListGrowForTest = () =>   // the swap has the slot
+        {
+            if (Volatile.Read(ref failing) == 0) return;
+            Interlocked.Increment(ref failures);
+            throw new IOException("test: a transient failure creating the next WAL");
+        };
+        using var despilling = new ManualResetEventSlim(false);
+        using var goesOn     = new ManualResetEventSlim(false);
+        engine._beforeLoadSpillForTest = _ => { despilling.Set(); goesOn.Wait(HangGuard); };
+        try
+        {
+            Assert.True(TryWriteOne(engine, 0));
+            await FailExplicitFlushesUntil(engine, () => Volatile.Read(ref failures), 2);   // a live run
+            hold.SetResult();   // the tier is not refusing: the despill takes the only slot at once
+            Assert.True(despilling.Wait(ShortGuard), "setup: the despill never took the slot");
+            Assert.False(engine.SwapRunClockStoppedForTest, "the despill's take of the last slot stopped the clock: no swap was wanted");
+
+            using (var full = Batch(engine, 1, TierEvents - 1))   // the tier fills: its swap is wanted, and finds no slot
+                Assert.Equal(new LogBatchWriteResult(TierEvents - 1, 0, 0), await engine.WriteBatchAsync(full, HangGuard));
+            WaitFor(() => engine.SwapRunClockStoppedForTest, "the wanted swap that found no slot to stop the clock", ShortGuard);
+
+            goesOn.Set();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.HeavyPhasesInFlight == 0, "the despill to end", ShortGuard);
+            Assert.False(engine.SwapRunClockStoppedForTest, "the clock stayed stopped past the slot's release");
+            Assert.True(engine.SwapFailuresInARowForTest >= 2, $"the run ended across the despill: {engine.SwapFailuresInARowForTest} in a row");
+        }
+        finally
+        {
+            Volatile.Write(ref failing, 0);
+            goesOn.Set();
+            hold.TrySetResult();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Round-5 review L-4, the frozen tiers' text (round-6 review: its half was pinned by nothing). A swap that finds the
     /// frozen tiers at their budget of text cannot be tried either, until a flush gives text back with its slot: a live
     /// run's clock stops there too, and a hold longer than the gap does not restart the run — the first failure after
