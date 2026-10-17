@@ -160,6 +160,12 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// <inheritdoc cref="ConfiguredTraces"/>
     protected virtual MetricsOptions ConfiguredMetrics => new();
 
+    /// <summary>
+    /// False keeps the application's own JWT bearer scheme as the default, for the suites that test
+    /// sign-in itself (see RealAuthWebAppFactory). Everything else authenticates as the test admin.
+    /// </summary>
+    protected virtual bool UseTestAuthentication => true;
+
     /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
     public string WebRootPath { get; private set; } = "";
 
@@ -228,6 +234,7 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
         // Swap the default authentication scheme for the test handler. This runs
         // after the app's own registration, so overriding the default
         // authenticate/challenge schemes here wins over the JWT bearer defaults.
+        if (UseTestAuthentication)
         builder.ConfigureTestServices(services =>
         {
             services.AddAuthentication(options =>

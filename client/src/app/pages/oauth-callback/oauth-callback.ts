@@ -1,5 +1,5 @@
 import { Component, OnInit, inject, ChangeDetectionStrategy } from '@angular/core';
-import { ActivatedRoute, Router } from '@angular/router';
+import { Router } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
 import { LucideAngularModule } from 'lucide-angular';
 
@@ -16,20 +16,14 @@ import { LucideAngularModule } from 'lucide-angular';
   `,
 })
 export class OauthCallbackComponent implements OnInit {
-  private route  = inject(ActivatedRoute);
   private auth   = inject(AuthService);
   private router = inject(Router);
 
   ngOnInit(): void {
-    const params = this.route.snapshot.queryParamMap;
-    const token     = params.get('token');
-    const expiresIn = Number(params.get('expiresIn') ?? 0);
-    const role      = params.get('role') ?? 'viewer';
-
-    if (token && expiresIn > 0) {
-      this.auth.handleOAuthCallback(token, expiresIn, role);
-    } else {
-      this.router.navigate(['/login'], { queryParams: { error: 'oauth_failed' } });
-    }
+    // The redirect that brought the browser here carried the session cookie, not a token.
+    this.auth.finishOAuthSignIn().subscribe({
+      next:  () => this.router.navigateByUrl(this.auth.takeOAuthReturnUrl()),
+      error: () => this.router.navigate(['/login'], { queryParams: { error: 'oauth_failed' } }),
+    });
   }
 }

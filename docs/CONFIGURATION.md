@@ -147,6 +147,18 @@ Two further checks apply regardless: Google sign-ins must carry `email_verified`
 
 **One gap remains if you set `AllowMultiTenant`.** Subject binding protects an account only once it is bound, and binding happens at the *first* sign-in. So an entry you add ahead of time — the usual "add the new hire to the allowlist, they join next week" flow — belongs to whoever signs in as that address first. With the tenant pinned that can only be someone from your directory; with `AllowMultiTenant` it can be anyone who asserts the address from any tenant. The binding is recorded in the log at `Information` ("bound to subject … on first sign-in"), which is the only signal distinguishing that from a normal sign-in, so if you run multi-tenant, watch that line. Prefer pinning the tenant and adding allowlist entries close to when they will be used.
 
+### How long a sign-in lasts
+
+A sign-in lasts 30 days from its last use. Every refresh of the 15-minute access token extends it, so anyone who opens Ameto at least once a month never signs in again. The session is an HttpOnly cookie, replaced on every refresh. If an older copy of the cookie is used, the session ends for everyone holding it.
+
+To stop someone's access, use **Settings → Users → user**. *Block user* ends every session at once, open tabs and live tails included, and refuses sign-in until unblocked. *Sign out everywhere* ends the sessions without blocking. Deleting an OAuth user does not keep them out if a domain rule matches their address: the rule provisions them again at their next sign-in. Block them instead.
+
+For Google and Microsoft accounts, Ameto also asks the provider about the account at most once an hour. The sign-in requests offline access, and the provider's refresh token is stored encrypted with the master key (`Ameto:MasterKey`, otherwise `secret.key` in the data directory). When the provider refuses because the account was disabled, deleted or had its sessions revoked, every Ameto session of that account ends. When the provider cannot be reached, sessions continue for at most 24 hours since its last confirmation.
+
+Google sends a refresh token only with the consent screen. If none is on file, Ameto shows that screen once.
+
+Deleting `jwt-secret.bin` from the data directory signs everyone out.
+
 ---
 
 ## Hot-tier options (`Ameto:HotTier`)

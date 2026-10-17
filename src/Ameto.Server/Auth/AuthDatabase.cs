@@ -111,6 +111,24 @@ internal sealed class AuthDatabase
             );
             CREATE INDEX IF NOT EXISTS ix_search_history_v2_user
                 ON search_history_v2(username, scope, pinned, updated_at DESC);
+
+            -- One row per signed-in browser. The refresh cookie names the row and a generation
+            -- under an HMAC, so nothing here is a credential; see AuthSessions. Times are unix ms.
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id            TEXT    PRIMARY KEY,
+                user_id       TEXT    NOT NULL,
+                generation    INTEGER NOT NULL,
+                created_at    INTEGER NOT NULL,
+                rotated_at    INTEGER NOT NULL,
+                last_used_at  INTEGER NOT NULL,
+                expires_at    INTEGER NOT NULL,
+                revoked_at    INTEGER,
+                revoke_reason TEXT    NOT NULL DEFAULT '',
+                user_agent    TEXT    NOT NULL DEFAULT '',
+                ip            TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS ix_auth_sessions_user
+                ON auth_sessions(user_id);
             """);
     }
 
@@ -174,6 +192,19 @@ internal sealed class AuthDatabase
         // Empty on rows created before this column existed; those bind on next sign-in.
         // See AuthStore.FindOrCreateOAuthUser — an email alone is not an identity.
         try { Exec(conn, "ALTER TABLE users ADD COLUMN provider_subject TEXT NOT NULL DEFAULT ''"); }
+        catch { /* column already exists */ }
+
+        // Blocked by an admin. The row stays — deleting it would let an OAuth domain rule
+        // provision the same person again at their next sign-in — but nothing is accepted for it.
+        try { Exec(conn, "ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0"); }
+        catch { /* column already exists */ }
+
+        // The provider's own refresh token (encrypted, enc:v1:) and when the provider last vouched
+        // for the account, in unix ms. Asking it again is how a suspension in Google Workspace or
+        // Entra ID ends an Ameto session. See ProviderAccessCheck.
+        try { Exec(conn, "ALTER TABLE users ADD COLUMN provider_refresh_token TEXT NOT NULL DEFAULT ''"); }
+        catch { /* column already exists */ }
+        try { Exec(conn, "ALTER TABLE users ADD COLUMN provider_checked_at INTEGER NOT NULL DEFAULT 0"); }
         catch { /* column already exists */ }
 
         // Carry an old un-scoped history into search_history_v2. Every row in the v1

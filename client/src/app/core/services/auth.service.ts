@@ -1,7 +1,7 @@
 import { Injectable, signal, computed, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Router } from '@angular/router';
-import { tap } from 'rxjs';
+import { Observable, finalize, shareReplay, tap } from 'rxjs';
 import { appPath } from '../../shared/utils/app-url';
 import {
   ALL_VIEW_PERMISSIONS, AuthProvidersDto, LoginResponseDto, UserRole, ViewPermission,
@@ -13,6 +13,23 @@ const ROLE_KEY    = 'rd_role';
 const PERMS_KEY   = 'rd_perms';
 const RETURN_KEY  = 'rd_return_url';
 
+/** Refresh this long before the access token runs out. It lives 15 minutes. */
+const REFRESH_AHEAD_MS = 3 * 60_000;
+
+/** True for an HTTP 401: the server saying there is no session to continue. */
+export function isUnauthorized(err: unknown): boolean {
+  return (err as { status?: number } | null)?.status === 401;
+}
+
+/**
+ * The sign-in, as the page holds it.
+ *
+ * <p>Two credentials, kept in two places. The access token — 15 minutes — is in localStorage
+ * and goes out as a bearer header. The session that outlives it is an HttpOnly cookie the page
+ * cannot read: `/api/auth/refresh` trades it for a new access token and a rotated cookie. So an
+ * expired token is not a signed-out user; it is a refresh away from being signed in again, and
+ * only a 401 from that refresh means the session is over (ended, blocked, or a month unused).</p>
+ */
 @Injectable({ providedIn: 'root' })
 export class AuthService {
   private http   = inject(HttpClient);
@@ -23,11 +40,26 @@ export class AuthService {
   private _role      = signal<UserRole>((localStorage.getItem(ROLE_KEY) as UserRole) ?? 'viewer');
   private _perms     = signal<number>(Number(localStorage.getItem(PERMS_KEY) ?? ALL_VIEW_PERMISSIONS));
 
-  isAuthenticated = computed(() => !!this._token() && this._expiresAt() > Date.now());
-  isAdmin         = computed(() => this._role() === 'admin');
-  isManager       = computed(() => this._role() === 'admin' || this._role() === 'manager');
+  /** The refresh in flight, shared by everyone who needs a token while it runs. */
+  private refreshing: Observable<LoginResponseDto> | null = null;
+
+  /**
+   * True while this browser is signed in as far as the page can tell: a token was issued and no
+   * sign-out or refused refresh has cleared it since. The token may have expired meanwhile.
+   */
+  hasSession  = computed(() => !!this._token());
+  isAdmin     = computed(() => this._role() === 'admin');
+  isManager   = computed(() => this._role() === 'admin' || this._role() === 'manager');
   /** Effective view-scope bitmask for the signed-in user (admin → all). */
-  permissions     = computed(() => (this._role() === 'admin' ? ALL_VIEW_PERMISSIONS : this._perms()));
+  permissions = computed(() => (this._role() === 'admin' ? ALL_VIEW_PERMISSIONS : this._perms()));
+
+  /**
+   * True when the access token is usable right now. A method, not a computed: the answer changes
+   * with the clock, and a computed would keep saying yes after expiry until a signal moved.
+   */
+  isAuthenticated(): boolean {
+    return !!this._token() && this._expiresAt() > Date.now();
+  }
 
   /** True when the user may view the given scope. Admin always passes. */
   can(scope: ViewPermission): boolean {
@@ -57,45 +89,71 @@ export class AuthService {
     window.location.href = appPath(`/api/auth/oauth/${provider}`);
   }
 
-  /** Called by the OAuth callback route — stores the token from the URL fragment. */
-  handleOAuthCallback(token: string, expiresIn: number, role: string): void {
-    this.storeToken({ token, expiresIn, role: role as UserRole });
+  /**
+   * Called by the OAuth callback route. The server has set the session cookie on the redirect
+   * that brought the browser here — and put no token in the URL — so the token comes from a
+   * refresh. Resolves to where the user should go next.
+   */
+  finishOAuthSignIn(): Observable<LoginResponseDto> {
+    return this.refresh();
+  }
+
+  /** Where to go after an OAuth sign-in: the page the user started from, once. */
+  takeOAuthReturnUrl(): string {
     const returnUrl = sessionStorage.getItem(RETURN_KEY);
     sessionStorage.removeItem(RETURN_KEY);
-    this.router.navigateByUrl(returnUrl || '/events');
+    return returnUrl || '/events';
   }
 
   getProviders() {
     return this.http.get<AuthProvidersDto>('/api/auth/providers');
   }
 
-  refresh() {
-    return this.http
-      .post<LoginResponseDto>('/api/auth/refresh', null)
-      .pipe(tap(r => this.storeToken(r)));
+  /**
+   * Trades the session cookie for a new access token. Concurrent callers — a burst of requests
+   * that all came back 401 when the token ran out — share one request: each refresh rotates the
+   * cookie, and a second one racing the first would only be answered from the server's grace.
+   * A 401 clears the session; any other failure leaves it alone for the next attempt.
+   */
+  refresh(): Observable<LoginResponseDto> {
+    this.refreshing ??= this.http.post<LoginResponseDto>('/api/auth/refresh', null).pipe(
+      tap({
+        next:  r   => this.storeToken(r),
+        error: err => { if (isUnauthorized(err)) this.clearSession(); },
+      }),
+      finalize(() => { this.refreshing = null; }),
+      shareReplay({ bufferSize: 1, refCount: false }),
+    );
+    return this.refreshing;
   }
 
+  /** Signs out here and on the server, which ends the session and clears its cookie. */
   logout(): void {
-    [TOKEN_KEY, EXPIRES_KEY, ROLE_KEY, PERMS_KEY].forEach(k => localStorage.removeItem(k));
-    this._token.set(null);
-    this._expiresAt.set(0);
-    this._role.set('viewer');
-    this._perms.set(ALL_VIEW_PERMISSIONS);
+    if (this.hasSession())
+      this.http.post('/api/auth/logout', null).subscribe({ error: () => { /* signed out locally regardless */ } });
+    this.clearSession();
     this.router.navigate(['/login']);
   }
 
   /**
    * Re-validates the session after a channel that bypasses the HTTP interceptor fails.
    * `EventSource` can neither send the `Authorization` header nor expose the response
-   * status, so an SSE 401 (stale/expired token, e.g. after the API target changed) never
-   * reaches {@link authInterceptor}. This routes the check back through `HttpClient`:
-   * a missing/expired token logs out immediately; otherwise `/api/auth/refresh` decides —
-   * a 401 there triggers the interceptor's logout + redirect, while a transient/network
-   * error returns no 401 and leaves the session intact (no false logout on a blip).
+   * status, so an SSE 401 (an expired token, an ended session) never reaches
+   * {@link authInterceptor}. A refresh answers the question: a 401 there means the session is
+   * gone and signs out, while a transient/network error leaves the session intact (no false
+   * logout on a blip).
    */
   verifySession(): void {
-    if (!this.isAuthenticated()) { this.logout(); return; }
-    this.refresh().subscribe({ error: () => { /* 401 → interceptor logs out; else ignore */ } });
+    if (!this.hasSession()) { this.logout(); return; }
+    this.refresh().subscribe({ error: err => { if (isUnauthorized(err)) this.logout(); } });
+  }
+
+  private clearSession(): void {
+    [TOKEN_KEY, EXPIRES_KEY, ROLE_KEY, PERMS_KEY].forEach(k => localStorage.removeItem(k));
+    this._token.set(null);
+    this._expiresAt.set(0);
+    this._role.set('viewer');
+    this._perms.set(ALL_VIEW_PERMISSIONS);
   }
 
   private storeToken(r: LoginResponseDto): void {
@@ -130,10 +188,14 @@ export class AuthService {
     this._perms.set(perms);
   }
 
+  /**
+   * Keeps the token fresh while the page is open, and renews an expired one as soon as the page
+   * runs again — after the laptop wakes, say. A 401 signs out; a network error waits for the
+   * next tick.
+   */
   private autoRefresh(): void {
-    if (!this.isAuthenticated()) return;
-    if (this._expiresAt() - Date.now() < 5 * 60 * 1000)
-      this.refresh().subscribe({ error: () => this.logout() });
+    if (!this.hasSession()) return;
+    if (this._expiresAt() - Date.now() < REFRESH_AHEAD_MS)
+      this.refresh().subscribe({ error: err => { if (isUnauthorized(err)) this.logout(); } });
   }
 }
-

@@ -23,6 +23,9 @@
             </td>
             <td>
               <span class="role-badge" [class.admin]="u.role === 'admin'">{{ u.role }}</span>
+              @if (u.blocked) {
+                <span class="blocked-badge" title="Blocked: cannot sign in">blocked</span>
+              }
             </td>
             <td class="muted">{{ u.createdAt | date: 'yyyy-MM-dd' }}</td>
             <td class="action-cell">

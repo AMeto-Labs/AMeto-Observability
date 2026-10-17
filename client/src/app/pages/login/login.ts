@@ -36,10 +36,16 @@ export class LoginComponent implements OnInit {
       if (err === 'access_denied') {
         const email = params.get('email') ?? '';
         this.error.set(`Access denied. Ask an admin to add ${email} to the system.`);
+      } else if (err === 'blocked') {
+        this.error.set('This account is blocked. Ask an admin to unblock it.');
       } else if (err === 'oauth_failed') {
         this.error.set('OAuth sign-in failed. Please try again.');
       } else if (err === 'no_email') {
         this.error.set('Could not retrieve email from OAuth provider.');
+      } else if (err === 'email_unverified') {
+        this.error.set('The provider has not verified this email address.');
+      } else if (err) {
+        this.error.set('Sign-in failed. Please try again.');
       }
     });
 
@@ -59,7 +65,11 @@ export class LoginComponent implements OnInit {
     this.error.set(null);
     this.auth.login(this.username, this.password).subscribe({
       next: () => this.router.navigateByUrl(this.returnUrl),
-      error: () => { this.loading.set(false); this.error.set('Invalid credentials.'); },
+      error: (e: { status?: number; error?: { error?: string } }) => {
+        this.loading.set(false);
+        // 403: the password was right and the account is blocked; the server says so.
+        this.error.set(e?.status === 403 ? (e.error?.error ?? 'This account is blocked.') : 'Invalid credentials.');
+      },
     });
   }
 

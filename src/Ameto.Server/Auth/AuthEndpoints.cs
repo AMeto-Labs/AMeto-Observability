@@ -11,7 +11,8 @@ internal static class AuthEndpoints
     public static void MapAuthEndpoints(this WebApplication app)
     {
         // ── Local login (open) ────────────────────────────────────────────────
-        app.MapPost("/api/auth/login", (LoginRequest req, AuthStore store, JwtIssuer issuer, AuthOptions opts) =>
+        app.MapPost("/api/auth/login", (
+            LoginRequest req, HttpContext ctx, AuthStore store, AuthSessions sessions, JwtIssuer issuer, AuthOptions opts) =>
         {
             if (!opts.LocalEnabled)
                 return Results.BadRequest(new { error = "Local authentication is disabled." });
@@ -22,15 +23,17 @@ internal static class AuthEndpoints
             if (!store.ValidateUser(req.Username.Trim(), req.Password))
                 return Results.Unauthorized();
 
-            var user  = store.FindByUsernameOrEmail(req.Username.Trim(), "");
-            var role  = user?.Role ?? "viewer";
-            var perms = user?.Permissions ?? ViewPermissions.All;
-            var token = issuer.Issue(req.Username.Trim(), role, permissions: perms);
-            return Results.Ok(new
-            {
-                token, expiresIn = JwtIssuer.ExpiresInSeconds, role,
-                permissions = (int)(role == "admin" ? ViewPermissions.All : perms),
-            });
+            // Null only if the account was deleted between the two statements.
+            var user = store.FindByUsernameOrEmail(req.Username.Trim(), "");
+            if (user is null)
+                return Results.Unauthorized();
+            // Said only after the password checked out, so it tells nobody else the account exists.
+            if (user.Disabled)
+                return Results.Json(new { error = "This account is blocked." }, statusCode: StatusCodes.Status403Forbidden);
+
+            // The session cookie goes out on this response; the token comes back in the body.
+            var sessionId = sessions.Start(ctx, user);
+            return Results.Ok(TokenResponse(issuer, user, sessionId));
         }).RequireRateLimiting("auth-login");
 
         // ── SSE ticket: exchange the bearer token for a single-use URL ticket ──
@@ -51,7 +54,9 @@ internal static class AuthEndpoints
         // GET /api/auth/oauth/microsoft → redirects to Microsoft login
         // The actual callback is handled by the OAuth middleware (OnTicketReceived
         // event in AuthServiceExtensions), not by a separate endpoint here.
-        app.MapGet("/api/auth/oauth/{provider}", async (string provider, HttpContext ctx, AuthOptions opts) =>
+        // ?consent=1 is the callback sending the browser back for a refresh token the provider
+        // withheld (see ProviderAccessCheck.OnSignInAsync); the consent screen is what releases one.
+        app.MapGet("/api/auth/oauth/{provider}", async (string provider, HttpContext ctx, AuthOptions opts, string? consent) =>
         {
             // IsUsable, not merely "configured": a provider refused at registration
             // (e.g. multi-tenant Microsoft without an opt-in) has no scheme to challenge.
@@ -69,8 +74,15 @@ internal static class AuthEndpoints
             // by HandleResponse() in the OnTicketReceived event — so this value is inert today.
             // It still carries PathBase: inert is not the same as correct, and the day someone
             // lets OnTicketReceived fall through, a bare "/" would drop the deployment prefix.
-            await ctx.ChallengeAsync(scheme,
-                new AuthenticationProperties { RedirectUri = ctx.AppUrl("/") });
+            var properties = new AuthenticationProperties { RedirectUri = ctx.AppUrl("/") };
+            if (consent == "1")
+            {
+                // A parameter is put on the provider's URL by the handler; an item travels in the
+                // protected state back to the callback, which must not ask a second time.
+                properties.SetParameter("prompt", "consent");
+                properties.Items[AuthServiceExtensions.ConsentAskedItem] = "1";
+            }
+            await ctx.ChallengeAsync(scheme, properties);
             return Results.Empty;
         });
 
@@ -84,27 +96,18 @@ internal static class AuthEndpoints
         }));
 
         // ── Refresh ───────────────────────────────────────────────────────────
-        // Re-checks that the user still exists in our DB before issuing a new token.
-        // This means deleting a user from Settings takes effect within 2 h (next refresh).
-        app.MapPost("/api/auth/refresh", (HttpContext ctx, JwtIssuer issuer, AuthStore store) =>
+        // The session cookie is the credential, not the bearer token: this is what runs when
+        // the access token has already expired, so it cannot require one. AuthSessions decides
+        // whether the session may continue (revoked, blocked, deleted, provider refusal) and
+        // rotates the cookie. Role and permissions come from the database each time, so an
+        // admin's change reaches the user within one access-token lifetime.
+        app.MapPost("/api/auth/refresh", async (HttpContext ctx, AuthSessions sessions, JwtIssuer issuer) =>
         {
-            var name  = ctx.User.FindFirst(ClaimTypes.Name)?.Value ?? "unknown";
-            var role  = ctx.User.FindFirst(ClaimTypes.Role)?.Value ?? "viewer";
-            var email = ctx.User.FindFirst(ClaimTypes.Email)?.Value ?? "";
-
-            // Verify the user still exists; if deleted, force logout.
-            var user = store.FindByUsernameOrEmail(name, email);
-            if (user is null)
-                return Results.Unauthorized();
-
-            // Use current role + permissions from DB (admin may have changed them since last login)
-            var token = issuer.Issue(user.Username, user.Role, user.Email, permissions: user.Permissions);
-            return Results.Ok(new
-            {
-                token, expiresIn = JwtIssuer.ExpiresInSeconds, role = user.Role,
-                permissions = (int)(user.Role == "admin" ? ViewPermissions.All : user.Permissions),
-            });
-        }).RequireAuthorization();
+            var session = await sessions.RefreshAsync(ctx, ctx.RequestAborted);
+            return session is { } s
+                ? Results.Ok(TokenResponse(issuer, s.User, s.SessionId))
+                : Results.Unauthorized();
+        });
 
         // ── Users: list ───────────────────────────────────────────────────────
         app.MapGet("/api/users", (HttpContext ctx, AuthStore store) =>
@@ -115,11 +118,12 @@ internal static class AuthEndpoints
                 u.Id, u.Username, u.DisplayName, u.Email, u.Provider, u.Role,
                 Permissions = (int)u.Permissions,
                 CreatedAt = u.CreatedAt.ToString("O"),
+                Blocked   = u.Disabled,
             }));
         }).RequireAuthorization();
 
         // ── Users: get one (detail page) ───────────────────────────────────────
-        app.MapGet("/api/users/{id}", (HttpContext ctx, string id, AuthStore store) =>
+        app.MapGet("/api/users/{id}", (HttpContext ctx, string id, AuthStore store, AuthSessions sessions) =>
         {
             if (!IsAdmin(ctx)) return Results.Forbid();
             var u = store.GetUser(id);
@@ -130,6 +134,14 @@ internal static class AuthEndpoints
                     u.Id, u.Username, u.DisplayName, u.Email, u.Provider, u.Role,
                     Permissions = (int)u.Permissions,
                     CreatedAt = u.CreatedAt.ToString("O"),
+                    Blocked   = u.Disabled,
+                    Sessions  = sessions.ListActive(u.Id).Select(s => new
+                    {
+                        CreatedAt  = s.CreatedAt.ToString("O"),
+                        LastUsedAt = s.LastUsedAt.ToString("O"),
+                        ExpiresAt  = s.ExpiresAt.ToString("O"),
+                        s.UserAgent, s.Ip,
+                    }),
                 });
         }).RequireAuthorization();
 
@@ -277,15 +289,22 @@ internal static class AuthEndpoints
         }).RequireAuthorization();
 
         // ── Users: delete ─────────────────────────────────────────────────────
-        app.MapDelete("/api/users/{id}", (HttpContext ctx, string id, AuthStore store) =>
+        app.MapDelete("/api/users/{id}", (
+            HttpContext ctx, string id, AuthStore store, AuthSessions sessions, AuthRevocations revocations) =>
         {
             if (!IsAdmin(ctx)) return Results.Forbid();
             var self   = ctx.User.FindFirst(ClaimTypes.Name)?.Value;
-            var target = store.ListUsers().FirstOrDefault(u => u.Id == id);
+            var target = store.GetUser(id);
             if (target?.Username.Equals(self, StringComparison.OrdinalIgnoreCase) == true)
                 return Results.BadRequest(new { error = "Cannot delete your own account." });
 
-            return store.DeleteUser(id) ? Results.NoContent() : Results.NotFound();
+            if (!store.DeleteUser(id)) return Results.NotFound();
+            // Its open tabs stop now, not when their access tokens run out. And the username is
+            // free again — an OAuth domain rule may provision the same person afresh — so it must
+            // not stay on the blocked list.
+            sessions.RevokeAllForUser(id, "deleted");
+            if (target is not null) revocations.UserUnblocked(target.Username);
+            return Results.NoContent();
         }).RequireAuthorization();
 
         // ── API keys: list (manager+) ─────────────────────────────────────────
@@ -352,8 +371,17 @@ internal static class AuthEndpoints
         }).RequireAuthorization(AuthServiceExtensions.PolicyManager);
     }
 
-    private static bool IsAdmin(HttpContext ctx) =>
+    internal static bool IsAdmin(HttpContext ctx) =>
         ctx.User.FindFirst(ClaimTypes.Role)?.Value == "admin";
+
+    /// <summary>The body login and refresh answer with: an access token under the session, and what the UI gates on.</summary>
+    private static object TokenResponse(JwtIssuer issuer, UserRecord user, string sessionId) => new
+    {
+        token       = issuer.Issue(user, sessionId),
+        expiresIn   = JwtIssuer.ExpiresInSeconds,
+        role        = user.Role,
+        permissions = (int)(user.Role == "admin" ? ViewPermissions.All : user.Permissions),
+    };
 }
 
 internal sealed record LoginRequest(string Username, string Password);

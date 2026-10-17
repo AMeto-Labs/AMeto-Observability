@@ -31,31 +31,49 @@ Use **JWT Bearer**. Obtain a token via `POST /api/auth/login`, then:
 Authorization: Bearer <token>
 ```
 
-SSE endpoints (`GET /api/events`, `GET /api/events/live`) also accept `?access_token=<token>` because browsers cannot set `Authorization` headers on `EventSource`.
+SSE endpoints (`GET /api/events`, `GET /api/events/live`) take `?ticket=<ticket>` instead, because browsers cannot set `Authorization` headers on `EventSource`: `POST /api/auth/sse-ticket` (with the bearer token) returns a single-use ticket.
 
 ---
 
 ## Auth
 
+A sign-in has two parts. The **access token** (a JWT, 15 minutes) goes in the `Authorization` header. The **session** lasts 30 days from its last use and lives in an HttpOnly cookie, `rd_session_<8 hex>` (SameSite=Strict, path `/api/auth`). The suffix is per server, so two servers on one host do not sign each other out. `POST /api/auth/refresh` trades the cookie for a new access token.
+
+A session ends on sign-out, when an admin ends the user's sessions or blocks the account, when the account is deleted, and after 30 days unused. For Google and Microsoft sign-ins, it also ends when the provider stops accepting the account (disabled, deleted, sessions revoked); the provider is asked at most once an hour. A token issued under an ended session is refused on its next request, and an open live tail is cut.
+
 ### `POST /api/auth/login`
 
-Obtain a JWT token (expires in 8 h).
+Sign in with a local account. Sets the session cookie.
 
 **Body:**
 ```json
-{ "username": "admin", "password": "123123" }
+{ "username": "admin", "password": "<password>" }
 ```
 
 **Response `200 OK`:**
 ```json
-{ "token": "<jwt>", "expiresIn": 28800 }
+{ "token": "<jwt>", "expiresIn": 900, "role": "admin", "permissions": 15 }
 ```
+
+**Response `401 Unauthorized`:** wrong username or password.  
+**Response `403 Forbidden`:** the account is blocked.
 
 ### `POST /api/auth/refresh`
 
-Refresh the current token (requires valid Bearer token).
+Continue the session named by the session cookie. No bearer token needed, since the access token may already have expired. Replaces the cookie with the session's next one.
 
-**Response `200 OK`:** same shape as login.
+**Response `200 OK`:** same shape as login.  
+**Response `401 Unauthorized`:** the session has ended. The cookie is cleared.
+
+### `POST /api/auth/logout`
+
+End this browser's session on the server and clear its cookie.
+
+**Response `204 No Content`.**
+
+### `GET /api/auth/oauth/{provider}`
+
+Start a Google (`google`) or Microsoft (`microsoft`) sign-in. The callback sets the session cookie and redirects to `/oauth-callback`, where the page calls `POST /api/auth/refresh`. No token travels in the URL.
 
 ---
 
@@ -81,9 +99,33 @@ Roles: `admin`, `manager`.
 
 ### `DELETE /api/users/{id}`
 
-Delete a user by ID. Cannot delete your own account.
+Delete a user by ID. Cannot delete your own account. Ends the user's sessions at once.
 
 **Response `204 No Content`** on success.
+
+### `GET /api/users/{id}`
+
+One user, with `blocked` and the user's live `sessions` (signed in, last used, expiry, user agent, IP).
+
+### `PATCH /api/users/{id}/blocked`
+
+Block or unblock an account. Blocking ends every session at once and refuses every sign-in until the account is unblocked. Unlike deleting, it keeps the user's row, so an OAuth domain rule cannot add the person back. You cannot block your own account.
+
+**Body:**
+```json
+{ "blocked": true }
+```
+
+**Response `204 No Content`** on success.
+
+### `DELETE /api/users/{id}/sessions`
+
+Sign a user out everywhere without blocking them.
+
+**Response `200 OK`:**
+```json
+{ "ended": 2 }
+```
 
 ---
 

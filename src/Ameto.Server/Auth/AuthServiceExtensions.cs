@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authentication.MicrosoftAccount;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Ameto.Server.Auth;
 
@@ -123,6 +124,17 @@ internal static class AuthServiceExtensions
         services.AddSingleton(issuer);
         services.AddSingleton<ApiKeyCache>();
         services.AddSingleton<SseTicketStore>();
+
+        // Sessions: the refresh cookie, its rotation, revocation, and the provider check.
+        services.AddKeyedSingleton(AuthSessions.ClockKey, TimeProvider.System);
+        services.AddSingleton(SessionTokenCodec.FromJwtSecret(secret));
+        services.AddSingleton<AuthRevocations>();
+        services.AddSingleton<ProviderAccessCheck>();
+        services.AddSingleton<AuthSessions>();
+        // Program registers the configured protector (Ameto:MasterKey) ahead of this; a host that
+        // does not still gets one, keyed by a file in the data directory.
+        services.TryAddSingleton<Ameto.Core.ISecretProtector>(_ =>
+            Ameto.Core.SecretProtectorFactory.Create(dataDirectory, configuredKey: null));
         // Expose the cache as the ingest-path validator (used by OTLP endpoints in Ameto.Otel).
         services.AddSingleton<Ameto.Ingestion.IApiKeyValidator>(sp => sp.GetRequiredService<ApiKeyCache>());
         services.AddSingleton(authOptions);
@@ -169,6 +181,15 @@ internal static class AuthServiceExtensions
                         }
                         return Task.CompletedTask;
                     },
+                    // A valid signature and expiry are not enough: the token's session may have
+                    // been ended, or its user blocked, since it was issued. See AuthRevocations.
+                    OnTokenValidated = static ctx =>
+                    {
+                        if (ctx.Principal is { } principal
+                            && ctx.HttpContext.RequestServices.GetRequiredService<AuthRevocations>().IsRefused(principal))
+                            ctx.Fail("The session has ended.");
+                        return Task.CompletedTask;
+                    },
                 };
             })
             // Read-path API-key scheme: a query request carrying an ingest-style
@@ -184,7 +205,11 @@ internal static class AuthServiceExtensions
                 o.ClientId     = google.ClientId;
                 o.ClientSecret = google.ClientSecret;
                 o.CallbackPath = "/api/auth/oauth/google/callback";
-                o.SaveTokens   = false;
+                // A refresh token, so the account can be re-checked later (ProviderAccessCheck).
+                o.AccessType   = "offline";
+                // Saved into the ticket's properties so HandleOAuthTicket can read the refresh
+                // token. They go no further: it ends the request before any sign-in cookie is written.
+                o.SaveTokens   = true;
                 // Google reports whether it verified the address; without this claim
                 // HandleOAuthTicket cannot tell a proven address from a self-asserted one.
                 o.ClaimActions.MapJsonKey(VerifiedEmailClaim, "email_verified");
@@ -213,7 +238,9 @@ internal static class AuthServiceExtensions
                     $"https://login.microsoftonline.com/{ms.TenantId}/oauth2/v2.0/authorize";
                 o.TokenEndpoint =
                     $"https://login.microsoftonline.com/{ms.TenantId}/oauth2/v2.0/token";
-                o.SaveTokens = false;
+                // As for Google: a refresh token to re-check the account with, read off the ticket.
+                o.Scope.Add("offline_access");
+                o.SaveTokens = true;
                 o.CorrelationCookie.SameSite     = Microsoft.AspNetCore.Http.SameSiteMode.Lax;
                 o.CorrelationCookie.SecurePolicy = Microsoft.AspNetCore.Http.CookieSecurePolicy.SameAsRequest;
                 o.Events.OnTicketReceived = ctx => HandleOAuthTicket(ctx, "microsoft");
@@ -263,33 +290,41 @@ internal static class AuthServiceExtensions
     internal const string VerifiedEmailClaim = "email_verified";
 
     /// <summary>
+    /// Authentication-properties item marking a challenge sent with <c>prompt=consent</c>. It rides
+    /// the protected <c>state</c> to the callback, so a second missing refresh token does not send
+    /// the browser round again.
+    /// </summary>
+    internal const string ConsentAskedItem = "ameto.consent";
+
+    /// <summary>
     /// Called by the OAuth middleware after it has validated the code, obtained
     /// the access token, and built the ClaimsPrincipal.
-    /// We check the email against our allowlist, issue our JWT, and redirect to
-    /// the SPA — then call HandleResponse() so the middleware does nothing further.
-    /// This avoids the double-redirect to CallbackPath that causes the state error.
+    /// We check the email against our allowlist, open a session (its cookie on this
+    /// response), and redirect to the SPA — then call HandleResponse() so the
+    /// middleware does nothing further. This avoids the double-redirect to
+    /// CallbackPath that causes the state error.
     /// </summary>
-    private static Task HandleOAuthTicket(
+    private static async Task HandleOAuthTicket(
         Microsoft.AspNetCore.Authentication.TicketReceivedContext ctx,
         string provider)
     {
-        // Every redirect below targets a route in the SPA, so it goes through AppUrl.
+        // Every redirect below is app-absolute (an SPA route, or back to the challenge for
+        // consent), so it goes through AppUrl.
         // Response.Redirect does not add it: under Ameto:BasePath the prefix has already been
         // stripped from Request.Path by the time this runs, and a bare "/login" would send the
         // browser to the host root — where the SPA loads but its router sees a path that does
         // not start with its own base href. PathBase is empty at the default root, so this is
         // the same string it always was there.
-        var store  = ctx.HttpContext.RequestServices.GetRequiredService<AuthStore>();
-        var issuer = ctx.HttpContext.RequestServices.GetRequiredService<JwtIssuer>();
+        var services = ctx.HttpContext.RequestServices;
+        var store    = services.GetRequiredService<AuthStore>();
 
         var email = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value
                  ?? ctx.Principal?.FindFirst("email")?.Value;
 
         if (string.IsNullOrWhiteSpace(email))
         {
-            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=no_email"));
-            ctx.HandleResponse();
-            return Task.CompletedTask;
+            Finish(ctx, "/login?error=no_email");
+            return;
         }
 
         // Google states whether it verified the address. An unverified one is a string the
@@ -298,18 +333,16 @@ internal static class AuthServiceExtensions
         if (provider == "google" && !string.Equals(
                 ctx.Principal?.FindFirst(VerifiedEmailClaim)?.Value, "true", StringComparison.OrdinalIgnoreCase))
         {
-            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=email_unverified"));
-            ctx.HandleResponse();
-            return Task.CompletedTask;
+            Finish(ctx, "/login?error=email_unverified");
+            return;
         }
 
         // The immutable subject id — the identity the account is actually bound to.
         var subject = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
         if (string.IsNullOrWhiteSpace(subject))
         {
-            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=no_subject"));
-            ctx.HandleResponse();
-            return Task.CompletedTask;
+            Finish(ctx, "/login?error=no_subject");
+            return;
         }
 
         var displayName = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value ?? email;
@@ -317,18 +350,38 @@ internal static class AuthServiceExtensions
         var user = store.FindOrCreateOAuthUser(email, displayName, provider, subject);
         if (user is null)
         {
-            ctx.Response.Redirect(ctx.HttpContext.AppUrl($"/login?error=access_denied&email={Uri.EscapeDataString(email)}"));
-            ctx.HandleResponse();
-            return Task.CompletedTask;
+            Finish(ctx, $"/login?error=access_denied&email={Uri.EscapeDataString(email)}");
+            return;
+        }
+        if (user.Disabled)
+        {
+            Finish(ctx, "/login?error=blocked");
+            return;
         }
 
-        var token = issuer.Issue(user.Username, user.Role, email, displayName, user.Permissions);
+        // SaveTokens put the provider's tokens in the properties; only the refresh token is kept.
+        var step = await services.GetRequiredService<ProviderAccessCheck>().OnSignInAsync(
+            user,
+            ctx.Properties?.GetTokenValue("refresh_token"),
+            consentAsked: ctx.Properties?.Items.ContainsKey(ConsentAskedItem) == true,
+            ctx.HttpContext.RequestAborted);
+        if (step == SignInStep.AskConsent)
+        {
+            Finish(ctx, $"/api/auth/oauth/{provider}?consent=1");
+            return;
+        }
 
-        ctx.Response.Redirect(ctx.HttpContext.AppUrl(
-            $"/oauth-callback?token={Uri.EscapeDataString(token)}" +
-            $"&expiresIn={JwtIssuer.ExpiresInSeconds}&role={user.Role}"));
+        // The session cookie rides this redirect; the page trades it for an access token. No
+        // token in the URL any more, where it reached the browser history and proxy logs.
+        services.GetRequiredService<AuthSessions>().Start(ctx.HttpContext, user);
+        Finish(ctx, "/oauth-callback");
+    }
+
+    /// <summary>Ends the callback with a redirect to an app-absolute path.</summary>
+    private static void Finish(Microsoft.AspNetCore.Authentication.TicketReceivedContext ctx, string appPath)
+    {
+        ctx.Response.Redirect(ctx.HttpContext.AppUrl(appPath));
         ctx.HandleResponse();
-        return Task.CompletedTask;
     }
 
     private static Task HandleOAuthFailure(

@@ -22,6 +22,23 @@ export interface UserDto {
   role: UserRole;
   permissions: number;
   createdAt: string;
+  /** Blocked by an admin: no sign-in, refresh or request is accepted until unblocked. */
+  blocked: boolean;
+}
+
+/** One signed-in browser of a user, as the user detail page lists it. */
+export interface UserSessionDto {
+  createdAt: string;
+  lastUsedAt: string;
+  /** When the session lapses unless it is used again (each use extends it). */
+  expiresAt: string;
+  userAgent: string;
+  ip: string;
+}
+
+/** The user detail page's view: the user plus their live sessions. */
+export interface UserDetailDto extends UserDto {
+  sessions: UserSessionDto[];
 }
 
 /** API-key permission bit flags (mirror of the server's ApiKeyPermissions).
