@@ -2617,14 +2617,21 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 throw;
             }
 
-            // Installed: whatever failed before has cleared.
+            // Installed: whatever failed before has cleared. The run's reset under its lock — guarded (round-6 review,
+            // the LOW on d9abd2f's audit): a Lock's first contended enter allocates its wait, and a throw here, after the
+            // install, skipped the hand-off of the slot and the count to the heavy phase below. The count goes to 0
+            // without it.
             Volatile.Write(ref _swapFailedAt, 0);
             Volatile.Write(ref _swapRetryAt, 0);
-            lock (_swapRunLock)
+            try
             {
-                Volatile.Write(ref _swapFailures, 0);
-                _swapsUntriableSince = 0;
+                lock (_swapRunLock)
+                {
+                    Volatile.Write(ref _swapFailures, 0);
+                    _swapsUntriableSince = 0;
+                }
             }
+            catch (Exception) { Volatile.Write(ref _swapFailures, 0); /* the clock's mark stays; it only ages a run */ }
 
             // Frozen: its events' own text is the frozen backlog's until its slot goes back. Allocates
             // nothing, so nothing stands between the slot and the heavy phase below.
@@ -2973,13 +2980,27 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private void ReleaseFlushSlot()
     {
-        lock (_swapRunLock)
+        // The lock's enter can throw — a Lock's first contended enter allocates its wait — and this must not (round-6
+        // review, the LOW on d9abd2f's audit): without the lock the clock's restart is lost, and the slot goes back.
+        bool locked = false;
+        try
         {
-            RestartSwapRunClockLocked();
+            try
+            {
+                _releaseSlotLockForTest?.Invoke();
+                _swapRunLock.Enter();
+                locked = true;
+            }
+            catch (Exception) { /* below, without the clock */ }
+            if (locked) RestartSwapRunClockLocked();
             try { _flushSlots.Release(); }
             catch (Exception) { /* ObjectDisposedException; or out of memory waking a waiter, which has the slot */ }
         }
+        finally { if (locked) _swapRunLock.Exit(); }
     }
+
+    /// <summary>Test seam: runs as a slot's release enters the run's lock; throwing from it is that enter running out of memory.</summary>
+    internal Action? _releaseSlotLockForTest;
 
     /// <summary>A swap found the frozen tiers' text at its budget, and was not tried: a live run's clock stops until a slot (with its text) comes back.</summary>
     private void StopSwapRunClock()

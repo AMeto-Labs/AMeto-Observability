@@ -509,21 +509,22 @@ public sealed partial class StorageEngine
     ///
     /// <para>Runs after a swap has been installed, so it must not leave the block in limbo when
     /// memory is short: a close that cannot even be queued is done here, inline, and a block that
-    /// cannot be queued for its despill says so — the next start finds the file and despills it.</para>
+    /// cannot be queued for its despill says so — the next start finds the file and despills it.
+    /// Never throws (the ultra review's #6, below).</para>
     /// </summary>
     private void CloseSpill(SpillTarget spill)
     {
         if (Volatile.Read(ref _writesClosed) != 0)
         {
-            Close(spill);
+            CloseSpillNow(spill);
             return;
         }
 
         Task t;
-        try { t = Task.Run(() => Close(spill)); }
+        try { t = StartSpillClose(spill); }
         catch (Exception)
         {
-            Close(spill);   // slower, on the swap, but closed and queued
+            CloseSpillNow(spill);   // slower, on the swap, but closed and queued
             return;
         }
         try
@@ -535,26 +536,57 @@ public sealed partial class StorageEngine
                 TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
         catch (Exception) { /* only shutdown's wait for this close is lost; the close itself is running */ }
+    }
 
-        void Close(SpillTarget s)
+    /// <summary>
+    /// The close, off the caller. Its own method so the closure over <paramref name="spill"/> is allocated in here,
+    /// inside <see cref="CloseSpill"/>'s try (the ultra review's #6), as <see cref="StartSwapRetry"/>'s is. Captured by
+    /// a lambda in CloseSpill, the parameter's closure was allocated on its entry — before the shutdown check, outside
+    /// every try: an out of memory there left the replaced target unclosed and unqueued, its acknowledged events
+    /// unsearchable until a restart and its tail never written back, and, from SpillWithoutSlot's rotation, it was
+    /// recorded as a failed swap although the new target was installed.
+    /// </summary>
+    private Task StartSpillClose(SpillTarget spill)
+    {
+        _spillCloseClosureForTest?.Invoke();
+        return Task.Run(() => CloseSpillNow(spill));
+    }
+
+    /// <summary>Test seam: runs where a spill's close allocates its closure; throwing from it is that allocation failing.</summary>
+    internal Action? _spillCloseClosureForTest;
+
+    /// <summary>Closes a replaced spill target and queues its block for its despill. Never throws: each step, and its line, guarded.</summary>
+    private void CloseSpillNow(SpillTarget s)
+    {
+        if (s.Count == 0)
         {
-            if (s.Count == 0)
-            {
-                // Opened and replaced before anything was written into it: there is nothing to keep.
-                try { s.Wal.Delete(); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Could not delete the empty spill file {File}", s.Path); }
-                return;
-            }
-            try { s.Wal.Dispose(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Closing the spill file {File} failed", s.Path); }
-            NoteKeptFlushFailures(s.Wal);   // its last fsyncs: it is not ticked again (round-6 review)
-            if (Volatile.Read(ref _writesClosed) != 0) return;
-            try { EnqueueSpill(new SpillFile(s.SegId, s.Path)); }
+            // Opened and replaced before anything was written into it: there is nothing to keep.
+            try { s.Wal.Delete(); }
             catch (Exception ex)
+            {
+                try { _logger.LogWarning(ex, "Could not delete the empty spill file {File}", s.Path); }
+                catch (Exception) { /* the line is lost; the next start deletes an empty spill file */ }
+            }
+            return;
+        }
+        try { s.Wal.Dispose(); }
+        catch (Exception ex)
+        {
+            try { _logger.LogWarning(ex, "Closing the spill file {File} failed", s.Path); }
+            catch (Exception) { /* the line is lost; the block is queued all the same */ }
+        }
+        try { NoteKeptFlushFailures(s.Wal); }   // its last fsyncs: it is not ticked again (round-6 review)
+        catch (Exception) { /* the count is lost; the block is queued all the same */ }
+        if (Volatile.Read(ref _writesClosed) != 0) return;
+        try { EnqueueSpill(new SpillFile(s.SegId, s.Path)); }
+        catch (Exception ex)
+        {
+            try
             {
                 _logger.LogError(ex, "Spilled block {File} could not be queued for its despill — it is written into " +
                                      "segments at the next start", s.Path);
             }
+            catch (Exception) { /* the line is lost; the next start finds the file */ }
         }
     }
 

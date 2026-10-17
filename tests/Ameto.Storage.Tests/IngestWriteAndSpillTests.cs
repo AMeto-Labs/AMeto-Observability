@@ -374,6 +374,73 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review, the LOW on d9abd2f's audit. A slot's release took the run's lock with a lock statement, and a
+    /// Lock's first contended enter allocates its wait: an out of memory there threw out of ReleaseFlushSlot — which
+    /// ends the finallys and catches that own a slot, and must never throw — and the slot was never given back. It
+    /// goes back without the lock now, the clock's restart lost.
+    /// </summary>
+    [Fact]
+    public async Task A_slots_release_whose_lock_cannot_be_entered_still_gives_the_slot_back()
+    {
+        var engine = OneSlotEngine(Options(NewDir()));
+        try
+        {
+            int calls = 0;
+            engine._releaseSlotLockForTest = () =>
+            {
+                if (Interlocked.Increment(ref calls) == 1) throw new OutOfMemoryException("test: the lock's wait cannot be allocated");
+            };
+            using (var batch = Batch(engine, 0, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            await engine.FlushHotTierAsync();
+            WaitFor(() => engine.HeavyPhasesInFlight == 0, "the flush to end", ShortGuard);
+            Assert.True(Volatile.Read(ref calls) >= 1, "setup: no slot was given back");
+            Assert.Equal(engine.FlushSlots, engine.FlushSlotsForTest.CurrentCount);
+            Assert.Equal(10, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._releaseSlotLockForTest = null;
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The ultra review's #6. A spill's close allocated its closure on CloseSpill's entry, before the shutdown check
+    /// and outside every try: an out of memory there left the replaced target unclosed and unqueued — its events,
+    /// acknowledged, unsearchable until a restart. The closure is made inside the try now, and a close that cannot be
+    /// set up is done inline: the block is queued and despilled all the same.
+    /// </summary>
+    [Fact]
+    public async Task A_spill_whose_close_cannot_be_set_up_is_closed_inline_and_despilled()
+    {
+        const int Spilled = 20;
+        var engine = OneSlotEngine(Options(NewDir()));
+        var gate   = HoldFirstFlush(engine);
+        try
+        {
+            using (var tiers = Batch(engine, 0, 2 * TierEvents))
+                Assert.Equal(new LogBatchWriteResult(2 * TierEvents, 0, 0), await engine.WriteBatchAsync(tiers, HangGuard));
+            using (var more = Batch(engine, 2 * TierEvents, Spilled))   // every slot busy, the live tier full: spilled
+                Assert.Equal(new LogBatchWriteResult(Spilled, 0, 0), await engine.WriteBatchAsync(more, HangGuard));
+            Assert.True(engine.IsSpilling, "setup: the engine is not spilling");
+
+            engine._spillCloseClosureForTest = static () => throw new OutOfMemoryException("test: the close's closure cannot be allocated");
+            gate.Set();   // the swap goes through, the spill ends, and its target is closed
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending == 0 && engine.DespilledEvents == Spilled,
+                    "the spill to end and its block to be despilled", ShortGuard);
+            await engine.FlushHotTierAsync();
+            Assert.Equal(2 * TierEvents + Spilled, ReadAll(engine).Count);
+        }
+        finally
+        {
+            engine._spillCloseClosureForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A spill file that cannot be opened — a full volume the floor check cannot see (a UNC path, a
     /// mount folder, a junction) — is reported once and tried again at most once a second. Every
     /// swap attempt used to try again, each waiting writer asking ten times a second, and each
