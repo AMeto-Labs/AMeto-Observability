@@ -60,15 +60,38 @@ public sealed class IngestFramesGate : IValueTaskSource<bool>
     /// <summary>
     /// A receiver's first suspension, in place of a yield: true once every frame above it has suspended — it may go
     /// on; false when one of them failed, or the request was answered without it — it must touch nothing of the
-    /// request, and return. With no gate (a pipeline without <see cref="Run"/>, such as a test's), a yield and true.
+    /// request, and return. With no gate (a pipeline without <see cref="Run"/>, such as a test's), a yield and true
+    /// (<see cref="Yielded"/>).
     /// </summary>
     public static ValueTask<bool> PassAsync(HttpContext ctx) =>
-        ctx.Features.Get<IngestFramesGate>() is { } gate ? new ValueTask<bool>(gate, gate._core.Version) : YieldThenPass();
+        ctx.Features.Get<IngestFramesGate>() is { } gate ? new ValueTask<bool>(gate, gate._core.Version) : new ValueTask<bool>(Yielded.Instance, 0);
 
-    private static async ValueTask<bool> YieldThenPass()
+    /// <summary>
+    /// With no gate: a suspension that always happens, as <see cref="Task.Yield"/>'s does — never complete until its
+    /// continuation is registered, which queues it to the pool. It was a yield inside an async method of its own, which
+    /// is not one: the pool could run that yield's continuation, and complete the method, before the receiver looked,
+    /// and the receiver then went on unsuspended — its first suspension its body read, waiting for an inflate slot,
+    /// which a failure there left waiting to take a freed slot for nobody (CI, 2 cores). Stateless: one for every use.
+    /// </summary>
+    private sealed class Yielded : IValueTaskSource<bool>
     {
-        await Task.Yield();
-        return true;
+        internal static readonly Yielded Instance = new();
+
+        public ValueTaskSourceStatus GetStatus(short token) => ValueTaskSourceStatus.Pending;
+
+        public bool GetResult(short token) => true;
+
+        /// <summary>
+        /// Queued to the pool, with the execution context when asked to flow it. A scheduling context is not looked for:
+        /// ASP.NET Core sets none.
+        /// </summary>
+        public void OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        {
+            if ((flags & ValueTaskSourceOnCompletedFlags.FlowExecutionContext) != 0)
+                ThreadPool.QueueUserWorkItem(continuation, state, preferLocal: false);
+            else
+                ThreadPool.UnsafeQueueUserWorkItem(continuation, state, preferLocal: false);
+        }
     }
 
     /// <summary>

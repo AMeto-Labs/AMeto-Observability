@@ -105,6 +105,22 @@ public sealed class ReceiverFramesAboveTests : IClassFixture<AmetoWebAppFactory>
         finally { storage._afterWriteGate = null; }
     }
 
+    /// <summary>
+    /// With no gate (a pipeline without <see cref="IngestFramesGate.Run"/>), the receiver's first suspension still always
+    /// happens: the wait is not complete until it is awaited, however long that takes. It was a yield inside an async
+    /// method of its own, which the pool could complete before the receiver looked — the receiver then went on
+    /// unsuspended to its body read, and a failure at that read's suspension left it waiting to take a freed inflate
+    /// slot for nobody (ReceiverFirstSuspensionTests' P12 on the metrics route, red on CI's 2 cores).
+    /// </summary>
+    [Fact]
+    public async Task With_no_gate_the_receivers_first_suspension_is_not_complete_before_it_is_awaited()
+    {
+        var pass = IngestFramesGate.PassAsync(new DefaultHttpContext());
+        await Task.Delay(100);   // a yield queued when the wait was made has long run by now
+        Assert.False(pass.IsCompleted, "the wait was complete before it was awaited: the receiver would not suspend on it");
+        Assert.True(await pass.AsTask().WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
     private RequestDelegate Pipeline(string route, Action<Task> received)
     {
         var receiver = ((RouteEndpoint)_factory.Services.GetRequiredService<EndpointDataSource>().Endpoints
