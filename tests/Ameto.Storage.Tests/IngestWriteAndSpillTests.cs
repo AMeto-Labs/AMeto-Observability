@@ -5245,6 +5245,40 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review (a38ecc2's version argument to LoadPool, unpinned): a spill file is a v6 log, and its pool is read
+    /// with round-5 L-1's torn-tail rule — a row whose text a power loss zero-filled from inside, its header kept, is the
+    /// torn tail, not its text and NULs stamped on every event of its index. Read as an older log's pool, the rule was
+    /// off for every despill.
+    /// </summary>
+    [Fact]
+    public async Task A_despilled_blocks_pool_row_a_power_loss_zero_filled_is_not_read_as_its_text()
+    {
+        string dir    = NewDir();
+        var    opts   = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill  = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(9_000), 1 << 20))
+            for (int i = 0; i < 10; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, 40, "event {n}", Props(i),
+                           serviceIndex: 41, service: "Orders.Api");
+
+        // The pool's tail zero-filled from inside its newest row's text, the row's header kept: as a power loss leaves it.
+        byte[] pool = File.ReadAllBytes(spill + ".pool");
+        int    at   = pool.AsSpan().IndexOf("Orders.Api"u8);
+        Assert.True(at > 0 && at + "Orders.Api".Length == pool.Length, "setup: the service is not the pool's newest row");
+        Array.Clear(pool, at + 3, pool.Length - at - 3);
+        File.WriteAllBytes(spill + ".pool", pool);
+
+        await using var engine = Engine(opts);
+        await FlushEverythingAsync(engine, ShortGuard);
+        var events = ReadAll(engine);
+        Assert.Equal(10, events.Count);
+        int misread = events.Values.Count(static e => e.Service is { } s && s.Contains('\0'));
+        Assert.True(misread == 0, $"{misread} of 10 despilled events carry the torn row's text and its NULs as their service");
+    }
+
+    /// <summary>
     /// Round-6 review R5-M5, the replay after a kill: the live WAL's pool, whose newest row was a NUL-ending
     /// service, is replayed with that service.
     /// </summary>
@@ -5766,12 +5800,68 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             Assert.True(spill is not null, "setup: the engine is not spilling");
             engine._beforePeriodicWalFlushForTest = static () => throw new IOException("test: the live WAL's msync failed");
 
-            WaitFor(() => logger.Thrown >= 2 && spill.HandleFlushCount >= 1,
+            // Counted from a tick whose live line threw, with spilled events written after it (round-6 review: a tick
+            // between the batch and the seam often flushed the spill file already, and the pin then held whatever the
+            // guard did — a spill file flushes only what is new).
+            WaitFor(() => logger.Thrown >= 1, "a tick's live WAL line to throw", ShortGuard);
+            long flushed = spill.HandleFlushCount;
+            using (var more = Batch(engine, Total, 10))
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(more, HangGuard));
+            Assert.Same(spill, engine.LiveSpillWalForTest);
+            WaitFor(() => spill.HandleFlushCount > flushed,
                     "the spill file to be flushed on ticks whose live WAL line threw", ShortGuard);
         }
         finally
         {
             engine._beforePeriodicWalFlushForTest = null;
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Round-5 review L-3, the WAL loop's other line (round-6 review: its guard was in no list and no test). A spill file
+    /// whose flush keeps failing, and whose Warning throws, must not end the tick there: the line's guard goes on to the
+    /// rest of it, the spill volume's free-space measure among them (L-5), which went stale while spilling — and each
+    /// tick then blocked a pool thread in the outer catch's pause.
+    /// </summary>
+    [Fact]
+    public async Task A_spill_file_whose_failed_flush_cannot_be_said_does_not_end_the_wal_loops_tick()
+    {
+        var logger = new ThrowingLogger(line => line.StartsWith("Periodic spill flush failed", StringComparison.Ordinal));
+        var opts   = new ServerOptions
+        {
+            DataDirectory = NewDir(),
+            HotTier = new HotTierOptions
+            {
+                MaxSizeBytes = TierBytes, FlushConcurrency = 1, SpillEnabled = true, SpillMinFreeDiskBytes = 0,
+                WalFlushInterval = TimeSpan.FromMilliseconds(20),
+            },
+        };
+        var engine = OneSlotEngine(opts, logger);
+        var gate   = HoldFirstFlush(engine);
+        int measures = 0;
+        engine._volumeMeasureForTest = _ => { Interlocked.Increment(ref measures); return long.MaxValue / 4; };
+        const int Total = 2 * TierEvents + 1_000;   // A in its flush, B full, the rest spilled
+        try
+        {
+            using (var batch = Batch(engine, 0, Total))
+                Assert.Equal(new LogBatchWriteResult(Total, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
+            var spill = engine.LiveSpillWalForTest;
+            Assert.True(spill is not null, "setup: the engine is not spilling");
+            spill.HandleFlushHookForTest = static _ => throw new IOException("test: the spill file's fsync failed");
+            using (var more = Batch(engine, Total, 10))   // something new for the spill file's flush to fail on
+                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(more, HangGuard));
+
+            WaitFor(() => logger.Thrown >= 1, "a tick's spill line to throw", ShortGuard);
+            int measured = Volatile.Read(ref measures);
+            WaitFor(() => Volatile.Read(ref measures) >= measured + 2,   // one a second, as each measure ages
+                    "the spill volume's free space to be measured on ticks whose spill line threw", ShortGuard);
+            Assert.True(logger.Thrown >= 3, $"setup: {logger.Thrown} spill line(s) thrown");
+        }
+        finally
+        {
+            if (engine.LiveSpillWalForTest is { } s) s.HandleFlushHookForTest = null;
             gate.Set();
             await engine.DisposeAsync();
         }
@@ -6739,10 +6829,14 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// cannot write the next (a directory stands where its file goes). The level it moved — registered
     /// by nobody — is deleted, the WAL goes to the despill, and once the way is clear the despill writes
     /// the whole block: every event once. Left there, the level would stop the despill's own flush,
-    /// which never moves a level over a file.
+    /// which never moves a level over a file. And with the log's look failing at the hand-off (round-6
+    /// review: 1b5cd00's hand-off of a log that cannot be looked at was unpinned): it is handed over all
+    /// the same — only a log that is gone is not — not left for the next start, unserved until then.
     /// </summary>
-    [Fact]
-    public async Task A_wal_whose_replay_flush_fails_part_way_is_written_whole_by_the_despill()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_wal_whose_replay_flush_fails_part_way_is_written_whole_by_the_despill(bool walLookFails)
     {
         string dir    = NewDir();
         var    opts   = Options(dir);
@@ -6756,11 +6850,18 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         string blocker = Path.Combine(segDir, $"{opts.NodeId.Value}-{9_000 + (int)LogLevel.Error}-{errorAt}-{errorAt}.seg");
         Directory.CreateDirectory(blocker);
 
-        var hold = new TaskCompletionSource();
+        var  hold  = new TaskCompletionSource();
+        bool armed = walLookFails;   // for the start only: the engine's loops carry the seam
         StorageEngine.HoldDespillForTest.Value = hold.Task;
+        StorageEngine.LookFailsForTest.Value   = p => Volatile.Read(ref armed) && p == wal;
         StorageEngine engine;
         try { engine = Engine(opts); }
-        finally { StorageEngine.HoldDespillForTest.Value = null; }
+        finally
+        {
+            StorageEngine.HoldDespillForTest.Value = null;
+            StorageEngine.LookFailsForTest.Value   = null;
+            Volatile.Write(ref armed, false);
+        }
         await using (engine)
         {
             await engine.CatalogLoaded;
