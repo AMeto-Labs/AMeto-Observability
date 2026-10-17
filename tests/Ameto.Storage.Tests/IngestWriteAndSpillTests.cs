@@ -1303,9 +1303,10 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         {
             // Tier 1 swaps, and its flush parks holding the only slot; tier 2 fills and refuses, and its
             // swap, finding no slot, tries to spill: the open fails.
+            // The write that fills tier 1 asks for its swap, and the slot is free: no refusal is asked of it.
+            // One was, and it raced the swap — refused before the swap ran, written into tier 2 after.
             using (var a = Batch(engine, 0, TierEvents))
                 Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
-            Assert.False(TryWriteOne(engine, TierEvents));
             WaitFor(() => engine.FrozenTierCountForTest == 1 && engine.LiveHotTier.Count == 0, "tier 1 to swap");
             using (var b = Batch(engine, TierEvents, TierEvents))
                 Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(b, HangGuard));
@@ -4164,8 +4165,6 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
                     }, Props(j), new string((char)('a' + j % 26), 25_000) + j, exception: null);
                 written += (await engine.WriteBatchAsync(batch, HangGuard)).Written;
             }
-            int blocks = engine.SpillFilesPending;
-            Assert.True(blocks >= 3, $"setup: {blocks} spilled block(s)");
 
             // The despills wait at their read until the frozen tier and the live one have been written, their text
             // given back — so no swapped tier's text stands in the despills' way, and theirs is all that is counted...
@@ -4174,6 +4173,10 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             engine._beforeLevelWriteForTest = null;
             hold.Set();
             WaitFor(() => engine.FrozenTextBytesForTest == 0 && engine.FrozenTierCountForTest == 0, "the swapped tiers written", HangGuard);
+            // Counted once the spill has ended (round-6 review, the LOW on this test): the open file is queued only as the
+            // spill ends and its close runs, and read right after the writes this said "setup: 1 spilled block(s)".
+            WaitFor(() => !engine.IsSpilling && engine.SpillFilesPending >= 3, "the spill to end, its blocks queued", HangGuard);
+            int blocks = engine.SpillFilesPending;
 
             // ...then every level write fails, and the despills go on: each one listed goes to a retry that keeps its tier.
             engine._beforeLevelWriteForTest = _ => throw new IOException("test: the volume is full");
