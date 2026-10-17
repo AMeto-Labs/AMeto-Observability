@@ -1073,6 +1073,7 @@ public sealed partial class StorageEngine
         long noRoomForText   = 0;       // its tier's own text, when the frozen tiers had no room for it: queued to wait
         HotTierSegment? unlisted = null; // read but not yet listed as frozen: freed here, whatever way we leave
         HotTierSegment? charged  = null; // listed and counted against the frozen tiers' text: given back with the slot
+        bool ended           = false;   // EndDespill has run: by a catch at a pause (round 7), or by the finally
         try
         {
             // The marker's paths, made here, before anything is owned: a give-up removes the marker in the
@@ -1114,8 +1115,21 @@ public sealed partial class StorageEngine
             // unfreed: it is still `unlisted`, and the finally frees it.
             // Never queued in the lock or the permit below (OwnerPoll; round-5 M-B).
             ct.ThrowIfCancellationRequested();
-            for (int pause = 1; !_flushLock.Wait(0); )
-                await OwnerPoll(_flushLock, ref pause, 0, ct).ConfigureAwait(false);
+            try
+            {
+                for (int pause = 1; !_flushLock.Wait(0); )
+                    await OwnerPoll(_flushLock, ref pause, 0, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ended HERE (ultra review #3, round 7): a pause whose continuation could not be registered (out of
+                // memory) throws into this method with the finally below skipped, and the tier just read was never
+                // freed, the slot never given back and the block never queued again: in flight, read by nobody, for
+                // the life of the process. A catch runs on every road.
+                ended = true;
+                EndDespill(file, unlisted, slotTransferred, settled, noRoomForText, parked, counted, charged);
+                throw;
+            }
             try
             {
                 if (Volatile.Read(ref _writesClosed) != 0) return;   // never listed; the file is the next start's
@@ -1156,27 +1170,39 @@ public sealed partial class StorageEngine
                 // as a wait that threw here left it — it was served for good beside the block's next
                 // despill. No flush ran: no marker of this attempt to remove (R5-M7).
                 parked = !AbandonDespilledTier(tier, file, mayHaveMarker: false, marker, voided);
+                // And ended here, not by the finally (ultra review #3, round 7): a pause whose continuation could not
+                // be registered skips it, and the slot, the heavy-phase count and the text charge were never given
+                // back — shutdown waited its whole budget for the count, and the frozen tiers stayed closed to that
+                // much text for the life of the process — nor the block queued again.
+                ended = true;
+                EndDespill(file, unlisted, slotTransferred, settled, noRoomForText, parked, counted, charged);
                 throw;
             }
             List<SegmentInfo> written;
-            Task<List<SegmentInfo>>? flush = null;
             try
             {
                 // A block a crash left half-written keeps the levels it got out — the ones found on
                 // disk when this run STARTED, not now: the boot scan registers them as ordinary
                 // segments, and a merge or retention pass may have taken one since. Asking the disk
                 // here found it gone and wrote its events a second time.
-                flush   = FlushTierByLevelAsync(tier, file.SegId, ct, publishedLevels: file.PublishedLevels);
-                written = await flush.ConfigureAwait(false);
+                //
+                // In this frame, not awaited (see FlushTierByLevel). The permit goes back by plain code and in the
+                // catches, not in a finally (R6-M6; see TryFlushAsync's heavy phase).
+                written = FlushTierByLevel(tier, file.SegId, ct, publishedLevels: file.PublishedLevels);
             }
-            // The FLUSH failed — not this method's await of it (see TryFlushAsync's heavy phase).
-            catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // A flush that failed wrote no marker: the marker is its last step, and never throws (R5-M7).
                 slotTransferred = HandFailedDespillToRetry(ex, tier, file, mayHaveMarker: false, marker, voided, out parked);
+                ReleaseHeavyPermit();
                 return;
             }
-            finally { ReleaseHeavyPermit(); }
+            catch
+            {
+                ReleaseHeavyPermit();
+                throw;
+            }
+            ReleaseHeavyPermit();
 
             // Published all or nothing (PublishFlushedTier): one that failed registered nothing, and the
             // tier goes to a retry as a failed flush's does. Left to the finally, the block was queued
@@ -1193,26 +1219,39 @@ public sealed partial class StorageEngine
         }
         finally
         {
-            if (unlisted is not null)
-            {
-                try { unlisted.Dispose(); }
-                catch (Exception) { /* its native memory is lost; the slot still goes back */ }
-            }
-            if (!slotTransferred)
-            {
-                // Before the slot goes back, so the loop that takes it sees this block as gone, or
-                // as not ready yet. A parked block stays in flight: its tier is kept, listed, and a
-                // despill of its file would serve its events twice.
-                if (settled)                SettleSpill(file.SegId);
-                else if (noRoomForText > 0) WaitForFrozenText(file.SegId, noRoomForText);
-                else if (!parked)           RetrySpillLater(file.SegId);
-                // With its text (R5-M11), the frozen tiers' room comes back as the slot does. A parked tier's goes
-                // back too: it is held until shutdown, and kept counted it would close the frozen tiers to every
-                // tier of text until then — its text is outside the budget, at most FlushSlots tiers' (R5-M7).
-                GiveBackSlot(endHeavyPhase: counted, charged);
-            }
-            Interlocked.Increment(ref _despillsCompleted);
+            if (!ended) EndDespill(file, unlisted, slotTransferred, settled, noRoomForText, parked, counted, charged);
         }
+    }
+
+    /// <summary>
+    /// A despill's end, however it ends: frees a tier it read and never listed; unless a retry took the slot over,
+    /// settles the block, leaves it to wait for text room or queues it again, and gives the slot back — with the
+    /// heavy-phase count and the text charge when it had them; then counts the despill. Never throws. Run once: by
+    /// <see cref="DespillAsync"/>'s finally, or by its catch at a pause whose continuation may not have been
+    /// registered (round 7) — such a failure skips the finally, and runs the catch.
+    /// </summary>
+    private void EndDespill(SpillFile file, HotTierSegment? unlisted, bool slotTransferred, bool settled, long noRoomForText,
+                            bool parked, bool counted, HotTierSegment? charged)
+    {
+        if (unlisted is not null)
+        {
+            try { unlisted.Dispose(); }
+            catch (Exception) { /* its native memory is lost; the slot still goes back */ }
+        }
+        if (!slotTransferred)
+        {
+            // Before the slot goes back, so the loop that takes it sees this block as gone, or
+            // as not ready yet. A parked block stays in flight: its tier is kept, listed, and a
+            // despill of its file would serve its events twice.
+            if (settled)                SettleSpill(file.SegId);
+            else if (noRoomForText > 0) WaitForFrozenText(file.SegId, noRoomForText);
+            else if (!parked)           RetrySpillLater(file.SegId);
+            // With its text (R5-M11), the frozen tiers' room comes back as the slot does. A parked tier's goes
+            // back too: it is held until shutdown, and kept counted it would close the frozen tiers to every
+            // tier of text until then — its text is outside the budget, at most FlushSlots tiers' (R5-M7).
+            GiveBackSlot(endHeavyPhase: counted, charged);
+        }
+        Interlocked.Increment(ref _despillsCompleted);
     }
 
     /// <summary>

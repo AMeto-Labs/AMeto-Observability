@@ -19,7 +19,7 @@ namespace Ameto.Storage.Tests;
 /// 64 MB host's budgets and a width of one), and the first tier's flush parks at the seam after
 /// its first level is published, holding that slot for as long as a test needs.</para>
 /// </summary>
-public sealed class IngestWriteAndSpillTests : IDisposable
+public sealed partial class IngestWriteAndSpillTests : IDisposable
 {
     private const long MB = 1024 * 1024;
 
@@ -3597,180 +3597,83 @@ public sealed class IngestWriteAndSpillTests : IDisposable
         }
     }
 
-    // ── A flush's own first suspension (round-5 H-B) ──────────────────────────
+    // ── A flush's level writes, and the awaits around them (round-5 H-B; round 7) ────
 
     /// <summary>
-    /// A flush whose own first suspension cannot be boxed (OwnerAsync's seam, <see cref="FailsFirstSuspension"/>),
-    /// and the level writes around it (StorageEngine.LevelWriteStartingForTest, on each write's thread before
-    /// it reads its tier). The box fails once a level write the flush queued has begun — or after
-    /// <see cref="Bound"/>, when it queued none — so a write that began before the failure is one the
-    /// failure left running: <see cref="LeftWriteBehind"/>, whatever the threads' order. Such a write is
-    /// then held, before it reads anything, until its tier is freed or a second write of it begins (both
-    /// recorded, and the write stopped there: in production the first is a use-after-free), or the bound
-    /// passes. A write that begins on a tier already freed is recorded and stopped too.
-    /// </summary>
-    private sealed class LeftBehindWriteWatch
-    {
-        private static readonly TimeSpan Bound = TimeSpan.FromSeconds(1);
-
-        private readonly ManualResetEventSlim _began = new(false), _boxFailed = new(false);
-        private int _armed = 1;
-        private HotTierSegment? _leftBehind;
-        private volatile bool _leftWriteBehind, _freedUnderIt, _writtenBesideIt;
-
-        /// <summary>A level write had begun when the flush's first suspension failed: it ran on after the flush's fault.</summary>
-        public bool LeftWriteBehind => _leftWriteBehind;
-
-        /// <summary>A tier was freed under a level write, or a write began on a freed tier.</summary>
-        public bool FreedUnderIt => _freedUnderIt;
-
-        /// <summary>A second write of a tier began while the one left behind was running.</summary>
-        public bool WrittenBesideIt => _writtenBesideIt;
-
-        /// <summary>For OwnerAsync.FirstSuspensionFailsForTest: FlushTierByLevelAsync's first suspension fails, once.</summary>
-        public bool FailsFirstSuspension(Type stateMachine)
-        {
-            if (!stateMachine.Name.Contains("<FlushTierByLevelAsync>", StringComparison.Ordinal) || Interlocked.Exchange(ref _armed, 0) == 0)
-                return false;
-            _began.Wait(Bound);   // a write queued before this suspension begins at once; none queued, none begins
-            _boxFailed.Set();
-            return true;
-        }
-
-        public void OnLevelWrite(HotTierSegment tier)
-        {
-            if (tier.IsDisposed)
-            {
-                _freedUnderIt = true;
-                throw new InvalidOperationException("test: a level write began on a freed tier; stopped before it reads");
-            }
-            if (!_boxFailed.IsSet)
-            {
-                Volatile.Write(ref _leftBehind, tier);
-                try
-                {
-                    _began.Set();
-                    if (!_boxFailed.Wait(Bound)) return;   // no flush failed meanwhile: an ordinary write
-                    _leftWriteBehind = true;
-                    SpinWait.SpinUntil(() => tier.IsDisposed || _writtenBesideIt, Bound + Bound);
-                    if (tier.IsDisposed) _freedUnderIt = true;
-                    throw new InvalidOperationException("test: the level write the failed flush left running is stopped before it reads");
-                }
-                finally { Volatile.Write(ref _leftBehind, null); }   // a write of the tier after this one is no longer beside it
-            }
-            if (ReferenceEquals(Volatile.Read(ref _leftBehind), tier))
-            {
-                _writtenBesideIt = true;
-                throw new InvalidOperationException("test: a second write of the tier began beside the one left running");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Round-5 review H-B, the swap. FlushTierByLevelAsync was boxed at its first real suspension, the
-    /// await of its first level's write — a Task.Run already reading the tier — and a box that could not
-    /// be allocated faulted the flush while that write ran on. The heavy phase takes the flush's own fault
-    /// for "it has stopped" and hands the tier to a retry, which wrote it beside the orphan: two writers of
-    /// one tier. The flush is boxed before any level write is queued now, so its failure leaves no write
-    /// behind, and the retry is the tier's only writer.
+    /// Round-5 review H-B and round 7, the swap: the level-write road. FlushTierByLevelAsync awaited each level's
+    /// write, a Task.Run already reading the tier; an await of it whose registration failed — the later-suspension
+    /// seam, while the write is held — faulted the flush with the write running on, and the heavy phase took the
+    /// flush's fault for "it has stopped": it handed the tier to a retry, which wrote it beside the orphan, two
+    /// writers of one tier. Round 5 boxed the flush first; a later suspension was the same road. The flush runs in
+    /// the heavy phase's own frame now (FlushTierByLevel), so no await is left to fail while a write runs.
     /// </summary>
     [Fact]
-    public async Task A_swapped_tiers_flush_that_cannot_be_boxed_leaves_no_level_write_behind_for_its_retry_to_meet()
+    public async Task A_swapped_tiers_flush_leaves_no_level_write_behind_for_a_retry_to_meet()
     {
         var engine = OneSlotEngine(Options(NewDir()));
         engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
-        var watch = new LeftBehindWriteWatch();
+        var watch = new HeldWriteWatch(holdWrite: 1, "<FlushTierByLevelAsync>") { Engine = engine };
         try
         {
             using (var batch = Batch(engine, 0, 500))
                 Assert.Equal(new LogBatchWriteResult(500, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
-            OwnerAsync.FirstSuspensionFailsForTest.Value  = watch.FailsFirstSuspension;
-            StorageEngine.LevelWriteStartingForTest.Value = watch.OnLevelWrite;   // the retry the swap starts carries both
-            try { await engine.FlushHotTierAsync(); }
-            finally
-            {
-                OwnerAsync.FirstSuspensionFailsForTest.Value  = null;
-                StorageEngine.LevelWriteStartingForTest.Value = null;
-            }
+            using (watch.Arm())   // and the retry the swap may start carries it
+                await engine.FlushHotTierAsync();
 
-            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the tier to be published by its retry", ShortGuard);
-            Assert.False(watch.LeftWriteBehind, "the flush that could not be boxed had queued a level write, which ran on after its fault");
-            Assert.False(watch.WrittenBesideIt, "the retry wrote the tier beside the level write the unboxed flush had left running");
-            Assert.False(watch.FreedUnderIt, "a tier was freed under a level write");
+            WaitFor(() => engine.FrozenTierCountForTest == 0 && engine.HeavyPhasesInFlight == 0, "the tier to be published", ShortGuard);
+            watch.AssertNothingLeftRunning();
             Assert.Equal(500, ReadAll(engine).Count);
         }
         finally { await engine.DisposeAsync(); }
     }
 
     /// <summary>
-    /// H-B, the despill whose retry cannot be started: it gives its tier up — unlisted and retired, freed —
-    /// which it did under the level write its unboxed flush had left running (a use-after-free).
+    /// H-B and round 7, a despill whose retry cannot be started: it gives its tier up — unlisted and retired, freed —
+    /// which it did under the level write its flush, faulted by a failed await, had left running (a use-after-free).
     /// </summary>
     [Fact]
-    public async Task A_despills_flush_that_cannot_be_boxed_and_whose_retry_cannot_start_frees_no_tier_under_a_write()
+    public async Task A_despills_flush_whose_retry_cannot_start_frees_no_tier_under_a_level_write()
     {
         string dir  = NewDir();
         var    opts = Options(dir);
         EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
-        var watch = new LeftBehindWriteWatch();
+        var watch = new HeldWriteWatch(holdWrite: 1, "<FlushTierByLevelAsync>");
         var hold  = new TaskCompletionSource();
-        StorageEngine.HoldDespillForTest.Value        = hold.Task;
-        OwnerAsync.FirstSuspensionFailsForTest.Value  = watch.FailsFirstSuspension;
-        StorageEngine.LevelWriteStartingForTest.Value = watch.OnLevelWrite;   // the despill loop carries them
         StorageEngine engine;
-        try { engine = OneSlotEngine(opts); }
-        finally
-        {
-            StorageEngine.HoldDespillForTest.Value        = null;
-            OwnerAsync.FirstSuspensionFailsForTest.Value  = null;
-            StorageEngine.LevelWriteStartingForTest.Value = null;
-        }
-        int refused = 0;
-        engine._beforeFlushRetryStartForTest = () =>
-        {
-            if (Interlocked.Exchange(ref refused, 1) == 0) throw new OutOfMemoryException("test: no retry can be set up");
-        };
+        using (watch.Arm())   // the despill loop carries it
+            engine = HeldOneSlotEngine(opts, hold);
+        watch.Engine = engine;
+        engine._beforeFlushRetryStartForTest = static () => throw new OutOfMemoryException("test: no retry can be set up");
         await using (engine)
         {
             engine._despillRetryDelay = TimeSpan.FromMilliseconds(50);
-            engine._flushRetryDelay   = TimeSpan.FromMilliseconds(50);
             hold.SetResult();
             WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == 50, "the block to be despilled", ShortGuard);
-            Assert.Equal(1, Volatile.Read(ref refused));
-            Assert.False(watch.LeftWriteBehind, "the despill's flush that could not be boxed had queued a level write, which ran on after its fault");
-            Assert.False(watch.FreedUnderIt, "the despill's tier was freed under the level write its unboxed flush had left running");
-            Assert.False(watch.WrittenBesideIt, "the despill's tier was written twice at once");
+            watch.AssertNothingLeftRunning();
             Assert.Equal(50, ReadAll(engine).Count);
         }
     }
 
     /// <summary>
-    /// H-B, the startup replay: its flush's fault reached GetResult, and the replay's `using` freed the
-    /// recovery tier under the level write the unboxed flush had left running.
+    /// H-B and round 7, the startup replay: its flush's fault reached the replay's wait for it, and the replay's
+    /// `using` freed the recovery tier under the level write the faulted flush had left running.
     /// </summary>
     [Fact]
-    public async Task A_replays_flush_that_cannot_be_boxed_frees_no_recovery_tier_under_a_write()
+    public async Task A_replays_flush_frees_no_recovery_tier_under_a_level_write()
     {
         string dir  = NewDir();
         var    opts = Options(dir);
         Directory.CreateDirectory(Path.Combine(dir, "wal"));
         WriteThreeEventLog(Path.Combine(dir, "wal", $"{opts.NodeId.Value}-9000.wal"), opts, 9_000);
-        var watch = new LeftBehindWriteWatch();
-        OwnerAsync.FirstSuspensionFailsForTest.Value  = watch.FailsFirstSuspension;
-        StorageEngine.LevelWriteStartingForTest.Value = watch.OnLevelWrite;
+        var watch = new HeldWriteWatch(holdWrite: 1, "<FlushTierByLevelAsync>");
         StorageEngine engine;
-        try { engine = Engine(opts); }
-        finally
-        {
-            OwnerAsync.FirstSuspensionFailsForTest.Value  = null;
-            StorageEngine.LevelWriteStartingForTest.Value = null;
-        }
+        using (watch.Arm())   // the replay runs in the constructor
+            engine = Engine(opts);
         await using (engine)
         {
             await engine.CatalogLoaded;
             WaitFor(() => engine.SpillFilesPending == 0, "the WAL to be written", ShortGuard);
-            Assert.False(watch.LeftWriteBehind, "the replay's flush that could not be boxed had queued a level write, which ran on after its fault");
-            Assert.False(watch.FreedUnderIt, "the recovery tier was freed under the level write the unboxed flush had left running");
+            watch.AssertNothingLeftRunning();
             AssertThreeEventsWhole(ReadAll(engine));
         }
     }
@@ -6765,73 +6668,6 @@ public sealed class IngestWriteAndSpillTests : IDisposable
             attempt.Set();
             await engine.DisposeAsync();
         }
-    }
-
-    /// <summary>
-    /// Round-6 review (the LOW on 21eb088's audit): the flush retry's await of its attempt's flush can throw
-    /// with the flush running on — its continuation's registration fails under the TPL event source or
-    /// async debugging. The loop took that for a failed attempt and began the next, which voided the
-    /// block's marker and unlinked the levels the first flush was still writing; that flush then wrote the
-    /// marker over a partial set. No attempt begins while an earlier one's flush runs now; the block is the
-    /// next start's, and comes back once.
-    /// </summary>
-    [Fact]
-    public async Task A_retry_whose_await_fails_with_its_flush_running_begins_no_attempt_beside_it()
-    {
-        string dir    = NewDir();
-        var    opts   = Options(dir);
-        var    engine = Engine(opts);
-        using var gate = new ManualResetEventSlim(false);
-        int writes = 0, started = 0, attempts = 0, failed = 0;
-        bool second;
-        try
-        {
-            using (var batch = Batch(engine, 0, 10))
-                Assert.Equal(new LogBatchWriteResult(10, 0, 0), await engine.WriteBatchAsync(batch, HangGuard));
-            engine._flushRetryDelay = TimeSpan.FromMilliseconds(50);
-            engine._afterLevelPublished = _ =>
-            {
-                if (Interlocked.Exchange(ref failed, 1) == 0) throw new IOException("test: the swap's flush fails after its level");
-            };
-            engine._beforeFlushRetryAttemptForTest = () => Interlocked.Increment(ref attempts);
-            engine._afterRetryFlushStartedForTest  = () =>
-            {
-                if (Interlocked.Increment(ref started) == 1) throw new OutOfMemoryException("test: the await's registration fails");
-            };
-            // The first retry attempt's level write is held: its flush runs on, past the await that failed.
-            StorageEngine.LevelWriteStartingForTest.Value = _ =>
-            {
-                if (Interlocked.Increment(ref writes) == 2) gate.Wait(HangGuard);
-            };
-            try { await engine.FlushHotTierAsync(); }
-            finally { StorageEngine.LevelWriteStartingForTest.Value = null; }
-
-            WaitFor(() => Volatile.Read(ref started) == 1 && Volatile.Read(ref writes) == 2, "the first attempt's flush to run past its failed await", ShortGuard);
-            // Sixty retry delays (round-6: a second was twenty, and on two cores, the held write blocking a pool thread,
-            // a second attempt that would begin did not always begin within it).
-            second = SpinWait.SpinUntil(() => Volatile.Read(ref attempts) >= 2, TimeSpan.FromSeconds(3));
-            Assert.False(second, "a second retry attempt began while the first attempt's flush was still writing the block");
-
-            // The orphaned flush is let go, and ends - its completion marker the last thing it writes - before the engine
-            // stops (round-6: the stop raced it). The seam throws BEFORE the await, so the loop's finally runs and gives
-            // the heavy phase back, and shutdown freed the tier under a flush still reading it. A registration that
-            // fails on the loop's box - the trigger - skips that finally instead: the phase stays counted, and shutdown
-            // leaves the tier allocated at its budget rather than free it.
-            gate.Set();
-            WaitFor(() => Directory.EnumerateFiles(Path.Combine(dir, "wal"), "*.flushed").Any(), "the orphaned flush to end", ShortGuard);
-        }
-        finally
-        {
-            gate.Set();
-            await engine.DisposeAsync();
-        }
-
-        // The block is the next start's: its marker says it was flushed, and the boot scan registers its level (round-6:
-        // read before the scan, in the background, had registered it, it counted 0 under a loaded whole-suite run).
-        await using var next = Engine(opts);
-        await next.CatalogLoaded;
-        await FlushEverythingAsync(next, ShortGuard);
-        Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
     }
 
     /// <summary>

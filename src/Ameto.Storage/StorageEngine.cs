@@ -2456,6 +2456,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // beside it, and the finallys that give back the heavy-phase permit, the slot and the count
         // skipped (with one permit, every later heavy phase waited for ever). Or it was the final
         // flush's wait for the swap lock or a slot, which then stayed taken. Here nothing is owned yet.
+        //
+        // Its LATER suspensions throw the same way when their continuation cannot be registered (round 7):
+        // the final flush's waits for the swap lock and for a slot, and the heavy phase's wait for its
+        // permit. Each has a catch that gives back what this frame holds there, as the finally would — the
+        // swap lock at the wait for a slot, the slot and the count at the wait for the permit. The flush
+        // itself is not awaited (FlushTierByLevel): nothing of it runs on when this method ends.
         await Task.Yield();
 
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
@@ -2486,7 +2492,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 await OwnerPoll(_flushLock, ref pause, waitDeadline, ct).ConfigureAwait(false);
             if (!locked) return;
         }
-        bool swapFailed = false;
+        bool swapFailed = false, lockReleased = false;
         try
         {
             // Every request made before this line is answered by the state read below.
@@ -2544,8 +2550,23 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // Never queued in the semaphore (OwnerPoll; round-5 M-B).
             bool slot = TryTakeFlushSlot();
             if (!slot && finalFlush)
-                for (int pause = 1; !(slot = TryTakeFlushSlot()) && Environment.TickCount64 < waitDeadline; )
-                    await OwnerPoll(_flushSlots, ref pause, waitDeadline, ct).ConfigureAwait(false);
+            {
+                try
+                {
+                    for (int pause = 1; !(slot = TryTakeFlushSlot()) && Environment.TickCount64 < waitDeadline; )
+                        await OwnerPoll(_flushSlots, ref pause, waitDeadline, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The swap lock goes back HERE, as the finally below would give it back (round 7). A pause whose
+                    // continuation could not be registered (out of memory) throws into this method with that finally
+                    // skipped, and the lock stayed taken for good: shutdown waited its whole budget to take it, then
+                    // left every tier allocated. A catch runs on every road.
+                    lockReleased = true;
+                    ReleaseFlushLock();
+                    throw;
+                }
+            }
             if (!slot)
             {
                 if (finalFlush)
@@ -2650,7 +2671,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // here left the swap lock held for good: no swap, spill end, despill or merge ever again,
             // every request answered 503 until a restart, and shutdown without its final flush.
             try { if (swapFailed) OnSwapFailed(); }
-            finally { ReleaseFlushLock(); }
+            finally { if (!lockReleased) ReleaseFlushLock(); }
         }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
@@ -2669,35 +2690,66 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             oldWal?.Dispose();
             NoteKeptFlushFailures(oldWal);   // its last fsyncs: it is not ticked again (round-6 review)
 
+            bool permit = false;
             try
             {
                 ct.ThrowIfCancellationRequested();
-                for (int pause = 1; !_flushConcurrency.Wait(0); )   // never queued in it (OwnerPoll; round-5 M-B)
-                    await OwnerPoll(_flushConcurrency, ref pause, 0, ct).ConfigureAwait(false);
+                // Never queued in it (OwnerPoll; round-5 M-B). The final flush waits only until its deadline (ultra
+                // review #7): it polled with none, and with a token nothing cancelled, so a permit another heavy phase
+                // held past the shutdown budget — a slow disk, a large tier — held DisposeAsync for good, and the
+                // service's stop timed out.
+                for (int pause = 1; !(permit = _flushConcurrency.Wait(0)) && (!finalFlush || Environment.TickCount64 < waitDeadline); )
+                    await OwnerPoll(_flushConcurrency, ref pause, finalFlush ? waitDeadline : 0, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // Out of memory waiting for the permit, the tier unread: a retry flushes it (and owns the
                 // slot and the count from here). It used to stay listed, unflushed, until shutdown.
-                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);
+                //
+                // And when no retry can start, the slot and the count go back HERE (ultra review #3). This
+                // catch runs on every road; the finally below does not when the pause's continuation could
+                // not be registered (round 7): that skips it, and the slot and the count were held for good —
+                // one slot fewer, and shutdown waited its whole budget for a heavy phase that would never end.
+                if (!HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId)) GiveBackSlot(endHeavyPhase: true, oldHot);
+                slotTransferred = true;   // given up either way, by the retry or just now: not the finally's
                 return;
             }
+            if (!permit)
+            {
+                // The final flush's budget ran out with no permit. Its tier stays listed and unread, its WAL on disk
+                // for the next start's replay; the slot and the count go back (the finally below), so shutdown frees
+                // it: nothing reads it.
+                try
+                {
+                    _logger.LogWarning(
+                        "Final hot-tier flush skipped: no heavy-phase permit came free within the shutdown budget — " +
+                        "the WAL replays the tier on the next start");
+                }
+                catch (Exception) { /* the line is lost */ }
+                return;
+            }
+            // The flush runs in this frame (FlushTierByLevel): a throw here is the flush's own, and nothing of it
+            // runs on — the tier goes to a retry. The flush was awaited, and a registration of that await's
+            // continuation that ran out of memory threw here with the flush running on and the finally that gave
+            // the permit back skipped — c42b5d4's filter let that throw out of the method — so the permit never
+            // came back, and at width 1 no flush, despill or merge ran again (R6-M6). It goes back by plain code
+            // and in the catches now, not in a finally: the compiler guards EVERY finally of an async method with
+            // its state, one whose try holds no await too, and one left after a catch that took such a throw is
+            // skipped until a suspension resumes (round 7; ReleaseHeavyPermit never throws).
             List<SegmentInfo> written;
-            Task<List<SegmentInfo>>? flush = null;
-            try
+            try { written = FlushTierByLevel(oldHot, reservedSegId, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                flush   = FlushTierByLevelAsync(oldHot, reservedSegId, ct);
-                written = await flush;
-            }
-            // The FLUSH failed — not this method's await of it. Anything else thrown at the await
-            // (its continuation's registration, out of memory) leaves the flush running: handing the
-            // tier to a retry then would flush it twice, and freeing it would free it under the flush.
-            catch (Exception ex) when (ex is not OperationCanceledException && (flush is null || flush.IsFaulted))
-            {
-                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);
+                slotTransferred = HandFailedFlushToRetry(ex, oldHot, oldWalPath, reservedSegId);   // never throws
+                ReleaseHeavyPermit();
                 return;
             }
-            finally { ReleaseHeavyPermit(); }
+            catch
+            {
+                ReleaseHeavyPermit();
+                throw;
+            }
+            ReleaseHeavyPermit();
 
             // Published all or nothing (PublishFlushedTier): one that failed registered nothing, and its
             // tier goes to a retry as a failed flush's does. Left to the finally, the tier stayed listed
@@ -3185,10 +3237,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </param>
     /// <param name="onAbandoned">
     /// Called, at most once, if the retry ends without giving its owners back itself — it could not be
-    /// queued, or its first suspension's box could not be allocated, which skips its finally — before
-    /// the slot and the count go back: how a despill's retry gives its tier up and queues its block
-    /// again, as the despill does when no retry starts. A swap's tier stays listed, served, until
-    /// shutdown frees it, and its WAL replays it at the next start.
+    /// queued, or one of its suspensions ran out of memory (its box at the first; the registration of its
+    /// continuation at a later one, round 7), which skips its finally — before the slot and the count go
+    /// back: how a despill's retry gives its tier up and queues its block again, as the despill does when
+    /// no retry starts. Nothing of the retry runs then (see <c>FlushRetryOwners</c>). A swap's tier stays
+    /// listed, served, until shutdown frees it, and its WAL replays it at the next start.
     /// </param>
     /// <returns>
     /// True once the retry is handed the tier: from then on it — or, if it ends without giving them
@@ -3267,12 +3320,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal Action? _beforeFlushRetryAttemptForTest;
 
     /// <summary>
-    /// Test seam: runs once a retry attempt's flush has started, before the loop awaits it; throwing from
-    /// it is that await failing while the flush runs on. Null in production.
-    /// </summary>
-    internal Action? _afterRetryFlushStartedForTest;
-
-    /// <summary>
     /// The retry's task, not started. Its own method so the closure over the arguments is allocated
     /// in here, inside the caller's try — captured by a lambda in the caller, they were allocated
     /// on entry, before any of its code ran.
@@ -3284,12 +3331,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// What a started flush retry owns — its tier's flush slot and heavy-phase count — given back
-    /// exactly once: by the retry's own finally, or, when that finally never ran, by the
-    /// continuation that sees the retry's task end (registered before the retry started). The
-    /// finally does not run when the retry's first suspension — the wait before its first attempt,
-    /// where its state machine is boxed — runs out of memory: the compiler guards it with the state
-    /// the suspension has already set. The slot and the count were then held for good, and the tier
-    /// never flushed.
+    /// exactly once: by the retry itself as it ends, or, when it ended without, by the continuation
+    /// that sees the retry's task end (registered before the retry started). The retry's finally does
+    /// not run when one of its suspensions runs out of memory — the first, where its state machine is
+    /// boxed, or a later one, whose continuation's registration fails (round 7): the compiler guards it
+    /// with the state the suspension has already set. The slot and the count were then held for good,
+    /// and the tier never flushed.
+    ///
+    /// <para>A retry that ended that way has nothing of it running (round 7): the attempt's flush runs
+    /// in the loop's own frame, so its suspensions are pauses — the wait before an attempt, the wait for
+    /// the permit — and no flush runs across one. c42b5d4's audit, and 788264c's, said the opposite road
+    /// left the phase counted; it did not: the loop awaited its attempt's flush, a registration that
+    /// failed there ended it with the flush running on, and this gave the slot, the count and the text
+    /// back and gave a despill's tier up under the flush (round-6 review R6-H3).</para>
     /// </summary>
     private sealed class FlushRetryOwners(StorageEngine engine, ulong block, Action? onAbandoned, HotTierSegment tier)
     {
@@ -3381,6 +3435,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     internal Action<SemaphoreSlim>? _beforeOwnerPollForTest;
 
+    /// <summary>
+    /// Test hook: on the calling thread, whether it holds the writer lock or the frozen-tier list's, and whether the swap
+    /// lock (a semaphore, held by no thread in particular) is taken — what a flush in its owner's frame must find (round 7).
+    /// </summary>
+    internal (bool WriterLockHeld, bool FrozenLockHeld, bool SwapLockTaken) LocksAsSeenHereForTest =>
+        (_writerLock.IsHeldByCurrentThread, Monitor.IsEntered(_frozenLock), _flushLock.CurrentCount == 0);
+
     /// <summary>Test hooks: the owner semaphores, for a seam to tell apart and a test to count.</summary>
     internal SemaphoreSlim FlushLockForTest        => _flushLock;
     internal SemaphoreSlim FlushConcurrencyForTest => _flushConcurrency;
@@ -3436,7 +3497,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             {
                 await Task.Delay(_flushRetryDelay, _cts.Token).ConfigureAwait(false);
                 List<SegmentInfo> written;
-                Task<List<SegmentInfo>>? flush = null;
                 try
                 {
                     _beforeFlushRetryAttemptForTest?.Invoke();
@@ -3454,22 +3514,31 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                         // a despill's levels an EARLIER run published: those are
                         // registered segments, and are kept and not rewritten.
                         DeleteUnpublishedLevelFiles(reservedSegId, publishedLevels);
-                        flush = FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
-                        _afterRetryFlushStartedForTest?.Invoke();
-                        written = await flush.ConfigureAwait(false);
+                        // In this frame, not awaited (see FlushTierByLevel): when an attempt ends, nothing of it runs.
+                        written = FlushTierByLevel(oldHot, reservedSegId, _cts.Token, publishedLevels: publishedLevels);
                     }
-                    finally { ReleaseHeavyPermit(); }
+                    catch
+                    {
+                        ReleaseHeavyPermit();
+                        throw;
+                    }
+                    // By plain code and the catch, as at every heavy phase's end (R6-M6; see TryFlushAsync's): a finally
+                    // is guarded by the compiler's state, which an attempt that caught a failed registration leaves set
+                    // until a suspension resumes — or until the loop re-enters this attempt's try, whose dispatch resumes
+                    // the failed wait (round 7). Plain code does not depend on which.
+                    ReleaseHeavyPermit();
 
                     PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
                 }
                 catch (OperationCanceledException) { throw; }
-                // The attempt failed — and its flush is not running (round-6 review, the LOW on 21eb088's audit):
-                // a throw at this loop's await of the flush that is not the flush's own (its continuation's
-                // registration, under the TPL event source or async debugging) left the flush running, and the
-                // next attempt voided the block's marker and unlinked the levels the flush was still writing,
-                // which then wrote the marker over a partial set. Such a throw ends the loop, as TryFlushAsync's
-                // ends its flush: the tier stays listed until shutdown, and the block is the next start's.
-                catch (Exception ex) when (flush is null || flush.IsCompleted)
+                // The attempt failed, and nothing of it runs on: its flush ran in this frame. It was awaited, and a
+                // registration of that await's continuation that ran out of memory left it running: the next attempt
+                // voided the marker and unlinked the levels it was writing (21eb088's LOW), and c42b5d4's filter,
+                // which let such a throw out of the loop, handed the loop's end to RetryEnded with every finally
+                // skipped — the slot, the count and the text given back, and a despill's tier freed, its levels
+                // unlinked and its block queued again, all under the running flush (round-6 review R6-H3; c42b5d4's
+                // audit and 788264c said the phase stayed counted: it did not).
+                catch (Exception ex)
                 {
                     try
                     {
@@ -3493,12 +3562,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     try { _logger.LogWarning(ex, "Bookkeeping after the retry of block {Block} failed", reservedSegId); }
                     catch (Exception) { /* the line is lost */ }
                 }
+                // Given back here, by plain code, and in the catches below; the finally only backs them up (round 7).
+                // An attempt whose pause for the permit failed at its registration is caught above, and the loop goes
+                // round with the compiler's state still that suspension's: a finally is skipped until a suspension
+                // resumes, or until the next attempt's try resets the state as it re-enters (its dispatch resumes the
+                // failed wait). Had neither happened, the loop would have returned through a skipped finally, and
+                // RetryEnded taken that for a retry that ended unfinished — for a despill, a give-up that unlinks the
+                // levels just published. Plain code does not depend on the dispatch.
+                owners.GiveBack();
                 return;
             }
         }
-        catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
-        catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
-        finally { owners.GiveBack(); }
+        catch (OperationCanceledException) { owners.GiveBack(); /* shutdown — WAL replays the tier next start */ }
+        catch (ObjectDisposedException)    { owners.GiveBack(); /* raced DisposeAsync's CTS teardown — same outcome */ }
+        finally { owners.GiveBack(); }   // once: GiveBack gives them back only the first time
     }
 
     /// <summary>
@@ -5688,19 +5765,26 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// their file is still there — a merge or retention pass may have taken it since, and asking
     /// the disk now would write those events a second time.
     /// </param>
-    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder<>))]
-    private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
+    /// <remarks>
+    /// <para><b>Synchronous, on the caller's thread</b> (round-7, the registration class). Every caller — the swap's
+    /// heavy phase, a despill, a flush retry, the startup replay — runs on a pool thread of its own and runs this in
+    /// its own frame, so nothing awaits a flush while the flush reads the tier. It was an async method that queued
+    /// each level's write (a Task.Run) and awaited it, and its callers awaited it in turn: an await whose
+    /// continuation could not be registered (out of memory under the TPL event source or async debugging, or a task
+    /// completed meanwhile queued to a pool queue that must grow) threw into the awaiting method with every finally
+    /// skipped while the flush ran on. Round 5 boxed this method first (H-B) and round 6 filtered its callers'
+    /// catches (c42b5d4), but a LATER suspension's registration was the same road: the retry loop's task faulted
+    /// and its RetryEnded gave the slot, the count and the text back and freed a despill's tier, unlinking its
+    /// levels, under the running flush (R6-H3); the heavy phase's permit was never given back, so at width 1 no
+    /// flush, despill or merge ran again (R6-M6); this method's own await of a level write faulted it while the
+    /// write read on, and the startup replay's <c>using</c> or a despill whose retry could not start freed the tier
+    /// under the write. With no await there is no orphan to free anything under: the method returns, or throws,
+    /// once nothing of it runs. The thread a level's write used to run on is the caller's now: the same one
+    /// blocked thread per flush, one hop fewer.</para>
+    /// </remarks>
+    private List<SegmentInfo> FlushTierByLevel(
         HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false, byte publishedLevels = 0)
     {
-        // Boxed first, before any level write is queued (round-5 H-B; see TryFlushAsync). Its first real
-        // suspension was the await of its first level's FlushToColdAsync, whose Task.Run is already
-        // reading the tier: a box that could not be allocated there faulted this task while that write
-        // ran on, and every caller takes this task's fault for "the flush has stopped" — the swap and the
-        // despill handed the tier to a retry that wrote it beside the orphan, a despill whose retry could
-        // not start freed it under the write, and the startup replay's `using` freed it the same way. A
-        // failure here faults the task before anything reads the tier.
-        await Task.Yield();
-
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
         var perLevel = new int[LevelSegmentSlots][];
@@ -5738,14 +5822,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // rent's tail — stale tier indices from a previous flush — as events.
                 var subset  = perLevel[lvl];
                 var segPath = BuildSegmentPath(segId, hot, subset, n);
-                written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset, n));
+                // Where the level's Task.Run took its token: a level not begun is not begun after a cancellation.
+                ct.ThrowIfCancellationRequested();
+                written.Add(FlushToCold(hot, segId, segPath, subset, n));
                 _afterLevelPublished?.Invoke(lvl);
             }
         }
         finally
         {
             // Returned only here: each level's array is read by the write it was handed to,
-            // and that write is awaited inside the loop, so nothing below still holds one.
+            // and that write runs inside the loop, so nothing below still holds one.
             for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
                 if (perLevel[lvl] is { } a) ArrayPool<int>.Shared.Return(a);
         }
@@ -5920,67 +6006,64 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     internal static readonly AsyncLocal<Action<HotTierSegment>?> LevelWriteStartingForTest = new();
 
+    /// <summary>
+    /// Writes one level of a frozen tier into its segment, on the calling thread (see <see cref="FlushTierByLevel"/>:
+    /// it was a Task.Run its caller awaited, and a failed registration of that await left it reading the tier for
+    /// nobody).
+    /// </summary>
     /// <param name="orderCount">
     /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
     /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
     /// </param>
-    private Task<SegmentInfo> FlushToColdAsync(
-        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct,
-        int[]? order_ = null, int orderCount = -1)
+    private SegmentInfo FlushToCold(HotTierSegment hot, SegmentId segId, string segPath, int[]? order_ = null, int orderCount = -1)
     {
-        // Capture delegate reference before entering Task.Run
-        var sinkFactory  = IndexSinkFactory;
-        long groupBudget = _groupPayloadBudgetBytes;
-        return Task.Run(() =>
+        LevelWriteStartingForTest.Value?.Invoke(hot);
+        // One sort order shared by the index build and the block writer: posting-list
+        // offsets become file ordinals, which the reader maps back to blocks/rows.
+        // A caller-supplied order may be a SUBSET of the tier (level-split flush).
+        int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
+        int   count = orderCount >= 0 ? orderCount : order.Length;
+
+        // The writer drives the index build now, one INDEX GROUP at a time: it knows
+        // where the group's payload budget falls, and only it can interleave a group's
+        // sections between its own blocks. Building the whole file up front is what
+        // made index memory scale with segment size — the ceiling that kept segments
+        // small in the first place.
+
+        // Write to a temp file first; rename to final path only after Finalise()
+        // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
+        string tmpPath = segPath + ".tmp";
+        try
         {
-            LevelWriteStartingForTest.Value?.Invoke(hot);
-            // One sort order shared by the index build and the block writer: posting-list
-            // offsets become file ordinals, which the reader maps back to blocks/rows.
-            // A caller-supplied order may be a SUBSET of the tier (level-split flush).
-            int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
-            int   count = orderCount >= 0 ? orderCount : order.Length;
-
-            // The writer drives the index build now, one INDEX GROUP at a time: it knows
-            // where the group's payload budget falls, and only it can interleave a group's
-            // sections between its own blocks. Building the whole file up front is what
-            // made index memory scale with segment size — the ceiling that kept segments
-            // small in the first place.
-
-            // Write to a temp file first; rename to final path only after Finalise()
-            // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
-            string tmpPath = segPath + ".tmp";
-            try
+            SegmentInfo info;
+            using (var writer = new SegmentWriter(tmpPath, _groupPayloadBudgetBytes))
             {
-                SegmentInfo info;
-                using (var writer = new SegmentWriter(tmpPath, groupBudget))
-                {
-                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), sinkFactory);
-                    info = writer.Finalise(_options.NodeId, segId);
-                } // FileStream closed here before Move
-                File.Move(tmpPath, segPath, overwrite: false);
-                // SegmentWriter captured tmpPath as FilePath; rewrite it to
-                // point at the final segment file so subsequent queries can
-                // open it. Without this, queries silently fail (file not
-                // found) until the next restart re-scans the segment dir.
-                return new SegmentInfo
-                {
-                    Id                = info.Id,
-                    NodeId            = info.NodeId,
-                    FilePath          = segPath,
-                    MinTimestampTicks = info.MinTimestampTicks,
-                    MaxTimestampTicks = info.MaxTimestampTicks,
-                    EventCount        = info.EventCount,
-                    MinLevel          = info.MinLevel,
-                    CompressedBytes   = info.CompressedBytes,
-                    UncompressedBytes = info.UncompressedBytes,
-                };
-            }
-            catch
+                writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), IndexSinkFactory);
+                info = writer.Finalise(_options.NodeId, segId);
+            } // FileStream closed here before Move
+            File.Move(tmpPath, segPath, overwrite: false);
+            // SegmentWriter captured tmpPath as FilePath; rewrite it to
+            // point at the final segment file so subsequent queries can
+            // open it. Without this, queries silently fail (file not
+            // found) until the next restart re-scans the segment dir.
+            return new SegmentInfo
             {
-                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
-                throw;
-            }
-        }, ct);
+                Id                = info.Id,
+                NodeId            = info.NodeId,
+                FilePath          = segPath,
+                MinTimestampTicks = info.MinTimestampTicks,
+                MaxTimestampTicks = info.MaxTimestampTicks,
+                EventCount        = info.EventCount,
+                MinLevel          = info.MinLevel,
+                CompressedBytes   = info.CompressedBytes,
+                UncompressedBytes = info.UncompressedBytes,
+            };
+        }
+        catch
+        {
+            try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+            throw;
+        }
     }
 
     // ── Retention ─────────────────────────────────────────────────────────────
@@ -6841,7 +6924,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // all: its complete flush replays to zero new segments and the WAL is simply dropped.
         if (recoveredHot.Count > 0)
         {
-            var written = ResultOnceEnded(FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true));
+            // In this frame (see FlushTierByLevel): the `using` above frees the tier only once nothing reads it.
+            var written = FlushTierByLevel(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true);
             long recovered = 0;
             for (int i = 0; i < written.Count; i++)
             {
@@ -6854,20 +6938,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
 
         DeleteLogAndMarker(walFile, segId);   // the marker stays while the WAL does
-    }
-
-    /// <summary>
-    /// The startup replay's wait for its flush, which reads the recovery tier the replay's <c>using</c>
-    /// frees on the way out — so it returns, or throws, only once the flush has ended. Task's own blocking
-    /// wait allocates once the task has not completed (its event, its completion action): an out of
-    /// memory there threw out of <c>GetResult</c> with the flush still reading, and the tier was freed
-    /// under it (round-5 H-B, the same line). This one waits allocating nothing — a sleep a millisecond at
-    /// a time, once per replayed log at the start — then takes the outcome of a task that has ended.
-    /// </summary>
-    private static T ResultOnceEnded<T>(Task<T> flush)
-    {
-        while (!flush.IsCompleted) Thread.Sleep(1);
-        return flush.GetAwaiter().GetResult();
     }
 
     // ── Segment-id allocator ──────────────────────────────────────────────────
@@ -7735,6 +7805,15 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         // ── Final flush. Waits for its turn at the lock and for a slot rather than dropping out
         //    when a racing flush holds either: dropping out left the live tier to the WAL replay.
+        //
+        //    Its WAITS are within the budget (ultra review #7): the swap lock, a slot and the heavy-phase permit
+        //    are each polled until the deadline, and past it the final flush gives the tier up to the WAL's
+        //    replay. The permit was polled with no deadline, and a permit another heavy phase held past the
+        //    budget held this await for good. The flush itself runs in its own frame (FlushTierByLevel) to its
+        //    end, as the level's Task.Run it awaited did: a level begun is written. One level's write is
+        //    bounded by the tier — at most MaxSizeBytes of its events and their index, written in sequence to
+        //    a local file, waiting on no thread and no lock but the disk — and only a disk that stops
+        //    answering holds it, as it held that Task.Run.
         if (_write.Hot.Count > 0)
         {
             try { await TryFlushAsync(waitDeadline: deadline); }
