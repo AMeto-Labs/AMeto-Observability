@@ -5,7 +5,7 @@ namespace Ameto.Core;
 /// <summary>
 /// The async method builders of the methods that hold an owner — a flush slot, the swap lock, a
 /// heavy-phase count, a batch's lease — across an await: <see cref="AsyncTaskMethodBuilder"/> and
-/// <see cref="AsyncValueTaskMethodBuilder{TResult}"/>, with one test seam.
+/// <see cref="AsyncValueTaskMethodBuilder{TResult}"/>, with test seams.
 ///
 /// <para>Why a seam is needed at all. An async method's state machine is boxed at its first real
 /// suspension, inside <c>AwaitUnsafeOnCompleted</c> — an allocation, and one that runs out of memory
@@ -17,8 +17,18 @@ namespace Ameto.Core;
 /// that own something across an await are built with these builders, which make the first
 /// suspension throw exactly there when a test asks.</para>
 ///
-/// <para>In production they are the runtime's builders: the seam is read once, at a method's
-/// first suspension, and is null.</para>
+/// <para>And not only the first (round-6 review, R6-H3's class). Every LATER suspension registers its
+/// continuation on what it awaits, and that can throw too, at the same point and with the same effect:
+/// the TPL event source and async debugging wrap the continuation (an allocation), a second continuation
+/// on one task makes a list, and a task that completed meanwhile is queued to a thread-pool queue that
+/// may have to grow. For a <see cref="Task"/> awaiter that throw reaches the method on a single out of
+/// memory; for a <see cref="ValueTask"/>, a yield or any other awaiter the runtime catches it and rethrows
+/// it on the pool (the process ends), unless that rethrow runs out of memory too. Either way every finally
+/// is skipped from that await until a suspension resumes — including, when a catch takes the throw and the
+/// method goes on, the finallys it leaves after the catch — while the catches run.
+/// <see cref="OwnerAsync.LaterSuspensionFailsForTest"/> makes a later suspension throw there.</para>
+///
+/// <para>In production they are the runtime's builders: a suspension reads one field, null in production.</para>
 /// </summary>
 internal static class OwnerAsync
 {
@@ -66,6 +76,30 @@ internal static class OwnerAsync
 
     /// <summary>What <see cref="BoxThenFailForTest"/> made; null until a test asks for it.</summary>
     private static AsyncLocal<Func<Type, bool>?>? s_boxThenFail;
+
+    /// <summary>
+    /// Test seam (round-6 review, R6-H3's class): asked at every LATER real suspension of an owner-holding
+    /// async method — each one after the first, when its box already exists and the method runs in it — with
+    /// its state machine's type and the awaiter's; true makes that suspension throw
+    /// <see cref="OutOfMemoryException"/> after the compiler has recorded it in the state and before anything
+    /// is registered, as a registration that fails does (see the type's remarks). What it awaited goes on. A
+    /// test that wants the Nth such suspension counts in the function. Created by the first test that asks for
+    /// it, like <see cref="FirstSuspensionFailsForTest"/>; null in production.
+    /// </summary>
+    internal static AsyncLocal<Func<Type, Type, bool>?> LaterSuspensionFailsForTest =>
+        Volatile.Read(ref s_laterSuspensionFails)
+        ?? Interlocked.CompareExchange(ref s_laterSuspensionFails, new AsyncLocal<Func<Type, Type, bool>?>(), null)
+        ?? s_laterSuspensionFails!;
+
+    /// <summary>What <see cref="LaterSuspensionFailsForTest"/> made; null until a test asks for it.</summary>
+    private static AsyncLocal<Func<Type, Type, bool>?>? s_laterSuspensionFails;
+
+    /// <summary>Throws where a later suspension's continuation would be registered, when the seam says so.</summary>
+    internal static void LaterSuspension(Type stateMachine, Type awaiter)
+    {
+        if (Volatile.Read(ref s_laterSuspensionFails)?.Value is { } fails && fails(stateMachine, awaiter))
+            throw new OutOfMemoryException("test: the registration of a later suspension's continuation failed");
+    }
 
     /// <summary>Whether the seam asks this first suspension to make its box and then fail.</summary>
     internal static bool BoxThenFail(Type stateMachine) =>
@@ -124,14 +158,16 @@ internal struct OwnerTaskMethodBuilder
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
@@ -183,14 +219,16 @@ internal struct OwnerTaskMethodBuilder<TResult>
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
@@ -236,14 +274,16 @@ internal struct OwnerValueTaskMethodBuilder<TResult>
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitOnCompleted(ref awaiter, ref stateMachine);
     }
 
     public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : ICriticalNotifyCompletion where TStateMachine : IAsyncStateMachine
     {
-        if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
+        if (_boxed) OwnerAsync.LaterSuspension(typeof(TStateMachine), typeof(TAwaiter));
+        else if (Suspending<TStateMachine>()) BoxThenFail(ref stateMachine);
         _inner.AwaitUnsafeOnCompleted(ref awaiter, ref stateMachine);
     }
 
