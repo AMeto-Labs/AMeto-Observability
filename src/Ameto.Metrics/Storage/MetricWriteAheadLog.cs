@@ -2705,7 +2705,23 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
         long target = capacity;
         while (target < needed) target = NextCapacity(target);
+        long fit = (needed + 4095) & ~4095L;
+        // A step the volume cannot hold is tried again at what the append needs (round-6 review R6-H1's class): the
+        // volume that refused the step — doubling, then 64 MiB at a time — had room for the points, which were refused
+        // with it. A failure leaves the log as it was (below).
+        try { GrowToCapacity(capacity, target); }
+        catch (IOException) when (target > fit) { GrowToCapacity(capacity, fit); }
+    }
+
+    /// <summary>The body of <see cref="GrowTo"/>: from <paramref name="capacity"/> to <paramref name="target"/>.</summary>
+    private void GrowToCapacity(long capacity, long target)
+    {
         long newFileSize = _headerSize + target;
+        // The view takes the file whole when it is longer: a growth that failed had already extended it
+        // (CreateFromFile below does), and a mapping cannot be smaller than its file — the retry at what the
+        // append needs (GrowTo) threw ArgumentOutOfRangeException. Only [.., target) is reserved, and the capacity
+        // goes no further: nothing writes past it, and a later growth reserves the rest from there.
+        long mapSize = Math.Max(newFileSize, _file!.Length);
 
         MemoryMappedFile?         mmf  = null;
         MemoryMappedViewAccessor? view = null;
@@ -2716,7 +2732,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
 
             // A capacity past the file's length extends the file (both platforms) — with the old
             // mapping still in place, which an explicit SetLength could not be sure of on Windows.
-            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, newFileSize, MemoryMappedFileAccess.ReadWrite,
+            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, mapSize, MemoryMappedFileAccess.ReadWrite,
                                                    HandleInheritability.None, leaveOpen: true);
             // The extension's blocks reserved before anything is written through the new view (round-5
             // H-F): on Linux the mapping extended the file sparse, and a write into a page of a full volume
@@ -2724,7 +2740,7 @@ internal sealed unsafe partial class MetricWriteAheadLog : IDisposable
             // file left its tail unreserved. A volume that cannot hold them fails this growth, the old
             // mapping still in place.
             FileSpace.Reserve(_file!.SafeFileHandle, _headerSize + capacity, target - capacity);
-            view = mmf.CreateViewAccessor(0, newFileSize, MemoryMappedFileAccess.ReadWrite);
+            view = mmf.CreateViewAccessor(0, mapSize, MemoryMappedFileAccess.ReadWrite);
             byte* ptr = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
             acquired = true;

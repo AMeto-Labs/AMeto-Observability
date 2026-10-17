@@ -195,6 +195,97 @@ public sealed class WalReservationTests : IDisposable
         finally { StopWatching(); }
     }
 
+    /// <summary>
+    /// Round-6 review R6-H1. A growth step the volume cannot hold is tried again at what the append needs. The whole step
+    /// — doubling, then up to a hot tier's 27 MB — was reserved or nothing, and a volume with room for the next spans
+    /// refused them: the drainer dropped them after the ring had acknowledged them (835 of 850 stored with 10.5 MB free
+    /// in the review's probe). Here the step's reservation is refused, as a nearly full volume refuses it, and the
+    /// smaller one that follows is not.
+    /// </summary>
+    [Fact]
+    public void A_span_log_growth_step_the_volume_cannot_hold_grows_by_what_the_append_needs()
+    {
+        try
+        {
+            int appended = 0, growths = 0;
+            using (var wal = SpanWriteAheadLog.Open(SpanPath, initialCapacity: 8 * 1024))
+            {
+                long capacity = wal.CapacityForTest;
+                Watch(refuse: (offset, _) => offset > 0 && Interlocked.Increment(ref growths) == 1);   // the first growth's
+                while (wal.CapacityForTest == capacity)
+                {
+                    Assert.True(appended < 100, "setup: the span log did not grow");
+                    wal.Append(Span(appended, attrBytes: 900));   // the IOException, before: the step was all or nothing
+                    appended++;
+                }
+                Assert.True(Volatile.Read(ref growths) >= 2, $"{growths} growth reservation(s): the step was not refused and tried again");
+                Assert.True(wal.CapacityForTest < 2 * capacity,
+                            $"grown from {capacity:N0} to {wal.CapacityForTest:N0} bytes: the refused step, not what the append needed");
+                StopWatching();
+            }
+            Assert.Equal(appended, ReadSpans(SpanPath).Count);
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// R6-H1's class, the metric log: a growth step the volume cannot hold is tried again at what the append needs.
+    /// The append that needed the step threw — the points refused with it — though the volume had room for them.
+    /// </summary>
+    [Fact]
+    public void A_metric_log_growth_step_the_volume_cannot_hold_grows_by_what_the_append_needs()
+    {
+        try
+        {
+            int steps = 0, fits = 0;
+            using (var wal = MetricWriteAheadLog.Open(MetricPath, 64 * 1024))
+            {
+                // Every step refused — the log pre-grows off the append, and a pre-growth that fails is let go — and
+                // what an append needs held: a few KB at a time.
+                Watch(refuse: (offset, length) =>
+                {
+                    if (offset == 0) return false;   // an open's
+                    if (length >= 32 * 1024) { Interlocked.Increment(ref steps); return true; }
+                    Interlocked.Increment(ref fits);
+                    return false;
+                });
+                for (int i = 0; i < 3_000; i++) wal.Append([Gauge(i)]);   // grows it; the IOException, before
+                Assert.True(Volatile.Read(ref steps) > 0 && Volatile.Read(ref fits) > 0,
+                            $"{steps} step(s) refused, {fits} growth(s) by what an append needed");
+                StopWatching();
+            }
+            Assert.Equal(3_000, CountPoints(MetricPath));
+        }
+        finally { StopWatching(); }
+    }
+
+    /// <summary>
+    /// R6-H1's class, the logs' WAL: a doubling the volume cannot hold is tried again at what the entry needs. The
+    /// append that needed the doubling threw, and the write behind it faulted, though the volume had room for the entry.
+    /// </summary>
+    [Fact]
+    public void A_log_growth_the_volume_cannot_double_grows_by_what_the_entry_needs()
+    {
+        try
+        {
+            int growths = 0, appended = 0;
+            using var wal = WriteAheadLog.Open(LogPath, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024);
+            long sized = new FileInfo(LogPath).Length;
+            Watch(refuse: (offset, _) => offset > 0 && Interlocked.Increment(ref growths) == 1);   // the first growth's
+            while (new FileInfo(LogPath).Length == sized)
+            {
+                Assert.True(appended < 1_000, "setup: the log did not grow");
+                Assert.True(wal.Append(1_000 + appended, LogLevel.Information, 1, "t", new byte[1_000]));   // threw, before
+                appended++;
+            }
+            long grown = new FileInfo(LogPath).Length;
+            Assert.True(Volatile.Read(ref growths) >= 2, $"{growths} growth reservation(s): the doubling was not refused and tried again");
+            Assert.True(grown - sized < sized - 4096,
+                        $"grown from {sized:N0} to {grown:N0} bytes: the refused doubling, not what the entry needed");
+        }
+        finally { StopWatching(); }
+    }
+
     /// <summary>An open whose reservation fails throws, and removes the file it created. It opened over the sparse file.</summary>
     [Fact]
     public void A_span_log_open_the_volume_cannot_hold_throws_and_removes_the_file_it_created()

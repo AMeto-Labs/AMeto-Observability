@@ -1243,7 +1243,21 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// to this if doubling is not enough: one doubling used to be assumed to be, and an entry larger
     /// than twice the capacity — reachable in a spill log, as small as 1 MB, whose first entry is
     /// taken whatever its size — was copied past the end of the mapping.</param>
-    private unsafe void Grow(long required)
+    private void Grow(long required)
+    {
+        // A spill log grows only for its first entry, and only to that entry's size: it is as large
+        // as its floor check counted, and a doubling made a log that took a first entry between one
+        // and two capacities go on taking entries up to twice what was counted.
+        long wanted = _spill ? required : Math.Max(_capacity * 2, required);
+        long fit    = (required + 4095) & ~4095L;
+        // A doubling the volume cannot hold is tried again at what the entry needs (round-6 review R6-H1's class):
+        // the volume that refused the doubling had room for the entry, which was refused with it. GrowTo leaves
+        // the log as it was when it fails.
+        try { GrowTo(wanted); }
+        catch (IOException) when (!_spill && wanted > fit) { GrowTo(fit); }
+    }
+
+    private unsafe void GrowTo(long newCapacity)
     {
         // Release current mapping, extend file, re-map. Runs under _writeLock (called
         // from Append). If extension or re-map fails (disk full is the typical cause —
@@ -1253,10 +1267,6 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         // for this first.
         long oldCapacity = _capacity;
         long oldFileSize = FileHeaderSize + oldCapacity;
-        // A spill log grows only for its first entry, and only to that entry's size: it is as large
-        // as its floor check counted, and a doubling made a log that took a first entry between one
-        // and two capacities go on taking entries up to twice what was counted.
-        long newCapacity = _spill ? required : Math.Max(oldCapacity * 2, required);
         long newFileSize = FileHeaderSize + newCapacity;
 
         // Waits out a tick writing the old view back (FlushTail, off the write lock) before the view

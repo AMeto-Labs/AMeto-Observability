@@ -1609,7 +1609,15 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
 
     private void EnsureCapacityLocked(long needed)
     {
-        if (needed > _capacity) Grow(NextCapacity(_capacity, needed, _growthStepCap));
+        if (needed <= _capacity) return;
+        long step = NextCapacity(_capacity, needed, _growthStepCap);
+        long fit  = (needed + 4095) & ~4095L;
+        // A step the volume cannot hold is tried again at what the append needs (round-6 review R6-H1): the whole
+        // step — doubling, then up to a hot tier's 27 MB — was reserved or nothing, and a volume with room for the
+        // next spans refused them, which the drainer dropped after the ring had acknowledged them (835 of 850 stored
+        // with 10.5 MB free, 2 165 dropped with 4 MB). Grow leaves the log as it was when it fails.
+        try { Grow(step); }
+        catch (IOException) when (step > fit) { Grow(fit); }
     }
 
     /// <summary>
