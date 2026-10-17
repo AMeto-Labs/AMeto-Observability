@@ -203,9 +203,10 @@ public static class ReplicationEndpointMapper
                         statusCode: StatusCodes.Status409Conflict)),
                     SegmentImportOutcome.ConflictAllocatedLocally => ("allocated-locally", Results.Problem(
                         $"Segment id {segmentId} falls inside the span this node's own allocator has " +
-                        $"already handed out under NodeId {nodeId}: a local flush, merge or WAL replay " +
-                        $"holds it or is about to publish under it. Two nodes appear to be configured " +
-                        $"with NodeId {nodeId}.",
+                        $"already handed out under NodeId {nodeId} — a local flush, merge or WAL replay " +
+                        $"holds it or is about to publish under it — or at or past the highest id that " +
+                        $"allocator can be raised to, where nothing keeps it from handing the id out later. " +
+                        $"Two nodes appear to be configured with NodeId {nodeId}.",
                         statusCode: StatusCodes.Status409Conflict)),
                     SegmentImportOutcome.ConflictUnreadableIncumbent => ("unreadable-incumbent", Results.Problem(
                         $"The path for segment {nodeId}-{segmentId} is occupied by a file this node " +
