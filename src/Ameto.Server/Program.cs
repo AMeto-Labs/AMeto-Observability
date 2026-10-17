@@ -278,6 +278,13 @@ var app = builder.Build();
 
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
+// THE RECEIVERS' GATE, first and frame-free (round-6 review R6-H2): a receiver goes on only once every async frame
+// above it has suspended on it, or a frame of theirs that ran out of memory answered 500 while the receiver ran on
+// in an HttpContext Kestrel had reused for the next request — see IngestFramesGate. On every POST, because a
+// receiver's path is known only below UsePathBase; one small object each. Every middleware below is synchronous up
+// to the next one for a receiver's request, which is what the gate rests on: keep it so.
+app.Use(static (ctx, next) => HttpMethods.IsPost(ctx.Request.Method) ? IngestFramesGate.Run(ctx, next) : next(ctx));
+
 // PORT ISOLATION for the OTLP/gRPC listener. A second Kestrel endpoint does not scope routing:
 // without this, port 4317 served the entire application — the Angular UI through the SPA
 // fallback, /api/auth/login, the whole query surface, replication — to anything that speaks
@@ -286,7 +293,8 @@ var app = builder.Build();
 // methods are unreachable anywhere else.
 if (serverOptions.OtlpGrpcPort > 0)
 {
-    app.Use(async (ctx, next) =>
+    // Frame-free (round-6 review R6-H2): it awaits nothing, so it adds no frame above a receiver.
+    app.Use((ctx, next) =>
     {
         bool onGrpcPort = ctx.Connection.LocalPort == serverOptions.OtlpGrpcPort;
         // A plain prefix, NOT StartsWithSegments: a gRPC method path is one long segment —
@@ -298,9 +306,9 @@ if (serverOptions.OtlpGrpcPort > 0)
         if (onGrpcPort != isGrpcRoute)
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
-            return;
+            return Task.CompletedTask;
         }
-        await next();
+        return next(ctx);
     });
 }
 
@@ -365,16 +373,21 @@ app.UseWhen(static ctx => !IngestRoutes.IsIngestRequest(ctx), static branch =>
 // whose only job here was mapping "/" to it.
 var spaIndex = new SpaIndex(app.Environment, basePath,
                             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<SpaIndex>());
-app.Use(async (ctx, next) =>
+// Frame-free for everything but the entry document (round-6 review R6-H2): no frame above a receiver.
+app.Use((ctx, next) =>
 {
     var path = ctx.Request.Path;
     bool isEntryDocument = !path.HasValue || path == "/" ||
                            path.Equals("/index.html", StringComparison.OrdinalIgnoreCase);
-    if (isEntryDocument && (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
-        && await spaIndex.TryWriteAsync(ctx))
-        return;
-    await next();
+    return isEntryDocument && (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
+        ? EntryDocumentOrNextAsync(ctx, next)
+        : next(ctx);
 });
+async Task EntryDocumentOrNextAsync(HttpContext ctx, RequestDelegate next)
+{
+    if (await spaIndex.TryWriteAsync(ctx)) return;
+    await next(ctx);
+}
 app.UseStaticFiles();
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────

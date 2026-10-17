@@ -122,7 +122,7 @@ public static class OtlpEndpointMapper
         // ── Traces ────────────────────────────────────────────────────────────
         var traces = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx, ISpanSink sink) =>
         {
-            try { await Task.Yield(); }
+            try { if (!await IngestFramesGate.PassAsync(ctx)) return; }   // boxed first, and only once the frames above have suspended (R6-H2)
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
@@ -171,7 +171,7 @@ public static class OtlpEndpointMapper
         // ── Metrics ───────────────────────────────────────────────────────────
         var metrics = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx) =>
         {
-            try { await Task.Yield(); }   // boxed first (see above)
+            try { if (!await IngestFramesGate.PassAsync(ctx)) return; }   // boxed first (see above)
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
@@ -249,7 +249,7 @@ public static class OtlpEndpointMapper
         // ── Logs ──────────────────────────────────────────────────────────────
         var logs = [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))] async Task (HttpContext ctx) =>
         {
-            try { await Task.Yield(); }   // boxed first (see above)
+            try { if (!await IngestFramesGate.PassAsync(ctx)) return; }   // boxed first (see above)
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);

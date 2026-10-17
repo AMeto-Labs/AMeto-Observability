@@ -590,13 +590,13 @@ public sealed class IngestionEndpoint
         // pool stalled for seconds, and the bound then expired into a 500. Here nothing is held yet: a
         // failure is a 500 for a request nothing was taken from, which a Seq client retries.
         //
-        // THE RESIDUAL, accepted (round-6 review): yielding, every request suspends, and so the async
-        // frames ABOVE this one are boxed on every request as well — ASP.NET Core's EndpointMiddleware and
-        // the app's middleware lambdas (Program.cs). A box of theirs that cannot be allocated answers 500
-        // while this handler, already queued by the yield, goes on and writes the batch, which a Seq
-        // client's retry stores again. Only on a heap that cannot box a state machine; the route's own
-        // lambda adds no frame (EndpointMapper), and API.md names it.
-        await Task.Yield();
+        // And only once every frame ABOVE this one has suspended on it (round-6 review R6-H2; IngestFramesGate).
+        // A yield queued this handler before they did, and a frame of theirs that could not box or register —
+        // ASP.NET Core's EndpointMiddleware, the path base's — answered 500 while the handler ran on, in an
+        // HttpContext Kestrel had reused for the next request on the connection: its batch written after the
+        // 500, its answer written into that request's response. The gate's wait is this method's first
+        // suspension; closed, nothing of the request is touched. What remains is in API.md.
+        if (!await IngestFramesGate.PassAsync(ctx)) return;
 
         // ── 1. Read body into a pooled buffer ─────────────────────────────────
         long? contentLength = ctx.Request.ContentLength;

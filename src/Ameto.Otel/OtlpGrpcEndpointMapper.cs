@@ -217,7 +217,11 @@ public static class OtlpGrpcEndpointMapper
         // handler ran and wrote the batch under a call already answered UNAVAILABLE, which the exporter
         // retries — stored twice (M-C's class). The status goes into the response headers instead, gRPC's
         // own Trailers-Only answer, which hosting completes when the handler returns.
-        try { await Task.Yield(); }
+        //
+        // AND ONLY ONCE THE FRAMES ABOVE HAVE SUSPENDED on it (round-6 review R6-H2; IngestFramesGate): queued by a
+        // yield, it ran on after a frame above failed at its suspension, in a context reused for the next call on
+        // the connection. Closed, it returns touching nothing more.
+        try { if (!await IngestFramesGate.PassAsync(ctx)) return; }
         catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex))
         {
             RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
