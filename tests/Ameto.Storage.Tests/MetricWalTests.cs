@@ -1019,6 +1019,41 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Round-6 review R6-M3. A WAL whose replay fails at the start is not given up for an empty hot tier: the engine went
+    /// on, and its next flush — its shutdown's, here — committed the log, every point the replay had not read with it
+    /// (0 of a crash's 10 in the review's probe). The start fails now, the log kept, and the next start replays it.
+    /// </summary>
+    [Fact]
+    public async Task A_wal_whose_replay_fails_fails_the_start_and_the_next_start_replays_it()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var labels = Labels(("service", "MintRoute.API"));
+        var crashed = OpenWal();
+        for (int i = 0; i < 10; i++)
+            Append(crashed, Scalar("cpu.utilisation", baseNano + i * 1_000_000L, i, labels));
+        crashed.Dispose();
+
+        MetricStorageEngine? went = null;
+        Exception? failed;
+        MetricStorageEngine.ReplayFailsForTest.Value = static () => new IOException("test: the replay could not read the log");
+        try { failed = Record.Exception(() => went = NewEngine()); }
+        finally { MetricStorageEngine.ReplayFailsForTest.Value = null; }
+        if (went is not null)
+        {
+            // The road it took: on with an empty hot tier, a new point, and the flush that commits the log (its close's).
+            went.Ingest([Scalar("cpu.other", baseNano + 60_000_000_000L, 1.0, labels)]);
+            await went.DisposeAsync();
+        }
+
+        var engine = NewEngine();
+        var series = engine.QueryAsync("cpu.utilisation").ToBlockingEnumerable().ToList();
+        Assert.True(series.Count == 1 && series[0].Points.Count == 10,
+                    $"{(series.Count == 0 ? 0 : series[0].Points.Count)} of the crash's 10 points replayed by the next start");
+        Assert.IsType<IOException>(failed);
+        await engine.DisposeAsync();
+    }
+
+    /// <summary>
     /// Engine-level counterpart: ingest from several threads across a threshold-triggered
     /// flush and account for every point afterwards. The flush drains the tier concurrently
     /// with those appends, so anything the snapshot boundary mishandles shows up as a point

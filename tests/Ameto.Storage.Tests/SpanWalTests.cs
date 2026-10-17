@@ -435,6 +435,39 @@ public sealed class SpanWalTests : IDisposable
         Assert.Equal(0, TrcCount(_dir));
     }
 
+    /// <summary>
+    /// Round-6 review R6-M3's span twin. A WAL whose replay fails at the start is not given up for an empty hot tier: the
+    /// engine went on, and its next flush — its shutdown's, here — reclaimed every span the replay had not read. The
+    /// start fails now, the log kept, and the next start replays it.
+    /// </summary>
+    [Fact]
+    public void A_span_wal_whose_replay_fails_fails_the_start_and_the_next_start_replays_it()
+    {
+        long baseNano = 1_784_800_000_000_000_000L;
+        var crashed = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 12; i++) crashed.Append(Item(i, baseNano + i * 1_000L));
+        crashed.Dispose();
+
+        TraceStorageEngine? went = null;
+        Exception? failed;
+        TraceStorageEngine.ReplayFailsForTest.Value = static () => new IOException("test: the replay could not read the log");
+        try { failed = Record.Exception(() => went = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance)); }
+        finally { TraceStorageEngine.ReplayFailsForTest.Value = null; }
+        if (went is not null)
+        {
+            // The road it took: on with an empty hot tier, a new span, and the flush that commits the log.
+            went.WriteSpan(Item(100, baseNano + 100_000L));
+            went.FlushHotTier();
+            went.Dispose();
+        }
+
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        int found = 0;
+        for (int i = 0; i < 12; i++) found += engine.GetTraceAsync(Item(i, 0).TraceId).ToBlockingEnumerable().Count();
+        Assert.True(found == 12, $"{found} of the crash's 12 spans replayed by the next start");
+        Assert.IsType<IOException>(failed);
+    }
+
     // ── Two-phase flush (Begin / Commit / Abandon) ───────────────────────────
     //
     // The protocol that lets the engine build a segment OFF its lock: Begin moves
