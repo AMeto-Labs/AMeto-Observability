@@ -6686,12 +6686,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private bool HandFailedReplayToDespill(string walFile, ulong flushingBlock)
     {
         ulong segId = flushingBlock;
-        if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;
-        // Looks, not File.Exists (round-6 review R5-M6): a log that cannot be looked at is handed over
-        // (the despill reads it with its backoff), and so is one whose marker cannot be (the despill's
-        // own check waits for that look to answer); only a log that is gone, or one whose marker is
-        // there, is not.
-        if (Look(walFile) == Presence.Gone || Look(FlushMarkerPath(segId)) == Presence.There) return false;
+        if (segId == 0 && (!TryParseBlockId(walFile, out segId) || !IsUsableBlockId(segId))) return false;   // allocates nothing
 
         // Out of merges from here, before anything below can throw (round-6 review R5-M1): the boot
         // scan may have registered levels the failed replay moved into place, and a hand-off that
@@ -6700,7 +6695,19 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // events twice (30 for 20). In the set the merge planner skips (LevelIdsAFlushOwns), sized for
         // every WAL of the start before the first replay, so the add allocates nothing. A block that is
         // handed over leaves it below, the despill queue owning it from there; one that is not stays.
+        // Before the looks too (round-7): the marker's path and the looks allocate, and an out of memory
+        // there was the same hole.
         lock (_blocksLeftByReplay) _blocksLeftByReplay.Add(segId);
+
+        // Looks, not File.Exists (round-6 review R5-M6): a log that cannot be looked at is handed over
+        // (the despill reads it with its backoff), and so is one whose marker cannot be (the despill's
+        // own check waits for that look to answer); only a log that is gone, or one whose marker is
+        // there, is not — and its levels are the boot scan's.
+        if (Look(walFile) == Presence.Gone || Look(FlushMarkerPath(segId)) == Presence.There)
+        {
+            lock (_blocksLeftByReplay) _blocksLeftByReplay.Remove(segId);
+            return false;
+        }
 
         BeforeFailedReplayHandOffForTest.Value?.Invoke(walFile);
         byte published = 0;

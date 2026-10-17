@@ -785,12 +785,13 @@ public sealed partial class StorageEngine
     }
 
     /// <summary><c>{node}-{block}.spill</c> or <c>{node}-{block}.wal</c> → the block: a log is named after the block it flushes into.</summary>
+    /// <remarks>On a span: it allocates nothing, so a failed replay's hand-off parses before it takes its block out of merges (round 7).</remarks>
     private static bool TryParseBlockId(string file, out ulong segId)
     {
         segId = 0;
-        var stem = Path.GetFileNameWithoutExtension(file);
+        ReadOnlySpan<char> stem = Path.GetFileNameWithoutExtension(file.AsSpan());
         int dash = stem.LastIndexOf('-');
-        return dash > 0 && ulong.TryParse(stem.AsSpan(dash + 1), System.Globalization.NumberStyles.None,
+        return dash > 0 && ulong.TryParse(stem[(dash + 1)..], System.Globalization.NumberStyles.None,
                                           System.Globalization.CultureInfo.InvariantCulture, out segId) && segId != 0;
     }
 

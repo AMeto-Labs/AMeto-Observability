@@ -6401,17 +6401,27 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// <summary>
     /// H-A, the despill's retry: as the swap's, its attempt unlinked the levels under the marker before
     /// writing them again, and a stop before the rewrite left the next start's despill to find the marker
-    /// and delete the spill file unread.
+    /// and delete the spill file unread. And with the marker's look failing from the publish on (round-6
+    /// review, MA3 unpinned): a look that fails is not "gone" — the removal is tried as for a marker that is
+    /// there, before the levels go. Taken for gone, the marker stayed over the unlinked levels.
     /// </summary>
-    [Fact]
-    public async Task A_despill_whose_publish_fails_and_whose_retry_stops_before_its_rewrite_writes_its_block_at_the_next_start()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_despill_whose_publish_fails_and_whose_retry_stops_before_its_rewrite_writes_its_block_at_the_next_start(bool markerLookFails)
     {
         string dir  = NewDir();
         var    opts = Options(dir);
         TwoLevelSpillBlock(opts, dir);
-        var hold   = new TaskCompletionSource();
-        var engine = HeldDespillEngine(opts, hold);
+        var        hold    = new TaskCompletionSource();
+        Func<int>? counted = null;
+        if (markerLookFails)   // the engine's loops carry the seam; armed once the publish has failed
+            StorageEngine.LookFailsForTest.Value = p => p.EndsWith(".flushed", StringComparison.Ordinal) && counted is { } c && c() >= 2;
+        StorageEngine engine;
+        try { engine = HeldDespillEngine(opts, hold); }
+        finally { StorageEngine.LookFailsForTest.Value = null; }
         var registrations = FailSecondRegistration(engine);
+        counted = registrations;
         int rewrites = 0;
         engine._beforeLevelWriteForTest = _ =>
         {
@@ -6834,10 +6844,13 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// despill throws (its marker removal allocates, and on Linux fsyncs) — the WAL is left for the next
     /// start with the scan's entries owned by nobody. A merge took the Information level with a neighbour,
     /// and the next start wrote it again: 30 Information events for 20. The block is out of merges from
-    /// before the hand-off can throw.
+    /// before the hand-off can throw — before its looks too (round 7: the look of the log, the marker's path,
+    /// each allocates, and an out of memory there was the same hole).
     /// </summary>
-    [Fact]
-    public async Task A_block_whose_failed_replay_could_not_be_handed_over_is_not_merged_meanwhile()
+    [Theory]
+    [InlineData("hand-off")]
+    [InlineData("look")]
+    public async Task A_block_whose_failed_replay_could_not_be_handed_over_is_not_merged_meanwhile(string throws)
     {
         string dir    = NewDir();
         var    opts   = Options(dir);
@@ -6858,15 +6871,25 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         string blocker = Path.Combine(segDir, $"{opts.NodeId.Value}-{Block + (int)LogLevel.Error}-{old + 10_000}-{old + 10_000}.seg");
         Directory.CreateDirectory(blocker);
 
-        var  scan    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var  logger  = new CountingLogger(line => line.StartsWith("Loaded ", StringComparison.Ordinal) && line.Contains(" segments from ", StringComparison.Ordinal));
-        bool scanned = false;
-        StorageEngine.BeforeFailedReplayHandOffForTest.Value = _ =>
+        var    scan    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var    logger  = new CountingLogger(line => line.StartsWith("Loaded ", StringComparison.Ordinal) && line.Contains(" segments from ", StringComparison.Ordinal));
+        bool   scanned = false;
+        string walPath = Path.Combine(walDir, $"{opts.NodeId.Value}-{Block}.wal");
+        void ScanThenFail(Exception ex)
         {
             scan.SetResult();   // the boot scan lists and registers the levels the replay moved
             scanned = SpinWait.SpinUntil(() => logger.Count == 1, HangGuard);
-            throw new IOException("test: the hand-off fails (the fsync of wal/, an allocation)");
-        };
+            throw ex;
+        }
+        if (throws == "hand-off")
+            StorageEngine.BeforeFailedReplayHandOffForTest.Value = _ => ScanThenFail(new IOException("test: the hand-off fails (the fsync of wal/, an allocation)"));
+        else
+            StorageEngine.LookFailsForTest.Value = path =>   // the hand-off's look of the log: the replay has moved its levels by then
+            {
+                if (!scanned && path == walPath && Directory.EnumerateFiles(segDir, $"{opts.NodeId.Value}-{Block + (int)LogLevel.Information}-*.seg").Any())
+                    ScanThenFail(new OutOfMemoryException("test: the look of the log cannot allocate"));
+                return false;
+            };
         StorageEngine engine;
         try
         {
@@ -6874,7 +6897,11 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
                                        new RetentionStore(opts, NullLogger<RetentionStore>.Instance), logger,
                                        maintenanceStartDelay: TimeSpan.FromHours(1), bootScanHeldUntil: scan.Task);
         }
-        finally { StorageEngine.BeforeFailedReplayHandOffForTest.Value = null; }
+        finally
+        {
+            StorageEngine.BeforeFailedReplayHandOffForTest.Value = null;
+            StorageEngine.LookFailsForTest.Value                 = null;
+        }
         await using (engine)
         {
             await engine.CatalogLoaded;
