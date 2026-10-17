@@ -587,14 +587,24 @@ public sealed partial class IngestWriteAndSpillTests
         EarlierRunSpill(opts, dir, 9_000, 100_000, 50);
         var hold = new TaskCompletionSource();
         StorageEngine engine;
-        int failed = 0;
-        // The first later suspension of the loop on a Task — the await of the despill (the signal's wait is a Task<bool>).
+        int failed = 0, pastTheHold = 0;
+        // The loop's await of the despill: its first later suspension on a Task (the signal's wait is a Task<bool>) — or,
+        // when the loop reached its hold only once it was let go, and so never suspended there, its first suspension of
+        // all, past the hold. Either throws into the loop the same way: a failed box or a failed registration.
         OwnerAsync.LaterSuspensionFailsForTest.Value = (sm, awaiter) =>
             sm.Name.Contains("<RunDespillLoopAsync>", StringComparison.Ordinal)
             && awaiter == typeof(System.Runtime.CompilerServices.ConfiguredTaskAwaitable.ConfiguredTaskAwaiter)
             && Interlocked.Exchange(ref failed, 1) == 0;
+        OwnerAsync.FirstSuspensionFailsForTest.Value = sm =>
+            sm.Name.Contains("<RunDespillLoopAsync>", StringComparison.Ordinal)
+            && Volatile.Read(ref pastTheHold) == 1 && Interlocked.Exchange(ref failed, 1) == 0;
         try { engine = HeldOneSlotEngine(opts, hold); }
-        finally { OwnerAsync.LaterSuspensionFailsForTest.Value = null; }
+        finally
+        {
+            OwnerAsync.LaterSuspensionFailsForTest.Value = null;
+            OwnerAsync.FirstSuspensionFailsForTest.Value = null;
+        }
+        engine._despillLoopIterationForTest = () => Volatile.Write(ref pastTheHold, 1);   // the top of a round: past the hold
 
         // Not disposed on failure: with the lock kept, the shutdown waits on it for good. And lock-free first — anything
         // that takes the lock (SpillFilesPending too) blocked as well — so the test fails rather than hangs.
