@@ -1,7 +1,8 @@
 import {
-  Component, inject, signal, HostListener, ChangeDetectionStrategy,
+  Component, inject, signal, computed, HostListener, ChangeDetectionStrategy,
 } from '@angular/core';
 import { LucideAngularModule } from 'lucide-angular';
+import { format } from 'date-fns';
 
 import { DropdownService, OverlayPanelRef } from '../../../../shared/services/overlay';
 import {
@@ -12,13 +13,15 @@ import {
 } from '../../dropdowns/services-dropdown';
 import { DateRangeDropdownComponent, DateDropdownController } from '../../dropdowns/date-range-dropdown';
 import { EventsStore } from '../../store/events.store';
-import { TimePreset } from '../../store/events-filter.util';
+import {
+  TimePreset, INLINE_PRESETS, PRESET_LABELS, utcOffsetLabel,
+} from '../../store/events-filter.util';
 
 /**
- * Filter options bar: date-range / levels / services dropdown triggers, the
- * per-level count chips, and the page-size selector. Each dropdown is a CDK
- * overlay opened via {@link DropdownService}; results are written back through
- * the shared {@link EventsStore}.
+ * Filter options bar: the time range (inline presets, Custom dropdown, earlier / later / zoom
+ * out, Live), the levels / services dropdown triggers, the per-level count chips, and the
+ * page-size selector. Each dropdown is a CDK overlay opened via {@link DropdownService};
+ * results are written back through the shared {@link EventsStore}.
  */
 @Component({
   selector: 'app-events-filter-bar',
@@ -48,16 +51,43 @@ export class EventsFilterBarComponent {
     { key: 'Error',       short: 'ERR' },
     { key: 'Fatal',       short: 'FTL' },
   ];
+  readonly inlinePresets = INLINE_PRESETS;
+  readonly presetLabels = PRESET_LABELS as Readonly<Record<TimePreset, string>>;
+  /** Read once: the offset changes only across a DST switch, and a reload picks that up. */
+  readonly tz = utcOffsetLabel();
+
+  /** The Custom dropdown's quick list: every preset, the inline ones included. */
   readonly datePresets: { label: string; value: TimePreset }[] = [
-    { label: 'Last 5 min',   value: '5m'     },
-    { label: 'Last 15 min',  value: '15m'    },
-    { label: 'Last 30 min',  value: '30m'    },
-    { label: 'Last 1 day',   value: '1d'     },
-    { label: 'Last 7 days',  value: '7d'     },
-    { label: 'Last 2 weeks', value: '2w'     },
-    { label: 'Last 1 month', value: '1mo'    },
+    ...(Object.keys(PRESET_LABELS) as Exclude<TimePreset, 'custom'>[])
+      .map(value => ({ label: PRESET_LABELS[value], value })),
     { label: 'Custom range', value: 'custom' },
   ];
+
+  /**
+   * The Custom slot speaks for any window that is not an inline preset — a custom range, or one
+   * of the presets that only live in the dropdown — and then shows that window's name.
+   */
+  readonly customActive = computed(() => !INLINE_PRESETS.includes(this.store.timePreset()));
+
+  readonly zoomOutLabel = computed(() => {
+    const i = INLINE_PRESETS.indexOf(this.store.timePreset());
+    return i >= 0 && i < INLINE_PRESETS.length - 1
+      ? `Zoom out to ${PRESET_LABELS[INLINE_PRESETS[i + 1] as Exclude<TimePreset, 'custom'>].toLowerCase()}`
+      : 'Zoom out — double the window';
+  });
+
+  /** When a stopped tail froze the list, as `11:42:07`; empty otherwise. */
+  readonly frozenAt = computed(() => {
+    const at = this.store.liveFrozenAt();
+    return at === null ? '' : format(at, 'HH:mm:ss');
+  });
+
+  readonly liveTitle = computed(() => {
+    if (this.store.live()) return 'Live tail — click to pause';
+    if (this.store.isAggregation()) return 'An aggregation is a snapshot of a window — there is nothing for a tail to append';
+    if (this.frozenAt()) return 'The list is what the tail had delivered when it was paused — click to resume';
+    return 'Live tail';
+  });
   readonly calendarWeekDays = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
   readonly pageSizeOptions = [50, 100, 150, 300, 500];
 

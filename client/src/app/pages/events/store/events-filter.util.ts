@@ -1,7 +1,37 @@
-import { subDays, startOfDay, format } from 'date-fns';
+import { subDays, startOfDay, format, isSameDay } from 'date-fns';
 import { LEVELS } from '../../../core/models/event.model';
 
-export type TimePreset = '5m' | '15m' | '30m' | '1d' | '7d' | '2w' | '1mo' | 'custom';
+export type TimePreset = '5m' | '15m' | '30m' | '1h' | '4h' | '24h' | '7d' | '2w' | '1mo' | 'custom';
+
+/**
+ * The presets shown inline in the filter bar, smallest first. Zoom out climbs this list, so a
+ * relative window stays relative; the rest (`30m`, `2w`, `1mo`) live behind Custom.
+ */
+export const INLINE_PRESETS: readonly TimePreset[] = ['5m', '15m', '1h', '4h', '24h', '7d'];
+
+export const PRESET_LABELS: Readonly<Record<Exclude<TimePreset, 'custom'>, string>> = {
+  '5m': 'Last 5 min',
+  '15m': 'Last 15 min',
+  '30m': 'Last 30 min',
+  '1h': 'Last 1 hour',
+  '4h': 'Last 4 hours',
+  '24h': 'Last 24 hours',
+  '7d': 'Last 7 days',
+  '2w': 'Last 2 weeks',
+  '1mo': 'Last 1 month',
+};
+
+/**
+ * A `preset=` URL value as a preset, or null when it names none. `1d` was the default before the
+ * presets moved inline and still sits in saved links; it is read as `24h`, the preset that
+ * replaced it.
+ */
+export function parsePreset(raw: string | null): TimePreset | null {
+  if (raw === '1d') return '24h';
+  if (raw === 'custom') return 'custom';
+  // Own keys only: `in` would accept `preset=toString`.
+  return raw !== null && Object.hasOwn(PRESET_LABELS, raw) ? raw as TimePreset : null;
+}
 
 /** Safe identifier as accepted by the server-side lexer (letter/digit/_/@). */
 const IDENT_RE = /^[A-Za-z_@][A-Za-z0-9_@]*$/;
@@ -499,9 +529,48 @@ export function parseCustomDate(val: string): Date | null {
 export function presetFrom(preset: TimePreset): string {
   if (preset === 'custom') return '';
   const now = new Date();
-  const msMap: Partial<Record<TimePreset, number>> = { '5m': 5 * 60_000, '15m': 15 * 60_000, '30m': 30 * 60_000 };
-  const daysMap: Partial<Record<TimePreset, number>> = { '1d': 1, '7d': 7, '2w': 14, '1mo': 30 };
+  const msMap: Partial<Record<TimePreset, number>> = {
+    '5m': 5 * 60_000, '15m': 15 * 60_000, '30m': 30 * 60_000,
+    '1h': 3_600_000, '4h': 4 * 3_600_000, '24h': 24 * 3_600_000,
+  };
+  const daysMap: Partial<Record<TimePreset, number>> = { '7d': 7, '2w': 14, '1mo': 30 };
   if (msMap[preset] !== undefined) return fmtDateInput(new Date(now.getTime() - msMap[preset]!));
   if (daysMap[preset] !== undefined) return fmtDateInput(startOfDay(subDays(now, daysMap[preset]!)));
   return '';
+}
+
+/** A duration in its two largest units, rounded to the minute: `45 m`, `4 h`, `4 d 9 h`. */
+export function fmtSpan(ms: number): string {
+  const min = Math.max(0, Math.round(ms / 60_000));
+  if (min < 60) return `${min} m`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return min % 60 ? `${h} h ${min % 60} m` : `${h} h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d} d ${h % 24} h` : `${d} d`;
+}
+
+/** `17 Oct 09:00`, with the year only when it is not the current one. */
+function fmtPoint(d: Date, now: Date): string {
+  return format(d, d.getFullYear() === now.getFullYear() ? 'd MMM HH:mm' : 'd MMM yyyy HH:mm');
+}
+
+/**
+ * How a custom window reads on its button: `17 Oct 09:00 → 13:00` plus its length when both ends
+ * are set (the date once when they share a day), `Since 17 Oct 09:00` when the end is open.
+ * `extra` is the length, drawn quieter than the window itself.
+ */
+export function customRangeLabel(from: Date | null, to: Date | null, now = new Date()): { text: string; extra: string } {
+  if (!from) return { text: 'Custom', extra: '' };
+  if (!to) return { text: `Since ${fmtPoint(from, now)}`, extra: '' };
+  const end = isSameDay(from, to) ? format(to, 'HH:mm') : fmtPoint(to, now);
+  return { text: `${fmtPoint(from, now)} → ${end}`, extra: fmtSpan(to.getTime() - from.getTime()) };
+}
+
+/** The browser's offset from UTC as `UTC+05:00` — the zone every time on the page is in. */
+export function utcOffsetLabel(d = new Date()): string {
+  const off = -d.getTimezoneOffset();
+  const abs = Math.abs(off);
+  const hh = String(Math.floor(abs / 60)).padStart(2, '0');
+  const mm = String(abs % 60).padStart(2, '0');
+  return `UTC${off < 0 ? '−' : '+'}${hh}:${mm}`;
 }

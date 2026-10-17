@@ -59,6 +59,149 @@
 }
 .fb-caret.rotated { transform: rotate(180deg); }
 
+/* ── Time range: inline presets + Custom ────────────────────────── */
+.tr-seg {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  flex-shrink: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.tr-seg-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  min-width: 34px;
+  justify-content: center;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--txt-muted);
+  font-family: var(--ui);
+  font-size: 11.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.tr-seg-btn:hover { color: var(--txt); background: var(--surface-hover); }
+.tr-seg-btn.active {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-weight: 700;
+}
+// Custom carries a window's name, so it reads as a selection rather than a solid key.
+.tr-custom.active {
+  background: var(--accent-dim);
+  color: var(--txt);
+  font-weight: 500;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.tr-custom.active lucide-icon:first-child { color: var(--accent); }
+.tr-custom.open { box-shadow: inset 0 0 0 1px var(--accent); color: var(--txt); }
+.tr-extra { color: var(--txt-muted); }
+
+.tr-seg-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--border);
+}
+
+/* Earlier / later / zoom out: one joined group */
+.tr-nav {
+  display: flex;
+  flex-shrink: 0;
+}
+.tr-nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin-left: -1px;
+  background: var(--surface-up);
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+.tr-nav-btn:first-child { margin-left: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.tr-nav-btn:last-child  { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.tr-nav-btn:hover:not(:disabled) { color: var(--txt); border-color: var(--accent); position: relative; }
+.tr-nav-btn:disabled { color: var(--txt-dim); opacity: .5; cursor: default; }
+
+/* Live: the moving "up to now" window, next to the fixed ones */
+.tr-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  flex-shrink: 0;
+  border-radius: 99px;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  font-family: var(--ui);
+  font-size: 11.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all .12s;
+}
+.tr-live:hover:not(:disabled) { color: var(--txt); border-color: var(--txt-muted); }
+.tr-live.live-on { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); font-weight: 600; }
+.tr-live.frozen { color: var(--txt); border-color: var(--txt-dim); background: var(--surface-hover); }
+.tr-live:disabled { opacity: .5; cursor: default; }
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--txt-dim);
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.live-dot.on {
+  background: var(--lvl-e);
+  box-shadow: 0 0 6px var(--lvl-e);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .5; }
+}
+/* The dot is the only thing on this page that animates indefinitely; the lit colour and the
+   glow still say "live" without it. */
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.on { animation: none; }
+}
+
+/* Right end: where the window starts, the zone, the page size */
+.fb-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.tr-readout {
+  font-size: 11px;
+  color: var(--txt-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* ── Level count chips ──────────────────────────────────────────── */
 .lc-chips {
   display: flex;
@@ -121,7 +264,6 @@
   cursor: pointer;
   outline: none;
   flex-shrink: 0;
-  margin-left: auto;
 }
 .page-size-select:hover { color: var(--txt); border-color: var(--accent); }
 .page-size-select:focus { border-color: var(--accent); }
