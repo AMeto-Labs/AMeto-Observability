@@ -1044,6 +1044,42 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// Round-6 review R6-M1. A spilled event whose template or service is the entry's own text — refused a pool row
+    /// at ingest, past the pool's budget or its request's share — comes back from its despill as it was logged:
+    /// unpooled, beside the event. The despill interned every such text into the live pool, spending what the share
+    /// had kept it from (3 texts pooled at ingest, 1 049 after the despill, in the review's probe).
+    /// </summary>
+    [Fact]
+    public async Task A_despill_keeps_an_events_own_template_and_service_out_of_the_pool()
+    {
+        const int Events = 50;
+        string dir  = NewDir();
+        var    opts = Options(dir);
+        string walDir = Path.Combine(dir, "wal");
+        Directory.CreateDirectory(walDir);
+        string spill = Path.Combine(walDir, $"{opts.NodeId.Value}-9000{StorageEngine.SpillExtension}");
+        using (var wal = WriteAheadLog.Open(spill, opts.NodeId, new SegmentId(9_000), 1 << 20))
+            for (int i = 0; i < Events; i++)
+                wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, LogLevel.Information, -1, $"own template {i}", Props(i),
+                           service: $"own.svc.{i}");   // no pool rows: the texts are the entries' own
+
+        var hold   = new TaskCompletionSource();
+        var engine = HeldOneSlotEngine(opts, hold);
+        await using (engine)
+        {
+            int before = engine.TemplatePool.ClaimedCount;
+            hold.SetResult();
+            WaitFor(() => engine.SpillFilesPending == 0 && engine.DespilledEvents == Events, "the block to be despilled", ShortGuard);
+            int pooled = engine.TemplatePool.ClaimedCount - before;
+            Assert.True(pooled == 0, $"the despill pooled {pooled} of its events' own texts");
+            var events = ReadAll(engine);
+            Assert.Equal(Events, events.Count);
+            Assert.Equal("own template 7", events[7].Template);
+            Assert.Equal("own.svc.7", events[7].Service);
+        }
+    }
+
+    /// <summary>
     /// R4-3. One transient swap failure, spilling off: the despill does not take the free slot (for a
     /// whole block), and the writers waiting are written once the swap installs at its first retry, a
     /// re-check interval later. The despill took the slot at the first failure while the writers were

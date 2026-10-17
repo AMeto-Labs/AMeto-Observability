@@ -230,19 +230,13 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     internal void ChargeString(string s) => Charge(StringBytes(s));
 
     /// <summary>An exception tree the decode made for this batch alone (CLEF's <c>@x</c>): its size in the heap.</summary>
-    internal void ChargeException(ExceptionInfo exception)
-    {
-        long bytes = 0;
-        for (var e = exception; e is not null; e = e.Inner)
-            bytes += ExceptionInfoObjectBytes + StringBytes(e.Type) + StringBytes(e.Message) + StringBytes(e.StackTrace);
-        Charge(bytes);
-    }
+    internal void ChargeException(ExceptionInfo exception) => Charge(HotTierSegment.ManagedBytesOf(exception));
 
-    /// <summary>A string's size in a 64-bit heap: header, method table, length, its UTF-16 and a terminator, 8-aligned.</summary>
-    internal static long StringBytes(string? s) => s is null ? 0 : (22L + 2L * s.Length + 7) & ~7L;
-
-    /// <summary>An <see cref="ExceptionInfo"/> object: header, method table and its four references.</summary>
-    private const long ExceptionInfoObjectBytes = 48;
+    /// <summary>
+    /// A string's size in a 64-bit heap, as the hot tier counts it (<see cref="HotTierSegment.ManagedBytesOf(string?)"/>):
+    /// one rule, so a batch charges what the tier it is written into counts (the ultra review's LOW: this was a copy).
+    /// </summary>
+    internal static long StringBytes(string? s) => HotTierSegment.ManagedBytesOf(s);
 
     // ── Sinks ─────────────────────────────────────────────────────────────────
 

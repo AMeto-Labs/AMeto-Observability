@@ -1428,24 +1428,36 @@ public sealed partial class StorageEngine
             {
                 count++;
                 undecoded.Note(in e);
-                // A template with no pool row — outside a saturated pool, or longer than a row holds
-                // — is in the entry itself (v6); the spill file is the event's only copy, and such a
-                // template used to come back empty, or cut at 65 535 bytes.
-                string? tmpl = e.Template
-                               ?? (!e.Unpooled && rows.TryGetValue(e.TemplateIndex, out var t) && t.Length != 0 ? t : null);
-                int tmplIdx  = tmpl is null ? -1 : TemplatePool.Intern(tmpl, out tmpl);
-                // The service by its row, or by the text the entry carries (logged outside a full
-                // pool): interned into the live pool by text, and kept beside the event when that
-                // pool is full too — the name used to be dropped there, the event despilled with none.
+                // A template with no pool row — outside a saturated pool, past its request's share of the
+                // pool, or longer than a row holds — is in the entry itself (v6); the spill file is the
+                // event's only copy, and such a template used to come back empty, or cut at 65 535 bytes.
+                //
+                // Attached as it was logged (round-6 review R6-M1): the entry's own text stays unpooled, with
+                // no pool index, as the startup replay attaches it (ReplayOrphanedWal), and the tier counts it
+                // as its own text. Interned here, it spent the pool the ingest's share had kept it out of: 3
+                // texts pooled at ingest, 1 049 after the despill, in the review's probe. A row's text is
+                // interned by its text, as it was pooled when it was logged.
+                string? tmpl;
+                int     tmplIdx;
+                if (e.Template is { } own) { tmpl = own; tmplIdx = -1; }
+                else if (!e.Unpooled && rows.TryGetValue(e.TemplateIndex, out var t) && t.Length != 0) tmplIdx = TemplatePool.Intern(t, out tmpl);
+                else { tmpl = null; tmplIdx = -1; }
+                // The service by its row, interned into the live pool by text and kept beside the event when
+                // that pool is full — the name used to be dropped there, the event despilled with none — or the
+                // text the entry carries (logged outside the pool), kept beside the event as it was logged.
                 int     svcAt   = e.ServiceIndexIn(rows);
-                string? svcText = svcAt >= 0 ? rows[(ushort)svcAt] : e.Service;
                 int     svcIdx  = -1;
                 string? svcKept = null;
-                if (!string.IsNullOrEmpty(svcText))
+                if (svcAt >= 0)
                 {
-                    svcIdx = TemplatePool.Intern(svcText, out string canonicalSvc);
-                    if (svcIdx < 0) svcKept = canonicalSvc;
+                    string svcRow = rows[(ushort)svcAt];
+                    if (!string.IsNullOrEmpty(svcRow))
+                    {
+                        svcIdx = TemplatePool.Intern(svcRow, out string canonicalSvc);
+                        if (svcIdx < 0) svcKept = canonicalSvc;
+                    }
                 }
+                else if (!string.IsNullOrEmpty(e.Service)) svcKept = e.Service;
 
                 var header = new LogEventHeader
                 {
