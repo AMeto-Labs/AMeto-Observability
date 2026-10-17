@@ -1,19 +1,79 @@
 <div class="filter-bar">
 <div class="filter-bar-inner">
 
-  <!-- Date range -->
-  <div class="fb-group" (click)="$event.stopPropagation()">
-    <button #dateBtn class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDate(dateBtn)">
-      <lucide-icon name="calendar" [size]="13" />
-      <span>{{ store.dateRangeLabel() }}</span>
+  <!-- Time range: the common presets inline, everything else behind Custom -->
+  <div class="tr-seg" role="group" aria-label="Time range" (click)="$event.stopPropagation()">
+    @for (p of inlinePresets; track p) {
+      <button
+        type="button"
+        class="tr-seg-btn"
+        [class.active]="store.timePreset() === p"
+        [attr.aria-pressed]="store.timePreset() === p"
+        [title]="presetLabels[p]"
+        (click)="store.setTimePreset(p)">{{ p }}</button>
+    }
+    <span class="tr-seg-sep"></span>
+    <button
+      #dateBtn
+      type="button"
+      class="tr-seg-btn tr-custom"
+      [class.active]="customActive()"
+      [class.open]="dateDropdownOpen()"
+      aria-haspopup="dialog"
+      [attr.aria-expanded]="dateDropdownOpen()"
+      (click)="openDate(dateBtn)">
+      <lucide-icon name="calendar" [size]="12" />
+      @if (customActive()) {
+        @let label = store.rangeLabel();
+        <span>{{ label.text }}</span>
+        @if (label.extra) { <span class="tr-extra">· {{ label.extra }}</span> }
+      } @else {
+        <span>Custom</span>
+      }
       <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="dateDropdownOpen()" />
     </button>
   </div>
 
+  <div class="tr-nav" role="group" aria-label="Move the time range">
+    <button type="button" class="tr-nav-btn" aria-label="Earlier"
+      title="Earlier — move the window back by its length"
+      (click)="store.shiftWindow(-1)">
+      <lucide-icon name="chevron-left" [size]="14" />
+    </button>
+    <button type="button" class="tr-nav-btn" aria-label="Later"
+      [title]="store.canShiftLater() ? 'Later — move the window forward by its length' : 'The window already ends now'"
+      [disabled]="!store.canShiftLater()"
+      (click)="store.shiftWindow(1)">
+      <lucide-icon name="chevron-right" [size]="14" />
+    </button>
+    <button type="button" class="tr-nav-btn" [attr.aria-label]="zoomOutLabel()" [title]="zoomOutLabel()"
+      (click)="store.zoomOut()">
+      <lucide-icon name="zoom-out" [size]="14" />
+    </button>
+  </div>
+
+  <button
+    type="button"
+    class="tr-live"
+    [class.live-on]="store.live()"
+    [class.frozen]="frozenAt()"
+    [attr.aria-pressed]="store.live()"
+    [disabled]="!store.live() && store.isAggregation()"
+    [title]="liveTitle()"
+    (click)="store.toggleLive()">
+    @if (frozenAt()) {
+      <lucide-icon name="pause" [size]="11" />
+      <span>Paused {{ frozenAt() }}</span>
+    } @else {
+      <span class="live-dot" [class.on]="store.live()"></span>
+      <span>Live</span>
+    }
+  </button>
+
   <!-- Everything from here to the page size edits or counts the EVENT LIST. An aggregation
        has neither: the level and service pickers would splice `@l = 'Error' and ` onto the
        front of the query, the chips count rows that no longer exist, and the row count comes
-       from the query's own `limit`. The date range stays — the window does apply. -->
+       from the query's own `limit`. The time range stays — the window does apply. -->
   @if (store.isAggregation()) {
     <div class="sep-v"></div>
     <span class="fb-agg-note">
@@ -21,6 +81,8 @@
       Aggregation — levels, services and page size come from the query itself
     </span>
   } @else {
+
+  <div class="sep-v"></div>
 
   <!-- All levels -->
   <div class="fb-group" (click)="$event.stopPropagation()">
@@ -56,17 +118,22 @@
       </button>
     }
   </div>
-  <div class="sep-v"></div>
-
-  <!-- Page size (right-aligned) -->
-  <select
-    class="page-size-select"
-    (change)="store.setPageSize(+$any($event.target).value)"
-    title="Events per request">
-    @for (n of pageSizeOptions; track n) {
-      <option [value]="n" [selected]="n === store.pageSize()">{{ n }}</option>
-    }
-  </select>
   }
+
+  <div class="fb-right">
+    <span class="tr-readout" [title]="'Times are in your time zone, ' + tz">
+      @if (store.windowReadout(); as readout) { {{ readout }} · }{{ tz }}
+    </span>
+    @if (!store.isAggregation()) {
+      <select
+        class="page-size-select"
+        (change)="store.setPageSize(+$any($event.target).value)"
+        title="Events per request">
+        @for (n of pageSizeOptions; track n) {
+          <option [value]="n" [selected]="n === store.pageSize()">{{ n }}</option>
+        }
+      </select>
+    }
+  </div>
 </div>
 </div>

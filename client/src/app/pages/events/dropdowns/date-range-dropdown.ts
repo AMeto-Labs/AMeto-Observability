@@ -3,8 +3,7 @@ import { LucideAngularModule } from 'lucide-angular';
 
 import { DateMaskDirective } from '../../../shared/directives/date-mask.directive';
 import { OverlayPanelRef } from '../../../shared/services/overlay';
-
-export type TimePreset = '5m' | '15m' | '30m' | '1d' | '7d' | '2w' | '1mo' | 'custom';
+import { TimePreset } from '../store/events-filter.util';
 
 export interface CalendarDay {
   day: number;

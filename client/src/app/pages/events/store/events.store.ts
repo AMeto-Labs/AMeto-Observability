@@ -10,12 +10,15 @@ import { ApiService } from '../../../core/services/api.service';
 import { SearchHistoryService } from '../../../core/services/search-history.service';
 import { EventDto, LEVELS, AggregationDto } from '../../../core/models/event.model';
 import {
-  TimePreset,
+  TimePreset, INLINE_PRESETS, PRESET_LABELS,
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
-  parseCustomDate, fmtDateInput, presetFrom,
+  parseCustomDate, fmtDateInput, presetFrom, parsePreset, customRangeLabel,
   collectPropPaths, isoToDotNetUtcTicksString, isAggregationQuery,
 } from './events-filter.util';
+
+/** The window a fresh page opens on, and the one Clear returns to. */
+const DEFAULT_PRESET: TimePreset = '24h';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
 const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
@@ -111,6 +114,12 @@ interface EventsState {
   liveReceived: number;
   /** Rows the buffer cap has discarded on this tail. A tail that drops must say so. */
   liveDropped: number;
+  /**
+   * When a tail that stopped froze the list (epoch ms), or null. While set, the rows on screen
+   * are what the tail delivered, not an answer for the time window, so the window controls must
+   * not claim them; the next search or tail clears it.
+   */
+  liveFrozenAt: number | null;
   pageSize: number;
   wrapMessages: boolean;
   quickSearch: string;
@@ -150,7 +159,7 @@ export const EventsStore = signalStore(
   withState<EventsState>(() => ({
     filterInput: '',
     filter: '',
-    timePreset: '1d',
+    timePreset: DEFAULT_PRESET,
     customFrom: '',
     customTo: '',
     customFromSuggestion: '',
@@ -166,6 +175,7 @@ export const EventsStore = signalStore(
     liveRate: 0,
     liveReceived: 0,
     liveDropped: 0,
+    liveFrozenAt: null,
     pageSize: 50,
     wrapMessages: false,
     quickSearch: '',
@@ -267,9 +277,26 @@ export const EventsStore = signalStore(
       return `${s.size} services`;
     });
 
-    const dateRangeLabel = computed(
-      () => `${store.customFrom() || '…'} – ${store.customTo() || 'now'}`,
-    );
+    /** What the window is called: a preset's name, or the custom window with its length. */
+    const rangeLabel = computed<{ text: string; extra: string }>(() => {
+      const preset = store.timePreset();
+      if (preset !== 'custom') return { text: PRESET_LABELS[preset], extra: '' };
+      return customRangeLabel(parseCustomDate(store.customFrom()), parseCustomDate(store.customTo()));
+    });
+
+    /**
+     * Where a preset's window actually starts — `11:27 → now`. Empty for a custom window, whose
+     * label already says it, and whenever the list is a tail's rather than the window's.
+     */
+    const windowReadout = computed(() => {
+      if (store.timePreset() === 'custom' || store.live() || store.liveFrozenAt() !== null) return '';
+      const from = parseCustomDate(store.customFrom());
+      if (!from) return '';
+      return `${format(from, from.toDateString() === new Date().toDateString() ? 'HH:mm' : 'd MMM HH:mm')} → now`;
+    });
+
+    /** An open end already ends now; only a window with a set end can move later. */
+    const canShiftLater = computed(() => !!parseCustomDate(store.customTo()));
 
     const calendarMonthLabel = computed(() => {
       const { year, month } = store.calendarNav();
@@ -341,7 +368,8 @@ export const EventsStore = signalStore(
     return {
       activeLevels, selectedServices, displayedEvents, availableServices,
       levelCounts, serviceCounts, totalCount, allLevelsActive, liveBufferSize,
-      levelsLabel, serviceLabel, dateRangeLabel, calendarMonthLabel, calendarDays,
+      levelsLabel, serviceLabel, rangeLabel, windowReadout, canShiftLater,
+      calendarMonthLabel, calendarDays,
       customFromValid, customToValid, canSearch, knownPropPaths, selectedEvent,
       isAggregation,
     };
@@ -602,6 +630,10 @@ export const EventsStore = signalStore(
 
     // ── Actions ─────────────────────────────────────────────────────────────
     function loadEvents(): void {
+      // A preset is relative: it is resolved against the clock on every load rather than frozen
+      // when it was picked, or a "Last 15 min" re-applied twenty minutes later would cover 35.
+      if (store.timePreset() !== 'custom') applyPresetDates(store.timePreset());
+
       // Every filter, level, time and page-size mutator ends here.
       // `select count(*) …` asks a different question and gets a different answer: a table,
       // over plain JSON. Checked BEFORE the live branch, not after it: a tail running when the
@@ -638,7 +670,7 @@ export const EventsStore = signalStore(
 
       patchState(store, {
         loading: true, error: null, events: [], aggregation: null, hasMore: true,
-        selectedId: null, selectedEventPinned: null,
+        selectedId: null, selectedEventPinned: null, liveFrozenAt: null,
       });
 
       const acc: EventDto[] = [];
@@ -701,7 +733,7 @@ export const EventsStore = signalStore(
       liveWasRunning = false;
       patchState(store, {
         loading: true, error: null, events: [], aggregation: null, hasMore: false,
-        selectedId: null, selectedEventPinned: null,
+        selectedId: null, selectedEventPinned: null, liveFrozenAt: null,
       });
 
       querySub = api.aggregate({
@@ -803,8 +835,8 @@ export const EventsStore = signalStore(
     }
 
     function reset(): void {
-      patchState(store, { filterInput: '', filter: '', timePreset: '1d' });
-      applyPresetDates('1d');
+      patchState(store, { filterInput: '', filter: '', timePreset: DEFAULT_PRESET });
+      applyPresetDates(DEFAULT_PRESET);
       loadEvents();
     }
 
@@ -813,10 +845,70 @@ export const EventsStore = signalStore(
       reset();
     }
 
+    /**
+     * Picks a preset. A running tail is stopped first, as {@link seek} stops it: the tail ignores
+     * the window, so the click would otherwise change the highlighted preset and nothing else.
+     */
     function setTimePreset(preset: TimePreset): void {
+      if (store.live()) stopLive();
       patchState(store, { calPickingEnd: false, timePreset: preset });
       applyPresetDates(preset);
       loadEvents();
+    }
+
+    /** The current window's bounds in epoch ms; an open end is now. */
+    function windowBounds(): { from: number; to: number } {
+      return { from: getFromDate().getTime(), to: parseCustomDate(store.customTo())?.getTime() ?? Date.now() };
+    }
+
+    /** Whole minutes, never under one: the date inputs carry nothing finer. */
+    function spanOf(from: number, to: number): number {
+      return Math.max(1, Math.round((to - from) / 60_000)) * 60_000;
+    }
+
+    /** Sets an explicit window (null end = up to now) and reloads, stopping a tail as presets do. */
+    function setWindow(fromMs: number, toMs: number | null): void {
+      if (store.live()) stopLive();
+      patchState(store, {
+        customFrom: fmtDateInput(new Date(fromMs)),
+        customTo: toMs === null ? '' : fmtDateInput(new Date(toMs)),
+        customFromSuggestion: '',
+        customToSuggestion: '',
+        timePreset: 'custom',
+        calPickingEnd: false,
+      });
+      loadEvents();
+    }
+
+    /**
+     * Moves the window by its own length, keeping the length: the new window starts (or ends)
+     * exactly where the old one ended (or started), so stepping back and forth leaves no gap.
+     * Later is only offered for a window with a set end (see canShiftLater); a later step that
+     * would pass now ends at now instead, since there is nothing beyond it to show.
+     */
+    function shiftWindow(dir: -1 | 1): void {
+      if (dir > 0 && !store.canShiftLater()) return;
+      const { from, to } = windowBounds();
+      const span = spanOf(from, to);
+      if (dir < 0) { setWindow(from - span, from); return; }
+      const end = to + span;
+      if (end >= Date.now()) setWindow(Date.now() - span, null);
+      else setWindow(to, end);
+    }
+
+    /**
+     * Widens the window. On an inline preset it steps to the next one up, so a relative window
+     * stays relative; anything else doubles around its middle, and ends at now if the doubled
+     * window would reach past it.
+     */
+    function zoomOut(): void {
+      const i = INLINE_PRESETS.indexOf(store.timePreset());
+      if (i >= 0 && i < INLINE_PRESETS.length - 1) { setTimePreset(INLINE_PRESETS[i + 1]); return; }
+      const { from, to } = windowBounds();
+      const span = spanOf(from, to);
+      const end = to + span / 2;
+      if (end >= Date.now()) setWindow(Date.now() - 2 * span, null);
+      else setWindow(from - span / 2, end);
     }
 
     function setFrom(v: string): void {
@@ -966,7 +1058,7 @@ export const EventsStore = signalStore(
       const from = continues ? newest : floor;
 
       patchState(store, {
-        live: true, error: null, newEventIds: EMPTY_IDS,
+        live: true, error: null, newEventIds: EMPTY_IDS, liveFrozenAt: null,
         livePending: 0, liveRate: 0, liveReceived: 0, liveDropped: 0,
         // The table belongs to the query it came from. Leaving it up while a tail runs put a
         // snapshot of totals on screen with the live dot lit beside it.
@@ -1029,7 +1121,7 @@ export const EventsStore = signalStore(
           // then drops — a stream that failed would silently delete every row behind the pill.
           landEverything();
           clearNew();
-          patchState(store, { live: false, error: err?.message || 'Live tail stopped' });
+          patchState(store, { live: false, liveFrozenAt: Date.now(), error: err?.message || 'Live tail stopped' });
         },
       });
     }
@@ -1046,7 +1138,7 @@ export const EventsStore = signalStore(
      * something the user asks for rather than something stop implies.</p>
      */
     function stopLive(): void {
-      patchState(store, { live: false });
+      patchState(store, { live: false, liveFrozenAt: Date.now() });
       liveSub?.unsubscribe();
       liveSub = undefined;
       liveWasRunning = false;
@@ -1294,22 +1386,26 @@ export const EventsStore = signalStore(
     function initFromUrl(): void {
       const qp = route.snapshot.queryParamMap;
       const urlFilter = qp.get('filter') ?? '';
-      const urlPreset = (qp.get('preset') as TimePreset) || '1d';
+      const urlPreset = parsePreset(qp.get('preset'));
       const urlFrom = qp.get('from') ?? '';
       const urlTo = qp.get('to') ?? '';
       const urlLevels = qp.get('levels');
       const urlSize = Number(qp.get('size'));
 
-      const patch: Partial<EventsState> = {
-        filterInput: urlFilter, filter: urlFilter, timePreset: urlPreset,
-      };
+      // A preset is relative, so a link carrying one opens on that preset from NOW — the
+      // `from` beside it is only where the window started when the link was made. Explicit
+      // bounds are read only for a custom window.
+      const relative = urlPreset !== null && urlPreset !== 'custom';
+      const timePreset: TimePreset = relative ? urlPreset : urlFrom ? 'custom' : DEFAULT_PRESET;
+
+      const patch: Partial<EventsState> = { filterInput: urlFilter, filter: urlFilter, timePreset };
       if (PAGE_SIZE_OPTIONS.includes(urlSize)) patch.pageSize = urlSize;
       patchState(store, patch);
 
-      if (urlFrom) {
+      if (timePreset === 'custom') {
         patchState(store, { customFrom: urlFrom, customTo: urlTo });
       } else {
-        applyPresetDates(urlPreset);
+        applyPresetDates(timePreset);
       }
 
       if (urlLevels) {
@@ -1358,6 +1454,8 @@ export const EventsStore = signalStore(
       reset,
       resetAll,
       setTimePreset,
+      shiftWindow,
+      zoomOut,
       setFrom,
       setTo,
       setFromSuggestion,
