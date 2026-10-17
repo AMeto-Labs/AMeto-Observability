@@ -33,6 +33,22 @@ The k6 summary reports the server's own per-batch accounting:
 `ameto_ingested` / `ameto_dropped` (summed from each `{"ingested":N,"dropped":M}`
 response), alongside the usual latency percentiles.
 
+## A/B comparison of two builds (Windows, PowerShell 7)
+
+`ab-round.ps1` runs one round against a server build of your choice — fresh data
+directory, the load started at a fixed 70 s after `/health` so every background timer
+is at the same phase, an idle gate before it, CPU / memory / dotnet-counters / foreign
+CPU recorded during it, one query per signal after it, and (traces) the compaction run
+after a restart. `ab-compare.ps1` interleaves A and B rounds and re-runs any round that
+overlapped another process's CPU or a host near its RAM limit; `ab-summary.ps1` prints
+the tables. Method, results and caveats: [docs/perf/TRACES-METRICS-RESULTS.md](../../docs/perf/TRACES-METRICS-RESULTS.md).
+
+```powershell
+tools/loadtest/ab-compare.ps1 -A <buildA>\bin\Release\net10.0 -B <buildB>\bin\Release\net10.0 `
+    -OutRoot C:\tmp\rounds -Signal traces -Rate 50 -Pairs 3
+tools/loadtest/ab-summary.ps1 -OutRoot C:\tmp\rounds
+```
+
 ## Measured: v1.0.9, 2026-07-17
 
 Fresh Windows install (installer defaults, 20-core dev box), k6 co-located on
