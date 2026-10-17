@@ -177,6 +177,30 @@
   transition: all .12s;
 }
 .tb-live-btn:hover { color: var(--txt); border-color: var(--txt-muted); }
+.tb-live-btn.live-on { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); }
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--txt-dim);
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.live-dot.on {
+  background: var(--lvl-e);
+  box-shadow: 0 0 6px var(--lvl-e);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .5; }
+}
+/* The dot is the only thing on this page that animates indefinitely; the lit colour and the
+   glow still say "live" without it. */
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.on { animation: none; }
+}
 
 .tb-icon-btn {
   display: flex;

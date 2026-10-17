@@ -1,30 +1,25 @@
 import { subDays, startOfDay, format, isSameDay } from 'date-fns';
 import { LEVELS } from '../../../core/models/event.model';
 
-export type TimePreset = '5m' | '15m' | '30m' | '1h' | '4h' | '24h' | '7d' | '2w' | '1mo' | 'custom';
+export type TimePreset = '15m' | '1h' | '4h' | '24h' | 'today' | 'yesterday' | '7d' | 'custom';
 
-/**
- * The presets shown inline in the filter bar, smallest first. Zoom out climbs this list, so a
- * relative window stays relative; the rest (`30m`, `2w`, `1mo`) live behind Custom.
- */
-export const INLINE_PRESETS: readonly TimePreset[] = ['5m', '15m', '1h', '4h', '24h', '7d'];
-
+/** The time range popover's quick ranges, in the order its chips show them. */
 export const PRESET_LABELS: Readonly<Record<Exclude<TimePreset, 'custom'>, string>> = {
-  '5m': 'Last 5 min',
   '15m': 'Last 15 min',
-  '30m': 'Last 30 min',
-  '1h': 'Last 1 hour',
-  '4h': 'Last 4 hours',
-  '24h': 'Last 24 hours',
+  '1h': 'Last 1 h',
+  '4h': 'Last 4 h',
+  '24h': 'Last 24 h',
+  today: 'Today',
+  yesterday: 'Yesterday',
   '7d': 'Last 7 days',
-  '2w': 'Last 2 weeks',
-  '1mo': 'Last 1 month',
 };
 
+/** The window a fresh page opens on, and the one Reset and Clear return to. */
+export const DEFAULT_PRESET: TimePreset = '24h';
+
 /**
- * A `preset=` URL value as a preset, or null when it names none. `1d` was the default before the
- * presets moved inline and still sits in saved links; it is read as `24h`, the preset that
- * replaced it.
+ * A `preset=` URL value as a preset, or null when it names none. `1d` was the default before
+ * this set and still sits in saved links; it is read as `24h`, the preset that replaced it.
  */
 export function parsePreset(raw: string | null): TimePreset | null {
   if (raw === '1d') return '24h';
@@ -525,18 +520,22 @@ export function parseCustomDate(val: string): Date | null {
   return null;
 }
 
-/** The `from` timestamp for a preset (empty string for `custom`); `to` is always open (''). */
-export function presetFrom(preset: TimePreset): string {
-  if (preset === 'custom') return '';
-  const now = new Date();
-  const msMap: Partial<Record<TimePreset, number>> = {
-    '5m': 5 * 60_000, '15m': 15 * 60_000, '30m': 30 * 60_000,
-    '1h': 3_600_000, '4h': 4 * 3_600_000, '24h': 24 * 3_600_000,
-  };
-  const daysMap: Partial<Record<TimePreset, number>> = { '7d': 7, '2w': 14, '1mo': 30 };
-  if (msMap[preset] !== undefined) return fmtDateInput(new Date(now.getTime() - msMap[preset]!));
-  if (daysMap[preset] !== undefined) return fmtDateInput(startOfDay(subDays(now, daysMap[preset]!)));
-  return '';
+/**
+ * A preset's bounds as of now, in the date inputs' format. `to` is '' (up to now) for every
+ * preset but Yesterday, which ends where today starts. `custom` has no bounds of its own.
+ */
+export function presetRange(preset: TimePreset, now = new Date()): { from: string; to: string } {
+  const back = (ms: number) => ({ from: fmtDateInput(new Date(now.getTime() - ms)), to: '' });
+  switch (preset) {
+    case '15m':       return back(15 * 60_000);
+    case '1h':        return back(3_600_000);
+    case '4h':        return back(4 * 3_600_000);
+    case '24h':       return back(24 * 3_600_000);
+    case 'today':     return { from: fmtDateInput(startOfDay(now)), to: '' };
+    case 'yesterday': return { from: fmtDateInput(startOfDay(subDays(now, 1))), to: fmtDateInput(startOfDay(now)) };
+    case '7d':        return { from: fmtDateInput(startOfDay(subDays(now, 7))), to: '' };
+    case 'custom':    return { from: '', to: '' };
+  }
 }
 
 /** A duration in its two largest units, rounded to the minute: `45 m`, `4 h`, `4 d 9 h`. */
@@ -550,7 +549,7 @@ export function fmtSpan(ms: number): string {
 }
 
 /** `17 Oct 09:00`, with the year only when it is not the current one. */
-function fmtPoint(d: Date, now: Date): string {
+export function fmtPoint(d: Date, now: Date): string {
   return format(d, d.getFullYear() === now.getFullYear() ? 'd MMM HH:mm' : 'd MMM yyyy HH:mm');
 }
 

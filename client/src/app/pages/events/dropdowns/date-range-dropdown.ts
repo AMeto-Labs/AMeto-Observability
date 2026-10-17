@@ -1,195 +1,228 @@
-import { ChangeDetectionStrategy, Component, inject, Signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy, Component, ElementRef, Injector, Signal,
+  afterNextRender, computed, inject, signal,
+} from '@angular/core';
 import { LucideAngularModule } from 'lucide-angular';
+import { format } from 'date-fns';
 
 import { DateMaskDirective } from '../../../shared/directives/date-mask.directive';
 import { OverlayPanelRef } from '../../../shared/services/overlay';
-import { TimePreset } from '../store/events-filter.util';
-
-export interface CalendarDay {
-  day: number;
-  month: number;
-  year: number;
-  isCurrentMonth: boolean;
-  isToday: boolean;
-  isFrom: boolean;
-  isTo: boolean;
-  inRange: boolean;
-}
+import {
+  DEFAULT_PRESET, TimePreset, fmtPoint, parseCustomDate, utcOffsetLabel,
+} from '../store/events-filter.util';
 
 /**
- * Controller handed to the date dropdown via {@link OverlayPanelRef.data}.
+ * Controller handed to the time range popover via {@link OverlayPanelRef.data}.
  *
- * The date range shares state with the toolbar (Apply button), URL sync and
- * per-row timestamp binding, so it stays owned by the parent — this dropdown is
- * a pure view over the parent's signals + actions. Reads are signals (tracked
- * for OnPush), writes delegate straight back to the parent (single source of
- * truth, no behaviour change).
+ * The applied window is store-owned — it is shared with the toolbar, URL sync and per-row
+ * timestamp binding — so the popover reads it here and writes it back only through
+ * `setPreset` / `applyRange`. Everything typed or picked before Apply is the popover's own
+ * draft, so closing it any other way leaves the page as it was.
  */
 export interface DateDropdownController {
   presets: { label: string; value: TimePreset }[];
-  weekDays: string[];
-
   timePreset: Signal<TimePreset>;
+  /** The applied bounds, `yyyy-MM-dd HH:mm`; `customTo` '' for "up to now". */
   customFrom: Signal<string>;
   customTo: Signal<string>;
-  fromSuggestion: Signal<string>;
-  toSuggestion: Signal<string>;
-  calPickingEnd: Signal<boolean>;
-  monthLabel: Signal<string>;
-  days: Signal<CalendarDay[]>;
-  customFromValid: Signal<boolean>;
-  customToValid: Signal<boolean>;
-  canSearch: Signal<boolean>;
-
   setPreset(p: TimePreset): void;
-  prevMonth(): void;
-  nextMonth(): void;
-  selectDay(d: CalendarDay): void;
-  setFrom(v: string): void;
-  setTo(v: string): void;
-  setFromSuggestion(v: string): void;
-  setToSuggestion(v: string): void;
-  acceptFromSuggestion(): void;
-  acceptToSuggestion(): void;
-  suggestionLabel(s: string): string;
-  onDateKeydown(e: Event): void;
-  /** Commit the current range and reload events. */
-  apply(): void;
+  applyRange(from: string, to: string): void;
 }
 
+type Side = 'from' | 'to';
+type Picker = { side: Side; kind: 'date' | 'time' } | null;
+
+interface CalendarCell {
+  iso: string;
+  day: number;
+  outside: boolean;
+  today: boolean;
+  selected: boolean;
+  inRange: boolean;
+  future: boolean;
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const HOURS = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
+const MINUTES = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'));
+const WEEK_DAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+
+/** A real calendar day: `2026-02-31` parses (to 3 March), so the round trip is the test. */
+function isDate(s: string): boolean {
+  if (!DATE_RE.test(s)) return false;
+  const d = parseCustomDate(s);
+  return !!d && format(d, 'yyyy-MM-dd') === s;
+}
+
+/** Time range popover: quick ranges, then From / To as a date and a time each, then Apply. */
 @Component({
   selector: 'app-date-range-dropdown',
-  standalone: true,
   imports: [LucideAngularModule, DateMaskDirective],
   changeDetection: ChangeDetectionStrategy.OnPush,
+  styleUrl: './date-range-dropdown.scss',
   template: `
-    <div class="dd-panel date-dd">
-      <div class="dd-panel-header">
-        <span class="dd-panel-title">Time range</span>
-        <button class="dd-close-btn" title="Close" (click)="ref.close()">
-          <lucide-icon name="x" [size]="13" />
-        </button>
+    <div class="trp" role="dialog" aria-label="Time range">
+      <div class="trp-head">
+        <span class="trp-title">Time range</span>
+        <span class="trp-summary">{{ summary() }}</span>
       </div>
 
-      <div class="date-dd-body">
-        <!-- Left: quick ranges — one click applies and closes -->
-        <div class="date-quick">
-          <div class="date-sec-label">Quick ranges</div>
-          @for (p of c.presets; track p.value) {
-            @if (p.value !== 'custom') {
-              <button
-                class="date-quick-item"
-                [class.active]="c.timePreset() === p.value"
-                (click)="pickPreset(p.value)">
-                <span>{{ p.label }}</span>
-                @if (c.timePreset() === p.value) {
-                  <lucide-icon name="check" [size]="13" class="date-quick-check" />
-                }
-              </button>
-            }
-          }
-        </div>
-
-        <!-- Right: absolute range — From/To + calendar (always available) -->
-        <div class="date-abs">
-          <div class="date-sec-label">
-            Absolute range
-            @if (c.timePreset() === 'custom') { <span class="date-sec-badge">custom</span> }
-          </div>
-
-          <!-- In custom mode the calendar fills whichever field is "picking" next,
-               so that one blinks (see .date-abs-fields--custom) — with a quick range
-               selected there is nothing to aim at and the highlight stays static. -->
-          <div class="date-abs-fields" [class.date-abs-fields--custom]="c.timePreset() === 'custom'">
-            <div class="date-field" [class.picking]="!c.calPickingEnd()" [class.invalid]="c.customFrom() && !c.customFromValid()">
-              <span class="date-field-lbl">From</span>
-              <div class="date-field-box">
-                <input
-                  type="text"
-                  class="date-field-input"
-                  placeholder="yyyy-mm-dd HH:mm"
-                  [value]="c.customFrom()"
-                  dateMask dateMaskType="datetime" dateMaskMode="start"
-                  (valueChange)="c.setFrom($event)"
-                  (suggestionChange)="c.setFromSuggestion($event)"
-                  (blur)="c.setFromSuggestion('')"
-                  (keydown.enter)="c.onDateKeydown($event)"
-                  spellcheck="false"
-                  autocomplete="off" />
-              </div>
-              @if (c.fromSuggestion()) {
-                <button
-                  class="date-field-tip"
-                  tabindex="-1"
-                  (mousedown)="$event.preventDefault(); c.acceptFromSuggestion()">
-                  {{ c.suggestionLabel(c.fromSuggestion()) }}
-                  <span class="date-field-tip-kbd">Tab ↵</span>
-                </button>
-              }
-            </div>
-
-            <div class="date-field" [class.picking]="c.calPickingEnd()" [class.invalid]="c.customTo() && !c.customToValid()">
-              <span class="date-field-lbl">To</span>
-              <div class="date-field-box">
-                <input
-                  type="text"
-                  class="date-field-input"
-                  [placeholder]="c.customTo() ? 'yyyy-mm-dd HH:mm' : 'Now'"
-                  [value]="c.customTo()"
-                  dateMask dateMaskType="datetime" dateMaskMode="end"
-                  (valueChange)="c.setTo($event)"
-                  (suggestionChange)="c.setToSuggestion($event)"
-                  (blur)="c.setToSuggestion('')"
-                  (keydown.enter)="c.onDateKeydown($event)"
-                  spellcheck="false"
-                  autocomplete="off" />
-              </div>
-              @if (c.toSuggestion()) {
-                <button
-                  class="date-field-tip"
-                  tabindex="-1"
-                  (mousedown)="$event.preventDefault(); c.acceptToSuggestion()">
-                  {{ c.suggestionLabel(c.toSuggestion()) }}
-                  <span class="date-field-tip-kbd">Tab ↵</span>
-                </button>
-              }
-            </div>
-          </div>
-
-          <div class="date-cal">
-            <div class="cal-header">
-              <button class="cal-nav-btn" title="Previous month" (click)="c.prevMonth()">
-                <lucide-icon name="chevron-left" [size]="14" />
-              </button>
-              <span class="cal-month-label">{{ c.monthLabel() }}</span>
-              <button class="cal-nav-btn" title="Next month" (click)="c.nextMonth()">
-                <lucide-icon name="chevron-right" [size]="14" />
-              </button>
-            </div>
-            <div class="cal-grid">
-              @for (d of c.weekDays; track d) {
-                <div class="cal-dow">{{ d }}</div>
-              }
-              @for (day of c.days(); track day.year + '-' + day.month + '-' + day.day) {
-                <button
-                  class="cal-day"
-                  [class.other-month]="!day.isCurrentMonth"
-                  [class.today]="day.isToday"
-                  [class.cal-from]="day.isFrom"
-                  [class.cal-to]="day.isTo"
-                  [class.cal-in-range]="day.inRange"
-                  (click)="c.selectDay(day)">
-                  {{ day.day }}
-                </button>
-              }
-            </div>
-          </div>
-        </div>
+      <div class="trp-chips">
+        @for (p of c.presets; track p.value) {
+          <button type="button" class="trp-chip"
+            [class.active]="c.timePreset() === p.value"
+            [attr.aria-pressed]="c.timePreset() === p.value"
+            (click)="pickPreset(p.value)">{{ p.label }}</button>
+        }
       </div>
 
-      <div class="dd-footer-actions">
-        <button class="dd-cancel-btn" (click)="ref.close()">Cancel</button>
-        <button class="dd-apply-btn" [disabled]="!c.canSearch()" (click)="apply()">Apply range</button>
+      <div class="trp-sides">
+        @for (s of sides; track s.side) {
+          @if (s.side === 'to') { <span class="trp-dash" aria-hidden="true">–</span> }
+          <div class="trp-side">
+            <label class="trp-label" [attr.for]="'trp-' + s.side + '-date'">{{ s.label }}</label>
+
+            <!-- Date -->
+            <div class="trp-anchor">
+              <div class="trp-field"
+                [class.active]="isOpen(s.side, 'date')"
+                [class.invalid]="dateInvalid(s.side)">
+                <div class="trp-box">
+                  <input
+                    [id]="'trp-' + s.side + '-date'"
+                    type="text"
+                    class="trp-input"
+                    [placeholder]="s.side === 'to' ? 'Now' : 'yyyy-mm-dd'"
+                    [value]="date(s.side)"
+                    dateMask dateMaskType="date"
+                    (valueChange)="setDate(s.side, $event)"
+                    (keydown.enter)="apply()"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  @if (date(s.side)) {
+                    <button type="button" class="trp-clear" [attr.aria-label]="'Clear ' + s.label"
+                      (click)="clear(s.side)">
+                      <lucide-icon name="x" [size]="14" />
+                    </button>
+                  }
+                </div>
+                <button type="button" class="trp-pick"
+                  [attr.aria-label]="'Pick ' + s.label + ' date'"
+                  [attr.aria-expanded]="isOpen(s.side, 'date')"
+                  (click)="toggle(s.side, 'date')">
+                  <lucide-icon name="calendar" [size]="16" />
+                </button>
+              </div>
+
+              @if (isOpen(s.side, 'date')) {
+                <div class="trp-pop trp-cal" role="dialog" [attr.aria-label]="'Pick ' + s.label + ' date'">
+                  <div class="trp-cal-head">
+                    <button type="button" class="trp-cal-nav" aria-label="Previous month" (click)="shiftMonth(-1)">
+                      <lucide-icon name="chevron-left" [size]="14" />
+                    </button>
+                    <span class="trp-cal-month">{{ calLabel() }}</span>
+                    <button type="button" class="trp-cal-nav" aria-label="Next month" (click)="shiftMonth(1)">
+                      <lucide-icon name="chevron-right" [size]="14" />
+                    </button>
+                  </div>
+                  <div class="trp-cal-grid">
+                    @for (d of weekDays; track d) { <span class="trp-cal-dow">{{ d }}</span> }
+                    @for (cell of calDays(); track cell.iso) {
+                      <button type="button" class="trp-cal-day"
+                        [class.outside]="cell.outside"
+                        [class.today]="cell.today"
+                        [class.selected]="cell.selected"
+                        [class.in-range]="cell.inRange"
+                        [class.future]="cell.future"
+                        [attr.aria-pressed]="cell.selected"
+                        (click)="pickDay(s.side, cell.iso)">{{ cell.day }}</button>
+                    }
+                  </div>
+                  <div class="trp-pop-foot">
+                    <button type="button" class="trp-link" (click)="pickDay(s.side, todayIso())">Today</button>
+                  </div>
+                </div>
+              }
+            </div>
+
+            <!-- Time -->
+            <div class="trp-anchor">
+              <div class="trp-field"
+                [class.active]="isOpen(s.side, 'time')"
+                [class.invalid]="timeInvalid(s.side)">
+                <div class="trp-box">
+                  <input
+                    type="text"
+                    class="trp-input"
+                    placeholder="HH:mm"
+                    [attr.aria-label]="s.label + ' time'"
+                    [value]="time(s.side)"
+                    dateMask dateMaskType="time"
+                    (valueChange)="setTime(s.side, $event)"
+                    (keydown.enter)="apply()"
+                    spellcheck="false"
+                    autocomplete="off" />
+                </div>
+                <button type="button" class="trp-pick"
+                  [attr.aria-label]="'Pick ' + s.label + ' time'"
+                  [attr.aria-expanded]="isOpen(s.side, 'time')"
+                  (click)="toggle(s.side, 'time')">
+                  <lucide-icon name="clock" [size]="16" />
+                </button>
+              </div>
+
+              @if (isOpen(s.side, 'time')) {
+                <div class="trp-pop trp-tp" role="dialog" [attr.aria-label]="'Pick ' + s.label + ' time'">
+                  <div class="trp-tp-head">
+                    <span class="trp-tp-name">{{ s.label }} time</span>
+                    <span class="trp-tp-value">{{ time(s.side) || '--:--' }}</span>
+                  </div>
+                  <div class="trp-tp-cols">
+                    <div class="trp-tp-col">
+                      <span class="trp-tp-unit">HH</span>
+                      <div class="trp-tp-list" role="group" aria-label="Hours">
+                        @for (h of hours; track h) {
+                          <button type="button" class="trp-tp-item"
+                            [class.selected]="time(s.side).slice(0, 2) === h"
+                            [attr.aria-pressed]="time(s.side).slice(0, 2) === h"
+                            (click)="pickHour(s.side, h)">{{ h }}</button>
+                        }
+                      </div>
+                    </div>
+                    <div class="trp-tp-col">
+                      <span class="trp-tp-unit">mm</span>
+                      <div class="trp-tp-list" role="group" aria-label="Minutes">
+                        @for (m of minutes; track m) {
+                          <button type="button" class="trp-tp-item"
+                            [class.selected]="time(s.side).slice(3, 5) === m"
+                            [attr.aria-pressed]="time(s.side).slice(3, 5) === m"
+                            (click)="pickMinute(s.side, m)">{{ m }}</button>
+                        }
+                      </div>
+                    </div>
+                  </div>
+                  <div class="trp-pop-foot">
+                    <button type="button" class="trp-link"
+                      [title]="s.side === 'to' ? 'Up to now: leave To open' : 'The current time'"
+                      (click)="pickNow(s.side)">Now</button>
+                    <button type="button" class="trp-ok" (click)="picker.set(null)">OK</button>
+                  </div>
+                </div>
+              }
+            </div>
+          </div>
+        }
+      </div>
+
+      <div class="trp-note">
+        <span>Times are in your time zone · {{ tz }}</span>
+        <button type="button" class="trp-link" (click)="wholeDays()">Whole days</button>
+      </div>
+
+      <div class="trp-actions">
+        <button type="button" class="trp-reset" (click)="reset()">Reset</button>
+        <button type="button" class="trp-apply" [disabled]="!canApply()" (click)="apply()">Apply</button>
       </div>
     </div>
   `,
@@ -197,15 +230,215 @@ export interface DateDropdownController {
 export class DateRangeDropdownComponent {
   readonly ref = inject<OverlayPanelRef<void, DateDropdownController>>(OverlayPanelRef);
   readonly c = this.ref.data;
+  private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
+  private readonly injector = inject(Injector);
 
-  /** Quick range: applies immediately (store reloads) and dismisses the popup. */
+  readonly sides: { side: Side; label: string }[] = [
+    { side: 'from', label: 'From' },
+    { side: 'to', label: 'To' },
+  ];
+  readonly hours = HOURS;
+  readonly minutes = MINUTES;
+  readonly weekDays = WEEK_DAYS;
+  readonly tz = utcOffsetLabel();
+
+  // ── Draft: what the fields hold until Apply ───────────────────────────
+  private readonly appliedFrom = this.c.customFrom();
+  private readonly appliedTo = this.c.customTo();
+  readonly fromDate = signal(this.appliedFrom.split(' ')[0] ?? '');
+  readonly fromTime = signal(this.appliedFrom.split(' ')[1] ?? '');
+  readonly toDate = signal(this.appliedTo.split(' ')[0] ?? '');
+  readonly toTime = signal(this.appliedTo.split(' ')[1] ?? '');
+
+  readonly picker = signal<Picker>(null);
+  readonly calMonth = signal({ year: 0, month: 0 });
+
+  /** The draft From as `yyyy-MM-dd HH:mm`; a day with no time starts at 00:00. */
+  readonly fromValue = computed(() => this.fromDate() ? `${this.fromDate()} ${this.fromTime() || '00:00'}` : '');
+
+  /**
+   * The draft To, '' for "up to now". A time with no date of its own is on the From day — the
+   * usual "09:00 to 13:00" — and a day with no time runs to 23:59.
+   */
+  readonly toValue = computed(() => {
+    const day = this.toDate() || (this.toTime() ? this.fromDate() : '');
+    return day ? `${day} ${this.toTime() || '23:59'}` : '';
+  });
+
+  private readonly start = computed(() =>
+    !this.badDate('from') && !this.badTime('from') && this.fromDate() ? parseCustomDate(this.fromValue()) : null);
+
+  private readonly end = computed(() => {
+    const v = this.toValue();
+    if (!v || this.badDate('to') || this.badTime('to')) return null;
+    return isDate(v.slice(0, 10)) ? parseCustomDate(v) : null;
+  });
+
+  /** A set To that is not after From. */
+  private readonly backwards = computed(() => {
+    const s = this.start(), e = this.end();
+    return !!s && !!e && e <= s;
+  });
+
+  readonly canApply = computed(() =>
+    !!this.start() && (!this.toValue() || !!this.end()) && !this.backwards());
+
+  readonly summary = computed(() => {
+    const s = this.start();
+    if (!s) return 'Pick a start';
+    const now = new Date();
+    const e = this.end();
+    return `From ${fmtPoint(s, now)} → ${e ? fmtPoint(e, now) : 'now'}`;
+  });
+
+  // ── Calendar ───────────────────────────────────────────────────────────
+  readonly calLabel = computed(() => {
+    const { year, month } = this.calMonth();
+    return format(new Date(year, month, 1), 'MMMM yyyy');
+  });
+
+  readonly calDays = computed<CalendarCell[]>(() => {
+    const { year, month } = this.calMonth();
+    const offset = (new Date(year, month, 1).getDay() + 6) % 7;   // Monday first
+    const today = this.todayIso();
+    const selected = this.picker()?.side === 'to' ? this.toDate() : this.fromDate();
+    const from = isDate(this.fromDate()) ? this.fromDate() : '';
+    const to = isDate(this.toDate()) ? this.toDate() : '';
+    return Array.from({ length: 42 }, (_, i) => {
+      const d = new Date(year, month, 1 - offset + i);
+      const iso = format(d, 'yyyy-MM-dd');
+      return {
+        iso,
+        day: d.getDate(),
+        outside: d.getMonth() !== month,
+        today: iso === today,
+        selected: iso === selected,
+        inRange: !!from && !!to && iso > from && iso < to,
+        future: iso > today,
+      };
+    });
+  });
+
+  // ── Reads used by the template ─────────────────────────────────────────
+  date(side: Side): string { return side === 'from' ? this.fromDate() : this.toDate(); }
+  time(side: Side): string { return side === 'from' ? this.fromTime() : this.toTime(); }
+
+  /** Red on the field: it does not parse, or — on To — it ends the window before it starts. */
+  dateInvalid(side: Side): boolean {
+    return this.badDate(side) || (side === 'to' && !!this.toDate() && this.backwards());
+  }
+
+  timeInvalid(side: Side): boolean {
+    return this.badTime(side) || (side === 'to' && !!this.toTime() && this.backwards());
+  }
+
+  /**
+   * The field's own text is wrong, whatever the other side says. Kept apart from the order check
+   * because `start` and `end` are built on it, and `backwards` on them.
+   */
+  private badDate(side: Side): boolean {
+    const d = this.date(side);
+    if (d) return !isDate(d);
+    // From is required once anything is in it; an empty To is "up to now".
+    return side === 'from' && !!this.fromTime();
+  }
+
+  private badTime(side: Side): boolean {
+    const t = this.time(side);
+    return !!t && !TIME_RE.test(t);
+  }
+
+  isOpen(side: Side, kind: 'date' | 'time'): boolean {
+    const p = this.picker();
+    return p?.side === side && p.kind === kind;
+  }
+
+  todayIso(): string { return format(new Date(), 'yyyy-MM-dd'); }
+
+  // ── Edits ──────────────────────────────────────────────────────────────
+  setDate(side: Side, v: string): void { (side === 'from' ? this.fromDate : this.toDate).set(v); }
+  setTime(side: Side, v: string): void { (side === 'from' ? this.fromTime : this.toTime).set(v); }
+
+  clear(side: Side): void {
+    this.setDate(side, '');
+    this.setTime(side, '');
+  }
+
+  toggle(side: Side, kind: 'date' | 'time'): void {
+    if (this.isOpen(side, kind)) { this.picker.set(null); return; }
+    if (kind === 'date') {
+      const shown = parseCustomDate(isDate(this.date(side)) ? this.date(side) : this.fromDate()) ?? new Date();
+      this.calMonth.set({ year: shown.getFullYear(), month: shown.getMonth() });
+    }
+    this.picker.set({ side, kind });
+    if (kind === 'time') afterNextRender(() => this.centreSelected(), { injector: this.injector });
+  }
+
+  shiftMonth(by: -1 | 1): void {
+    const { year, month } = this.calMonth();
+    const d = new Date(year, month + by, 1);
+    this.calMonth.set({ year: d.getFullYear(), month: d.getMonth() });
+  }
+
+  pickDay(side: Side, iso: string): void {
+    this.setDate(side, iso);
+    this.picker.set(null);
+  }
+
+  pickHour(side: Side, h: string): void {
+    const t = this.time(side);
+    this.setTime(side, `${h}:${TIME_RE.test(t) ? t.slice(3, 5) : '00'}`);
+  }
+
+  pickMinute(side: Side, m: string): void {
+    const t = this.time(side);
+    this.setTime(side, `${TIME_RE.test(t) ? t.slice(0, 2) : '00'}:${m}`);
+  }
+
+  /** From: the current time (and today, when no day is set). To: open again, "up to now". */
+  pickNow(side: Side): void {
+    if (side === 'to') this.clear('to');
+    else {
+      const now = new Date();
+      if (!this.fromDate()) this.fromDate.set(format(now, 'yyyy-MM-dd'));
+      this.fromTime.set(format(now, 'HH:mm'));
+    }
+    this.picker.set(null);
+  }
+
+  /** From the start of the From day; to the end of the To day when there is one. */
+  wholeDays(): void {
+    this.fromTime.set('00:00');
+    if (this.toDate()) this.toTime.set('23:59');
+  }
+
+  // ── Commit ─────────────────────────────────────────────────────────────
+  /** Quick range: applies immediately (the store reloads) and closes. */
   pickPreset(p: TimePreset): void {
     this.c.setPreset(p);
     this.ref.close();
   }
 
-  apply(): void {
-    this.c.apply();
+  reset(): void {
+    this.c.setPreset(DEFAULT_PRESET);
     this.ref.close();
+  }
+
+  apply(): void {
+    if (!this.canApply()) return;
+    // Untouched fields under a preset are the preset's own bounds: re-run the preset, so it stays
+    // relative, rather than freezing them into a custom window.
+    const untouched = this.fromValue() === this.appliedFrom && this.toValue() === this.appliedTo;
+    if (untouched && this.c.timePreset() !== 'custom') this.c.setPreset(this.c.timePreset());
+    else this.c.applyRange(this.fromValue(), this.toValue());
+    this.ref.close();
+  }
+
+  /** Scrolls each open time column so its selected value sits in the middle. */
+  private centreSelected(): void {
+    for (const list of this.host.nativeElement.querySelectorAll<HTMLElement>('.trp-tp-list')) {
+      const sel = list.querySelector<HTMLElement>('.selected');
+      if (sel) list.scrollTop = sel.offsetTop - (list.clientHeight - sel.offsetHeight) / 2;
+    }
   }
 }

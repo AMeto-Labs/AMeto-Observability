@@ -1,6 +1,6 @@
 import { computed, inject } from '@angular/core';
 import { ActivatedRoute, Router } from '@angular/router';
-import { subDays, format } from 'date-fns';
+import { subDays } from 'date-fns';
 import { Subscription } from 'rxjs';
 import {
   patchState, signalStore, withComputed, withHooks, withMethods, withState,
@@ -10,15 +10,12 @@ import { ApiService } from '../../../core/services/api.service';
 import { SearchHistoryService } from '../../../core/services/search-history.service';
 import { EventDto, LEVELS, AggregationDto } from '../../../core/models/event.model';
 import {
-  TimePreset, INLINE_PRESETS, PRESET_LABELS,
+  TimePreset, PRESET_LABELS, DEFAULT_PRESET,
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
-  parseCustomDate, fmtDateInput, presetFrom, parsePreset, customRangeLabel,
+  parseCustomDate, fmtDateInput, presetRange, parsePreset, customRangeLabel,
   collectPropPaths, isoToDotNetUtcTicksString, isAggregationQuery,
 } from './events-filter.util';
-
-/** The window a fresh page opens on, and the one Clear returns to. */
-const DEFAULT_PRESET: TimePreset = '24h';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
 const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
@@ -71,27 +68,18 @@ const SEED_WINDOW_MS = 30_000;
  */
 const LIVE_FLUSH_MAX = 500;
 
-/** A single cell of the 42-cell calendar month grid. */
-interface CalendarDay {
-  day: number;
-  month: number;
-  year: number;
-  isCurrentMonth: boolean;
-  isToday: boolean;
-  isFrom: boolean;
-  isTo: boolean;
-  inRange: boolean;
-}
-
 /** Writable state owned by the Events page. */
 interface EventsState {
   filterInput: string;
   filter: string;
   timePreset: TimePreset;
+  /**
+   * The window's bounds as `yyyy-MM-dd HH:mm`, `customTo` '' for "up to now". For a preset they
+   * are what the preset resolved to at the last load; the time range popover edits a draft of
+   * its own and writes these only when it applies.
+   */
   customFrom: string;
   customTo: string;
-  customFromSuggestion: string;
-  customToSuggestion: string;
   events: EventDto[];
   loading: boolean;
   loadingMore: boolean;
@@ -114,19 +102,11 @@ interface EventsState {
   liveReceived: number;
   /** Rows the buffer cap has discarded on this tail. A tail that drops must say so. */
   liveDropped: number;
-  /**
-   * When a tail that stopped froze the list (epoch ms), or null. While set, the rows on screen
-   * are what the tail delivered, not an answer for the time window, so the window controls must
-   * not claim them; the next search or tail clears it.
-   */
-  liveFrozenAt: number | null;
   pageSize: number;
   wrapMessages: boolean;
   quickSearch: string;
   backendServices: string[];
   signalsPanelOpen: boolean;
-  calendarNav: { year: number; month: number };
-  calPickingEnd: boolean;
   /** Single selected event backing the detail drawer (replaces the old expanded-ids set). */
   selectedId: string | null;
   /**
@@ -155,15 +135,12 @@ interface EventsState {
  * since `patchState` is inherently reactive.
  */
 export const EventsStore = signalStore(
-  // Factory form so `calendarNav` picks up the current month at mount, not at module load.
   withState<EventsState>(() => ({
     filterInput: '',
     filter: '',
     timePreset: DEFAULT_PRESET,
     customFrom: '',
     customTo: '',
-    customFromSuggestion: '',
-    customToSuggestion: '',
     events: [],
     loading: false,
     loadingMore: false,
@@ -175,14 +152,11 @@ export const EventsStore = signalStore(
     liveRate: 0,
     liveReceived: 0,
     liveDropped: 0,
-    liveFrozenAt: null,
     pageSize: 50,
     wrapMessages: false,
     quickSearch: '',
     backendServices: [],
     signalsPanelOpen: false,
-    calendarNav: { year: new Date().getFullYear(), month: new Date().getMonth() },
-    calPickingEnd: false,
     selectedId: null,
     selectedEventPinned: null,
     newEventIds: EMPTY_IDS,
@@ -277,57 +251,14 @@ export const EventsStore = signalStore(
       return `${s.size} services`;
     });
 
-    /** What the window is called: a preset's name, or the custom window with its length. */
+    /**
+     * The time range button's label: a preset's name, or the custom window — `Since 17 Oct 09:00`,
+     * `17 Oct 09:00 → 13:00` — with its length in `extra`.
+     */
     const rangeLabel = computed<{ text: string; extra: string }>(() => {
       const preset = store.timePreset();
       if (preset !== 'custom') return { text: PRESET_LABELS[preset], extra: '' };
       return customRangeLabel(parseCustomDate(store.customFrom()), parseCustomDate(store.customTo()));
-    });
-
-    /**
-     * Where a preset's window actually starts — `11:27 → now`. Empty for a custom window, whose
-     * label already says it, and whenever the list is a tail's rather than the window's.
-     */
-    const windowReadout = computed(() => {
-      if (store.timePreset() === 'custom' || store.live() || store.liveFrozenAt() !== null) return '';
-      const from = parseCustomDate(store.customFrom());
-      if (!from) return '';
-      return `${format(from, from.toDateString() === new Date().toDateString() ? 'HH:mm' : 'd MMM HH:mm')} → now`;
-    });
-
-    /** An open end already ends now; only a window with a set end can move later. */
-    const canShiftLater = computed(() => !!parseCustomDate(store.customTo()));
-
-    const calendarMonthLabel = computed(() => {
-      const { year, month } = store.calendarNav();
-      return format(new Date(year, month, 1), 'MMMM yyyy');
-    });
-
-    const calendarDays = computed<CalendarDay[]>(() => {
-      const { year, month } = store.calendarNav();
-      const firstDow = new Date(year, month, 1).getDay();
-      const startOffset = (firstDow + 6) % 7; // Monday-first
-      const today = format(new Date(), 'yyyy-MM-dd');
-      const fromDate = parseCustomDate(store.customFrom());
-      const toDate = parseCustomDate(store.customTo());
-      const fromStr = fromDate ? format(fromDate, 'yyyy-MM-dd') : null;
-      const toStr = toDate ? format(toDate, 'yyyy-MM-dd') : null;
-      const days: CalendarDay[] = [];
-      for (let i = 0; i < 42; i++) {
-        const d = new Date(year, month, 1 - startOffset + i);
-        const ds = format(d, 'yyyy-MM-dd');
-        days.push({
-          day: d.getDate(),
-          month: d.getMonth(),
-          year: d.getFullYear(),
-          isCurrentMonth: d.getMonth() === month,
-          isToday: ds === today,
-          isFrom: ds === fromStr,
-          isTo: ds === toStr,
-          inRange: !!(fromStr && toStr && ds > fromStr && ds < toStr),
-        });
-      }
-      return days;
     });
 
     const customFromValid = computed(() => !!parseCustomDate(store.customFrom()));
@@ -368,8 +299,7 @@ export const EventsStore = signalStore(
     return {
       activeLevels, selectedServices, displayedEvents, availableServices,
       levelCounts, serviceCounts, totalCount, allLevelsActive, liveBufferSize,
-      levelsLabel, serviceLabel, rangeLabel, windowReadout, canShiftLater,
-      calendarMonthLabel, calendarDays,
+      levelsLabel, serviceLabel, rangeLabel,
       customFromValid, customToValid, canSearch, knownPropPaths, selectedEvent,
       isAggregation,
     };
@@ -596,19 +526,11 @@ export const EventsStore = signalStore(
       return d ? d.toISOString() : undefined;
     }
 
-    /**
-     * Applies preset date bounds. `custom` leaves the current range untouched; every
-     * other preset sets customFrom from presetFrom(), opens the end (customTo ''), and
-     * clears both inline suggestions.
-     */
+    /** Writes a preset's bounds as of now. `custom` leaves the current range untouched. */
     function applyPresetDates(preset: TimePreset): void {
       if (preset === 'custom') return;
-      patchState(store, {
-        customFrom: presetFrom(preset),
-        customTo: '',
-        customFromSuggestion: '',
-        customToSuggestion: '',
-      });
+      const { from, to } = presetRange(preset);
+      patchState(store, { customFrom: from, customTo: to });
     }
 
     /**
@@ -632,7 +554,7 @@ export const EventsStore = signalStore(
     function loadEvents(): void {
       // A preset is relative: it is resolved against the clock on every load rather than frozen
       // when it was picked, or a "Last 15 min" re-applied twenty minutes later would cover 35.
-      if (store.timePreset() !== 'custom') applyPresetDates(store.timePreset());
+      applyPresetDates(store.timePreset());
 
       // Every filter, level, time and page-size mutator ends here.
       // `select count(*) …` asks a different question and gets a different answer: a table,
@@ -670,7 +592,7 @@ export const EventsStore = signalStore(
 
       patchState(store, {
         loading: true, error: null, events: [], aggregation: null, hasMore: true,
-        selectedId: null, selectedEventPinned: null, liveFrozenAt: null,
+        selectedId: null, selectedEventPinned: null,
       });
 
       const acc: EventDto[] = [];
@@ -733,7 +655,7 @@ export const EventsStore = signalStore(
       liveWasRunning = false;
       patchState(store, {
         loading: true, error: null, events: [], aggregation: null, hasMore: false,
-        selectedId: null, selectedEventPinned: null, liveFrozenAt: null,
+        selectedId: null, selectedEventPinned: null,
       });
 
       querySub = api.aggregate({
@@ -836,7 +758,6 @@ export const EventsStore = signalStore(
 
     function reset(): void {
       patchState(store, { filterInput: '', filter: '', timePreset: DEFAULT_PRESET });
-      applyPresetDates(DEFAULT_PRESET);
       loadEvents();
     }
 
@@ -846,116 +767,28 @@ export const EventsStore = signalStore(
     }
 
     /**
-     * Picks a preset. A running tail is stopped first, as {@link seek} stops it: the tail ignores
-     * the window, so the click would otherwise change the highlighted preset and nothing else.
+     * Picks a preset and loads it. A running tail is stopped first, as {@link seek} stops it: the
+     * tail ignores the window, so the click would otherwise change the label and nothing else.
      */
     function setTimePreset(preset: TimePreset): void {
       if (store.live()) stopLive();
-      patchState(store, { calPickingEnd: false, timePreset: preset });
-      applyPresetDates(preset);
+      patchState(store, { timePreset: preset });
       loadEvents();
     }
 
-    /** The current window's bounds in epoch ms; an open end is now. */
-    function windowBounds(): { from: number; to: number } {
-      return { from: getFromDate().getTime(), to: parseCustomDate(store.customTo())?.getTime() ?? Date.now() };
-    }
-
-    /** Whole minutes, never under one: the date inputs carry nothing finer. */
-    function spanOf(from: number, to: number): number {
-      return Math.max(1, Math.round((to - from) / 60_000)) * 60_000;
-    }
-
-    /** Sets an explicit window (null end = up to now) and reloads, stopping a tail as presets do. */
-    function setWindow(fromMs: number, toMs: number | null): void {
+    /**
+     * Applies an explicit window from the time range popover — `to` '' for "up to now" — and
+     * loads it, stopping a running tail as a preset does. Bounds that do not parse, or an end
+     * before the start, are refused: the popover keeps Apply disabled for those, and nothing
+     * else may get them into the URL.
+     */
+    function applyRange(from: string, to: string): void {
+      const start = parseCustomDate(from);
+      const end = to ? parseCustomDate(to) : null;
+      if (!start || (to && (!end || end <= start))) return;
       if (store.live()) stopLive();
-      patchState(store, {
-        customFrom: fmtDateInput(new Date(fromMs)),
-        customTo: toMs === null ? '' : fmtDateInput(new Date(toMs)),
-        customFromSuggestion: '',
-        customToSuggestion: '',
-        timePreset: 'custom',
-        calPickingEnd: false,
-      });
+      patchState(store, { customFrom: from, customTo: to, timePreset: 'custom' });
       loadEvents();
-    }
-
-    /**
-     * Moves the window by its own length, keeping the length: the new window starts (or ends)
-     * exactly where the old one ended (or started), so stepping back and forth leaves no gap.
-     * Later is only offered for a window with a set end (see canShiftLater); a later step that
-     * would pass now ends at now instead, since there is nothing beyond it to show.
-     */
-    function shiftWindow(dir: -1 | 1): void {
-      if (dir > 0 && !store.canShiftLater()) return;
-      const { from, to } = windowBounds();
-      const span = spanOf(from, to);
-      if (dir < 0) { setWindow(from - span, from); return; }
-      const end = to + span;
-      if (end >= Date.now()) setWindow(Date.now() - span, null);
-      else setWindow(to, end);
-    }
-
-    /**
-     * Widens the window. On an inline preset it steps to the next one up, so a relative window
-     * stays relative; anything else doubles around its middle, and ends at now if the doubled
-     * window would reach past it.
-     */
-    function zoomOut(): void {
-      const i = INLINE_PRESETS.indexOf(store.timePreset());
-      if (i >= 0 && i < INLINE_PRESETS.length - 1) { setTimePreset(INLINE_PRESETS[i + 1]); return; }
-      const { from, to } = windowBounds();
-      const span = spanOf(from, to);
-      const end = to + span / 2;
-      if (end >= Date.now()) setWindow(Date.now() - 2 * span, null);
-      else setWindow(from - span / 2, end);
-    }
-
-    function setFrom(v: string): void {
-      // suggestion is managed by the date input's (suggestionChange) binding — don't clear it here
-      patchState(store, { customFrom: v, timePreset: 'custom' });
-    }
-
-    function setTo(v: string): void {
-      patchState(store, { customTo: v, timePreset: 'custom' });
-    }
-
-    /** Ghost-suggestion setters, driven by the date inputs' (suggestionChange) binding. */
-    function setFromSuggestion(v: string): void {
-      patchState(store, { customFromSuggestion: v });
-    }
-
-    function setToSuggestion(v: string): void {
-      patchState(store, { customToSuggestion: v });
-    }
-
-    /** Prepares the calendar when the date dropdown opens: reset picking, jump to the start month. */
-    function openCalendar(): void {
-      const d = parseCustomDate(store.customFrom()) ?? new Date();
-      patchState(store, {
-        calPickingEnd: false,
-        calendarNav: { year: d.getFullYear(), month: d.getMonth() },
-      });
-    }
-
-    function acceptFromSuggestion(): void {
-      const s = store.customFromSuggestion();
-      if (!s) return;
-      patchState(store, {
-        customFrom: store.customFrom() + s,
-        customFromSuggestion: '',
-        timePreset: 'custom',
-      });
-    }
-
-    function acceptToSuggestion(): void {
-      const s = store.customToSuggestion();
-      if (!s) return;
-      patchState(store, {
-        customTo: store.customTo() + s,
-        customToSuggestion: '',
-        timePreset: 'custom',
-      });
     }
 
     /**
@@ -1058,7 +891,7 @@ export const EventsStore = signalStore(
       const from = continues ? newest : floor;
 
       patchState(store, {
-        live: true, error: null, newEventIds: EMPTY_IDS, liveFrozenAt: null,
+        live: true, error: null, newEventIds: EMPTY_IDS,
         livePending: 0, liveRate: 0, liveReceived: 0, liveDropped: 0,
         // The table belongs to the query it came from. Leaving it up while a tail runs put a
         // snapshot of totals on screen with the live dot lit beside it.
@@ -1121,7 +954,7 @@ export const EventsStore = signalStore(
           // then drops — a stream that failed would silently delete every row behind the pill.
           landEverything();
           clearNew();
-          patchState(store, { live: false, liveFrozenAt: Date.now(), error: err?.message || 'Live tail stopped' });
+          patchState(store, { live: false, error: err?.message || 'Live tail stopped' });
         },
       });
     }
@@ -1138,7 +971,7 @@ export const EventsStore = signalStore(
      * something the user asks for rather than something stop implies.</p>
      */
     function stopLive(): void {
-      patchState(store, { live: false, liveFrozenAt: Date.now() });
+      patchState(store, { live: false });
       liveSub?.unsubscribe();
       liveSub = undefined;
       liveWasRunning = false;
@@ -1320,57 +1153,6 @@ export const EventsStore = signalStore(
       patchState(store, { signalsPanelOpen: !store.signalsPanelOpen() });
     }
 
-    function prevCalendarMonth(): void {
-      const { year, month } = store.calendarNav();
-      patchState(store, {
-        calendarNav: month === 0 ? { year: year - 1, month: 11 } : { year, month: month - 1 },
-      });
-    }
-
-    function nextCalendarMonth(): void {
-      const { year, month } = store.calendarNav();
-      patchState(store, {
-        calendarNav: month === 11 ? { year: year + 1, month: 0 } : { year, month: month + 1 },
-      });
-    }
-
-    function selectCalendarDay(d: { day: number; month: number; year: number }): void {
-      const date = new Date(d.year, d.month, d.day);
-      const dateStr = format(date, 'yyyy-MM-dd');
-      if (!store.calPickingEnd()) {
-        const time = store.customFrom().split(' ')[1] || '00:00';
-        patchState(store, {
-          customFrom: `${dateStr} ${time}`,
-          customTo: '',
-          customFromSuggestion: '',
-          customToSuggestion: '',
-          timePreset: 'custom',
-          calPickingEnd: true,
-        });
-        return;
-      }
-      const fromDate = parseCustomDate(store.customFrom());
-      if (fromDate && date < fromDate) {
-        // Second click precedes the start → treat it as a new start instead.
-        const time = store.customFrom().split(' ')[1] || '00:00';
-        patchState(store, {
-          customFrom: `${dateStr} ${time}`,
-          customTo: '',
-          customFromSuggestion: '',
-          customToSuggestion: '',
-          timePreset: 'custom',
-        });
-      } else {
-        const time = store.customTo().split(' ')[1] || '23:59';
-        patchState(store, {
-          customTo: `${dateStr} ${time}`,
-          customToSuggestion: '',
-          timePreset: 'custom',
-          calPickingEnd: false,
-        });
-      }
-    }
-
     /** Lazily fetches the full backend service list on first use (static per session). */
     function loadBackendServices(): Promise<void> {
       if (store.backendServices().length > 0) return Promise.resolve();
@@ -1392,21 +1174,16 @@ export const EventsStore = signalStore(
       const urlLevels = qp.get('levels');
       const urlSize = Number(qp.get('size'));
 
-      // A preset is relative, so a link carrying one opens on that preset from NOW — the
-      // `from` beside it is only where the window started when the link was made. Explicit
-      // bounds are read only for a custom window.
+      // A preset is relative, so a link carrying one opens on that preset from NOW — the `from`
+      // beside it is only where the window started when the link was made. Explicit bounds are
+      // read for a custom window, and for a link whose preset this build no longer has.
       const relative = urlPreset !== null && urlPreset !== 'custom';
       const timePreset: TimePreset = relative ? urlPreset : urlFrom ? 'custom' : DEFAULT_PRESET;
 
       const patch: Partial<EventsState> = { filterInput: urlFilter, filter: urlFilter, timePreset };
       if (PAGE_SIZE_OPTIONS.includes(urlSize)) patch.pageSize = urlSize;
+      if (timePreset === 'custom') { patch.customFrom = urlFrom; patch.customTo = urlTo; }
       patchState(store, patch);
-
-      if (timePreset === 'custom') {
-        patchState(store, { customFrom: urlFrom, customTo: urlTo });
-      } else {
-        applyPresetDates(timePreset);
-      }
 
       if (urlLevels) {
         // Legacy: old URLs carried a separate `levels=` param. Apply it only when the
@@ -1454,15 +1231,7 @@ export const EventsStore = signalStore(
       reset,
       resetAll,
       setTimePreset,
-      shiftWindow,
-      zoomOut,
-      setFrom,
-      setTo,
-      setFromSuggestion,
-      setToSuggestion,
-      openCalendar,
-      acceptFromSuggestion,
-      acceptToSuggestion,
+      applyRange,
       toggleLevel,
       toggleAllLevels,
       setLevels,
@@ -1483,9 +1252,6 @@ export const EventsStore = signalStore(
       toggleEvent,
       toggleWrap,
       toggleSignalsPanel,
-      prevCalendarMonth,
-      nextCalendarMonth,
-      selectCalendarDay,
       loadBackendServices,
       _disposeStreams,
     };
