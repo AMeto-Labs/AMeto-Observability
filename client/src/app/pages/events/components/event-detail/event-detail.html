@@ -120,7 +120,7 @@
               <button class="d-menu-btn" (click)="openPropMenu($event, kv)" title="Filter / copy">
                 <lucide-icon name="list-filter" [size]="12" />
               </button>
-              <span class="d-prop-k">{{ kv.path }}</span>
+              <span class="d-prop-k" [title]="kv.path">{{ kv.path }}</span>
               <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" [oneLine]="true" [rootMenu]="false" /></div>
             </div>
           }
@@ -149,9 +149,11 @@
           }
         </div>
         <div class="ev-json-body">
+          <!-- The whole event has no path to filter on; each field leads its row with its own menu. -->
           <app-json-viewer
             [value]="clefView()"
             [initialExpanded]="true"
+            [rootMenu]="false"
             [searchTerm]="jsonSearch()" />
         </div>
       </section>
@@ -416,7 +418,7 @@
   </div>
 </app-modal>
 
-<!-- Full property-value modal (opened from the 'jv' context menu) -->
+<!-- Full property-value modal (opened from the property menu) -->
 <app-modal [open]="valueModalOpen()" [title]="valueModal()?.path || 'Value'" (close)="valueModalOpen.set(false)">
   <pre class="d-modal-value">{{ valueModal()?.text }}</pre>
   <div class="d-modal-actions">
@@ -494,51 +496,29 @@
       <hr />
       <button (click)="copyTimestampIso()"><lucide-icon name="copy" [size]="13" />Copy ISO timestamp</button>
     }
-    @if (menuType() === 'jv') {
-      @if (jvMenu(); as m) {
-        <div class="ctx-label">{{ m.path }}</div>
-        @if (m.isContainer) {
-          <button (click)="jvFind()">
-            <lucide-icon name="search" [size]="13" />Find <code>has({{ m.path }})</code>
-          </button>
-          <button (click)="jvExclude()">
-            <lucide-icon name="ban" [size]="13" />Exclude <code>not has(…)</code>
-          </button>
-        } @else {
-          <button (click)="jvFind()">
-            <lucide-icon name="search" [size]="13" />Find <code>{{ jvEqExpr() }}</code>
-          </button>
-          <button (click)="jvExclude()">
-            <lucide-icon name="ban" [size]="13" />Exclude <code>{{ jvNeExpr() }}</code>
-          </button>
-          @if (jvAnyExpr(); as anyExpr) {
-            <hr />
-            <button (click)="jvFindAny()">
-              <lucide-icon name="asterisk" [size]="13" />Any element <code>{{ anyExpr }}</code>
-            </button>
-          }
-        }
-        <hr />
-        <button (click)="jvViewValue()"><lucide-icon name="maximize-2" [size]="13" />View full value</button>
-        <button (click)="jvCopy()"><lucide-icon name="copy" [size]="13" />Copy</button>
-      }
-    }
   </div>
 </ng-template>
 
-<!-- Shared scalar-property menu (same component the Traces page uses). -->
+<!-- The property menu for every property, top-level or nested, value or object / array (same
+     component the Traces page uses), rendered into the same
+     CDK overlay as the context menus above, anchored to its ⋮ button. -->
+<ng-template #propMenuTpl>
 @if (propMenu(); as m) {
   <app-property-menu
-    [x]="m.x" [y]="m.y" [propKey]="m.entry.label" [propValue]="m.entry.value"
+    [floating]="false" [propKey]="m.entry.label" [propValue]="m.entry.value"
     [seekable]="propSeekMs() != null"
     [viewable]="true"
-    crossLabel="Find in traces"
+    [wildcard]="propWildcard() != null"
+    [crossLabel]="m.entry.isStructured ? null : 'Find in traces'"
+    (anyElement)="propAnyElement($event)"
     (viewValue)="propViewValue()"
     (copyValue)="propCopyValue()"
     (copyKey)="propCopyKey()"
+    (copyCondition)="propCopyCondition($event)"
     (seek)="propSeek($event)"
     (search)="propSearch($event)"
     (andExpr)="propCompose('and', $event)"
     (orExpr)="propCompose('or', $event)"
     (cross)="propFindInTraces()" />
 }
+</ng-template>

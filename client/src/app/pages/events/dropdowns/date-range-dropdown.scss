@@ -1,25 +1,23 @@
-/* Time range popover. Its own box rather than .dd-panel: the date and time pickers drop out
-   below their fields and past the popover's edge, which .dd-panel's overflow would clip. */
-:host {
-  --trp-muted: color-mix(in srgb, var(--txt-muted) 65%, var(--txt-dim));
-  --trp-field: var(--surface);
-  display: block;
-}
+/* Time range popover: the designed form (title and summary, quick-range chips, From – To with
+   amber picker buttons, Whole days, Reset / Apply), at the type sizes of the Levels and Services
+   dropdowns — the Reset and Apply buttons are theirs (.dd-reset-btn / .dd-apply-btn). Its own box
+   rather than .dd-panel: the pickers drop out below their fields, past the popover's edge, which
+   .dd-panel's overflow would clip. */
 
 .trp {
-  width: 480px;
+  width: 360px;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 16px;
+  gap: 12px;
+  padding: 14px;
   background: var(--surface-up);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, .55);
+  box-shadow: var(--shadow);
   color: var(--txt);
   font-family: var(--ui);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .trp-head {
@@ -28,157 +26,141 @@
   justify-content: space-between;
   gap: 12px;
 }
-.trp-title { font-size: 15px; font-weight: 600; }
-.trp-summary { font-size: 12.5px; color: var(--trp-muted); font-variant-numeric: tabular-nums; }
+.trp-title { font-size: 12px; font-weight: 600; letter-spacing: .3px; }
+.trp-summary { font-size: 11px; color: var(--txt-dim); font-variant-numeric: tabular-nums; }
 
 /* Quick ranges */
-.trp-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.trp-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .trp-chip {
-  height: 30px;
-  padding: 0 12px;
-  border-radius: 15px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 11px;
   border: 1px solid var(--border);
-  background: transparent;
+  background: none;
   color: var(--txt-muted);
-  font: 500 12.5px var(--ui);
+  font-size: 11px;
+  font-family: var(--ui);
   cursor: pointer;
   transition: border-color .12s, color .12s, background .12s;
 }
 .trp-chip:hover { border-color: var(--accent); color: var(--txt); }
 .trp-chip.active {
   border-color: var(--accent);
-  background: var(--accent-soft);
+  background: var(--accent-dim);
   color: var(--accent);
   font-weight: 600;
 }
 
 /* From – To */
 .trp-sides { display: flex; align-items: flex-start; gap: 8px; }
-.trp-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.trp-dash { margin-top: 30px; color: var(--txt-dim); font-size: 15px; }
-.trp-label { font-size: 12px; color: var(--trp-muted); }
+.trp-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.trp-dash { margin-top: 24px; color: var(--txt-dim); font-size: 13px; }
+.trp-label { font-size: 11px; color: var(--txt-dim); }
 .trp-anchor { position: relative; }
 
-.trp-field { display: flex; height: 36px; }
+.trp-field { display: flex; height: 30px; }
 .trp-box {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
+  gap: 2px;
   box-sizing: border-box;
-  padding: 0 6px 0 10px;
-  background: var(--trp-field);
+  padding: 0 4px 0 9px;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-right: 0;
-  border-radius: 6px 0 0 6px;
+  border-radius: var(--radius) 0 0 var(--radius);
   transition: border-color .12s;
 }
 .trp-field:focus-within .trp-box,
 .trp-field.active .trp-box { border-color: var(--accent); }
-.trp-field.invalid .trp-box { border-color: var(--error); }
+.trp-field.invalid .trp-box { border-color: var(--lvl-e); }
 
 .trp-input {
   flex: 1;
   min-width: 0;
   border: 0;
   outline: 0;
-  background: transparent;
+  background: none;
   color: var(--txt);
-  font: 500 13px var(--ui);
+  font-size: 12px;
+  font-family: var(--ui);
   font-variant-numeric: tabular-nums;
+  caret-color: var(--accent);
 }
 .trp-input::placeholder { color: var(--txt-dim); }
 
 .trp-clear {
-  width: 24px;
-  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
+  width: 20px;
+  height: 20px;
   flex-shrink: 0;
+  padding: 0;
   border: 0;
   border-radius: 4px;
-  background: transparent;
-  color: var(--trp-muted);
+  background: none;
+  color: var(--txt-dim);
   cursor: pointer;
 }
 .trp-clear:hover { background: var(--surface-hover); color: var(--txt); }
 
 .trp-pick {
-  width: 40px;
+  width: 28px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
   border: 0;
-  border-radius: 0 6px 6px 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
   background: var(--accent);
   color: var(--text-on-accent);
   cursor: pointer;
   transition: filter .12s;
 }
 .trp-pick:hover { filter: brightness(1.1); }
-.trp-field.active .trp-pick {
-  background: color-mix(in srgb, var(--accent) 80%, white);
-  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 60%, black);
-}
+.trp-field.active .trp-pick { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, black); }
 
-/* Footer rows */
 .trp-note {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  font-size: 12px;
-  color: var(--trp-muted);
+  font-size: 11px;
+  color: var(--txt-dim);
 }
 .trp-link {
-  border: 0;
   padding: 0;
-  background: transparent;
+  border: 0;
+  background: none;
   color: var(--accent);
-  font: 600 12px var(--ui);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-family: var(--ui);
   cursor: pointer;
 }
 .trp-link:hover { text-decoration: underline; }
+// Set times / Whole days: a quiet toggle, the size of the note beside it.
+.trp-note .trp-link { font-size: 11px; font-weight: 500; }
+.trp-set-times { display: inline-flex; align-items: center; gap: 3px; }
 
 .trp-actions { display: flex; align-items: center; justify-content: space-between; }
-.trp-reset,
-.trp-apply {
-  height: 34px;
-  border-radius: 6px;
-  font: 600 13px var(--ui);
-  cursor: pointer;
-}
-.trp-reset {
-  padding: 0 16px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--txt-muted);
-}
-.trp-reset:hover { border-color: var(--txt-muted); color: var(--txt); }
-.trp-apply {
-  padding: 0 20px;
-  border: 0;
-  background: var(--accent);
-  color: var(--text-on-accent);
-}
-.trp-apply:hover:not(:disabled) { filter: brightness(1.1); }
-.trp-apply:disabled { opacity: .45; cursor: default; }
 
 /* ── Pickers: dropped below their field ─────────────────────────── */
 .trp-pop {
   position: absolute;
-  top: 42px;
+  top: 34px;
   left: 0;
   z-index: 2;
-  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   background: var(--surface-2);
-  border: 1px solid color-mix(in srgb, var(--border) 60%, var(--txt-dim));
+  border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 14px 36px rgba(0, 0, 0, .6);
+  box-shadow: var(--shadow);
 }
 // The To column's pickers open leftwards, so they stay inside the popover's width.
 .trp-side:last-child .trp-pop { left: auto; right: 0; }
@@ -187,42 +169,33 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 10px;
   border-top: 1px solid var(--border);
-}
-.trp-ok {
-  height: 30px;
-  padding: 0 16px;
-  border: 0;
-  border-radius: 6px;
-  background: var(--accent);
-  color: var(--text-on-accent);
-  font: 600 12.5px var(--ui);
-  cursor: pointer;
 }
 
 /* Time picker */
-.trp-tp { width: 236px; }
+.trp-tp { width: 190px; }
 .trp-tp-head {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border);
 }
-.trp-tp-name { font-size: 12px; color: var(--trp-muted); }
-.trp-tp-value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.trp-tp-name { font-size: 11px; color: var(--txt-dim); }
+.trp-tp-value { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .trp-tp-cols {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 10px;
 }
-.trp-tp-col { display: flex; flex-direction: column; gap: 4px; }
-.trp-tp-unit { font-size: 11px; font-weight: 600; color: var(--txt-dim); text-align: center; }
+.trp-tp-col { display: flex; flex-direction: column; gap: 3px; }
+.trp-tp-unit { font-size: 10.5px; font-weight: 600; color: var(--txt-dim); text-align: center; }
 .trp-tp-list {
   position: relative;
-  height: 192px;
+  height: 168px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -230,13 +203,15 @@
   scrollbar-width: thin;
 }
 .trp-tp-item {
-  height: 30px;
+  height: 24px;
   flex-shrink: 0;
+  padding: 0;
   border: 0;
-  border-radius: 6px;
-  background: transparent;
+  border-radius: var(--radius);
+  background: none;
   color: var(--txt-muted);
-  font: 500 13px var(--ui);
+  font-size: 12px;
+  font-family: var(--ui);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
 }
@@ -244,24 +219,25 @@
 .trp-tp-item.selected { background: var(--accent); color: var(--text-on-accent); font-weight: 700; }
 
 /* Date picker */
-.trp-cal { width: 252px; }
+.trp-cal { width: 232px; }
 .trp-cal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--border);
 }
-.trp-cal-month { font-size: 13px; font-weight: 600; }
+.trp-cal-month { font-size: 12px; font-weight: 600; }
 .trp-cal-nav {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: transparent;
+  border-radius: var(--radius-sm);
+  background: none;
   color: var(--txt-muted);
   cursor: pointer;
 }
@@ -270,31 +246,32 @@
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
   row-gap: 2px;
-  padding: 8px 10px;
+  padding: 6px 8px;
 }
 .trp-cal-dow {
-  height: 22px;
+  height: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   color: var(--txt-dim);
 }
 .trp-cal-day {
-  height: 30px;
+  height: 26px;
   padding: 0;
   border: 0;
-  border-radius: 6px;
-  background: transparent;
+  border-radius: var(--radius);
+  background: none;
   color: var(--txt-muted);
-  font: 500 12.5px var(--ui);
+  font-size: 11.5px;
+  font-family: var(--ui);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
 }
 .trp-cal-day:hover { background: var(--surface-hover); color: var(--txt); }
-.trp-cal-day.outside { opacity: .35; }
+.trp-cal-day.outside { opacity: .38; }
 .trp-cal-day.future { color: var(--txt-dim); }
-.trp-cal-day.in-range { background: var(--accent-soft); color: var(--txt); border-radius: 0; }
-.trp-cal-day.today { box-shadow: inset 0 0 0 1px var(--trp-muted); }
-.trp-cal-day.selected { background: var(--accent); color: var(--text-on-accent); font-weight: 700; border-radius: 6px; }
+.trp-cal-day.in-range { background: var(--accent-dim); color: var(--txt); border-radius: 0; }
+.trp-cal-day.today { box-shadow: inset 0 0 0 1px var(--txt-dim); }
+.trp-cal-day.selected { background: var(--accent); color: var(--text-on-accent); font-weight: 700; border-radius: var(--radius); }

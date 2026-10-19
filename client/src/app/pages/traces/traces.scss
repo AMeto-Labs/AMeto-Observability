@@ -841,6 +841,11 @@
   color: var(--text-muted);
   pointer-events: none;
   white-space: nowrap;
+
+  /* The end labels sit inside the axis: centred on 0% and 100% they spilled half out of it,
+     and the last one ran into the Duration heading. */
+  &:first-child { transform: none; }
+  &:last-child  { transform: translateX(-100%); }
 }
 
 .wf-body {

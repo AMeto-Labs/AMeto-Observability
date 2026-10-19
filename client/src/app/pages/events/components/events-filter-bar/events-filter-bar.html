@@ -5,7 +5,7 @@
   <div class="fb-group" (click)="$event.stopPropagation()">
     <button #dateBtn class="fb-btn fb-date" [class.open]="dateDropdownOpen()"
       aria-haspopup="dialog" [attr.aria-expanded]="dateDropdownOpen()" (click)="openDate(dateBtn)">
-      <lucide-icon name="calendar" [size]="13" class="fb-date-icon" />
+      <lucide-icon name="calendar" [size]="13" />
       @let label = store.rangeLabel();
       <span>{{ label.text }}</span>
       @if (label.extra) { <span class="fb-date-extra">· {{ label.extra }}</span> }

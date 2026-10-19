@@ -5,7 +5,7 @@
 
   <!-- ── Main body ────────────────────────────────────────────────────── -->
   <div class="events-body">
-    <div class="events-list-wrap">
+    <div class="events-list-wrap" [style.--svc-col]="svcColWidth() + 'px'">
       <!-- Column headers — for the EVENT list. An aggregation's columns are whatever its
            query asked for, so it brings its own header. -->
       @if (!store.aggregation()) {

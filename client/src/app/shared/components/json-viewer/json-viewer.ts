@@ -90,6 +90,12 @@ function highlightJsonLine(json: string): string {
     @if (isContainer()) {
       <span class="jv-node" [class.jv-open]="expanded()">
         <span class="jv-head">
+          @if (actions && rootMenu()) {
+            <button class="jv-menu-btn" type="button" title="Filter / copy"
+                    (click)="openMenu($event, path(), value(), true)">
+              <lucide-icon name="list-filter" [size]="11" />
+            </button>
+          }
           <button
             type="button"
             class="jv-toggle"
@@ -105,32 +111,27 @@ function highlightJsonLine(json: string): string {
           } @else {
             <span class="jv-bracket">{{ isArray() ? '[' : '{' }}</span>
           }
-
-          @if (actions && rootMenu()) {
-            <button class="jv-menu-btn" type="button" title="Filter…"
-                    (click)="openMenu($event, path(), value(), true)">
-              <lucide-icon name="list-filter" [size]="11" />
-            </button>
-          }
         </span>
 
         @if (expanded()) {
           <span class="jv-children">
             @for (entry of entries(); track entry.key) {
               <span class="jv-row" [class.jv-row--hit]="rowMatches(entry)">
+                <!-- The row's menu leads it, before the key, as in the Properties list: every
+                     child has one, leaf or container (whose own viewer then shows none). -->
+                @if (actions) {
+                  <button class="jv-menu-btn" type="button" title="Filter / copy"
+                          (click)="openMenu($event, childPath(entry), entry.value, !isContainerLeaf(entry.value))">
+                    <lucide-icon name="list-filter" [size]="11" />
+                  </button>
+                }
                 @if (!isArray()) {
                   <span class="jv-key" [innerHTML]="hl(entry.key)"></span><span class="jv-colon">: </span>
                 }
                 @if (isContainerLeaf(entry.value)) {
                   <span [class]="leafClass(entry.value)" [innerHTML]="hl(leafText(entry.value))"></span>
-                  @if (actions) {
-                    <button class="jv-menu-btn" type="button" title="Filter…"
-                            (click)="openMenu($event, childPath(entry), entry.value, false)">
-                      <lucide-icon name="list-filter" [size]="11" />
-                    </button>
-                  }
                 } @else {
-                  <app-json-viewer [value]="entry.value" [path]="childPath(entry)"
+                  <app-json-viewer [value]="entry.value" [path]="childPath(entry)" [rootMenu]="false"
                                    [searchTerm]="searchTerm()" [initialExpanded]="initialExpanded()" />
                 }
               </span>
@@ -141,6 +142,12 @@ function highlightJsonLine(json: string): string {
       </span>
     } @else {
       <span class="jv-leaf" [class.jv-leaf--open]="leafExpanded()">
+        @if (actions && rootMenu()) {
+          <button class="jv-menu-btn" type="button" title="Filter / copy"
+                  (click)="openMenu($event, path(), value(), false)">
+            <lucide-icon name="list-filter" [size]="11" />
+          </button>
+        }
         @if (oneLine() && (clipped() || leafExpanded())) {
           <button
             type="button"
@@ -153,12 +160,6 @@ function highlightJsonLine(json: string): string {
           </button>
         }
         <span #leafEl [class]="leafTextClass(value())" [innerHTML]="hl(leafText(value()))"></span>
-        @if (actions && rootMenu()) {
-          <button class="jv-menu-btn" type="button" title="Filter…"
-                  (click)="openMenu($event, path(), value(), false)">
-            <lucide-icon name="list-filter" [size]="11" />
-          </button>
-        }
       </span>
     }
   `,
@@ -177,8 +178,8 @@ export class JsonViewerComponent {
    *  inline. Expanding a container still reveals the full multi-line tree. */
   readonly oneLine = input<boolean>(false);
   /** Show the filter menu button on THIS (root) node. Off in the Properties list,
-   *  where the row already has its own leading menu button — nested nodes still
-   *  show theirs, so per-path filtering stays available when expanded. */
+   *  where the row already has its own leading menu button, and on every nested
+   *  viewer, whose button leads its row in the parent — so each node has exactly one. */
   readonly rootMenu = input<boolean>(true);
 
   /** Optional — present only when a host (e.g. event-row) provides the channel. */
@@ -244,7 +245,10 @@ export class JsonViewerComponent {
   openMenu(e: MouseEvent, path: string, value: unknown, isContainer: boolean): void {
     e.stopPropagation();
     e.preventDefault();
-    this.actions?.open({ path, rawValue: value, isContainer, x: e.clientX, y: e.clientY });
+    this.actions?.open({
+      path, rawValue: value, isContainer, x: e.clientX, y: e.clientY,
+      origin: e.currentTarget as Element,
+    });
   }
 
   readonly isContainer = computed(() => isContainerValue(this.value()));

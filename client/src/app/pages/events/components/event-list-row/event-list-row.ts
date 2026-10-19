@@ -15,14 +15,6 @@ const LEVEL_SHORT: Record<string, string> = {
   warning: 'WRN', error: 'ERR', fatal: 'FTL',
 };
 
-/** Render a top-level prop value to a compact single-line string for the row hint. */
-function formatInline(v: unknown): string {
-  if (v === null || v === undefined) return 'null';
-  if (Array.isArray(v))               return JSON.stringify(v);
-  if (typeof v === 'object')          return JSON.stringify(v);
-  return String(v);
-}
-
 /**
  * Fixed-height, single-line collapsed log row for the Events virtual list.
  *
@@ -102,13 +94,6 @@ export class EventListRowComponent {
     this.sanitizer.bypassSecurityTrustHtml(
       renderMessageHtml(this.event()['@mt'], this.event().props),
     ));
-
-  readonly topProps = computed(() =>
-    Object.entries(this.event().props ?? {})
-      .slice(0, 3)
-      .map(([k, v]) => ({ k, v: formatInline(v) })));
-
-  readonly propsCount = computed(() => Object.keys(this.event().props ?? {}).length);
 
   // ── Interaction ───────────────────────────────────────────────────────
   onRowClick(): void {

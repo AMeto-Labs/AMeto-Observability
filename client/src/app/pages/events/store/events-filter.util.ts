@@ -1,31 +1,28 @@
 import { subDays, startOfDay, format, isSameDay } from 'date-fns';
 import { LEVELS } from '../../../core/models/event.model';
 
-export type TimePreset = '15m' | '1h' | '4h' | '24h' | 'today' | 'yesterday' | '7d' | 'custom';
+export type TimePreset = '1d' | '3d' | '7d' | 'custom';
 
-/** The time range popover's quick ranges, in the order its chips show them. */
+/** The time range dropdown's quick ranges, in the order it lists them. */
 export const PRESET_LABELS: Readonly<Record<Exclude<TimePreset, 'custom'>, string>> = {
-  '15m': 'Last 15 min',
-  '1h': 'Last 1 h',
-  '4h': 'Last 4 h',
-  '24h': 'Last 24 h',
-  today: 'Today',
-  yesterday: 'Yesterday',
+  '1d': 'Last 1 day',
+  '3d': 'Last 3 days',
   '7d': 'Last 7 days',
 };
 
 /** The window a fresh page opens on, and the one Reset and Clear return to. */
-export const DEFAULT_PRESET: TimePreset = '24h';
+export const DEFAULT_PRESET: TimePreset = '1d';
 
-/**
- * A `preset=` URL value as a preset, or null when it names none. `1d` was the default before
- * this set and still sits in saved links; it is read as `24h`, the preset that replaced it.
- */
+/** Presets that saved links still carry, read as the one that replaced each. */
+const LEGACY_PRESETS: Readonly<Record<string, TimePreset>> = { '24h': '1d' };
+
+/** A `preset=` URL value as a preset, or null when it names none. */
 export function parsePreset(raw: string | null): TimePreset | null {
-  if (raw === '1d') return '24h';
+  if (raw === null) return null;
   if (raw === 'custom') return 'custom';
   // Own keys only: `in` would accept `preset=toString`.
-  return raw !== null && Object.hasOwn(PRESET_LABELS, raw) ? raw as TimePreset : null;
+  if (Object.hasOwn(LEGACY_PRESETS, raw)) return LEGACY_PRESETS[raw];
+  return Object.hasOwn(PRESET_LABELS, raw) ? raw as TimePreset : null;
 }
 
 /** Safe identifier as accepted by the server-side lexer (letter/digit/_/@). */
@@ -502,6 +499,19 @@ export function fmtDateInput(d: Date): string {
   return format(d, 'yyyy-MM-dd HH:mm');
 }
 
+/**
+ * The last instant of `d`'s minute as an ISO-8601 UTC string with seven fractional digits —
+ * the server's 100 ns tick. A To bound is a minute and the whole minute is in the window, while
+ * the server's `to` is inclusive (API.md): sending the next minute would also take in events
+ * stamped exactly on it, so this sends the tick before it. `2026-10-18 23:59` becomes
+ * `…T18:59:59.9999999Z` at UTC+5: everything up to, and nothing at, 2026-10-19 00:00.
+ */
+export function endOfMinuteIso(d: Date): string {
+  const nextMinute = Math.floor(d.getTime() / 60_000) * 60_000 + 60_000;
+  // toISOString stops at milliseconds (…59.999Z); the four 9s after it are the sub-ms ticks.
+  return new Date(nextMinute - 1).toISOString().replace(/Z$/, '9999Z');
+}
+
 /** Parses `yyyy-MM-dd [HH:mm]` (also accepts legacy `dd/MM/yyyy [HH:mm]`). */
 export function parseCustomDate(val: string): Date | null {
   if (!val) return null;
@@ -521,21 +531,14 @@ export function parseCustomDate(val: string): Date | null {
 }
 
 /**
- * A preset's bounds as of now, in the date inputs' format. `to` is '' (up to now) for every
- * preset but Yesterday, which ends where today starts. `custom` has no bounds of its own.
+ * A preset's bounds as of now, in the date inputs' format: N days back to the minute, up to now
+ * (`to` ''). Calendar days, so a DST switch inside the window moves no bound by an hour.
+ * `custom` has no bounds of its own.
  */
 export function presetRange(preset: TimePreset, now = new Date()): { from: string; to: string } {
-  const back = (ms: number) => ({ from: fmtDateInput(new Date(now.getTime() - ms)), to: '' });
-  switch (preset) {
-    case '15m':       return back(15 * 60_000);
-    case '1h':        return back(3_600_000);
-    case '4h':        return back(4 * 3_600_000);
-    case '24h':       return back(24 * 3_600_000);
-    case 'today':     return { from: fmtDateInput(startOfDay(now)), to: '' };
-    case 'yesterday': return { from: fmtDateInput(startOfDay(subDays(now, 1))), to: fmtDateInput(startOfDay(now)) };
-    case '7d':        return { from: fmtDateInput(startOfDay(subDays(now, 7))), to: '' };
-    case 'custom':    return { from: '', to: '' };
-  }
+  const days: Record<Exclude<TimePreset, 'custom'>, number> = { '1d': 1, '3d': 3, '7d': 7 };
+  if (preset === 'custom') return { from: '', to: '' };
+  return { from: fmtDateInput(subDays(now, days[preset])), to: '' };
 }
 
 /** A duration in its two largest units, rounded to the minute: `45 m`, `4 h`, `4 d 9 h`. */

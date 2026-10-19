@@ -8,26 +8,14 @@
     <span class="ev-level">
       <span class="ev-lvl-badge">{{ levelShort() }}</span>
     </span>
-    @if (service()) {
-      <span class="ev-svc">
+    <!-- Always there, empty or not: the message column starts in the same place on every row. -->
+    <span class="ev-svc" [title]="service()">
+      @if (service()) {
         <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
         <span class="ev-svc-name">{{ service() }}</span>
-      </span>
-    }
+      }
+    </span>
     <span class="ev-msg" [innerHTML]="renderedHtml()" (contextmenu)="openMessageMenu($event)"></span>
-    @if (propsCount() > 0) {
-      <span class="ev-props-hint">
-        @for (kv of topProps(); track kv.k) {
-          <span class="ev-kv">
-            <span class="ev-pk">{{ kv.k }}</span
-            ><span class="ev-sep"> = </span><span class="ev-pv">{{ kv.v }}</span>
-          </span>
-        }
-        @if (propsCount() > 3) {
-          <span class="ev-more-props">+{{ propsCount() - 3 }}</span>
-        }
-      </span>
-    }
   </div>
 }
 

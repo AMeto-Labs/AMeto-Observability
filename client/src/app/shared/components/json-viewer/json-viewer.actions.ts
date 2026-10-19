@@ -11,6 +11,8 @@ export interface JvMenuRequest {
   /** Viewport coordinates of the click, for positioning the menu. */
   x: number;
   y: number;
+  /** The menu button that was clicked — the menu anchors to it when given. */
+  origin?: Element;
 }
 
 /**

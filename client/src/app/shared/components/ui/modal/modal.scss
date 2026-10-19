@@ -23,6 +23,17 @@
   overflow: hidden;
 }
 
+/* A whole panel (the Traces page's log details) rather than a form: most of the window and
+   all of its height, so the detail's tabs — the trace waterfall above all — have room. */
+.modal--wide {
+  max-width: 1100px;
+  height: calc(100vh - 48px);
+}
+.modal--wide .modal__body {
+  flex: 1;
+  min-height: 0;
+}
+
 .modal__header {
   display: flex;
   align-items: center;

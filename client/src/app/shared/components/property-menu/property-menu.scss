@@ -1,8 +1,6 @@
 :host { display: contents; }
 
 .prop-menu {
-  position: fixed;
-  z-index: 1000;
   min-width: 220px;
   padding: 4px;
   background: var(--bg-panel, var(--bg-main));
@@ -10,6 +8,15 @@
   border-radius: var(--radius-sm, 6px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: 12px;
+  // A menu taller than the window scrolls rather than running off it.
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+// Placed by itself at (x, y); inside an overlay the overlay places it.
+.prop-menu.floating {
+  position: fixed;
+  z-index: 1000;
 }
 
 .pm-header {
@@ -41,10 +48,11 @@
   &:hover { background: var(--bg-main); }
 }
 
-.pm-sep {
-  height: 1px;
-  margin: 3px 0;
-  background: var(--border);
+/* Groups (Copy / Find / Seek window / Open), each under its own heading, a rule between them. */
+.pm-group + .pm-group {
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px solid var(--border);
 }
 
 .pm-section {
@@ -68,6 +76,12 @@
   color: var(--text-primary);
 }
 
+/* A row that leads with an icon lines its label up with the plain items' text. */
+.pm-row-icon {
+  flex-shrink: 0;
+  margin-right: 3px;
+}
+
 .pm-op {
   width: 26px;
   padding: 2px 0;
@@ -80,4 +94,9 @@
   cursor: pointer;
 
   &:hover { background: var(--bg-main); border-color: var(--info); }
+}
+.pm-op--wide {
+  width: auto;
+  padding: 2px 6px;
+  white-space: nowrap;
 }

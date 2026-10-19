@@ -40,7 +40,7 @@
   padding-right: 4px;
 }
 .ev-h-stripe {
-  width: 9px; /* 3px stripe + 6px margin-right */
+  width: 11px; /* the row's 3px stripe + its 8px margin-right */
   flex-shrink: 0;
 }
 .ev-h-col {
@@ -57,7 +57,8 @@
 }
 .ev-h-ts  { width: 160px; flex-shrink: 0; padding-right: 6px; }
 .ev-h-lvl { width: 45px;  flex-shrink: 0; padding-right: 6px; }
-.ev-h-svc { width: 156px; flex-shrink: 0; padding-right: 10px; }
+/* --svc-col is set on .events-list-wrap from the longest service name (EventsComponent.svcColWidth). */
+.ev-h-svc { width: var(--svc-col, 155px); flex-shrink: 0; padding-right: 10px; }
 .ev-h-msg { flex: 1; min-width: 0; }
 .ev-h-wrap-btn { margin-left: auto; opacity: 0.5; }
 .ev-h-wrap-btn:hover, .ev-h-wrap-btn.tb-icon-btn--on { opacity: 1; }
@@ -255,7 +256,10 @@
 .event-drawer {
   position: relative;                 /* anchor for the drag handle */
   flex-shrink: 0;
-  /* width is set inline from the persisted preference; JS clamps the bounds */
+  /* width is set inline from the persisted preference; JS clamps the bounds while dragging.
+     The persisted width is only a wish: on a window narrower than it the drawer takes the
+     whole body instead of running past its right edge, which took the close button with it. */
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;

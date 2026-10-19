@@ -52,8 +52,8 @@
 
     @if (addUserTab() === 'local') {
       <form class="inline-form" (ngSubmit)="addUser()">
-        <input class="field-input" type="text" placeholder="Username" [ngModel]="newUsername()" (ngModelChange)="newUsername.set($event)" name="uname" />
-        <input class="field-input" type="password" placeholder="Password" [ngModel]="newPassword()" (ngModelChange)="newPassword.set($event)" name="pwd" />
+        <input class="field-input" type="text" placeholder="Username" autocomplete="off" [ngModel]="newUsername()" (ngModelChange)="newUsername.set($event)" name="uname" />
+        <input class="field-input" type="password" placeholder="Password" autocomplete="new-password" [ngModel]="newPassword()" (ngModelChange)="newPassword.set($event)" name="pwd" />
         <select class="field-select" [ngModel]="newRole()" (ngModelChange)="newRole.set($event)" name="role">
           <option value="viewer">viewer</option>
           <option value="manager">manager</option>
@@ -69,8 +69,8 @@
 
     @if (addUserTab() === 'oauth-email') {
       <form class="inline-form" (ngSubmit)="addOAuthUser()">
-        <input class="field-input" type="email" placeholder="Email" [ngModel]="newOAuthEmail()" (ngModelChange)="newOAuthEmail.set($event)" name="oemail" />
-        <input class="field-input" type="text" placeholder="Display name (optional)" [ngModel]="newOAuthDisplay()" (ngModelChange)="newOAuthDisplay.set($event)" name="odname" />
+        <input class="field-input" type="email" placeholder="Email" autocomplete="off" [ngModel]="newOAuthEmail()" (ngModelChange)="newOAuthEmail.set($event)" name="oemail" />
+        <input class="field-input" type="text" placeholder="Display name (optional)" autocomplete="off" [ngModel]="newOAuthDisplay()" (ngModelChange)="newOAuthDisplay.set($event)" name="odname" />
         <select class="field-select" [ngModel]="newOAuthProvider()" (ngModelChange)="newOAuthProvider.set($event)" name="oprov">
           <option value="google">Google</option>
           <option value="microsoft">Microsoft</option>
@@ -100,7 +100,7 @@
 
     @if (addUserTab() === 'oauth-domain') {
       <form class="inline-form" (ngSubmit)="addDomain()">
-        <input class="field-input" type="text" placeholder="ameto.com" [ngModel]="newDomain()" (ngModelChange)="newDomain.set($event)" name="domain" />
+        <input class="field-input" type="text" placeholder="ameto.com" autocomplete="off" [ngModel]="newDomain()" (ngModelChange)="newDomain.set($event)" name="domain" />
         <select class="field-select" [ngModel]="newDomainProvider()" (ngModelChange)="newDomainProvider.set($event)" name="dprov">
           <option value="google">Google</option>
           <option value="microsoft">Microsoft</option>

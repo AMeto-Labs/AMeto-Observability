@@ -13,12 +13,26 @@ import {
   TimePreset, PRESET_LABELS, DEFAULT_PRESET,
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
-  parseCustomDate, fmtDateInput, presetRange, parsePreset, customRangeLabel,
+  parseCustomDate, fmtDateInput, endOfMinuteIso, presetRange, parsePreset, customRangeLabel,
   collectPropPaths, isoToDotNetUtcTicksString, isAggregationQuery,
 } from './events-filter.util';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
 const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
+
+/**
+ * Wrap mode is remembered in two places: the URL (`wrap=1`), so a link opens the way it was
+ * shared, and localStorage, so a page opened without one comes back the way it was left.
+ */
+const WRAP_KEY = 'Ameto-events-wrap';
+
+function loadWrap(): boolean {
+  try { return localStorage.getItem(WRAP_KEY) === '1'; } catch { return false; }
+}
+
+function saveWrap(on: boolean): void {
+  try { localStorage.setItem(WRAP_KEY, on ? '1' : '0'); } catch { /* quota / private mode */ }
+}
 
 /**
  * Shared empty highlight set. Reused BY IDENTITY so a flush that flashes nothing writes the
@@ -520,10 +534,15 @@ export const EventsStore = signalStore(
       return parseCustomDate(store.customFrom()) ?? subDays(new Date(), 1);
     }
 
-    /** To-instant for a query (ISO), or undefined when the range is open-ended. */
+    /**
+     * To-instant for a query (ISO), or undefined when the range is open-ended. The To bound is a
+     * minute and the whole of it is in the window: `23:59` reaches the server as the last tick
+     * before 00:00 (see endOfMinuteIso). It used to go as 23:59:00.000, which left out the last
+     * 59.999 s of the day a "Whole days" window was meant to cover.
+     */
     function getToDate(): string | undefined {
       const d = parseCustomDate(store.customTo());
-      return d ? d.toISOString() : undefined;
+      return d ? endOfMinuteIso(d) : undefined;
     }
 
     /** Writes a preset's bounds as of now. `custom` leaves the current range untouched. */
@@ -546,6 +565,7 @@ export const EventsStore = signalStore(
         to: store.customTo() || null,
         levels: null,
         size: store.pageSize() === 50 ? null : String(store.pageSize()),
+        wrap: store.wrapMessages() ? '1' : null,
       };
       router.navigate([], { queryParams, replaceUrl: true });
     }
@@ -1091,16 +1111,16 @@ export const EventsStore = signalStore(
      * the same behaviour as the filter / bind-time context-menu actions. The filter string
      * is left untouched (the seek only moves the time window).
      *
-     * The date inputs are minute-precision, so floor `from` / ceil `to` to the minute to
-     * guarantee the picked event stays inside an otherwise sub-minute (± seconds) window.
+     * The date inputs are minute-precision, so both bounds are floored to the minute: From
+     * starts at the start of its minute, and the To minute is in the window whole (getToDate),
+     * so the picked event stays inside an otherwise sub-minute (± seconds) window.
      */
     function seek(from: Date, to: Date): void {
       if (store.live()) stopLive();
       const floorMin = (d: Date) => new Date(Math.floor(d.getTime() / 60_000) * 60_000);
-      const ceilMin  = (d: Date) => new Date(Math.ceil(d.getTime() / 60_000) * 60_000);
       patchState(store, {
         customFrom: fmtDateInput(floorMin(from)),
-        customTo: fmtDateInput(ceilMin(to)),
+        customTo: fmtDateInput(floorMin(to)),
         timePreset: 'custom',
       });
       loadEvents();
@@ -1145,8 +1165,12 @@ export const EventsStore = signalStore(
       selectEvent(store.selectedId() === id ? null : id);
     }
 
+    /** Flips wrap mode and remembers it — in the URL and in localStorage (see WRAP_KEY). */
     function toggleWrap(): void {
-      patchState(store, { wrapMessages: !store.wrapMessages() });
+      const on = !store.wrapMessages();
+      patchState(store, { wrapMessages: on });
+      saveWrap(on);
+      syncRoute();
     }
 
     function toggleSignalsPanel(): void {
@@ -1173,6 +1197,7 @@ export const EventsStore = signalStore(
       const urlTo = qp.get('to') ?? '';
       const urlLevels = qp.get('levels');
       const urlSize = Number(qp.get('size'));
+      const urlWrap = qp.get('wrap');
 
       // A preset is relative, so a link carrying one opens on that preset from NOW — the `from`
       // beside it is only where the window started when the link was made. Explicit bounds are
@@ -1180,7 +1205,11 @@ export const EventsStore = signalStore(
       const relative = urlPreset !== null && urlPreset !== 'custom';
       const timePreset: TimePreset = relative ? urlPreset : urlFrom ? 'custom' : DEFAULT_PRESET;
 
-      const patch: Partial<EventsState> = { filterInput: urlFilter, filter: urlFilter, timePreset };
+      const patch: Partial<EventsState> = {
+        filterInput: urlFilter, filter: urlFilter, timePreset,
+        // The link's own wrap wins; without one, the page comes back the way it was left.
+        wrapMessages: urlWrap === null ? loadWrap() : urlWrap === '1',
+      };
       if (PAGE_SIZE_OPTIONS.includes(urlSize)) patch.pageSize = urlSize;
       if (timePreset === 'custom') { patch.customFrom = urlFrom; patch.customTo = urlTo; }
       patchState(store, patch);

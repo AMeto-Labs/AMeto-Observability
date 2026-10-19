@@ -24,6 +24,8 @@ export class ModalComponent {
   readonly open = input<boolean>(false);
   readonly title = input<string>('');
   readonly dismissable = input(true, { transform: booleanAttribute });
+  /** For a whole panel rather than a form (log details): up to 1100px wide, full height. */
+  readonly wide = input(false, { transform: booleanAttribute });
 
   readonly close = output<void>();
 

@@ -48,6 +48,10 @@ const HOURS = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
 const MINUTES = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'));
 const WEEK_DAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
+/** Where a side with no time of its own starts or ends: the whole day. */
+const DAY_START = '00:00';
+const DAY_END = '23:59';
+
 /** A real calendar day: `2026-02-31` parses (to 3 March), so the round trip is the test. */
 function isDate(s: string): boolean {
   if (!DATE_RE.test(s)) return false;
@@ -55,14 +59,24 @@ function isDate(s: string): boolean {
   return !!d && format(d, 'yyyy-MM-dd') === s;
 }
 
-/** Time range popover: quick ranges, then From / To as a date and a time each, then Apply. */
+/** `17 Oct`, with the year only when it is not the current one. */
+function fmtDay(d: Date, now: Date): string {
+  return format(d, d.getFullYear() === now.getFullYear() ? 'd MMM' : 'd MMM yyyy');
+}
+
+/**
+ * Time range popover: quick ranges, then From – To as a date each, with a time only when asked
+ * for, then Apply.
+ */
 @Component({
   selector: 'app-date-range-dropdown',
   imports: [LucideAngularModule, DateMaskDirective],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styleUrl: './date-range-dropdown.scss',
   template: `
-    <div class="trp" role="dialog" aria-label="Time range">
+    <div class="trp" role="dialog" aria-label="Time range"
+      (pointerdown)="closePickerOutside($event)"
+      (keydown.escape)="closePickerOnEscape($event)">
       <div class="trp-head">
         <span class="trp-title">Time range</span>
         <span class="trp-summary">{{ summary() }}</span>
@@ -84,7 +98,7 @@ function isDate(s: string): boolean {
             <label class="trp-label" [attr.for]="'trp-' + s.side + '-date'">{{ s.label }}</label>
 
             <!-- Date -->
-            <div class="trp-anchor">
+            <div class="trp-anchor" [class.open]="isOpen(s.side, 'date')">
               <div class="trp-field"
                 [class.active]="isOpen(s.side, 'date')"
                 [class.invalid]="dateInvalid(s.side)">
@@ -103,7 +117,7 @@ function isDate(s: string): boolean {
                   @if (date(s.side)) {
                     <button type="button" class="trp-clear" [attr.aria-label]="'Clear ' + s.label"
                       (click)="clear(s.side)">
-                      <lucide-icon name="x" [size]="14" />
+                      <lucide-icon name="x" [size]="12" />
                     </button>
                   }
                 </div>
@@ -111,7 +125,7 @@ function isDate(s: string): boolean {
                   [attr.aria-label]="'Pick ' + s.label + ' date'"
                   [attr.aria-expanded]="isOpen(s.side, 'date')"
                   (click)="toggle(s.side, 'date')">
-                  <lucide-icon name="calendar" [size]="16" />
+                  <lucide-icon name="calendar" [size]="14" />
                 </button>
               </div>
 
@@ -146,83 +160,92 @@ function isDate(s: string): boolean {
               }
             </div>
 
-            <!-- Time -->
-            <div class="trp-anchor">
-              <div class="trp-field"
-                [class.active]="isOpen(s.side, 'time')"
-                [class.invalid]="timeInvalid(s.side)">
-                <div class="trp-box">
-                  <input
-                    type="text"
-                    class="trp-input"
-                    placeholder="HH:mm"
-                    [attr.aria-label]="s.label + ' time'"
-                    [value]="time(s.side)"
-                    dateMask dateMaskType="time"
-                    (valueChange)="setTime(s.side, $event)"
-                    (keydown.enter)="apply()"
-                    spellcheck="false"
-                    autocomplete="off" />
+            <!-- Time: only after Set times -->
+            @if (timesShown()) {
+              <div class="trp-anchor" [class.open]="isOpen(s.side, 'time')">
+                <div class="trp-field"
+                  [class.active]="isOpen(s.side, 'time')"
+                  [class.invalid]="timeInvalid(s.side)">
+                  <div class="trp-box">
+                    <input
+                      type="text"
+                      class="trp-input"
+                      placeholder="HH:mm"
+                      [attr.aria-label]="s.label + ' time'"
+                      [value]="time(s.side)"
+                      dateMask dateMaskType="time"
+                      (valueChange)="setTime(s.side, $event)"
+                      (keydown.enter)="apply()"
+                      spellcheck="false"
+                      autocomplete="off" />
+                  </div>
+                  <button type="button" class="trp-pick"
+                    [attr.aria-label]="'Pick ' + s.label + ' time'"
+                    [attr.aria-expanded]="isOpen(s.side, 'time')"
+                    (click)="toggle(s.side, 'time')">
+                    <lucide-icon name="clock" [size]="14" />
+                  </button>
                 </div>
-                <button type="button" class="trp-pick"
-                  [attr.aria-label]="'Pick ' + s.label + ' time'"
-                  [attr.aria-expanded]="isOpen(s.side, 'time')"
-                  (click)="toggle(s.side, 'time')">
-                  <lucide-icon name="clock" [size]="16" />
-                </button>
-              </div>
 
-              @if (isOpen(s.side, 'time')) {
-                <div class="trp-pop trp-tp" role="dialog" [attr.aria-label]="'Pick ' + s.label + ' time'">
-                  <div class="trp-tp-head">
-                    <span class="trp-tp-name">{{ s.label }} time</span>
-                    <span class="trp-tp-value">{{ time(s.side) || '--:--' }}</span>
-                  </div>
-                  <div class="trp-tp-cols">
-                    <div class="trp-tp-col">
-                      <span class="trp-tp-unit">HH</span>
-                      <div class="trp-tp-list" role="group" aria-label="Hours">
-                        @for (h of hours; track h) {
-                          <button type="button" class="trp-tp-item"
-                            [class.selected]="time(s.side).slice(0, 2) === h"
-                            [attr.aria-pressed]="time(s.side).slice(0, 2) === h"
-                            (click)="pickHour(s.side, h)">{{ h }}</button>
-                        }
+                @if (isOpen(s.side, 'time')) {
+                  <div class="trp-pop trp-tp" role="dialog" [attr.aria-label]="'Pick ' + s.label + ' time'">
+                    <div class="trp-tp-head">
+                      <span class="trp-tp-name">{{ s.label }} time</span>
+                      <span class="trp-tp-value">{{ time(s.side) || '--:--' }}</span>
+                    </div>
+                    <div class="trp-tp-cols">
+                      <div class="trp-tp-col">
+                        <span class="trp-tp-unit">HH</span>
+                        <div class="trp-tp-list" role="group" aria-label="Hours">
+                          @for (h of hours; track h) {
+                            <button type="button" class="trp-tp-item"
+                              [class.selected]="time(s.side).slice(0, 2) === h"
+                              [attr.aria-pressed]="time(s.side).slice(0, 2) === h"
+                              (click)="pickHour(s.side, h)">{{ h }}</button>
+                          }
+                        </div>
+                      </div>
+                      <div class="trp-tp-col">
+                        <span class="trp-tp-unit">mm</span>
+                        <div class="trp-tp-list" role="group" aria-label="Minutes">
+                          @for (m of minutes; track m) {
+                            <button type="button" class="trp-tp-item"
+                              [class.selected]="time(s.side).slice(3, 5) === m"
+                              [attr.aria-pressed]="time(s.side).slice(3, 5) === m"
+                              (click)="pickMinute(s.side, m)">{{ m }}</button>
+                          }
+                        </div>
                       </div>
                     </div>
-                    <div class="trp-tp-col">
-                      <span class="trp-tp-unit">mm</span>
-                      <div class="trp-tp-list" role="group" aria-label="Minutes">
-                        @for (m of minutes; track m) {
-                          <button type="button" class="trp-tp-item"
-                            [class.selected]="time(s.side).slice(3, 5) === m"
-                            [attr.aria-pressed]="time(s.side).slice(3, 5) === m"
-                            (click)="pickMinute(s.side, m)">{{ m }}</button>
-                        }
-                      </div>
+                    <div class="trp-pop-foot">
+                      <button type="button" class="trp-link"
+                        [title]="s.side === 'to' ? 'Up to now: leave To open' : 'The current time'"
+                        (click)="pickNow(s.side)">Now</button>
+                      <button type="button" class="dd-apply-btn" (click)="picker.set(null)">OK</button>
                     </div>
                   </div>
-                  <div class="trp-pop-foot">
-                    <button type="button" class="trp-link"
-                      [title]="s.side === 'to' ? 'Up to now: leave To open' : 'The current time'"
-                      (click)="pickNow(s.side)">Now</button>
-                    <button type="button" class="trp-ok" (click)="picker.set(null)">OK</button>
-                  </div>
-                </div>
-              }
-            </div>
+                }
+              </div>
+            }
           </div>
         }
       </div>
 
       <div class="trp-note">
         <span>Times are in your time zone · {{ tz }}</span>
-        <button type="button" class="trp-link" (click)="wholeDays()">Whole days</button>
+        @if (timesShown()) {
+          <button type="button" class="trp-link" (click)="wholeDays()">Whole days</button>
+        } @else {
+          <button type="button" class="trp-link trp-set-times" (click)="setTimes()">
+            <lucide-icon name="clock" [size]="11" />
+            Set times
+          </button>
+        }
       </div>
 
       <div class="trp-actions">
-        <button type="button" class="trp-reset" (click)="reset()">Reset</button>
-        <button type="button" class="trp-apply" [disabled]="!canApply()" (click)="apply()">Apply</button>
+        <button type="button" class="dd-reset-btn" (click)="reset()">Reset</button>
+        <button type="button" class="dd-apply-btn" [disabled]="!canApply()" (click)="apply()">Apply</button>
       </div>
     </div>
   `,
@@ -245,24 +268,44 @@ export class DateRangeDropdownComponent {
   // ── Draft: what the fields hold until Apply ───────────────────────────
   private readonly appliedFrom = this.c.customFrom();
   private readonly appliedTo = this.c.customTo();
+  private readonly appliedPreset = this.c.timePreset();
+
   readonly fromDate = signal(this.appliedFrom.split(' ')[0] ?? '');
-  readonly fromTime = signal(this.appliedFrom.split(' ')[1] ?? '');
   readonly toDate = signal(this.appliedTo.split(' ')[0] ?? '');
-  readonly toTime = signal(this.appliedTo.split(' ')[1] ?? '');
+  /**
+   * A preset's times are where the clock happened to be, not something the reader chose, so the
+   * popover opens without them. A custom window brings its times along exactly as applied —
+   * 00:00 and 23:59 included, or reopening would lose them.
+   */
+  readonly fromTime = signal(this.appliedTime(this.appliedFrom));
+  readonly toTime = signal(this.appliedTime(this.appliedTo));
+  /**
+   * Whether the time fields are out — both sides together. They open out for a custom window
+   * whose times are not just the whole day's; hidden times are kept, only not used.
+   */
+  readonly timesShown = signal(
+    (!!this.fromTime() && this.fromTime() !== DAY_START) || (!!this.toTime() && this.toTime() !== DAY_END));
+
+  /** Whether anything was edited — an untouched Apply under a preset re-runs the preset. */
+  private readonly touched = signal(false);
 
   readonly picker = signal<Picker>(null);
   readonly calMonth = signal({ year: 0, month: 0 });
 
-  /** The draft From as `yyyy-MM-dd HH:mm`; a day with no time starts at 00:00. */
-  readonly fromValue = computed(() => this.fromDate() ? `${this.fromDate()} ${this.fromTime() || '00:00'}` : '');
+  /** The draft From as `yyyy-MM-dd HH:mm`; with no time shown it starts at 00:00. */
+  readonly fromValue = computed(() => {
+    const day = this.fromDate();
+    return day ? `${day} ${this.timesShown() && this.fromTime() ? this.fromTime() : DAY_START}` : '';
+  });
 
   /**
-   * The draft To, '' for "up to now". A time with no date of its own is on the From day — the
-   * usual "09:00 to 13:00" — and a day with no time runs to 23:59.
+   * The draft To, '' for "up to now". With no time shown it runs to 23:59; a time with no date
+   * of its own is on the From day — the usual "09:00 to 13:00".
    */
   readonly toValue = computed(() => {
-    const day = this.toDate() || (this.toTime() ? this.fromDate() : '');
-    return day ? `${day} ${this.toTime() || '23:59'}` : '';
+    const time = this.timesShown() && this.toTime() ? this.toTime() : '';
+    const day = this.toDate() || (time ? this.fromDate() : '');
+    return day ? `${day} ${time || DAY_END}` : '';
   });
 
   private readonly start = computed(() =>
@@ -283,12 +326,19 @@ export class DateRangeDropdownComponent {
   readonly canApply = computed(() =>
     !!this.start() && (!this.toValue() || !!this.end()) && !this.backwards());
 
+  /** What Apply would load: the preset as it stands until something is edited, then the draft. */
   readonly summary = computed(() => {
+    const now = new Date();
+    if (!this.touched() && this.appliedPreset !== 'custom') {
+      const from = parseCustomDate(this.appliedFrom);
+      return from ? `From ${fmtPoint(from, now)} → now` : '';
+    }
     const s = this.start();
     if (!s) return 'Pick a start';
-    const now = new Date();
     const e = this.end();
-    return `From ${fmtPoint(s, now)} → ${e ? fmtPoint(e, now) : 'now'}`;
+    const from = this.timesShown() ? fmtPoint(s, now) : fmtDay(s, now);
+    const to = !e ? 'now' : this.timesShown() && this.toTime() ? fmtPoint(e, now) : fmtDay(e, now);
+    return `From ${from} → ${to}`;
   });
 
   // ── Calendar ───────────────────────────────────────────────────────────
@@ -332,22 +382,6 @@ export class DateRangeDropdownComponent {
     return this.badTime(side) || (side === 'to' && !!this.toTime() && this.backwards());
   }
 
-  /**
-   * The field's own text is wrong, whatever the other side says. Kept apart from the order check
-   * because `start` and `end` are built on it, and `backwards` on them.
-   */
-  private badDate(side: Side): boolean {
-    const d = this.date(side);
-    if (d) return !isDate(d);
-    // From is required once anything is in it; an empty To is "up to now".
-    return side === 'from' && !!this.fromTime();
-  }
-
-  private badTime(side: Side): boolean {
-    const t = this.time(side);
-    return !!t && !TIME_RE.test(t);
-  }
-
   isOpen(side: Side, kind: 'date' | 'time'): boolean {
     const p = this.picker();
     return p?.side === side && p.kind === kind;
@@ -356,12 +390,34 @@ export class DateRangeDropdownComponent {
   todayIso(): string { return format(new Date(), 'yyyy-MM-dd'); }
 
   // ── Edits ──────────────────────────────────────────────────────────────
-  setDate(side: Side, v: string): void { (side === 'from' ? this.fromDate : this.toDate).set(v); }
-  setTime(side: Side, v: string): void { (side === 'from' ? this.fromTime : this.toTime).set(v); }
+  setDate(side: Side, v: string): void {
+    (side === 'from' ? this.fromDate : this.toDate).set(v);
+    this.touched.set(true);
+  }
+
+  setTime(side: Side, v: string): void {
+    (side === 'from' ? this.fromTime : this.toTime).set(v);
+    this.touched.set(true);
+  }
 
   clear(side: Side): void {
     this.setDate(side, '');
     this.setTime(side, '');
+  }
+
+  /**
+   * Set times: both time fields come out. A side with a time keeps it; one without starts at the
+   * whole day's bound — From 00:00, To 23:59 — and a side with no day gets today, so the 23:59
+   * has a day to end ("now" is today).
+   */
+  setTimes(): void {
+    const today = this.todayIso();
+    if (!this.fromDate()) this.fromDate.set(today);
+    if (!this.toDate()) this.toDate.set(today);
+    if (!TIME_RE.test(this.fromTime())) this.fromTime.set(DAY_START);
+    if (!TIME_RE.test(this.toTime())) this.toTime.set(DAY_END);
+    this.timesShown.set(true);
+    this.touched.set(true);
   }
 
   toggle(side: Side, kind: 'date' | 'time'): void {
@@ -390,9 +446,32 @@ export class DateRangeDropdownComponent {
     this.setTime(side, `${h}:${TIME_RE.test(t) ? t.slice(3, 5) : '00'}`);
   }
 
+  /** The minute is the last thing picked, so it closes the picker; the hour leaves it open. */
   pickMinute(side: Side, m: string): void {
     const t = this.time(side);
     this.setTime(side, `${TIME_RE.test(t) ? t.slice(0, 2) : '00'}:${m}`);
+    this.picker.set(null);
+  }
+
+  /**
+   * A press anywhere in the popover outside the open picker and its own field closes the picker.
+   * Presses outside the popover close all of it (DropdownService); this covers the inside.
+   */
+  closePickerOutside(e: Event): void {
+    if (!this.picker()) return;
+    if (!(e.target as Element | null)?.closest('.trp-anchor.open')) this.picker.set(null);
+  }
+
+  /**
+   * Esc closes an open picker and nothing else. Stopping it here keeps it from the page's
+   * document-level Esc, which closes every dropdown, and from the overlay's own; with no picker
+   * open it goes on and closes the popover as before.
+   */
+  closePickerOnEscape(e: Event): void {
+    if (!this.picker()) return;
+    e.stopPropagation();
+    e.preventDefault();
+    this.picker.set(null);
   }
 
   /** From: the current time (and today, when no day is set). To: open again, "up to now". */
@@ -401,15 +480,19 @@ export class DateRangeDropdownComponent {
     else {
       const now = new Date();
       if (!this.fromDate()) this.fromDate.set(format(now, 'yyyy-MM-dd'));
-      this.fromTime.set(format(now, 'HH:mm'));
+      this.setTime('from', format(now, 'HH:mm'));
     }
     this.picker.set(null);
   }
 
-  /** From the start of the From day; to the end of the To day when there is one. */
+  /**
+   * Whole days on both sides: From starts at 00:00 and a set To ends at 23:59. The times are
+   * hidden, not erased, so Set times brings them back as they were.
+   */
   wholeDays(): void {
-    this.fromTime.set('00:00');
-    if (this.toDate()) this.toTime.set('23:59');
+    this.timesShown.set(false);
+    this.touched.set(true);
+    if (this.picker()?.kind === 'time') this.picker.set(null);
   }
 
   // ── Commit ─────────────────────────────────────────────────────────────
@@ -426,12 +509,32 @@ export class DateRangeDropdownComponent {
 
   apply(): void {
     if (!this.canApply()) return;
-    // Untouched fields under a preset are the preset's own bounds: re-run the preset, so it stays
-    // relative, rather than freezing them into a custom window.
-    const untouched = this.fromValue() === this.appliedFrom && this.toValue() === this.appliedTo;
-    if (untouched && this.c.timePreset() !== 'custom') this.c.setPreset(this.c.timePreset());
+    // Untouched fields under a preset are the preset itself: re-run it, so it stays relative,
+    // rather than freezing it into a custom window.
+    if (!this.touched() && this.appliedPreset !== 'custom') this.c.setPreset(this.appliedPreset);
     else this.c.applyRange(this.fromValue(), this.toValue());
     this.ref.close();
+  }
+
+  /** The applied side's time, or '' under a preset. */
+  private appliedTime(applied: string): string {
+    return this.appliedPreset === 'custom' ? applied.split(' ')[1] ?? '' : '';
+  }
+
+  /**
+   * The field's own text is wrong, whatever the other side says. Kept apart from the order check
+   * because `start` and `end` are built on it, and `backwards` on them.
+   */
+  private badDate(side: Side): boolean {
+    const d = this.date(side);
+    if (d) return !isDate(d);
+    // From is required once a time is in it; an empty To is "up to now".
+    return side === 'from' && this.timesShown() && !!this.fromTime();
+  }
+
+  private badTime(side: Side): boolean {
+    const t = this.time(side);
+    return this.timesShown() && !!t && !TIME_RE.test(t);
   }
 
   /** Scrolls each open time column so its selected value sits in the middle. */

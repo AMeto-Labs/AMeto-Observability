@@ -1,6 +1,6 @@
 import {
   Component, inject, viewChild, viewChildren, ElementRef, OnInit,
-  ChangeDetectionStrategy, afterRenderEffect, effect, untracked, signal, DestroyRef,
+  ChangeDetectionStrategy, afterRenderEffect, effect, untracked, signal, computed, DestroyRef,
 } from '@angular/core';
 import { LucideAngularModule } from 'lucide-angular';
 import {
@@ -16,6 +16,13 @@ import { AggregationTableComponent } from './components/aggregation-table/aggreg
 import { SignalsPanelComponent } from './signals-panel/signals-panel';
 import { EventsStore } from './store/events.store';
 import { UserPreferencesService } from '../../core/services/user-preferences.service';
+
+/** The SERVICE cell around its name: the 12px icon, the 5px gap and the 10px right padding. */
+const SVC_COL_CHROME = 27;
+/** The SERVICE column is never wider than this — a longer name ends in an ellipsis… */
+const SVC_COL_MAX = 155;
+/** …and never narrower than its header. */
+const SVC_COL_MIN = 70;
 
 /**
  * Events page shell. All state and logic live in {@link EventsStore} (provided
@@ -45,6 +52,39 @@ export class EventsComponent implements OnInit {
 
   private rowEls = viewChildren<ElementRef<HTMLElement>>('evRowEl');
   private readonly destroyRef = inject(DestroyRef);
+
+  /**
+   * Width of the SERVICE column, one for the header and every row: the widest service name in
+   * the loaded list with its icon and padding, between SVC_COL_MIN and SVC_COL_MAX. Sized per
+   * row it was a different width on each, and the message after it started somewhere else on
+   * every line; a fixed width wasted room when the names were short.
+   */
+  readonly svcColWidth = computed(() => {
+    this.fontsReady();                       // widths measured in a fallback font are redone
+    let widest = 0;
+    for (const name of Object.keys(this.store.serviceCounts())) widest = Math.max(widest, this.textWidth(name));
+    return Math.min(SVC_COL_MAX, Math.max(SVC_COL_MIN, Math.ceil(widest) + SVC_COL_CHROME));
+  });
+
+  /** Measured service-name widths: each name is measured once, not on every live flush. */
+  private readonly nameWidths = new Map<string, number>();
+  private measureCtx?: CanvasRenderingContext2D | null;
+  private readonly fontsReady = signal(false);
+
+  /** A service name's width in the row's font (12px, --font-mono). */
+  private textWidth(name: string): number {
+    let w = this.nameWidths.get(name);
+    if (w !== undefined) return w;
+    if (this.measureCtx === undefined) {
+      this.measureCtx = document.createElement('canvas').getContext('2d');
+      const family = getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim();
+      if (this.measureCtx) this.measureCtx.font = `12px ${family || 'sans-serif'}`;
+    }
+    // No canvas (a test host): a generous per-character guess rather than nothing.
+    w = this.measureCtx ? this.measureCtx.measureText(name).width : name.length * 7;
+    this.nameWidths.set(name, w);
+    return w;
+  }
 
   /**
    * True while the list is parked at the head. It gates the virtualizer's scroll anchor and it
@@ -119,6 +159,12 @@ export class EventsComponent implements OnInit {
   });
 
   constructor() {
+    // Names measured before the web font arrived were measured in its fallback: measure again.
+    void document.fonts?.ready.then(() => {
+      this.nameWidths.clear();
+      this.fontsReady.set(true);
+    });
+
     // Turning Live on means "show me the newest", so go to the head and say so in both places
     // that hold the fact — the anchor's `atHead` here and the store's follow mode, which has no
     // way to see a scroll position of its own.
@@ -151,6 +197,22 @@ export class EventsComponent implements OnInit {
     afterRenderEffect(() => {
       if (!this.store.wrapMessages()) return;
       for (const el of this.rowEls()) this.virtualizer.measureElement(el.nativeElement);
+    });
+    // Every switch of wrap mode starts the row heights over. The virtualizer keeps each
+    // MEASURED height by row key and prefers it to the estimate whatever `measureElement` says,
+    // so turning wrap off left every row that had been measured at its wrapped height: the
+    // one-line rows sat spread out down the list with the gaps where their extra lines had been,
+    // and the list never came back to 29px. The reader is kept on the row at the top of the
+    // view — found in the OLD layout, before the heights go — rather than left at a pixel
+    // offset that now points somewhere else entirely.
+    effect(() => {
+      this.store.wrapMessages();
+      untracked(() => {
+        const v = this.virtualizer;
+        const top = this.atHead() ? undefined : v.getVirtualItemForOffset(v.scrollOffset() ?? 0)?.index;
+        v.measure();
+        if (top !== undefined) v.scrollToIndex(top, { align: 'start', behavior: 'auto' });
+      });
     });
   }
 

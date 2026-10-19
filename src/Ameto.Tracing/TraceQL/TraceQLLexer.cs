@@ -251,11 +251,25 @@ public static class TraceQLLexer
 
     // ── Identifier ─────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// An identifier, its dotted segments included: <c>service.name</c>, <c>span.name</c> and
+    /// <c>span.kind</c> are the parser's own spellings of three intrinsics, and they used to stop
+    /// at the dot — <c>service</c>, then an attribute <c>.name</c> where an operator belonged — so
+    /// every one of them was a parse error, the Traces page's own "search by key" on a span's
+    /// service among them. A dot is taken only when a segment follows it.
+    /// </summary>
     private static Token ReadIdent(ReadOnlySpan<char> src, ref int pos)
     {
         int start = pos;
-        while (pos < src.Length && (char.IsLetterOrDigit(src[pos]) || src[pos] == '_'))
-            pos++;
+        while (pos < src.Length)
+        {
+            char c = src[pos];
+            if (char.IsLetterOrDigit(c) || c == '_'
+                || (c == '.' && pos + 1 < src.Length && (char.IsLetter(src[pos + 1]) || src[pos + 1] == '_')))
+                pos++;
+            else
+                break;
+        }
         return new Token(TokenKind.Ident, src[start..pos].ToString());
     }
 }

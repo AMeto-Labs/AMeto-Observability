@@ -142,14 +142,18 @@
    hash used elsewhere, and not a hue at all: the level badge is the only saturated
    colour in the row, so nothing else can read as a severity at a glance. It shares
    the timestamp's tone (--row-ts-time), keeping the row's metadata on one level. */
+/* One width for the column, the SERVICE header's: sized to its own name it was a different
+   width on every row, and the message after it started somewhere else on each. The Events page
+   sets --svc-col from its longest service name, up to 155px; a longer name ends in an ellipsis
+   and is in full on hover. */
 .ev-svc {
   flex-shrink: 0;
-  max-width: 200px;
+  width: var(--svc-col, 155px);
   display: flex;
   align-items: center;
   gap: 5px;
   overflow: hidden;
-  padding-right: 12px;
+  padding-right: 10px;
   color: var(--txt-muted);
   --ev-svc-color: var(--row-svc);
 }
@@ -177,6 +181,8 @@
   font-size: var(--log-font-size);
   cursor: pointer;
   min-width: 0;
+  // The message is the row's last column now, so its ellipsis needs its own gap from the edge.
+  padding-right: 8px;
   color: var(--msg-tmpl);
 }
 .ev-msg:hover { color: var(--txt); }
@@ -205,21 +211,3 @@
   word-break: break-word;
   padding-right: 8px;
 }
-:host.ev-wrap-mode .ev-props-hint { display: none; }
-
-.ev-props-hint {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  padding: 0 8px;
-  max-width: 320px;
-  overflow: hidden;
-}
-/* Props hint: neutral like the rest of the row. The value previously used --c-str,
-   which is exactly --lvl-i (Information green) — a plain value reading as a level. */
-.ev-kv { display: flex; gap: 0; overflow: hidden; max-width: 120px; }
-.ev-pk { color: var(--row-prop-key); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
-.ev-pv { color: var(--row-prop-val); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; max-width: 60px; }
-.ev-sep { color: var(--row-prop-sep); }
-.ev-more-props { color: var(--row-prop-sep); font-size: 10px; flex-shrink: 0; }

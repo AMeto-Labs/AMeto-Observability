@@ -120,7 +120,8 @@
   text-overflow: ellipsis;
 }
 
-/* Filter affordance — hidden until its row/header is hovered. */
+/* Filter affordance — leads its row (before the key), hidden until the row/header is
+   hovered. Its slot is kept while hidden, so keys stay in one column. */
 .jv-menu-btn {
   display: inline-flex;
   align-items: center;
@@ -128,7 +129,7 @@
   width: 16px;
   height: 14px;
   padding: 0;
-  margin-left: 4px;
+  margin-right: 4px;
   vertical-align: middle;
   background: none;
   border: none;

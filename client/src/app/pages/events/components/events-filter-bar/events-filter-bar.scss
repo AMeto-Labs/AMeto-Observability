@@ -59,11 +59,9 @@
 }
 .fb-caret.rotated { transform: rotate(180deg); }
 
-/* Time range trigger */
+/* Time range trigger: a plain .fb-btn, like Levels and Services */
 .fb-date { font-variant-numeric: tabular-nums; }
-.fb-date-icon { color: var(--accent); flex-shrink: 0; }
 .fb-date-extra { color: var(--txt-dim); }
-.fb-date.open { background: var(--accent-dim); }
 
 /* ── Level count chips ──────────────────────────────────────────── */
 .lc-chips {

@@ -1,4 +1,4 @@
-import { TestBed } from '@angular/core/testing';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection, signal } from '@angular/core';
 import { Router, provideRouter } from '@angular/router';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
@@ -10,7 +10,7 @@ import { ApiService } from '../../core/services/api.service';
 import { OverlayPanelRef } from '../../shared/services/overlay';
 import { DateDropdownController, DateRangeDropdownComponent } from './dropdowns/date-range-dropdown';
 import {
-  TimePreset, customRangeLabel, fmtSpan, parsePreset, presetRange,
+  TimePreset, customRangeLabel, endOfMinuteIso, fmtSpan, parsePreset, presetRange,
 } from './store/events-filter.util';
 
 /**
@@ -26,22 +26,20 @@ const NOW = new Date(2026, 9, 17, 11, 42, 30);
 const at = (h: number, m: number, day = 17) => new Date(2026, 9, day, h, m);
 
 describe('time range presets and labels', () => {
-  it('reads a legacy 1d link as 24h and refuses names it does not know', () => {
-    expect(parsePreset('1d')).toBe('24h');
-    expect(parsePreset('yesterday')).toBe('yesterday');
+  it('reads replaced presets as their successors and refuses names it does not know', () => {
+    expect(parsePreset('1d')).toBe('1d');
+    expect(parsePreset('24h')).toBe('1d');
+    expect(parsePreset('30d')).toBeNull();
     expect(parsePreset('custom')).toBe('custom');
-    expect(parsePreset('5m')).toBeNull();
+    expect(parsePreset('15m')).toBeNull();
     expect(parsePreset('toString')).toBeNull();
     expect(parsePreset(null)).toBeNull();
   });
 
-  it('resolves each preset against the clock', () => {
-    expect(presetRange('15m', NOW)).toEqual({ from: '2026-10-17 11:27', to: '' });
-    expect(presetRange('24h', NOW)).toEqual({ from: '2026-10-16 11:42', to: '' });
-    expect(presetRange('today', NOW)).toEqual({ from: '2026-10-17 00:00', to: '' });
-    // Yesterday is the one preset with an end: where today starts.
-    expect(presetRange('yesterday', NOW)).toEqual({ from: '2026-10-16 00:00', to: '2026-10-17 00:00' });
-    expect(presetRange('7d', NOW)).toEqual({ from: '2026-10-10 00:00', to: '' });
+  it('resolves each preset against the clock, N days back to the minute', () => {
+    expect(presetRange('1d', NOW)).toEqual({ from: '2026-10-16 11:42', to: '' });
+    expect(presetRange('3d', NOW)).toEqual({ from: '2026-10-14 11:42', to: '' });
+    expect(presetRange('7d', NOW)).toEqual({ from: '2026-10-10 11:42', to: '' });
   });
 
   it('gives a length in its two largest units', () => {
@@ -99,27 +97,22 @@ describe('Events store — the applied window', () => {
   const lastSearch = () => searches[searches.length - 1];
 
   it('resolves a preset on every load, not once when it was picked', () => {
-    store.setTimePreset('15m');
-    expect(store.customFrom()).toBe('2026-10-17 11:27');
+    store.setTimePreset('1d');
+    expect(store.customFrom()).toBe('2026-10-16 11:42');
+    expect(store.rangeLabel()).toEqual({ text: 'Last 1 day', extra: '' });
 
     vi.setSystemTime(new Date(NOW.getTime() + 20 * 60_000));
     store.search();
 
-    expect(store.customFrom()).toBe('2026-10-17 11:47');
-    expect(lastSearch().from).toBe(at(11, 47).toISOString());
+    expect(store.customFrom()).toBe('2026-10-16 12:02');
+    expect(lastSearch().from).toBe(at(12, 2, 16).toISOString());
     expect(lastSearch().to).toBeUndefined();
-  });
-
-  it('searches Yesterday up to where today starts', () => {
-    store.setTimePreset('yesterday');
-    expect(lastSearch()).toEqual({ from: at(0, 0, 16).toISOString(), to: at(0, 0).toISOString() });
-    expect(store.rangeLabel()).toEqual({ text: 'Yesterday', extra: '' });
   });
 
   it('applies an explicit window as a custom one and searches it', () => {
     store.applyRange('2026-10-17 09:00', '2026-10-17 13:00');
     expect(store.timePreset()).toBe('custom');
-    expect(lastSearch()).toEqual({ from: at(9, 0).toISOString(), to: at(13, 0).toISOString() });
+    expect(lastSearch()).toEqual({ from: at(9, 0).toISOString(), to: endOfMinuteIso(at(13, 0)) });
     expect(store.rangeLabel()).toEqual({ text: '17 Oct 09:00 → 13:00', extra: '4 h' });
 
     store.applyRange('2026-10-17 09:00', '');
@@ -127,26 +120,36 @@ describe('Events store — the applied window', () => {
     expect(store.rangeLabel().text).toBe('Since 17 Oct 09:00');
   });
 
+  it('sends a To of 23:59 as everything before the next midnight, and nothing at it', () => {
+    store.applyRange('2026-10-17 00:00', '2026-10-18 23:59');
+    const to = lastSearch().to!;
+    const midnight = at(0, 0, 19);
+    // The last 100 ns tick of the minute: the server's `to` is inclusive.
+    expect(to).toMatch(/:59\.9999999Z$/);
+    expect(to.slice(0, 23)).toBe(new Date(midnight.getTime() - 1).toISOString().slice(0, 23));
+    expect(to < midnight.toISOString()).toBe(true);
+  });
+
   it('refuses a window that ends before it starts, or does not parse', () => {
-    store.setTimePreset('1h');
+    store.setTimePreset('3d');
     const before = searches.length;
     store.applyRange('2026-10-17 13:00', '2026-10-17 09:00');
     store.applyRange('2026-10-1', '');
     expect(searches.length).toBe(before);
-    expect(store.timePreset()).toBe('1h');
+    expect(store.timePreset()).toBe('3d');
   });
 
   it('picking a window while the tail runs stops the tail and searches the window', () => {
-    store.setTimePreset('15m');
+    store.setTimePreset('1d');
     store.toggleLive();
     expect(store.live()).toBe(true);
     const before = searches.length;
 
-    store.setTimePreset('4h');
+    store.setTimePreset('7d');
 
     expect(store.live()).toBe(false);
     expect(searches.length).toBe(before + 1);
-    expect(lastSearch().from).toBe(at(7, 42).toISOString());
+    expect(lastSearch().from).toBe(at(11, 42, 10).toISOString());
   });
 
   describe('opening from a link', () => {
@@ -156,14 +159,14 @@ describe('Events store — the applied window', () => {
     };
 
     it('opens a preset from now, whatever start the link was made with', async () => {
-      await open('/?preset=15m&from=2026-10-01%2009:00');
-      expect(store.timePreset()).toBe('15m');
-      expect(store.customFrom()).toBe('2026-10-17 11:27');
+      await open('/?preset=7d&from=2026-10-01%2009:00');
+      expect(store.timePreset()).toBe('7d');
+      expect(store.customFrom()).toBe('2026-10-10 11:42');
     });
 
-    it('reads the old 1d default as 24h', async () => {
-      await open('/?preset=1d&from=2026-10-16%2000:00');
-      expect(store.timePreset()).toBe('24h');
+    it('reads the replaced 24h preset as the last day', async () => {
+      await open('/?preset=24h&from=2026-10-16%2000:00');
+      expect(store.timePreset()).toBe('1d');
       expect(store.customFrom()).toBe('2026-10-16 11:42');
     });
 
@@ -178,13 +181,13 @@ describe('Events store — the applied window', () => {
       expect(store.timePreset()).toBe('custom');
       expect(lastSearch()).toEqual({
         from: at(9, 0, 16).toISOString(),
-        to: at(13, 0, 16).toISOString(),
+        to: endOfMinuteIso(at(13, 0, 16)),
       });
     });
 
-    it('opens on the last 24 hours when the link says nothing', async () => {
+    it('opens on the last day when the link says nothing', async () => {
       await open('/');
-      expect(store.timePreset()).toBe('24h');
+      expect(store.timePreset()).toBe('1d');
       expect(store.customFrom()).toBe('2026-10-16 11:42');
     });
   });
@@ -193,13 +196,14 @@ describe('Events store — the applied window', () => {
 describe('Time range popover', () => {
   let ctrl: DateDropdownController;
   let close: Mock<() => void>;
+  let fixture: ComponentFixture<DateRangeDropdownComponent>;
 
   const create = (preset: TimePreset, from: string, to = '') => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(NOW);
     close = vi.fn<() => void>();
     ctrl = {
-      presets: [{ label: 'Last 15 min', value: '15m' }, { label: 'Yesterday', value: 'yesterday' }],
+      presets: [{ label: 'Last 1 day', value: '1d' }, { label: 'Last 3 days', value: '3d' }],
       timePreset: signal(preset),
       customFrom: signal(from),
       customTo: signal(to),
@@ -213,10 +217,12 @@ describe('Time range popover', () => {
         { provide: OverlayPanelRef, useValue: { data: ctrl, close } },
       ],
     });
-    const fixture = TestBed.createComponent(DateRangeDropdownComponent);
+    fixture = TestBed.createComponent(DateRangeDropdownComponent);
     fixture.detectChanges();
     return fixture.componentInstance;
   };
+
+  const el = (selector: string) => fixture.nativeElement.querySelector(selector) as HTMLElement;
 
   afterEach(() => {
     TestBed.resetTestingModule();
@@ -232,9 +238,9 @@ describe('Time range popover', () => {
   });
 
   it('a quick range applies at once and closes', () => {
-    const p = create('24h', '2026-10-16 11:42');
-    p.pickPreset('yesterday');
-    expect(ctrl.setPreset).toHaveBeenCalledWith('yesterday');
+    const p = create('1d', '2026-10-16 11:42');
+    p.pickPreset('3d');
+    expect(ctrl.setPreset).toHaveBeenCalledWith('3d');
     expect(close).toHaveBeenCalled();
   });
 
@@ -244,6 +250,93 @@ describe('Time range popover', () => {
     expect(ctrl.applyRange).not.toHaveBeenCalled();
     p.apply();
     expect(ctrl.applyRange).toHaveBeenCalledWith('2026-10-17 10:30', '');
+  });
+
+  it('shows no time until asked; a day alone runs from 00:00 to 23:59', () => {
+    const p = create('1d', '2026-10-16 11:42');
+    expect(p.timesShown()).toBe(false);
+    expect(p.summary()).toBe('From 16 Oct 11:42 → now');
+
+    p.setDate('to', '2026-10-17');
+    expect(p.summary()).toBe('From 16 Oct → 17 Oct');
+    p.apply();
+    expect(ctrl.applyRange).toHaveBeenCalledWith('2026-10-16 00:00', '2026-10-17 23:59');
+  });
+
+  it('Set times shows both, From 00:00 and To 23:59, and gives an open To today', () => {
+    const p = create('1d', '2026-10-16 11:42');
+    p.setTimes();
+    expect(p.timesShown()).toBe(true);
+    expect(p.fromValue()).toBe('2026-10-16 00:00');
+    expect(p.toDate()).toBe('2026-10-17');
+    expect(p.toValue()).toBe('2026-10-17 23:59');
+    expect(p.summary()).toBe('From 16 Oct 00:00 → 17 Oct 23:59');
+
+    p.pickHour('from', '09');
+    expect(p.fromValue()).toBe('2026-10-16 09:00');
+
+    p.wholeDays();
+    expect(p.timesShown()).toBe(false);
+    expect(p.fromValue()).toBe('2026-10-16 00:00');
+  });
+
+  it('reopening a window keeps its times as applied, 00:00 and 23:59 included', () => {
+    const p = create('custom', '2026-10-16 10:00', '2026-10-17 23:59');
+    expect(p.timesShown()).toBe(true);
+    expect(p.fromTime()).toBe('10:00');
+    expect(p.toTime()).toBe('23:59');
+    expect(p.toValue()).toBe('2026-10-17 23:59');
+  });
+
+  it('Set times keeps times already set; Whole days only hides them', () => {
+    const p = create('custom', '2026-10-16 00:00', '2026-10-17 23:59');
+    expect(p.timesShown()).toBe(false);
+    p.setTimes();
+    expect(p.fromTime()).toBe('00:00');
+    p.setTime('from', '10:00');
+
+    p.wholeDays();
+    expect(p.fromValue()).toBe('2026-10-16 00:00');
+    p.setTimes();
+    expect(p.fromTime()).toBe('10:00');
+    expect(p.fromValue()).toBe('2026-10-16 10:00');
+  });
+
+  it('a press outside the open picker closes it, a press inside does not', () => {
+    const p = create('custom', '2026-10-17 09:00');
+    p.toggle('from', 'time');
+    fixture.detectChanges();
+
+    el('.trp-tp-head').dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(p.isOpen('from', 'time')).toBe(true);
+
+    el('.trp-title').dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(p.picker()).toBeNull();
+  });
+
+  it('Esc closes the open picker and goes no further', () => {
+    const p = create('custom', '2026-10-17 09:00');
+    p.toggle('from', 'time');
+    fixture.detectChanges();
+    const reachedDocument = vi.fn();
+    document.addEventListener('keydown', reachedDocument);
+
+    el('.trp-tp-item').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+    document.removeEventListener('keydown', reachedDocument);
+    expect(p.picker()).toBeNull();
+    expect(reachedDocument).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('picking the minute closes the time picker; the hour leaves it open', () => {
+    const p = create('custom', '2026-10-17 09:00');
+    p.toggle('from', 'time');
+    p.pickHour('from', '11');
+    expect(p.isOpen('from', 'time')).toBe(true);
+    p.pickMinute('from', '30');
+    expect(p.picker()).toBeNull();
+    expect(p.fromTime()).toBe('11:30');
   });
 
   it('a To time with no To day is on the From day', () => {
@@ -270,9 +363,9 @@ describe('Time range popover', () => {
   });
 
   it('Apply on untouched fields re-runs the preset instead of freezing it', () => {
-    const p = create('15m', '2026-10-17 11:27');
+    const p = create('7d', '2026-10-10 11:42');
     p.apply();
-    expect(ctrl.setPreset).toHaveBeenCalledWith('15m');
+    expect(ctrl.setPreset).toHaveBeenCalledWith('7d');
     expect(ctrl.applyRange).not.toHaveBeenCalled();
   });
 
@@ -299,10 +392,10 @@ describe('Time range popover', () => {
     expect(ctrl.applyRange).toHaveBeenCalledWith('2026-10-17 00:00', '2026-10-18 23:59');
   });
 
-  it('Reset goes back to the last 24 hours', () => {
+  it('Reset goes back to the last day', () => {
     const p = create('custom', '2026-10-17 09:00');
     p.reset();
-    expect(ctrl.setPreset).toHaveBeenCalledWith('24h');
+    expect(ctrl.setPreset).toHaveBeenCalledWith('1d');
     expect(close).toHaveBeenCalled();
   });
 });

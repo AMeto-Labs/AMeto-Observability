@@ -1743,6 +1743,14 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.attrMenu.set(null);
   }
 
+  /** Copies the TraceQL condition Search would run (`.key = "value"`), for pasting into a query. */
+  async attrCopyCondition(neq: boolean): Promise<void> {
+    const m = this.attrMenu();
+    if (!m?.tqlKey) return;
+    await this.copyText(this.tqlPredicate(m.tqlKey, m.value, neq));
+    this.attrMenu.set(null);
+  }
+
   /** Replace the query: search traces by this field alone. */
   attrFind(neq: boolean): void {
     const m = this.attrMenu();

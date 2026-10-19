@@ -22,7 +22,7 @@ import { MetricSparkComponent } from '../../../../shared/components/metric-spark
 import { ModalComponent } from '../../../../shared/components/ui';
 import { PropertyMenuComponent } from '../../../../shared/components/property-menu/property-menu';
 import {
-  JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
+  JsonViewerActions, jvLiteral, jvWildcard,
 } from '../../../../shared/components/json-viewer/json-viewer.actions';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
 import { appPath } from '../../../../shared/utils/app-url';
@@ -173,15 +173,13 @@ export class EventDetailComponent {
   jsonSearch = signal('');
   /** Full rendered-message modal (the hero clamps to 2 lines). */
   messageModalOpen = signal(false);
-  /** Full property-value modal (opened from the 'jv' menu — for one-line-clamped props). */
+  /** Full property-value modal (opened from the property menu — for one-line-clamped props). */
   valueModalOpen = signal(false);
   valueModal = signal<{ path: string; text: string } | null>(null);
-  menuType  = signal<'timestamp' | 'jv' | 'service' | 'level' | 'traceId' | 'spanId' | null>(null);
+  menuType  = signal<'timestamp' | 'service' | 'level' | 'traceId' | 'spanId' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
-  /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
-  jvMenu = signal<JvMenuRequest | null>(null);
   /** Shared property menu for a scalar top-level property (same menu the Traces page uses). */
-  propMenu = signal<{ entry: PropEntry; x: number; y: number } | null>(null);
+  propMenu = signal<{ entry: PropEntry } | null>(null);
 
   // ── Trace waterfall state ─────────────────────────────────────────────
   readonly traceSpans        = signal<SpanDto[]>([]);
@@ -208,20 +206,27 @@ export class EventDetailComponent {
   private jvActions = inject(JsonViewerActions);
   private contextMenu = inject(ContextMenuService);
   private menuRef?: OverlayPanelRef;
+  /** The ⋮ button the open menu belongs to; unset for a menu opened at a click point. */
+  private menuOrigin?: Element;
   ctxMenuTpl = viewChild<TemplateRef<unknown>>('ctxMenuTpl');
+  /** The property menu's overlay and the ⋮ button it belongs to — see {@link propMenu}. */
+  private propMenuRef?: OverlayPanelRef;
+  private propMenuOrigin?: Element;
+  /** Where the property menu goes when it has no button to anchor to. */
+  private propMenuPoint = { x: 0, y: 0 };
+  propMenuTpl = viewChild<TemplateRef<unknown>>('propMenuTpl');
 
   constructor() {
-    // A filter icon inside the inline JSON viewer was clicked → open the
-    // context menu (CDK overlay) at the click position with that node's path.
-    this.jvActions.menu.pipe(takeUntilDestroyed()).subscribe(req => {
-      this.jvMenu.set(req);
-      let x = req.x;
-      let y = req.y + 6;
-      if (x + 240 > window.innerWidth)  x = req.x - 240;
-      if (y + 200 > window.innerHeight) y = req.y - 200;
-      this.menuPos.set({ x, y });
-      this.menuType.set('jv');
-    });
+    // A menu button inside a JSON viewer — a nested value in the Properties list, or a node of
+    // the JSON tab — opens the same shared property menu as a top-level property. A node that
+    // is an object or array is a container: its condition is has(path), not an equality.
+    this.jvActions.menu.pipe(takeUntilDestroyed()).subscribe(req => this.openPropMenuFor({
+      path: req.path,
+      label: req.path,
+      value: req.isContainer ? '' : formatInline(req.rawValue),
+      raw: req.rawValue,
+      isStructured: req.isContainer,
+    }, req.origin, req.x, req.y));
 
     // The detail now shows one event at a time via a required input. Reset all
     // local UI state (tab, open menu, fetched-trace/metric caches) whenever the
@@ -232,7 +237,7 @@ export class EventDetailComponent {
         this.traceSubRef?.unsubscribe();
         this.metricsSubRef?.unsubscribe();
         this.menuType.set(null);
-        this.jvMenu.set(null);
+        this.propMenu.set(null);
         this.jsonSearch.set('');
         this.messageModalOpen.set(false);
         this.valueModalOpen.set(false);
@@ -329,6 +334,7 @@ export class EventDetailComponent {
           this.menuRef = this.contextMenu.open({
             template: tpl,
             viewContainerRef: this.vcr,
+            origin: this.menuOrigin,
             x: pos.x,
             y: pos.y,
             panelClass: 'ctx-menu-overlay',
@@ -341,6 +347,31 @@ export class EventDetailComponent {
         }
       });
     });
+
+    // The property menu goes through the same overlay, anchored to its ⋮ button. It used to be
+    // drawn `position: fixed` at a point the drawer clamped against a guessed height, and near the
+    // bottom of the window the rest of the menu was cut off. The overlay places it on its real
+    // size: below the button, above it when there is no room, on screen either way.
+    effect(() => {
+      const m   = this.propMenu();
+      const tpl = this.propMenuTpl();
+      untracked(() => {
+        this.propMenuRef?.close();
+        this.propMenuRef = undefined;
+        if (m && tpl) {
+          this.propMenuRef = this.contextMenu.open({
+            template: tpl,
+            viewContainerRef: this.vcr,
+            origin: this.propMenuOrigin,
+            x: this.propMenuPoint.x,
+            y: this.propMenuPoint.y,
+            panelClass: 'ctx-menu-overlay',
+            closeOnOutside: false,
+            closeOnEscape: false,
+          });
+        }
+      });
+    });
   }
 
   ngOnDestroy(): void {
@@ -349,6 +380,8 @@ export class EventDetailComponent {
     this.metricsSubRef?.unsubscribe();
     this.menuRef?.close();
     this.menuRef = undefined;
+    this.propMenuRef?.close();
+    this.propMenuRef = undefined;
   }
 
   eventTsMs = computed(() =>
@@ -531,66 +564,6 @@ export class EventDetailComponent {
     this.selectedWfSpan.update(s => s?.spanId === span.spanId ? null : span);
   }
 
-  // ── JSON-viewer context menu ──────────────────────────────────────────
-  /** `path = value` (leaf) — exact match. */
-  jvEqExpr = computed(() => {
-    const m = this.jvMenu();
-    return m ? `${m.path} = ${jvLiteral(m.rawValue)}` : '';
-  });
-
-  /** `path <> value` (leaf) — exclude. */
-  jvNeExpr = computed(() => {
-    const m = this.jvMenu();
-    return m ? `${m.path} <> ${jvLiteral(m.rawValue)}` : '';
-  });
-
-  /** `items[%].id = value` — match the leaf in any array element (null if no index). */
-  jvAnyExpr = computed(() => {
-    const m = this.jvMenu();
-    if (!m) return null;
-    const wild = jvWildcard(m.path);
-    return wild ? `${wild} = ${jvLiteral(m.rawValue)}` : null;
-  });
-
-  private emitFilter(expr: string): void {
-    this.filterSelected.emit(expr);
-    this.menuType.set(null);
-  }
-
-  jvFind(): void {
-    const m = this.jvMenu();
-    if (!m) return;
-    this.emitFilter(m.isContainer ? `has(${m.path})` : this.jvEqExpr());
-  }
-
-  jvExclude(): void {
-    const m = this.jvMenu();
-    if (!m) return;
-    this.emitFilter(m.isContainer ? `not has(${m.path})` : this.jvNeExpr());
-  }
-
-  jvFindAny(): void {
-    const expr = this.jvAnyExpr();
-    if (expr) this.emitFilter(expr);
-  }
-
-  async jvCopy(): Promise<void> {
-    const m = this.jvMenu();
-    if (!m) return;
-    const text = m.isContainer ? m.path : jvLiteral(m.rawValue);
-    await navigator.clipboard.writeText(text);
-    this.menuType.set(null);
-  }
-
-  /** Opens the full-value modal for the active 'jv' node (scalar text or pretty JSON). */
-  jvViewValue(): void {
-    const m = this.jvMenu();
-    if (!m) return;
-    this.valueModal.set({ path: m.path, text: formatFullValue(m.rawValue) });
-    this.valueModalOpen.set(true);
-    this.menuType.set(null);
-  }
-
   async copyValueModal(): Promise<void> {
     const v = this.valueModal();
     if (!v) return;
@@ -605,32 +578,33 @@ export class EventDetailComponent {
   openMenu(e: MouseEvent, type: 'timestamp' | 'service' | 'level' | 'traceId' | 'spanId'): void {
     e.preventDefault();
     e.stopPropagation();
+    // One menu at a time: the overlay service keeps one, so the other's state must go with it.
+    this.propMenu.set(null);
     this.positionMenu(e.currentTarget as HTMLElement);
     this.menuType.set(type);
   }
 
-  /**
-   * Opens the filter/copy menu for a top-level property, reusing the JSON-viewer
-   * 'jv' menu, anchored below its leading ⋮ button.
-   */
+  /** Opens the shared filter/copy menu for a top-level property, anchored to its ⋮ button. */
   openPropMenu(e: MouseEvent, kv: PropEntry): void {
     e.preventDefault();
     e.stopPropagation();
-    // Structured props (object/array) keep the path-aware jv menu (has()/wildcards);
-    // a scalar key=value pair uses the shared menu — identical to the Traces page.
-    if (kv.isStructured) {
-      this.jvMenu.set({ path: kv.path, rawValue: kv.raw, isContainer: true, x: 0, y: 0 });
-      this.positionMenu(e.currentTarget as HTMLElement);
-      this.menuType.set('jv');
-      return;
-    }
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const x = Math.min(r.left, window.innerWidth - 240);
-    const y = Math.min(r.bottom + 4, window.innerHeight - 290);
-    this.propMenu.set({ entry: kv, x, y });
+    this.openPropMenuFor(kv, e.currentTarget as Element, r.left, r.bottom + 4);
   }
 
-  // ── Shared property menu (scalar props) → CLEF filter composition ─────────
+  /**
+   * The one way a property menu opens — top-level or nested, value or object/array — so every
+   * one of them is the shared menu the Traces page uses too. One menu at a time: the overlay
+   * service keeps one, so the facts' menu state goes with it.
+   */
+  private openPropMenuFor(entry: PropEntry, origin: Element | undefined, x: number, y: number): void {
+    this.menuType.set(null);
+    this.propMenuOrigin = origin;
+    this.propMenuPoint = { x, y };
+    this.propMenu.set({ entry });
+  }
+
+  // ── Shared property menu → CLEF filter composition ─────────────────────────
 
   /** Epoch ms when the active property's value is an ISO date, else null. */
   propSeekMs = computed<number | null>(() => {
@@ -651,10 +625,30 @@ export class EventDetailComponent {
     this.propMenu.set(null);
   }
 
+  /**
+   * The property's condition: `path = value` / `path <> value` for a value; for an object or
+   * array, which no literal can equal, `has(path)` / `not has(path)`.
+   */
   private propPredicate(neq: boolean): string {
     const m = this.propMenu();
     if (!m) return '';
+    if (m.entry.isStructured) return `${neq ? 'not ' : ''}has(${m.entry.path})`;
     return `${m.entry.path} ${neq ? '<>' : '='} ${jvLiteral(m.entry.raw)}`;
+  }
+
+  /** The value's path with every array index as `[%]` — null when there is none, or for an
+   *  object / array, which has no equality to ask of each element. */
+  propWildcard = computed<string | null>(() => {
+    const m = this.propMenu();
+    return m && !m.entry.isStructured ? jvWildcard(m.entry.path) : null;
+  });
+
+  /** Replace the query with the value's condition asked of any element: `items[%].id = 5`. */
+  propAnyElement(neq: boolean): void {
+    const m = this.propMenu();
+    const wild = this.propWildcard();
+    if (m && wild) this.filterSelected.emit(`${wild} ${neq ? '<>' : '='} ${jvLiteral(m.entry.raw)}`);
+    this.propMenu.set(null);
   }
 
   /** Opens the full-value modal for the active scalar property — the row clamps
@@ -667,15 +661,23 @@ export class EventDetailComponent {
     this.propMenu.set(null);
   }
 
+  /** A value as shown; an object or array as its JSON. */
   async propCopyValue(): Promise<void> {
     const m = this.propMenu();
-    if (m) await this.writeClipboard(m.entry.value);
+    if (m) await this.writeClipboard(m.entry.isStructured ? formatInline(m.entry.raw) : m.entry.value);
     this.propMenu.set(null);
   }
 
   async propCopyKey(): Promise<void> {
     const m = this.propMenu();
     if (m) await this.writeClipboard(m.entry.label);
+    this.propMenu.set(null);
+  }
+
+  /** Copies `key (=|≠) value` — the predicate Search would run — for pasting into a query. */
+  async propCopyCondition(neq: boolean): Promise<void> {
+    const pred = this.propPredicate(neq);
+    if (pred) await this.writeClipboard(pred);
     this.propMenu.set(null);
   }
 
@@ -715,15 +717,15 @@ export class EventDetailComponent {
     }
   }
 
-  /** Positions the context menu just below the triggering button, flipping up / clamping to the viewport. */
+  /**
+   * Anchors the context menu to its ⋮ button. The overlay places it below the button, above it
+   * when there is no room below, and on screen either way — on the menu's real size, where this
+   * used to clamp against a guessed 240 × 340 and let a taller menu run off the window.
+   */
   private positionMenu(el: HTMLElement): void {
+    this.menuOrigin = el;
     const r = el.getBoundingClientRect();
-    const w = 240, h = 340;
-    let x = r.left;
-    let y = r.bottom + 4;
-    if (x + w > window.innerWidth)  x = Math.max(4, window.innerWidth - w - 4);
-    if (y + h > window.innerHeight) y = Math.max(4, r.top - h - 4);
-    this.menuPos.set({ x, y });
+    this.menuPos.set({ x: r.left, y: r.bottom + 4 });
   }
 
   @HostListener('document:click')

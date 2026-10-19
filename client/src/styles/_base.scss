@@ -118,7 +118,10 @@ lucide-icon {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 4px 0;
-  overflow: hidden;
+  // A menu taller than the window scrolls rather than running off it.
+  max-height: calc(100vh - 16px);
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .ctx-menu button {
