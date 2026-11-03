@@ -49,16 +49,21 @@ public sealed class IngestRouteCorrespondenceTests : IClassFixture<AmetoWebAppFa
     /// against <c>Replication.Secret</c> — fail-closed, rejecting everything while that is unset.
     /// That is the same shape as a receiver checking its own API key, just not on the ingest hot
     /// path this bypass exists for.</item>
+    /// <item>token refresh and sign-out (#140): the session cookie names the session, and the
+    /// access token may already have expired, so both run open and decide inside the handler —
+    /// a refresh with no live session answers 401 itself, a sign-out of nothing is a no-op.</item>
     /// </list>
     ///
     /// <para>Named rather than inferred: a rule that let ANY unauthenticated POST pass would be no
-    /// guard at all, which is the state this suite exists to end. Note what is deliberately NOT
-    /// here — <c>/api/auth/refresh</c> carries authorization metadata and so is not in this set;
-    /// listing routes that do not need listing would make the exemption meaningless in its turn.</para>
+    /// guard at all, which is the state this suite exists to end. Before #140 the refresh carried
+    /// authorization metadata and was deliberately NOT here; listing routes that do not need listing
+    /// would make the exemption meaningless in its turn.</para>
     /// </summary>
     private static readonly HashSet<string> AnonymousByDesign = new(StringComparer.OrdinalIgnoreCase)
     {
         "/api/auth/login",
+        "/api/auth/refresh",
+        "/api/auth/logout",
         "/api/replication/ping",
         "/api/replication/segments/{nodeId}/{segmentId}",
     };
