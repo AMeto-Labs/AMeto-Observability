@@ -13,6 +13,8 @@ import { serviceColor } from '../../../shared/utils/service-color';
   standalone: true,
   imports: [FormsModule, LucideAngularModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
+  // The `data-label`s are read by the phone stylesheet, where the table becomes one card per
+  // service and every number needs its own caption; the header row that carried them is gone.
   template: `
     <div class="lat-root">
 
@@ -86,12 +88,12 @@ import { serviceColor } from '../../../shared/utils/service-color';
                 </svg>
               </div>
 
-              <span class="lat-col-p p50">{{ fmtMs(row.p50Ms) }}</span>
-              <span class="lat-col-p p95">{{ fmtMs(row.p95Ms) }}</span>
-              <span class="lat-col-p p99">{{ fmtMs(row.p99Ms) }}</span>
-              <span class="lat-col-p p999">{{ fmtMs(row.p999Ms) }}</span>
-              <span class="lat-col-p">{{ fmtCount(row.spanCount) }}</span>
-              <span class="lat-col-p" [class.red]="row.errorCount > 0">{{ row.errorCount }}</span>
+              <span class="lat-col-p p50"  data-label="P50">{{ fmtMs(row.p50Ms) }}</span>
+              <span class="lat-col-p p95"  data-label="P95">{{ fmtMs(row.p95Ms) }}</span>
+              <span class="lat-col-p p99"  data-label="P99">{{ fmtMs(row.p99Ms) }}</span>
+              <span class="lat-col-p p999" data-label="P999">{{ fmtMs(row.p999Ms) }}</span>
+              <span class="lat-col-p lat-col-p--spans"  data-label="Spans">{{ fmtCount(row.spanCount) }}</span>
+              <span class="lat-col-p lat-col-p--errors" data-label="Errors" [class.red]="row.errorCount > 0">{{ row.errorCount }}</span>
             </div>
           }
         </div>
@@ -113,6 +115,8 @@ import { serviceColor } from '../../../shared/utils/service-color';
       }
     </div>
   `,
+  // Inline styles cannot @use the shared breakpoints partial, so the tablet and phone queries
+  // below spell out the same values: 899px is bp.$bp-md − 1, 639px is bp.$bp-sm − 1.
   styles: [`
     :host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
@@ -122,19 +126,22 @@ import { serviceColor } from '../../../shared/utils/service-color';
       flex: 1;
       min-height: 0;
       overflow: hidden;
+      /* The table's columns, in one place for the three widths: the service, the histogram
+         taking what is left, then six 56px numbers (design canvas). */
+      --lat-cols: 180px minmax(0, 1fr) repeat(6, 56px);
     }
 
     .lat-toolbar {
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 9px 14px;
+      padding: 6px 12px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }
 
     .lat-title {
-      font-size: 13px;
+      font-size: var(--fs-md);
       font-weight: 600;
       color: var(--text-primary);
       flex: 1;
@@ -154,14 +161,14 @@ import { serviceColor } from '../../../shared/utils/service-color';
     }
 
     .lat-filter-input {
-      height: 30px;
-      width: 200px;
-      padding: 0 10px 0 28px;
+      height: var(--ctl-h);
+      width: 180px;
+      padding: 0 8px 0 26px;
       background: var(--bg-elevated);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: var(--radius);
       color: var(--text-primary);
-      font-size: 12px;
+      font-size: var(--fs-sm);
       outline: none;
 
       &::placeholder { color: var(--text-muted); }
@@ -172,13 +179,13 @@ import { serviceColor } from '../../../shared/utils/service-color';
       display: flex;
       align-items: center;
       gap: 5px;
-      height: 30px;
-      padding: 0 12px;
+      height: var(--ctl-h);
+      padding: 0 10px;
       background: none;
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: var(--radius);
       color: var(--text-secondary);
-      font-size: 12px;
+      font-size: var(--fs-sm);
       cursor: pointer;
       white-space: nowrap;
 
@@ -192,23 +199,23 @@ import { serviceColor } from '../../../shared/utils/service-color';
       justify-content: center;
       gap: 8px;
       color: var(--text-muted);
-      font-size: 13px;
+      font-size: var(--fs-sm);
     }
     .lat-err { color: var(--error); }
 
     .lat-head {
       display: grid;
-      grid-template-columns: 200px 1fr 64px 64px 64px 64px 64px 64px;
+      grid-template-columns: var(--lat-cols);
       gap: 0;
       background: var(--bg-elevated);
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
-      font-size: 10px;
+      font-size: var(--fs-2xs);
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--text-muted);
-      padding: 5px 14px;
+      padding: 4px 12px;
     }
 
     .lat-body {
@@ -218,9 +225,9 @@ import { serviceColor } from '../../../shared/utils/service-color';
 
     .lat-row {
       display: grid;
-      grid-template-columns: 200px 1fr 64px 64px 64px 64px 64px 64px;
+      grid-template-columns: var(--lat-cols);
       align-items: center;
-      padding: 6px 14px;
+      padding: 4px 12px;
       border-bottom: 1px solid var(--border);
       gap: 0;
 
@@ -233,6 +240,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
       align-items: center;
       gap: 6px;
       overflow: hidden;
+      min-width: 0;
     }
 
     .lat-svc-dot {
@@ -243,7 +251,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
     }
 
     .lat-svc-name {
-      font-size: 12px;
+      font-size: var(--fs-sm);
       color: var(--text-primary);
       font-weight: 600;
       white-space: nowrap;
@@ -252,7 +260,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
     }
 
     .lat-err-badge {
-      font-size: 10px;
+      font-size: var(--fs-2xs);
       font-weight: 700;
       padding: 1px 5px;
       border-radius: 3px;
@@ -264,20 +272,22 @@ import { serviceColor } from '../../../shared/utils/service-color';
 
     .lat-col-chart {
       padding: 0 8px;
+      min-width: 0;
     }
 
     .lat-hist {
       width: 100%;
-      height: 36px;
+      height: 30px;
       display: block;
     }
 
     .lat-col-p {
-      font-size: 11px;
+      font-size: var(--fs-xs);
       font-family: var(--font-ui);
       color: var(--text-secondary);
       text-align: right;
-      padding-right: 8px;
+      padding-right: 6px;
+      white-space: nowrap;
 
       &.p50  { color: #22c55e; }
       &.p95  { color: #f59e0b; }
@@ -290,10 +300,10 @@ import { serviceColor } from '../../../shared/utils/service-color';
       display: flex;
       align-items: center;
       gap: 14px;
-      padding: 6px 14px;
+      padding: 4px 12px;
       border-top: 1px solid var(--border);
       flex-shrink: 0;
-      font-size: 11px;
+      font-size: var(--fs-xs);
       color: var(--text-muted);
     }
 
@@ -305,6 +315,62 @@ import { serviceColor } from '../../../shared/utils/service-color';
 
     @keyframes spin { to { transform: rotate(360deg); } }
     .spin { animation: spin 1s linear infinite; }
+
+    /* Tablet: the same table with less room for the service name and the numbers. */
+    @media (max-width: 899px) {
+      .lat-root { --lat-cols: 140px minmax(0, 1fr) repeat(6, 52px); }
+    }
+
+    /* Phone: one card per service — the name, the histogram, then the six numbers in two rows
+       of three, each captioned from its data-label since the header row is gone. */
+    @media (max-width: 639px) {
+      .lat-toolbar { flex-wrap: wrap; gap: 8px; }
+      .lat-title { flex-basis: 100%; }
+      .lat-filter { flex: 1; }
+      .lat-filter-input { width: 100%; height: 32px; }
+      .lat-btn { height: 32px; }
+
+      .lat-head { display: none; }
+
+      .lat-row {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-areas:
+          "svc   svc   svc"
+          "chart chart chart"
+          "p50   p95   p99"
+          "p999  spans errors";
+        gap: 6px 8px;
+        padding: 10px 12px;
+      }
+
+      .lat-col-svc   { grid-area: svc; }
+      .lat-col-chart { grid-area: chart; padding: 0; }
+      .lat-hist      { height: 36px; }
+
+      .lat-col-p {
+        display: flex;
+        flex-direction: column;
+        text-align: left;
+        padding: 0;
+        font-size: var(--fs-md);
+
+        &::before {
+          content: attr(data-label);
+          font-size: var(--fs-3xs);
+          font-weight: 600;
+          letter-spacing: .05em;
+          text-transform: uppercase;
+          color: var(--text-muted);
+        }
+      }
+
+      .p50  { grid-area: p50; }
+      .p95  { grid-area: p95; }
+      .p99  { grid-area: p99; }
+      .p999 { grid-area: p999; }
+      .lat-col-p--spans  { grid-area: spans; }
+      .lat-col-p--errors { grid-area: errors; }
+    }
   `],
 })
 export class LatencyComponent implements OnChanges {

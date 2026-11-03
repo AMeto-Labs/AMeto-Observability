@@ -43,7 +43,7 @@ class NoopResizeObserver {
 // "the header says X" assertion would pass over an empty list. Same shim as the sibling spec.
 Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
   configurable: true,
-  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 82; },
+  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 62; },
 });
 
 /** The server's sentence for a window it could not fully read — arrives as a query-error. */

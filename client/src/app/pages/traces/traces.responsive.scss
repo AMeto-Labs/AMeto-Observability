@@ -1,0 +1,644 @@
+// The Traces page below the full desktop width: a narrow desktop, a tablet and a phone layer over
+// traces.scss, in that order, plus the coarse-pointer sizes. Its own stylesheet so that each layer
+// stays within the per-stylesheet style budget (angular.json); both files style this one component
+// and traces.ts lists them in cascade order.
+@use 'breakpoints' as bp;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Narrow desktop (900–1279): the same layout, a little less of it.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.below(bp.$bp-lg) {
+  .trace-list-panel {
+    flex-basis: 320px;
+    &.narrow { flex-basis: 280px; }
+  }
+
+  .waterfall { --wf-cols: 200px minmax(0, 1fr) 64px; }
+
+  // The History panel floats over the page instead of taking a column of it: at this width a
+  // docked 248px column left the detail too narrow for a waterfall.
+  .history-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: var(--bottom-nav-h, 0px);
+    z-index: 40;
+    border-radius: 0;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+    box-shadow: var(--shadow);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Tablet (640–899): the header in two rows, the controls in a scrolling strip; the list OR
+// the detail, never both; the span panel stacked.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.below(bp.$bp-md) {
+  .traces-page {
+    --pad-x: 12px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "title    quick"
+      "controls controls"
+      "search   search"
+      "stats    stats"
+      "tabs     tabs"
+      "body     body";
+    row-gap: var(--gap);
+  }
+
+  // One row, scrolled sideways rather than wrapped: wrapping made the header three rows tall
+  // with the custom range open, and the chips are the thing most worth keeping in one line.
+  .hdr-actions {
+    justify-self: stretch;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    padding-bottom: 2px;
+
+    > * { flex-shrink: 0; }
+  }
+
+  .stats-row { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+
+  // With a trace open the detail has the width to itself; the list is still mounted (its
+  // scroll position and the virtualizer's measurements survive — see measureOnlyWhenRendered
+  // in traces.ts) and the detail's back button brings it back.
+  .trace-list-panel {
+    flex: 1 1 auto;
+    &.narrow { display: none; }
+  }
+
+  .detail-back  { display: inline-flex; }
+  .detail-close { display: none; }
+
+  .waterfall {
+    --wf-cols: 170px minmax(0, 1fr) 60px;
+    --wf-row-h: 32px;
+  }
+
+  // Stacked: the fields in two columns on top, the tags / logs under them.
+  .span-detail {
+    flex-direction: column;
+    height: 300px;
+    max-height: 70vh;
+  }
+
+  .span-detail-left {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 16px;
+    overflow: visible;
+  }
+
+  .span-detail-right {
+    flex: 1;
+    min-height: 0;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phone (< 640): a 48px header, the controls in a bottom sheet, the detail as a layer.
+// Every fixed layer stops at --bottom-nav-h, where the shell's bottom bar is.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.below(bp.$bp-sm) {
+  .traces-page {
+    --pad-x: 8px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: 48px auto auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "title   quick"
+      "psearch psearch"
+      "stats   stats"
+      "tabs    tabs"
+      "body    body";
+    row-gap: 8px;
+    padding-top: 0;
+    padding-bottom: 8px;
+  }
+
+  .page-subtitle { display: none; }
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  .hdr-quick { gap: 6px; }
+  .hdr-quick .icon-btn { width: 32px; height: 32px; }
+
+  .range-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 32px;
+    padding: 0 10px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .live-btn {
+    display: inline-flex;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    font-size: var(--fs-sm);
+  }
+
+  // ── Search row ────────────────────────────────────────────────────────────
+  .phone-search {
+    grid-area: psearch;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .phone-search-field {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .phone-search .fi-input { height: 36px; }
+
+  .filters-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 36px;
+    padding: 0 12px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    white-space: nowrap;
+    cursor: pointer;
+    flex-shrink: 0;
+
+    &.active { border-color: var(--accent); color: var(--accent); }
+  }
+
+  .filters-count { color: var(--accent); font-weight: 600; }
+
+  // ── The sheet ─────────────────────────────────────────────────────────────
+  .hdr-sheet {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: var(--bottom-nav-h, 0px);
+    max-height: calc(100vh - 48px - var(--bottom-nav-h, 0px));
+    max-height: calc(100dvh - 48px - var(--bottom-nav-h, 0px));
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+    border-radius: 12px 12px 0 0;
+    box-shadow: var(--shadow);
+    z-index: 70;
+    transform: translateY(100%);
+    visibility: hidden;
+    transition: transform .2s ease, visibility .2s;
+
+    &.open {
+      transform: none;
+      visibility: visible;
+    }
+  }
+
+  .sheet-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .5);
+    z-index: 69;
+  }
+
+  .sheet-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 44px;
+    padding: 4px var(--pad-x) 4px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+
+    .icon-btn { width: 32px; height: 32px; }
+  }
+
+  .sheet-title {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sheet-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 12px var(--pad-x);
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  // Sticky because the body above it scrolls; 44px because these are thumbs, not cursors.
+  .sheet-foot {
+    display: flex;
+    gap: 8px;
+    padding: 8px var(--pad-x) calc(8px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+
+    button {
+      flex: 1;
+      height: 44px;
+      border-radius: var(--radius);
+      font-size: var(--fs-md);
+      font-weight: 600;
+      cursor: pointer;
+    }
+  }
+
+  .sheet-clear {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  .sheet-apply {
+    background: var(--accent);
+    border: none;
+    color: #000;
+  }
+
+  // The controls inside the sheet: one labelled block each. The labels are drawn here rather
+  // than in the template, because wider than a phone the groups sit in a header row that has
+  // no room for them and needs none.
+  .hdr-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+    overflow: visible;
+    padding: 0;
+
+    > * { flex-shrink: 1; }
+  }
+
+  .preset-group,
+  .live-group,
+  .rows-group,
+  .custom-range {
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: 0;
+  }
+
+  .preset-group::before,
+  .live-group::before,
+  .rows-group::before,
+  .custom-range::before {
+    flex-basis: 100%;
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .preset-group::before  { content: 'Time range'; }
+  .custom-range::before  { content: 'Custom range'; }
+  .live-group::before    { content: 'Auto-refresh'; }
+  .rows-group::before    { content: 'Rows limit'; }
+
+  .preset-btn {
+    height: 36px;
+    padding: 0 12px;
+    font-size: var(--fs-sm);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+
+    &.active { border-color: var(--accent); }
+  }
+
+  .custom-range .custom-dt { flex: 1 1 140px; height: 36px; font-size: var(--fs-sm); }
+  .custom-range .btn-apply { height: 36px; padding: 0 14px; font-size: var(--fs-sm); }
+
+  .live-toggle,
+  .live-select,
+  .rows-select {
+    height: 36px;
+    font-size: var(--fs-sm);
+    background-color: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .live-toggle { padding: 0 12px; }
+  .live-select, .rows-select { flex: 1; padding-left: 10px; }
+  .rows-label { display: none; }
+
+  .search-area { gap: 12px; }
+
+  .mode-toggle {
+    align-self: stretch;
+    .mode-btn { flex: 1; justify-content: center; height: 32px; }
+  }
+
+  // Two columns: the min / max durations side by side, everything else full width. The name
+  // search and the Apply / Clear pair are not here — the page has the first, the footer the
+  // second.
+  .filter-bar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+
+    .filter-search,
+    .btn-apply,
+    .btn-clear { display: none; }
+
+    .filter-select { grid-column: 1 / -1; width: 100%; height: 36px; }
+    .dur-input     { width: 100%; height: 36px; }
+  }
+
+  .traceql-bar {
+    .tql-input { height: 36px; }
+    .btn-apply { display: none; }
+  }
+
+  .jump-bar {
+    align-self: stretch;
+    .jump-input { flex: 1; width: auto; height: 36px; }
+    .btn-jump   { height: 36px; }
+  }
+
+  // ── Stats: a scroll-snap strip ────────────────────────────────────────────
+  .stats-row {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+    margin: 0 calc(-1 * var(--pad-x));
+    padding: 0 var(--pad-x);
+    gap: 8px;
+
+    &::-webkit-scrollbar { display: none; }
+  }
+
+  .stat-card {
+    flex: 0 0 144px;
+    scroll-snap-align: start;
+  }
+
+  // ── Tabs ──────────────────────────────────────────────────────────────────
+  .main-tabs {
+    overflow-x: auto;
+    scrollbar-width: none;
+    &::-webkit-scrollbar { display: none; }
+  }
+  .main-tab { flex-shrink: 0; padding: 8px 12px; }
+
+  // ── List: edge to edge, rows of at least 44px ─────────────────────────────
+  .trace-list-panel,
+  .graph-panel {
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+    margin: 0 calc(-1 * var(--pad-x));
+  }
+
+  .trace-row { min-height: 44px; padding: 6px 10px; }
+
+  // ── The detail: a layer over the page ─────────────────────────────────────
+  .trace-detail-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: var(--bottom-nav-h, 0px);
+    z-index: 50;
+    border: none;
+    border-radius: 0;
+  }
+
+  .detail-header {
+    min-height: 48px;
+    padding: 6px 8px;
+  }
+
+  .detail-back {
+    border: none;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+  .detail-back-count { display: none; }
+
+  .detail-tabs {
+    overflow-x: auto;
+    scrollbar-width: none;
+    &::-webkit-scrollbar { display: none; }
+  }
+  .tab-btn { padding: 8px 12px; flex-shrink: 0; }
+
+  // ── Waterfall: one span per stacked row — label and duration, then the track ──
+  .waterfall {
+    --wf-depth-step: 10px;
+    --wf-bar-h: 8px;
+  }
+
+  // The axis keeps only its ticks. Its bar column is reset explicitly because the row rules
+  // below give every .wf-bar-col a grid area, a margin and a track background, and an area
+  // name the axis grid does not define would push it into an implicit column.
+  .wf-axis-row {
+    grid-template-columns: minmax(0, 1fr);
+    height: 20px;
+    > div { height: 20px; }
+    .wf-label-col, .wf-dur-col { display: none; }
+    .wf-bar-col {
+      grid-area: auto;
+      height: 20px;
+      margin: 0;
+      padding: 0 8px;
+      background: none;
+      border-radius: 0;
+    }
+  }
+  .wf-tick { height: 20px; line-height: 20px; }
+
+  .wf-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "label dur"
+      "bar   bar";
+    min-height: 0;
+    padding: 6px 0 7px;
+  }
+
+  .wf-label-col {
+    grid-area: label;
+    border-right: none;
+    padding-right: 4px;
+  }
+
+  .wf-names {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .wf-svc { flex-shrink: 0; }
+
+  .wf-dur-col {
+    grid-area: dur;
+    height: auto;
+  }
+
+  .wf-bar-col {
+    grid-area: bar;
+    height: var(--wf-bar-h);
+    margin: 5px 8px 0 calc(var(--depth, 0) * var(--wf-depth-step) + 8px);
+    padding: 0;
+    border-right: none;
+    background: var(--bg-elevated);
+    border-radius: 4px;
+  }
+
+  .wf-bar {
+    top: 0;
+    height: var(--wf-bar-h);
+    border-radius: 4px;
+  }
+
+  // The span sheet covers the bottom of the waterfall; this keeps the last rows reachable.
+  .has-span .wf-body { padding-bottom: 372px; }
+
+  // ── Span sheet: 372px, a drag handle, three KPIs, then the Tags / Logs tabs ──
+  .span-detail {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: var(--bottom-nav-h, 0px);
+    height: 372px;
+    max-height: calc(100vh - 48px - var(--bottom-nav-h, 0px));
+    max-height: calc(100dvh - 48px - var(--bottom-nav-h, 0px));
+    flex-direction: column;
+    padding-top: 14px;
+    border-radius: 12px 12px 0 0;
+    box-shadow: var(--shadow);
+    z-index: 60;
+  }
+
+  // The resizer becomes the handle: no row-resize on a touch screen, but the pill says "this
+  // is a sheet" the way every mobile sheet does.
+  .span-resizer {
+    top: 0;
+    height: 14px;
+    cursor: default;
+
+    &::before,
+    &:hover::before {
+      left: 50%;
+      right: auto;
+      top: 5px;
+      width: 36px;
+      height: 4px;
+      border-radius: 2px;
+      transform: translateX(-50%);
+      background: var(--border);
+    }
+  }
+
+  .span-close { top: 10px; right: 8px; width: 32px; height: 32px; }
+
+  .span-detail-left {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 2px 12px 10px;
+    overflow: visible;
+  }
+
+  // Each kept field is a KPI tile: the key above its value.
+  .sd-field {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 6px 8px;
+    min-width: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .sd-key { width: auto; }
+  .sd-val { font-size: var(--fs-md); font-weight: 600; }
+
+  // The operation is the sheet's title, drawn first and across the row…
+  .sd-field--op {
+    order: -1;
+    grid-column: 1 / -1;
+    padding: 0 36px 2px 0;
+    background: none;
+    border: none;
+    border-radius: 0;
+
+    .sd-val { font-size: var(--fs-md); font-weight: 600; word-break: break-word; }
+  }
+
+  // …the ids are a tap away in the Details tab, and Start stands in as the third KPI only
+  // when a span has no HTTP status to show there.
+  .sd-field--id,
+  .sd-field--parent,
+  .sd-field--start { display: none; }
+
+  .span-detail-left:not(:has(.sd-field--http)) .sd-field--start { display: flex; }
+
+  .span-detail-right {
+    flex: 1;
+    min-height: 0;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .stab { padding: 8px 12px; }
+
+  // A 360px sheet cannot give the service column 112px and still show a message.
+  .logs-wrap { --svc-col: 84px; }
+
+  // ── History: a full-width layer ───────────────────────────────────────────
+  .history-panel {
+    left: 0;
+    width: auto;
+    min-width: 0;
+    border-left: none;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Touch: tap targets a finger can hit, hover-only affordances on all the time.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.coarse-pointer {
+  .icon-btn { min-width: 32px; min-height: 32px; }
+  .tag-menu-btn { width: 24px; height: 24px; color: var(--text-secondary); }
+  .copy-icon { padding: 6px; margin: -6px; box-sizing: content-box; }
+  .tql-clear { padding: 8px; right: 2px; }
+  .stream-stop { height: 32px; }
+  .span-close { width: 32px; height: 32px; }
+}

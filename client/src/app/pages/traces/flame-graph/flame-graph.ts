@@ -116,39 +116,54 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
               ↩ Reset zoom
             </button>
           }
-          @if (hovered()) {
+          <!-- The zoom as buttons, for a screen with no hover and no wheel: + zooms into the
+               pressed bar, − steps back out one level. Shown on phones and on coarse pointers
+               (the stylesheet decides); a mouse zooms by clicking the bar, as it always did. -->
+          <span class="fg-zoom">
+            <button class="fg-zoom-btn" (click)="zoomOut()" [disabled]="!focused()" title="Zoom out one level">−</button>
+            <button class="fg-zoom-btn" (click)="zoomIn()" [disabled]="!canZoomIn()" title="Zoom into the selected bar">+</button>
+          </span>
+          @if (shown(); as node) {
+            <!-- On a desktop the hovered bar's row, on a touch screen the pressed bar's: the
+                 same strip either way. -->
             <div class="fg-tooltip">
-              <strong>{{ hovered()!.name }}</strong>
-              <span class="fg-tt-svc">{{ hovered()!.service }}</span>
-              <span class="fg-tt-dur">{{ fmtMs(hovered()!.totalMs) }} total · {{ fmtMs(hovered()!.selfMs) }} self</span>
-              <span class="fg-tt-pct">{{ pct(hovered()!.totalMs) }}%</span>
-              @if (hovered()!.truncated) {
+              <strong>{{ node.name }}</strong>
+              <span class="fg-tt-svc">{{ node.service }}</span>
+              <span class="fg-tt-dur">{{ fmtMs(node.totalMs) }} total · {{ fmtMs(node.selfMs) }} self</span>
+              <span class="fg-tt-pct">{{ pct(node.totalMs) }}%</span>
+              @if (node.truncated) {
                 <span class="fg-tt-cut">{{ CUT_NOTE }}</span>
               }
             </div>
           }
         </div>
 
+        <!-- The plane is what the bars are positioned in. It is as tall as the rows in view and,
+             on a phone, wider than the screen (min-width in the stylesheet), so the canvas
+             scrolls sideways across a wide trace instead of squeezing every bar to a sliver. -->
         <div class="fg-canvas" #canvas>
-          @for (node of visibleNodes(); track node) {
-            <div class="fg-bar"
-                 [title]="barTitle(node)"
-                 [style.left.%]="barLeft(node)"
-                 [style.width.%]="barWidth(node)"
-                 [style.top.px]="barTop(node)"
-                 [style.height.px]="ROW_H - 2"
-                 [style.background]="barColor(node)"
-                 [class.fg-bar--error]="node.status === 'Error'"
-                 [class.fg-bar--cut]="node.truncated"
-                 [class.fg-bar--focused]="focused() === node"
-                 (mouseenter)="hovered.set(node)"
-                 (mouseleave)="hovered.set(null)"
-                 (click)="focusNode(node)">
-              @if (barWidth(node) > 4) {
-                <span class="fg-label">{{ node.name }}</span>
-              }
-            </div>
-          }
+          <div class="fg-plane" [style.height.px]="planeHeight()">
+            @for (node of visibleNodes(); track node) {
+              <div class="fg-bar"
+                   [title]="barTitle(node)"
+                   [style.left.%]="barLeft(node)"
+                   [style.width.%]="barWidth(node)"
+                   [style.top.px]="barTop(node)"
+                   [style.height.px]="ROW_H - 2"
+                   [style.background]="barColor(node)"
+                   [class.fg-bar--error]="node.status === 'Error'"
+                   [class.fg-bar--cut]="node.truncated"
+                   [class.fg-bar--focused]="focused() === node"
+                   [class.fg-bar--pressed]="pressed() === node"
+                   (mouseenter)="hovered.set(node)"
+                   (mouseleave)="hovered.set(null)"
+                   (click)="onBarClick(node)">
+                @if (barWidth(node) > 4) {
+                  <span class="fg-label">{{ node.name }}</span>
+                }
+              </div>
+            }
+          </div>
         </div>
 
         <div class="fg-legend">
@@ -163,12 +178,14 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
               <span class="fg-legend-dot fg-legend-cut" style="background:#38bdf8"></span> Cut — deeper spans not drawn
             </span>
           }
-          <span class="fg-legend-item fg-legend-hint">Click to zoom · Click again to reset</span>
+          <span class="fg-legend-item fg-legend-hint">{{ hint }}</span>
         </div>
 
       }
     </div>
   `,
+  // Inline styles cannot @use the shared breakpoints partial, so the phone and touch queries
+  // below spell out the same values: 639px is bp.$bp-sm − 1, (pointer: coarse) is bp.coarse-pointer.
   styles: [`
     :host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
@@ -187,7 +204,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       justify-content: center;
       gap: 8px;
       color: var(--text-muted);
-      font-size: 13px;
+      font-size: var(--fs-sm);
     }
     .fg-err  { color: var(--error); }
     .fg-spin { width: 18px; height: 18px; animation: fgspin 1s linear infinite; }
@@ -197,24 +214,40 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 7px 12px;
+      padding: 4px 10px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
-      min-height: 38px;
+      min-height: 32px;
     }
 
-    .fg-stat { font-size: 12px; color: var(--text-muted); }
+    .fg-stat { font-size: var(--fs-sm); color: var(--text-muted); white-space: nowrap; }
 
     .fg-btn {
+      height: var(--ctl-h-sm);
       background: none;
       border: 1px solid var(--border);
       border-radius: 5px;
       color: var(--text-secondary);
-      font-size: 12px;
-      padding: 3px 10px;
+      font-size: var(--fs-sm);
+      padding: 0 8px;
       cursor: pointer;
+      white-space: nowrap;
       transition: border-color .15s, color .15s;
       &:hover { border-color: var(--accent); color: var(--accent); }
+    }
+
+    .fg-zoom { display: none; gap: 4px; }
+    .fg-zoom-btn {
+      width: 32px;
+      height: 32px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text-primary);
+      font-size: var(--fs-lg);
+      line-height: 1;
+      cursor: pointer;
+      &:disabled { opacity: .4; cursor: default; }
     }
 
     .fg-tooltip {
@@ -222,11 +255,12 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       display: flex;
       align-items: center;
       gap: 8px;
-      font-size: 12px;
-      strong { color: var(--text-primary); }
+      min-width: 0;
+      font-size: var(--fs-sm);
+      strong { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     }
     .fg-tt-svc  { color: var(--text-muted); }
-    .fg-tt-dur  { color: var(--info); font-family: var(--font-ui); }
+    .fg-tt-dur  { color: var(--info); font-family: var(--font-ui); white-space: nowrap; }
     .fg-tt-pct  { color: var(--accent); font-weight: 700; }
     .fg-tt-cut  { color: var(--warning); }
 
@@ -234,7 +268,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       display: flex;
       align-items: center;
       gap: 5px;
-      font-size: 12px;
+      font-size: var(--fs-sm);
       color: var(--warning);
       background: var(--warning-soft);
       border-radius: 5px;
@@ -244,9 +278,13 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
     .fg-canvas {
       flex: 1;
       position: relative;
-      overflow-y: auto;
-      overflow-x: hidden;
+      overflow: auto;
       padding-bottom: 8px;
+    }
+
+    .fg-plane {
+      position: relative;
+      width: 100%;
     }
 
     .fg-bar {
@@ -261,6 +299,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
     }
     .fg-bar.fg-bar--error   { outline: 1px solid #ef4444; }
     .fg-bar.fg-bar--focused { outline: 2px solid var(--accent); filter: brightness(1.2); }
+    .fg-bar.fg-bar--pressed { outline: 2px solid var(--text-primary); }
     /* A cut subtree: the bar keeps its width (the server's totalMs counts what was not sent) and
        its right edge says "continues, not drawn" — a box-shadow, so it survives the inline
        background and composes with the error and focus outlines. */
@@ -268,7 +307,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
 
     .fg-label {
       display: block;
-      font-size: 10px;
+      font-size: var(--fs-2xs);
       color: #0f172a;
       padding: 0 4px;
       white-space: nowrap;
@@ -284,14 +323,30 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 6px 12px;
+      padding: 4px 10px;
       border-top: 1px solid var(--border);
       flex-shrink: 0;
+      flex-wrap: wrap;
     }
-    .fg-legend-item   { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-muted); }
+    .fg-legend-item   { display: flex; align-items: center; gap: 5px; font-size: var(--fs-xs); color: var(--text-muted); }
     .fg-legend-dot    { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
     .fg-legend-hint   { margin-left: auto; font-style: italic; }
     .fg-legend-cut    { box-shadow: inset -3px 0 0 var(--warning); }
+
+    /* Touch: the zoom needs buttons, since a tap selects. */
+    @media (pointer: coarse) {
+      .fg-zoom { display: flex; }
+    }
+
+    /* Phone: the plane is wider than the screen and scrolls sideways; the pressed bar's row
+       wraps under the toolbar instead of competing with it for one line. */
+    @media (max-width: 639px) {
+      .fg-toolbar { flex-wrap: wrap; row-gap: 4px; padding: 6px 8px; }
+      .fg-zoom { display: flex; margin-left: auto; }
+      .fg-tooltip { flex-basis: 100%; margin-left: 0; order: 10; flex-wrap: wrap; row-gap: 2px; }
+      .fg-plane { min-width: 720px; }
+      .fg-legend-hint { margin-left: 0; flex-basis: 100%; }
+    }
   `],
 })
 export class FlamegraphComponent implements OnChanges {
@@ -300,13 +355,33 @@ export class FlamegraphComponent implements OnChanges {
   private api = inject(ApiService);
   private cdr = inject(ChangeDetectorRef);
 
-  readonly ROW_H = 24;
+  /** One row of bars, in px. The bar itself is ROW_H − 2 (the template), leaving the seam. */
+  readonly ROW_H = 20;
+
+  /**
+   * A touch screen: a tap on a bar SELECTS it (shows its row, arms the + button) instead of
+   * zooming, because a tap is also the only way to read a bar and zooming on every read is
+   * unusable. Decided once, at construction — a pointer does not change kind mid-session, and
+   * jsdom (no matchMedia) counts as a mouse.
+   */
+  private readonly coarse =
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
+
+  readonly hint = this.coarse
+    ? 'Tap a bar for details · zoom with + / −'
+    : 'Click to zoom · Click again to reset';
 
   loading = signal(false);
   error   = signal('');
   root    = signal<FlamegraphNode | null>(null);
   focused = signal<FlamegraphNode | null>(null);
   hovered = signal<FlamegraphNode | null>(null);
+  /** The bar last tapped on a touch screen — what the row describes and what + zooms into. */
+  pressed = signal<FlamegraphNode | null>(null);
+
+  /** The bar the toolbar row describes: the pressed one when there is one, else the hovered. */
+  shown = computed(() => this.pressed() ?? this.hovered());
 
   rootMs = computed(() => this.root()?.totalMs ?? 1);
 
@@ -315,6 +390,13 @@ export class FlamegraphComponent implements OnChanges {
   flatNodes = computed(() => {
     const r = this.root();
     return r ? layoutFlamegraph(r) : [];
+  });
+
+  /** Each node's parent, for stepping the zoom back out one level. */
+  private readonly parentOf = computed(() => {
+    const map = new Map<FlamegraphNode, FlamegraphNode>();
+    for (const n of this.flatNodes()) for (const c of n.children) map.set(c, n);
+    return map;
   });
 
   /**
@@ -353,11 +435,23 @@ export class FlamegraphComponent implements OnChanges {
     return { x: f?._x ?? 0, w: f?._w ?? 1, depth: f?._depth ?? 0 };
   });
 
+  /**
+   * The plane's height: one row per level in view. Explicit, because the bars are absolutely
+   * positioned and would otherwise give the plane no height of its own — the canvas used to get
+   * its scroll extent from the bars' overflow, which a plane with a min-width cannot rely on.
+   */
+  planeHeight = computed(() => {
+    let maxDepth = 0;
+    for (const n of this.visibleNodes()) if ((n._depth ?? 0) > maxDepth) maxDepth = n._depth!;
+    return (maxDepth - this.zoom().depth + 1) * this.ROW_H;
+  });
+
   ngOnChanges(ch: SimpleChanges) {
     if (ch['traceId']) {
       this.root.set(null);
       this.focused.set(null);
       this.hovered.set(null);
+      this.pressed.set(null);
       const id = this.traceId();
       if (id) this.load(id);
     }
@@ -380,6 +474,12 @@ export class FlamegraphComponent implements OnChanges {
     });
   }
 
+  /** A mouse click zooms; a tap selects (see {@link coarse}). */
+  onBarClick(node: FlamegraphNode) {
+    if (this.coarse) this.pressed.set(this.pressed() === node ? null : node);
+    else this.focusNode(node);
+  }
+
   /**
    * Zooms into `node`, or back out when it is the focused one. Only a node of a finite, positive
    * width can be stretched to the canvas. One of no width — a span the server rounded to 0 ms,
@@ -397,6 +497,25 @@ export class FlamegraphComponent implements OnChanges {
   }
 
   resetFocus() { this.focused.set(null); }
+
+  /** The + button has something to do: a pressed bar that is not already the zoom. */
+  canZoomIn(): boolean {
+    const p = this.pressed();
+    return !!p && p !== this.focused() && Number.isFinite(p._w) && p._w! > 0;
+  }
+
+  /** + : zoom into the pressed bar. */
+  zoomIn() {
+    const p = this.pressed();
+    if (p && this.canZoomIn()) this.focused.set(p);
+  }
+
+  /** − : one level back out — the focused node's parent, or the whole tree from a top-level zoom. */
+  zoomOut() {
+    const f = this.focused();
+    if (!f) return;
+    this.focused.set(this.parentOf().get(f) ?? null);
+  }
 
   // ── Bar geometry: a node's place in the full layout, seen through the zoom ──
 
