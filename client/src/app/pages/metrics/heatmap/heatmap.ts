@@ -26,7 +26,7 @@ interface Cell { x: number; y: number; v: number; }
     .hm-wrap { position: relative; height: 240px; }
     .hm-empty {
       height: 240px; display: flex; align-items: center; justify-content: center;
-      color: var(--text-muted); font-size: 13px;
+      color: var(--text-muted); font-size: var(--fs-md);
     }
   `],
 })

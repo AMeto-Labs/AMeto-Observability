@@ -9,8 +9,8 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px 4px;
-  font-size: 10.5px;
+  padding: 6px 10px 3px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .06em;
@@ -23,7 +23,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 10px;
+  padding: 5px 10px;
   cursor: pointer;
   transition: background .1s;
 }
@@ -36,7 +36,8 @@
   flex: 1;
   min-width: 0;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11.5px;   /* the design's one-off for list rows, between --fs-xs and --fs-sm */
+  line-height: var(--lh-ui);
   color: var(--txt);
   white-space: nowrap;
   overflow: hidden;
@@ -56,7 +57,7 @@
 
 .sh-icon-btn {
   display: flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px;
+  width: var(--icon-btn); height: var(--icon-btn);
   border-radius: var(--radius-sm);
   background: none; border: none;
   color: var(--txt-muted);
@@ -66,10 +67,10 @@
 .sh-icon-btn.danger:hover { color: var(--lvl-e); }
 
 .sh-empty {
-  padding: 20px 14px;
+  padding: 16px 12px;
   text-align: center;
   color: var(--txt-dim);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   display: flex; flex-direction: column; gap: 6px; align-items: center;
 }
-.sh-hint { color: var(--txt-dim); font-size: 11px; }
+.sh-hint { color: var(--txt-dim); font-size: var(--fs-xs); }

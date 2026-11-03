@@ -1,25 +1,29 @@
+@use 'breakpoints' as bp;
+
 .dash-hdr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--gap);
+  flex-wrap: wrap;
+  margin-bottom: var(--gap);
 }
-.label { display: block; font-size: 13px; color: var(--text-primary); }
-.sublabel { font-size: 11px; color: var(--text-secondary); }
+.label { display: block; font-size: var(--fs-md); color: var(--text-primary); }
+.sublabel { font-size: var(--fs-xs); color: var(--text-secondary); }
 
-.dash-hdr-actions { display: flex; align-items: center; gap: 12px; }
-.refreshed-at { font-size: 11px; color: var(--text-secondary); }
+.dash-hdr-actions { display: flex; align-items: center; gap: var(--gap); }
+.refreshed-at { font-size: var(--fs-xs); color: var(--text-secondary); }
 .dash-refresh {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: var(--ctl-h);
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   color: var(--text-primary);
-  font-size: 12px;
-  padding: 5px 11px;
-  border-radius: 6px;
+  font-size: var(--fs-xs);
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 
   &:hover:not(:disabled) { border-color: var(--accent); }
@@ -30,16 +34,16 @@
 .metric {
   display: grid;
   grid-template-columns: 200px 1fr;
-  gap: 12px;
-  padding: 12px 4px;
+  gap: var(--gap);
+  padding: 8px 4px;
   border-bottom: 1px solid var(--border);
   align-items: start;
 }
 .metric:last-child { border-bottom: none; }
-.metric-name  { font-size: 13px; font-weight: 600; color: var(--text-primary); padding-top: 1px; }
-.metric-value { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+.metric-name  { font-size: var(--fs-md); font-weight: 600; color: var(--text-primary); padding-top: 1px; }
+.metric-value { font-size: var(--fs-lg); font-weight: 600; line-height: var(--lh-tight); color: var(--text-primary); }
 .metric-value.accent { color: var(--primary); }
-.metric-desc  { font-size: 11px; color: var(--text-secondary); margin-top: 3px; line-height: 1.5; }
+.metric-desc  { font-size: var(--fs-xs); color: var(--text-secondary); margin-top: 3px; line-height: var(--lh-body); }
 
 .ram-bar-track {
   height: 6px;
@@ -54,7 +58,7 @@
 .ram-bar-fill.danger  { background: var(--error); }
 
 .skeleton-name  { width: 140px; }
-.skeleton-value { width: 80px; height: 18px; }
+.skeleton-value { width: 80px; height: 16px; }
 .skeleton-desc  { width: 260px; margin-top: 6px; }
 
 // Storage per-signal breakdown
@@ -70,7 +74,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .sb-val { margin-left: auto; color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -84,4 +88,9 @@
   &.traces  { background: #cf9be6; }
   &.db      { background: var(--warning, #f59e0b); }
   &.other   { background: var(--text-muted, #888); }
+}
+
+/* Phone: the name sits over its value instead of beside it. */
+@include bp.below(bp.$bp-sm) {
+  .metric { grid-template-columns: 1fr; gap: 4px; }
 }

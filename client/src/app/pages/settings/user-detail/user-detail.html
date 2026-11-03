@@ -167,26 +167,29 @@
         @if (u.sessions.length === 0) {
           <span class="sublabel">No active sessions.</span>
         } @else {
-          <table class="data-table sessions-table">
-            <thead>
-              <tr>
-                <th>Device</th>
-                <th>IP</th>
-                <th>Last active</th>
-                <th>Signed in</th>
-              </tr>
-            </thead>
-            <tbody>
-              @for (s of u.sessions; track $index) {
+          <!-- Four dated columns are wider than a phone: the table scrolls inside its wrapper. -->
+          <div class="table-scroll">
+            <table class="data-table sessions-table">
+              <thead>
                 <tr>
-                  <td [title]="s.userAgent">{{ describeAgent(s.userAgent) }}</td>
-                  <td class="mono-sm">{{ s.ip || '—' }}</td>
-                  <td class="muted">{{ s.lastUsedAt | date: 'yyyy-MM-dd HH:mm' }}</td>
-                  <td class="muted">{{ s.createdAt | date: 'yyyy-MM-dd HH:mm' }}</td>
+                  <th>Device</th>
+                  <th>IP</th>
+                  <th>Last active</th>
+                  <th>Signed in</th>
                 </tr>
-              }
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                @for (s of u.sessions; track $index) {
+                  <tr>
+                    <td [title]="s.userAgent">{{ describeAgent(s.userAgent) }}</td>
+                    <td class="mono-sm">{{ s.ip || '—' }}</td>
+                    <td class="muted">{{ s.lastUsedAt | date: 'yyyy-MM-dd HH:mm' }}</td>
+                    <td class="muted">{{ s.createdAt | date: 'yyyy-MM-dd HH:mm' }}</td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
         }
       </div>
 

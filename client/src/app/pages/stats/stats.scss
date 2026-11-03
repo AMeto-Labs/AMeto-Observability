@@ -1,3 +1,5 @@
+@use 'breakpoints' as bp;
+
 :host { display: block; height: 100%; }
 /* Layout comes from the global `.page` wrapper (padding + gap + scroll). */
 
@@ -8,15 +10,16 @@
   padding: 2px;
   background: var(--surface-up);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius);
 }
 .range-tab {
-  padding: 4px 12px;
+  height: var(--ctl-h-sm);
+  padding: 0 10px;
   background: none;
   border: none;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   color: var(--txt-muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-family: var(--ui);
   cursor: pointer;
   transition: background .12s, color .12s;
@@ -27,38 +30,38 @@
 /* ── Summary tiles ────────────────────────────────────────────────── */
 .stat-tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--gap);
 }
 .stat-tile {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 14px 16px;
+  gap: 4px;
+  padding: 10px 12px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-card);
 }
 .stat-tile-label {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-family: var(--ui);
   color: var(--txt-dim);
   text-transform: uppercase;
   letter-spacing: .05em;
 }
 .stat-tile-value {
-  font-size: 24px;
+  font-size: var(--fs-xl);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--txt);
-  line-height: 1.1;
+  line-height: var(--lh-tight);
 }
 .stat-tile-note {
   position: absolute;
-  top: 12px;
-  right: 12px;
-  font-size: 9px;
+  top: 8px;
+  right: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
   letter-spacing: .04em;
   text-transform: uppercase;
@@ -72,17 +75,18 @@
 .stat-card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px 16px;
+  border-radius: var(--radius-card);
+  padding: var(--section-pad);
 }
 .stat-card-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 12px;
+  gap: var(--gap);
+  margin-bottom: var(--gap);
 }
 .stat-card-title {
-  font-size: 12px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   font-family: var(--ui);
   text-transform: uppercase;
@@ -90,7 +94,7 @@
   color: var(--txt-muted);
 }
 .stat-card-sub {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
 }
@@ -99,8 +103,8 @@
 .err-rate.hot { color: var(--lvl-e, #EF4444); font-weight: 600; }
 .stat-loading {
   color: var(--txt-muted);
-  font-size: 12px;
-  padding: 20px 2px;
+  font-size: var(--fs-sm);
+  padding: 16px 2px;
 }
 
 /* ── Volume chart ─────────────────────────────────────────────────── */
@@ -109,7 +113,7 @@
   display: flex;
   align-items: flex-end;
   gap: 1px;
-  height: 180px;
+  height: 150px;
   width: 100%;
   overflow: hidden;   /* buckets share width via flex — no horizontal scroll */
 }
@@ -148,7 +152,7 @@
   position: absolute;
   top: 4px;
   transform: translateX(-50%);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -162,14 +166,14 @@
   display: grid;
   grid-template-columns: 10px minmax(120px, 200px) 1fr 72px 48px;
   align-items: center;
-  gap: 10px;
-  padding: 5px 4px;
+  gap: var(--gap);
+  padding: 4px;
   border-radius: 5px;
 }
 .svc-row:hover { background: var(--surface-hover); }
 .svc-dot { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
 .svc-name {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--txt);
   white-space: nowrap;
   overflow: hidden;
@@ -183,14 +187,24 @@
 }
 .svc-bar { display: block; height: 100%; border-radius: 999px; min-width: 2px; opacity: .85; }
 .svc-count {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--txt);
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
 .svc-pct {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+/* ── Phone ────────────────────────────────────────────────────────── */
+@include bp.below(bp.$bp-sm) {
+  .stat-tiles { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+  /* The name column gives up its fixed minimum, or five columns overflow a 360px screen. */
+  .svc-row {
+    grid-template-columns: 10px minmax(64px, 1fr) minmax(40px, 1fr) 60px 40px;
+    gap: 6px;
+  }
 }

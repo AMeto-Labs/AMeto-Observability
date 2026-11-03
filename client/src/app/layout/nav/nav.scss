@@ -1,3 +1,5 @@
+@use 'breakpoints' as bp;
+
 :host { display: contents; }
 
 .nav {
@@ -14,7 +16,7 @@
 
 /* ── Logo ───────────────────────────────────────────────────────── */
 .nav-logo {
-  height: 52px;
+  height: 44px;   /* was 52: a row in step with the 40px toolbar beside it, not a header of its own */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -30,7 +32,7 @@
   flex-direction: column;
   align-items: stretch;
   gap: 1px;
-  padding: 8px 6px 4px;
+  padding: 6px 6px 4px;
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -40,10 +42,11 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 2px;
   /* 3px sides, not 4px: buys the label box back the last few pixels it needs so
-     "Reference" fits on one line without widening --nav-w any further. */
-  padding: 7px 3px 6px;
+     "Reference" fits on one line without widening --nav-w any further.
+     5px / 4px above and below (were 7 / 6): the dense scale's rail. */
+  padding: 5px 3px 4px;
   border-radius: var(--radius-sm);
   color: var(--txt-muted);
   background: none;
@@ -67,10 +70,12 @@
   padding: 6px;
   justify-content: center;
 }
+/* The bar's fifth entry (phone). The rail lists every page itself, so it never shows it. */
+.nav-item--more { display: none; }
 
 .nav-label {
   font-family: var(--ui);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 500;
   letter-spacing: .15px;
   white-space: nowrap;
@@ -90,8 +95,8 @@
   flex-direction: column;
   align-items: stretch;
   border-top: 1px solid var(--border-sub);
-  padding: 6px 6px 4px;
-  gap: 2px;
+  padding: 4px 6px;
+  gap: 1px;
 }
 
 .nav-env {
@@ -102,7 +107,7 @@
 }
 .env-eyebrow {
   font-family: var(--ui);
-  font-size: 9px;
+  font-size: var(--fs-3xs);
   font-weight: 500;
   color: var(--txt-dim);
   text-transform: uppercase;
@@ -123,7 +128,7 @@
 }
 .env-name {
   font-family: var(--ui);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   color: var(--txt-muted);
   flex: 1;
@@ -132,3 +137,98 @@
   text-overflow: ellipsis;
 }
 .env-caret { color: var(--txt-dim); flex-shrink: 0; }
+
+/* ── More sheet (phone) ─────────────────────────────────────────────
+   The pages the bar has no room for, as a sheet resting on the bar. Opened by the More
+   entry; the backdrop sits UNDER the bar (z 99 < 100) so the bar's entries still answer
+   a tap while it is open. */
+.nav-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+  background: color-mix(in srgb, var(--bg-main) 55%, transparent);
+}
+.nav-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--bottom-nav-h, 0px);
+  z-index: 101;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius-card) var(--radius-card) 0 0;
+  box-shadow: var(--shadow);
+}
+.nav-sheet-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 44px;   /* a finger's row */
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--txt-muted);
+  font: inherit;
+  font-size: var(--fs-md);
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+.nav-sheet-item:hover { color: var(--txt); background: var(--surface-hover); }
+.nav-sheet-item--active { color: var(--accent); background: var(--accent-dim); }
+/* The sheet is the phone's: a window widened past the breakpoint while it is open loses
+   it, and the rail lists its pages itself. */
+@include bp.from(bp.$bp-sm) {
+  .nav-sheet,
+  .nav-sheet-backdrop { display: none; }
+}
+
+/* ── Phone: the rail is a bar along the bottom edge ───────────────
+   Five entries — Logs, Traces, Metrics, Alerts and More — 56px tall plus the home-indicator
+   inset, the height --bottom-nav-h (_components.scss) also counts. Fixed, so it stays put
+   while a page scrolls; the shell pads its content by the same height. The logo, Stats and
+   the rail's bottom group have no room here and wait under More. */
+@include bp.below(bp.$bp-sm) {
+  .nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    min-width: 0;
+    height: var(--bottom-nav-h);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+  }
+  .nav-logo,
+  .nav-bottom,
+  .nav-item--rail-only { display: none; }
+  .nav-items {
+    flex-direction: row;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+    overflow: visible;
+  }
+  .nav-item {
+    flex: 1 1 0;
+    gap: 3px;
+    padding: 0 2px;
+    border-radius: 0;
+  }
+  .nav-item--more { display: flex; }
+  /* 20px icons on the bar (18 on the rail). lucide-angular appends the <svg> with the
+     renderer, so it carries no encapsulation attribute and only ::ng-deep reaches it — as
+     json-viewer does for its rendered preview. Its size attributes stay; the CSS wins. */
+  .nav-item ::ng-deep svg {
+    width: 20px;
+    height: 20px;
+  }
+}
