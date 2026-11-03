@@ -33,7 +33,9 @@
 .events-header {
   display: flex;
   align-items: center;
-  height: 26px;
+  /* 22px is the design's own number for this row (canvas "Логи — плотно"), not a control height:
+     --ctl-h-sm happens to be 22px too, but a chip and a header row need not move together. */
+  height: 22px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
@@ -44,7 +46,7 @@
   flex-shrink: 0;
 }
 .ev-h-col {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   letter-spacing: .06em;
   text-transform: uppercase;
@@ -55,12 +57,15 @@
   gap: 3px;
   font-family: var(--ui);
 }
-.ev-h-ts  { width: 160px; flex-shrink: 0; padding-right: 6px; }
-.ev-h-lvl { width: 45px;  flex-shrink: 0; padding-right: 6px; }
+/* The widths mirror event-list-row.scss (.ev-ts / .ev-level / .ev-svc): header and rows move together. */
+.ev-h-ts  { width: 154px; flex-shrink: 0; padding-right: 6px; }
+.ev-h-lvl { width: 42px;  flex-shrink: 0; padding-right: 6px; }
 /* --svc-col is set on .events-list-wrap from the longest service name (EventsComponent.svcColWidth). */
-.ev-h-svc { width: var(--svc-col, 155px); flex-shrink: 0; padding-right: 10px; }
+.ev-h-svc { width: var(--svc-col, 140px); flex-shrink: 0; padding-right: 10px; }
 .ev-h-msg { flex: 1; min-width: 0; }
-.ev-h-wrap-btn { margin-left: auto; opacity: 0.5; }
+/* 20px tall rather than --icon-btn: it is the one icon button inside the 22px header row, and a 24px
+   button would overhang the row by a pixel on each side — over its border and the first log row. */
+.ev-h-wrap-btn { margin-left: auto; opacity: 0.5; height: 20px; }
 .ev-h-wrap-btn:hover, .ev-h-wrap-btn.tb-icon-btn--on { opacity: 1; }
 
 /* Wrap-toggle icon button (only tb-icon-btn user left in the shell). */
@@ -68,8 +73,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   border-radius: var(--radius-sm);
   background: none;
   border: none;
@@ -106,13 +111,14 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  height: 30px;
+  height: 26px;      /* the design's footer bar — a one-off, like the filter bar's 32px */
   flex-shrink: 0;
   padding: 0 12px;
   border-top: 1px solid var(--border);
   background: var(--surface);
   font-family: var(--ui);
-  font-size: 11px;
+  font-size: 10.5px; /* one-off: the bar text size the design names for the footer and the filter
+                        bar; the buttons below inherit it */
 }
 .ev-footer-count { color: var(--txt-dim); white-space: nowrap; }
 .ev-footer-nav {
@@ -129,7 +135,6 @@
   background: none;
   border: none;
   color: var(--txt-muted);
-  font-size: 11px;
   font-family: var(--ui);
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -144,7 +149,6 @@
   background: none;
   border: 1px solid var(--border);
   color: var(--accent);
-  font-size: 11px;
   font-family: var(--ui);
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -169,7 +173,7 @@
    Positioned against `.events-list-wrap`, which is already `position: relative`. */
 .ev-new-pill {
   position: absolute;
-  top: 34px;
+  top: 30px; /* 8px under the 22px header row */
   left: 50%;
   transform: translateX(-50%);
   z-index: 3;
@@ -182,7 +186,7 @@
   background: var(--surface-up);
   color: var(--accent);
   font-family: var(--ui);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   box-shadow: 0 2px 10px rgb(0 0 0 / .35);
 }
@@ -198,7 +202,7 @@
   padding: 6px 12px;
   background: var(--lvl-e-bg);
   color: var(--lvl-e);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   flex-shrink: 0;
 }
 .err-retry {
@@ -207,7 +211,7 @@
   color: inherit;
   padding: 1px 8px;
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-left: auto;
 }
 
@@ -220,7 +224,7 @@
   height: 220px;
   color: var(--txt-dim);
 }
-.empty-state p { font-size: 13px; }
+.empty-state p { font-size: var(--fs-md); }
 
 .load-more {
   display: flex;

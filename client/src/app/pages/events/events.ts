@@ -20,7 +20,7 @@ import { UserPreferencesService } from '../../core/services/user-preferences.ser
 /** The SERVICE cell around its name: the 12px icon, the 5px gap and the 10px right padding. */
 const SVC_COL_CHROME = 27;
 /** The SERVICE column is never wider than this — a longer name ends in an ellipsis… */
-const SVC_COL_MAX = 155;
+const SVC_COL_MAX = 140;
 /** …and never narrower than its header. */
 const SVC_COL_MIN = 70;
 
@@ -71,14 +71,19 @@ export class EventsComponent implements OnInit {
   private measureCtx?: CanvasRenderingContext2D | null;
   private readonly fontsReady = signal(false);
 
-  /** A service name's width in the row's font (12px, --font-mono). */
+  /** A service name's width in the row's font: --fs-xs (11px) in --font-mono, what .ev-svc-name renders at. */
   private textWidth(name: string): number {
     let w = this.nameWidths.get(name);
     if (w !== undefined) return w;
     if (this.measureCtx === undefined) {
       this.measureCtx = document.createElement('canvas').getContext('2d');
-      const family = getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim();
-      if (this.measureCtx) this.measureCtx.font = `12px ${family || 'sans-serif'}`;
+      const root = getComputedStyle(document.documentElement);
+      const family = root.getPropertyValue('--font-mono').trim();
+      // Read from the same token the row's name is set in, so a change to the scale cannot leave
+      // the measured column and the rendered name at different sizes. No stylesheet (a test
+      // host): the token's value.
+      const size = root.getPropertyValue('--fs-xs').trim() || '11px';
+      if (this.measureCtx) this.measureCtx.font = `${size} ${family || 'sans-serif'}`;
     }
     // No canvas (a test host): a generous per-character guess rather than nothing.
     w = this.measureCtx ? this.measureCtx.measureText(name).width : name.length * 7;
@@ -113,9 +118,10 @@ export class EventsComponent implements OnInit {
    * the page stopped responding. Measured rows are the answer to variable heights, and the
    * Traces list already does exactly this with the same library.</p>
    *
-   * <p>Fixed mode keeps its 29px and measures nothing, which is what the original comment here
-   * was protecting: its rows are one line by construction, and measuring them re-introduced an
-   * overlap on selection. Only wrap mode measures — {@link measureOnlyWhenWrapping} is what
+   * <p>Fixed mode keeps its 24px (--log-row-h) and measures nothing, which is what the original
+   * comment here was protecting: its rows are one line by construction, and measuring them
+   * re-introduced an overlap on selection. Only wrap mode measures —
+   * {@link measureOnlyWhenWrapping} is what
    * makes that switch, and it is `undefined` (not a no-op function) in fixed mode so the
    * library takes its own non-measuring path rather than one that lies about a height.</p>
    */
@@ -136,9 +142,11 @@ export class EventsComponent implements OnInit {
     // keys for ever.
     const rows = this.store.displayedEvents();
     const wrap = this.store.wrapMessages();
-    // Wrapped rows are one line more often than not; the estimate only has to be close enough
-    // that the scrollbar does not jump while the real heights arrive.
-    const rowHeight = wrap ? 48 : 29;
+    // Fixed mode: --log-row-h, the collapsed row's pinned height (event-list-row.scss) — the two
+    // numbers must move together. Wrapped rows are one line more often than not (4px of padding
+    // around an 18px line), so the estimate only has to be close enough that the scrollbar does
+    // not jump while the real heights arrive.
+    const rowHeight = wrap ? 40 : 24;
     return {
       count: rows.length,
       scrollElement: this.eventsScroll(),
@@ -202,7 +210,7 @@ export class EventsComponent implements OnInit {
     // MEASURED height by row key and prefers it to the estimate whatever `measureElement` says,
     // so turning wrap off left every row that had been measured at its wrapped height: the
     // one-line rows sat spread out down the list with the gaps where their extra lines had been,
-    // and the list never came back to 29px. The reader is kept on the row at the top of the
+    // and the list never came back to 24px. The reader is kept on the row at the top of the
     // view — found in the OLD layout, before the heights go — rather than left at a pixel
     // offset that now points somewhere else entirely.
     effect(() => {
