@@ -665,19 +665,42 @@ public sealed class TraceFlushProbe : IDisposable
     }
 
     /// <summary>
+    /// <see cref="SpanWriter.Write"/> picks the level from the path when none is given — the flush
+    /// level for a recoverable flush, the merge level for a merge (<c>recoverable: false</c>) — so a
+    /// merge cannot be written at the flush level by a forgotten argument. Pinned on the bytes: a
+    /// write with the default and a write with the level spelled out are the same file.
+    /// </summary>
+    [Fact]
+    public void The_default_level_follows_the_path_a_flush_or_a_merge()
+    {
+        var corpus = BuildCorpus();
+        string flush        = SpanWriter.Write(NewDir("level-flush"), corpus).FilePath;
+        string merge        = SpanWriter.Write(NewDir("level-merge"), corpus, recoverable: false).FilePath;
+        string atFlushLevel = SpanWriter.Write(NewDir("level-flush-explicit"), corpus, level: SpanWriter.FlushLevel).FilePath;
+        string atMergeLevel = SpanWriter.Write(NewDir("level-merge-explicit"), corpus, level: SpanWriter.MergeLevel).FilePath;
+
+        Assert.Equal(Sha(atFlushLevel), Sha(flush));
+        Assert.Equal(Sha(atMergeLevel), Sha(merge));
+        Assert.NotEqual(Sha(flush), Sha(merge));   // the two levels are different bytes on this corpus
+    }
+
+    /// <summary>
     /// TS#7(g), MEASURED TWICE AND ADOPTED THE SECOND TIME. The flush used to compress every span
     /// block (and v3's trace-index block) at <c>LZ4Level.L09_HC</c>; the plan's instruction was
     /// "measure the file-size delta first; do not adopt blind". The first measurement was of size
     /// alone — L03_HC cost +1,9-2,1 % on the golden corpus, +1,3 % on the varied one and +7,1 % on the
-    /// resource-shaped one — and the flush stayed at L09_HC. The second added the CPU side: L09_HC was
-    /// 1,4-5,9 µs of a flush's ~3,6 µs a span (<see cref="Flush_cost_per_span"/>) and about half of a
-    /// streaming merge's 11 µs a span (<c>TraceStandCompactionProbe</c>), on a two-core stand that
-    /// spent half a core on a merge backlog. So the flush now writes at <see cref="SpanWriter.FlushLevel"/>
-    /// (L03_HC: half the encode time for the sizes above, on a file the merge rewrites within the hour)
-    /// while a merge stays at <see cref="SpanWriter.MergeLevel"/> (L09_HC: the rows below put L06_HC at
-    /// +0,04-1,2 % of its size for 1,2-1,5× its rate — not worth it on a file that lives until retention).
-    /// This is the measurement, kept so the decision
-    /// can be re-taken on numbers rather than re-argued.
+    /// resource-shaped one — and the flush stayed at L09_HC. The second added the CPU side, from the
+    /// rows below: the compressor alone takes 1,6 µs a span at L09_HC against 0,7 at L03_HC on the
+    /// golden corpus (5,7 against 2,8 on the varied one, 1,9 against 0,7 on the resource-shaped one),
+    /// and on the golden 12 000-span flush that 1,6 µs is close to half of the flush's ~3,6 µs a span
+    /// (<see cref="Flush_cost_per_span"/>). So the flush now writes at <see cref="SpanWriter.FlushLevel"/>
+    /// (L03_HC), on the premise that a merge rewrites the file at the merge level once it is past the
+    /// planner's one-hour minimum age; where that premise fails — a flush the planner would never
+    /// take — the engine writes at the merge level instead (<c>TraceStorageEngine.FlushLevelFor</c>,
+    /// pinned in <c>FlushLevelByFateTests</c>). A merge stays at <see cref="SpanWriter.MergeLevel"/>
+    /// (L09_HC): the rows put L06_HC at +0,04-1,2 % of its size for 1,2-1,5× its rate — not worth it
+    /// on a file that lives until retention. This is the measurement, kept so the decision can be
+    /// re-taken on numbers rather than re-argued.
     ///
     /// <para>Measured on the writer's OWN bytes rather than a model of them: the segment is written
     /// as a flush writes it, every LZ4 section is read back out of the file and inflated, and each
@@ -693,8 +716,11 @@ public sealed class TraceFlushProbe : IDisposable
     /// resource attributes merged onto EVERY span, a route per root — and it is where the levels
     /// part: long matches repeated across spans are what the deeper HC search exists to find.</para>
     ///
-    /// <para>A PROBE, NOT A GATE: the only assertion is that the instrument reads the file it
-    /// measures (the <see cref="SpanWriter.FlushLevel"/> row re-pickled is what is on disk).</para>
+    /// <para>A PROBE WITH TWO GATES, both on bytes, which do not move between runs: that the
+    /// instrument reads the file it measures (the <see cref="SpanWriter.FlushLevel"/> row re-pickled
+    /// is what is on disk), and that the flush level costs no more than a tenth of a file over
+    /// L09_HC on any of the three corpora — the bound the decision rests on, with the resource-shaped
+    /// corpus at +7,1 % the closest to it. The times are printed, never asserted.</para>
     /// </summary>
     [Fact]
     public void Lz4_level_of_the_flush_blocks_measured()
@@ -717,6 +743,7 @@ public sealed class TraceFlushProbe : IDisposable
         _out.WriteLine($"{corpusName} {n:N0} spans: {raws.Count} LZ4 sections (span blocks + trace index), "
                      + $"{onDisk:N0} B of a {fileBytes:N0} B .trc");
         long flushBytes = 0;
+        long l09Bytes   = 0;
         foreach (var level in levels)
         {
             long bytes  = 0;
@@ -731,6 +758,7 @@ public sealed class TraceFlushProbe : IDisposable
                 best  = Math.Min(best, sw.Elapsed.TotalMicroseconds);
             }
             if (level == SpanWriter.FlushLevel) flushBytes = bytes;
+            if (level == LZ4Level.L09_HC)       l09Bytes   = bytes;
 
             long file = fileBytes - onDisk + bytes;
             _out.WriteLine($"  {level,-9} {bytes,11:N0} B  .trc {file,11:N0} B "
@@ -739,6 +767,9 @@ public sealed class TraceFlushProbe : IDisposable
         }
 
         Assert.Equal(onDisk, flushBytes);
+        // THE PREMISE'S BOUND: the flush level may cost at most a tenth of a file over L09_HC on any shape.
+        Assert.True(flushBytes * 10 <= l09Bytes * 11,
+            $"{corpusName}: FlushLevel puts {flushBytes:N0} B on disk against {l09Bytes:N0} B at L09_HC — past the +10 % the decision rests on");
     }
 
     /// <summary>

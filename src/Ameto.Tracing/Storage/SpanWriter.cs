@@ -57,7 +57,7 @@ namespace Ameto.Tracing.Storage;
 /// v3 versus v2: positional arrays replace string-keyed maps (~40 B of repeated
 /// key strings per span gone), timestamps are block-local deltas instead of
 /// 9-byte absolutes, attributes serialize inline (no per-span nested buffer),
-/// root spans store nil instead of an 8-byte zero parent id, blocks use LZ4 (HC on a merge),
+/// root spans store nil instead of an 8-byte zero parent id, blocks are LZ4-HC (FlushLevel on a flush, the deeper MergeLevel on a merge),
 /// the trace index is compressed, and per-block attribute blooms let TraceQL
 /// skip blocks. v2 files remain readable (see <see cref="SpanReader"/>) and
 /// migrate to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
@@ -114,26 +114,33 @@ internal static class SpanWriter
     internal const int BlockSize = 4096;
 
     /// <summary>
-    /// The LZ4 level a FLUSH writes its span blocks (and a v3 trace-index block) at. L03_HC, not the
-    /// L09_HC every block used to get. Measured (TraceFlushProbe.Lz4_level_of_the_flush_blocks_measured,
-    /// three corpora): L09_HC was 1,5–5,7 µs of a flush's ~3,6 µs a span — 40–60 % of the whole flush's
-    /// CPU — and L03_HC does the same work in half the time (0,7–2,8 µs) for +1,2–1,9 % of file on the
-    /// span-shaped corpora and +7,1 % on the resource-shaped one. That is paid only until the streaming
-    /// merge rewrites the segment at <see cref="MergeLevel"/>, which is the ordinary fate of a flush
-    /// (merge min-age one hour). L00_FAST would be 4–8× cheaper again, but at +16–28 % on every flush
-    /// a merge backlog leaves standing, so it is not the default. A reader does not care which level
-    /// wrote a block: the pickled frame is the same format at every level. Re-take the decision in the
-    /// probe, on numbers.
+    /// The LZ4 level a FLUSH writes its span blocks (and a v3 trace-index block) at — unless the
+    /// engine knows the flush will never be merged, in which case it writes at <see cref="MergeLevel"/>
+    /// (<c>TraceStorageEngine.FlushLevelFor</c>). L03_HC, not the L09_HC every block used to get.
+    /// Measured on the writer's own bytes (TraceFlushProbe.Lz4_level_of_the_flush_blocks_measured):
+    /// the compressor alone at L09_HC against L03_HC, per span — golden corpus 1,6 → 0,7 µs, varied
+    /// 5,7 → 2,8 µs, resource-shaped 1,9 → 0,7 µs; on the golden 12 000-span flush L09_HC was ~1,6 of
+    /// the flush's ~3,6 µs a span, so roughly 45 % of it. The file grows +1,9 % (golden), +1,2 %
+    /// (varied) and +7,1 % (resource-shaped). A flush the planner can merge keeps that for an hour
+    /// or two — the streaming merge takes a segment only past its one-hour minimum age — and the
+    /// merge rewrites it at <see cref="MergeLevel"/>; a flush left standing by a merge backlog, or
+    /// one the planner cannot place (compaction off, a 24 h window it does not fit), keeps L03_HC
+    /// until retention. L00_FAST would be 4–8× cheaper again, but at +16–28 % on every such file, so
+    /// it is not the default. A reader does not care which level wrote a block: the pickled frame is
+    /// the same format at every level. Re-take the decision in the probe, on numbers.
     /// </summary>
     internal const LZ4Level FlushLevel = LZ4Level.L03_HC;
 
     /// <summary>
-    /// The LZ4 level a MERGE — streaming or materialising — writes at. A merged file is written once
-    /// and read until retention deletes it, so it keeps the deepest HC search: the same ladder puts
-    /// L06_HC at +0,04–1,2 % of L09_HC's size (the most on the resource-shaped corpus, the realistic
-    /// one) for 1,2–1,5× its encode rate — a few percent of an hourly merge's CPU against a percent
-    /// of disk for the life of the file, which is not a trade worth making. Named so the two paths
-    /// cannot drift apart silently, and so the flush's level is visibly the exception.
+    /// The LZ4 level a MERGE — streaming or materialising — writes at, and the level a flush that
+    /// will never be merged is written at. A merged file is read until retention deletes it, and a
+    /// merged file below half a pass is merged again as flushes accumulate (hourly on a quiet host),
+    /// each time at this level, so it keeps the deepest HC search: the same ladder puts L06_HC at
+    /// +0,04–1,2 % of L09_HC's size (the most on the resource-shaped corpus, the realistic one) for
+    /// 1,2–1,5× its encode rate — a few percent of an hourly merge's CPU against a percent of disk
+    /// for the life of the file, which is not a trade worth making. Named so the two paths cannot
+    /// drift apart silently: <see cref="Write"/> picks it for a merge (<c>recoverable: false</c>)
+    /// unless told otherwise, and <see cref="WriteMerged"/> uses nothing else.
     /// </summary>
     internal const LZ4Level MergeLevel = LZ4Level.L09_HC;
 
@@ -164,6 +171,14 @@ internal static class SpanWriter
     /// The engine's own scratch arrays (#90), or null for the shared pool. See
     /// <see cref="SpanWriteScratch"/>: a thread-pool flush otherwise missed the pool slot its last
     /// flush left on another thread, and allocated its biggest arrays on the LOH again.
+    /// </param>
+    /// <param name="level">
+    /// The LZ4 level of the span blocks and the v3 trace-index block. Null picks the level from the
+    /// path: <see cref="FlushLevel"/> for a flush (<paramref name="recoverable"/> true),
+    /// <see cref="MergeLevel"/> for a merge (false) — so a caller cannot write a merge at the flush
+    /// level by forgetting an argument. The engine passes <see cref="MergeLevel"/> explicitly for a
+    /// flush it knows will never be merged (<c>TraceStorageEngine.FlushLevelFor</c>); the format tests
+    /// pass <c>L09_HC</c> to compare layouts at one level.
     /// </param>
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
                                         Action<string>? onNamed = null,
@@ -216,7 +231,7 @@ internal static class SpanWriter
             order.AsSpan(0, count).Sort((a, b) => keys[a].CompareTo(keys[b]));
 
             var batch = new OrderedSpans(spans, order, count);
-            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch, level ?? FlushLevel);
+            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch, level ?? (recoverable ? FlushLevel : MergeLevel));
         }
         finally
         {
