@@ -4150,7 +4150,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             TraceIndexPairs? mergedTraceIndex = null;   // released after its run is written
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
                                           onTraceIndex: _indexEnabled ? pairs => mergedTraceIndex = pairs : null,
-                                          version: _segmentVersion, scratch: _writeScratch)
+                                          version: _segmentVersion, scratch: _writeScratch, level: SpanWriter.MergeLevel)
                                    .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);

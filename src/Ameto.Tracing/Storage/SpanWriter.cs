@@ -21,7 +21,7 @@ namespace Ameto.Tracing.Storage;
 ///    26   Flags        : byte   bit 0 = spans in start order across blocks (SortedByStartFlag)
 ///
 ///   [Span Blocks]
-///     N × { uncompSize uint32 | compSize uint32 | LZ4-HC msgpack bytes }
+///     N × { uncompSize uint32 | compSize uint32 | LZ4 msgpack bytes (FlushLevel or MergeLevel) }
 ///     span: positional 11-element array
 ///       [ tid bin16, sid bin8, pid bin8|nil, Δts, dur, name, svc, kind, status, hsc, attrs map|nil ]
 ///       Δts: first span of a block = absolute unix nanos, the rest = varint delta
@@ -57,7 +57,7 @@ namespace Ameto.Tracing.Storage;
 /// v3 versus v2: positional arrays replace string-keyed maps (~40 B of repeated
 /// key strings per span gone), timestamps are block-local deltas instead of
 /// 9-byte absolutes, attributes serialize inline (no per-span nested buffer),
-/// root spans store nil instead of an 8-byte zero parent id, blocks use LZ4-HC,
+/// root spans store nil instead of an 8-byte zero parent id, blocks use LZ4 (HC on a merge),
 /// the trace index is compressed, and per-block attribute blooms let TraceQL
 /// skip blocks. v2 files remain readable (see <see cref="SpanReader"/>) and
 /// migrate to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
@@ -113,6 +113,30 @@ internal static class SpanWriter
     /// <summary>Spans per block: every block but a file's last holds exactly this many.</summary>
     internal const int BlockSize = 4096;
 
+    /// <summary>
+    /// The LZ4 level a FLUSH writes its span blocks (and a v3 trace-index block) at. L03_HC, not the
+    /// L09_HC every block used to get. Measured (TraceFlushProbe.Lz4_level_of_the_flush_blocks_measured,
+    /// three corpora): L09_HC was 1,5–5,7 µs of a flush's ~3,6 µs a span — 40–60 % of the whole flush's
+    /// CPU — and L03_HC does the same work in half the time (0,7–2,8 µs) for +1,2–1,9 % of file on the
+    /// span-shaped corpora and +7,1 % on the resource-shaped one. That is paid only until the streaming
+    /// merge rewrites the segment at <see cref="MergeLevel"/>, which is the ordinary fate of a flush
+    /// (merge min-age one hour). L00_FAST would be 4–8× cheaper again, but at +16–28 % on every flush
+    /// a merge backlog leaves standing, so it is not the default. A reader does not care which level
+    /// wrote a block: the pickled frame is the same format at every level. Re-take the decision in the
+    /// probe, on numbers.
+    /// </summary>
+    internal const LZ4Level FlushLevel = LZ4Level.L03_HC;
+
+    /// <summary>
+    /// The LZ4 level a MERGE — streaming or materialising — writes at. A merged file is written once
+    /// and read until retention deletes it, so it keeps the deepest HC search: the same ladder puts
+    /// L06_HC at +0,04–1,2 % of L09_HC's size (the most on the resource-shaped corpus, the realistic
+    /// one) for 1,2–1,5× its encode rate — a few percent of an hourly merge's CPU against a percent
+    /// of disk for the life of the file, which is not a trade worth making. Named so the two paths
+    /// cannot drift apart silently, and so the flush's level is visibly the exception.
+    /// </summary>
+    internal const LZ4Level MergeLevel = LZ4Level.L09_HC;
+
     /// <param name="recoverable">
     /// True for a hot-tier flush, whose temp file the engine constructor may rename into
     /// place if a crash lost the rename — the spans exist nowhere else. FALSE for a
@@ -145,7 +169,8 @@ internal static class SpanWriter
                                         Action<string>? onNamed = null,
                                         Action<TraceIndexPairs>? onTraceIndex = null,
                                         ushort version = DefaultVersion,
-                                        SpanWriteScratch? scratch = null)
+                                        SpanWriteScratch? scratch = null,
+                                        LZ4Level? level = null)
     {
         int count = spans.Count;
         if (count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
@@ -191,7 +216,7 @@ internal static class SpanWriter
             order.AsSpan(0, count).Sort((a, b) => keys[a].CompareTo(keys[b]));
 
             var batch = new OrderedSpans(spans, order, count);
-            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch);
+            return WriteOrdered(dataDir, in batch, recoverable, onNamed, onTraceIndex, version, scratch, level ?? FlushLevel);
         }
         finally
         {
@@ -211,7 +236,7 @@ internal static class SpanWriter
     private static SpanSegmentInfo WriteOrdered(string dataDir, in OrderedSpans spans, bool recoverable,
                                                 Action<string>? onNamed,
                                                 Action<TraceIndexPairs>? onTraceIndex,
-                                                ushort version, SpanWriteScratch? scratch)
+                                                ushort version, SpanWriteScratch? scratch, LZ4Level level)
     {
         int  count   = spans.Count;
         long minNano = spans[0].StartTimeUnixNano;
@@ -300,7 +325,7 @@ internal static class SpanWriter
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
                     var block      = WriteBlock(in spans, written, batchCount, written, blockBuf, blockIdx,
-                                                traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
+                                                traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms, level);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
                     bw.Write(block.CompressedBytes);
@@ -348,7 +373,7 @@ internal static class SpanWriter
                     // Compress from the stream's own backing array — ToArray() duplicated the
                     // whole index (LOH-sized on a busy segment) for nothing.
                     var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
-                    var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+                    var compressed = LZ4Pickler.Pickle(raw, level);
                     bw.Write((uint)raw.Length);
                     bw.Write((uint)compressed.Length);
                     bw.Write(compressed);
@@ -651,7 +676,7 @@ internal static class SpanWriter
                         WriteV3TraceIndexFromRefs(idxBw, traceRefs.AsSpan(0, count), traceCount);
                     }
                     var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
-                    var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+                    var compressed = LZ4Pickler.Pickle(raw, MergeLevel);
                     bw.Write((uint)raw.Length);
                     bw.Write((uint)compressed.Length);
                     bw.Write(compressed);
@@ -732,7 +757,7 @@ internal static class SpanWriter
             uint blockIdx = (uint)(first / BlockSize);
             var  batch    = new OrderedSpans(block);
             var  written  = WriteBlock(in batch, 0, block.Count, first, blockBuf, blockIdx,
-                                       traceRefs, svcBlockMap, spanSvc: null, bloomHashes, svcStats, blooms);
+                                       traceRefs, svcBlockMap, spanSvc: null, bloomHashes, svcStats, blooms, MergeLevel);
             bw.Write((uint)written.UncompressedSize);
             bw.Write((uint)written.CompressedBytes.Length);
             bw.Write(written.CompressedBytes);
@@ -918,7 +943,8 @@ internal static class SpanWriter
         Dictionary<SpanId, string>?              spanSvc,
         HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
-        List<byte[]>                             blooms)
+        List<byte[]>                             blooms,
+        LZ4Level                                 level)
     {
         // Caller-owned buffer, reused across blocks: reset the index without
         // clearing the backing array (Clear() would memset the full capacity).
@@ -1033,9 +1059,9 @@ internal static class SpanWriter
         writer.Flush();
         // Pickle straight from the written span — the ToArray() copy the old code made
         // here existed only to hand Pickle a byte[] it never kept.
-        // HC level: this runs on background flush/compaction threads only.
+        // At the level the caller writes at: FlushLevel for a flush, MergeLevel for a merge (see both).
         var raw        = bufWriter.WrittenSpan;
-        var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+        var compressed = LZ4Pickler.Pickle(raw, level);
         return (compressed, raw.Length);
     }
 

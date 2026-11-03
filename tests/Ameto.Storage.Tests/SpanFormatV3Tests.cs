@@ -239,7 +239,12 @@ public sealed class SpanFormatV3Tests : IDisposable
 
         var sub  = Path.Combine(_dir, "v3");
         Directory.CreateDirectory(sub);
-        var info = SpanWriter.Write(sub, corpus);
+        // At L09_HC EXPLICITLY, the level the bound was calibrated with. What this fact pins is the v3
+        // LAYOUT's saving over v2 — block-local deltas, positional arrays, inline attributes — not the
+        // flush's compression level, which is a separate knob (SpanWriter.FlushLevel, L03_HC) measured
+        // on this very corpus shape in TraceFlushProbe.Lz4_level_of_the_flush_blocks_measured: +7,1 %,
+        // which alone pushes this ratio from 0,66 to 0,70 and says nothing about the layout.
+        var info = SpanWriter.Write(sub, corpus, level: LZ4Level.L09_HC);
         long v3Size = new FileInfo(info.FilePath).Length;
 
         Assert.True(v3Size * 3 <= v2Size * 2, // ≥ 1.5×
