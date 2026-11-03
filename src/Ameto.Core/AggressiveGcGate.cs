@@ -120,8 +120,22 @@ public static class AggressiveGcGate
     internal static void SetForTest(TimeSpan? aggressiveAgo, TimeSpan? backgroundAgo)
     {
         long now = Now();
-        Interlocked.Exchange(ref _lastAggressiveMs, aggressiveAgo is { } a ? Math.Max(1, now - (long)a.TotalMilliseconds) : 0);
-        Interlocked.Exchange(ref _lastBackgroundMs, backgroundAgo is { } b ? Math.Max(1, now - (long)b.TotalMilliseconds) : 0);
+        Interlocked.Exchange(ref _lastAggressiveMs, Stamp(now, aggressiveAgo));
+        Interlocked.Exchange(ref _lastBackgroundMs, Stamp(now, backgroundAgo));
+    }
+
+    /// <summary>
+    /// A tick-count stamp this long ago, or 0 for never. NOT clamped to the positive range: a CI runner
+    /// boots minutes before the run, so "an hour ago" lies before its tick count started, and a clamp to
+    /// 1 put every such stamp at the same instant — "inside the interval" and "well past it" became the
+    /// same test, and two of them failed on the runner while passing on a box up for days. Only
+    /// differences from now are ever taken, so a negative stamp is simply older.
+    /// </summary>
+    private static long Stamp(long now, TimeSpan? ago)
+    {
+        if (ago is not { } a) return 0;
+        long stamp = now - (long)a.TotalMilliseconds;
+        return stamp == 0 ? -1 : stamp;
     }
 
     /// <summary>Forgets every collection, so a test sees the gate open whatever ran before it.</summary>

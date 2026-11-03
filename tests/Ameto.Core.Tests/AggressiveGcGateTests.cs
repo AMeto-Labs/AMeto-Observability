@@ -64,6 +64,18 @@ public sealed class AggressiveGcGateTests
     }
 
     [Fact]
+    public void A_stamp_older_than_the_machines_uptime_still_reads_as_long_past()
+    {
+        // A CI runner boots minutes before the run, so "an hour ago" lies before its tick count began.
+        // Such a stamp must read as old, not as a moment after boot: the clamp that made it read so
+        // failed two facts above on the runner and nowhere else.
+        AggressiveGcGate.SetForTest(aggressiveAgo: TimeSpan.FromDays(400), backgroundAgo: TimeSpan.FromDays(400));
+
+        Assert.True(AggressiveGcGate.TryCollectInBackground(Interval));
+        Assert.True(AggressiveGcGate.TryCollect(Interval));
+    }
+
+    [Fact]
     public void A_zero_interval_never_gates()
     {
         AggressiveGcGate.ResetForTest();
