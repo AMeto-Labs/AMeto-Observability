@@ -1,18 +1,22 @@
 namespace Ameto.Core;
 
 /// <summary>
-/// Process-wide gate in front of <c>GC.Collect(2, Aggressive, blocking, compacting)</c>.
+/// Process-wide gate in front of every gen2 collection the server asks for by hand: the aggressive
+/// blocking compacting one (<see cref="TryCollect"/>) and the background one
+/// (<see cref="TryCollectInBackground"/>).
 ///
-/// <para>Three independent paths ask for an aggressive collection — RAM pressure
-/// (<c>RamPressureService</c>), log-segment merges (<c>StorageEngine</c>) and metric
-/// rollup (<c>MetricStorageEngine</c>). Each is individually a "background" trigger, but
-/// the pause is not background: a blocking compacting gen2 stops EVERY thread, ingest and
-/// query included. With no coordination, a GC trace caught two of them 8 s apart in the
-/// middle of peak load — the two longest pauses in the whole file (246 ms and 219 ms).</para>
+/// <para>Three independent paths used to ask for an aggressive collection — RAM pressure
+/// (<c>RamPressureService</c>), log-segment merges (<c>StorageEngine</c>) and metric rollup
+/// (<c>MetricStorageEngine</c>). Each is individually a "background" trigger, but the pause is
+/// not background: a blocking compacting gen2 stops EVERY thread, ingest and query included. With
+/// no coordination, a GC trace caught two of them 8 s apart in the middle of peak load — the two
+/// longest pauses in the whole file (246 ms and 219 ms).</para>
 ///
-/// <para>The gate lets the first caller through and turns the pile-up into a no-op, which
-/// is correct as well as cheap: immediately after an aggressive compacting collection
-/// there is nothing left for a second one to reclaim.</para>
+/// <para>The gate lets the first caller through and turns the pile-up into a no-op, which is
+/// correct as well as cheap: immediately after an aggressive compacting collection there is
+/// nothing left for a second one to reclaim. The log merge path asks for a background collection
+/// now (<see cref="TryCollectInBackground"/>) and still goes through the same timestamp, so it
+/// cannot land right behind a pressure collection either, nor one right behind it.</para>
 /// </summary>
 public static class AggressiveGcGate
 {
@@ -41,19 +45,49 @@ public static class AggressiveGcGate
     /// </summary>
     public static bool TryCollect(TimeSpan minInterval)
     {
+        if (!TryClaim(minInterval)) return false;
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        return true;
+    }
+
+    /// <summary>
+    /// Asks for a BACKGROUND gen2 — <c>GC.Collect(2, Default, blocking: false, compacting: false)</c> —
+    /// unless any collection went through this gate within <paramref name="minInterval"/>. What a
+    /// log merge asks for once it has merged (<c>StorageEngine.ReleaseMaintenanceMemory</c>): the
+    /// garbage the pass left is reclaimed and the gen2 callbacks the pools trim on
+    /// (<see cref="PoolTrimPolicy.OnGen2Collection"/>) fire, while every other thread keeps running
+    /// but for the collection's two short suspensions. It used to be the aggressive collection above:
+    /// a stop-the-world mark and compaction of the whole heap — 65 ms on a 20-core box, longer on the
+    /// two-core stand — and a decommit of everything freed, which the next flush re-committed page by
+    /// page, every two minutes for as long as merges had a backlog. Aggressive mode is for a process
+    /// going idle, not one about to allocate the same 40–90 MB again. Returns whether the collection
+    /// was asked for.
+    /// </summary>
+    public static bool TryCollectInBackground(TimeSpan minInterval)
+    {
+        if (!TryClaim(minInterval)) return false;
+        GC.Collect(2, GCCollectionMode.Default, blocking: false, compacting: false);
+        return true;
+    }
+
+    /// <summary>
+    /// Claims the gate for a collection now unless one went through it within
+    /// <paramref name="minInterval"/>. The slot is claimed BEFORE collecting, so a caller arriving
+    /// mid-collection skips instead of queueing a second one right behind the first.
+    /// </summary>
+    private static bool TryClaim(TimeSpan minInterval)
+    {
         long now = Math.Max(1, Environment.TickCount64);
         while (true)
         {
             long last = Interlocked.Read(ref _lastCollectMs);
             if (last != 0 && now - last < (long)minInterval.TotalMilliseconds)
                 return false;
-            // Claim the slot BEFORE collecting, so a caller arriving mid-collection
-            // skips instead of queueing a second stop-the-world right behind the first.
             if (Interlocked.CompareExchange(ref _lastCollectMs, now, last) == last)
-                break;
+                return true;
         }
-
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        return true;
     }
+
+    /// <summary>Forgets the last collection, so a test sees the gate open whatever ran before it.</summary>
+    internal static void ResetForTest() => Interlocked.Exchange(ref _lastCollectMs, 0);
 }

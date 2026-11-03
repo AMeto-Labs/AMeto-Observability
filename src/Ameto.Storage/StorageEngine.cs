@@ -1270,19 +1270,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal Action? _beforeMaintenanceSweeps;
 
     /// <summary>
-    /// Returns the memory a maintenance burst just used. The TRIGGER is background,
-    /// but the pause is not: a blocking compacting gen2 stops every thread, ingest
-    /// and query included, so this is visible to clients no matter which thread asks
-    /// for it. Routed through <see cref="AggressiveGcGate"/> so bursts from the other
-    /// maintenance paths can't line up several such pauses back to back; skipping is
-    /// fine — the next natural gen2 reclaims the garbage either way, aggressive
-    /// collection only accelerates handing pages back to the OS.
+    /// Hands back what a merge pass just used — as a BACKGROUND gen2, not the aggressive blocking
+    /// compacting one this used to force. That one stopped every thread, ingest and query included,
+    /// for a full mark and compaction of the heap (65 ms on 20 cores; longer on the two-core stand),
+    /// decommitted everything it freed for the next flush to re-commit page by page, and on Windows
+    /// emptied the working set behind it, so the mapped WALs and the native tiers faulted back in —
+    /// once every two minutes for as long as merges had a backlog. Aggressive mode is for a process
+    /// going idle, not one about to allocate the same 40–90 MB again. A background collection reclaims
+    /// the same garbage and fires the gen2 callbacks the pools trim on
+    /// (<see cref="PoolTrimPolicy.OnGen2Collection"/>) with two short suspensions instead; what it
+    /// does not do is hand pages back to the OS at once, which stays <see cref="RamPressureService"/>'s
+    /// job, under pressure only. Routed through <see cref="AggressiveGcGate"/> still, so it cannot land
+    /// right behind a pressure collection. Skipping is fine: the next natural gen2 reclaims the
+    /// garbage either way.
     /// </summary>
-    private static void ReleaseMaintenanceMemory()
-    {
-        if (AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2)))
-            WorkingSetTrimmer.TryTrim();
-    }
+    private static void ReleaseMaintenanceMemory() =>
+        AggressiveGcGate.TryCollectInBackground(TimeSpan.FromMinutes(2));
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
 
