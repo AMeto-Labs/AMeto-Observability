@@ -82,7 +82,7 @@ public sealed class FlushCpuProbe
         swGc.Restart();
         GC.Collect(2, GCCollectionMode.Default, blocking: false, compacting: false);
         swGc.Stop();
-        _out.WriteLine($"  background gen2 asked for after a merge (ReleaseMaintenanceMemory), time to return: {swGc.Elapsed.TotalMilliseconds:F1} ms");
+        _out.WriteLine($"  background gen2 asked for after a merge (ReleaseMaintenanceMemory), time to return on the heap the collection above just emptied — the best case: {swGc.Elapsed.TotalMilliseconds:F1} ms");
     }
 
     /// <summary>
