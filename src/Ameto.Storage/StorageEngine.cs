@@ -1191,8 +1191,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     // dump this used to force (see ReleaseMaintenanceMemory). What it no longer does
                     // is hand the freed pages back to the OS at once: after the last merge of a
                     // backlog the heap stays committed, and on Windows resident, until the GC's own
-                    // policy or an aggressive collection gives it back — RamPressureService's under
-                    // pressure, or a metric rollup's after a large pass. RSS on an idle server
+                    // policy or an aggressive collection gives it back — who still asks for one is
+                    // said in ReleaseMaintenanceMemory's doc, and only there. RSS on an idle server
                     // therefore settles at the merge's high-water mark rather than falling right after
                     // it, which is the price of not stopping the world every two minutes while merges
                     // run.
@@ -1297,8 +1297,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// aggressive collection never yields to it. Skipping is fine: the next natural gen2 reclaims
     /// the garbage either way.</para>
     ///
-    /// <para>Internal so a fact can pin which shape a merge asks for (<c>MaintenanceCollectShapeTests</c>):
-    /// back on the aggressive entry point, every fact about the gate itself would stay green.</para>
+    /// <para>What the maintenance loop asks for is pinned on a running engine
+    /// (<c>MaintenanceCollectShapeTests</c>): this shape after a pass that merged, nothing after one
+    /// that merged nothing. Back on the aggressive entry point, or asked after every pass, every fact
+    /// about the gate itself would stay green. Internal for that class's fact that the request yields
+    /// to a recent aggressive collection.</para>
     /// </summary>
     internal static void ReleaseMaintenanceMemory() =>
         AggressiveGcGate.TryCollectInBackground(TimeSpan.FromMinutes(2));
