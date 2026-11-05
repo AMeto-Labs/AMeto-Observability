@@ -61,10 +61,17 @@ internal sealed class SpanWriteScratch
     /// <summary>
     /// The largest LZ4 frame buffer kept: a span block of ordinary spans plus its header
     /// (<see cref="PooledLz4Pickler"/>). The writer pickles every block of a segment into one buffer sized
-    /// to the largest block's raw bytes — a 4096-span block of ~250-byte spans is ~1 MiB, which rents 2 MiB;
-    /// resource-shaped spans twice that, which rents 4 MiB — and before #141's follow-up each block came back
-    /// in a fresh LOH array from <c>LZ4Pickler.Pickle</c>. A segment of heavier spans rents more and gives
-    /// it to the shared pool, like a body that outgrows its estimate.
+    /// to the largest block's raw bytes — a 4096-span block (<c>SpanWriter.BlockSize</c>) of 250-byte spans
+    /// is 1 024 000 bytes, which rents 1 MiB; from 256 bytes a span the block passes 1 MiB and rents 2, which
+    /// is what an ordinary flush leaves behind; 4 MiB keeps the block of spans up to ~1 KiB each — and before
+    /// #141's follow-up each block came back in a fresh LOH array from <c>LZ4Pickler.Pickle</c>.
+    ///
+    /// <para>WHAT OUTGROWS IT is not a block of heavier spans but a v3 MERGE's trace index: one block of
+    /// <c>count × 4 + traces × 24</c> bytes, past 4 MiB from some 650 000 spans of 10-span traces, which a
+    /// large streaming merge has. That rental goes to the shared pool at the end of the write, like a body
+    /// that outgrows its estimate; the buffer the merge started with — the engine's, from this slot — goes
+    /// back here the moment it is outgrown (<c>PooledLz4Pickler.Buffer</c>, #144 review 2), so the next
+    /// flush still finds it.</para>
     /// </summary>
     internal const int MaxKeptPickleBytes = 4 << 20;
 

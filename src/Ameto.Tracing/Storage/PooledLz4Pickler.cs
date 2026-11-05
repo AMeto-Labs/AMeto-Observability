@@ -28,9 +28,12 @@ namespace Ameto.Tracing.Storage;
 ///
 /// <para>THE BUFFER is the engine's between flushes (<see cref="SpanWriteScratch.RentPickle"/>, #90: a
 /// thread-pool flush would otherwise miss the shared pool's slot its last flush left on another thread)
-/// or the shared pool's, rented at the first block, grown to the largest block seen — a rental of that
-/// block's size plus the header, the one it outgrew going back — and given back once, in
-/// <see cref="Return"/>. One of these per segment write, used from one thread.</para>
+/// or the shared pool's, rented at the first block and grown to the largest block seen — a rental of
+/// that block's size plus the header. Growing rents the larger array FIRST and lets go of the one in
+/// hand after, to where the buffer goes in the end (the engine's slot when it fits): so a v3 merge whose
+/// trace index outgrows the kept size leaves the engine's buffer where the next flush finds it, and the
+/// index's own rental is the one that goes to the shared pool. Given back once, in <see cref="Return"/>.
+/// One of these per segment write, used from one thread.</para>
 /// </summary>
 internal sealed class PooledLz4Pickler
 {
@@ -38,9 +41,21 @@ internal sealed class PooledLz4Pickler
     internal const int MaxHeaderBytes = 5;
 
     private readonly SpanWriteScratch? _scratch;
+    private readonly ArrayPool<byte>   _pool;
     private byte[]? _buffer;
 
-    public PooledLz4Pickler(SpanWriteScratch? scratch) => _scratch = scratch;
+    public PooledLz4Pickler(SpanWriteScratch? scratch) : this(scratch, ArrayPool<byte>.Shared) { }
+
+    /// <summary>
+    /// Test seam: the pool a rental past the engine's slot comes from and, without a scratch, goes back
+    /// to. Production uses the shared pool — the one <see cref="SpanWriteScratch"/> rents from and
+    /// returns to as well, so a buffer may pass between the slot and the pool either way.
+    /// </summary>
+    internal PooledLz4Pickler(SpanWriteScratch? scratch, ArrayPool<byte> pool)
+    {
+        _scratch = scratch;
+        _pool    = pool;
+    }
 
     /// <summary>
     /// The frame of <paramref name="raw"/> at <paramref name="level"/>, in this pickler's buffer — valid
@@ -79,19 +94,28 @@ internal sealed class PooledLz4Pickler
     {
         var buf = _buffer;
         if (buf is null)
-            return _buffer = _scratch?.RentPickle(needed) ?? ArrayPool<byte>.Shared.Rent(needed);
+            return _buffer = _scratch?.RentPickle(needed) ?? _pool.Rent(needed);
         if (buf.Length >= needed) return buf;
 
-        // Outgrown. The next flush's blocks are the size of this one's, so the larger rental is the one
-        // to keep; the one it outgrew goes to the shared pool now rather than displacing it from the
-        // engine's slot later.
-        ArrayPool<byte>.Shared.Return(buf);
-        return _buffer = ArrayPool<byte>.Shared.Rent(needed);
+        // Outgrown. RENT FIRST, THEN LET GO OF THE ONE IN HAND (#144 review 1). The other way round, a
+        // Rent that threw — the 8 to 32 MiB a v3 merge's trace index asks for, in a container at its
+        // heap limit — left _buffer pointing at an array already in the shared pool, and the writer's
+        // finally gave it to the engine's scratch as well: one array with two owners, two writers'
+        // frames in it later, and no error anywhere. The one outgrown goes where Return() sends the
+        // buffer — the engine's slot when it fits — not straight to the shared pool (review 2): a v3
+        // merge's index outgrows the kept size, and the 2 MiB buffer the merge started with, the
+        // engine's, would otherwise have left the slot with it, the next flush paying that LOH array
+        // again on another thread.
+        var bigger = _pool.Rent(needed);
+        _buffer = bigger;
+        if (_scratch is not null) _scratch.ReturnPickle(buf);
+        else                      _pool.Return(buf);
+        return bigger;
     }
 
     /// <summary>
     /// Gives the buffer back — to the engine's scratch when this pickler was given one, else to the
-    /// shared pool. Idempotent: only the first call has a buffer to give.
+    /// pool. Idempotent: only the first call has a buffer to give.
     /// </summary>
     public void Return()
     {
@@ -99,6 +123,6 @@ internal sealed class PooledLz4Pickler
         if (buf is null) return;
         _buffer = null;
         if (_scratch is not null) _scratch.ReturnPickle(buf);
-        else                      ArrayPool<byte>.Shared.Return(buf);
+        else                      _pool.Return(buf);
     }
 }

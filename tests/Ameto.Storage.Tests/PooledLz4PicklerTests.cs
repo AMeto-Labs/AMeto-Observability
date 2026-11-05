@@ -1,5 +1,7 @@
 using Ameto.Tracing.Storage;
 using K4os.Compression.LZ4;
+using System.Buffers;
+using System.Numerics;
 using Xunit;
 
 namespace Ameto.Storage.Tests;
@@ -130,6 +132,100 @@ public sealed class PooledLz4PicklerTests
         pickler.Return();
         Assert.Null(scratch.HeldPickleForTest);
     }
+
+    /// <summary>
+    /// ONE OWNER, WHATEVER THE RENT DOES (#144 review 1). Growing the buffer rents the larger array before it
+    /// lets go of the one in hand. The other way round, a Rent that threw — the 8–32 MiB a v3 merge's trace
+    /// index asks for, in a container at its heap limit — left the pickler pointing at an array it had already
+    /// given back, and the writer's finally gave it back a second time, to the engine's scratch: one array with
+    /// two owners, and two writers' LZ4 frames in it later with no error anywhere. Through a pool that refuses
+    /// the second rental: nothing is let go of on the failed growth, and after Return() the one array rented
+    /// came back exactly once.
+    /// </summary>
+    [Fact]
+    public void A_rent_that_throws_on_growth_leaves_the_buffer_with_one_owner()
+    {
+        var pool    = new RecordingPool { ThrowOnRent = 2 };
+        var pickler = new PooledLz4Pickler(scratch: null, pool);
+        pickler.Pickle(Corpus("vocabulary", 1_000), SpanWriter.FlushLevel);                   // the first rental
+        var first = Assert.Single(pool.Rented);
+        Assert.Same(first, pickler.BufferForTest);
+
+        Assert.Throws<PoolExhaustedException>(() => { pickler.Pickle(Corpus("vocabulary", 100_000), SpanWriter.FlushLevel); });
+        Assert.Same(first, pickler.BufferForTest);                                             // still the owner
+        Assert.Empty(pool.Returned);                                                           // nothing let go of
+
+        pickler.Return();
+        Assert.Null(pickler.BufferForTest);
+        Assert.Equal([first], pool.Returned, ReferenceEqualityComparer.Instance);              // once, not twice
+    }
+
+    /// <summary>Growth lets go of the outgrown array once, Return() of the larger one once: every rental back exactly once.</summary>
+    [Fact]
+    public void Every_array_rented_comes_back_exactly_once()
+    {
+        var pool    = new RecordingPool();
+        var pickler = new PooledLz4Pickler(scratch: null, pool);
+        pickler.Pickle(Corpus("vocabulary", 1_000), SpanWriter.FlushLevel);
+        pickler.Pickle(Corpus("vocabulary", 100_000), SpanWriter.FlushLevel);                  // outgrown: a second rental
+        Assert.Equal(2, pool.Rented.Count);
+        Assert.Equal([pool.Rented[0]], pool.Returned, ReferenceEqualityComparer.Instance);     // the small one, once
+        Assert.Same(pool.Rented[1], pickler.BufferForTest);
+
+        pickler.Return();
+        pickler.Return();                                                                      // idempotent
+        Assert.Equal(pool.Rented, pool.Returned, ReferenceEqualityComparer.Instance);          // each once, in order
+    }
+
+    /// <summary>
+    /// THE ENGINE'S BUFFER SURVIVES A WRITE THAT OUTGROWS IT (#144 review 2). A v3 merge starts in the buffer
+    /// the last flush left in the slot — 2 MiB — and outgrows it at its trace index: count × 4 + traces × 24
+    /// bytes, past the kept size from ~700 000 spans of 10-span traces. The outgrown buffer goes back to the
+    /// slot there and then, where the next flush finds it; the index's rental, past the kept size, is the one
+    /// that goes to the shared pool at the end. Letting go of the outgrown buffer to the shared pool instead
+    /// left the slot empty after every large merge, and the next flush — on another thread — paid that LOH
+    /// array again, which is the miss the scratch exists for (#90).
+    /// </summary>
+    [Fact]
+    public void A_write_that_outgrows_the_kept_size_leaves_the_engines_buffer_in_the_slot()
+    {
+        var scratch = new SpanWriteScratch();
+        var kept    = ArrayPool<byte>.Shared.Rent(2 << 20);                                   // what an ordinary flush leaves
+        scratch.ReturnPickle(kept);
+        Assert.Same(kept, scratch.HeldPickleForTest);
+
+        var pickler = new PooledLz4Pickler(scratch);
+        pickler.Pickle(Corpus("vocabulary", 1 << 20), SpanWriter.FlushLevel);                  // a span block: fits
+        Assert.Same(kept, pickler.BufferForTest);
+        pickler.Pickle(Corpus("zeros", 5 << 20), SpanWriter.FlushLevel);                       // the index: past the kept size
+        Assert.NotSame(kept, pickler.BufferForTest);
+        Assert.Same(kept, scratch.HeldPickleForTest);                                          // back in the slot already
+
+        pickler.Return();
+        Assert.Same(kept, scratch.HeldPickleForTest);                                          // the index's rental did not displace it
+    }
+
+    /// <summary>A pool that remembers every array it handed out and took back, and can refuse a rental.</summary>
+    private sealed class RecordingPool : ArrayPool<byte>
+    {
+        public readonly List<byte[]> Rented   = [];
+        public readonly List<byte[]> Returned = [];
+
+        /// <summary>The 1-based rental that throws; none by default.</summary>
+        public int ThrowOnRent { get; init; } = int.MaxValue;
+
+        public override byte[] Rent(int minimumLength)
+        {
+            if (Rented.Count + 1 == ThrowOnRent) throw new PoolExhaustedException();
+            var a = new byte[(int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(16, minimumLength))];   // sized as the shared pool sizes
+            Rented.Add(a);
+            return a;
+        }
+
+        public override void Return(byte[] array, bool clearArray = false) => Returned.Add(array);
+    }
+
+    private sealed class PoolExhaustedException : Exception { }
 
     private static byte[] Corpus(string shape, int bytes)
     {
