@@ -2,8 +2,11 @@ import {
   Component, inject, viewChild, viewChildren, ElementRef, OnInit, HostListener,
   ChangeDetectionStrategy, afterRenderEffect, effect, untracked, signal, computed, DestroyRef,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import {
+  NavigationCancel, NavigationEnd, NavigationError, NavigationSkipped, NavigationStart, Router,
+} from '@angular/router';
 import { LucideAngularModule } from 'lucide-angular';
-import { format } from 'date-fns';
 import {
   injectVirtualizer, measureElement as measureRenderedElement,
 } from '@tanstack/angular-virtual';
@@ -55,14 +58,38 @@ export type ListItem = EventDto | DaySeparator;
 export const PHONE_ROW_ESTIMATE = 60;
 /** The day separator's height: fixed by its stylesheet, so this is exact rather than a guess. */
 export const DAY_SEPARATOR_H = 24;
+/** A separator's virtualizer key begins with this; an event id never does. */
+const DAY_KEY_PREFIX = 'day:';
 
 export function isDaySeparator(item: ListItem | undefined): item is DaySeparator {
   return !!item && (item as DaySeparator).kind === 'day';
 }
 
-/** The local calendar day of an event's timestamp, as the separator writes it. */
-export function dayOf(iso: string): string {
-  return format(new Date(iso), 'yyyy-MM-dd');
+/**
+ * The local calendar day of an instant, `yyyy-MM-dd`, as the separator writes it. By the date's
+ * own getters rather than a formatter: the phone's list runs this for every row on every live
+ * flush, and date-fns' `format` parses its pattern each time it is called.
+ */
+export function dayOf(at: Date | string): string {
+  const d = typeof at === 'string' ? new Date(at) : at;
+  const m = d.getMonth() + 1;
+  const day = d.getDate();
+  return `${d.getFullYear()}-${m < 10 ? '0' : ''}${m}-${day < 10 ? '0' : ''}${day}`;
+}
+
+/** The mark in `history.state` of the entry the phone's event layer pushes; `id` is the event's. */
+const LAYER_STATE = 'event-detail';
+
+/** The event a history entry's state asks the phone's layer to show, or null for any other entry. */
+export function layerEventId(state: unknown): string | null {
+  const s = state as { ameto?: unknown; id?: unknown } | null | undefined;
+  return s?.ameto === LAYER_STATE && typeof s.id === 'string' ? s.id : null;
+}
+
+/** Puts the layer's mark back on the current entry after a rewrite of its state (the Router's) lost it. */
+function stampLayerEntry(id: string | null): void {
+  if (id === null || layerEventId(history.state) === id) return;
+  history.replaceState({ ...history.state, ameto: LAYER_STATE, id }, '');
 }
 
 /**
@@ -76,7 +103,7 @@ export function withDaySeparators(rows: readonly EventDto[], today: string): Lis
   for (const ev of rows) {
     const day = dayOf(ev['@t']);
     if (day !== current) {
-      items.push({ kind: 'day', date: day, id: `day:${day}` });
+      items.push({ kind: 'day', date: day, id: DAY_KEY_PREFIX + day });
       current = day;
     }
     items.push(ev);
@@ -205,7 +232,7 @@ export class EventsComponent implements OnInit {
   readonly listItems = computed<readonly ListItem[]>(() => {
     const rows = this.store.displayedEvents();
     if (!this.viewport.phone()) return rows;
-    return withDaySeparators(rows, dayOf(new Date().toISOString()));
+    return withDaySeparators(rows, dayOf(new Date()));
   });
 
   /** Whether rows are measured rather than assumed: wrapped rows, and every phone row. */
@@ -285,7 +312,7 @@ export class EventsComponent implements OnInit {
     const item = top ? this.listItems()[top.index] : undefined;
     if (!item || isDaySeparator(item)) return null;
     const day = dayOf(item['@t']);
-    return day === dayOf(new Date().toISOString()) ? null : day;
+    return day === dayOf(new Date()) ? null : day;
   });
 
   /**
@@ -295,6 +322,9 @@ export class EventsComponent implements OnInit {
    * again. Dropped with the list, when a new search runs.
    */
   readonly lastViewedId = signal<string | null>(null);
+
+  /** The mark the list draws from it: the phone's alone. Wider, the table marks the open row only. */
+  readonly lastViewedMark = computed(() => this.viewport.phone() ? this.lastViewedId() : null);
 
   /** The event whose message action sheet is open (a long press on its row), or null. */
   readonly messageSheetEvent = signal<EventDto | null>(null);
@@ -309,15 +339,44 @@ export class EventsComponent implements OnInit {
     return n;
   });
 
-  /**
-   * Whether the phone's event layer has pushed a history entry of its own, so the system Back
-   * (and, on iOS, the edge swipe) closes the layer instead of leaving the page.
-   */
-  private detailHistoryPushed = false;
+  /** The toolbar, whose phone field's focus and recent searches the body's overlay reads. */
+  readonly toolbar = viewChild(EventsToolbarComponent);
 
-  private readonly onPopState = (): void => {
-    if (!this.detailHistoryPushed) return;
-    this.detailHistoryPushed = false;
+  /**
+   * The phone's event layer in the browser's history. Opening the layer pushes an entry of its
+   * own, marked in `history.state` ({@link layerEventId}), so the system Back (and, on iOS, the
+   * edge swipe) closes the layer instead of leaving the page; a close by any other way — the
+   * arrow, the X, Escape, a filter picked inside it — pops the entry again. Landing on the entry
+   * from elsewhere — Forward after a Back, Back from the page the bottom bar went to (the entry
+   * outlives this component), F5 — brings the layer back while its event is in the list, so the
+   * entry never becomes a Back that does nothing. True while the current entry is the layer's.
+   */
+  private layerEntry = false;
+  /** Whether the layer was open at the last run of the effect that keeps {@link layerEntry}. */
+  private layerWasOpen = false;
+
+  /** The event the entry this component was created on asks for, answered by the first load. */
+  private readonly restoreLayerId = signal<string | null>(null);
+
+  /** Whether the Router's navigation in flight was started by the browser's Back or Forward. */
+  private popNavigation = false;
+
+  private readonly onPopState = (e: PopStateEvent): void => {
+    const landedId = layerEventId(e.state);
+    if (landedId !== null) {
+      // Forward onto the layer's entry: the layer returns while its event is listed; otherwise
+      // the entry stays a plain one.
+      if (!this.layerEntry && this.viewport.phone() && this.store.events().some(ev => ev.id === landedId)) {
+        this.layerEntry = true;
+        this.store.selectEvent(landedId);
+      }
+      return;
+    }
+    // Back off the layer's entry closes the layer. A close of our own (the history.back() in the
+    // constructor's effect) has dropped the flag already, so its popstate changes nothing.
+    this.restoreLayerId.set(null);
+    if (!this.layerEntry) return;
+    this.layerEntry = false;
     this.store.selectEvent(null);
   };
 
@@ -374,15 +433,15 @@ export class EventsComponent implements OnInit {
       this.viewport.phone();
       untracked(() => {
         const v = this.virtualizer;
-        const top = this.atHead() ? undefined : v.getVirtualItemForOffset(v.scrollOffset() ?? 0)?.index;
+        // By key, not index: the phone's list holds separators the table's does not, so an index
+        // taken in one layout lands a few rows off in the other.
+        const topKey = this.atHead() ? undefined : this.topRowKey();
         v.measure();
-        if (top !== undefined) v.scrollToIndex(top, { align: 'start', behavior: 'auto' });
+        if (topKey === undefined) return;
+        const index = this.listItems().findIndex(item => item.id === topKey);
+        if (index >= 0) v.scrollToIndex(index, { align: 'start', behavior: 'auto' });
       });
     });
-    // The phone's event layer is a place the system Back returns from: opening it pushes a
-    // history entry (same URL), the popstate listener closes it, and a close by any other way —
-    // the arrow, the X, Escape, a filter picked inside it — pops the entry again so Back does
-    // not later land on a layer that is no longer there.
     // The row the phone's layer showed last stays marked; a new search starts the list over.
     effect(() => {
       const id = this.store.selectedId();
@@ -391,22 +450,79 @@ export class EventsComponent implements OnInit {
     effect(() => {
       if (this.store.loading()) untracked(() => this.lastViewedId.set(null));
     });
+    // The phone's sheets belong to the phone layout: a turn into the tablet's width leaves the
+    // drawer and the Signals panel in their own shapes, and the sheets gone.
     effect(() => {
-      const open = this.viewport.phone() && !!this.store.selectedEvent();
+      if (this.viewport.phone()) return;
       untracked(() => {
-        if (open && !this.detailHistoryPushed) {
-          history.pushState({ ameto: 'event-detail' }, '');
-          this.detailHistoryPushed = true;
-        } else if (!open && this.detailHistoryPushed) {
-          this.detailHistoryPushed = false;
+        if (this.store.filterSheetOpen()) this.store.closeFilterSheet();
+        if (this.messageSheetEvent()) this.messageSheetEvent.set(null);
+      });
+    });
+    // The layer's history entry (see layerEntry): pushed when the layer opens, popped when it
+    // closes any way but Back. A turn into the tablet's width closes the "layer" as well — the
+    // drawer stays, the entry goes — so Back there leaves the page, as the tablet's always has.
+    effect(() => {
+      const ev = this.viewport.phone() ? this.store.selectedEvent() : null;
+      untracked(() => {
+        if (ev && !this.layerEntry) {
+          history.pushState({ ameto: LAYER_STATE, id: ev.id }, '');
+          this.layerEntry = true;
+        } else if (!ev && this.layerWasOpen && this.layerEntry) {
+          // Closed any way but Back — Back has dropped the flag already (onPopState). Only a layer
+          // that WAS open: created on the layer's entry, the page holds the entry with no layer
+          // yet, until the first answer decides what becomes of it (restoreLayerId).
+          this.layerEntry = false;
+          history.back();
+        }
+        this.layerWasOpen = !!ev;
+      });
+    });
+    // Created on the layer's entry (F5, or Back from the page the bottom bar went to): the first
+    // answer brings the layer back when it holds the event, and otherwise drops the entry rather
+    // than leave a Back that does nothing.
+    effect(() => {
+      const id = this.restoreLayerId();
+      if (id === null || this.store.loading()) return;
+      untracked(() => {
+        this.restoreLayerId.set(null);
+        if (this.store.events().some(ev => ev.id === id)) {
+          this.store.selectEvent(id);
+        } else {
+          this.layerEntry = false;
           history.back();
         }
       });
+    });
+    // The Router follows Back and Forward to the entry's URL, which is the URL of the moment the
+    // entry was made: a load that completed under the open layer rewrote the layer's entry, not
+    // the one before it. The store reads the URL once, on init, so what is on screen does not
+    // change; the address is rewritten to it instead, after the Router's own navigation. That
+    // same rewrite by the Router (replaceUrl) drops the mark from the layer's entry: put back.
+    inject(Router).events.pipe(takeUntilDestroyed()).subscribe(e => {
+      if (e instanceof NavigationStart) {
+        this.popNavigation = e.navigationTrigger === 'popstate';
+      } else if (e instanceof NavigationEnd) {
+        if (this.popNavigation) {
+          this.popNavigation = false;
+          this.store.syncUrl();
+        } else if (this.layerEntry) {
+          stampLayerEntry(this.store.selectedId());
+        }
+      } else if (e instanceof NavigationCancel || e instanceof NavigationError || e instanceof NavigationSkipped) {
+        this.popNavigation = false;
+      }
     });
   }
 
   ngOnInit(): void {
     this.store.initFromUrl();
+    // Created on the layer's own entry (see layerEntry): the first answer decides what becomes of it.
+    const layerId = this.viewport.phone() ? layerEventId(history.state) : null;
+    if (layerId !== null) {
+      this.layerEntry = true;
+      this.restoreLayerId.set(layerId);
+    }
     document.addEventListener('visibilitychange', this.onVisibility);
     window.addEventListener('popstate', this.onPopState);
     this.destroyRef.onDestroy(() => {
@@ -457,6 +573,16 @@ export class EventsComponent implements OnInit {
     // not a second mechanism running alongside it.
     this.store.setFollow(head);
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) this.store.loadMore();
+  }
+
+  /** The key of the first EVENT row at or under the list's top edge, in the layout being left. */
+  private topRowKey(): string | undefined {
+    const offset = this.virtualizer.scrollOffset() ?? 0;
+    for (const item of this.virtualizer.getVirtualItems()) {
+      if (item.end <= offset) continue;
+      if (typeof item.key === 'string' && !item.key.startsWith(DAY_KEY_PREFIX)) return item.key;
+    }
+    return undefined;
   }
 
   scrollToOlderLogs(): void {

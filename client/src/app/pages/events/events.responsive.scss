@@ -55,11 +55,88 @@
 // with day separators, a 28px footer, the detail as a layer, everything else a sheet.
 // ═════════════════════════════════════════════════════════════════════════════
 @include bp.below(bp.$bp-sm) {
-  // The toolbar's recent-searches overlay is positioned against the page.
-  .events-page { position: relative; }
+  // Anchors the recent-searches overlay below.
+  .events-body { position: relative; }
 
   // The list sits under a 1px rule (design: the strip's bottom edge); its rows have no header.
   .events-list-wrap { border-top: 1px solid var(--border); }
+
+  // ── Recent searches: over the list while the search field has focus ──────────────────────
+  // The body's whole box (events.html): it begins where the toolbar's strip ends, so a field
+  // grown to two or three lines moves the strip and this with it. Above the list's pill and
+  // sticky day (z 2), under the layer (50) and the sheets (70).
+  .ph-recent {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    overflow-y: auto;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    font-family: var(--ui);
+  }
+  .ph-recent-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 32px;
+    padding: 0 12px;
+  }
+  .ph-recent-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--txt-dim);
+  }
+  .ph-recent-sum {
+    font-size: 10.5px;
+    color: var(--txt-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .ph-recent-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 44px;
+    padding: 0 6px 0 12px;
+    border-bottom: 1px solid var(--border-sub);
+    cursor: pointer;
+  }
+  .ph-recent-lead { color: var(--txt-dim); flex-shrink: 0; }
+  .ph-recent-lead.pinned { color: var(--accent); }
+  .ph-recent-q {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--txt-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ph-recent-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius);
+    background: none;
+    color: var(--txt-dim);
+    cursor: pointer;
+  }
+  .ph-recent-empty {
+    padding: 16px 12px;
+    font-size: var(--fs-sm);
+    color: var(--txt-dim);
+    text-align: center;
+  }
 
   // ── Day separator ────────────────────────────────────────────────────────
   // 24px: the date in 10.5px / 600 tabular small caps on --surface, a rule to the right edge.

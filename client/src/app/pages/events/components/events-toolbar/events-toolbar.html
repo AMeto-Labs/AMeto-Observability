@@ -69,26 +69,8 @@
         <lucide-icon name="corner-down-left" [size]="13" />
       </button>
     </div>
-    <div class="ph-recent" (mousedown)="$event.preventDefault()">
-      <div class="ph-recent-hdr">
-        <span class="ph-recent-title"><lucide-icon name="history" [size]="12" />Recent searches</span>
-        <span class="ph-recent-sum">{{ phoneRecentSummary() }}</span>
-      </div>
-      @for (h of phoneRecent(); track h.q) {
-        <div class="ph-recent-row" role="button" tabindex="0" (click)="applyRecent(h.q)" (keydown.enter)="applyRecent(h.q)">
-          <lucide-icon [name]="h.pinned ? 'pin' : 'clock'" [size]="13" [strokeWidth]="1.8" class="ph-recent-lead" [class.pinned]="h.pinned" />
-          <span class="ph-recent-q">{{ h.q }}</span>
-          <button type="button" class="ph-recent-btn" [attr.aria-label]="h.pinned ? 'Unpin search' : 'Pin search'" (click)="pinRecent(h.q, !h.pinned, $event)">
-            <lucide-icon [name]="h.pinned ? 'pin-off' : 'pin'" [size]="12" [strokeWidth]="1.8" />
-          </button>
-          <button type="button" class="ph-recent-btn" aria-label="Remove from history" (click)="removeRecent(h.q, $event)">
-            <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
-          </button>
-        </div>
-      } @empty {
-        <div class="ph-recent-empty">No searches yet</div>
-      }
-    </div>
+    <!-- The recent searches under the strip are the page's (events.html, .ph-recent): they fill
+         the list's box, so they start under the strip whatever height the field has grown to. -->
   } @else if (store.isAggregation()) {
     <!-- The chips mean nothing to a table: the note the filter bar shows wider. -->
     <div class="ph-strip ph-agg-note">

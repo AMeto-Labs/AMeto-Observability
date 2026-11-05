@@ -1,6 +1,7 @@
 // The phone's top of the Logs page (design canvas, "Телефон — список логов", "— поиск в фокусе",
 // "— агрегация"): the 48px header, the search row, the chip strip and, with the field in focus,
-// the suggestion strip and the recent searches. The markup exists below 640px only
+// the suggestion strip (the recent searches under it are the page's: events.responsive.scss).
+// The markup exists below 640px only
 // (events-toolbar.html), so these rules need no media query of their own; the breakpoint is
 // the one events-toolbar.ts reads through ViewportService. Its own stylesheet to keep the
 // desktop bar's within the per-stylesheet style budget.
@@ -275,83 +276,4 @@
   height: 18px;
   background: var(--border);
   flex-shrink: 0;
-}
-
-// ── Recent searches: over the list while the field has focus ────────────────────────────────
-// 136px: the header (48), the search row (52) and the suggestion strip (36). The page is
-// position: relative on a phone (events.responsive.scss).
-.ph-recent {
-  position: absolute;
-  top: 136px;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 5;
-  overflow-y: auto;
-  background: var(--bg);
-  border-top: 1px solid var(--border);
-  font-family: var(--ui);
-}
-.ph-recent-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 32px;
-  padding: 0 12px;
-}
-.ph-recent-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--fs-2xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  color: var(--txt-dim);
-}
-.ph-recent-sum {
-  font-size: 10.5px;
-  color: var(--txt-dim);
-  font-variant-numeric: tabular-nums;
-}
-.ph-recent-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 44px;
-  padding: 0 6px 0 12px;
-  border-bottom: 1px solid var(--border-sub);
-  cursor: pointer;
-}
-.ph-recent-lead { color: var(--txt-dim); flex-shrink: 0; }
-.ph-recent-lead.pinned { color: var(--accent); }
-.ph-recent-q {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
-  color: var(--txt-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.ph-recent-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  flex-shrink: 0;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius);
-  background: none;
-  color: var(--txt-dim);
-  cursor: pointer;
-}
-.ph-recent-empty {
-  padding: 16px 12px;
-  font-size: var(--fs-sm);
-  color: var(--txt-dim);
-  text-align: center;
 }

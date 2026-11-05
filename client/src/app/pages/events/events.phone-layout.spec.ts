@@ -1,11 +1,14 @@
 import { TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection, signal } from '@angular/core';
-import { provideRouter } from '@angular/router';
-import { NEVER, of } from 'rxjs';
+import {
+  NavigationEnd, NavigationStart, Router, provideRouter, type Event as RouterEvent,
+} from '@angular/router';
+import { NEVER, Subject, of } from 'rxjs';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
-  DAY_SEPARATOR_H, EventsComponent, PHONE_ROW_ESTIMATE, isDaySeparator, withDaySeparators,
+  DAY_SEPARATOR_H, EventsComponent, PHONE_ROW_ESTIMATE, dayOf, isDaySeparator, layerEventId,
+  withDaySeparators,
 } from './events';
 import { ApiService } from '../../core/services/api.service';
 import { ViewportService } from '../../core/services/viewport.service';
@@ -38,7 +41,7 @@ const viewport = (phone: boolean, tablet = false) => ({
   phone: signal(phone), tablet: signal(tablet), coarse: signal(phone),
 });
 
-const render = async (vp: ReturnType<typeof viewport>, rows: EventDto[]) => {
+const mount = async (vp: ReturnType<typeof viewport>, rows: EventDto[]) => {
   TestBed.configureTestingModule({
     providers: [
       provideZonelessChangeDetection(),
@@ -52,12 +55,23 @@ const render = async (vp: ReturnType<typeof viewport>, rows: EventDto[]) => {
   });
   const fixture = TestBed.createComponent(EventsComponent);
   await fixture.whenStable();
-  return fixture.componentInstance;
+  return { fixture, page: fixture.componentInstance };
 };
+
+const render = async (vp: ReturnType<typeof viewport>, rows: EventDto[]) => (await mount(vp, rows)).page;
 
 afterEach(() => {
   TestBed.resetTestingModule();
   vi.useRealTimers();
+  vi.restoreAllMocks();
+  history.replaceState(null, '');
+});
+
+describe('dayOf', () => {
+  it('writes the local calendar day, zero-padded, of a Date or an ISO instant', () => {
+    expect(dayOf(new Date(2026, 0, 7, 23, 59))).toBe('2026-01-07');
+    expect(dayOf(new Date(2026, 10, 25, 0, 0).toISOString())).toBe('2026-11-25');
+  });
 });
 
 describe('withDaySeparators', () => {
@@ -137,5 +151,129 @@ describe('Events page on a phone — the virtual list', () => {
     expect(page.svcCol()).toBe('120px');
     expect(page.drawerWidth()).toBeNull();
     expect(page.measured()).toBe(false);
+  });
+});
+
+describe('Events page on a phone — what belongs to the phone layout', () => {
+  const rows = [ev('a', new Date(2026, 10, 5, 9, 0)), ev('c', new Date(2026, 10, 4, 23, 59))];
+
+  it('marks the last-viewed row on the phone alone; a turn into the tablet drops the mark and the sheets', async () => {
+    vi.spyOn(history, 'back').mockImplementation(() => {});
+    const vp = viewport(true);
+    const { fixture, page } = await mount(vp, rows);
+    page.store.selectEvent('a');
+    await fixture.whenStable();
+    page.store.selectEvent(null);
+    await fixture.whenStable();
+    expect(page.lastViewedId()).toBe('a');
+    expect(page.lastViewedMark()).toBe('a');
+
+    page.store.openFilterSheet();
+    page.openMessageSheet(rows[1]);
+    vp.phone.set(false);
+    vp.tablet.set(true);
+    await fixture.whenStable();
+    expect(page.lastViewedMark()).toBeNull();
+    expect(page.store.filterSheetOpen()).toBe(false);
+    expect(page.messageSheetEvent()).toBeNull();
+  });
+});
+
+describe('Events page on a phone — the event layer in the history', () => {
+  const rows = [ev('a', new Date(2026, 10, 5, 9, 0)), ev('c', new Date(2026, 10, 4, 23, 59))];
+  const entry = (id: string) => ({ ameto: 'event-detail', id });
+
+  it('reads the layer\'s mark off an entry\'s state', () => {
+    expect(layerEventId(entry('a'))).toBe('a');
+    expect(layerEventId({ ameto: 'event-detail' })).toBeNull();
+    expect(layerEventId({ navigationId: 3 })).toBeNull();
+    expect(layerEventId(null)).toBeNull();
+  });
+
+  it('pushes a marked entry when the layer opens and pops it when the layer closes any other way', async () => {
+    const push = vi.spyOn(history, 'pushState');
+    const back = vi.spyOn(history, 'back').mockImplementation(() => {});
+    const { fixture, page } = await mount(viewport(true), rows);
+
+    page.store.selectEvent('a');
+    await fixture.whenStable();
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(push).toHaveBeenCalledWith(entry('a'), '');
+    expect(back).not.toHaveBeenCalled();
+
+    page.store.selectEvent(null);
+    await fixture.whenStable();
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(push).toHaveBeenCalledTimes(1);
+  });
+
+  it('Back closes the layer without a second back; Forward onto the entry opens it again', async () => {
+    const push = vi.spyOn(history, 'pushState');
+    const back = vi.spyOn(history, 'back').mockImplementation(() => {});
+    const { fixture, page } = await mount(viewport(true), rows);
+    page.store.selectEvent('a');
+    await fixture.whenStable();
+
+    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    expect(page.store.selectedId()).toBeNull();
+    await fixture.whenStable();
+    expect(back).not.toHaveBeenCalled();
+
+    window.dispatchEvent(new PopStateEvent('popstate', { state: entry('c') }));
+    expect(page.store.selectedId()).toBe('c');
+    await fixture.whenStable();
+    expect(push).toHaveBeenCalledTimes(1);
+
+    // An entry whose event is no longer listed stays a plain one.
+    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    await fixture.whenStable();
+    window.dispatchEvent(new PopStateEvent('popstate', { state: entry('gone') }));
+    expect(page.store.selectedId()).toBeNull();
+  });
+
+  it('created on the layer\'s entry, brings the layer back with the first answer — or drops the entry', async () => {
+    const back = vi.spyOn(history, 'back').mockImplementation(() => {});
+    history.replaceState(entry('c'), '');
+    const { fixture, page } = await mount(viewport(true), rows);
+    await fixture.whenStable();
+    expect(page.store.selectedId()).toBe('c');
+    expect(back).not.toHaveBeenCalled();
+    TestBed.resetTestingModule();
+
+    history.replaceState(entry('gone'), '');
+    const second = await mount(viewport(true), rows);
+    await second.fixture.whenStable();
+    expect(second.page.store.selectedId()).toBeNull();
+    expect(back).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a desktop no entry is pushed', async () => {
+    const push = vi.spyOn(history, 'pushState');
+    const { fixture, page } = await mount(viewport(false), rows);
+    page.store.selectEvent('a');
+    await fixture.whenStable();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it('rewrites the URL after the Router followed Back to an entry older than the state', async () => {
+    const { fixture, page } = await mount(viewport(true), rows);
+    const router = TestBed.inject(Router);
+    const navigate = vi.spyOn(router, 'navigate').mockResolvedValue(true);
+    const events = router.events as Subject<RouterEvent>;
+
+    // The Router's own navigation: nothing to put right.
+    events.next(new NavigationStart(1, '/logs?filter=new', 'imperative'));
+    events.next(new NavigationEnd(1, '/logs?filter=new', '/logs?filter=new'));
+    expect(navigate).not.toHaveBeenCalled();
+
+    // Back landed on the entry made before the last search: the address is the store's again.
+    events.next(new NavigationStart(2, '/logs?filter=old', 'popstate'));
+    events.next(new NavigationEnd(2, '/logs?filter=old', '/logs?filter=old'));
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith([], expect.objectContaining({
+      replaceUrl: true,
+      queryParams: expect.objectContaining({ filter: page.store.filter() || null }),
+    }));
+    await fixture.whenStable();
   });
 });

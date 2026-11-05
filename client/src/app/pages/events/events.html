@@ -9,6 +9,34 @@
 
   <!-- ── Main body ────────────────────────────────────────────────────── -->
   <div class="events-body">
+    <!-- The phone's recent searches while the search field has focus (design canvas, "Телефон —
+         поиск в фокусе"): over the list, in the body's box, so they start under the toolbar's
+         strip whatever height the field has grown to. The toolbar owns the field, the focus and
+         the history; this is where its list is drawn. -->
+    @if (toolbar(); as tb) {
+      @if (viewport.phone() && tb.phoneFocused()) {
+        <div class="ph-recent" (mousedown)="$event.preventDefault()">
+          <div class="ph-recent-hdr">
+            <span class="ph-recent-title"><lucide-icon name="history" [size]="12" />Recent searches</span>
+            <span class="ph-recent-sum">{{ tb.phoneRecentSummary() }}</span>
+          </div>
+          @for (h of tb.phoneRecent(); track h.q) {
+            <div class="ph-recent-row" role="button" tabindex="0" (click)="tb.applyRecent(h.q)" (keydown.enter)="tb.applyRecent(h.q)">
+              <lucide-icon [name]="h.pinned ? 'pin' : 'clock'" [size]="13" [strokeWidth]="1.8" class="ph-recent-lead" [class.pinned]="h.pinned" />
+              <span class="ph-recent-q">{{ h.q }}</span>
+              <button type="button" class="ph-recent-btn" [attr.aria-label]="h.pinned ? 'Unpin search' : 'Pin search'" (click)="tb.pinRecent(h.q, !h.pinned, $event)">
+                <lucide-icon [name]="h.pinned ? 'pin-off' : 'pin'" [size]="12" [strokeWidth]="1.8" />
+              </button>
+              <button type="button" class="ph-recent-btn" aria-label="Remove from history" (click)="tb.removeRecent(h.q, $event)">
+                <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
+              </button>
+            </div>
+          } @empty {
+            <div class="ph-recent-empty">No searches yet</div>
+          }
+        </div>
+      }
+    }
     <div class="events-list-wrap" [style.--svc-col]="svcCol()">
       <!-- Column headers — for the EVENT list. An aggregation's columns are whatever its
            query asked for, so it brings its own header; the phone's two-line rows have no
@@ -94,7 +122,7 @@
               } @else if (asEvent(item); as ev) {
                 <app-event-list-row
                   [event]="ev"
-                  [selected]="ev.id === store.selectedId() || ev.id === lastViewedId()"
+                  [selected]="ev.id === store.selectedId() || ev.id === lastViewedMark()"
                   [wrap]="store.wrapMessages()"
                   [phone]="viewport.phone()"
                   [dateless]="viewport.tablet()"
