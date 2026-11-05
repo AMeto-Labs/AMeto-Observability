@@ -1,3 +1,4 @@
+using K4os.Compression.LZ4;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using MessagePack;
@@ -694,6 +695,40 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// every span to get there.</para>
     /// </summary>
     internal static long CompactionThresholdBytesFor(long mergeBudgetBytes) => mergeBudgetBytes / 2;
+
+    /// <summary>
+    /// The LZ4 level a flush of <paramref name="spanCount"/> spans in <paramref name="traceCount"/>
+    /// traces, weighing <paramref name="weightBytes"/> read back (<see cref="ReadBackBytesOf"/>), is
+    /// written at. <see cref="SpanWriter.FlushLevel"/> when the compaction planner will take the
+    /// segment: its cheaper compression is paid only until the merge rewrites the file at
+    /// <see cref="SpanWriter.MergeLevel"/>. <see cref="SpanWriter.MergeLevel"/> when it will not,
+    /// because then the flush's file IS the final file and would keep the cheaper level until
+    /// retention. "Will not" is the planner's own candidate test, asked here with the weight the
+    /// flush is about to publish: a streaming pass (<see cref="SelectStreamingBatch"/>) refuses a
+    /// segment whose block and output-side state reach half of what a pass may spend on them, a
+    /// materialising pass (<see cref="SelectCompactionBatch"/>) one at or past
+    /// <see cref="CompactionThresholdBytesFor"/>. Rows are priced as the traces, which is what the
+    /// <c>.tracesum</c> the flush writes will hold (a long trace takes two) and what the planner reads
+    /// off that sidecar later. On the 512 MB stand (24 MB pass budget) this is what tells a full flush
+    /// of short traces, which settles on its own, from one the hourly merge will fold.
+    /// </summary>
+    internal static LZ4Level FlushLevelFor(int spanCount, int traceCount, long weightBytes, long mergeBudgetBytes, bool streaming)
+    {
+        var asSegment = new SpanSegmentInfo { SpanCount = spanCount, FormatVersion = SpanWriter.DefaultVersion }
+            .WithWeight(weightBytes);
+        bool settles;
+        if (streaming)
+        {
+            long available = mergeBudgetBytes - StreamedFixedBytes(mergeBudgetBytes);
+            settles = available <= 0
+                   || StreamedBlockBytes(asSegment) + StreamedStateBytes(asSegment, traceCount) >= available / 2;
+        }
+        else
+        {
+            settles = EstimatedSegmentBytes(asSegment) >= CompactionThresholdBytesFor(mergeBudgetBytes);
+        }
+        return settles ? SpanWriter.MergeLevel : SpanWriter.FlushLevel;
+    }
 
     // ── THE THRESHOLD AND THE PASS CAP, AS THEY WERE WRITTEN — in spans. Kept because the byte budgets above
     // inherit every constraint these taught, and CompactionThresholdTests still speaks in them: on a host whose
@@ -2508,6 +2543,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             Task? inflight;
             List<SpanRecord>?     snapshot   = null;
             TaskCompletionSource? inlineDone = null;
+            int                   traces     = 0;
             _lock.EnterWriteLock();
             try
             {
@@ -2523,6 +2559,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     // _flushInProgress set with no task to wait on and nothing to complete it —
                     // this very loop then spun on it for ever. See TakeSnapshotLocked.
                     var done   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    traces     = _traceIdx.Count;
                     snapshot   = TakeSnapshotLocked();
                     inlineDone = done;
                     _flushTask = done.Task;
@@ -2533,7 +2570,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             if (snapshot is not null)
             {
                 // On this thread — the caller wants it durable NOW.
-                try     { CompleteFlush(snapshot); }
+                try     { CompleteFlush(snapshot, traces); }
                 finally { inlineDone!.TrySetResult(); }
                 return;
             }
@@ -2670,12 +2707,13 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         try
         {
             var snapshot   = _hotSpans;
+            int traces     = _traceIdx.Count;
             var nextTier   = new List<SpanRecord>();
             var nextStarts = new SpanStartIndex(nextTier, _hotStarts);   // continues where this tier's left off
             var nextNames  = _pools.CreateNamePool();
             var flush      = new Task(() =>
             {
-                try     { CompleteFlush(snapshot); }
+                try     { CompleteFlush(snapshot, traces); }
                 finally { EndHeavyPhase(); }
             }, TaskCreationOptions.DenyChildAttach);            // what Task.Run passes
 
@@ -2708,7 +2746,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// every span of it (Abandon keeps its generation live), so nothing is lost and the
     /// next due-check retries.
     /// </summary>
-    private void CompleteFlush(List<SpanRecord> snapshot)
+    private void CompleteFlush(List<SpanRecord> snapshot, int traceCount)
     {
         SpanSegmentInfo? info    = null;
         Exception?       failure = null;
@@ -2728,15 +2766,20 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             // still held the same spans, which the stats, service-graph and volume paths add to
             // the cold tiers without de-duplicating. Narrow (microseconds, once per process) and
             // free to close.
+            // Weighed while the spans are still at hand — the compaction planner prices this segment
+            // by what it holds rather than by its span count — and the weight decides the LZ4 level
+            // too: a flush the planner would never take is written at the merge level, since no
+            // merge will rewrite it (FlushLevelFor); every other flush at the flush level.
+            long weight = ReadBackBytesOf(CollectionsMarshal.AsSpan(snapshot));
+            var  level  = FlushLevelFor(snapshot.Count, traceCount, weight, _mergeBudgetBytes, _streamingCompaction);
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
                                     // No index, no refs: a v4 flush then builds and sorts none at all.
                                     onTraceIndex: _indexEnabled ? pairs => traceIndex = pairs : null,
                                     version:      _segmentVersion,
-                                    scratch:      _writeScratch);
-            // Weighed while the spans are still at hand, so the compaction planner prices this
-            // segment by what it holds rather than by its span count.
-            info = info.WithWeight(ReadBackBytesOf(CollectionsMarshal.AsSpan(snapshot)));
+                                    scratch:      _writeScratch,
+                                    level:        level);
+            info = info.WithWeight(weight);
         }
         catch (Exception ex) { failure = ex; }
 

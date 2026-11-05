@@ -88,6 +88,13 @@ public sealed class TraceFlushProbe : IDisposable
 
     // ── The golden constants ────────────────────────────────────────────────────
     //
+    // RE-RECORDED AGAIN FOR THE FLUSH'S LZ4 LEVEL (L09_HC → L03_HC, SpanWriter.FlushLevel), the two
+    // .trc constants only: 415 544 → 423 433 B (v3) and 354 149 → 361 597 B (v4); the three sidecars
+    // did not move. The block CONTENT is what it was — only its compression changed — and that is
+    // proved twice over: The_flush_changes_nothing_but_the_bloom_index writes at L09_HC explicitly and
+    // still lands on the pre-#86 constants, and Lz4_level_of_the_flush_blocks_measured inflates the
+    // L03_HC sections and re-pickles them at L09_HC to exactly the old on-disk total (402 755 B).
+    //
     // THE TWO .trc CONSTANTS WERE RE-RECORDED FOR #86, DELIBERATELY, AND ONLY THOSE TWO. The bloom
     // index changed format: its values are hashed from a culture-invariant, case-folded text taken
     // straight off the blob's bytes (SpanBloom), and the section is now empty legacy slots, the
@@ -104,11 +111,11 @@ public sealed class TraceFlushProbe : IDisposable
     // and read D1BD639A… and FBFA3819…, because the old bloom hashed `value.ToString()` in the
     // CURRENT culture.
 
-    private const string V3Trc      = "8B8066F8B9418B62903432641EADBEEDAAF4FD7F80996BD3236A260FB99E4178";
+    private const string V3Trc      = "00F9CD6748CC1D7216C31B0B52CE705F952BE62F6056C0197B0F8C3472EF4DF5";
     private const string V3Stats    = "FAF48AB485397E0F3B65E3ADCE5413D6B8702E8AB8E3A044214D5CD0CB79C423";
     private const string V3SvcGraph = "44BE43D931468E9C74F5177BA89CAA5D252FA87FDF744AA98BA4F848C56C5A9F";
     private const string V3TraceSum = "BB5C2FD272B3D86F3DB50870847F530601D234AE373A33D4AD0FD524FA54C773";
-    private const string V4Trc      = "0FEAA5E8BD06A15F738E90580E2EB536E2022B40A83BD7C273007B59DABFAEB4";
+    private const string V4Trc      = "23902230D445D73F14AEA529049D6E6E37B296E9FE6EDFF362CA1717301FEA1D";
 
     /// <summary>The pre-#86 <c>.trc</c> constants, as recorded under the invariant culture.</summary>
     private const string Pre86V3Trc = "81564E1FC2731519ABB87046EAB30D2EE23DDF5B7C96839261009FFDB992AA11";
@@ -171,6 +178,11 @@ public sealed class TraceFlushProbe : IDisposable
     /// included) exactly as the one it replaced: a different verdict copies different bytes into the
     /// block. It also certifies <see cref="LegacySpanBloom"/> as the old writer, which is what the
     /// legacy-read tests in <c>SpanBloomCanonicalTests</c> stand on.
+    ///
+    /// <para>WRITTEN AT <c>LZ4Level.L09_HC</c> EXPLICITLY. The flush moved to <see cref="SpanWriter.FlushLevel"/>
+    /// (L03_HC) after the constants were recorded, and a block pickled at another level is other
+    /// bytes; passing the old level keeps the fact provable — everything outside the bloom is still
+    /// the old writer's output, byte for byte.</para>
     /// </summary>
     [Theory]
     [InlineData(3, Pre86V3Trc)]
@@ -179,7 +191,7 @@ public sealed class TraceFlushProbe : IDisposable
     {
         string dir  = NewDir($"pre86-v{version}");
         var corpus  = BuildCorpus();
-        string trc  = UnderCulture("ru-KZ", () => SpanWriter.Write(dir, corpus, version: version).FilePath);
+        string trc  = UnderCulture("ru-KZ", () => SpanWriter.Write(dir, corpus, version: version, level: LZ4Level.L09_HC).FilePath);
 
         LegacySpanBloom.Rewrite(trc, corpus, culture: "");
         string sha = Sha(trc);
@@ -653,30 +665,62 @@ public sealed class TraceFlushProbe : IDisposable
     }
 
     /// <summary>
-    /// TS#7(g), MEASURED AND NOT ADOPTED. The plan's instruction was "measure the file-size delta
-    /// first; do not adopt blind": the flush compresses every span block (and v3's trace-index
-    /// block) at <c>LZ4Level.L09_HC</c>, and the proposal was L03_HC for the flush — on the critical
-    /// path for releasing tier memory — keeping HC for compaction. This is the measurement, kept so
-    /// the decision can be re-taken on numbers rather than re-argued.
+    /// <see cref="SpanWriter.Write"/> picks the level from the path when none is given — the flush
+    /// level for a recoverable flush, the merge level for a merge (<c>recoverable: false</c>) — so a
+    /// merge cannot be written at the flush level by a forgotten argument. Pinned on the bytes: a
+    /// write with the default and a write with the level spelled out are the same file.
+    /// </summary>
+    [Fact]
+    public void The_default_level_follows_the_path_a_flush_or_a_merge()
+    {
+        var corpus = BuildCorpus();
+        string flush        = SpanWriter.Write(NewDir("level-flush"), corpus).FilePath;
+        string merge        = SpanWriter.Write(NewDir("level-merge"), corpus, recoverable: false).FilePath;
+        string atFlushLevel = SpanWriter.Write(NewDir("level-flush-explicit"), corpus, level: SpanWriter.FlushLevel).FilePath;
+        string atMergeLevel = SpanWriter.Write(NewDir("level-merge-explicit"), corpus, level: SpanWriter.MergeLevel).FilePath;
+
+        Assert.Equal(Sha(atFlushLevel), Sha(flush));
+        Assert.Equal(Sha(atMergeLevel), Sha(merge));
+        Assert.NotEqual(Sha(flush), Sha(merge));   // the two levels are different bytes on this corpus
+    }
+
+    /// <summary>
+    /// TS#7(g), MEASURED TWICE AND ADOPTED THE SECOND TIME. The flush used to compress every span
+    /// block (and v3's trace-index block) at <c>LZ4Level.L09_HC</c>; the plan's instruction was
+    /// "measure the file-size delta first; do not adopt blind". The first measurement was of size
+    /// alone — L03_HC cost +1,9-2,1 % on the golden corpus, +1,3 % on the varied one and +7,1 % on the
+    /// resource-shaped one — and the flush stayed at L09_HC. The second added the CPU side, from the
+    /// rows below: the compressor alone takes 1,6 µs a span at L09_HC against 0,7 at L03_HC on the
+    /// golden corpus (5,7 against 2,8 on the varied one, 1,9 against 0,7 on the resource-shaped one),
+    /// and on the golden 12 000-span flush that 1,6 µs is close to half of the flush's ~3,6 µs a span
+    /// (<see cref="Flush_cost_per_span"/>). So the flush now writes at <see cref="SpanWriter.FlushLevel"/>
+    /// (L03_HC), on the premise that a merge rewrites the file at the merge level once it is past the
+    /// planner's one-hour minimum age; where that premise fails — a flush the planner would never
+    /// take — the engine writes at the merge level instead (<c>TraceStorageEngine.FlushLevelFor</c>,
+    /// pinned in <c>FlushLevelByFateTests</c>). A merge stays at <see cref="SpanWriter.MergeLevel"/>
+    /// (L09_HC): the rows put L06_HC at +0,04-1,2 % of its size for 1,2-1,5× its rate — not worth it
+    /// on a file that lives until retention. This is the measurement, kept so the decision can be
+    /// re-taken on numbers rather than re-argued.
     ///
     /// <para>Measured on the writer's OWN bytes rather than a model of them: the segment is written
     /// as a flush writes it, every LZ4 section is read back out of the file and inflated, and each
     /// is re-pickled at every candidate level. So the sizes are exactly what that level puts on disk
     /// for the corpus, section for section, and the times are the compressor's alone (best of three
-    /// passes; K4os ships Release-built, so this holds in a Debug test run too).</para>
+    /// passes; K4os ships Release-built, so this holds in a Debug test run too). The percentage is
+    /// against the file as the flush now writes it.</para>
     ///
     /// <para>THREE CORPORA, because the answer depends on the data. The golden one is synthetic and
     /// repetitive. The varied one gives every span its own statement parameters, a 32-hex-digit URL
     /// id, a user id, a latency and a port — high entropy, where HC's search is most expensive and
     /// finds least. The resource-shaped one is the stored shape <c>SpanFormatV3Tests</c> uses —
     /// resource attributes merged onto EVERY span, a route per root — and it is where the levels
-    /// part: long matches repeated across spans are what L09_HC's deeper search exists to find.
-    /// MEASURED: L03_HC is +1,9-2,1 % on the golden corpus and +1,3 % on the varied one, but +7,1 %
-    /// on the resource-shaped one, which also pushed <c>V3_IsMuchSmallerThanV2</c> over its bound.
-    /// Material, so the flush stays at L09_HC.</para>
+    /// part: long matches repeated across spans are what the deeper HC search exists to find.</para>
     ///
-    /// <para>A PROBE, NOT A GATE: the only assertion is that the instrument reads the file it
-    /// measures (L09_HC re-pickled is what is on disk).</para>
+    /// <para>A PROBE WITH TWO GATES, both on bytes, which do not move between runs: that the
+    /// instrument reads the file it measures (the <see cref="SpanWriter.FlushLevel"/> row re-pickled
+    /// is what is on disk), and that the flush level costs no more than a tenth of a file over
+    /// L09_HC on any of the three corpora — the bound the decision rests on, with the resource-shaped
+    /// corpus at +7,1 % the closest to it. The times are printed, never asserted.</para>
     /// </summary>
     [Fact]
     public void Lz4_level_of_the_flush_blocks_measured()
@@ -689,7 +733,7 @@ public sealed class TraceFlushProbe : IDisposable
 
     private void MeasureLz4Levels(string corpusName, List<SpanRecord> corpus)
     {
-        LZ4Level[] levels = [LZ4Level.L09_HC, LZ4Level.L03_HC, LZ4Level.L00_FAST];
+        LZ4Level[] levels = [LZ4Level.L09_HC, LZ4Level.L06_HC, LZ4Level.L03_HC, LZ4Level.L00_FAST];
         int n = corpus.Count;
 
         string trc = SpanWriter.Write(NewDir($"lz4-{corpusName}-{n}"), corpus).FilePath;
@@ -698,7 +742,8 @@ public sealed class TraceFlushProbe : IDisposable
 
         _out.WriteLine($"{corpusName} {n:N0} spans: {raws.Count} LZ4 sections (span blocks + trace index), "
                      + $"{onDisk:N0} B of a {fileBytes:N0} B .trc");
-        long hcBytes = 0;
+        long flushBytes = 0;
+        long l09Bytes   = 0;
         foreach (var level in levels)
         {
             long bytes  = 0;
@@ -712,15 +757,19 @@ public sealed class TraceFlushProbe : IDisposable
                 bytes = b;
                 best  = Math.Min(best, sw.Elapsed.TotalMicroseconds);
             }
-            if (level == LZ4Level.L09_HC) hcBytes = bytes;
+            if (level == SpanWriter.FlushLevel) flushBytes = bytes;
+            if (level == LZ4Level.L09_HC)       l09Bytes   = bytes;
 
-            long file = fileBytes - hcBytes + bytes;
+            long file = fileBytes - onDisk + bytes;
             _out.WriteLine($"  {level,-9} {bytes,11:N0} B  .trc {file,11:N0} B "
                          + $"({(file - fileBytes) * 100.0 / fileBytes,5:+0.0;-0.0} %)  "
                          + $"{best / 1000.0,7:N1} ms  {best / n,5:N2} us/span");
         }
 
-        Assert.Equal(onDisk, hcBytes);
+        Assert.Equal(onDisk, flushBytes);
+        // THE PREMISE'S BOUND: the flush level may cost at most a tenth of a file over L09_HC on any shape.
+        Assert.True(flushBytes * 10 <= l09Bytes * 11,
+            $"{corpusName}: FlushLevel puts {flushBytes:N0} B on disk against {l09Bytes:N0} B at L09_HC — past the +10 % the decision rests on");
     }
 
     /// <summary>

@@ -69,12 +69,20 @@ public sealed class FlushCpuProbe
         _out.WriteLine($"    managed ceiling     ~{width * perFlush / (long)MB,8:N0} MB  (budget {managedBudget / (long)MB} MB)");
         _out.WriteLine($"    native  ceiling     ~{slots * tierNative / (long)MB,8:N0} MB  (budget {nativeBudget / (long)MB} MB)");
 
-        // Cost of the maintenance GC that StorageEngine.ReleaseMaintenanceMemory forces.
+        // The two collections the server asks for by hand: the aggressive blocking compacting gen2
+        // RamPressureService forces under memory pressure, and the background gen2 a log merge asks for
+        // in its place (StorageEngine.ReleaseMaintenanceMemory, through AggressiveGcGate). The second
+        // figure is the time the REQUEST takes — the suspension the caller pays — not the collection,
+        // which runs on the background GC thread while everything else goes on.
         var swGc = Stopwatch.StartNew();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         swGc.Stop();
         _out.WriteLine("");
-        _out.WriteLine($"  ReleaseMaintenanceMemory() blocking compacting gen2: {swGc.Elapsed.TotalMilliseconds:F0} ms");
+        _out.WriteLine($"  aggressive blocking compacting gen2 (RamPressureService, under pressure): {swGc.Elapsed.TotalMilliseconds:F0} ms");
+        swGc.Restart();
+        GC.Collect(2, GCCollectionMode.Default, blocking: false, compacting: false);
+        swGc.Stop();
+        _out.WriteLine($"  background gen2 asked for after a merge (ReleaseMaintenanceMemory), time to return on the heap the collection above just emptied — the best case: {swGc.Elapsed.TotalMilliseconds:F1} ms");
     }
 
     /// <summary>
