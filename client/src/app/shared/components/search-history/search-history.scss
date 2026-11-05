@@ -83,19 +83,3 @@
   .sh-item-actions { opacity: 1; }
   .sh-icon-btn { width: 32px; height: 32px; }
 }
-@include bp.below(bp.$bp-sm) {
-  .sh-section-label {
-    height: 32px;
-    padding: 0;
-    align-items: center;
-  }
-  .sh-item {
-    min-height: 44px;
-    padding: 0;
-    gap: 10px;
-    border-bottom: 1px solid var(--border-sub);
-  }
-  .sh-item-actions { opacity: 1; }
-  .sh-icon-btn { width: 32px; height: 32px; }
-  .sh-query { font-size: var(--fs-sm); color: var(--txt-muted); }
-}
