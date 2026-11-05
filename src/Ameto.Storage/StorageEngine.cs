@@ -1185,10 +1185,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 }
                 if (outcome == MergeOutcome.Merged)
                 {
-                    // A merge briefly holds the batch, its native tier copy and the
-                    // index builders. Hand that back to the OS instead of letting the
-                    // allocator sit on it until the next burst (RSS otherwise ratchets
-                    // up across passes and never comes down on an idle server).
+                    // A merge briefly holds the batch, its native tier copy and the index builders.
+                    // Ask for a background gen2 once it is over, so that garbage is reclaimed and the
+                    // pools' gen2 trims fire — not the blocking compacting collection and working-set
+                    // dump this used to force (see ReleaseMaintenanceMemory). What it no longer does
+                    // is hand the freed pages back to the OS at once: after the last merge of a
+                    // backlog the heap stays committed, and on Windows resident, until the GC's own
+                    // policy or RamPressureService under pressure gives it back. RSS on an idle server
+                    // therefore settles at the merge's high-water mark rather than falling right after
+                    // it, which is the price of not stopping the world every two minutes while merges
+                    // run.
                     //
                     // Gated on a merge having HAPPENED, which is what keeps an idle server from
                     // paying for this. The removed HC sweep had its own release behind a bytes
@@ -1270,19 +1276,27 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal Action? _beforeMaintenanceSweeps;
 
     /// <summary>
-    /// Returns the memory a maintenance burst just used. The TRIGGER is background,
-    /// but the pause is not: a blocking compacting gen2 stops every thread, ingest
-    /// and query included, so this is visible to clients no matter which thread asks
-    /// for it. Routed through <see cref="AggressiveGcGate"/> so bursts from the other
-    /// maintenance paths can't line up several such pauses back to back; skipping is
-    /// fine — the next natural gen2 reclaims the garbage either way, aggressive
-    /// collection only accelerates handing pages back to the OS.
+    /// Hands back what a merge pass just used — as a BACKGROUND gen2, not the aggressive blocking
+    /// compacting one this used to force. That one stopped every thread, ingest and query included,
+    /// for a full mark and compaction of the heap (40–65 ms on 20 cores; longer on the two-core
+    /// stand), decommitted everything it freed for the next flush to re-commit page by page, and on
+    /// Windows emptied the working set behind it, so the mapped WALs and the native tiers faulted
+    /// back in — once every two minutes for as long as merges had a backlog. Aggressive mode is for
+    /// a process going idle, not one about to allocate the same 40–90 MB again.
+    ///
+    /// <para>What the background collection does and does not do: it reclaims the same garbage and
+    /// fires the gen2 callbacks the pools trim on (<see cref="PoolTrimPolicy.OnGen2Collection"/>),
+    /// with two short suspensions in the common case — the runtime decides the shape, and under
+    /// <c>GCConserveMemory</c> with a fragmented heap it may compact instead. It does not decommit
+    /// what it frees: handing pages back to the OS stays <see cref="RamPressureService"/>'s job,
+    /// under pressure only, so an idle server's RSS now settles at the merge's high-water mark
+    /// instead of dropping right after it. Routed through <see cref="AggressiveGcGate"/>, which
+    /// keeps a timestamp per shape: this request yields to a recent pressure collection, and a
+    /// pressure collection never yields to it. Skipping is fine: the next natural gen2 reclaims the
+    /// garbage either way.</para>
     /// </summary>
-    private static void ReleaseMaintenanceMemory()
-    {
-        if (AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2)))
-            WorkingSetTrimmer.TryTrim();
-    }
+    private static void ReleaseMaintenanceMemory() =>
+        AggressiveGcGate.TryCollectInBackground(TimeSpan.FromMinutes(2));
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
 

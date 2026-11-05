@@ -1,3 +1,4 @@
+using K4os.Compression.LZ4;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
@@ -85,7 +86,9 @@ public sealed class SpanFormatV4Tests : IDisposable
         string dir = Dir("size");
         var corpus = Corpus(traces: 2_000, spansPer: 3);
 
-        var v4 = SpanWriter.Write(dir, corpus, version: SpanWriter.NewestVersion);
+        // At L09_HC explicitly, as the v3 the test writer below produces: this fact is about the trace
+        // index leaving the file, so the two sides stay on one compression level (see SpanFormatV3Tests).
+        var v4 = SpanWriter.Write(dir, corpus, version: SpanWriter.NewestVersion, level: LZ4Level.L09_HC);
         Assert.Equal(4, v4.FormatVersion);
 
         string v3Path = Path.Combine(dir, "legacy-v3.trc");
