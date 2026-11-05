@@ -1,0 +1,44 @@
+:host { display: contents; }
+
+// Above the event layer (z 50, events.responsive.scss) and under the bottom bar (z 100,
+// nav.scss), as the Traces sheet is: the bar stays visible and answers a tap while a sheet is
+// open. The scrim is the design's 55 % black (the Traces sheet's is 50 %).
+.bs-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 69;
+  background: rgb(0 0 0 / .55);
+}
+
+.bs-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--bottom-nav-h, 0px);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 48px - var(--bottom-nav-h, 0px));
+  max-height: calc(100dvh - 48px - var(--bottom-nav-h, 0px));
+  background: var(--surface);
+  border-radius: 14px 14px 0 0;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  font-family: var(--ui);
+}
+
+// The design's handle: 36 × 4, 8px under the top edge.
+.bs-handle {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 0;
+  flex-shrink: 0;
+
+  &::before {
+    content: '';
+    width: 36px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+}

@@ -11,11 +11,12 @@ import {
   Bell, BellOff, BellRing, BookOpen, Box, Boxes, Braces, Brackets,
   Calendar, CalendarClock, ChartBar, ChartLine, ChartPie, Check, CheckCheck, CheckCircle,
   ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, CircleAlert, Clock, Copy,
-  Database, Download, Ellipsis, Equal, ExternalLink, FileQuestion, Flame, GitBranch, GitCompare, Globe,
+  CornerDownLeft, Database, Download, Ellipsis, EllipsisVertical, Equal, ExternalLink, FileQuestion,
+  Flame, GitBranch, GitCompare, Globe,
   Hash, History, Inbox, Info, Key, LayoutDashboard, List, ListFilter,
   Loader, LoaderCircle, LogOut, Mail, Maximize2, Network, Pause, Pencil,
   Pin, PinOff, Play, Plus, RefreshCw, Regex, Save, ScrollText, Search, Send,
-  Settings, Share2, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
+  Settings, Share2, Shuffle, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
   ToggleRight, Trash2, TriangleAlert, Type, User, UserPlus, Users, X, ZoomOut,
 } from 'lucide-angular';
 import { authInterceptor } from './core/interceptors/auth.interceptor';
@@ -28,11 +29,12 @@ const APP_ICONS = {
   Bell, BellOff, BellRing, BookOpen, Box, Boxes, Braces, Brackets,
   Calendar, CalendarClock, ChartBar, ChartLine, ChartPie, Check, CheckCheck, CheckCircle,
   ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, CircleAlert, Clock, Copy,
-  Database, Download, Ellipsis, Equal, ExternalLink, FileQuestion, Flame, GitBranch, GitCompare, Globe,
+  CornerDownLeft, Database, Download, Ellipsis, EllipsisVertical, Equal, ExternalLink, FileQuestion,
+  Flame, GitBranch, GitCompare, Globe,
   Hash, History, Inbox, Info, Key, LayoutDashboard, List, ListFilter,
   Loader, LoaderCircle, LogOut, Mail, Maximize2, Network, Pause, Pencil,
   Pin, PinOff, Play, Plus, RefreshCw, Regex, Save, ScrollText, Search, Send,
-  Settings, Share2, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
+  Settings, Share2, Shuffle, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
   ToggleRight, Trash2, TriangleAlert, Type, User, UserPlus, Users, X, ZoomOut,
 };
 

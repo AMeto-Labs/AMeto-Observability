@@ -1,18 +1,27 @@
 import {
-  Component, inject, viewChild, viewChildren, ElementRef, OnInit,
+  Component, inject, viewChild, viewChildren, ElementRef, OnInit, HostListener,
   ChangeDetectionStrategy, afterRenderEffect, effect, untracked, signal, computed, DestroyRef,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import {
+  NavigationCancel, NavigationEnd, NavigationError, NavigationSkipped, NavigationStart, Router,
+} from '@angular/router';
 import { LucideAngularModule } from 'lucide-angular';
 import {
   injectVirtualizer, measureElement as measureRenderedElement,
 } from '@tanstack/angular-virtual';
 
 import { EmptyStateComponent } from '../../shared/components/ui';
+import { BottomSheetComponent } from '../../shared/components/bottom-sheet/bottom-sheet';
+import { EventDto, AggregationDto } from '../../core/models/event.model';
+import { ViewportService } from '../../core/services/viewport.service';
 import { EventsToolbarComponent } from './components/events-toolbar/events-toolbar';
 import { EventsFilterBarComponent } from './components/events-filter-bar/events-filter-bar';
+import { EventsFilterSheetComponent } from './components/events-filter-sheet/events-filter-sheet';
 import { EventListRowComponent } from './components/event-list-row/event-list-row';
 import { EventDetailComponent } from './components/event-detail/event-detail';
-import { AggregationTableComponent } from './components/aggregation-table/aggregation-table';
+import { MessageActionSheetComponent } from './components/message-action-sheet/message-action-sheet';
+import { AggregationTableComponent, aggRowSummary } from './components/aggregation-table/aggregation-table';
 import { SignalsPanelComponent } from './signals-panel/signals-panel';
 import { EventsStore } from './store/events.store';
 import { UserPreferencesService } from '../../core/services/user-preferences.service';
@@ -23,35 +32,132 @@ const SVC_COL_CHROME = 27;
 const SVC_COL_MAX = 140;
 /** …and never narrower than its header. */
 const SVC_COL_MIN = 70;
+/** The tablet's SERVICE column (design canvas, "Планшет 768 — логи"): one width, not measured. */
+const SVC_COL_TABLET = 120;
+/** The tablet's drawer: a 440px slide-over, whatever width the desktop drawer was dragged to. */
+const DRAWER_TABLET = 440;
+
+/**
+ * A day separator in the phone's list (design canvas, "Анатомия строки на телефоне"): the date
+ * has left the row, so a 24px line names the day before the first row of each new date — and
+ * before the first row of the list when that is not today. An item of the virtual list in its
+ * own right, so it scrolls with the rows and is counted in their indices.
+ */
+export interface DaySeparator {
+  kind: 'day';
+  /** `yyyy-MM-dd`, local time, as the rows' times are local. */
+  date: string;
+  /** The virtualizer's key: `day:` + the date, which no event id can be. */
+  id: string;
+}
+
+/** One entry of the virtual list: an event, or (phone only) a day separator. */
+export type ListItem = EventDto | DaySeparator;
+
+/** The phone's two-line rows are estimated at this height and measured (design: 49 / 67px). */
+export const PHONE_ROW_ESTIMATE = 60;
+/** The day separator's height: fixed by its stylesheet, so this is exact rather than a guess. */
+export const DAY_SEPARATOR_H = 24;
+/** A separator's virtualizer key begins with this; an event id never does. */
+const DAY_KEY_PREFIX = 'day:';
+
+export function isDaySeparator(item: ListItem | undefined): item is DaySeparator {
+  return !!item && (item as DaySeparator).kind === 'day';
+}
+
+/**
+ * The local calendar day of an instant, `yyyy-MM-dd`, as the separator writes it. By the date's
+ * own getters rather than a formatter: the phone's list runs this for every row on every live
+ * flush, and date-fns' `format` parses its pattern each time it is called.
+ */
+export function dayOf(at: Date | string): string {
+  const d = typeof at === 'string' ? new Date(at) : at;
+  const m = d.getMonth() + 1;
+  const day = d.getDate();
+  return `${d.getFullYear()}-${m < 10 ? '0' : ''}${m}-${day < 10 ? '0' : ''}${day}`;
+}
+
+/** The mark in `history.state` of the entry the phone's event layer pushes; `id` is the event's. */
+const LAYER_STATE = 'event-detail';
+
+/** The event a history entry's state asks the phone's layer to show, or null for any other entry. */
+export function layerEventId(state: unknown): string | null {
+  const s = state as { ameto?: unknown; id?: unknown } | null | undefined;
+  return s?.ameto === LAYER_STATE && typeof s.id === 'string' ? s.id : null;
+}
+
+/** Puts the layer's mark back on the current entry after a rewrite of its state (the Router's) lost it. */
+function stampLayerEntry(id: string | null): void {
+  if (id === null || layerEventId(history.state) === id) return;
+  history.replaceState({ ...history.state, ameto: LAYER_STATE, id }, '');
+}
+
+/**
+ * The phone's list: the rows with a separator before the first of each new day, and before the
+ * first row of all when it is not from today — today's rows need no heading, and a live tail at
+ * the head would otherwise carry one that moves with every arrival.
+ */
+export function withDaySeparators(rows: readonly EventDto[], today: string): ListItem[] {
+  const items: ListItem[] = [];
+  let current = today;
+  for (const ev of rows) {
+    const day = dayOf(ev['@t']);
+    if (day !== current) {
+      items.push({ kind: 'day', date: day, id: DAY_KEY_PREFIX + day });
+      current = day;
+    }
+    items.push(ev);
+  }
+  return items;
+}
 
 /**
  * Events page shell. All state and logic live in {@link EventsStore} (provided
  * here so each mount is fresh); the toolbar, filter bar and detail drawer are
  * self-contained children. This container only lays them out and drives the
  * fixed-height virtual list.
+ *
+ * <p>Below 640px (design canvas, "Логи на телефоне") the toolbar and filter bar give way to the
+ * phone header, search row and chip strip the toolbar component renders, the rows are two lines
+ * each and measured, day separators replace the date, the detail is a layer over the list and
+ * the filters, Signals and the row's actions are bottom sheets. From 640 to 899px the table
+ * drops its date column and the drawer and Signals panel slide over the list behind a scrim.
+ * The breakpoints are read here through {@link ViewportService} and in the stylesheets through
+ * `_breakpoints.scss`; the two name the same numbers.</p>
  */
 @Component({
   selector: 'app-events',
   imports: [
-    LucideAngularModule, EmptyStateComponent,
-    EventsToolbarComponent, EventsFilterBarComponent,
-    EventListRowComponent, EventDetailComponent, SignalsPanelComponent,
+    LucideAngularModule, EmptyStateComponent, BottomSheetComponent,
+    EventsToolbarComponent, EventsFilterBarComponent, EventsFilterSheetComponent,
+    EventListRowComponent, EventDetailComponent, MessageActionSheetComponent, SignalsPanelComponent,
     AggregationTableComponent,
   ],
   templateUrl: './events.html',
-  styleUrl: './events.scss',
+  // Two stylesheets: the component-style budget (angular.json) is checked per stylesheet, and
+  // the phone and tablet layers are kept apart from the desktop rules, as traces.scss does.
+  styleUrls: ['./events.scss', './events.responsive.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
   providers: [EventsStore],
 })
 export class EventsComponent implements OnInit {
   readonly store = inject(EventsStore);
   readonly prefs = inject(UserPreferencesService);
+  readonly viewport = inject(ViewportService);
 
   private eventsScroll = viewChild<ElementRef<HTMLElement>>('eventsScroll');
   private drawerEl = viewChild<ElementRef<HTMLElement>>('drawerEl');
 
   private rowEls = viewChildren<ElementRef<HTMLElement>>('evRowEl');
   private readonly destroyRef = inject(DestroyRef);
+
+  /**
+   * A touch screen, or the phone layout on any screen: the rows answer a long press with the
+   * message action sheet and the detail opens action sheets in place of its cursor-anchored
+   * menus. The phone layout counts even under a mouse — at 390px a menu drawn at the cursor
+   * runs off the screen as surely as it would under a finger.
+   */
+  readonly touch = computed(() => this.viewport.phone() || this.viewport.coarse());
 
   /**
    * Width of the SERVICE column, one for the header and every row: the widest service name in
@@ -65,6 +171,16 @@ export class EventsComponent implements OnInit {
     for (const name of Object.keys(this.store.serviceCounts())) widest = Math.max(widest, this.textWidth(name));
     return Math.min(SVC_COL_MAX, Math.max(SVC_COL_MIN, Math.ceil(widest) + SVC_COL_CHROME));
   });
+
+  /** What `--svc-col` is set to: the measured width, or the tablet's fixed 120px. */
+  readonly svcCol = computed(() => `${this.viewport.tablet() ? SVC_COL_TABLET : this.svcColWidth()}px`);
+
+  /**
+   * The drawer's inline width: the dragged preference on a desktop; nothing on a tablet or a
+   * phone, where the stylesheet sizes the slide-over (440px) and the layer (the screen).
+   */
+  readonly drawerWidth = computed(() =>
+    this.viewport.phone() || this.viewport.tablet() ? null : this.prefs.drawerWidth());
 
   /** Measured service-name widths: each name is measured once, not on every live flush. */
   private readonly nameWidths = new Map<string, number>();
@@ -109,6 +225,20 @@ export class EventsComponent implements OnInit {
   };
 
   /**
+   * What the virtual list holds: the rows, or on a phone the rows with their day separators.
+   * The desktop and tablet lists ARE the store's array — no copy per live flush — and the
+   * template reads either shape through {@link asEvent} / {@link asDay}.
+   */
+  readonly listItems = computed<readonly ListItem[]>(() => {
+    const rows = this.store.displayedEvents();
+    if (!this.viewport.phone()) return rows;
+    return withDaySeparators(rows, dayOf(new Date()));
+  });
+
+  /** Whether rows are measured rather than assumed: wrapped rows, and every phone row. */
+  readonly measured = computed(() => this.store.wrapMessages() || this.viewport.phone());
+
+  /**
    * One virtualizer for BOTH list modes.
    *
    * <p>Wrap mode used to opt out of virtualization entirely — it rendered every row, because
@@ -120,10 +250,10 @@ export class EventsComponent implements OnInit {
    *
    * <p>Fixed mode keeps its 24px (--log-row-h) and measures nothing, which is what the original
    * comment here was protecting: its rows are one line by construction, and measuring them
-   * re-introduced an overlap on selection. Only wrap mode measures —
-   * {@link measureOnlyWhenWrapping} is what
-   * makes that switch, and it is `undefined` (not a no-op function) in fixed mode so the
-   * library takes its own non-measuring path rather than one that lies about a height.</p>
+   * re-introduced an overlap on selection. Only wrap mode measures — and the phone, whose
+   * two-line rows are 49 or 67px by their message ({@link measured}). `measureElement` is
+   * `undefined` (not a no-op function) otherwise so the library takes its own non-measuring
+   * path rather than one that lies about a height.</p>
    */
   readonly virtualizer = injectVirtualizer(() => {
     // Snapshot the rows ONCE per options evaluation; the per-item closures below read the
@@ -140,20 +270,22 @@ export class EventsComponent implements OnInit {
     // The closures must still be minted FRESH on each evaluation: a hoisted, stable getItemKey
     // would leave the library's measurement memo permanently valid and it would serve stale
     // keys for ever.
-    const rows = this.store.displayedEvents();
-    const wrap = this.store.wrapMessages();
+    const items = this.listItems();
+    const phone = this.viewport.phone();
+    const measured = this.measured();
     // Fixed mode: --log-row-h, the collapsed row's pinned height (event-list-row.scss) — the two
     // numbers must move together. Wrapped rows are one line more often than not (4px of padding
     // around an 18px line), so the estimate only has to be close enough that the scrollbar does
-    // not jump while the real heights arrive.
-    const rowHeight = wrap ? 40 : 24;
+    // not jump while the real heights arrive. The phone's rows are 49 or 67px by their message
+    // (event-list-row.scss), so 60 is the guess between the two; its separators are exactly 24.
+    const rowHeight = phone ? PHONE_ROW_ESTIMATE : this.store.wrapMessages() ? 40 : 24;
     return {
-      count: rows.length,
+      count: items.length,
       scrollElement: this.eventsScroll(),
-      estimateSize: () => rowHeight,
+      estimateSize: (i: number) => isDaySeparator(items[i]) ? DAY_SEPARATOR_H : rowHeight,
       overscan: 20,
-      getItemKey: (i: number) => rows[i]?.id ?? i,
-      measureElement: wrap ? measureRenderedElement : undefined,
+      getItemKey: (i: number) => items[i]?.id ?? i,
+      measureElement: measured ? measureRenderedElement : undefined,
       // Rows are absolutely positioned and moved by transform, so the browser's own scroll
       // anchoring has nothing to work with: a prepend shifts every cumulative `start` while
       // scrollTop is untouched, and the line under the reader's eye walks down the screen one
@@ -165,6 +297,88 @@ export class EventsComponent implements OnInit {
       anchorTo: this.atHead() ? 'start' : 'end',
     } as const;
   });
+
+  /**
+   * The phone's sticky day heading: the date of the row under the list's top edge, drawn over
+   * the list while that row's own separator has scrolled away. Nothing at the head (the first
+   * separator, when there is one, is in view there), nothing while a separator itself is the
+   * topmost item, nothing for today — today's rows carry no separator either.
+   */
+  readonly stickyDay = computed<string | null>(() => {
+    if (!this.viewport.phone()) return null;
+    const offset = this.virtualizer.scrollOffset() ?? 0;
+    if (offset <= 0) return null;
+    const top = this.virtualizer.getVirtualItems().find(v => v.end > offset);
+    const item = top ? this.listItems()[top.index] : undefined;
+    if (!item || isDaySeparator(item)) return null;
+    const day = dayOf(item['@t']);
+    return day === dayOf(new Date()) ? null : day;
+  });
+
+  /**
+   * The row last opened in the phone's layer, kept marked after the layer closes (design canvas,
+   * "Анатомия строки на телефоне": the row stays selected after Back, the list where it was) —
+   * the list is still the one the reader left, so the row they came from is worth finding
+   * again. Dropped with the list, when a new search runs.
+   */
+  readonly lastViewedId = signal<string | null>(null);
+
+  /** The mark the list draws from it: the phone's alone. Wider, the table marks the open row only. */
+  readonly lastViewedMark = computed(() => this.viewport.phone() ? this.lastViewedId() : null);
+
+  /** The event whose message action sheet is open (a long press on its row), or null. */
+  readonly messageSheetEvent = signal<EventDto | null>(null);
+
+  /** How many loaded events share the sheet's message template — the count its heading shows. */
+  readonly messageSheetLikeCount = computed(() => {
+    const ev = this.messageSheetEvent();
+    if (!ev) return 0;
+    const mt = ev['@mt'];
+    let n = 0;
+    for (const e of this.store.events()) if (e['@mt'] === mt) n++;
+    return n;
+  });
+
+  /** The toolbar, whose phone field's focus and recent searches the body's overlay reads. */
+  readonly toolbar = viewChild(EventsToolbarComponent);
+
+  /**
+   * The phone's event layer in the browser's history. Opening the layer pushes an entry of its
+   * own, marked in `history.state` ({@link layerEventId}), so the system Back (and, on iOS, the
+   * edge swipe) closes the layer instead of leaving the page; a close by any other way — the
+   * arrow, the X, Escape, a filter picked inside it — pops the entry again. Landing on the entry
+   * from elsewhere — Forward after a Back, Back from the page the bottom bar went to (the entry
+   * outlives this component), F5 — brings the layer back while its event is in the list, so the
+   * entry never becomes a Back that does nothing. True while the current entry is the layer's.
+   */
+  private layerEntry = false;
+  /** Whether the layer was open at the last run of the effect that keeps {@link layerEntry}. */
+  private layerWasOpen = false;
+
+  /** The event the entry this component was created on asks for, answered by the first load. */
+  private readonly restoreLayerId = signal<string | null>(null);
+
+  /** Whether the Router's navigation in flight was started by the browser's Back or Forward. */
+  private popNavigation = false;
+
+  private readonly onPopState = (e: PopStateEvent): void => {
+    const landedId = layerEventId(e.state);
+    if (landedId !== null) {
+      // Forward onto the layer's entry: the layer returns while its event is listed; otherwise
+      // the entry stays a plain one.
+      if (!this.layerEntry && this.viewport.phone() && this.store.events().some(ev => ev.id === landedId)) {
+        this.layerEntry = true;
+        this.store.selectEvent(landedId);
+      }
+      return;
+    }
+    // Back off the layer's entry closes the layer. A close of our own (the history.back() in the
+    // constructor's effect) has dropped the flag already, so its popstate changes nothing.
+    this.restoreLayerId.set(null);
+    if (!this.layerEntry) return;
+    this.layerEntry = false;
+    this.store.selectEvent(null);
+  };
 
   constructor() {
     // Names measured before the web font arrived were measured in its fallback: measure again.
@@ -199,41 +413,151 @@ export class EventsComponent implements OnInit {
       this.store.displayedEvents();
       this.virtualizer.measureElement(null);
     });
-    // Hands each rendered wrapped row over to be measured and observed. afterRender, not
+    // Hands each rendered measured row over to be measured and observed. afterRender, not
     // effect: a height means nothing until the element exists and is laid out. Idempotent per
-    // node, and a no-op in fixed mode where nothing carries #evRowEl.
+    // node, and a no-op in fixed mode, where nothing is measured.
     afterRenderEffect(() => {
-      if (!this.store.wrapMessages()) return;
+      if (!this.measured()) return;
       for (const el of this.rowEls()) this.virtualizer.measureElement(el.nativeElement);
     });
-    // Every switch of wrap mode starts the row heights over. The virtualizer keeps each
-    // MEASURED height by row key and prefers it to the estimate whatever `measureElement` says,
-    // so turning wrap off left every row that had been measured at its wrapped height: the
-    // one-line rows sat spread out down the list with the gaps where their extra lines had been,
-    // and the list never came back to 24px. The reader is kept on the row at the top of the
-    // view — found in the OLD layout, before the heights go — rather than left at a pixel
-    // offset that now points somewhere else entirely.
+    // Every switch of wrap mode — and of the phone layout, whose rows are another height again —
+    // starts the row heights over. The virtualizer keeps each MEASURED height by row key and
+    // prefers it to the estimate whatever `measureElement` says, so turning wrap off left every
+    // row that had been measured at its wrapped height: the one-line rows sat spread out down
+    // the list with the gaps where their extra lines had been, and the list never came back to
+    // 24px. The reader is kept on the row at the top of the view — found in the OLD layout,
+    // before the heights go — rather than left at a pixel offset that now points somewhere else
+    // entirely.
     effect(() => {
       this.store.wrapMessages();
+      this.viewport.phone();
       untracked(() => {
         const v = this.virtualizer;
-        const top = this.atHead() ? undefined : v.getVirtualItemForOffset(v.scrollOffset() ?? 0)?.index;
+        // By key, not index: the phone's list holds separators the table's does not, so an index
+        // taken in one layout lands a few rows off in the other.
+        const topKey = this.atHead() ? undefined : this.topRowKey();
         v.measure();
-        if (top !== undefined) v.scrollToIndex(top, { align: 'start', behavior: 'auto' });
+        if (topKey === undefined) return;
+        const index = this.listItems().findIndex(item => item.id === topKey);
+        if (index >= 0) v.scrollToIndex(index, { align: 'start', behavior: 'auto' });
       });
+    });
+    // The row the phone's layer showed last stays marked; a new search starts the list over.
+    effect(() => {
+      const id = this.store.selectedId();
+      if (id && this.viewport.phone()) untracked(() => this.lastViewedId.set(id));
+    });
+    effect(() => {
+      if (this.store.loading()) untracked(() => this.lastViewedId.set(null));
+    });
+    // The phone's sheets belong to the phone layout: a turn into the tablet's width leaves the
+    // drawer and the Signals panel in their own shapes, and the sheets gone.
+    effect(() => {
+      if (this.viewport.phone()) return;
+      untracked(() => {
+        if (this.store.filterSheetOpen()) this.store.closeFilterSheet();
+        if (this.messageSheetEvent()) this.messageSheetEvent.set(null);
+      });
+    });
+    // The layer's history entry (see layerEntry): pushed when the layer opens, popped when it
+    // closes any way but Back. A turn into the tablet's width closes the "layer" as well — the
+    // drawer stays, the entry goes — so Back there leaves the page, as the tablet's always has.
+    effect(() => {
+      const ev = this.viewport.phone() ? this.store.selectedEvent() : null;
+      untracked(() => {
+        if (ev && !this.layerEntry) {
+          history.pushState({ ameto: LAYER_STATE, id: ev.id }, '');
+          this.layerEntry = true;
+        } else if (!ev && this.layerWasOpen && this.layerEntry) {
+          // Closed any way but Back — Back has dropped the flag already (onPopState). Only a layer
+          // that WAS open: created on the layer's entry, the page holds the entry with no layer
+          // yet, until the first answer decides what becomes of it (restoreLayerId).
+          this.layerEntry = false;
+          history.back();
+        }
+        this.layerWasOpen = !!ev;
+      });
+    });
+    // Created on the layer's entry (F5, or Back from the page the bottom bar went to): the first
+    // answer brings the layer back when it holds the event, and otherwise drops the entry rather
+    // than leave a Back that does nothing.
+    effect(() => {
+      const id = this.restoreLayerId();
+      if (id === null || this.store.loading()) return;
+      untracked(() => {
+        this.restoreLayerId.set(null);
+        if (this.store.events().some(ev => ev.id === id)) {
+          this.store.selectEvent(id);
+        } else {
+          this.layerEntry = false;
+          history.back();
+        }
+      });
+    });
+    // The Router follows Back and Forward to the entry's URL, which is the URL of the moment the
+    // entry was made: a load that completed under the open layer rewrote the layer's entry, not
+    // the one before it. The store reads the URL once, on init, so what is on screen does not
+    // change; the address is rewritten to it instead, after the Router's own navigation. That
+    // same rewrite by the Router (replaceUrl) drops the mark from the layer's entry: put back.
+    inject(Router).events.pipe(takeUntilDestroyed()).subscribe(e => {
+      if (e instanceof NavigationStart) {
+        this.popNavigation = e.navigationTrigger === 'popstate';
+      } else if (e instanceof NavigationEnd) {
+        if (this.popNavigation) {
+          this.popNavigation = false;
+          this.store.syncUrl();
+        } else if (this.layerEntry) {
+          stampLayerEntry(this.store.selectedId());
+        }
+      } else if (e instanceof NavigationCancel || e instanceof NavigationError || e instanceof NavigationSkipped) {
+        this.popNavigation = false;
+      }
     });
   }
 
   ngOnInit(): void {
     this.store.initFromUrl();
+    // Created on the layer's own entry (see layerEntry): the first answer decides what becomes of it.
+    const layerId = this.viewport.phone() ? layerEventId(history.state) : null;
+    if (layerId !== null) {
+      this.layerEntry = true;
+      this.restoreLayerId.set(layerId);
+    }
     document.addEventListener('visibilitychange', this.onVisibility);
-    this.destroyRef.onDestroy(() =>
-      document.removeEventListener('visibilitychange', this.onVisibility));
+    window.addEventListener('popstate', this.onPopState);
+    this.destroyRef.onDestroy(() => {
+      document.removeEventListener('visibilitychange', this.onVisibility);
+      window.removeEventListener('popstate', this.onPopState);
+    });
+  }
+
+  /** The tablet's slide-overs close on Escape, as the drawer does; the detail owns its own key. */
+  @HostListener('document:keydown.escape', ['$event'])
+  onEscape(e: Event): void {
+    if (e.defaultPrevented) return;
+    if (this.viewport.tablet() && this.store.signalsPanelOpen() && !this.store.selectedEvent()) {
+      e.preventDefault();
+      this.store.toggleSignalsPanel();
+    }
   }
 
   fmtCount(n: number | undefined): string {
     if (!n) return '0';
     return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+  }
+
+  /** A list item as an event, or null for a day separator — the template's discriminator. */
+  asEvent(item: ListItem | undefined): EventDto | null {
+    return item && !isDaySeparator(item) ? item : null;
+  }
+
+  asDay(item: ListItem | undefined): DaySeparator | null {
+    return isDaySeparator(item) ? item : null;
+  }
+
+  /** The phone's footer under an aggregation, in the table's own words. */
+  aggSummary(agg: AggregationDto): string {
+    return `${aggRowSummary(agg)} · ${agg.scanned.toLocaleString()} events read`;
   }
 
   onEventsScroll(e: Event): void {
@@ -251,8 +575,18 @@ export class EventsComponent implements OnInit {
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) this.store.loadMore();
   }
 
+  /** The key of the first EVENT row at or under the list's top edge, in the layout being left. */
+  private topRowKey(): string | undefined {
+    const offset = this.virtualizer.scrollOffset() ?? 0;
+    for (const item of this.virtualizer.getVirtualItems()) {
+      if (item.end <= offset) continue;
+      if (typeof item.key === 'string' && !item.key.startsWith(DAY_KEY_PREFIX)) return item.key;
+    }
+    return undefined;
+  }
+
   scrollToOlderLogs(): void {
-    const last = this.store.displayedEvents().length - 1;
+    const last = this.listItems().length - 1;
     // 'auto', not 'smooth': during a tail that index moves on every flush, so a smooth scroll
     // spends its whole duration chasing a target running away from it.
     if (last >= 0) this.virtualizer.scrollToIndex(last, { behavior: 'auto' });
@@ -276,6 +610,21 @@ export class EventsComponent implements OnInit {
     this.atHead.set(true);
     this.virtualizer.scrollToOffset(0, { behavior: 'auto' });
     if (!this.store.live()) this.store.startLive();
+  }
+
+  /** A long press on a row (touch): the message action sheet for that event. */
+  openMessageSheet(ev: EventDto): void {
+    this.messageSheetEvent.set(ev);
+  }
+
+  closeMessageSheet(): void {
+    this.messageSheetEvent.set(null);
+  }
+
+  /** The sheet's "Open event": the detail for the pressed row. */
+  openFromMessageSheet(ev: EventDto): void {
+    this.messageSheetEvent.set(null);
+    this.store.selectEvent(ev.id);
   }
 
   /**

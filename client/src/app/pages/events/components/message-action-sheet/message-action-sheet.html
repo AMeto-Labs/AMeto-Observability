@@ -1,0 +1,27 @@
+<app-bottom-sheet label="Actions for this message" (closed)="closed.emit()">
+  <div class="bs-head bs-head--kv">
+    <span class="bs-key">{{ heading() }}</span>
+    <span class="ms-template" [innerHTML]="templateHtml()"></span>
+  </div>
+  <div class="bs-list">
+    <button type="button" class="bs-act bs-act--lead" (click)="find()">
+      <lucide-icon name="list-filter" [size]="16" />
+      <span class="bs-act-t"><span class="bs-act-a">Find all like this</span><span class="bs-act-b">{{ findCaption() }}</span></span>
+    </button>
+    <button type="button" class="bs-act" (click)="exclude()">
+      <lucide-icon name="ban" [size]="16" />
+      <span class="bs-act-t"><span class="bs-act-a">Exclude these</span><span class="bs-act-b">{{ excludeCaption() }}</span></span>
+    </button>
+    <button type="button" class="bs-act" (click)="copyMessage()">
+      <lucide-icon name="copy" [size]="16" />
+      <span class="bs-act-t"><span class="bs-act-a">Copy message</span><span class="bs-act-b">Rendered text of this event</span></span>
+    </button>
+    <button type="button" class="bs-act" (click)="openRequested.emit()">
+      <lucide-icon name="arrow-right" [size]="16" />
+      <span class="bs-act-t"><span class="bs-act-a">Open event</span><span class="bs-act-b">Overview · JSON · Trace · Metrics</span></span>
+    </button>
+  </div>
+  <div class="bs-cancel-wrap">
+    <button type="button" class="bs-cancel" (click)="closed.emit()">Cancel</button>
+  </div>
+</app-bottom-sheet>

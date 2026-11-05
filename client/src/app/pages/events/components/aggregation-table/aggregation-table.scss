@@ -106,3 +106,63 @@
 }
 
 .agg-foot-sep { opacity: .5; }
+
+// ── Phone (design canvas, "Телефон — агрегация: таблица со скроллом вбок") ──────────────────
+// The host class is set from the page's ViewportService; no media query, as the page decides.
+:host(.agg--phone) {
+  position: relative;
+
+  .agg-partial { padding: 7px 12px; }
+
+  // The grid is as wide as its columns (events.ts sets 150 / 88 / minmax(92, max-content)) and
+  // the box scrolls both ways; the header stays at the top, the first key column at the left.
+  .agg-head,
+  .agg-row {
+    width: max-content;
+    min-width: 100%;
+    padding: 0 12px;
+  }
+  .agg-head {
+    height: 28px;
+    align-items: center;
+  }
+  .agg-row {
+    height: 32px;
+    border-bottom-color: var(--border);
+  }
+  .agg-h-key:first-child,
+  .agg-cell-key:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg);
+    box-shadow: 1px 0 0 var(--border);
+    // The cell's own 12px of padding is the row's; the pinned cell carries the gutter itself.
+    margin-left: -12px;
+    padding-left: 12px;
+  }
+  .agg-h-key:first-child { background: var(--bg-elevated); }
+  .agg-row:hover .agg-cell-key:first-child { background: var(--bg-elevated); }
+
+  // 3px, 6px over the bottom edge of the scroll box.
+  .agg-hscroll {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 6px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border-soft);
+    pointer-events: none;
+  }
+  .agg-hscroll-thumb {
+    position: absolute;
+    top: 0;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+
+  // The summary is the page footer's (events.html).
+  .agg-foot { display: none; }
+}

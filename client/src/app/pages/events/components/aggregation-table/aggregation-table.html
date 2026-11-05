@@ -10,7 +10,7 @@
   }
 
   @if (hasRows()) {
-    <div class="agg-scroll">
+    <div #aggScroll class="agg-scroll" (scroll)="onScroll($event)">
       <div class="agg-head" [style.grid-template-columns]="gridTemplate()">
         @for (col of result().keyColumns; track col) {
           <span class="agg-h agg-h-key">{{ col }}</span>
@@ -33,6 +33,13 @@
         }
       </div>
     </div>
+
+    <!-- The phone's sideways-scroll indicator: a 3px track under the table (design canvas). -->
+    @if (phone() && hscroll(); as hs) {
+      <span class="agg-hscroll" aria-hidden="true">
+        <span class="agg-hscroll-thumb" [style.left.%]="hs.left" [style.width.%]="hs.width"></span>
+      </span>
+    }
 
     <div class="agg-foot">
       <span>{{ rowSummary() }}</span>

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { EventDto } from '../../../../core/models/event.model';
-import { buildClefView, buildProps } from './event-detail';
+import { buildClefView, buildProps, countJsonHits } from './event-detail';
 
 /**
  * The detail panel shows the service once, in its own row, as the header field `@service`. A
@@ -37,6 +37,15 @@ describe('Event detail — the service and the properties beside it', () => {
     const view = buildClefView({ ...base, '@service': 'api', props: { '@service': 'rogue', n: 1 } });
     expect(view['@service']).toBe('api');
     expect(Object.keys(view)).toEqual(['@t', '@l', '@mt', '@service', 'n']);
+  });
+
+  it('the phone\'s JSON toolbar counts the rows a search lights — a key or a leaf value, once each', () => {
+    const view = { PaymentId: 'pay_7Qk2', Http: { Path: '/payments/pay_7Qk2', Status: 504 }, Tags: ['payments', 'x'], Retry: null };
+    expect(countJsonHits(view, 'pay')).toBe(3);   // PaymentId (key and value: one row), Http.Path, Tags[0]
+    expect(countJsonHits(view, 'null')).toBe(1);
+    expect(countJsonHits(view, 'http')).toBe(1);   // the container's own row
+    expect(countJsonHits(view, '')).toBe(0);
+    expect(countJsonHits(view, 'nothing')).toBe(0);
   });
 
   it('the JSON tab takes the service from @service alone, not from the key servers before it sent', () => {

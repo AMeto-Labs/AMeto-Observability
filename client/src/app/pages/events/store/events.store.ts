@@ -121,6 +121,9 @@ interface EventsState {
   quickSearch: string;
   backendServices: string[];
   signalsPanelOpen: boolean;
+  /** The phone's filter sheet (design canvas, "Телефон — лист фильтров логов"): one sheet in
+   *  place of the three dropdowns and the page-size select. Nothing above 640px reads it. */
+  filterSheetOpen: boolean;
   /** Single selected event backing the detail drawer (replaces the old expanded-ids set). */
   selectedId: string | null;
   /**
@@ -139,6 +142,22 @@ interface EventsState {
   newEventIds: ReadonlySet<string>;
   /** The table a `select … group by …` query answered with; null whenever the page lists events. */
   aggregation: AggregationDto | null;
+}
+
+/**
+ * What the phone's filter sheet applies in one go: the time range, the level and service
+ * clauses, the page size and the wrap switch. One load for all of it — through the single
+ * mutators each change would be a reload of its own.
+ */
+export interface FilterSheetDraft {
+  preset: TimePreset;
+  /** The custom bounds, `yyyy-MM-dd HH:mm`, `to` '' for "up to now"; read for `custom` only. */
+  from: string;
+  to: string;
+  levels: ReadonlySet<string>;
+  services: ReadonlySet<string>;
+  pageSize: number;
+  wrap: boolean;
 }
 
 /**
@@ -171,6 +190,7 @@ export const EventsStore = signalStore(
     quickSearch: '',
     backendServices: [],
     signalsPanelOpen: false,
+    filterSheetOpen: false,
     selectedId: null,
     selectedEventPinned: null,
     newEventIds: EMPTY_IDS,
@@ -275,6 +295,16 @@ export const EventsStore = signalStore(
       return customRangeLabel(parseCustomDate(store.customFrom()), parseCustomDate(store.customTo()));
     });
 
+    /**
+     * How many of the three restrictions the phone's filter sheet holds are on — the number on
+     * its "Filters · N" button: a window other than the default preset, a narrowed level set,
+     * a service selection. The filter text is not one of them: it has its own field.
+     */
+    const restrictionCount = computed(() =>
+      (store.timePreset() !== DEFAULT_PRESET ? 1 : 0)
+      + (allLevelsActive() ? 0 : 1)
+      + (selectedServices().size > 0 ? 1 : 0));
+
     const customFromValid = computed(() => !!parseCustomDate(store.customFrom()));
     /** "To" is optional — empty is valid; a non-empty value must parse. */
     const customToValid = computed(() => {
@@ -315,7 +345,7 @@ export const EventsStore = signalStore(
       levelCounts, serviceCounts, totalCount, allLevelsActive, liveBufferSize,
       levelsLabel, serviceLabel, rangeLabel,
       customFromValid, customToValid, canSearch, knownPropPaths, selectedEvent,
-      isAggregation,
+      isAggregation, restrictionCount,
     };
   }),
 
@@ -555,7 +585,8 @@ export const EventsStore = signalStore(
     /**
      * Mirrors the toolbar/filter state into the URL query params. `levels` is written as
      * null so any legacy `levels=` param is dropped — the @l clause inside `filter` is
-     * the single source of truth.
+     * the single source of truth. Exposed as `syncUrl` for the page, which rewrites the entry
+     * the browser's Back landed on when its URL is older than the state (EventsComponent).
      */
     function syncRoute(): void {
       const queryParams: Record<string, string | null> = {
@@ -1177,6 +1208,63 @@ export const EventsStore = signalStore(
       patchState(store, { signalsPanelOpen: !store.signalsPanelOpen() });
     }
 
+    function openFilterSheet(): void {
+      patchState(store, { filterSheetOpen: true });
+    }
+
+    function closeFilterSheet(): void {
+      patchState(store, { filterSheetOpen: false });
+    }
+
+    /**
+     * The phone's filter sheet, applied: the level and service clauses are spliced into the
+     * draft exactly as the pickers splice them, the window is set as a preset or a custom
+     * range would set it, the page size and wrap as their controls would — and ONE load runs
+     * for the lot, where the single mutators would each have run their own. A running tail is
+     * stopped only when the window moved, as {@link setTimePreset} and {@link applyRange} stop
+     * it: the tail ignores the window, and nothing else here needs it stopped. Custom bounds
+     * that do not parse, or an end before the start, leave the window as it was, as
+     * {@link applyRange} refuses them.
+     */
+    function applyFilterSheet(draft: FilterSheetDraft): void {
+      let filterInput = store.filterInput();
+      // An aggregation has no level or service clause to splice — see clauseEditingBlocked.
+      if (!isAggregationQuery(filterInput)) {
+        filterInput = setServicesClause(setLevelsClause(filterInput, new Set(draft.levels)), new Set(draft.services));
+      }
+
+      const patch: Partial<EventsState> = { filterInput, filter: filterInput };
+      // The window moved: another preset, a preset turned into fixed bounds, or other bounds. A
+      // custom window re-applied as it stands is no move — the sheet is reopened to change the
+      // levels under it more often than not — so a tail under it keeps running.
+      let windowMoved = false;
+      if (draft.preset !== 'custom') {
+        if (draft.preset !== store.timePreset()) {
+          patch.timePreset = draft.preset;
+          windowMoved = true;
+        }
+      } else {
+        const start = parseCustomDate(draft.from);
+        const end = draft.to ? parseCustomDate(draft.to) : null;
+        if (start && (!draft.to || (end && end > start))) {
+          windowMoved = store.timePreset() !== 'custom'
+            || draft.from !== store.customFrom() || draft.to !== store.customTo();
+          patch.customFrom = draft.from;
+          patch.customTo = draft.to;
+          patch.timePreset = 'custom';
+        }
+      }
+      if (windowMoved && store.live()) stopLive();
+
+      if (PAGE_SIZE_OPTIONS.includes(draft.pageSize)) patch.pageSize = draft.pageSize;
+      if (draft.wrap !== store.wrapMessages()) {
+        patch.wrapMessages = draft.wrap;
+        saveWrap(draft.wrap);
+      }
+      patchState(store, { ...patch, filterSheetOpen: false });
+      loadEvents();
+    }
+
     /** Lazily fetches the full backend service list on first use (static per session). */
     function loadBackendServices(): Promise<void> {
       if (store.backendServices().length > 0) return Promise.resolve();
@@ -1280,7 +1368,11 @@ export const EventsStore = signalStore(
       selectEvent,
       toggleEvent,
       toggleWrap,
+      syncUrl: syncRoute,
       toggleSignalsPanel,
+      openFilterSheet,
+      closeFilterSheet,
+      applyFilterSheet,
       loadBackendServices,
       _disposeStreams,
     };

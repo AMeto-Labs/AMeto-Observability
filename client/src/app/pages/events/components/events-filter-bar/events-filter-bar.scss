@@ -1,3 +1,5 @@
+@use 'breakpoints' as bp;
+
 /* ── Filter options bar ─────────────────────────────────────────── */
 .filter-bar {
   min-height: 32px;  /* the design's filter-bar row — a one-off, like the footer's 26px */
@@ -138,4 +140,34 @@
   gap: 6px;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+/* ── Tablet (640–899): two rows of 32px (design canvas, "Планшет 768 — логи") ─────────────────
+   The three triggers and the page-size select on the first row, the level chips on a second
+   under a rule — nothing scrolls sideways. The phone has no filter bar at all (events.html). */
+@include bp.between(bp.$bp-sm, bp.$bp-md) {
+  .filter-bar-inner {
+    flex-wrap: wrap;
+    gap: 0 6px;
+    padding: 0;
+    overflow: visible;
+  }
+  .fb-group,
+  .fb-agg-note,
+  .page-size-select { margin: 4px 0 3px; }
+  .fb-group:first-child,
+  .fb-agg-note { margin-left: 10px; }
+  .page-size-select { margin-right: 10px; }
+  .sep-v { display: none; }
+  .lc-chips {
+    flex: 1 0 100%;
+    order: 10;
+    height: 32px;
+    padding: 0 10px;
+    border-top: 1px solid var(--border-sub);
+    box-sizing: border-box;
+    overflow-x: auto;
+    scrollbar-width: none;
+    &::-webkit-scrollbar { display: none; }
+  }
 }

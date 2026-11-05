@@ -1,5 +1,6 @@
 /* Lifted from the events Signals panel so all three pages render the identical
    section; the host still owns the panel chrome around it. */
+@use 'breakpoints' as bp;
 
 :host {
   display: block;
@@ -74,3 +75,11 @@
   display: flex; flex-direction: column; gap: 6px; align-items: center;
 }
 .sh-hint { color: var(--txt-dim); font-size: var(--fs-xs); }
+
+/* A touch screen has no hover to reveal the row's buttons with, so they are always out, at a
+   finger's size (design canvas, "Телефон — Signals": 44px rows, 32px buttons). */
+@include bp.coarse-pointer {
+  .sh-item { min-height: 44px; }
+  .sh-item-actions { opacity: 1; }
+  .sh-icon-btn { width: 32px; height: 32px; }
+}

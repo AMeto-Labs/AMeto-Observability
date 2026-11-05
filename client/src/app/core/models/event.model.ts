@@ -115,3 +115,15 @@ export interface AggregationDto {
 
 export const LEVELS = ['Verbose', 'Debug', 'Information', 'Warning', 'Error', 'Fatal'] as const;
 export type Level = (typeof LEVELS)[number];
+
+/** The three-letter badge for a level, keyed by the lowercased name (`error` → `ERR`). */
+export const LEVEL_SHORT: Readonly<Record<string, string>> = {
+  verbose: 'VRB', debug: 'DBG', information: 'INF',
+  warning: 'WRN', error: 'ERR', fatal: 'FTL',
+};
+
+/** `ERR` for `Error`; the first three letters, upper-cased, for a level the table does not name. */
+export function levelShort(level: string | undefined): string {
+  const key = (level ?? 'information').toLowerCase();
+  return LEVEL_SHORT[key] ?? key.slice(0, 3).toUpperCase();
+}

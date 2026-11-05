@@ -1,66 +1,174 @@
-<div class="toolbar">
-  <div class="filter-wrap">
-    <lucide-icon name="search" [size]="13" class="filter-icon" />
-    <div class="filter-hl-wrap">
-      <div class="filter-hl" [innerHTML]="filterHighlight()" aria-hidden="true"></div>
-      <textarea
-        #filterEl
-        class="filter-input"
-        placeholder="Filter expression… (Enter = run, Ctrl+Enter = newline, Ctrl+Space = suggest)"
-        [rows]="filterRows()"
-        (input)="onFilterInput($any($event.target).value)"
-        (keydown)="onFilterKeydown($event)"
-        (blur)="closeSuggest()"
-        spellcheck="false"
-        autocomplete="off"
-        wrap="soft"></textarea>
-      @if (suggestOpen() && suggestItems().length) {
-        <div class="suggest-pop" role="listbox" aria-label="Filter suggestions" (mousedown)="$event.preventDefault()">
-          @for (item of suggestItems(); track item; let i = $index) {
-            <div
-              class="suggest-item"
-              role="option"
-              [class.active]="i === suggestIndex()"
-              (mouseenter)="suggestIndex.set(i)"
-              (click)="selectSuggestion(item)">{{ item }}</div>
-          }
-        </div>
-      }
-    </div>
-    @if (store.filterInput()) {
-      <button class="filter-clear" (click)="store.applyFilter('')" title="Clear filter">
-        <lucide-icon name="x" [size]="12" />
+@if (phone()) {
+  <!-- ── Phone: the 48px header (design canvas, "Телефон — список логов") ───────────────── -->
+  <header class="ph-hdr">
+    <h1 class="ph-title">Logs</h1>
+    <div class="ph-quick">
+      <button type="button" class="ph-range" (click)="store.openFilterSheet()" aria-label="Time range and filters">
+        <lucide-icon name="calendar" [size]="12" />
+        <span class="ph-range-txt">{{ phoneRangeLabel() }}</span>
+        <lucide-icon name="chevron-down" [size]="10" class="ph-range-caret" />
       </button>
-    }
-    <span class="kbd-hint">Ctrl+Space</span>
+      <button
+        type="button"
+        class="ph-live"
+        role="switch"
+        [class.live-on]="store.live()"
+        [attr.aria-checked]="store.live()"
+        [attr.aria-label]="store.live() ? 'Live tail, on' : 'Live tail, off'"
+        [disabled]="!store.live() && store.isAggregation()"
+        [title]="!store.live() && store.isAggregation() ? 'An aggregation is a snapshot of a window — there is nothing for a tail to append' : 'Live tail'"
+        (click)="store.toggleLive()">
+        <span class="live-dot" [class.on]="store.live()"></span>Live
+      </button>
+      <button
+        type="button"
+        class="ph-bell"
+        [class.on]="store.signalsPanelOpen()"
+        aria-label="Signals and alerts"
+        (click)="store.toggleSignalsPanel()">
+        <lucide-icon name="bell" [size]="15" [strokeWidth]="1.6" />
+      </button>
+    </div>
+  </header>
+
+  <!-- ── The search row: the filter field and "Filters · N" ─────────────────────────────── -->
+  <div class="ph-search">
+    <label class="ph-field" [class.focused]="phoneFocused()">
+      <lucide-icon [name]="store.isAggregation() ? 'sigma' : 'search'" [size]="13" class="ph-field-icon" />
+      <span class="ph-sr-only">Filter expression</span>
+      <ng-container *ngTemplateOutlet="filterField" />
+      @if (store.filterInput()) {
+        <button type="button" class="ph-clear" aria-label="Clear filter" (click)="clearFilter()">
+          <lucide-icon name="x" [size]="12" />
+        </button>
+      }
+    </label>
+    <button type="button" class="ph-filters" [class.active]="store.restrictionCount() > 0 && !store.isAggregation()" (click)="store.openFilterSheet()">
+      <lucide-icon name="sliders-horizontal" [size]="13" />
+      Filters
+      @if (store.restrictionCount() > 0 && !store.isAggregation()) {
+        <span class="ph-filters-n">{{ store.restrictionCount() }}</span>
+      }
+    </button>
   </div>
 
-  <div class="toolbar-right">
-    <div class="sep-v"></div>
-    <button class="tb-live-btn fb-apply-btn" [disabled]="!store.canSearch()" (click)="store.search()">
-      <lucide-icon name="play" [size]="12" />
-      Apply
-    </button>
-    <button class="tb-live-btn" (click)="store.resetAll()">
-      <lucide-icon name="x" [size]="12" />
-      Clear
-    </button>
-    <div class="sep-v"></div>
-    <button
-      class="tb-live-btn"
-      [class.live-on]="store.live()"
-      [disabled]="!store.live() && store.isAggregation()"
-      (click)="store.toggleLive()"
-      [title]="!store.live() && store.isAggregation() ? 'An aggregation is a snapshot of a window — there is nothing for a tail to append' : 'Live tail'">
-      <span class="live-dot" [class.on]="store.live()"></span>
-      <span>Live</span>
-    </button>
-    <button
-      class="tb-icon-btn"
-      [class.tb-icon-btn--on]="store.signalsPanelOpen()"
-      (click)="store.toggleSignalsPanel()"
-      title="Signals / Alerts">
-      <lucide-icon name="bell" [size]="16" [strokeWidth]="1.5" />
-    </button>
+  @if (phoneFocused()) {
+    <!-- ── In focus: suggestion chips in the strip, the recent searches under them ───────────
+         mousedown is swallowed so a tap on a chip or a row does not blur the field first. -->
+    <div class="ph-strip ph-suggest" role="listbox" aria-label="Suggestions" (mousedown)="$event.preventDefault()">
+      @for (item of phoneSuggestItems(); track item; let i = $index) {
+        <button type="button" role="option" class="ph-sg" [class.active]="i === suggestIndex()"
+                [attr.aria-selected]="i === suggestIndex()" (click)="selectSuggestion(item)">{{ item }}</button>
+      }
+      @if (phoneSuggestItems().length) {
+        <span class="ph-sg-sep" aria-hidden="true"></span>
+      }
+      <button type="button" class="ph-sg ph-sg-kw" (click)="insertText(' and ')">and</button>
+      <button type="button" class="ph-sg ph-sg-kw" (click)="insertText(' or ')">or</button>
+      <button type="button" class="ph-sg ph-sg-nl" aria-label="New line" (click)="insertText('\n')">
+        <lucide-icon name="corner-down-left" [size]="13" />
+      </button>
+    </div>
+    <!-- The recent searches under the strip are the page's (events.html, .ph-recent): they fill
+         the list's box, so they start under the strip whatever height the field has grown to. -->
+  } @else if (store.isAggregation()) {
+    <!-- The chips mean nothing to a table: the note the filter bar shows wider. -->
+    <div class="ph-strip ph-agg-note">
+      <lucide-icon name="sigma" [size]="12" />
+      <span>Aggregation — levels, services and page size come from the query itself</span>
+    </div>
+  } @else {
+    <!-- ── The level chips, scrolled sideways; the counts the filter bar shows wider ───────── -->
+    <div class="ph-strip ph-chips">
+      <button type="button" class="lc-chip lc-all" [class.active]="store.allLevelsActive()" [attr.aria-pressed]="store.allLevelsActive()" (click)="store.toggleAllLevels()">
+        ALL <span class="lc-num">{{ fmtCount(store.totalCount()) }}</span>
+      </button>
+      @for (lvl of levelItems; track lvl.key) {
+        <button
+          type="button"
+          class="lc-chip"
+          [class.active]="isLevelActive(lvl.key)"
+          [attr.aria-pressed]="isLevelActive(lvl.key)"
+          [attr.data-level]="lvl.key.toLowerCase()"
+          (click)="store.toggleLevel(lvl.key)">
+          {{ lvl.short }} <span class="lc-num">{{ fmtCount(store.levelCounts()[lvl.key.toLowerCase()]) }}</span>
+        </button>
+      }
+    </div>
+  }
+} @else {
+  <div class="toolbar">
+    <div class="filter-wrap">
+      <lucide-icon name="search" [size]="13" class="filter-icon" />
+      <ng-container *ngTemplateOutlet="filterField" />
+      @if (store.filterInput()) {
+        <button class="filter-clear" (click)="store.applyFilter('')" title="Clear filter">
+          <lucide-icon name="x" [size]="12" />
+        </button>
+      }
+      <span class="kbd-hint">Ctrl+Space</span>
+    </div>
+
+    <div class="toolbar-right">
+      <div class="sep-v"></div>
+      <button class="tb-live-btn fb-apply-btn" [disabled]="!store.canSearch()" (click)="store.search()">
+        <lucide-icon name="play" [size]="12" />
+        Apply
+      </button>
+      <button class="tb-live-btn" (click)="store.resetAll()">
+        <lucide-icon name="x" [size]="12" />
+        Clear
+      </button>
+      <div class="sep-v"></div>
+      <button
+        class="tb-live-btn"
+        [class.live-on]="store.live()"
+        [disabled]="!store.live() && store.isAggregation()"
+        (click)="store.toggleLive()"
+        [title]="!store.live() && store.isAggregation() ? 'An aggregation is a snapshot of a window — there is nothing for a tail to append' : 'Live tail'">
+        <span class="live-dot" [class.on]="store.live()"></span>
+        <span>Live</span>
+      </button>
+      <button
+        class="tb-icon-btn"
+        [class.tb-icon-btn--on]="store.signalsPanelOpen()"
+        (click)="store.toggleSignalsPanel()"
+        title="Signals / Alerts">
+        <lucide-icon name="bell" [size]="16" [strokeWidth]="1.5" />
+      </button>
+    </div>
   </div>
-</div>
+}
+
+<!-- The one filter field, in the desktop bar or the phone's row: the highlight overlay, the
+     transparent textarea over it and, wider than a phone, the Ctrl+Space popup. -->
+<ng-template #filterField>
+  <div class="filter-hl-wrap">
+    <div class="filter-hl" [innerHTML]="filterHighlight()" aria-hidden="true"></div>
+    <textarea
+      #filterEl
+      class="filter-input"
+      [placeholder]="phone() ? 'Filter expression…' : 'Filter expression… (Enter = run, Ctrl+Enter = newline, Ctrl+Space = suggest)'"
+      [rows]="filterRows()"
+      [attr.enterkeyhint]="phone() ? 'search' : null"
+      (input)="onFilterInput($any($event.target).value)"
+      (keydown)="onFilterKeydown($event)"
+      (focus)="onFilterFocus()"
+      (blur)="onFilterBlur()"
+      spellcheck="false"
+      autocomplete="off"
+      wrap="soft"></textarea>
+    @if (!phone() && suggestOpen() && suggestItems().length) {
+      <div class="suggest-pop" role="listbox" aria-label="Filter suggestions" (mousedown)="$event.preventDefault()">
+        @for (item of suggestItems(); track item; let i = $index) {
+          <div
+            class="suggest-item"
+            role="option"
+            [class.active]="i === suggestIndex()"
+            (mouseenter)="suggestIndex.set(i)"
+            (click)="selectSuggestion(item)">{{ item }}</div>
+        }
+      </div>
+    }
+  </div>
+</ng-template>

@@ -2,6 +2,29 @@
 
 <div class="ev-detail" [attr.data-level]="levelKey()">
 
+  @if (phone()) {
+    <!-- ── The phone layer's header (design canvas, "Телефон — событие"): back, the level and
+         the service over the time and the machine, copy and close. ──────────────────────── -->
+    <header class="ph-dhdr">
+      <button type="button" class="ph-back" aria-label="Back to logs" (click)="closed.emit()">
+        <lucide-icon name="arrow-left" [size]="18" />
+      </button>
+      <div class="ph-dtitle">
+        <div class="ph-dtitle-l1">
+          <span class="ev-log-badge ph-dbadge" [attr.data-level]="levelKey()">{{ levelShort() }}</span>
+          <span class="ph-dsvc">{{ service() || 'n/a' }}</span>
+        </div>
+        <span class="ph-dmeta">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}@if (machineName()) { · {{ machineName() }}}</span>
+      </div>
+      <button type="button" class="ph-hbtn" [class.done]="copiedKey() === 'message'" aria-label="Copy message" (click)="copyMessage()">
+        <lucide-icon [name]="copiedKey() === 'message' ? 'check' : 'copy'" [size]="14" />
+      </button>
+      <button type="button" class="ph-hbtn" aria-label="Close" (click)="closed.emit()">
+        <lucide-icon name="x" [size]="16" />
+      </button>
+    </header>
+  }
+
   <!-- ── Message hero (top element) — clamped to 2 lines; expand for full ─ -->
   <div class="d-message">
     <div class="d-message-text d-clamp" [innerHTML]="renderedHtml()"></div>
@@ -43,8 +66,8 @@
       <div class="d-facts">
         <div class="d-fact">
           @if (service()) {
-            <button class="d-menu-btn" (click)="openMenu($event, 'service')" title="Service actions">
-              <lucide-icon name="list-filter" [size]="12" />
+            <button class="d-menu-btn" (click)="openMenu($event, 'service')" title="Service actions" aria-label="Service actions">
+              <lucide-icon [name]="menuIcon()" [size]="12" />
             </button>
           } @else {
             <span class="d-menu-spacer"></span>
@@ -59,8 +82,8 @@
         </div>
 
         <div class="d-fact">
-          <button class="d-menu-btn" (click)="openMenu($event, 'timestamp')" title="Seek / range around this time">
-            <lucide-icon name="list-filter" [size]="12" />
+          <button class="d-menu-btn" (click)="openMenu($event, 'timestamp')" title="Seek / range around this time" aria-label="Timestamp actions">
+            <lucide-icon [name]="menuIcon()" [size]="12" />
           </button>
           <span class="d-fact-k">Timestamp</span>
           <div class="d-fact-v">
@@ -69,8 +92,8 @@
         </div>
 
         <div class="d-fact">
-          <button class="d-menu-btn" (click)="openMenu($event, 'level')" title="Level actions">
-            <lucide-icon name="list-filter" [size]="12" />
+          <button class="d-menu-btn" (click)="openMenu($event, 'level')" title="Level actions" aria-label="Level actions">
+            <lucide-icon [name]="menuIcon()" [size]="12" />
           </button>
           <span class="d-fact-k">Level</span>
           <div class="d-fact-v">
@@ -80,20 +103,28 @@
 
         @if (traceId()) {
           <div class="d-fact">
-            <button class="d-menu-btn" (click)="openMenu($event, 'traceId')" title="TraceId actions">
-              <lucide-icon name="list-filter" [size]="12" />
+            <button class="d-menu-btn" (click)="openMenu($event, 'traceId')" title="TraceId actions" aria-label="TraceId actions">
+              <lucide-icon [name]="menuIcon()" [size]="12" />
             </button>
             <span class="d-fact-k">TraceId</span>
             <div class="d-fact-v">
-              <span class="d-fact-val d-mono d-id">{{ traceId() }}</span>
+              @if (phone()) {
+                <!-- The phone's id is the way into the trace (design canvas); the menu has it wider. -->
+                <a class="d-fact-val d-mono d-id d-trace-link" [href]="traceHref()" target="_blank" rel="noopener">
+                  <span class="d-trace-link-id">{{ traceId() }}</span>
+                  <lucide-icon name="arrow-right" [size]="11" />
+                </a>
+              } @else {
+                <span class="d-fact-val d-mono d-id">{{ traceId() }}</span>
+              }
             </div>
           </div>
         }
 
         @if (spanId()) {
           <div class="d-fact">
-            <button class="d-menu-btn" (click)="openMenu($event, 'spanId')" title="SpanId actions">
-              <lucide-icon name="list-filter" [size]="12" />
+            <button class="d-menu-btn" (click)="openMenu($event, 'spanId')" title="SpanId actions" aria-label="SpanId actions">
+              <lucide-icon [name]="menuIcon()" [size]="12" />
             </button>
             <span class="d-fact-k">SpanId</span>
             <div class="d-fact-v">
@@ -117,8 +148,8 @@
         <div class="d-props">
           @for (kv of allProps(); track kv.path) {
             <div class="d-prop" [class.structured]="kv.isStructured">
-              <button class="d-menu-btn" (click)="openPropMenu($event, kv)" title="Filter / copy">
-                <lucide-icon name="list-filter" [size]="12" />
+              <button class="d-menu-btn" (click)="openPropMenu($event, kv)" title="Filter / copy" aria-label="Property actions">
+                <lucide-icon [name]="menuIcon()" [size]="12" />
               </button>
               <span class="d-prop-k" [title]="kv.path">{{ kv.path }}</span>
               <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" [oneLine]="true" [rootMenu]="false" /></div>
@@ -143,11 +174,14 @@
             autocomplete="off"
             spellcheck="false" />
           @if (jsonSearch()) {
-            <button class="ev-json-search-clear" (click)="jsonSearch.set('')" title="Clear">
+            <button class="ev-json-search-clear" (click)="jsonSearch.set('')" title="Clear" aria-label="Clear search">
               <lucide-icon name="x" [size]="11" />
             </button>
           }
         </div>
+        @if (phone() && jsonSearch()) {
+          <span class="ev-json-hits">{{ jsonHits() }} {{ jsonHits() === 1 ? 'hit' : 'hits' }}</span>
+        }
         <div class="ev-json-body">
           <!-- The whole event has no path to filter on; each field leads its row with its own menu. -->
           <app-json-viewer
@@ -178,10 +212,18 @@
           <!-- ── Trace waterfall ──────────────────────────────────── -->
           @if (traceId()) {
             <div class="tr-block tr-block--wf">
-              <div class="tr-block-label">
-                Trace waterfall
-                @if (traceSpansLoading()) {
-                  <span class="tr-wf-loading">loading…</span>
+              <div class="tr-block-label tr-block-label--wf">
+                <span class="tr-block-label-text">
+                  Trace waterfall
+                  @if (phone() && traceSpans().length) { · {{ traceSpans().length }} spans }
+                  @if (traceSpansLoading()) {
+                    <span class="tr-wf-loading">loading…</span>
+                  }
+                </span>
+                @if (phone()) {
+                  <a class="tr-open-traces" [href]="traceHref()" target="_blank" rel="noopener">
+                    Open in Traces <lucide-icon name="external-link" [size]="11" />
+                  </a>
                 }
               </div>
 
@@ -209,17 +251,23 @@
                     <div class="ev-wf-dur-col">Duration</div>
                   </div>
                   @for (span of traceSpans(); track span.spanId) {
+                    <!-- The depth is a variable, not an inline padding: the drawer indents the
+                         label column by 14px a level, the phone the whole row by 10 (stylesheets). -->
                     <div class="ev-wf-row"
                          [class.ev-wf-row--current]="span.spanId === spanId()"
                          [class.ev-wf-row--error]="span.status === 'Error'"
                          [class.ev-wf-row--selected]="selectedWfSpan()?.spanId === span.spanId"
+                         [style.--depth]="wfDepth(span)"
                          (click)="selectWfSpan(span)">
-                      <div class="ev-wf-label-col" [style.padding-left.px]="wfDepth(span) * 14 + 6">
+                      <div class="ev-wf-label-col">
                         <span class="ev-wf-dot" [style.background]="wfSvcColor(span.serviceName)"></span>
                         <div class="ev-wf-names">
                           <span class="ev-wf-svc">{{ span.serviceName }}</span>
                           <span class="ev-wf-op" [class.ev-wf-op--error]="span.status === 'Error'">{{ span.name }}</span>
                         </div>
+                        @if (phone() && span.spanId === spanId()) {
+                          <span class="ev-wf-me">this event</span>
+                        }
                       </div>
                       <div class="ev-wf-bar-col">
                         <div class="ev-wf-bar"
@@ -330,7 +378,7 @@
           <!-- ── OTel attributes ───────────────────────────────── -->
           @if (otelAttrs().length > 0) {
             <div class="tr-block">
-              <div class="tr-block-label">OTel attributes</div>
+                <div class="tr-block-label">OTel attributes@if (phone()) { · {{ otelAttrs().length }}}</div>
               <table class="tr-attrs-table">
                 @for (kv of otelAttrs(); track kv.key) {
                   <tr class="tr-attr-row">
@@ -498,6 +546,86 @@
     }
   </div>
 </ng-template>
+
+<!-- ── Touch: the menus as sheets (design canvas, "Телефон — действия по свойству") ────────────
+     The same state (propMenu / menuType) the overlays read; on a touch screen the effects in
+     event-detail.ts open nothing and these render instead. A tap inside a sheet must not reach
+     the document, whose click closes the menus (onCloseMenu). -->
+@if (touch() && propMenu(); as m) {
+  <app-bottom-sheet [label]="'Actions for ' + m.entry.label" (closed)="closeSheets()">
+    <div class="as-sheet" (click)="$event.stopPropagation()">
+      <div class="bs-head bs-head--kv">
+        <span class="bs-key">{{ m.entry.label }}</span>
+        <span class="bs-value">{{ m.entry.isStructured ? formatInlineValue(m.entry.raw) : m.entry.value }}</span>
+      </div>
+      <div class="bs-list">
+        <button type="button" class="bs-act bs-act--lead" (click)="propSearch(false)">
+          <lucide-icon name="list-filter" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Filter by this value</span><span class="bs-act-b">{{ propCondition() }}</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propSearch(true)">
+          <lucide-icon name="ban" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Exclude this value</span><span class="bs-act-b">{{ propExclusion() }}</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propCompose('and', false)">
+          <lucide-icon name="plus" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Add to filter with AND</span><span class="bs-act-b">… and {{ propCondition() }}</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propCompose('or', false)">
+          <lucide-icon name="shuffle" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Add to filter with OR</span><span class="bs-act-b">… or {{ propCondition() }}</span></span>
+        </button>
+        @if (propWildcard(); as wild) {
+          <button type="button" class="bs-act" (click)="propAnyElement(false)">
+            <lucide-icon name="brackets" [size]="16" />
+            <span class="bs-act-t"><span class="bs-act-a">Any element</span><span class="bs-act-b">{{ wild }} = …</span></span>
+          </button>
+        }
+        @if (propSeekMs() != null) {
+          <button type="button" class="bs-act" (click)="propSeek(30)">
+            <lucide-icon name="clock" [size]="16" />
+            <span class="bs-act-t"><span class="bs-act-a">Seek ± 30 s around this time</span></span>
+          </button>
+        }
+        <button type="button" class="bs-act" (click)="propCopyValue()">
+          <lucide-icon name="copy" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Copy value</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propCopyKey()">
+          <lucide-icon name="copy" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Copy key</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propCopyCondition(false)">
+          <lucide-icon name="terminal" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">Copy as condition</span><span class="bs-act-b">{{ propCondition() }}</span></span>
+        </button>
+        <button type="button" class="bs-act" (click)="propViewValue()">
+          <lucide-icon name="maximize-2" [size]="16" />
+          <span class="bs-act-t"><span class="bs-act-a">View full value</span></span>
+        </button>
+        @if (!m.entry.isStructured) {
+          <button type="button" class="bs-act" (click)="propFindInTraces()">
+            <lucide-icon name="activity" [size]="16" />
+            <span class="bs-act-t"><span class="bs-act-a">Find in traces</span></span>
+          </button>
+        }
+      </div>
+      <div class="bs-cancel-wrap">
+        <button type="button" class="bs-cancel" (click)="closeSheets()">Cancel</button>
+      </div>
+    </div>
+  </app-bottom-sheet>
+}
+@if (touch() && menuType(); as type) {
+  <app-bottom-sheet [label]="type + ' actions'" (closed)="closeSheets()">
+    <div class="as-sheet as-sheet--ctx" (click)="$event.stopPropagation()">
+      <ng-container *ngTemplateOutlet="ctxMenuTpl" />
+      <div class="bs-cancel-wrap">
+        <button type="button" class="bs-cancel" (click)="closeSheets()">Cancel</button>
+      </div>
+    </div>
+  </app-bottom-sheet>
+}
 
 <!-- The property menu for every property, top-level or nested, value or object / array (same
      component the Traces page uses), rendered into the same

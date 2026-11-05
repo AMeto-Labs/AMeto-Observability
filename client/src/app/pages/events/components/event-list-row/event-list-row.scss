@@ -31,15 +31,18 @@
 :host.ev-error       { --lc: var(--lvl-e); --lc-bg: var(--lvl-e-bg); }
 :host.ev-fatal       { --lc: var(--lvl-f); --lc-bg: var(--lvl-f-bg); }
 
-:host:hover .ev-main { background: rgba(255, 255, 255, .03); }
-
 /* Subtle row tint by severity — only for warning/error/fatal */
 :host.ev-warning  .ev-main { background: color-mix(in srgb, var(--lvl-w-bg) 30%, transparent); }
 :host.ev-error    .ev-main { background: color-mix(in srgb, var(--lvl-e-bg) 30%, transparent); }
 :host.ev-fatal    .ev-main { background: color-mix(in srgb, var(--lvl-f-bg) 30%, transparent); }
-:host.ev-warning:hover .ev-main { background: color-mix(in srgb, var(--lvl-w-bg) 50%, transparent); }
-:host.ev-error:hover   .ev-main { background: color-mix(in srgb, var(--lvl-e-bg) 50%, transparent); }
-:host.ev-fatal:hover   .ev-main { background: color-mix(in srgb, var(--lvl-f-bg) 50%, transparent); }
+/* Hover tints only where a pointer can hover. A touch screen has no hover state to leave, so
+   its rows would keep the lit tint after every tap; the phone rows get a :active press instead. */
+@media (hover: hover) {
+  :host:hover .ev-main { background: rgba(255, 255, 255, .03); }
+  :host.ev-warning:hover .ev-main { background: color-mix(in srgb, var(--lvl-w-bg) 50%, transparent); }
+  :host.ev-error:hover   .ev-main { background: color-mix(in srgb, var(--lvl-e-bg) 50%, transparent); }
+  :host.ev-fatal:hover   .ev-main { background: color-mix(in srgb, var(--lvl-f-bg) 50%, transparent); }
+}
 
 /* Selected — this row is the one open in the detail drawer. Declared after the
    severity/hover tints so it wins at equal specificity. */
@@ -82,8 +85,10 @@
 @media (prefers-reduced-motion: reduce) {
   :host.is-new .ev-main::after { animation: none; }
 }
-:host.selected:hover .ev-main {
-  background: color-mix(in srgb, var(--accent) 26%, transparent);
+@media (hover: hover) {
+  :host.selected:hover .ev-main {
+    background: color-mix(in srgb, var(--accent) 26%, transparent);
+  }
 }
 
 /* ── Main row ─────────────────────────────────────────────────────── */
@@ -96,6 +101,10 @@
   padding-right: 8px;
   transition: background 120ms ease;
 }
+
+/* The first-line wrapper: nothing in the table layouts — its three cells sit in the row's flex
+   line as they always did — and the line over the message in the phone layout below. */
+.ev-meta { display: contents; }
 
 .ev-stripe {
   width: 3px;
@@ -186,7 +195,9 @@
   padding-right: 8px;
   color: var(--msg-tmpl);
 }
-.ev-msg:hover { color: var(--txt); }
+@media (hover: hover) {
+  .ev-msg:hover { color: var(--txt); }
+}
 
 /* Wrap mode: the row grows to show the full message across multiple lines.
    (The parent measures each wrapped row instead of assuming a height, so variable heights are fine.) */
@@ -212,3 +223,101 @@
   word-break: break-word;
   padding-right: 8px;
 }
+
+/* ── Tablet (the Events page from 640 to 899px): the TIME column holds the time alone ────────
+   88px instead of 154 — the date is in the cell's title and in the detail (design canvas,
+   "Планшет 768 — логи"). events.responsive.scss sizes the header's TIME to the same 88px. An
+   input, not a media query: the Traces page uses this row too and keeps its date. */
+:host.ev-dateless .ev-ts { width: 88px; }
+:host.ev-dateless .ev-ts-date { display: none; }
+
+/* ── Touch: the long press is the row's menu, so the browser must not select its text ─────── */
+:host.ev-touch .ev-main {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* ── Phone: two lines (design canvas, "Анатомия строки на телефоне") ──────────────────────────
+   Line 1 — the level badge, the time (HH:mm:ss.SSS, 11px tabular; the date is the list's day
+   separator) and the service at the right, at most 46 % of the line; line 2 — the message at
+   12px / 1.5 clamped to two lines. 6 + 16 + 2 + 18·n + 7 = 49px of content for one line of
+   message, 67 for two, 85 only with Full messages (wrap) on, plus the row's 1px border. The
+   parent measures every phone row (estimateSize 60 in events.ts). */
+:host.ev-phone {
+  height: auto;
+  overflow: visible;
+  border-bottom-color: rgba(255, 255, 255, .04);
+}
+:host.ev-phone .ev-main {
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr);
+  column-gap: 8px;
+  align-items: start;
+  height: auto;
+  min-height: 0;
+  padding: 0 12px 0 0;
+}
+:host.ev-phone .ev-stripe {
+  grid-row: 1 / 3;
+  align-self: stretch;
+  margin: 0;
+}
+:host.ev-phone .ev-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 6px;
+  line-height: 16px; /* the line is the badge: 14px of line plus 1px of padding each side */
+}
+:host.ev-phone .ev-level {
+  order: 1;
+  width: auto;
+  padding: 0;
+}
+:host.ev-phone .ev-lvl-badge {
+  letter-spacing: .04em;
+  line-height: 14px;
+}
+:host.ev-phone .ev-ts {
+  order: 2;
+  width: auto;
+  padding: 0;
+  cursor: pointer;
+}
+:host.ev-phone .ev-ts-date { display: none; }
+:host.ev-phone .ev-svc {
+  order: 3;
+  width: auto;
+  max-width: 46%;
+  margin-left: auto;
+  padding: 0;
+  gap: 0;
+}
+:host.ev-phone .ev-svc-icon { display: none; }
+:host.ev-phone .ev-svc-name { opacity: .9; }
+:host.ev-phone .ev-msg {
+  grid-column: 2;
+  padding: 2px 0 7px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  white-space: normal;
+  text-overflow: clip;
+  word-break: break-word;
+  line-height: var(--lh-body);
+}
+/* Full messages (the filter sheet's switch, which is wrap): the clamp goes, the row grows. */
+:host.ev-phone.ev-wrap-mode .ev-msg {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+:host.ev-phone.ev-wrap-mode .ev-main { padding-top: 0; padding-bottom: 0; }
+:host.ev-phone.ev-wrap-mode .ev-ts,
+:host.ev-phone.ev-wrap-mode .ev-level,
+:host.ev-phone.ev-wrap-mode .ev-svc { padding-top: 0; }
+/* No hover on a phone; a press is the design's 7 % wash. */
+:host.ev-phone .ev-main:active { background: rgba(255, 255, 255, .07); }
