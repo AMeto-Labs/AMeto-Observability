@@ -12,6 +12,7 @@ import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
 import { UserPreferencesService } from '../../core/services/user-preferences.service';
 import { serviceColor } from '../../shared/utils/service-color';
+import { copyToClipboard } from '../../shared/utils/clipboard';
 import { EventDto } from '../../core/models/event.model';
 import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
 import { StreamEndDto, StreamFrame } from '../../core/models/stream.model';
@@ -1717,27 +1718,11 @@ export class TracesComponent implements OnInit, OnDestroy {
   async copyTraceId(): Promise<void> {
     const id = this.selectedTraceId();
     if (!id) return;
-    await this.copyText(id);
+    await copyToClipboard(id);
     this.traceIdCopied.set(true);
     setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
   }
 
-  private async copyText(text: string): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // navigator.clipboard needs a secure context (https/localhost) and focus —
-      // plain-http hosts (e.g. http://sandbox:8555) get the legacy fallback.
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-    }
-  }
 
   // ── Span property context menu (Tags table + the left-column fields) ───────
 
@@ -1796,7 +1781,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   async attrCopy(what: 'value' | 'key'): Promise<void> {
     const m = this.attrMenu();
     if (!m) return;
-    await this.copyText(what === 'value' ? m.value : m.key);
+    await copyToClipboard(what === 'value' ? m.value : m.key);
     this.attrMenu.set(null);
   }
 
@@ -1804,7 +1789,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   async attrCopyCondition(neq: boolean): Promise<void> {
     const m = this.attrMenu();
     if (!m?.tqlKey) return;
-    await this.copyText(this.tqlPredicate(m.tqlKey, m.value, neq));
+    await copyToClipboard(this.tqlPredicate(m.tqlKey, m.value, neq));
     this.attrMenu.set(null);
   }
 

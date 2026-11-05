@@ -5,6 +5,7 @@ import { LucideAngularModule } from 'lucide-angular';
 import { BottomSheetComponent } from '../../../../shared/components/bottom-sheet/bottom-sheet';
 import { EventDto } from '../../../../core/models/event.model';
 import { renderMessageHtml, renderTemplateHtml } from '../../../../shared/utils/clef-renderer';
+import { copyToClipboard } from '../../../../shared/utils/clipboard';
 import { excludeLikeFilter, findLikeFilter, quoted } from '../../store/events-filter.util';
 
 /** The expression on one line for the row's caption, cut with an ellipsis. */
@@ -62,15 +63,7 @@ export class MessageActionSheetComponent {
   async copyMessage(): Promise<void> {
     const tmp = document.createElement('div');
     tmp.innerHTML = renderMessageHtml(this.event()['@mt'], this.event().props);
-    const text = tmp.textContent ?? '';
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); ta.remove();
-    }
+    await copyToClipboard(tmp.textContent ?? '');
     this.closed.emit();
   }
 }

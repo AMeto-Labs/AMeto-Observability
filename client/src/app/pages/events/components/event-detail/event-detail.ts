@@ -18,6 +18,7 @@ import { UserPreferencesService } from '../../../../core/services/user-preferenc
 import { ApiService } from '../../../../core/services/api.service';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
 import { serviceColor } from '../../../../shared/utils/service-color';
+import { copyToClipboard } from '../../../../shared/utils/clipboard';
 import { JsonViewerComponent } from '../../../../shared/components/json-viewer/json-viewer';
 import { MetricSparkComponent } from '../../../../shared/components/metric-spark/metric-spark';
 import { ModalComponent } from '../../../../shared/components/ui';
@@ -642,7 +643,7 @@ export class EventDetailComponent {
   async copyValueModal(): Promise<void> {
     const v = this.valueModal();
     if (!v) return;
-    await navigator.clipboard.writeText(v.text);
+    await copyToClipboard(v.text);
     this.flashCopied('jv-value');
   }
 
@@ -751,20 +752,20 @@ export class EventDetailComponent {
   /** A value as shown; an object or array as its JSON. */
   async propCopyValue(): Promise<void> {
     const m = this.propMenu();
-    if (m) await this.writeClipboard(m.entry.isStructured ? formatInline(m.entry.raw) : m.entry.value);
+    if (m) await copyToClipboard(m.entry.isStructured ? formatInline(m.entry.raw) : m.entry.value);
     this.propMenu.set(null);
   }
 
   async propCopyKey(): Promise<void> {
     const m = this.propMenu();
-    if (m) await this.writeClipboard(m.entry.label);
+    if (m) await copyToClipboard(m.entry.label);
     this.propMenu.set(null);
   }
 
   /** Copies `key (=|≠) value` — the predicate Search would run — for pasting into a query. */
   async propCopyCondition(neq: boolean): Promise<void> {
     const pred = this.propPredicate(neq);
-    if (pred) await this.writeClipboard(pred);
+    if (pred) await copyToClipboard(pred);
     this.propMenu.set(null);
   }
 
@@ -791,17 +792,6 @@ export class EventDetailComponent {
     this.propMenu.set(null);
     const v = /^-?\d+(\.\d+)?$/.test(m.entry.value) ? m.entry.value : `"${m.entry.value.replaceAll('"', '')}"`;
     window.open(appPath(`/traces?ql=${encodeURIComponent(`{ .${m.entry.label} = ${v} }`)}`), '_blank');
-  }
-
-  private async writeClipboard(text: string): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); ta.remove();
-    }
   }
 
   /**
@@ -869,7 +859,7 @@ export class EventDetailComponent {
 
   // ── Service row actions ──────────────────────────────────────────────
   async copyService(): Promise<void> {
-    await navigator.clipboard.writeText(this.service());
+    await copyToClipboard(this.service());
     this.menuType.set(null);
     this.flashCopied('service');
   }
@@ -912,7 +902,7 @@ export class EventDetailComponent {
   }
 
   async copyTimestampIso(): Promise<void> {
-    await navigator.clipboard.writeText(this.timestampIso());
+    await copyToClipboard(this.timestampIso());
     this.menuType.set(null);
     this.flashCopied('ts-iso');
   }
@@ -950,13 +940,13 @@ export class EventDetailComponent {
   async copyMessage(): Promise<void> {
     const tmp = document.createElement('div');
     tmp.innerHTML = this.renderedHtml() as string;
-    await navigator.clipboard.writeText(tmp.textContent ?? '');
+    await copyToClipboard(tmp.textContent ?? '');
     this.menuType.set(null);
     this.flashCopied('message');
   }
 
   async copyText(text: string, key?: string): Promise<void> {
-    await navigator.clipboard.writeText(text);
+    await copyToClipboard(text);
     this.flashCopied(key ?? text);
   }
 

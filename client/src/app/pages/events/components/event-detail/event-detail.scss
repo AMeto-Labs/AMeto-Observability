@@ -452,8 +452,6 @@
   text-transform: uppercase;
   letter-spacing: .05em;
 }
-/* The axis's label column is the same element class as a row's; it has no depth to indent by. */
-.ev-wf-axis .ev-wf-label-col { padding-left: 6px; }
 /* The phone's "this event" mark, the waterfall's count and its "Open in Traces" exist only in
    the phone layer (event-detail.html renders them there); the label row is a flex line so the
    link can sit at its right. */
