@@ -62,12 +62,19 @@ public sealed class RamPressureService : BackgroundService
                 // dashboard poll re-sampling on its own would cut this window short.
                 double cpuPct = _cpu.Sample();
 
+                // gc_pause is the time the GC has had every thread stopped since the process started
+                // (GC.GetTotalPauseDuration), cumulative — the counter /api/diagnostics reports as
+                // gcPauseTotalMs, in whole milliseconds here where the endpoint keeps a tenth, so the
+                // two may differ by under 1 ms. Differenced between two lines it is what the collections
+                // of that half-minute cost, which is how the shape a merge or a rollup asks for (#141)
+                // shows on a stand without a GC trace.
                 _logger.LogInformation(
-                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}% cpu={Cpu}% ({Cores} cores)",
+                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB gc_pause={Pause}ms hot_tier={Hot}MB mode={Mode} sys_ram={Pct}% cpu={Cpu}% ({Cores} cores)",
                     Environment.WorkingSet      / MB,
                     gc.HeapSizeBytes            / MB,
                     gc.TotalCommittedBytes      / MB,
                     gc.FragmentedBytes          / MB,
+                    (long)GC.GetTotalPauseDuration().TotalMilliseconds,
                     _storage.HotTierAllocatedBytes / MB,
                     System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation",
                     pct,
@@ -130,16 +137,23 @@ public sealed class RamPressureService : BackgroundService
 
                         await _storage.FlushHotTierAsync(stoppingToken);
 
-                        // Ask the GC to reclaim any freed managed memory, then
-                        // release the freed resident pages back to the OS
-                        // (Windows working set + Linux arenas). Gated so this can't
-                        // stack a second stop-the-world onto a maintenance pass that
-                        // compacted moments ago. The short interval only ensures
-                        // pressure never waits out the 2-minute maintenance cadence;
-                        // when the gate DOES skip, this cycle still spends its full
-                        // cooldown below — accepted, because the expensive relief
-                        // (the flush) has already happened, and a collect right after
-                        // a maintenance compaction would find little to return.
+                        // The process's one AGGRESSIVE collection (#141, #144): a blocking
+                        // compacting gen2 that also decommits what it frees, then the freed
+                        // resident pages go back to the OS (Windows working set, Linux
+                        // arenas). The maintenance passes — the log merge and the metric
+                        // rollup — ask the gate for a BACKGROUND gen2 instead, and a background
+                        // request never stands in this call's way: an aggressive request yields
+                        // only to a recent aggressive collection, and this loop is the only one
+                        // that asks for it, at least a cooldown apart. So the 30 s interval
+                        // skips nothing today. What going through the gate still does is stamp
+                        // the aggressive slot, so a merge or a rollup finishing within the next
+                        // two minutes skips its own request (nothing left for it to reclaim),
+                        // and keep a second aggressive caller, should one ever appear, from
+                        // stacking a stop-the-world onto this one. If it ever does skip, this
+                        // cycle still spends its full cooldown below — accepted: the expensive
+                        // relief (the flush) has already happened, and right after an
+                        // aggressive compaction there is nothing left to return, so the trim is
+                        // skipped with it.
                         if (AggressiveGcGate.TryCollect(TimeSpan.FromSeconds(30)))
                             WorkingSetTrimmer.TryTrim();
 

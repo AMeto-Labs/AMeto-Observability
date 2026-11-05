@@ -2526,14 +2526,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1), RewriteWork.OneHourRollup, ct);
         if (ct.IsCancellationRequested) return;    // stopped: no collection for a pass cut short
 
-        // Hand the pass's peak back to the OS instead of letting it ratchet up across
-        // passes — but only when there WAS a peak. This used to run unconditionally:
+        // Reclaim the pass's peak — but only when there WAS a peak. This used to run unconditionally:
         // a silent blocking compacting gen2 every 5 minutes around the clock, even for
         // a pass whose every work list was empty. A day's MEM telemetry showed exactly
         // that shape — the idle CPU sawing 0.2→5% on a drifting 5-minute period with
         // nothing in the log to explain it, 41 of 46 idle spikes unaccounted for.
-        // Aggressive mode also raises the memory-pressure signal that drains
-        // ArrayPool.Shared, undoing the pooling on the ingest/query hot paths.
         // The gate interval still applies when the floor is met (see AggressiveGcGate);
         // without coordination this call and StorageEngine's maintenance collect once
         // landed 8 s apart mid-load — the two longest pauses in a 7-minute GC trace.
@@ -2541,10 +2538,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         // pass listed, and since #125 stopped re-merging a window's own outputs and carried files
         // every pass, most passes list a metric's 1-hour files and rewrite nothing: each still
         // stopped the world for 100–250 ms on the 5-minute cadence.
+        // WHAT IS ASKED FOR is the log merge's background collection (ReleaseRollupMemory), not the
+        // aggressive blocking compacting one this forced until #141's follow-up — see the method for
+        // what that does and does not do.
         if (_passRewrittenBytes >= AggressiveGcGate.MaintenancePassBytesFloor)
         {
-            OnAggressiveCollectRequestedForTest?.Invoke(_passRewrittenBytes);
-            AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
+            OnMaintenanceCollectRequestedForTest?.Invoke(_passRewrittenBytes);
+            ReleaseRollupMemory();
         }
     }
 
@@ -2552,11 +2552,42 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     private long _passRewrittenBytes;
 
     /// <summary>
-    /// Test seam: a pass is about to ask for the aggressive collection, with the source bytes it
-    /// rewrote (#126 review L3). <see cref="AggressiveGcGate"/> is process-wide and rate-limited, so the
-    /// decision is observed here rather than there. Null in production.
+    /// Hands back what a rollup pass just used — as a BACKGROUND gen2, the shape a log merge asks for
+    /// (<c>StorageEngine.ReleaseMaintenanceMemory</c>, #141), not the aggressive blocking compacting one
+    /// this forced after every pass that met the floor. That one stopped every thread, ingest and query
+    /// included, for a full mark and compaction of the heap — 100–250 ms on the two-core stand — raised
+    /// the memory-pressure signal that drains <c>ArrayPool.Shared</c>, undoing the pooling on the ingest
+    /// and query hot paths, and decommitted everything it freed. Its reason was the pass's peak — whole
+    /// metrics materialised, up to four a pass — handed back to the OS so RSS did not ratchet up across
+    /// passes (078610d). Since #125 that peak is one chunk of <see cref="RewriteBudgetBytes"/>, and a pass
+    /// that meets the floor is followed by another five minutes later that commits the same chunk again:
+    /// nothing in the rollup is the process going idle that aggressive mode is for, any more than the
+    /// merge was.
+    ///
+    /// <para>What the background collection does and does not do: it reclaims the pass's garbage and
+    /// fires the gen2 callbacks the pools trim on (<c>PoolTrimPolicy.OnGen2Collection</c>), with two
+    /// short suspensions in the common case — the runtime decides the shape, and under
+    /// <c>GCConserveMemory</c> with a fragmented heap it may compact instead. It does NOT decommit what it
+    /// frees: handing pages back to the OS is the aggressive shape's alone now, <c>RamPressureService</c>'s
+    /// under pressure, so an idle server's RSS settles at the pass's high-water mark instead of dropping
+    /// after it. Routed through <see cref="AggressiveGcGate"/>, which keeps a timestamp per shape: this
+    /// request yields to a recent aggressive collection and to a recent background one (a log merge's
+    /// sweep within two minutes reclaimed what this one would), and an aggressive collection never yields
+    /// to it. Skipping is fine: the next natural gen2 reclaims the garbage either way.</para>
+    ///
+    /// <para>Internal so a fact can pin which shape a rollup asks for (<c>MetricRollupCollectShapeTests</c>):
+    /// back on the aggressive entry point, every fact about the gate itself would stay green.</para>
     /// </summary>
-    internal Action<long>? OnAggressiveCollectRequestedForTest;
+    internal static void ReleaseRollupMemory() =>
+        AggressiveGcGate.TryCollectInBackground(TimeSpan.FromMinutes(2));
+
+    /// <summary>
+    /// Test seam: a pass is about to ask for its collection (<see cref="ReleaseRollupMemory"/>), with the
+    /// source bytes it rewrote (#126 review L3). <see cref="AggressiveGcGate"/> is process-wide and
+    /// rate-limited, so the decision is observed here rather than there; the SHAPE asked for is pinned
+    /// through the gate's own seam. Null in production.
+    /// </summary>
+    internal Action<long>? OnMaintenanceCollectRequestedForTest;
 
     /// <summary>Metrics processed per rollup pass (rotating) — bounds peak memory.</summary>
     private const int MaxMetricsPerPass = 4;

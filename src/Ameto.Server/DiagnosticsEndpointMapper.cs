@@ -130,6 +130,12 @@ public static class DiagnosticsEndpointMapper
                 gen0Collections        = GC.CollectionCount(0),
                 gen1Collections        = GC.CollectionCount(1),
                 gen2Collections        = GC.CollectionCount(2),
+                // How long the GC has had every thread stopped since the process started, in ms —
+                // what the collections counted above cost, which until #141's follow-up showed
+                // nowhere but a GC trace. Cumulative: difference it across polls. The MEM line
+                // RamPressureService writes every 30 s carries the same counter as gc_pause, in whole
+                // milliseconds where this keeps a tenth (like processCpuSeconds).
+                gcPauseTotalMs         = Math.Round(GC.GetTotalPauseDuration().TotalMilliseconds, 1),
                 hotTierNativeBytes     = hotTierBytes,
 
                 // Decoded segment indexes held across queries: managed postings plus native

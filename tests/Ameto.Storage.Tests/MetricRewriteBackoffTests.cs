@@ -321,19 +321,21 @@ public sealed class MetricRewriteBackoffTests : IDisposable
     }
 
     /// <summary>
-    /// A PASS ASKS FOR THE AGGRESSIVE COLLECTION ONLY WHEN IT REWROTE ENOUGH (#126 review L3). The
-    /// blocking, compacting gen2 at the end of a pass was gated on the bytes of the files the pass
-    /// LISTED. Since #125 a window's own outputs and carried files are no longer rewritten on every
-    /// pass, so most passes list a metric's 1-hour files and rewrite nothing — and each still stopped
-    /// the world on the 5-minute cadence. Here three kinds of listed work are left alone, each over
-    /// the 8 MiB floor by itself, and none may count (#126 review NEW-8): a 1-hour file alone in its
-    /// 7-day window 40 days back; three 1-hour files in the next window, which a merge of four does
-    /// not yet want; and four 5-minute files of the last day whose merge failed on the pass before
-    /// and is backing off. No collection asked. Two raw files of the last hour, over the floor
-    /// between them, are compacted: asked, with exactly their bytes.
+    /// A PASS ASKS FOR ITS COLLECTION ONLY WHEN IT REWROTE ENOUGH (#126 review L3). The gen2 at the
+    /// end of a pass — blocking and compacting then, the log merge's background one since #141's
+    /// follow-up — was gated on the bytes of the files the pass LISTED. Since #125 a window's own
+    /// outputs and carried files are no longer rewritten on every pass, so most passes list a metric's
+    /// 1-hour files and rewrite nothing — and each still stopped the world on the 5-minute cadence. Here
+    /// three kinds of listed work are left alone, each over the 8 MiB floor by itself, and none may
+    /// count (#126 review NEW-8): a 1-hour file alone in its 7-day window 40 days back; three 1-hour
+    /// files in the next window, which a merge of four does not yet want; and four 5-minute files of
+    /// the last day whose merge failed on the pass before and is backing off. No collection asked. Two
+    /// raw files of the last hour, over the floor between them, are compacted: asked, with exactly
+    /// their bytes — and asked as the background shape (the call itself is pinned in
+    /// <c>MetricRollupCollectShapeTests</c>).
     /// </summary>
     [Fact]
-    public async Task A_pass_asks_for_the_aggressive_collection_only_when_it_rewrote_enough()
+    public async Task A_pass_asks_for_its_collection_only_when_it_rewrote_enough()
     {
         long floor = Ameto.Core.AggressiveGcGate.MaintenancePassBytesFloor;
 
@@ -360,7 +362,7 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         {
             await engine.ColdLoadCompleted;
             long? asked = null;
-            engine.OnAggressiveCollectRequestedForTest = bytes => asked = bytes;
+            engine.OnMaintenanceCollectRequestedForTest = bytes => asked = bytes;
 
             // The pass before: the 5-minute merge is due, is handed its files, and fails — so it backs off.
             engine.OnRewriteChunkWrittenForTest = _ => throw new IOException("injected failure");
@@ -388,9 +390,19 @@ public sealed class MetricRewriteBackoffTests : IDisposable
         {
             await engine.ColdLoadCompleted;
             long? asked = null;
-            engine.OnAggressiveCollectRequestedForTest = bytes => asked = bytes;
-            await engine.PerformRollupForTest();
+            engine.OnMaintenanceCollectRequestedForTest = bytes => asked = bytes;
+
+            // And the SHAPE the pass asks the gate for: the background collection, the log merge's (#141),
+            // not the stop-the-world it used to force — through the gate's seam, which records instead of
+            // collecting. The gate is reset first: a merge or a rollup earlier in the run may hold the slot.
+            var collected = new List<Ameto.Core.AggressiveGcGate.Shape>();
+            Ameto.Core.AggressiveGcGate.ResetForTest();
+            Ameto.Core.AggressiveGcGate._collectForTest = collected.Add;
+            try     { await engine.PerformRollupForTest(); }
+            finally { Ameto.Core.AggressiveGcGate._collectForTest = null; Ameto.Core.AggressiveGcGate.ResetForTest(); }
+
             Assert.Equal(raw.Sum(s => s.SizeBytes), asked);
+            Assert.Equal(new[] { Ameto.Core.AggressiveGcGate.Shape.Background }, collected);
             Assert.Empty(Paths(engine, "busy.gauge", MetricGranularity.Raw).Intersect(raw.Select(s => s.FilePath)));
         }
     }
