@@ -133,7 +133,8 @@ public static class DiagnosticsEndpointMapper
                 // How long the GC has had every thread stopped since the process started, in ms —
                 // what the collections counted above cost, which until #141's follow-up showed
                 // nowhere but a GC trace. Cumulative: difference it across polls. The MEM line
-                // RamPressureService writes every 30 s carries the same figure as gc_pause.
+                // RamPressureService writes every 30 s carries the same counter as gc_pause, in whole
+                // milliseconds where this keeps a tenth (like processCpuSeconds).
                 gcPauseTotalMs         = Math.Round(GC.GetTotalPauseDuration().TotalMilliseconds, 1),
                 hotTierNativeBytes     = hotTierBytes,
 

@@ -403,6 +403,12 @@ internal static class SpanWriter
                 fs.Flush(flushToDisk: true);
             }
 
+            // The frames are written: the buffer — up to 4 MiB, the engine's — goes back now rather
+            // than after the sidecars, their fsyncs and the renames below (#144 review 3), so a merge
+            // that starts in that window finds it in the slot instead of renting its own. The
+            // finally's Return is then a no-op.
+            pickler.Return();
+
             // ── Sidecars, at temp names (each fsyncs itself). Some legitimately write
             //    nothing — an empty stats/edge set produces no file at all.
             WriteStatsSidecar(statsFinal + ".tmp", svcStats);
@@ -714,6 +720,10 @@ internal static class SpanWriter
                 bw.Flush();
                 fs.Flush(flushToDisk: true);
             }
+
+            // The frames are written: the buffer goes back before the sidecars and the renames, as in
+            // WriteOrdered (#144 review 3) — a flush starting now finds the engine's in the slot.
+            pickler.Return();
 
             // ── Sidecars, at temp names beside the final one ───────────────────
             string baseName = $"spans-{minNano}-{maxNano}-{count}-{nonce}";

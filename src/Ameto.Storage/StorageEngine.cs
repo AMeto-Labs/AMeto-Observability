@@ -1294,9 +1294,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// background collection too, <c>MetricStorageEngine.ReleaseRollupMemory</c>) — so an idle server's
     /// RSS now settles at the merge's high-water mark instead of dropping right after it. Routed
     /// through <see cref="AggressiveGcGate"/>, which keeps a timestamp per shape: this request yields
-    /// to a recent aggressive collection, and an
-    /// aggressive collection never yields to it. Skipping is fine: the next natural gen2 reclaims
-    /// the garbage either way.</para>
+    /// to a recent aggressive collection (nothing left to reclaim) and to a recent background one —
+    /// its own spacing, or a metric rollup's sweep (<c>MetricStorageEngine.ReleaseRollupMemory</c>)
+    /// within the two minutes — and an aggressive collection never yields to it. Skipping is fine:
+    /// the next natural gen2 reclaims the garbage either way.</para>
     ///
     /// <para>What the maintenance loop asks for is pinned on a running engine
     /// (<c>MaintenanceCollectShapeTests</c>): this shape after a pass that merged, nothing after one

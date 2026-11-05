@@ -43,7 +43,7 @@ public sealed class PooledLz4PicklerTests
         {
             foreach (var level in new[] { LZ4Level.L00_FAST, SpanWriter.FlushLevel, SpanWriter.MergeLevel })
             {
-                byte[] expected = LZ4Pickler.Pickle(raw, level);
+                byte[] expected = LZ4Pickler.Pickle(raw.AsSpan(), level);   // the overload the writer called before the pickler
                 byte[] frame    = pickler.Pickle(raw, level).ToArray();
 
                 Assert.Equal(headerByte, frame[0]);                  // the shape this row is about
