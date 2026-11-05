@@ -3,9 +3,10 @@ namespace Ameto.Core;
 /// <summary>
 /// Process-wide gate in front of every gen2 collection the server asks for by hand. Two shapes
 /// go through it: the AGGRESSIVE blocking compacting collection (<see cref="TryCollect"/>) that
-/// RAM pressure (<c>RamPressureService</c>) and the metric rollup (<c>MetricStorageEngine</c>) ask
-/// for, and the BACKGROUND collection (<see cref="TryCollectInBackground"/>) a log merge asks for
-/// (<c>StorageEngine.ReleaseMaintenanceMemory</c>).
+/// RAM pressure (<c>RamPressureService</c>) asks for, and the BACKGROUND collection
+/// (<see cref="TryCollectInBackground"/>) the maintenance passes ask for — a log merge
+/// (<c>StorageEngine.ReleaseMaintenanceMemory</c>) and a metric rollup
+/// (<c>MetricStorageEngine.ReleaseRollupMemory</c>).
 ///
 /// <para>Why a gate at all: each caller is individually a "background" trigger, but an aggressive
 /// collection's pause is not background — it stops EVERY thread, ingest and query included. With
@@ -18,8 +19,8 @@ namespace Ameto.Core;
 /// only. A background request yields to both: to a recent aggressive collection (nothing left
 /// to reclaim) and to a recent background one (its own spacing). An aggressive request yields
 /// ONLY to a recent aggressive collection — never to a background one, which compacted nothing
-/// and handed nothing back to the OS, so the pressure path's collection, or the rollup's, must
-/// not be skipped because a log merge asked for a background sweep a moment ago. With one
+/// and handed nothing back to the OS, so the pressure path's collection must not be skipped
+/// because a log merge or a metric rollup asked for a background sweep a moment ago. With one
 /// shared timestamp the merge loop's claims took the pressure path's slot about a quarter of
 /// the time during a merge backlog, and the pressure loop still waited out its five-minute
 /// cooldown as if it had collected.</para>
@@ -28,8 +29,8 @@ public static class AggressiveGcGate
 {
     /// <summary>
     /// Floor for maintenance passes: below this many source bytes a pass should skip its
-    /// aggressive release entirely — the materialised peak is small enough for the next
-    /// natural gen2 to absorb.
+    /// release entirely — the materialised peak is small enough for the next natural gen2
+    /// to absorb.
     ///
     /// <para>Only the metric-rollup loop tests it now. It was shared with the log side's HC
     /// re-compression sweep, whose idle pass rewrote a couple of tiny segments per tick and
@@ -65,8 +66,10 @@ public static class AggressiveGcGate
     /// Asks for a BACKGROUND gen2 — <c>GC.Collect(2, Default, blocking: false, compacting: false)</c>
     /// — unless an aggressive collection ran, or a background one was asked for, within
     /// <paramref name="minInterval"/>. What a log merge asks for once it has merged
-    /// (<c>StorageEngine.ReleaseMaintenanceMemory</c>): the garbage the pass left is reclaimed and
-    /// the gen2 callbacks the pools trim on (<see cref="PoolTrimPolicy.OnGen2Collection"/>) fire.
+    /// (<c>StorageEngine.ReleaseMaintenanceMemory</c>) and a metric rollup after a pass that rewrote
+    /// at least <see cref="MaintenancePassBytesFloor"/> (<c>MetricStorageEngine.ReleaseRollupMemory</c>):
+    /// the garbage the pass left is reclaimed and the gen2 callbacks the pools trim on
+    /// (<see cref="PoolTrimPolicy.OnGen2Collection"/>) fire.
     ///
     /// <para>What it costs, and what it does not do. With concurrent GC on (the server's setting)
     /// the runtime runs this as a background collection: two short suspensions around a mark that
@@ -74,14 +77,14 @@ public static class AggressiveGcGate
     /// the shape, and with <c>GCConserveMemory</c> set and the heap fragmented past its threshold
     /// it may take the chance to compact instead; with concurrent GC off every collection blocks.
     /// It does not decommit what it frees, so it is not what hands pages back to the OS; the
-    /// aggressive shape is — RAM pressure's, and a metric rollup's after a pass that rewrote at least
-    /// <see cref="MaintenancePassBytesFloor"/>. And the request takes the gate whether or not the
-    /// runtime starts a collection for it (one may already be running), which costs at most one
-    /// skipped request an interval later. It replaced the aggressive collection on this path: a
-    /// stop-the-world mark and compaction of the whole heap — 40–65 ms on a 20-core box, longer on
-    /// the two-core stand — and a decommit of everything freed, which the next flush re-committed
-    /// page by page, every two minutes for as long as merges had a backlog. Aggressive mode is for
-    /// a process going idle, not one about to allocate the same 40–90 MB again.</para>
+    /// aggressive shape is — RAM pressure's, under pressure only. And the request takes the gate
+    /// whether or not the runtime starts a collection for it (one may already be running), which
+    /// costs at most one skipped request an interval later. It replaced the aggressive collection on
+    /// both maintenance paths: a stop-the-world mark and compaction of the whole heap — 40–65 ms on a
+    /// 20-core box, 100–250 ms on the two-core stand — and a decommit of everything freed, which the
+    /// next flush or pass re-committed page by page, every two minutes for as long as merges had a
+    /// backlog and every five after a rollup pass that rewrote enough. Aggressive mode is for a
+    /// process going idle, not one about to allocate the same 40–90 MB again.</para>
     /// Returns whether the collection was asked for.
     /// </summary>
     public static bool TryCollectInBackground(TimeSpan minInterval)

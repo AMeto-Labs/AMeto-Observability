@@ -4,10 +4,10 @@ namespace Ameto.Core.Tests;
 
 /// <summary>
 /// The gate in front of the gen2 collections the server asks for by hand: the aggressive blocking
-/// one (RAM pressure, metric rollup) and the background one (a log merge). The rule under test is
+/// one (RAM pressure) and the background one (a log merge, a metric rollup). The rule under test is
 /// the asymmetry: a background request yields to either shape's recent collection, an aggressive
-/// request yields only to an aggressive one — a merge's sweep must never cost the pressure path
-/// its compaction. Intervals here are an hour or more, and "just inside" means ten seconds short
+/// request yields only to an aggressive one — a merge's or a rollup's sweep must never cost the
+/// pressure path its compaction. Intervals here are an hour or more, and "just inside" means ten seconds short
 /// of it, so no tick of <c>Environment.TickCount64</c> can move a test over the line.
 ///
 /// <para>NOTHING HERE COLLECTS FOR REAL. The gate's test seam records the shape it would have

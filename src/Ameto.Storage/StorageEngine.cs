@@ -1290,9 +1290,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// with two short suspensions in the common case — the runtime decides the shape, and under
     /// <c>GCConserveMemory</c> with a fragmented heap it may compact instead. It does not decommit
     /// what it frees: handing pages back to the OS is the aggressive shape's job —
-    /// <see cref="RamPressureService"/>'s under pressure, and the metric rollup's after a pass that
-    /// rewrote enough to matter — so an idle server's RSS now settles at the merge's high-water mark
-    /// instead of dropping right after it. Routed through <see cref="AggressiveGcGate"/>, which
+    /// <see cref="RamPressureService"/>'s, under pressure only, since the metric rollup asks for this
+    /// shape too (<c>MetricStorageEngine.ReleaseRollupMemory</c>) — so an idle server's RSS now settles
+    /// at the merge's high-water mark instead of dropping right after it. Routed through
+    /// <see cref="AggressiveGcGate"/>, which
     /// keeps a timestamp per shape: this request yields to a recent aggressive collection, and an
     /// aggressive collection never yields to it. Skipping is fine: the next natural gen2 reclaims
     /// the garbage either way.</para>
