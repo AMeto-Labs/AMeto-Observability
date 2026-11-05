@@ -71,7 +71,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>Whether this batch reserves what it holds against the process-wide bound.</summary>
     private readonly bool _bounded;
 
-    /// <summary>What the batch holds now: its arrays, and the strings and exceptions charged to it.</summary>
+    /// <summary>What the batch holds now: its arrays (an event's exception is bytes in them), and the strings charged to it.</summary>
     private long _charged;
 
     /// <summary>Reserved for it against the batches held decoded at once; given back when its arrays are.</summary>

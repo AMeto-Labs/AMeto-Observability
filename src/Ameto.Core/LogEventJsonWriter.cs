@@ -168,7 +168,7 @@ public static class LogEventJsonWriter
     /// <see cref="ExceptionInfo.MaxDepth"/> is dropped. A value that is not a string where the tree
     /// read one throws what the tree's decode threw, from inside the object — the SSE writer
     /// discards the frame it was composing, and the list endpoint fails the response, as either did
-    /// when the throw came out of <see cref="LogEvent.Exception"/>. <c>ExceptionJsonWriterTests</c>
+    /// when the throw came out of <see cref="LogEvent.Exception"/>. <c>ExceptionBytesContractTests</c>
     /// pins the two roads against each other over every shape.</para>
     /// </summary>
     private static void WriteException(Utf8JsonWriter writer, ref MessagePackReader reader, JsonEncodedText name, int depth)

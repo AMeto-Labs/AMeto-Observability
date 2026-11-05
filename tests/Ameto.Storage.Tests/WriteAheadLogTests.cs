@@ -84,7 +84,8 @@ public sealed class WriteAheadLogTests
     /// <summary>
     /// The exception is logged as the bytes the client sent, whatever their shape — a legacy plain
     /// string, a map with its keys in any order and unknown ones among them — and comes back the
-    /// same: the log normalises nothing. A value the decoder reads as no exception (nil) is none.
+    /// same: the log normalises nothing. (An event with no exception is logged with none, an entry
+    /// of exception length 0: the round trips above.)
     /// </summary>
     [Fact]
     public void Append_KeepsTheClientsExceptionBytesWhateverTheirShape()

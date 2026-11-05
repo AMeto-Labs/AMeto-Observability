@@ -11,9 +11,11 @@ namespace Ameto.Core;
 ///
 /// <para>The owner sets the pointer inside a <c>fixed</c> block over the payload span and
 /// clears it before leaving, so the memory is pinned for exactly the walk; nothing keeps the
-/// <see cref="Memory{T}"/> beyond it.</para>
+/// <see cref="Memory{T}"/> beyond it. Internal, and named to the assemblies that walk payloads
+/// in place (the index builder, the WAL's replay): a re-pointable raw-pointer view is no public
+/// surface.</para>
 /// </summary>
-public sealed unsafe class PinnedSpanMemoryManager : MemoryManager<byte>
+internal sealed unsafe class PinnedSpanMemoryManager : MemoryManager<byte>
 {
     private byte* _ptr;
     private int   _len;

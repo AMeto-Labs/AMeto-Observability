@@ -31,7 +31,10 @@ public sealed class LogBatchHeldMemoryTests : IClassFixture<LogBatchHeldMemoryTe
 
     public sealed class Factory : AmetoWebAppFactory
     {
-        protected override IngestionOptions ConfiguredIngestion => new() { MaxDecodedLogBatchBytes = Limit };
+        // The body cap is lifted so that a refusal below is the decoded-batch limit's and not the body's:
+        // a 12 MB body under the default 4 MiB MaxBatchBytes was 413 before a byte of it was weighed,
+        // and the test of exception bytes past the limit pinned nothing about how they are charged.
+        protected override IngestionOptions ConfiguredIngestion => new() { MaxDecodedLogBatchBytes = Limit, MaxBatchBytes = 16 * 1024 * 1024 };
     }
 
     private readonly Factory           _factory;
@@ -119,12 +122,17 @@ public sealed class LogBatchHeldMemoryTests : IClassFixture<LogBatchHeldMemoryTe
         Assert.Equal(0, _endpoint.DecodedBytesInFlight);
     }
 
-    /// <summary>The same shape past the limit in bytes alone — stacks four times as long — is still refused, nothing written.</summary>
+    /// <summary>
+    /// The same shape past the limit in bytes alone — stacks four times as long — is still refused, nothing
+    /// written: the exception bytes are in the body, the body is what a CLEF batch is weighed by, and the
+    /// weight passes the limit. The body cap is above it (the fixture), so this is the limit's refusal.
+    /// </summary>
     [Fact]
     public async Task Clef_events_whose_exception_bytes_pass_the_limit_are_refused_413()
     {
         byte[] body = ClefEventsWithExceptions(events: 1_000, stackChars: 4_000);   // ~12 MB of UTF-8 stacks
         Assert.True(body.Length > Limit, $"the body is {body.Length:N0} B");
+        Assert.True(IngestionEndpoint.WeighClef(body, out _) > Limit, "the weigh lets a body of exception bytes past the limit through");
         long accepted = _endpoint.AcceptedTotal;
 
         using var response = await PostClefAsync(body);
