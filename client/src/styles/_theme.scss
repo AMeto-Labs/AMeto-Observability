@@ -13,7 +13,8 @@
 
   --text-primary: #F9FAFB;
   --text-secondary: #CBD5E1;
-  --text-muted: #6B7280;
+  --text-muted: #8B95A5;   /* was #6B7280 — 4.0:1 on the page ground at 11 px; 6.3:1 now. Secondary text
+                              recedes by weight and size, never below 4.5:1 (design canvas, "Шкала"). */
   --text-on-primary: #FFFFFF;
   --text-on-accent: #111827;
 
@@ -31,8 +32,8 @@
      the level palette exactly (string == --lvl-i green, integer == --lvl-w amber). */
   --msg-tmpl:  #C7CED9;  /* literal template text                    */
   --msg-val:   #8C98A8;  /* JSON value — dimmed below the template   */
-  --msg-punct: #566073;  /* JSON structure — recedes                 */
-  --msg-null:  #6B7488;  /* absent value — dim + italic              */
+  --msg-punct: #76829A;  /* JSON structure — recedes (was #566073, 3.0:1; 5.0:1 now) */
+  --msg-null:  #7E889C;  /* absent value — dim + italic (was #6B7488, 4.1:1; 5.4:1 now) */
 
   /* Details JSON viewer (Overview properties + JSON tab): keys are one uniform
      dimmed tone (the design's "dim key") — quiet landmarks, values stay bright. */
@@ -44,7 +45,7 @@
      --lvl-d is #3982F6 — which leaves teal as the nearest genuinely free band. */
   --ev-new-flash: #2DD4BF;
 
-  --row-ts-date: #5C6879;  /* date recedes …                       */
+  --row-ts-date: #74839A;  /* date recedes … (was #5C6879, 3.4:1; 5.0:1 now) */
   --row-ts-time: #AEB8C5;  /* … time carries the row               */
   --row-svc:     #AEB8C5;  /* service name — same tone as the time */
 
@@ -79,16 +80,40 @@
      the selected entry showed its text hanging outside its own highlight.
      72px leaves 54px of label room — see .nav-item/.nav-label in nav.scss. */
   --nav-w: 72px;
-  --panel-w: 264px;
-  --toolbar-h: 44px;
+  --panel-w: 248px;
+  --toolbar-h: 40px;
+
+  /* ── Type scale: one for every page (design canvas "Шкала типографики", 2026-11) ──────────
+     Set at 100 % zoom. Secondary text recedes by weight and size, not by contrast. */
+  --fs-3xs: 9px;    /* axis ticks, kind tags, nav eyebrows — small caps only            */
+  --fs-2xs: 10px;   /* column headers, section captions, level and status badges       */
+  --fs-xs:  11px;   /* buttons, tabs, chips, metadata, property keys, row time, cells   */
+  --fs-sm:  12px;   /* the base: body, log rows and messages, inputs, values, JSON      */
+  --fs-md:  13px;   /* a row's lead text: trace path, alert rule name, modal section    */
+  --fs-lg:  14px;   /* page and modal titles — one size instead of two                 */
+  --fs-xl:  18px;   /* the number on a Stats / Traces tile, an alert rule's value       */
+  --fs-2xl: 22px;   /* the login title and Reference's h1 — the only large ones         */
+  --lh-tight: 1.25; /* titles, badges, tile numbers   */
+  --lh-ui:    1.4;  /* controls, tabs, filter text    */
+  --lh-body:  1.5;  /* log rows, running text, JSON   */
+
+  /* ── Heights and spacing ─────────────────────────────────────────────────────────────── */
+  --ctl-h:    26px; /* inputs, selects, buttons (were 34 / 32 / 30 / 28) */
+  --ctl-h-sm: 22px; /* chips, small buttons, the page-size select        */
+  --icon-btn: 24px; /* icon-only buttons (were 28 / 26)                   */
+  --page-pad:    16px;
+  --section-pad: 12px;
+  --gap:         10px;
+  --radius-card: 8px;
   --radius: 6px;
   --radius-sm: 4px;
   --font-ui: Inter, "Segoe UI", sans-serif;
   --font-mono: Inter, "Segoe UI", sans-serif;
   --mono: var(--font-ui);
   --ui: var(--font-ui);
-  --log-font-size: 13px;
-  --log-line-height: 1.6;
+  --log-font-size: var(--fs-sm);
+  --log-line-height: var(--lh-body);
+  --log-row-h: 24px;          /* one collapsed log row; the virtual list sizes rows by it (events.ts) */
   --log-letter-spacing: 0;
 
   --bg: var(--bg-main);

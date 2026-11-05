@@ -1,3 +1,5 @@
+@use 'breakpoints' as bp;
+
 :host {
   display: block;
   height: 100%;
@@ -15,18 +17,18 @@
 .ref-rail {
   flex: 0 0 210px;
   border-right: 1px solid var(--border);
-  padding: 16px 10px;
+  padding: var(--page-pad) 10px;
   overflow-y: auto;
   position: sticky;
   top: 0;
 }
 
 .ref-rail-title {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
   letter-spacing: .08em;
   color: var(--txt-dim);
-  padding: 0 8px 10px;
+  padding: 0 8px 8px;
 }
 
 .ref-rail-item {
@@ -34,14 +36,14 @@
   align-items: center;
   gap: 9px;
   width: 100%;
-  padding: 7px 8px;
+  padding: 6px 8px;
   margin-bottom: 2px;
   border: none;
   background: none;
   border-radius: var(--radius-sm, 6px);
   color: var(--txt-muted);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   text-align: left;
   cursor: pointer;
   transition: background .1s, color .1s;
@@ -55,43 +57,46 @@
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 28px 34px 80px;
+  padding: 20px 28px 64px;
 }
 
 .ref-sec {
   max-width: 900px;
-  margin-bottom: 44px;
+  margin-bottom: 36px;
   scroll-margin-top: 20px;
 }
 
-h1 { font-size: 24px; font-weight: 650; margin: 0 0 8px; }
+/* Running text is 13px / 1.6 (the scale's --fs-md); the h1 is the one large size the
+   client has besides the login title. */
+h1 { font-size: var(--fs-2xl); font-weight: 650; line-height: var(--lh-tight); margin: 0 0 8px; }
 h2 {
   display: flex;
   align-items: center;
   gap: 9px;
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: 620;
-  margin: 0 0 12px;
+  line-height: var(--lh-tight);
+  margin: 0 0 var(--gap);
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-sub);
   lucide-icon { color: var(--accent); }
 }
-h3 { font-size: 13.5px; font-weight: 600; color: var(--txt); margin: 22px 0 8px; }
+h3 { font-size: var(--fs-lg); font-weight: 600; color: var(--txt); margin: 20px 0 8px; }
 
-p { font-size: 13.5px; line-height: 1.65; color: var(--txt-muted); margin: 0 0 12px; }
-p.lead { font-size: 15px; color: var(--txt); }
+p { font-size: var(--fs-md); line-height: 1.6; color: var(--txt-muted); margin: 0 0 var(--gap); }
+p.lead { font-size: var(--fs-lg); color: var(--txt); }
 p.note {
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   background: var(--surface);
   border: 1px solid var(--border-sub);
-  border-radius: var(--radius, 8px);
-  padding: 11px 13px;
+  border-radius: var(--radius-card);
+  padding: 10px 12px;
 }
 b { color: var(--txt); font-weight: 600; }
 
 code {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   background: var(--surface-up);
   border: 1px solid var(--border-sub);
   border-radius: 4px;
@@ -103,38 +108,39 @@ code.ex.block {
   display: block;
   background: var(--surface-up);
   border: 1px solid var(--border-sub);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: 8px 11px;
   color: var(--txt);
+  overflow-x: auto;   /* a long example scrolls instead of widening a phone's page */
 }
 
 /* ── Overview cards ────────────────────────────────────────────────────────── */
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 12px;
-  margin: 18px 0;
+  gap: var(--gap);
+  margin: 16px 0;
 }
 .card {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  padding: 14px;
+  padding: var(--section-pad);
   background: var(--surface);
   border: 1px solid var(--border-sub);
-  border-radius: var(--radius, 8px);
+  border-radius: var(--radius-card);
 
   lucide-icon { color: var(--accent); }
-  b { font-size: 14px; }
-  span { font-size: 12px; line-height: 1.5; color: var(--txt-muted); }
+  b { font-size: var(--fs-lg); }
+  span { font-size: var(--fs-sm); line-height: var(--lh-body); color: var(--txt-muted); }
 }
 
 /* ── Level chips ───────────────────────────────────────────────────────────── */
 .levels { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
-.levels-label { font-size: 12.5px; color: var(--txt-muted); margin-right: 4px; }
+.levels-label { font-size: var(--fs-sm); color: var(--txt-muted); margin-right: 4px; }
 .lvl-chip {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 2px 9px;
   border-radius: 999px;
   border: 1px solid transparent;
@@ -147,39 +153,39 @@ code.ex.block {
 .lvl-chip[data-level="fatal"]       { color: var(--lvl-f); background: var(--lvl-f-bg); }
 
 /* ── Lists ─────────────────────────────────────────────────────────────────── */
-.path-list { margin: 0 0 12px; padding-left: 18px; }
-.path-list li { font-size: 13px; line-height: 1.9; color: var(--txt-muted); }
+.path-list { margin: 0 0 var(--gap); padding-left: 18px; }
+.path-list li { font-size: var(--fs-md); line-height: 1.7; color: var(--txt-muted); }
 
 /* ── Tables ────────────────────────────────────────────────────────────────── */
 .tbl-wrap {
   overflow-x: auto;
   border: 1px solid var(--border-sub);
-  border-radius: var(--radius, 8px);
-  margin-bottom: 14px;
+  border-radius: var(--radius-card);
+  margin-bottom: var(--section-pad);
 }
 .tbl {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .tbl thead th {
   text-align: left;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   text-transform: uppercase;
   letter-spacing: .05em;
   color: var(--txt-dim);
   font-weight: 600;
-  padding: 8px 12px;
+  padding: 7px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border-sub);
   white-space: nowrap;
 }
 .tbl tbody td {
-  padding: 9px 12px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border-sub);
   color: var(--txt-muted);
   vertical-align: top;
-  line-height: 1.5;
+  line-height: var(--lh-body);
 }
 .tbl tbody tr:last-child td { border-bottom: none; }
 .tbl tbody tr:hover { background: var(--surface-hover); }
@@ -190,16 +196,35 @@ code.ex.block {
   display: flex;
   align-items: flex-start;
   gap: 9px;
-  font-size: 12.5px;
-  line-height: 1.55;
+  font-size: var(--fs-md);
+  line-height: 1.6;
   color: var(--txt);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  border-radius: var(--radius, 8px);
-  padding: 11px 13px;
-  margin-bottom: 14px;
+  border-radius: var(--radius-card);
+  padding: 10px 12px;
+  margin-bottom: var(--section-pad);
 
   lucide-icon { color: var(--accent); flex: none; margin-top: 1px; }
 }
 
 .examples { display: flex; flex-direction: column; gap: 8px; }
+
+/* ── Phone: the rail is a strip of section tabs above the text ─────────────── */
+@include bp.below(bp.$bp-sm) {
+  .ref { flex-direction: column; }
+  .ref-rail {
+    flex: none;
+    display: flex;
+    gap: 2px;
+    padding: 6px var(--section-pad);
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    position: static;
+  }
+  .ref-rail-title { display: none; }
+  .ref-rail-item { width: auto; margin: 0; white-space: nowrap; flex-shrink: 0; }
+  .ref-body { padding: var(--page-pad) var(--section-pad) 48px; }
+}

@@ -1,8 +1,11 @@
+@use 'breakpoints' as bp;
+
 :host { display: contents; }
 
 .shell {
   display: flex;
   height: 100vh;
+  height: 100dvh;   /* a phone's toolbars come and go; the window's real height, where known */
   overflow: hidden;
 }
 
@@ -12,4 +15,12 @@
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+/* Phone: the rail is a bar fixed along the bottom edge (nav.scss), so the shell is one
+   column of content above it. The padding keeps the end of a page, and a page sized to
+   the shell, clear of the bar; it is the bar's own height, home-indicator inset included. */
+@include bp.below(bp.$bp-sm) {
+  .shell { flex-direction: column; }
+  .shell-content { padding-bottom: var(--bottom-nav-h, 0px); }
 }

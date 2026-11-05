@@ -23,10 +23,10 @@ const LEVEL_SHORT: Record<string, string> = {
  * lightweight "find similar" filter ({@link filterSelected}). All inline detail,
  * trace/metrics/JSON tabs and heavyweight menus live in the drawer, not here.
  *
- * By default the host renders at a fixed 29px and clips overflow so heights stay
- * uniform for virtual scrolling. In {@link wrap} mode the host grows to fit the
- * full message across multiple lines (the parent renders wrapped rows
- * non-virtualized, since variable heights can't be virtualized at fixed size).
+ * By default the host renders at a fixed --log-row-h (24px) and clips overflow so
+ * heights stay uniform for virtual scrolling. In {@link wrap} mode the host grows to
+ * fit the full message across multiple lines (the parent measures each wrapped row
+ * instead of assuming a height).
  */
 @Component({
   selector: 'app-event-list-row',

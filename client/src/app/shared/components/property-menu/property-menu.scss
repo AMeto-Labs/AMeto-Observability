@@ -1,5 +1,9 @@
 :host { display: contents; }
 
+/* The design's named one-off for menus and lists: between --fs-xs and --fs-sm, deliberately
+   outside the scale. With --lh-ui and 4px of padding a row is the 24px the design draws. */
+$fs-menu: 11.5px;
+
 .prop-menu {
   min-width: 220px;
   padding: 4px;
@@ -7,7 +11,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 6px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  font-size: 12px;
+  font-size: $fs-menu;
+  line-height: var(--lh-ui);
   // A menu taller than the window scrolls rather than running off it.
   max-height: calc(100vh - 16px);
   overflow-y: auto;
@@ -20,8 +25,8 @@
 }
 
 .pm-header {
-  padding: 5px 8px;
-  font-size: 11px;
+  padding: 4px 8px;
+  font-size: var(--fs-xs);
   color: var(--info);
   border-bottom: 1px solid var(--border);
   margin-bottom: 3px;
@@ -36,7 +41,7 @@
   align-items: center;
   gap: 7px;
   width: 100%;
-  padding: 5px 8px;
+  padding: 4px 8px;
   border: none;
   border-radius: 4px;
   background: transparent;
@@ -57,7 +62,7 @@
 
 .pm-section {
   padding: 3px 8px 2px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -84,19 +89,19 @@
 
 .pm-op {
   width: 26px;
-  padding: 2px 0;
+  height: var(--ctl-h-sm);
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: transparent;
   color: var(--info);
   font: inherit;
-  font-size: 12px;
   cursor: pointer;
 
   &:hover { background: var(--bg-main); border-color: var(--info); }
 }
 .pm-op--wide {
   width: auto;
-  padding: 2px 6px;
+  padding: 0 6px;
   white-space: nowrap;
 }

@@ -19,6 +19,8 @@ interface AlignedRow {
   standalone:      true,
   imports:         [FormsModule, LucideAngularModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
+  // The `data-label`s on the A / B / Δ cells are read by the phone stylesheet, where the table
+  // header is gone and each row becomes "operation, then A / B / Δ, then the two bars".
   template: `
     <div class="cmp-root">
 
@@ -111,17 +113,17 @@ interface AlignedRow {
                   </div>
                 </div>
 
-                <span class="cmp-col-a mono">
+                <span class="cmp-col-a mono" data-label="A">
                   {{ row.aSpan ? fmtMs(row.aSpan.durationNanos / 1_000_000) : '—' }}
                   @if (!row.aSpan) { <span class="badge-missing">missing</span> }
                 </span>
 
-                <span class="cmp-col-b mono">
+                <span class="cmp-col-b mono" data-label="B">
                   {{ row.bSpan ? fmtMs(row.bSpan.durationNanos / 1_000_000) : '—' }}
                   @if (!row.bSpan) { <span class="badge-missing">missing</span> }
                 </span>
 
-                <span class="cmp-col-diff mono"
+                <span class="cmp-col-diff mono" data-label="Δ"
                       [class.faster]="(row.diffMs ?? 0) < 0"
                       [class.slower]="(row.diffMs ?? 0) > 0">
                   {{ row.diffMs !== null ? diffLabel(row.diffMs) : '—' }}
@@ -152,6 +154,8 @@ interface AlignedRow {
       }
     </div>
   `,
+  // Inline styles cannot @use the shared breakpoints partial, so the phone query below spells
+  // out the same value: 639px is bp.$bp-sm − 1.
   styles: [`
     :host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
@@ -166,8 +170,8 @@ interface AlignedRow {
     .cmp-inputs {
       display: flex;
       align-items: flex-end;
-      gap: 12px;
-      padding: 12px 16px;
+      gap: 10px;
+      padding: 8px 12px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
       flex-wrap: wrap;
@@ -176,28 +180,29 @@ interface AlignedRow {
     .cmp-input-group {
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 3px;
       flex: 1;
       min-width: 240px;
       max-width: 420px;
     }
 
     .cmp-label {
-      font-size: 11px;
+      font-size: var(--fs-2xs);
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--text-muted);
     }
 
+    /* 28px, like the TraceQL box on the page above: a whole id is typed into each. */
     .cmp-id-input {
-      height: 34px;
-      padding: 0 12px;
+      height: 28px;
+      padding: 0 10px;
       background: var(--bg-elevated);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: var(--radius);
       color: var(--text-primary);
-      font-size: 12px;
+      font-size: var(--fs-sm);
       font-family: var(--font-ui);
       outline: none;
       box-sizing: border-box;
@@ -207,7 +212,7 @@ interface AlignedRow {
     }
 
     .cmp-vs {
-      font-size: 13px;
+      font-size: var(--fs-sm);
       font-weight: 700;
       color: var(--text-muted);
       padding-bottom: 6px;
@@ -218,13 +223,13 @@ interface AlignedRow {
       display: flex;
       align-items: center;
       gap: 6px;
-      height: 34px;
-      padding: 0 18px;
+      height: 28px;
+      padding: 0 14px;
       background: var(--accent);
       border: none;
-      border-radius: 6px;
+      border-radius: var(--radius);
       color: #000;
-      font-size: 13px;
+      font-size: var(--fs-sm);
       font-weight: 600;
       cursor: pointer;
       flex-shrink: 0;
@@ -238,8 +243,8 @@ interface AlignedRow {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 8px 16px;
-      font-size: 12px;
+      padding: 6px 12px;
+      font-size: var(--fs-sm);
       color: var(--error);
       flex-shrink: 0;
     }
@@ -255,26 +260,31 @@ interface AlignedRow {
       flex: 1;
       display: flex;
       flex-direction: column;
-      gap: 2px;
-      padding: 10px 16px;
+      gap: 1px;
+      padding: 6px 12px;
       border-right: 1px solid var(--border);
+      min-width: 0;
 
       &:last-child { border-right: none; }
     }
 
     .cmp-sum-label {
-      font-size: 10px;
+      font-size: var(--fs-2xs);
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--text-muted);
+      white-space: nowrap;
     }
 
+    /* 15px/600 (design canvas) — between --fs-md and --fs-xl, so a literal. */
     .cmp-sum-val {
-      font-size: 16px;
-      font-weight: 700;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: var(--lh-tight);
       color: var(--text-primary);
       font-family: var(--font-ui);
+      white-space: nowrap;
 
       &.faster { color: var(--success); }
       &.slower { color: var(--error); }
@@ -287,7 +297,7 @@ interface AlignedRow {
       justify-content: center;
       gap: 8px;
       color: var(--text-muted);
-      font-size: 13px;
+      font-size: var(--fs-sm);
     }
 
     .cmp-table-wrap {
@@ -300,16 +310,16 @@ interface AlignedRow {
 
     .cmp-head {
       display: grid;
-      grid-template-columns: 1fr 80px 80px 90px 1fr;
+      grid-template-columns: minmax(0, 1fr) 80px 80px 90px minmax(0, 1fr);
       gap: 0;
       background: var(--bg-elevated);
       border-bottom: 1px solid var(--border);
-      font-size: 10px;
+      font-size: var(--fs-2xs);
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--text-muted);
-      padding: 6px 16px;
+      padding: 4px 12px;
       flex-shrink: 0;
     }
 
@@ -320,9 +330,9 @@ interface AlignedRow {
 
     .cmp-row {
       display: grid;
-      grid-template-columns: 1fr 80px 80px 90px 1fr;
+      grid-template-columns: minmax(0, 1fr) 80px 80px 90px minmax(0, 1fr);
       align-items: center;
-      padding: 7px 16px;
+      padding: 5px 12px;
       border-bottom: 1px solid var(--border);
       gap: 0;
 
@@ -337,6 +347,7 @@ interface AlignedRow {
       align-items: center;
       gap: 7px;
       overflow: hidden;
+      min-width: 0;
     }
 
     .cmp-dot {
@@ -349,12 +360,14 @@ interface AlignedRow {
     .cmp-names {
       display: flex;
       flex-direction: column;
-      gap: 1px;
+      gap: 0;
       overflow: hidden;
+      min-width: 0;
     }
 
     .cmp-op {
-      font-size: 12px;
+      font-size: var(--fs-sm);
+      line-height: 1.25;
       color: var(--text-primary);
       white-space: nowrap;
       overflow: hidden;
@@ -362,29 +375,32 @@ interface AlignedRow {
     }
 
     .cmp-svc {
-      font-size: 10px;
+      font-size: var(--fs-2xs);
+      line-height: 1.25;
       color: var(--text-muted);
       white-space: nowrap;
     }
 
     .cmp-col-a, .cmp-col-b {
-      font-size: 12px;
+      font-size: var(--fs-sm);
       color: var(--text-secondary);
       text-align: right;
       padding-right: 12px;
+      white-space: nowrap;
     }
 
     .cmp-col-diff {
-      font-size: 12px;
+      font-size: var(--fs-sm);
       font-weight: 600;
       text-align: right;
       padding-right: 12px;
+      white-space: nowrap;
 
       &.faster { color: var(--success); }
       &.slower { color: var(--error); }
     }
 
-    .cmp-col-bar { padding: 0 4px; }
+    .cmp-col-bar { padding: 0 4px; min-width: 0; }
 
     .diff-bars {
       display: flex;
@@ -393,7 +409,7 @@ interface AlignedRow {
     }
 
     .diff-bar {
-      height: 8px;
+      height: 7px;
       border-radius: 2px;
       min-width: 2px;
       transition: width .2s;
@@ -402,7 +418,7 @@ interface AlignedRow {
     .diff-bar--b { background: var(--accent); opacity: .7; }
 
     .badge-missing {
-      font-size: 9px;
+      font-size: var(--fs-3xs);
       font-weight: 700;
       padding: 1px 4px;
       border-radius: 3px;
@@ -416,6 +432,57 @@ interface AlignedRow {
 
     @keyframes spin { to { transform: rotate(360deg); } }
     .spin { animation: spin 1s linear infinite; }
+
+    /* Phone: the two ids stacked, the summary in two rows, and each table row as a card —
+       operation, then A / B / Δ captioned from their data-labels, then the two bars. */
+    @media (max-width: 639px) {
+      .cmp-inputs { flex-direction: column; align-items: stretch; }
+      .cmp-input-group { min-width: 0; max-width: none; }
+      .cmp-vs { display: none; }
+      .cmp-id-input { height: 36px; }
+      .cmp-btn { height: 40px; justify-content: center; }
+
+      .cmp-summary { flex-wrap: wrap; }
+      .cmp-sum-item { flex: 1 1 33%; border-bottom: 1px solid var(--border); }
+
+      .cmp-head { display: none; }
+
+      .cmp-row {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-areas:
+          "name name name"
+          "a    b    diff"
+          "bar  bar  bar";
+        gap: 6px 8px;
+        padding: 10px 12px;
+      }
+
+      .cmp-col-name { grid-area: name; }
+      .cmp-col-a    { grid-area: a; }
+      .cmp-col-b    { grid-area: b; }
+      .cmp-col-diff { grid-area: diff; }
+      .cmp-col-bar  { grid-area: bar; padding: 0; }
+
+      .cmp-col-a, .cmp-col-b, .cmp-col-diff {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        text-align: left;
+        padding: 0;
+        font-size: var(--fs-md);
+
+        &::before {
+          content: attr(data-label);
+          font-size: var(--fs-3xs);
+          font-weight: 600;
+          letter-spacing: .05em;
+          text-transform: uppercase;
+          color: var(--text-muted);
+        }
+      }
+
+      .badge-missing { margin-left: 0; }
+    }
   `],
 })
 export class CompareTraceComponent {

@@ -6,14 +6,15 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--gap);
+  flex-wrap: wrap;   /* a phone puts the actions under the title instead of squeezing it */
   flex-shrink: 0;
 }
 
 .page-header__copy {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 
@@ -23,20 +24,22 @@
   gap: 8px;
   margin: 0;
   color: var(--text-primary);
-  font-size: 15px;
+  font-size: var(--fs-lg);
   font-weight: 600;
+  line-height: var(--lh-tight);
 }
 
 .page-header__subtitle {
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-ui);
   margin: 0;
 }
 
 .page-header__actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--gap);
   flex-shrink: 0;
 }
 

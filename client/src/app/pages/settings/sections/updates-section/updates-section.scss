@@ -1,17 +1,17 @@
 .sublabel {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
 .upd-grid {
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 8px 24px;
+  gap: 6px 20px;
   align-items: center;
 }
 
 .upd-label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -19,18 +19,19 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 
   &.mono,
   .mono {
     font-family: var(--font-mono, monospace);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 }
 
 .upd-dim {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
@@ -38,7 +39,7 @@
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--info);
   text-decoration: none;
 
@@ -51,7 +52,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 
   &.ok    { color: var(--success); }
   &.avail { color: var(--info); }
@@ -75,8 +76,8 @@
 
 .upd-hint,
 .upd-error {
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-body);
   padding: 8px 10px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
@@ -92,6 +93,7 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
   margin-top: 4px;
   gap: 8px;
 }

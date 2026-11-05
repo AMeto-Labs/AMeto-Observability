@@ -65,10 +65,10 @@ describe('Events page — switching wrap starts the row heights over', () => {
 
 /**
  * The SERVICE column is as wide as the longest service name on the page, between its header's
- * width and 155px, and one width for every row. jsdom has no canvas, so names are measured by
+ * width and 140px, and one width for every row. jsdom has no canvas, so names are measured by
  * the page's per-character fallback (7px a character); what is pinned is the bounds.
  */
-describe('Events page — the SERVICE column fits its longest name, up to 155px', () => {
+describe('Events page — the SERVICE column fits its longest name, up to 140px', () => {
   const render = async (services: string[]) => {
     TestBed.configureTestingModule({
       providers: [
@@ -103,9 +103,9 @@ describe('Events page — the SERVICE column fits its longest name, up to 155px'
     expect(page.svcColWidth()).toBe(104);
   });
 
-  it('stops at 155px, however long a name is', async () => {
+  it('stops at 140px, however long a name is', async () => {
     const page = await render(['WalletOperator.API.Controllers.Dealer']);
-    expect(page.svcColWidth()).toBe(155);
+    expect(page.svcColWidth()).toBe(140);
   });
 });
 

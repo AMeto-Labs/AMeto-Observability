@@ -4,6 +4,11 @@
    any component's view-encapsulation scope.
    ═══════════════════════════════════════════════════════════════════ */
 
+/* The design's named one-off for dense lists and menus (and tables, see _components.scss):
+   between --fs-xs and --fs-sm, deliberately outside the scale. A row at this size with
+   --lh-ui and 4px of padding is the 24px the design draws. */
+$fs-list: 11.5px;
+
 /* ── Panel box ──────────────────────────────────────────────────── */
 .dd-panel {
   display: flex;
@@ -20,12 +25,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px 6px;
+  padding: 6px 12px 5px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 .dd-panel-title {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   font-family: var(--ui);
   color: var(--txt);
@@ -35,8 +40,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   border-radius: 4px;
   background: none;
   border: none;
@@ -51,11 +56,12 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
+  padding: 4px 12px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
   font-family: var(--ui);
-  font-size: 12px;
+  font-size: $fs-list;
+  line-height: var(--lh-ui);
   color: var(--txt-muted);
   transition: background .1s;
 
@@ -69,26 +75,27 @@
 }
 .dd-select-all-row:hover { background: var(--surface-hover); }
 .dd-select-all-lbl { flex: 1; color: var(--txt); font-weight: 500; }
-.dd-total-count { color: var(--txt-dim); font-size: 11px; }
+.dd-total-count { color: var(--txt-dim); font-size: var(--fs-xs); }
 
-/* footer actions (Reset + Apply) */
+/* footer actions (Reset + Apply): the dropdown's buttons are 24px, between the chip and
+   the control height, as the design draws them. */
 .dd-footer-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
 .dd-reset-btn {
-  height: 26px;
-  padding: 0 12px;
+  height: 24px;
+  padding: 0 10px;
   border-radius: var(--radius-sm);
   background: none;
   border: 1px solid var(--border);
   color: var(--txt-muted);
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   font-family: var(--ui);
   cursor: pointer;
   transition: all .12s;
@@ -96,13 +103,13 @@
 .dd-reset-btn:hover { border-color: var(--txt-muted); color: var(--txt); }
 
 .dd-apply-btn {
-  height: 26px;
-  padding: 0 14px;
+  height: 24px;
+  padding: 0 12px;
   border-radius: var(--radius-sm);
   background: var(--accent);
   border: none;
   color: #fff;
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   font-family: var(--ui);
   font-weight: 600;
   cursor: pointer;
@@ -112,13 +119,13 @@
 .dd-apply-btn:disabled { opacity: .35; cursor: default; }
 
 .dd-cancel-btn {
-  height: 26px;
-  padding: 0 12px;
+  height: 24px;
+  padding: 0 10px;
   border-radius: var(--radius-sm);
   background: none;
   border: 1px solid var(--border);
   color: var(--txt-muted);
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   font-family: var(--ui);
   cursor: pointer;
   transition: all .12s;
@@ -142,9 +149,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
+  padding: 4px 12px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: $fs-list;
+  line-height: var(--lh-ui);
   font-family: var(--ui);
   color: var(--txt-muted);
   transition: background .1s;
@@ -161,7 +169,7 @@
 .lvl-name { flex: 1; color: var(--txt); }
 .lvl-count {
   color: var(--txt-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   min-width: 42px;
   text-align: right;
@@ -193,8 +201,8 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 7px 10px 4px;
-  height: 28px;
+  margin: 6px 10px 4px;
+  height: var(--ctl-h);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -210,7 +218,7 @@
   border: none;
   outline: none;
   color: var(--txt);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-family: var(--ui);
   caret-color: var(--accent);
   min-width: 0;
@@ -221,9 +229,10 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 5px 12px;
+  padding: 4px 12px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: $fs-list;
+  line-height: var(--lh-ui);
   font-family: var(--ui);
   color: var(--txt-muted);
   transition: background .1s;
@@ -247,13 +256,13 @@
 .svc-name { flex: 1; color: var(--txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .svc-count {
   color: var(--txt-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
 .svc-pct {
   color: var(--txt-dim);
-  font-size: 10.5px;
+  font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   min-width: 36px;
@@ -263,12 +272,13 @@
   display: block;
   width: 100%;
   text-align: left;
-  padding: 5px 12px;
+  padding: 4px 12px;
   background: none;
   border: none;
   border-top: 1px solid var(--border);
   color: var(--accent);
-  font-size: 11.5px;
+  font-size: $fs-list;
+  line-height: var(--lh-ui);
   font-family: var(--ui);
   cursor: pointer;
   transition: background .1s;
@@ -277,8 +287,23 @@
 .svc-show-more:hover { background: var(--surface-hover); }
 .svc-empty {
   padding: 10px 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--txt-dim);
   font-family: var(--ui);
   font-style: italic;
 }
+
+/* ── Context menu (ContextMenuService) ──────────────────────────────
+   The menu's box and colours are in _base.scss; its density is set here with the other
+   overlay panels: list-size text on 24px rows, the small sizes one step down the scale.
+   Same specificity as the base rules, later in the cascade (styles.scss order). */
+.ctx-menu button {
+  padding: 4px 12px;
+  font-size: $fs-list;
+  line-height: var(--lh-ui);
+}
+.ctx-label {
+  padding: 3px 12px;
+  font-size: var(--fs-xs);
+}
+.ctx-menu code { font-size: var(--fs-xs); }

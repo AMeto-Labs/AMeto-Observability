@@ -7,63 +7,98 @@
 }
 
 // ── Page layout ──────────────────────────────────────────────────────────────
+// A grid of named areas rather than a flex column (see the note at the top of traces.html):
+// the title row, the control strip and the search area are the same elements at every width,
+// placed differently. Sizes come from the design canvas ("Traces 1366×768 / 1920×1080 — плотно"):
+// 16px above, 20px at the sides, 12px below, 12px between the rows.
 .traces-page {
-  display: flex;
-  flex-direction: column;
+  --pad-x: 20px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "title  controls quick"
+    "search search   search"
+    "stats  stats    stats"
+    "tabs   tabs     tabs"
+    "body   body     body";
+  column-gap: var(--gap);
+  row-gap: var(--section-pad);
   height: 100%;
-  padding: 20px 24px 16px;
-  gap: 12px;
+  padding: var(--page-pad) var(--pad-x) var(--section-pad);
   overflow: hidden;
 }
 
 // ── Page header ───────────────────────────────────────────────────────────────
-.page-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-shrink: 0;
-}
-
 .page-title {
+  grid-area: title;
+  align-self: center;
   display: flex;
   align-items: baseline;
   gap: 10px;
+  min-width: 0;
 
   h1 {
     margin: 0;
-    font-size: 18px;
-    font-weight: 700;
+    font-size: var(--fs-lg);
+    font-weight: 600;
+    line-height: var(--lh-tight);
     color: var(--text-primary);
   }
 }
 
 .page-subtitle {
-  font-size: 13px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
+// The range chips, the Live switch and the Rows menu. Right-aligned on the title row; it may
+// wrap, because the custom range adds two date inputs and an end-aligned grid item that
+// outgrows its column overflows towards the title.
 .hdr-actions {
+  grid-area: controls;
+  align-self: center;
+  justify-self: end;
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--gap);
 }
 
+// The buttons that never leave the header. Two of them exist for the phone only.
+.hdr-quick {
+  grid-area: quick;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+}
+
+.range-btn,
+.live-btn { display: none; }
+
+// The header row's controls are all --icon-btn (24px) tall, the bordered groups included:
+// 1px border + 1px padding + a 20px button.
 .preset-group {
   display: flex;
   gap: 2px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
+  border-radius: var(--radius);
+  padding: 1px;
 }
 
 .preset-btn {
+  height: 20px;
   background: none;
   border: none;
   color: var(--text-secondary);
-  font-size: 12px;
-  padding: 4px 9px;
-  border-radius: 4px;
+  font-size: var(--fs-xs);
+  line-height: 1;
+  padding: 0 7px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s;
 
@@ -76,21 +111,23 @@
   display: flex;
   align-items: center;
   gap: 6px;
+
+  .btn-apply { height: var(--icon-btn); padding: 0 10px; font-size: var(--fs-xs); }
 }
 .custom-dt {
-  height: 28px;
-  padding: 0 8px;
+  height: var(--icon-btn);
+  padding: 0 6px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color-scheme: dark;
   outline: none;
 
   &:focus { border-color: var(--accent); }
 }
-.custom-sep { color: var(--text-muted); font-size: 12px; }
+.custom-sep { color: var(--text-muted); font-size: var(--fs-xs); }
 
 /* Live switch + cadence menu. One bordered group, like .preset-group, because they are one
    control: the state the switch shows is the state the menu selects. */
@@ -100,19 +137,23 @@
   gap: 2px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
+  border-radius: var(--radius);
+  padding: 1px;
 }
 
-.live-toggle {
-  display: flex;
+.live-toggle { display: flex; }
+// The phone header's .live-btn stays display: none here (above); the phone layer shows it.
+.live-toggle,
+.live-btn {
   align-items: center;
   gap: 5px;
+  height: 20px;
   background: none;
   border: none;
-  border-radius: 4px;
-  padding: 4px 8px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  padding: 0 7px;
+  font-size: var(--fs-xs);
+  line-height: 1;
   font-weight: 600;
   color: var(--success);
   cursor: pointer;
@@ -130,15 +171,18 @@
   flex-shrink: 0;
 }
 
-.live-select {
-  height: 22px;
-  padding: 0 17px 0 6px;
+// The two menus share one look: a borderless select inside its group, with a chevron drawn in
+// as a background because `appearance: none` takes the native one away.
+.live-select,
+.rows-select {
+  height: 20px;
+  padding: 0 16px 0 6px;
   background: transparent;
   border: none;
   border-left: 1px solid var(--border);
   border-radius: 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   outline: none;
   cursor: pointer;
   appearance: none;
@@ -159,389 +203,41 @@
   gap: 2px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
+  border-radius: var(--radius);
+  padding: 1px;
 }
 
 .rows-label {
   padding: 0 2px 0 6px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
 }
 
-.rows-select {
-  height: 22px;
-  padding: 0 17px 0 6px;
-  background: transparent;
-  border: none;
-  border-left: 1px solid var(--border);
-  border-radius: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 4px center;
-
-  &:hover, &:focus { color: var(--text-primary); }
-  option { background: var(--bg-elevated); }
-}
-
 /* Paused. The dot stops MOVING as well as changing colour: an animation is what the eye reads
    as "something is still arriving", and a grey pulse would go on saying it. */
-.live-group.off {
+.live-group.off,
+.live-btn.off {
   .live-toggle { color: var(--text-muted); }
   .live-dot    { background: var(--text-muted); animation: none; }
 }
+.live-btn.off { color: var(--text-muted); }
 
 @keyframes live-pulse {
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.3; }
 }
 
-// ── Jump-to-trace bar ─────────────────────────────────────────────────────────
-.jump-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  position: relative;
-
-  .search-icon {
-    position: absolute;
-    left: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-}
-
-.jump-input {
-  flex: 1;
-  max-width: 480px;
-  height: 32px;
-  padding: 0 10px 0 32px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 12px;
-  font-family: var(--font-ui);
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--info); }
-}
-
-.btn-jump {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  height: 32px;
-  padding: 0 14px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  cursor: pointer;
-
-  &:hover:not(:disabled) { border-color: var(--info); color: var(--info); }
-  &:disabled { opacity: 0.4; cursor: default; }
-}
-
-// ── Duration filter ───────────────────────────────────────────────────────────
-.duration-filter {
-  position: relative;
-  display: flex;
-  align-items: center;
-
-  .dur-icon {
-    position: absolute;
-    left: 9px;
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-}
-
-.duration-input {
-  width: 90px;
-  height: 32px;
-  padding: 0 8px 0 28px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--accent); }
-  &::-webkit-inner-spin-button,
-  &::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-  -moz-appearance: textfield;
-}
-
-// ── Filter bar ────────────────────────────────────────────────────────────────
-.filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.filter-search {
-  position: relative;
-  flex: 1;
-  min-width: 200px;
-  max-width: 380px;
-
-  .search-icon {
-    position: absolute;
-    left: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-}
-
-.filter-search-input {
-  width: 100%;
-  height: 32px;
-  padding: 0 10px 0 32px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--accent); }
-}
-
-.filter-select {
-  height: 32px;
-  padding: 0 24px 0 10px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-
-  &:focus { border-color: var(--accent); }
-  option  { background: var(--bg-elevated); }
-
-  &--http { width: 90px; }
-}
-
-.btn-apply {
-  height: 32px;
-  padding: 0 16px;
-  background: var(--accent);
-  border: none;
-  border-radius: 6px;
-  color: #000;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: opacity 0.15s;
-  &:hover { opacity: 0.85; }
-}
-
-.btn-clear {
-  height: 32px;
-  padding: 0 12px;
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-muted);
-  font-size: 13px;
-  cursor: pointer;
-  transition: border-color 0.15s, color 0.15s;
-  &:hover { border-color: var(--error); color: var(--error); }
-}
-
-// ── Stats row ─────────────────────────────────────────────────────────────────
-.stats-row {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 10px;
-  flex-shrink: 0;
-}
-
-.stat-card {
-  position: relative;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px 14px 10px;
-  overflow: hidden;
-
-  &.stat-error  { border-top: 2px solid var(--error); }
-  &.stat-success { border-top: 2px solid var(--success); }
-}
-
-.stat-info {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  position: relative;
-  z-index: 1;
-}
-
-.stat-label {
-  font-size: 11px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.stat-value {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--text-primary);
-  font-family: var(--font-ui);
-}
-
-.sparkline {
-  position: absolute;
-  bottom: 0;
-  right: 0;
-  width: 80px;
-  height: 28px;
-  opacity: 0.55;
-}
-
-// ── Body row (main content + History panel) ────────────────────────────────────
-// The History panel sits beside whichever main-tab body is showing (list, graph,
-// latency, compare) — not just the trace list — so it stays reachable from any tab,
-// same as the Events Signals panel sits beside the whole events body.
-.body-row {
-  display: flex;
-  gap: 12px;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.body-main {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-// ── Main content ──────────────────────────────────────────────────────────────
-.main-content {
-  display: flex;
-  gap: 10px;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-// ── History panel ─────────────────────────────────────────────────────────────
-// Chrome copied from the Events Signals panel (signals-panel.scss): fixed width
-// var(--panel-w), header with title + close X. Given this page's card language
-// (every other panel here is a bordered, radius-8 card), it gets the same treatment
-// rather than the Events panel's flush edge-to-edge strip.
-.history-panel {
-  display: flex;
-  flex-direction: column;
-  width: var(--panel-w);
-  min-width: var(--panel-w);
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  flex-shrink: 0;
-}
-
-.history-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.history-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.history-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 4px 0;
-}
-
-// ── Trace list panel ──────────────────────────────────────────────────────────
-.trace-list-panel {
-  display: flex;
-  flex-direction: column;
-  flex: 0 0 400px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  transition: flex-basis 0.2s;
-
-  &.narrow { flex-basis: 320px; }
-}
-
-.list-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.list-title {
-  font-size: 13px;
-  color: var(--text-secondary);
-
-  strong {
-    color: var(--text-primary);
-    font-weight: 600;
-    margin-right: 3px;
-  }
-}
-
 .icon-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
+  padding: 0;
   background: none;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius);
   color: var(--text-muted);
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s;
@@ -553,6 +249,579 @@
   &.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 }
 
+// ── Sheet scaffolding ─────────────────────────────────────────────────────────
+// Everything here is the phone's bottom sheet (see the phone block at the end). Wider than a
+// phone the wrapper and its scroll box dissolve (`display: contents`) so .hdr-actions and
+// .search-area are placed by the page grid, and the sheet's own chrome does not exist.
+.hdr-sheet,
+.sheet-scroll { display: contents; }
+
+.sheet-hdr,
+.sheet-foot,
+.sheet-backdrop,
+.phone-search { display: none; }
+
+// ── Search area ───────────────────────────────────────────────────────────────
+.search-area {
+  grid-area: search;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+// ── Mode toggle ───────────────────────────────────────────────────────────────
+// --ctl-h (26px) like the inputs it switches between: 1px border + 1px padding + a 22px button.
+.mode-toggle {
+  display: flex;
+  align-self: flex-start;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px;
+  gap: 2px;
+}
+
+.mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: var(--ctl-h-sm);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  padding: 0 10px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+
+  &:hover  { color: var(--text-primary); }
+  &.active { background: var(--bg-card); color: var(--text-primary); font-weight: 600; }
+}
+
+// ── Filter bar ────────────────────────────────────────────────────────────────
+// Every control in it is --ctl-h (26px) tall at 12px.
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.filter-search {
+  position: relative;
+  min-width: 200px;
+  flex: 1;
+  max-width: 320px;
+}
+
+.fi-icon {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.fi-input {
+  width: 100%;
+  height: var(--ctl-h);
+  padding: 0 8px 0 26px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+  box-sizing: border-box;
+
+  &::placeholder { color: var(--text-muted); }
+  &:focus { border-color: var(--accent); }
+}
+
+.filter-select {
+  height: var(--ctl-h);
+  padding: 0 22px 0 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+
+  &:focus { border-color: var(--accent); }
+  option  { background: var(--bg-elevated); }
+
+  &--http { width: 96px; }
+}
+
+.dur-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.dur-input {
+  width: 84px;
+  height: var(--ctl-h);
+  padding: 0 6px 0 24px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+  box-sizing: border-box;
+
+  &::placeholder { color: var(--text-muted); }
+  &:focus { border-color: var(--accent); }
+  &::-webkit-inner-spin-button,
+  &::-webkit-outer-spin-button { -webkit-appearance: none; }
+  -moz-appearance: textfield;
+}
+
+.btn-apply {
+  height: var(--ctl-h);
+  padding: 0 12px;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: #000;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  &:hover:not(:disabled) { opacity: 0.85; }
+  &:disabled { opacity: 0.4; cursor: default; }
+}
+
+.btn-clear {
+  height: var(--ctl-h);
+  padding: 0 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  &:hover { border-color: var(--error); color: var(--error); }
+}
+
+// ── TraceQL bar ───────────────────────────────────────────────────────────────
+// 28px — a little taller than the filter controls, because it is the one box a whole query is
+// typed into (design canvas).
+.traceql-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  .btn-apply { display: flex; align-items: center; gap: 5px; height: 28px; }
+}
+
+.tql-wrap {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+
+  &.has-error .tql-input { border-color: var(--error); }
+}
+
+.tql-icon {
+  position: absolute;
+  left: 9px;
+  color: var(--text-muted);
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.tql-input {
+  width: 100%;
+  height: 28px;
+  padding: 0 28px 0 28px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+
+  &::placeholder { color: var(--text-muted); font-family: var(--font-ui); }
+  &:focus { border-color: var(--info); }
+}
+
+.tql-clear {
+  position: absolute;
+  right: 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 3px;
+
+  &:hover { color: var(--text-primary); }
+}
+
+.tql-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-sm);
+  color: var(--error);
+  padding: 2px 4px;
+}
+
+.tql-hints {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tql-hint-label {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.tql-hint-chip {
+  height: var(--ctl-h-sm);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--info);
+  font-size: var(--fs-xs);
+  font-family: var(--font-ui);
+  padding: 0 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+
+  &:hover { border-color: var(--info); background: color-mix(in srgb, var(--info) 8%, transparent); }
+}
+
+// ── Jump bar ──────────────────────────────────────────────────────────────────
+.jump-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  align-self: flex-start;
+
+  .fi-icon {
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+}
+
+.jump-input {
+  width: 300px;
+  height: var(--ctl-h);
+  padding: 0 8px 0 26px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
+  outline: none;
+  box-sizing: border-box;
+
+  &::placeholder { color: var(--text-muted); }
+  &:focus { border-color: var(--info); color: var(--text-primary); }
+}
+
+.btn-jump {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: var(--ctl-h);
+  padding: 0 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover:not(:disabled) { border-color: var(--info); color: var(--info); }
+  &:disabled { opacity: 0.4; cursor: default; }
+}
+
+// ── Stats row ─────────────────────────────────────────────────────────────────
+.stats-row {
+  grid-area: stats;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: var(--gap);
+  min-width: 0;
+}
+
+.stat-card {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: 8px 12px 6px;
+  overflow: hidden;
+  min-width: 0;
+
+  &.stat-error  { border-top: 2px solid var(--error); }
+  &.stat-success { border-top: 2px solid var(--success); }
+}
+
+.stat-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+  z-index: 1;
+}
+
+.stat-label {
+  font-size: var(--fs-2xs);
+  line-height: var(--lh-ui);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.stat-value {
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  white-space: nowrap;
+}
+
+.sparkline {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 72px;
+  height: 24px;
+  opacity: 0.55;
+}
+
+// ── Main tabs ─────────────────────────────────────────────────────────────────
+.main-tabs {
+  grid-area: tabs;
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 2px;
+  min-width: 0;
+}
+
+.main-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
+  padding: 6px 12px;
+  cursor: pointer;
+  margin-bottom: -1px;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s;
+
+  &:hover  { color: var(--text-primary); }
+  &.active { color: var(--accent); border-bottom-color: var(--accent); }
+}
+
+// ── Body row (main content + History panel) ────────────────────────────────────
+// The History panel sits beside whichever main-tab body is showing (list, graph,
+// latency, compare) — not just the trace list — so it stays reachable from any tab,
+// same as the Events Signals panel sits beside the whole events body.
+.body-row {
+  grid-area: body;
+  display: flex;
+  gap: var(--section-pad);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.body-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-pad);
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+// ── Main content ──────────────────────────────────────────────────────────────
+.main-content {
+  display: flex;
+  gap: var(--gap);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.hidden { display: none !important; }
+
+// ── Graph panel (Service Graph / Latency / Compare hosts) ─────────────────────
+.graph-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+
+.fg-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+// ── History panel ─────────────────────────────────────────────────────────────
+// Chrome copied from the Events Signals panel (signals-panel.scss): fixed width
+// var(--panel-w), header with title + close X. Given this page's card language
+// (every other panel here is a bordered, radius-8 card), it gets the same treatment
+// rather than the Events panel's flush edge-to-edge strip. A docked column here; an
+// overlay below 1280px, where a column would take a third of the page.
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  width: var(--panel-w);
+  min-width: var(--panel-w);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.history-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  min-height: 36px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.history-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.history-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+// ── Trace list panel ──────────────────────────────────────────────────────────
+// 360px, 300px once a trace is open beside it (design canvas); 320 / 280 below 1280px.
+.trace-list-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 360px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  transition: flex-basis 0.2s;
+
+  &.narrow { flex-basis: 300px; }
+}
+
+.list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 4px 10px;
+  min-height: 32px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.list-title {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
+  color: var(--text-secondary);
+  min-width: 0;
+
+  strong {
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-right: 3px;
+  }
+}
+
+// ── Trace list header (live count + the stream's Stop control) ─────────────
+.list-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.stream-stop {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--ctl-h-sm);
+  padding: 0 8px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+
+  &:hover { color: var(--error); border-color: var(--error); }
+}
+
+.list-more-hint {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+// Warmer than .list-more-hint on purpose: the other suffixes describe an answer that is
+// merely short, this one says the list has stopped keeping itself up to date.
+.list-stale-hint {
+  color: var(--warning);
+  font-weight: 400;
+  cursor: help;
+}
+
 .panel-empty {
   flex: 1;
   display: flex;
@@ -560,7 +829,7 @@
   justify-content: center;
   gap: 8px;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .trace-rows {
@@ -585,11 +854,13 @@
 }
 
 // ── Trace row ──────────────────────────────────────────────────────────────
+// Three lines, ~62px (the virtualizer's estimate in traces.ts — keep the two in step): when /
+// how long / how it ended at 11px, the method and path at 12px, the service chips at 10px.
 .trace-row {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 5px 10px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
   transition: background 0.1s;
@@ -607,7 +878,7 @@
   height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
-  margin-top: 5px;
+  margin-top: 4px;
   background: var(--text-muted);
 
   &.ok    { background: var(--success); }
@@ -620,13 +891,34 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
+}
+
+.trace-ts-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-ui);
 }
 
 .trace-ts {
-  font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-ui);
+  white-space: nowrap;
+}
+
+.trace-dur {
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  white-space: nowrap;
+}
+
+.span-count {
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .trace-path-line {
@@ -634,40 +926,41 @@
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
 }
 
 .trace-path {
-  font-size: 13px;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.trace-svc {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.trace-row-right {
+// ── Service chips in trace rows ───────────────────────────────────────────────
+.trace-svc-chips {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 1px;
 }
 
-.trace-dur {
-  font-size: 11px;
-  color: var(--text-muted);
-  font-family: var(--font-ui);
+.trace-svc-chip {
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid;
+  white-space: nowrap;
+  line-height: 1.3;
 }
 
 // ── HTTP method badge ──────────────────────────────────────────────────────
 .http-method {
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
-  padding: 1px 5px;
+  line-height: 1.3;
+  padding: 1px 4px;
   border-radius: 3px;
   flex-shrink: 0;
   text-transform: uppercase;
@@ -683,17 +976,23 @@
 // ── Status badge ──────────────────────────────────────────────────────────
 .status-badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
-  padding: 2px 6px;
-  border-radius: 4px;
+  line-height: 1.3;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
   letter-spacing: 0.03em;
+  white-space: nowrap;
 
   &.badge-ok    { background: color-mix(in srgb, var(--success) 15%, transparent); color: var(--success); }
   &.badge-error { background: color-mix(in srgb, var(--error)   15%, transparent); color: var(--error); }
   &.badge-warn  { background: color-mix(in srgb, var(--accent)  15%, transparent); color: var(--accent); }
   &.badge-info  { background: color-mix(in srgb, var(--info)    15%, transparent); color: var(--info); }
 }
+
+// In the row it closes the first line, pushed to the right edge so the eye finds the outcome
+// at the same place in every row.
+.trace-ts-line .status-badge { margin-left: auto; }
 
 // ── Trace detail panel ────────────────────────────────────────────────────────
 .trace-detail-panel {
@@ -702,7 +1001,7 @@
   flex-direction: column;
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-card);
   overflow: hidden;
   min-width: 0;
 }
@@ -710,10 +1009,30 @@
 .detail-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  min-height: 36px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+}
+
+// Only below 900px, where it is the way back to the list (see the tablet block).
+.detail-back {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  height: var(--ctl-h);
+  padding: 0 8px 0 4px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+
+  &:hover { border-color: var(--accent); color: var(--accent); }
 }
 
 .detail-title {
@@ -725,12 +1044,12 @@
 }
 
 .detail-trace-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
 }
 
 .detail-trace-id {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--info);
   user-select: all;          // one click selects the whole id
   overflow-wrap: anywhere;   // full 32-hex id wraps instead of overflowing on narrow panels
@@ -742,6 +1061,25 @@
   cursor: pointer;
   flex-shrink: 0;
   &:hover { color: var(--text-primary); }
+}
+
+.detail-meta {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.meta-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  font-size: var(--fs-2xs);
+  padding: 0 7px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 // ── Span-attribute context menu ──────────────────────────────────────────────
@@ -756,7 +1094,7 @@
   margin-right: 5px;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
@@ -767,21 +1105,6 @@
 }
 
 // The span-attribute context menu now lives in the shared PropertyMenuComponent.
-
-.detail-meta {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.meta-chip {
-  font-size: 11px;
-  padding: 2px 8px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-secondary);
-}
 
 // ── Detail tabs ───────────────────────────────────────────────────────────────
 .detail-tabs {
@@ -795,49 +1118,58 @@
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--text-muted);
-  font-size: 13px;
-  padding: 8px 16px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
+  padding: 6px 12px;
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
   margin-bottom: -1px;
+  white-space: nowrap;
 
   &:hover { color: var(--text-primary); }
   &.active { color: var(--accent); border-bottom-color: var(--accent); }
 }
 
 // ── Waterfall ─────────────────────────────────────────────────────────────────
+// The column template and the row height are variables so the breakpoints below can retune
+// them in one place: 220 / 64px and 28px rows on a desktop, 200px labels below 1280px,
+// 170 / 60px and 32px rows on a tablet, a stacked row on a phone.
 .waterfall {
+  --wf-cols: 220px minmax(0, 1fr) 64px;
+  --wf-row-h: 28px;
+  --wf-bar-h: 14px;
+  --wf-depth-step: 14px;
   flex: 1;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 .wf-axis-row {
   display: grid;
-  grid-template-columns: 250px 1fr 72px;
+  grid-template-columns: var(--wf-cols);
+  height: 24px;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   flex-shrink: 0;
 
-  > div { padding: 6px 8px; }
-}
-
-.wf-bar-col.header {
-  position: relative;
+  > div { display: flex; align-items: center; padding: 0 8px; height: 24px; }
+  .wf-bar-col { height: 24px; }
 }
 
 .wf-tick {
   position: absolute;
-  top: 4px;
+  top: 0;
+  height: 24px;
+  line-height: 24px;
   transform: translateX(-50%);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   pointer-events: none;
   white-space: nowrap;
@@ -855,10 +1187,10 @@
 
 .wf-row {
   display: grid;
-  grid-template-columns: 250px 1fr 72px;
+  grid-template-columns: var(--wf-cols);
   border-bottom: 1px solid var(--border);
   align-items: center;
-  min-height: 34px;
+  min-height: var(--wf-row-h);
   cursor: pointer;
   transition: background 0.1s;
 
@@ -868,11 +1200,13 @@
   &.error-span .wf-op { color: var(--error); }
 }
 
+// `--depth` is set per row by the template (the nesting level); the axis header has none.
 .wf-label-col {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px;
+  padding: 0 8px 0 calc(var(--depth, 0) * var(--wf-depth-step) + 8px);
+  min-width: 0;
   overflow: hidden;
   border-right: 1px solid var(--border);
 }
@@ -890,11 +1224,12 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  gap: 1px;
+  gap: 0;
 }
 
 .wf-svc {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
+  line-height: 1.2;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -902,7 +1237,8 @@
 }
 
 .wf-op {
-  font-size: 12px;
+  font-size: var(--fs-sm);
+  line-height: 1.2;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -912,7 +1248,7 @@
 .wf-bar-col {
   position: relative;
   padding: 0 8px;
-  height: 34px;
+  height: var(--wf-row-h);
   display: flex;
   align-items: center;
   border-right: 1px solid var(--border);
@@ -920,8 +1256,8 @@
 
 .wf-bar {
   position: absolute;
-  top: 9px;
-  height: 16px;
+  top: calc((var(--wf-row-h) - var(--wf-bar-h)) / 2);
+  height: var(--wf-bar-h);
   border-radius: 3px;
   min-width: 2px;
   opacity: 0.85;
@@ -931,20 +1267,25 @@
 }
 
 .wf-dur-col {
-  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 8px;
   text-align: right;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-family: var(--font-ui);
+  white-space: nowrap;
 }
 
 // ── Span detail panel ──────────────────────────────────────────────────────────
-/* Height comes from the template ([style.height.px]) so the user's drag owns it. The bounds
-   stay here as a floor and a ceiling the inline value is clamped into by the service — the
-   panel must never collapse to nothing, nor grow until the waterfall it annotates is gone. */
+/* The height comes from the template as --span-h (the user's drag owns it). The bounds stay
+   here as a floor and a ceiling the value is clamped into by the service — the panel must never
+   collapse to nothing, nor grow until the waterfall it annotates is gone. */
 .span-detail {
   display: flex;
   flex-shrink: 0;
+  height: var(--span-h, 200px);
   min-height: 140px;
   max-height: 90vh;
   border-top: 1px solid var(--border);
@@ -980,14 +1321,14 @@
 /* Close affordance for the span panel (re-clicking the span row also toggles it off). */
 .span-close {
   position: absolute;
-  top: 6px;
-  right: 6px;
+  top: 4px;
+  right: 4px;
   z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: var(--ctl-h-sm);
+  height: var(--ctl-h-sm);
   padding: 0;
   background: none;
   border: none;
@@ -1001,7 +1342,8 @@
 .span-detail-left,
 .span-detail-right {
   flex: 1;
-  padding: 12px;
+  min-width: 0;
+  padding: 8px 10px;
   overflow-y: auto;
 }
 
@@ -1015,7 +1357,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  padding: 3px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 
   &:last-child { border-bottom: none; }
@@ -1024,24 +1366,25 @@
 .sd-key {
   display: flex;
   align-items: center;
-  width: 122px;
+  width: 104px;
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
 .sd-val {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   display: flex;
   align-items: center;
   gap: 5px;
+  min-width: 0;
   word-break: break-all;
 
   &.mono  { font-family: var(--font-ui); }
-  &.small { font-size: 11px; }
+  &.small { font-size: var(--fs-xs); }
 }
 
 // ── Span tags ──────────────────────────────────────────────────────────────
@@ -1057,423 +1400,13 @@
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--text-muted);
-  font-size: 12px;
-  padding: 4px 12px;
+  font-size: var(--fs-sm);
+  padding: 3px 10px;
   cursor: pointer;
   margin-bottom: -1px;
-
-  &.active { color: var(--accent); border-bottom-color: var(--accent); }
-}
-
-.tags-wrap {
-  flex: 1;
-  overflow-y: auto;
-}
-
-.tags-empty {
-  color: var(--text-muted);
-  font-size: 12px;
-  padding: 8px 0;
-}
-
-.tags-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-
-  th {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    padding: 4px 6px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-  }
-
-  tr:hover td { background: var(--bg-card); }
-
-  td {
-    padding: 4px 6px;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
-    vertical-align: top;
-    color: var(--text-primary);
-
-    &.tag-key { color: var(--info); font-family: var(--font-ui); white-space: nowrap; }
-    &.tag-val { word-break: break-all; }
-  }
-}
-
-// ── Details tab ──────────────────────────────────────────────────────────────
-.detail-info-tab {
-  padding: 16px;
-  overflow-y: auto;
-}
-
-.di-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 7px 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-
-  &:last-child { border-bottom: none; }
-}
-
-.di-k {
-  width: 90px;
-  flex-shrink: 0;
-  font-size: 11px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.di-v {
-  flex: 1;
-  font-size: 13px;
-  color: var(--text-primary);
-  word-break: break-all;
-
-  &.mono  { font-family: var(--font-ui); font-size: 12px; }
-  &.small { font-size: 11px; }
-}
-
-.svc-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.svc-chip {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid;
-  font-weight: 600;
-}
-
-// ── Shared utilities ──────────────────────────────────────────────────────────
-.mono  { font-family: var(--font-ui); }
-.small { font-size: 11px; }
-
-@keyframes spin { to { transform: rotate(360deg); } }
-.spin { animation: spin 1s linear infinite; }
-
-// ── Main tabs ─────────────────────────────────────────────────────────────────
-.main-tabs {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  padding: 0 2px;
-}
-
-.main-tab {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text-muted);
-  font-size: 13px;
-  padding: 8px 14px;
-  cursor: pointer;
-  margin-bottom: -1px;
-  transition: color .15s, border-color .15s;
-
-  &:hover  { color: var(--text-primary); }
-  &.active { color: var(--accent); border-bottom-color: var(--accent); }
-}
-
-// ── Graph panel ───────────────────────────────────────────────────────────────
-.graph-panel {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.hidden { display: none !important; }
-
-.fg-host {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-// ── Search area ───────────────────────────────────────────────────────────────
-.search-area {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-// ── Mode toggle ───────────────────────────────────────────────────────────────
-.mode-toggle {
-  display: flex;
-  align-self: flex-start;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
-  gap: 2px;
-}
-
-.mode-btn {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  background: none;
-  border: none;
-  border-radius: 4px;
-  color: var(--text-muted);
-  font-size: 12px;
-  padding: 4px 10px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-
-  &:hover  { color: var(--text-primary); }
-  &.active { background: var(--bg-card); color: var(--text-primary); font-weight: 600; }
-}
-
-// ── Filter bar (new compact) ──────────────────────────────────────────────────
-.filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-}
-
-.filter-search {
-  position: relative;
-  min-width: 200px;
-  flex: 1;
-  max-width: 320px;
-}
-
-.fi-icon {
-  position: absolute;
-  left: 9px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--text-muted);
-  pointer-events: none;
-}
-
-.fi-input {
-  width: 100%;
-  height: 32px;
-  padding: 0 10px 0 30px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--accent); }
-}
-
-.dur-wrap {
-  position: relative;
-  display: flex;
-  align-items: center;
-}
-
-.dur-input {
-  width: 86px;
-  height: 32px;
-  padding: 0 8px 0 26px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--accent); }
-  &::-webkit-inner-spin-button,
-  &::-webkit-outer-spin-button { -webkit-appearance: none; }
-  -moz-appearance: textfield;
-}
-
-// ── TraceQL bar ───────────────────────────────────────────────────────────────
-.traceql-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.tql-wrap {
-  flex: 1;
-  position: relative;
-  display: flex;
-  align-items: center;
-
-  &.has-error .tql-input { border-color: var(--error); }
-}
-
-.tql-icon {
-  position: absolute;
-  left: 10px;
-  color: var(--text-muted);
-  pointer-events: none;
-  flex-shrink: 0;
-}
-
-.tql-input {
-  width: 100%;
-  height: 34px;
-  padding: 0 32px 0 32px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: var(--font-ui);
-  outline: none;
-  box-sizing: border-box;
-  transition: border-color 0.15s;
-
-  &::placeholder { color: var(--text-muted); font-family: var(--font-ui); }
-  &:focus { border-color: var(--info); }
-}
-
-.tql-clear {
-  position: absolute;
-  right: 8px;
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  padding: 2px;
-  border-radius: 3px;
-
-  &:hover { color: var(--text-primary); }
-}
-
-.tql-error {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--error);
-  padding: 2px 4px;
-}
-
-.tql-hints {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.tql-hint-label {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.tql-hint-chip {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--info);
-  font-size: 11px;
-  font-family: var(--font-ui);
-  padding: 2px 8px;
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
-
-  &:hover { border-color: var(--info); background: color-mix(in srgb, var(--info) 8%, transparent); }
-}
-
-// ── Jump bar ──────────────────────────────────────────────────────────────────
-.jump-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  position: relative;
-  align-self: flex-start;
-
-  .fi-icon {
-    left: 9px;
-    top: 50%;
-    transform: translateY(-50%);
-  }
-}
-
-.jump-input {
-  width: 360px;
-  height: 30px;
-  padding: 0 10px 0 30px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-family: var(--font-ui);
-  outline: none;
-  box-sizing: border-box;
-
-  &::placeholder { color: var(--text-muted); }
-  &:focus { border-color: var(--info); color: var(--text-primary); }
-}
-
-.btn-jump {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  height: 30px;
-  padding: 0 12px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
   white-space: nowrap;
 
-  &:hover:not(:disabled) { border-color: var(--info); color: var(--info); }
-  &:disabled { opacity: 0.4; cursor: default; }
-}
-
-// ── Service chips in trace rows ───────────────────────────────────────────────
-.trace-svc-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px;
-  margin-top: 2px;
-}
-
-.trace-svc-chip {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 1px 6px;
-  border-radius: 3px;
-  border: 1px solid;
-  white-space: nowrap;
-  line-height: 1.5;
-}
-
-.span-count {
-  font-size: 10px;
-  color: var(--text-muted);
+  &.active { color: var(--accent); border-bottom-color: var(--accent); }
 }
 
 // ── Span logs ─────────────────────────────────────────────────────────────────
@@ -1488,12 +1421,56 @@
   background: var(--info);
   color: #000;
   border-radius: 8px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   line-height: 1;
 }
 
+.tags-wrap {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.tags-empty {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  padding: 8px 0;
+}
+
+.tags-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+
+  th {
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    padding: 3px 6px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  tr:hover td { background: var(--bg-card); }
+
+  td {
+    padding: 3px 6px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    vertical-align: top;
+    color: var(--text-primary);
+
+    &.tag-key { color: var(--info); font-family: var(--font-ui); white-space: nowrap; }
+    &.tag-val { word-break: break-all; }
+  }
+}
+
+// --svc-col is the shared row's SERVICE column (event-list-row.scss reads it, 140px when unset
+// — the Events page's width). These rows sit in half of a 200px panel, where 140px of service
+// name left the message a stub; a trace's logs come from a handful of services anyway.
 .logs-wrap {
+  --svc-col: 112px;
   flex: 1;
   overflow-y: auto;
   display: flex;
@@ -1505,12 +1482,13 @@
   align-items: center;
   gap: 6px;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 12px;
 }
 
-// Trace Logs tab: full Events-style rows (app-event-list-row). Grow to fit the
-// wrapped message rather than the fixed 29px used by the virtual list.
+// Trace Logs tab: the Events page's own collapsed rows (app-event-list-row), at the height that
+// component pins for itself — var(--log-row-h), 24px — so a log reads the same here as in the
+// Events list. Only the separator and the match tint are this page's.
 .tl-log-row {
   display: block;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
@@ -1533,7 +1511,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 6px 8px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
@@ -1542,7 +1520,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   cursor: pointer;
   user-select: none;
@@ -1560,350 +1538,70 @@
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   color: var(--accent);
   border-radius: 8px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   line-height: 1;
 }
 
 .logs-total {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   font-family: var(--font-ui);
 }
 
-.log-level {
+// ── Details tab ──────────────────────────────────────────────────────────────
+.detail-info-tab {
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.di-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+
+  &:last-child { border-bottom: none; }
+}
+
+.di-k {
+  width: 90px;
   flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--fs-2xs);
+  line-height: var(--lh-ui);
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  width: 52px;
-
-  &.lvl-error { color: var(--error); }
-  &.lvl-warn  { color: var(--accent); }
-  &.lvl-debug { color: var(--text-muted); }
-  &.lvl-info  { color: var(--info); }
 }
 
-.log-ts {
-  flex-shrink: 0;
-  font-size: 10px;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.log-msg {
+.di-v {
   flex: 1;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
-  white-space: pre-wrap;
-  word-break: break-word;
+  word-break: break-all;
+
+  &.mono  { font-family: var(--font-ui); }
+  &.small { font-size: var(--fs-xs); }
 }
 
-// ── Filter bar ──────────────────────────────────────────────────────────────
-.filter-bar {
+.svc-chips {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 16px;
+  gap: 5px;
 }
 
-.preset-group {
-  display: flex;
-  gap: 2px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
-}
-
-.preset-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background 0.15s;
-
-  &:hover { background: var(--bg-card); }
-  &.active {
-    background: var(--accent);
-    color: #000;
-    font-weight: 600;
-  }
-}
-
-.filter-input,
-.filter-select {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-  height: 32px;
-  padding: 0 10px;
-  outline: none;
-  min-width: 140px;
-
-  &:focus { border-color: var(--accent); }
-}
-
-.filter-select option { background: var(--bg-elevated); }
-
-.refresh-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 13px;
-  height: 32px;
-  padding: 0 12px;
-  cursor: pointer;
-  transition: border-color 0.15s, color 0.15s;
-
-  &:hover { border-color: var(--accent); color: var(--accent); }
-}
-
-// ── Table ───────────────────────────────────────────────────────────────────
-.table-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.spans-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-
-  th {
-    background: var(--bg-elevated);
-    color: var(--text-muted);
-    font-weight: 600;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 10px 12px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-  }
-
-  tr {
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    transition: background 0.1s;
-
-    &:last-child { border-bottom: none; }
-    &:hover      { background: var(--bg-elevated); }
-    &.selected   { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-  }
-
-  td { padding: 10px 12px; color: var(--text-primary); vertical-align: middle; }
-}
-
-.mono   { font-family: var(--font-ui); font-size: 12px; }
-.time   { color: var(--text-muted); }
-.trace-id { color: var(--info); }
-.span-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.table-footer {
-  padding: 8px 12px;
-  font-size: 12px;
-  color: var(--text-muted);
-  border-top: 1px solid var(--border);
-  background: var(--bg-elevated);
-}
-
-// ── Badges ──────────────────────────────────────────────────────────────────
-.badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 7px;
-  border-radius: 4px;
-  font-size: 11px;
+.svc-chip {
+  font-size: var(--fs-xs);
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  border: 1px solid;
   font-weight: 600;
-  background: var(--bg-elevated);
-  color: var(--text-secondary);
-  border: 1px solid var(--border);
-
-  &.kind   { background: color-mix(in srgb, var(--info) 12%, transparent); color: var(--info); border-color: color-mix(in srgb, var(--info) 30%, transparent); }
-  &.status {
-    &.ok    { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); border-color: color-mix(in srgb, var(--success) 30%, transparent); }
-    &.error { background: color-mix(in srgb, var(--error)   12%, transparent); color: var(--error);   border-color: color-mix(in srgb, var(--error)   30%, transparent); }
-    &.unset { background: color-mix(in srgb, var(--text-muted) 12%, transparent); color: var(--text-muted); border-color: var(--border); }
-  }
-  &.sm { padding: 1px 5px; font-size: 10px; width: 18px; justify-content: center; }
 }
 
-// ── Loading / empty ─────────────────────────────────────────────────────────
-.loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 40px;
-  color: var(--text-muted);
-  font-size: 14px;
-}
+// ── Shared utilities ──────────────────────────────────────────────────────────
+.mono  { font-family: var(--font-ui); }
+.small { font-size: var(--fs-xs); }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }
-
-// ── Trace detail panel ──────────────────────────────────────────────────────
-.trace-panel {
-  margin-top: 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.trace-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  padding: 4px;
-  border-radius: 4px;
-  transition: color 0.15s;
-  &:hover { color: var(--error); }
-}
-
-// ── Waterfall ───────────────────────────────────────────────────────────────
-.waterfall {
-  font-size: 12px;
-}
-
-.wf-header {
-  display: flex;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-  color: var(--text-muted);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.wf-row {
-  display: flex;
-  border-bottom: 1px solid var(--border);
-  align-items: center;
-  min-height: 32px;
-  &:last-child { border-bottom: none; }
-  &:hover { background: var(--bg-elevated); }
-}
-
-.wf-label-col {
-  flex: 0 0 320px;
-  padding: 6px 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-  border-right: 1px solid var(--border);
-}
-
-.wf-name {
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 1;
-}
-
-.wf-svc {
-  color: var(--text-muted);
-  white-space: nowrap;
-  font-size: 10px;
-  flex-shrink: 0;
-}
-
-.wf-bar-col {
-  flex: 1;
-  padding: 6px 8px;
-  border-right: 1px solid var(--border);
-}
-
-.wf-track {
-  position: relative;
-  height: 16px;
-  background: var(--bg-elevated);
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.wf-bar {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  border-radius: 2px;
-  min-width: 2px;
-  background: var(--info);
-
-  &.ok    { background: var(--success); }
-  &.error { background: var(--error); }
-  &.unset { background: var(--info); }
-}
-
-.wf-dur-col {
-  flex: 0 0 90px;
-  padding: 6px 8px;
-  text-align: right;
-  color: var(--text-muted);
-}
-
-// ── Trace list header (live count + the stream's Stop control) ─────────────
-.list-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.stream-stop {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  height: 24px;
-  padding: 0 9px;
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-dim);
-  font-size: 11px;
-  cursor: pointer;
-
-  &:hover { color: var(--error); border-color: var(--error); }
-}
-
-.list-more-hint {
-  color: var(--text-dim);
-  font-weight: 400;
-}
-
-// Warmer than .list-more-hint on purpose: the other suffixes describe an answer that is
-// merely short, this one says the list has stopped keeping itself up to date.
-.list-stale-hint {
-  color: var(--warning);
-  font-weight: 400;
-  cursor: help;
-}

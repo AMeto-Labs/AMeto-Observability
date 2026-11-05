@@ -251,8 +251,8 @@ describe('flame graph zoom', () => {
   }
 
   const WHOLE = {
-    root: [0, 100, 0], e: [0, 50, 24], a: [50, 50, 24], d: [50, 25, 48], b: [75, 25, 48],
-    c: [75, 12.5, 72], f: [87.5, 6.25, 72],
+    root: [0, 100, 0], e: [0, 50, 20], a: [50, 50, 20], d: [50, 25, 40], b: [75, 25, 40],
+    c: [75, 12.5, 60], f: [87.5, 6.25, 60],
   };
 
   it('zooms into the node clicked inside a zoomed view: full width on the top row, its subtree at its own offsets', async () => {
@@ -263,12 +263,12 @@ describe('flame graph zoom', () => {
     bar(el, 'a').click();
     fixture.detectChanges();
     expect(geometry(el)).toEqual({
-      a: [0, 100, 0], d: [0, 50, 24], b: [50, 50, 24], c: [50, 25, 48], f: [75, 12.5, 48],
+      a: [0, 100, 0], d: [0, 50, 20], b: [50, 50, 20], c: [50, 25, 40], f: [75, 12.5, 40],
     });
 
     bar(el, 'b').click();         // a bar of the zoomed view
     fixture.detectChanges();
-    expect(geometry(el)).toEqual({ b: [0, 100, 0], c: [0, 50, 24], f: [50, 25, 24] });
+    expect(geometry(el)).toEqual({ b: [0, 100, 0], c: [0, 50, 20], f: [50, 25, 20] });
     expect(el.querySelector<HTMLElement>('.fg-bar--focused')?.title).toMatch(/^b /);
 
     bar(el, 'f').click();         // and once more
@@ -331,7 +331,7 @@ describe('flame graph zoom', () => {
     const fixture = await render(tree);
     const el: HTMLElement = fixture.nativeElement;
     const whole = geometry(el);
-    expect(whole['z']).toEqual([0, 0.05, 24]);    // drawn as the minimum sliver, so it can be clicked
+    expect(whole['z']).toEqual([0, 0.05, 20]);    // drawn as the minimum sliver, so it can be clicked
 
     bar(el, 'z').click();
     fixture.detectChanges();
@@ -419,7 +419,7 @@ describe('flame graph zoom', () => {
         const [left, width, top] = drawn[n.name];
         expect(left).toBeCloseTo(n._x! * 100, 4);
         expect(width).toBeCloseTo(Math.max(0.05, n._w! * 100), 4);
-        expect(top).toBe(n._depth! * 24);
+        expect(top).toBe(n._depth! * 20);
       }
     }
   });

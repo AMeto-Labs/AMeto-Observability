@@ -7,13 +7,14 @@
   justify-content: center;
   background: color-mix(in srgb, var(--bg-main) 70%, transparent);
   backdrop-filter: blur(2px);
-  padding: 24px;
+  padding: var(--page-pad);
 }
 
 .modal {
   width: 100%;
   max-width: 480px;
-  max-height: calc(100vh - 48px);
+  /* dvh: a phone's toolbars come and go, and the dialog must fit the window that is left */
+  max-height: calc(100dvh - 2 * var(--page-pad));
   display: flex;
   flex-direction: column;
   background: var(--bg-secondary);
@@ -27,7 +28,7 @@
    all of its height, so the detail's tabs — the trace waterfall above all — have room. */
 .modal--wide {
   max-width: 1100px;
-  height: calc(100vh - 48px);
+  height: calc(100dvh - 2 * var(--page-pad));
 }
 .modal--wide .modal__body {
   flex: 1;
@@ -38,21 +39,22 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 16px;
+  padding: var(--gap) var(--section-pad);
   border-bottom: 1px solid var(--border);
 }
 
 .modal__title {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 600;
+  line-height: var(--lh-tight);
   color: var(--text-primary);
 }
 
 .modal__body {
-  padding: 16px;
+  padding: var(--section-pad);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap);
 }

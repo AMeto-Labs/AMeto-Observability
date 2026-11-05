@@ -1,15 +1,34 @@
+@use 'breakpoints' as bp;
+
+/* ── Layout variables the pages read ──────────────────────────────────────────
+   --bottom-nav-h is the height of the phone's bottom navigation (nav.scss), for anything
+   a page pins to the bottom of the window: `bottom: var(--bottom-nav-h, 0px)` clears the
+   bar on a phone and collapses to the window's edge beside the side rail. It is the bar's
+   56px plus the home-indicator inset, so a sheet above the bar never ends inside that
+   inset. Set on :root from a global sheet, not from shell.scss: an emulated-encapsulation
+   stylesheet cannot address :root, and CDK overlays live outside the shell anyway. */
+:root { --bottom-nav-h: 0px; }
+@include bp.below(bp.$bp-sm) {
+  :root { --bottom-nav-h: calc(56px + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* The design's named one-off for dense tables (also lists and menus, see _overlay.scss):
+   between --fs-xs and --fs-sm, deliberately outside the scale. */
+$fs-table: 11.5px;
+
 .page {
-  padding: 20px;
+  padding: var(--page-pad);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--section-pad);
   overflow-y: auto;
   height: 100%;
 }
 
 .page-title {
-  font-size: 15px;
+  font-size: var(--fs-lg);
   font-weight: 600;
+  line-height: var(--lh-tight);
   color: var(--text-primary);
   display: flex;
   align-items: center;
@@ -23,20 +42,21 @@
   border-radius: var(--radius);
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px;
+  gap: var(--gap);
+  padding: var(--section-pad);
 }
 
+/* Section captions are the scale's 10px small caps; a little tracking keeps them legible. */
 .section-title {
-  font-size: 12px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-secondary);
-  letter-spacing: 0;
+  letter-spacing: .04em;
   text-transform: uppercase;
 }
 
 .section-subtitle {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
@@ -44,13 +64,15 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 5px 12px;
+  height: var(--ctl-h);
+  padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: none;
   color: var(--text-secondary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-ui);
   white-space: nowrap;
   text-decoration: none;
 }
@@ -97,8 +119,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: none;
@@ -120,13 +142,15 @@
 }
 
 .field-input {
-  padding: 5px 8px;
+  height: var(--ctl-h);
+  padding: 0 8px;
   background: var(--bg-main);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
   outline: none;
   width: 100%;
   box-sizing: border-box;
@@ -139,13 +163,13 @@
 .field-input.mono,
 .mono {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: $fs-table;
 }
 
 .data-table th {
@@ -157,13 +181,20 @@
 }
 
 .data-table td {
-  padding: 5px 8px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--border);
   color: var(--text-primary);
 }
 
 .data-table tr:last-child td {
   border-bottom: none;
+}
+
+/* Wraps a .data-table with more columns than a phone is wide: the table scrolls sideways
+   inside it instead of widening the page. On a desktop it is just a block. */
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .skeleton {
@@ -185,8 +216,8 @@
 
 .empty {
   color: var(--text-muted);
-  font-size: 13px;
-  padding: 24px 0;
+  font-size: var(--fs-md);
+  padding: 20px 0;
   text-align: center;
 }
 
@@ -196,5 +227,11 @@
 
 .loading-text {
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-md);
+}
+
+/* ── Phone ─────────────────────────────────────────────────────────────────── */
+@include bp.below(bp.$bp-sm) {
+  // The page's own padding steps down to the section's: 16px a side is a tenth of the screen.
+  .page { padding: var(--section-pad); }
 }

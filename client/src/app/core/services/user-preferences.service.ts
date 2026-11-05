@@ -5,7 +5,8 @@ const OVERVIEW_PROPS_KEY = 'Ameto-events-overview-custom-props';
 const DRAWER_WIDTH_KEY = 'Ameto-events-drawer-width';
 const DRAWER_MIN = 400;
 const DRAWER_MAX = 1200;
-const DRAWER_DEFAULT = 560;
+/** 520px (design canvas, dense UI, 2026-11; was 560). A stored width still wins over it. */
+const DRAWER_DEFAULT = 520;
 
 const SPAN_DETAIL_HEIGHT_KEY = 'Ameto-traces-span-detail-height';
 /** Below this the two-column body stops showing a usable line of either column. */
@@ -13,9 +14,9 @@ const SPAN_DETAIL_MIN = 140;
 /** The waterfall above it has to stay readable; past this the panel IS the tab. The drag is
  *  additionally capped against the live viewport in the component, which this cannot see. */
 const SPAN_DETAIL_MAX = 900;
-/** The height the panel had when it was fixed (min 180 / max 240 in SCSS), so an untouched
- *  install looks exactly as it did. */
-const SPAN_DETAIL_DEFAULT = 220;
+/** 200px (design canvas, dense UI, 2026-11). Was 220 — the height the panel had when it was
+ *  fixed (min 180 / max 240 in SCSS). A stored height still wins over this default. */
+const SPAN_DETAIL_DEFAULT = 200;
 
 @Injectable({ providedIn: 'root' })
 export class UserPreferencesService {

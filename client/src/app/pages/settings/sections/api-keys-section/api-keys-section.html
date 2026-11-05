@@ -10,39 +10,42 @@
   @if (loading()) {
     <span class="sublabel">Loading…</span>
   } @else {
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Description</th>
-          <th>Permissions</th>
-          <th>Key</th>
-          <th>Created by</th>
-          <th>Created</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        @for (k of apiKeys(); track k.id) {
+    <!-- Seven columns are wider than a phone: the table scrolls inside its wrapper. -->
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
           <tr>
-            <td>{{ k.name }}</td>
-            <td class="muted">{{ k.description || '—' }}</td>
-            <td><span class="level-pill">{{ permLabel(k.permissions) }}</span></td>
-            <td class="mono muted">{{ k.keyPreview }}</td>
-            <td class="muted">{{ k.createdBy }}</td>
-            <td class="muted">{{ k.createdAt | date: 'yyyy-MM-dd' }}</td>
-            <td class="action-cell">
-              <button class="btn-icon" title="Edit permissions" (click)="openEditModal(k)">
-                <lucide-icon name="pencil" [size]="13" />
-              </button>
-              <button class="btn-icon danger" title="Revoke key" (click)="removeApiKey(k.id)">
-                <lucide-icon name="trash-2" [size]="13" />
-              </button>
-            </td>
+            <th>Name</th>
+            <th>Description</th>
+            <th>Permissions</th>
+            <th>Key</th>
+            <th>Created by</th>
+            <th>Created</th>
+            <th></th>
           </tr>
-        }
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          @for (k of apiKeys(); track k.id) {
+            <tr>
+              <td>{{ k.name }}</td>
+              <td class="muted">{{ k.description || '—' }}</td>
+              <td><span class="level-pill">{{ permLabel(k.permissions) }}</span></td>
+              <td class="mono muted">{{ k.keyPreview }}</td>
+              <td class="muted">{{ k.createdBy }}</td>
+              <td class="muted">{{ k.createdAt | date: 'yyyy-MM-dd' }}</td>
+              <td class="action-cell">
+                <button class="btn-icon" title="Edit permissions" (click)="openEditModal(k)">
+                  <lucide-icon name="pencil" [size]="13" />
+                </button>
+                <button class="btn-icon danger" title="Revoke key" (click)="removeApiKey(k.id)">
+                  <lucide-icon name="trash-2" [size]="13" />
+                </button>
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
   }
 </app-section>
 

@@ -22,7 +22,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--txt-muted);
   letter-spacing: 0;
@@ -32,7 +32,7 @@
 
 .sig-icon-btn {
   display: flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px;
+  width: var(--icon-btn); height: var(--icon-btn);
   border-radius: var(--radius-sm);
   background: none; border: none;
   color: var(--txt-muted);
@@ -50,7 +50,7 @@
 }
 
 .sig-create-filter {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--accent);
   background: var(--accent-dim);
   padding: 3px 8px;
@@ -65,27 +65,30 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--txt);
-  padding: 4px 8px;
+  height: var(--ctl-h);
+  padding: 0 8px;
   outline: none;
   width: 100%;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .sig-name-input:focus { border-color: var(--accent); }
 .sig-name-input::placeholder { color: var(--txt-dim); }
 
 .sig-create-btns { display: flex; gap: 6px; justify-content: flex-end; }
 .sig-save-btn {
-  padding: 3px 12px;
+  height: var(--ctl-h-sm);
+  padding: 0 12px;
   background: var(--primary); color: var(--text-on-primary);
-  border: none; border-radius: var(--radius-sm); font-size: 11px; cursor: pointer;
+  border: none; border-radius: var(--radius-sm); font-size: var(--fs-xs); cursor: pointer;
 }
 .sig-save-btn:hover { background: var(--accent); color: var(--text-on-accent); }
 .sig-save-btn:disabled { opacity: .4; cursor: default; }
 .sig-cancel-btn {
-  padding: 3px 10px;
+  height: var(--ctl-h-sm);
+  padding: 0 10px;
   background: none; border: 1px solid var(--border);
-  color: var(--txt-muted); border-radius: var(--radius-sm); font-size: 11px; cursor: pointer;
+  color: var(--txt-muted); border-radius: var(--radius-sm); font-size: var(--fs-xs); cursor: pointer;
 }
 .sig-cancel-btn:hover { color: var(--txt); }
 
@@ -123,8 +126,8 @@
   flex-direction: column;
   gap: 2px;
 }
-.sig-name   { font-size: 12px; color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sig-filter { font-size: 11px; color: var(--txt-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sig-name   { font-size: var(--fs-sm); color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sig-filter { font-size: var(--fs-xs); color: var(--txt-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ── Section labels ─────────────────────────────────────────────────────── */
 .sig-section-label {
@@ -132,7 +135,7 @@
   align-items: center;
   gap: 6px;
   padding: 8px 10px 4px;
-  font-size: 10.5px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .06em;

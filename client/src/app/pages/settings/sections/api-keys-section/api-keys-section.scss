@@ -1,5 +1,5 @@
 .sublabel {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
@@ -7,11 +7,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--gap);
+  flex-wrap: wrap;
 }
 
 .action-cell {
-  width: 64px;
+  width: 56px;   /* two icon buttons and the gap between them */
   text-align: right;
   white-space: nowrap;
 }
@@ -22,7 +23,7 @@
   margin: 4px 0 2px;
 
   th {
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-weight: 600;
     color: var(--text-secondary);
     text-align: center;
@@ -34,14 +35,14 @@
   }
   .perm-signal {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-primary);
   }
   input[type="checkbox"] { cursor: pointer; }
 }
 
 .level-pill {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   padding: 1px 6px;
   border-radius: 99px;
   background: var(--bg-main);
@@ -58,23 +59,24 @@
 }
 
 .label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
 .hint {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
 }
 
 .field-select {
-  padding: 5px 8px;
+  height: var(--ctl-h);
+  padding: 0 8px;
   background: var(--bg-main);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   outline: none;
 }
 
@@ -93,9 +95,9 @@
     flex-shrink: 0;
   }
 }
-.perm-name { font-size: 12px; color: var(--text-primary); }
+.perm-name { font-size: var(--fs-sm); color: var(--text-primary); }
 .perm-hint {
-  font-size: 10.5px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   font-family: var(--font-mono);
   margin-left: auto;
@@ -109,7 +111,7 @@
 }
 
 .form-error {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--error);
 }
 
@@ -117,7 +119,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   background: var(--bg-main);
   border: 1px solid var(--primary);
   border-radius: var(--radius);
@@ -125,7 +127,7 @@
 
 .key-text {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--primary);
   flex: 1;
   word-break: break-all;

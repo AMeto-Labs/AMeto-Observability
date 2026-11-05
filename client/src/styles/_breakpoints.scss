@@ -1,0 +1,26 @@
+// Width breakpoints, SCSS variables because a media query cannot read a CSS custom property.
+// One source for every component: phone below $bp-sm, tablet below $bp-md (the one breakpoint the
+// client already had), a narrow desktop below $bp-lg, and the full layout from $bp-lg up.
+$bp-sm: 640px;
+$bp-md: 900px;
+$bp-lg: 1280px;
+
+/// Styles for viewports narrower than the breakpoint (max-width: $bp - 1px).
+@mixin below($bp) {
+  @media (max-width: ($bp - 1px)) { @content; }
+}
+
+/// Styles for viewports at least the breakpoint wide.
+@mixin from($bp) {
+  @media (min-width: $bp) { @content; }
+}
+
+/// Styles for viewports from $lo up to (not including) $hi.
+@mixin between($lo, $hi) {
+  @media (min-width: $lo) and (max-width: ($hi - 1px)) { @content; }
+}
+
+/// A touch device with no fine pointer: hover-only affordances must be visible.
+@mixin coarse-pointer {
+  @media (pointer: coarse) { @content; }
+}

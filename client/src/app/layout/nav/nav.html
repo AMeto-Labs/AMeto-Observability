@@ -4,20 +4,33 @@
     <img src="logo.svg" alt="Ameto" class="logo-img" />
   </div>
 
-  <!-- Main nav items -->
+  <!-- Main nav items. On a phone the rail is a bottom bar with room for four of them and
+       More; an item without a place in the bar (Stats) is listed under More instead. -->
   <div class="nav-items">
     @for (item of visibleItems(); track item.path) {
       <a class="nav-item"
+         [class.nav-item--rail-only]="!item.bar"
          [routerLink]="item.path"
          routerLinkActive="nav-item--active"
-         [title]="item.label">
+         [title]="item.label"
+         (click)="closeMore()">
         <lucide-icon [name]="item.icon" [size]="18" [strokeWidth]="1.5" />
         <span class="nav-label">{{ item.label }}</span>
       </a>
     }
+    <button class="nav-item nav-item--more"
+            type="button"
+            [class.nav-item--active]="moreOpen() || moreActive()"
+            [attr.aria-expanded]="moreOpen()"
+            aria-haspopup="menu"
+            title="More"
+            (click)="toggleMore()">
+      <lucide-icon name="ellipsis" [size]="18" [strokeWidth]="1.5" />
+      <span class="nav-label">More</span>
+    </button>
   </div>
 
-  <!-- Bottom: reference + settings + theme + env + user -->
+  <!-- Bottom: reference + settings + sign out -->
   <div class="nav-bottom">
     <a class="nav-item"
        [routerLink]="referenceItem.path"
@@ -41,3 +54,24 @@
     </button>
   </div>
 </nav>
+
+<!-- Phone: the pages the bar has no room for, as a sheet resting on it. -->
+@if (moreOpen()) {
+  <div class="nav-sheet-backdrop" (click)="closeMore()"></div>
+  <div class="nav-sheet" role="menu" aria-label="More pages">
+    @for (item of moreItems(); track item.path) {
+      <a class="nav-sheet-item"
+         role="menuitem"
+         [routerLink]="item.path"
+         routerLinkActive="nav-sheet-item--active"
+         (click)="closeMore()">
+        <lucide-icon [name]="item.icon" [size]="18" [strokeWidth]="1.5" />
+        <span>{{ item.label }}</span>
+      </a>
+    }
+    <button class="nav-sheet-item" role="menuitem" type="button" (click)="auth.logout()">
+      <lucide-icon name="log-out" [size]="18" [strokeWidth]="1.5" />
+      <span>Sign out</span>
+    </button>
+  </div>
+}
