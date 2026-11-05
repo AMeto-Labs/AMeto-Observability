@@ -1,0 +1,91 @@
+// The filter sheet's own rows; the sheet chrome, chips, fields, segment, switch and foot are the
+// shared sheet styles (styles/_sheet.scss). Design canvas, "Телефон — лист фильтров логов".
+:host { display: contents; }
+
+.fs-body {
+  padding-top: 0;
+  padding-bottom: 14px;
+}
+
+.fs-presets { margin-bottom: 8px; }
+
+// From / To side by side.
+.fs-range {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.bs-field.invalid { border-color: var(--lvl-e); }
+
+.fs-svc-search { margin-bottom: 4px; }
+
+// A service row: 36px — the checkbox (18), the colour (8), the name, the count and the share.
+.fs-svc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  border-bottom: 1px solid var(--border-sub);
+  font-size: var(--fs-sm);
+  color: var(--txt);
+  cursor: pointer;
+}
+.fs-svc-cb {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.fs-svc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.fs-svc-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fs-svc-n {
+  font-size: var(--fs-xs);
+  color: var(--txt-dim);
+  font-variant-numeric: tabular-nums;
+}
+.fs-svc-pct {
+  min-width: 40px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  font-variant-numeric: tabular-nums;
+}
+.fs-svc-more {
+  height: 32px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.fs-svc-empty {
+  padding: 10px 0;
+  font-size: var(--fs-sm);
+  color: var(--txt-dim);
+  font-style: italic;
+}
+
+// Page size at the left, the switch at the right, on one line.
+.fs-bottom {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+.fs-label-tight { margin-bottom: 4px; }
+.fs-wrap { padding-top: 16px; }

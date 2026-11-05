@@ -1,5 +1,9 @@
 import { subDays, startOfDay, format, isSameDay } from 'date-fns';
-import { LEVELS } from '../../../core/models/event.model';
+import { LEVELS, Level, levelShort } from '../../../core/models/event.model';
+
+/** The levels in the order every picker and chip strip lists them, each with its badge. */
+export const LEVEL_ITEMS: readonly { key: Level; short: string }[] =
+  LEVELS.map(key => ({ key, short: levelShort(key) }));
 
 export type TimePreset = '1d' | '3d' | '7d' | 'custom';
 

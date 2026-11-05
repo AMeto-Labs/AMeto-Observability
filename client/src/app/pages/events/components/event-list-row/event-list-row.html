@@ -1,20 +1,31 @@
 @if (event(); as ev) {
-  <div class="ev-main" (click)="onRowClick()">
+  <div class="ev-main"
+       (click)="onRowClick()"
+       (contextmenu)="onRowContextMenu($event)"
+       (pointerdown)="onPointerDown($event)"
+       (pointermove)="onPointerMove($event)"
+       (pointerup)="onPointerEnd()"
+       (pointercancel)="onPointerEnd()"
+       (pointerleave)="onPointerEnd()">
     <span class="ev-stripe"></span>
-    <span class="ev-ts" [title]="ev['@t']"
-      ><span class="ev-ts-date">{{ ev['@t'] | date: 'yyyy-MM-dd' }} </span
-      ><span class="ev-ts-time">{{ ev['@t'] | date: 'HH:mm:ss.SSS' }}</span
-    ></span>
-    <span class="ev-level">
-      <span class="ev-lvl-badge">{{ levelShort() }}</span>
-    </span>
-    <!-- Always there, empty or not: the message column starts in the same place on every row. -->
-    <span class="ev-svc" [title]="service()">
-      @if (service()) {
-        <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
-        <span class="ev-svc-name">{{ service() }}</span>
-      }
-    </span>
+    <!-- `display: contents` in the table layouts, so the three cells sit in the row's own flex
+         line as before; on a phone it IS the first line — badge, time, service — over the message. -->
+    <div class="ev-meta">
+      <span class="ev-ts" [title]="ev['@t']"
+        ><span class="ev-ts-date">{{ ev['@t'] | date: 'yyyy-MM-dd' }} </span
+        ><span class="ev-ts-time">{{ ev['@t'] | date: 'HH:mm:ss.SSS' }}</span
+      ></span>
+      <span class="ev-level">
+        <span class="ev-lvl-badge">{{ levelShort() }}</span>
+      </span>
+      <!-- Always there, empty or not: the message column starts in the same place on every row. -->
+      <span class="ev-svc" [title]="service()">
+        @if (service()) {
+          <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
+          <span class="ev-svc-name">{{ service() }}</span>
+        }
+      </span>
+    </div>
     <span class="ev-msg" [innerHTML]="renderedHtml()" (contextmenu)="openMessageMenu($event)"></span>
   </div>
 }

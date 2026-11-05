@@ -1,0 +1,17 @@
+// The sheet's rows are the shared sheet styles (styles/_sheet.scss); only the template line is
+// this sheet's own. Design canvas, "Телефон — long-press по строке".
+:host { display: contents; }
+
+// The template at the message's size, its holes in their property colours (clef-renderer),
+// two lines at most.
+.ms-template {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: var(--lh-body);
+  color: var(--msg-tmpl);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
+}

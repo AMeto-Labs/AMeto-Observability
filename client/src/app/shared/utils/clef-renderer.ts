@@ -130,6 +130,27 @@ export function renderMessageHtml(
   return result;
 }
 
+/**
+ * The template itself, its holes coloured: `Capture failed for {PaymentId}` with `{PaymentId}`
+ * in the colour its property has in every rendered message (the phone's message action sheet,
+ * which names the template the actions match on).
+ */
+export function renderTemplateHtml(template: string | null | undefined): string {
+  const tmpl = template || '';
+  let result = '';
+  let lastIndex = 0;
+  const tokenRegex = /\{([^}]+)\}/g;
+  let match: RegExpExecArray | null;
+  while ((match = tokenRegex.exec(tmpl)) !== null) {
+    result += escapeHtml(tmpl.slice(lastIndex, match.index));
+    let key = match[1].split(':')[0].split(',')[0].trim();
+    if (key.startsWith('@') || key.startsWith('$')) key = key.slice(1);
+    result += propSpan(match[0], key);
+    lastIndex = match.index + match[0].length;
+  }
+  return result + escapeHtml(tmpl.slice(lastIndex));
+}
+
 export function escapeHtmlExport(s: string): string {
   return escapeHtml(s);
 }

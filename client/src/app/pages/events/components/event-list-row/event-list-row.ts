@@ -6,14 +6,10 @@ import { DatePipe } from '@angular/common';
 import { DomSanitizer } from '@angular/platform-browser';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto } from '../../../../core/models/event.model';
+import { EventDto, levelShort } from '../../../../core/models/event.model';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
+import { LongPress } from '../../../../shared/utils/long-press';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
-
-const LEVEL_SHORT: Record<string, string> = {
-  verbose: 'VRB', debug: 'DBG', information: 'INF',
-  warning: 'WRN', error: 'ERR', fatal: 'FTL',
-};
 
 /**
  * Fixed-height, single-line collapsed log row for the Events virtual list.
@@ -27,6 +23,12 @@ const LEVEL_SHORT: Record<string, string> = {
  * heights stay uniform for virtual scrolling. In {@link wrap} mode the host grows to
  * fit the full message across multiple lines (the parent measures each wrapped row
  * instead of assuming a height).
+ *
+ * On a phone ({@link phone}) the row is two lines — the level badge, the time and the service
+ * over the message clamped to two lines — and is measured like a wrapped row; the date leaves
+ * the row for the list's day separators. On a touch screen ({@link touch}) a long press on the
+ * row asks the parent for the message actions ({@link messageActionsRequested}) in place of the
+ * right-click menu, which has no cursor to open at.
  */
 @Component({
   selector: 'app-event-list-row',
@@ -44,6 +46,9 @@ const LEVEL_SHORT: Record<string, string> = {
     '[class.selected]':       'selected()',
     '[class.ev-wrap-mode]':   'wrap()',
     '[class.is-new]':         'isNew()',
+    '[class.ev-phone]':       'phone()',
+    '[class.ev-dateless]':    'dateless()',
+    '[class.ev-touch]':       'touch()',
   },
 })
 export class EventListRowComponent {
@@ -55,12 +60,20 @@ export class EventListRowComponent {
   readonly wrap = input<boolean>(false);
   /** True for ~1s after the event arrives on the live tail — plays a highlight flash. */
   readonly isNew = input<boolean>(false);
+  /** The phone's two-line row (design canvas, Logs on a phone). The parent measures it. */
+  readonly phone = input<boolean>(false);
+  /** The tablet's table: the TIME column holds the time alone, the date stays in its title. */
+  readonly dateless = input<boolean>(false);
+  /** A touch screen: a long press opens the message actions; the right-click menu is not offered. */
+  readonly touch = input<boolean>(false);
 
   // ── Outputs ───────────────────────────────────────────────────────────
   /** Row clicked — parent opens the detail drawer for this event. */
   readonly selectRequested = output<void>();
   /** Quick filter picked from the message context menu (a CLEF filter expression). */
   readonly filterSelected = output<string>();
+  /** A long press on a touch screen: the parent shows the message action sheet for this event. */
+  readonly messageActionsRequested = output<void>();
 
   private readonly sanitizer = inject(DomSanitizer);
   private readonly contextMenu = inject(ContextMenuService);
@@ -68,6 +81,9 @@ export class EventListRowComponent {
 
   private readonly ctxMenuTpl = viewChild<TemplateRef<unknown>>('ctxMenuTpl');
   private menuRef?: OverlayPanelRef;
+
+  /** The long press, on a touch screen. A press that fires swallows the click its release makes. */
+  private readonly press = new LongPress(() => this.messageActionsRequested.emit());
 
   constructor() {
     // CDK virtual scroll recycles this row instance across events — close any
@@ -80,13 +96,13 @@ export class EventListRowComponent {
 
   ngOnDestroy(): void {
     this.closeMenu();
+    this.press.end();
   }
 
   // ── Derived view state ────────────────────────────────────────────────
   readonly levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
 
-  readonly levelShort = computed(() =>
-    LEVEL_SHORT[this.levelKey()] ?? this.levelKey().slice(0, 3).toUpperCase());
+  readonly levelShort = computed(() => levelShort(this.event()['@l']));
 
   readonly service = computed(() => this.event()['@service'] ?? '');
 
@@ -97,13 +113,38 @@ export class EventListRowComponent {
 
   // ── Interaction ───────────────────────────────────────────────────────
   onRowClick(): void {
+    // The release after a long press clicks too; that press has already been answered.
+    if (this.press.consumeFired()) return;
     this.selectRequested.emit();
+  }
+
+  onPointerDown(e: PointerEvent): void {
+    if (!this.touch() || !e.isPrimary) return;
+    this.press.start(e.clientX, e.clientY);
+  }
+
+  onPointerMove(e: PointerEvent): void {
+    if (this.touch()) this.press.move(e.clientX, e.clientY);
+  }
+
+  onPointerEnd(): void {
+    this.press.end();
+  }
+
+  /**
+   * A long press on Android raises `contextmenu` as well; on a touch screen that menu is the
+   * browser's text-selection one, and the sheet the press opens replaces it.
+   */
+  onRowContextMenu(e: MouseEvent): void {
+    if (this.touch()) e.preventDefault();
   }
 
   /** Right-click on the message → open the lightweight quick-filter menu. */
   openMessageMenu(e: MouseEvent): void {
     e.preventDefault();
     e.stopPropagation();
+    // No cursor to anchor to: the long press has opened, or is about to open, the sheet.
+    if (this.touch()) return;
     const tpl = this.ctxMenuTpl();
     if (!tpl) return;
 

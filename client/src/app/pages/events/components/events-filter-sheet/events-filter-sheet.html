@@ -1,0 +1,99 @@
+<app-bottom-sheet label="Log filters" (closed)="close()">
+  <div class="bs-head">
+    <h2 class="bs-title">Filters</h2>
+    <span class="bs-note">{{ fmtCount(store.totalCount()) }} events loaded</span>
+  </div>
+
+  <div class="bs-scroll fs-body">
+    <!-- ── Time range: the presets as chips, then From / To ────────────────────────────── -->
+    <section>
+      <div class="bs-label">Time range<span class="bs-label-note">{{ rangeSummary() }}</span></div>
+      <div class="bs-chips fs-presets">
+        @for (p of presets; track p) {
+          <button type="button" class="bs-chip" [class.active]="preset() === p"
+                  [attr.aria-pressed]="preset() === p" (click)="pickPreset(p)">{{ p }}</button>
+        }
+        <button type="button" class="bs-chip" [class.active]="preset() === 'custom'"
+                [attr.aria-pressed]="preset() === 'custom'" (click)="pickPreset('custom')">Custom…</button>
+      </div>
+      <div class="fs-range">
+        <label class="bs-field" [class.invalid]="!rangeValid()">
+          <span class="bs-field-k">From</span>
+          <input type="datetime-local" class="bs-field-in" aria-label="From"
+                 [value]="from()" (input)="setFrom($any($event.target).value)" />
+        </label>
+        <label class="bs-field">
+          <span class="bs-field-k">To</span>
+          <input type="datetime-local" class="bs-field-in" aria-label="To, empty for now"
+                 [value]="to()" (input)="setTo($any($event.target).value)" />
+        </label>
+      </div>
+    </section>
+
+    <!-- ── Levels: toggle chips with the loaded counts ─────────────────────────────────── -->
+    <section>
+      <div class="bs-label">
+        Levels
+        @if (!allLevels()) {
+          <button type="button" class="bs-label-link" (click)="allLevelsOn()">All on</button>
+        }
+      </div>
+      <div class="bs-chips">
+        @for (lvl of levelItems; track lvl.key) {
+          <button type="button" class="bs-chip" [class.active]="isLevel(lvl.key)"
+                  [attr.data-level]="lvl.key.toLowerCase()" [attr.aria-pressed]="isLevel(lvl.key)"
+                  (click)="toggleLevel(lvl.key)">
+            {{ lvl.short }}<span class="bs-chip-num">{{ fmtCount(store.levelCounts()[lvl.key.toLowerCase()]) }}</span>
+          </button>
+        }
+      </div>
+    </section>
+
+    <!-- ── Services: a search, then rows with a checkbox, the colour, the count and the share ─ -->
+    <section>
+      <div class="bs-label">Services<span class="bs-label-note">{{ servicesSummary() }}</span></div>
+      <label class="bs-field fs-svc-search">
+        <lucide-icon name="search" [size]="13" />
+        <input type="text" class="bs-field-in" placeholder="Search services…" aria-label="Search services"
+               [value]="svcSearch()" (input)="svcSearch.set($any($event.target).value)" autocomplete="off" />
+      </label>
+      @for (svc of shownServices(); track svc) {
+        <label class="fs-svc">
+          <input type="checkbox" class="fs-svc-cb" [checked]="isService(svc)" (change)="toggleService(svc)" />
+          <span class="fs-svc-dot" [style.background]="serviceColor(svc)"></span>
+          <span class="fs-svc-name">{{ svc }}</span>
+          <span class="fs-svc-n">{{ fmtCount(store.serviceCounts()[svc]) }}</span>
+          <span class="fs-svc-pct">{{ servicePercent(svc) }}</span>
+        </label>
+      } @empty {
+        <div class="fs-svc-empty">No services found</div>
+      }
+      @if (hiddenServiceCount() > 0) {
+        <button type="button" class="fs-svc-more" (click)="showMore.set(true)">Show {{ hiddenServiceCount() }} more</button>
+      }
+    </section>
+
+    <!-- ── Page size and Full messages ────────────────────────────────────────────────── -->
+    <section class="fs-bottom">
+      <div>
+        <div class="bs-label fs-label-tight">Page size</div>
+        <div class="bs-seg" role="group" aria-label="Events per request">
+          @for (n of pageSizes; track n) {
+            <button type="button" [class.active]="pageSize() === n" [attr.aria-pressed]="pageSize() === n"
+                    (click)="pageSize.set(n)">{{ n }}</button>
+          }
+        </div>
+      </div>
+      <label class="bs-switch-label fs-wrap">
+        <span>Full messages</span>
+        <button type="button" class="bs-switch" role="switch" [attr.aria-checked]="wrap()"
+                aria-label="Full messages" (click)="wrap.set(!wrap())"></button>
+      </label>
+    </section>
+  </div>
+
+  <div class="bs-foot">
+    <button type="button" class="bs-foot-clear" (click)="clear()">Clear</button>
+    <button type="button" class="bs-foot-apply" [disabled]="!rangeValid()" (click)="apply()">Apply filters</button>
+  </div>
+</app-bottom-sheet>
