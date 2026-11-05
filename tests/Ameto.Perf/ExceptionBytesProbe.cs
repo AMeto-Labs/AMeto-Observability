@@ -166,6 +166,7 @@ public sealed class ExceptionBytesProbe
             {
                 if (deliver)
                 {
+                    ev.OwnRawBytes();   // as the executor does for a row it yields: the page outlives the snapshot
                     sink.ResetWrittenCount();
                     json.Reset(sink);
                     LogEventJsonWriter.Write(json, ev);
@@ -176,15 +177,30 @@ public sealed class ExceptionBytesProbe
             return GC.GetAllocatedBytesForCurrentThread() - before;
         }
 
-        PageBytes(false); PageBytes(true);
+        // The filtered scan's road: every candidate's @x.type read where it sits, none kept — what a
+        // predicate on @x, or free text, costs per row of an Error tier it rejects.
+        long ScanBytes()
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            int hits = 0;
+            foreach (var ev in HotTierScan.ReadSorted(hot, frozen, pool, long.MinValue, long.MaxValue, null, null, forward: false, levels: null))
+                if (ExceptionInfo.ReadField(ev.RawException, ExceptionInfo.Field.Type) == "never") hits++;
+            Assert.Equal(0, hits);
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
+
+        PageBytes(false); PageBytes(true); ScanBytes();
         long scanned   = PageBytes(false);
         long delivered = PageBytes(true);
+        long filtered  = ScanBytes();
 
         _out.WriteLine($"hot tier, {Events:N0} events each with a 3-deep @x; native payload {hot.AllocatedBytes / 1048576.0:F1} MB committed:");
         _out.WriteLine($"  managed heap retained by the tier : {retained / 1048576.0,8:F1} MB  {retained / (double)Events,8:F0} B/event");
         _out.WriteLine($"  page of {Page}, materialised only   : {scanned / 1024.0,8:F1} KB  {scanned / (double)Page,8:F0} B/row");
-        _out.WriteLine($"  page of {Page}, written as JSON      : {delivered / 1024.0,8:F1} KB  {delivered / (double)Page,8:F0} B/row");
+        _out.WriteLine($"  page of {Page}, owned + written as JSON: {delivered / 1024.0,8:F1} KB  {delivered / (double)Page,8:F0} B/row");
+        _out.WriteLine($"  filtered scan of {Events:N0} rows, @x.type read, none kept: {filtered / 1048576.0,6:F1} MB  {filtered / (double)Events,8:F0} B/candidate");
         Assert.True(scanned > 0);
+        Assert.True(filtered / Events < 600, $"a rejected candidate cost {filtered / Events} B: the exception is being copied per scanned row");
     }
 
     // ── 3. Flush: the index build over an exception-bearing tier ──────────────

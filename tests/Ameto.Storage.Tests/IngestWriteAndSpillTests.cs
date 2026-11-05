@@ -4018,6 +4018,55 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     }
 
     /// <summary>
+    /// The payload limit is HARD for exception bytes, so that a tier whose flush slot is busy REFUSES an
+    /// exception-bearing stream past its size and the swap spills it, instead of taking it into the chunk's
+    /// 16 384 slots however large the exceptions: 64 KB of @x an event into an 8 MB tier while the one slot
+    /// is held by another tier's flush. Without the refusal nothing set HotRefused, so nothing spilled, and
+    /// the live tier grew to a gigabyte of exception blocks beside its 8 MB limit.
+    /// </summary>
+    [Fact]
+    public async Task An_exception_bearing_stream_past_the_tiers_size_spills_while_no_flush_slot_is_free()
+    {
+        string dir    = NewDir();
+        var    engine = OneSlotEngine(Options(dir));
+        var    gate   = HoldFirstFlush(engine);
+        try
+        {
+            // A held in its flush: the one slot is taken.
+            using (var a = Batch(engine, 0, TierEvents))
+                Assert.Equal(new LogBatchWriteResult(TierEvents, 0, 0), await engine.WriteBatchAsync(a, HangGuard));
+            WaitFor(() => engine.LiveHotTier.Count == 0 && engine.HeavyPhasesInFlight == 1, "tier A to be swapped and held");
+
+            // Then 64 KB of @x an event, 600 events: four tiers' worth into a tier that cannot be flushed.
+            const int Events = 600;
+            byte[] exc  = new ExceptionInfo { Type = "E", Message = "m", StackTrace = new string('x', 64 * 1024 - 64) }.ToBytes();
+            int    tmpl = engine.TemplatePool.Intern("event {n}");
+            int written = 0;
+            for (int from = TierEvents; from < TierEvents + Events; from += 50)
+            {
+                using var batch = new LogWriteBatch();
+                for (int i = from; i < from + 50; i++)
+                    batch.Add(new LogEventHeader
+                    {
+                        TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Error,
+                        MessageTemplatePoolIndex = tmpl, ServiceNamePoolIndex = -1,
+                    }, Props(i), "event {n}", exc);
+                written += (await engine.WriteBatchAsync(batch, HangGuard)).Written;
+            }
+            Assert.Equal(Events, written);
+
+            Assert.True(engine.IsSpilling, "the live tier took every exception-bearing event without refusing: nothing spilled");
+            Assert.True(engine.LiveHotTier.ExceptionBytes <= TierBytes,
+                        $"the live tier holds {engine.LiveHotTier.ExceptionBytes / MB} MB of exception bytes against a limit of {TierBytes / MB} MB");
+        }
+        finally
+        {
+            gate.Set();
+            await engine.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// Round-5 review H-D, the frozen backlog's half. Each tier bounds the text its events carry of their
     /// own, but the frozen tiers were bounded only in number, by their native footprint against the
     /// physical limit — on a 384 MiB heap limit over a host's RAM, 30 frozen tiers of one 8 MB CLEF stack

@@ -143,6 +143,8 @@ public sealed class LogEvent
         init => _exception = value;
     }
 
+    private ReadOnlyMemory<byte> _rawException;
+
     /// <summary>
     /// The exception as its msgpack arrived — the CLEF <c>@x</c> value: a map, or a legacy plain
     /// string — when the event was decoded from a segment, the hot tier or an ingest body, which
@@ -151,8 +153,35 @@ public sealed class LogEvent
     /// straight to JSON (<see cref="LogEventJsonWriter"/>) and a filter reads single fields out of
     /// it (<see cref="ExceptionInfo.ReadField"/>), so the tree is built only by a caller that asks
     /// for <see cref="Exception"/>.
+    ///
+    /// <para>A row materialised by the hot tier's scan holds a VIEW into the tier's exception arena
+    /// here — native memory, valid while the reader snapshot that found the row is held — so that
+    /// the candidates a filter rejects (most of a scan) pay no copy for the exception they were
+    /// tested on. A consumer that keeps the row past the snapshot calls <see cref="OwnRawBytes"/>
+    /// first; the query executor does, for every row it yields.</para>
     /// </summary>
-    public ReadOnlyMemory<byte> RawException             { get; init; }
+    public ReadOnlyMemory<byte> RawException
+    {
+        get  => _rawException;
+        init => _rawException = value;
+    }
+
+    /// <summary>
+    /// Makes the event's raw bytes its own: a view into a hot tier's arena (see <see cref="RawException"/>)
+    /// is copied once and the copy kept; bytes that are an array already — a segment row's, an ingest
+    /// body's, a copy made by an earlier call — are left as they are, so this is free to call twice
+    /// and free for every row that is not a hot-tier view. Called by whoever keeps a row past the
+    /// reader snapshot that found it: the executor for each row it yields, so a page the events list
+    /// serialises after releasing the snapshot never reads a tier that has gone. The properties
+    /// travel as a copy today; they are covered here for the day they travel as a view too.
+    /// </summary>
+    public void OwnRawBytes()
+    {
+        if (!_rawException.IsEmpty && !MemoryMarshal.TryGetArray(_rawException, out _))
+            _rawException = _rawException.ToArray();
+        if (!_rawProperties.IsEmpty && !MemoryMarshal.TryGetArray(_rawProperties, out _))
+            _rawProperties = _rawProperties.ToArray();
+    }
 
     /// <summary>
     /// True when <see cref="Exception"/> is already decoded, so reading it costs nothing —
@@ -198,7 +227,13 @@ public sealed class LogEvent
     }
 
     /// <summary>Raw msgpack bytes of the properties map (for re-serialization without re-deserializing).</summary>
-    public ReadOnlyMemory<byte> RawProperties            { get; init; }
+    public ReadOnlyMemory<byte> RawProperties
+    {
+        get  => _rawProperties;
+        init => _rawProperties = value;
+    }
+
+    private ReadOnlyMemory<byte> _rawProperties;
 
     /// <summary>
     /// Reads ONE top-level property without building <see cref="Properties"/>.

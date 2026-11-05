@@ -404,7 +404,10 @@ public sealed partial class StorageEngine
         _afterWriteGate?.Invoke();
 
         // Never admitted by any tier, empty or not: waiting for room would wait for ever. The properties
-        // must fit a chunk's payload area, the exception a block of the exception arena.
+        // must fit a chunk's payload area. The exception is held to a block of the exception arena by
+        // the same rule — the tier itself would take a longer one in a block of its own, and a replay
+        // of a log an older release wrote (which bounded a tree's size by nothing) does, but a live
+        // event of that size is refused as the properties are, so a spill file is never asked to hold it.
         if (payload.Length > HotTierSegment.ChunkPayloadBytes || exception.Length > HotTierSegment.ExceptionBlockBytes)
             return WriteOutcome.TooLarge;
 

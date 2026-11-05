@@ -94,9 +94,17 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <summary>
     /// Worst-case native bytes a tier built with <see cref="EventCapacityFor"/> can hold in its
     /// chunks — payload arenas plus header arrays. This is the number to budget RSS against.
-    /// The exception arena comes on top, but its bytes share <paramref name="maxPayloadBytes"/>
-    /// with the properties (<see cref="IsFull"/>), so what it adds is what the properties no
-    /// longer take, plus at most one <see cref="ExceptionBlockBytes"/> block of slack.
+    /// The exception arena comes on top. Its bytes share <paramref name="maxPayloadBytes"/> with
+    /// the properties, and an exception-bearing event that would take the tier past it is REFUSED
+    /// (<see cref="TryWrite"/>, as an event is for its text) rather than taken into the chunk's
+    /// slack, so the arena HOLDS at most the limit less what the properties took. What it has
+    /// ALLOCATED is that in whole <see cref="ExceptionBlockBytes"/> blocks, and a block's tail that
+    /// the next exception does not fit is lost to it: for the kilobytes a stack trace is, one block
+    /// more than the bytes held; for exceptions of megabytes (half a block each, say) up to twice
+    /// them. <see cref="AllocatedBytes"/> counts the blocks as they are. The one event outside the
+    /// bound is the first of an empty tier, taken whatever its size, like its text: a replay or a
+    /// despill of a log an older release wrote can bring one longer than a block, and it gets a
+    /// block of its own.
     /// </summary>
     public static long NativeBytesFor(long maxPayloadBytes) =>
         (long)ChunksFor(maxPayloadBytes) * ChunkTotalBytes;
@@ -146,21 +154,44 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     // Error tier (level-split flush makes one 100 % exceptions) filled its first chunk's bytes at
     // ~5 000 events with 11 000 slots to spare, and was flushed there, three to four times as often
     // as before. Here the bytes cost the tier what they are: blocks allocated on demand, counted
-    // against the payload limit like the properties (IsFull: a tier holds at most that much of the
-    // two together), and the chunk geometry untouched.
+    // against the payload limit like the properties, and the chunk geometry untouched.
+    //   The limit is HARD for them, as it is for the events' own text and unlike the properties: a
+    // chunk's payload area bounds the properties on its own, and a new chunk is refused past the limit,
+    // but the arena takes a block whenever the last is full — so past the limit an exception-bearing
+    // event is refused (TryWriteClaimed) and waits for the next tier, where the chunk's slack would
+    // have let a stream of 32 KB stack traces grow a 64 MB tier to 512 MB of blocks with every flush
+    // slot busy, nothing refusing and so nothing spilling. The one event an empty tier takes whatever
+    // its size can be longer than a block (a replay of a log an older release wrote) and gets a block
+    // of its own.
     //   Each chunk keeps a long per slot — the exception's position: block index in the high bits,
     // offset in the block in the low — in a pooled array rented on the chunk's first exception, as the
     // template and service arrays are; the length is in the header (LogEventHeader.ExceptionByteLength).
+    //   A reader gets the bytes where they sit (GetExceptionMemory: a view over the block, no copy)
+    // and copies them only for a row it keeps past the tier's life (LogEvent.OwnRawBytes); a scan's
+    // rejected candidates pay nothing for the exception they were tested on.
 
-    /// <summary>Bytes per exception-arena block; an exception longer than this is never admitted (the engine refuses it as too large).</summary>
+    /// <summary>
+    /// Bytes per exception-arena block. The engine's live ingest refuses an exception longer than this
+    /// as too large (as it refuses properties longer than a chunk's payload area); the tier itself takes
+    /// one in a block of its own, so a replay or a despill of a log written before the limit loses nothing.
+    /// </summary>
     public const int ExceptionBlockBytes = 8 * 1024 * 1024;
     private const int ExceptionBlockShift = 23;   // log2(ExceptionBlockBytes): position = block << shift | offset
 
-    private readonly long[]?[] _chunkExcOffsets;
-    private          nuint[]   _excBlocks = new nuint[8];
-    private          int       _excBlockCount;
-    private          long      _excTail;    // bytes used in the last block
-    private          long      _excBytes;   // bytes used in all blocks
+    /// <summary>One block of the arena: its native memory, its size, and the view readers get it through.</summary>
+    private struct ExceptionBlock
+    {
+        public nuint            Ptr;
+        public int              Bytes;   // ExceptionBlockBytes, or the one exception a larger block holds
+        public ArenaBlockMemory View;
+    }
+
+    private readonly long[]?[]        _chunkExcOffsets;
+    private          ExceptionBlock[] _excBlocks = new ExceptionBlock[8];
+    private          int              _excBlockCount;
+    private          long             _excAllocated;   // bytes allocated in blocks
+    private          long             _excTail;        // bytes used in the last block
+    private          long             _excBytes;       // bytes used in all blocks
     /// <summary>Running sum of <see cref="_chunkPayloadTails"/> — total payload bytes
     /// actually written across all chunks. Kept incrementally so the hot-path
     /// <see cref="IsFull"/> check is O(1) instead of re-summing the tails array.</summary>
@@ -204,11 +235,11 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
     /// <summary>
     /// Total native (off-GC-heap) bytes currently committed by this segment: every allocated chunk
-    /// reserves <see cref="ChunkTotalBytes"/>, every exception block <see cref="ExceptionBlockBytes"/>.
-    /// Lets live diagnostics attribute process RSS to the hot tier vs. the managed heap instead of
-    /// guessing.
+    /// reserves <see cref="ChunkTotalBytes"/>, every exception block <see cref="ExceptionBlockBytes"/>
+    /// (or the one exception a larger block holds). Lets live diagnostics attribute process RSS to
+    /// the hot tier vs. the managed heap instead of guessing.
     /// </summary>
-    public long AllocatedBytes => (long)_chunksAllocated * ChunkTotalBytes + (long)_excBlockCount * ExceptionBlockBytes;
+    public long AllocatedBytes => (long)_chunksAllocated * ChunkTotalBytes + Volatile.Read(ref _excAllocated);
 
     /// <summary>Bytes of exception msgpack the tier holds (counted in the payload bytes <see cref="IsFull"/> tests).</summary>
     public long ExceptionBytes => Volatile.Read(ref _excBytes);
@@ -274,7 +305,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// the <see cref="StringInternPool"/> no longer contains the entry.
     /// <paramref name="exception"/>: the event's <c>@x</c> as its msgpack arrived (a map, or a legacy
     /// plain string; see <see cref="ExceptionInfo.Validate"/>), copied into the exception arena and
-    /// counted as payload; empty for none. One longer than <see cref="ExceptionBlockBytes"/> is refused.
+    /// counted as payload; empty for none. Against the payload limit it counts HARD, as the text does:
+    /// an event whose exception would take the tier past it is refused unless the tier is empty. One
+    /// longer than <see cref="ExceptionBlockBytes"/> gets a block of its own (the engine's live path
+    /// refuses it before it gets here; a replay does not).
     /// <paramref name="service"/>: the event's <c>@service</c> when it has no pool index
     /// (<see cref="LogEventHeader.ServiceNamePoolIndex"/> -1: the pool was full) — kept beside the
     /// header the same way; ignored for an event whose service is pooled.
@@ -338,8 +372,13 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         int ci         = eventIdx / ChunkEventCapacity;   // chunk index
         int si         = eventIdx % ChunkEventCapacity;   // slot within chunk
 
-        // No block holds it, so no tier does: the engine refuses it as too large before it gets here.
-        if (excLen > ExceptionBlockBytes)
+        // The exception's bytes against the payload limit, HARD, as the text above: past it the event
+        // waits for the next tier. The properties are bounded by the chunk's area (below) and a new
+        // chunk is refused past the limit, but the arena takes a block whenever the last is full, so
+        // without this an exception-bearing stream grew a tier to its chunk's 16 384 slots however
+        // large the exceptions — and with every flush slot busy nothing refused, so nothing spilled.
+        // An empty tier takes it whatever its size: a tier never refuses what no tier could take.
+        if (excLen > 0 && _count > 0 && _payloadBytes + payloadLen + excLen > _maxPayloadBytes)
             return false;
 
         // Allocate the chunk lazily on first use.
@@ -368,8 +407,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         string?[]? templates  = template is not null ? _chunkTemplates[ci]  ??= RentSlotsFor<string?>(SlotKind.Template)        : _chunkTemplates[ci];
         string?[]? services   = service  is not null ? _chunkServices[ci]   ??= RentSlotsFor<string?>(SlotKind.Service)         : _chunkServices[ci];
         long[]?    excOffsets = excLen > 0           ? _chunkExcOffsets[ci] ??= RentSlotsFor<long>(SlotKind.ExceptionOffsets)  : _chunkExcOffsets[ci];
+        // A new block when the last cannot hold this exception — one of the usual size, or of the
+        // exception's own when it is longer than that (the tail left in the old block is lost to it).
         if (excLen > 0 && (_excBlockCount == 0 || _excTail + excLen > ExceptionBlockBytes))
-            AllocExceptionBlock();
+            AllocExceptionBlock(Math.Max(excLen, ExceptionBlockBytes));
 
         // ── Write payload ────────────────────────────────────────────────────
         byte* dest = ChunkPayloadPtr(ci) + _chunkPayloadTails[ci];
@@ -381,8 +422,8 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         if (excLen > 0)
         {
             int block = _excBlockCount - 1;
-            excPos    = ((long)block << ExceptionBlockShift) | _excTail;
-            exception.CopyTo(new Span<byte>((byte*)_excBlocks[block] + _excTail, excLen));
+            excPos    = ((long)block << ExceptionBlockShift) | _excTail;   // _excTail < ExceptionBlockBytes here: a larger block is written at 0 and never again
+            exception.CopyTo(new Span<byte>((byte*)_excBlocks[block].Ptr + _excTail, excLen));
         }
 
         // ── Write header ─────────────────────────────────────────────────────
@@ -480,8 +521,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <summary>
     /// The exception of the event at <paramref name="eventIndex"/> as its msgpack sits in the
     /// exception arena; empty when the event has none. A span into native memory the tier owns:
-    /// copy it out (<see cref="LogEvent.RawException"/>) or consume it before the tier is disposed,
-    /// as for <see cref="GetPropertiesPayload"/>.
+    /// copy it out or consume it before the tier is disposed, as for <see cref="GetPropertiesPayload"/>.
     /// </summary>
     public ReadOnlySpan<byte> GetExceptionPayload(int eventIndex)
     {
@@ -491,8 +531,27 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         int len   = h.ExceptionByteLength;
         if (len == 0) return default;
         long pos  = _chunkExcOffsets[ci]![si];
-        byte* src = (byte*)_excBlocks[(int)(pos >> ExceptionBlockShift)] + (pos & (ExceptionBlockBytes - 1));
+        byte* src = (byte*)_excBlocks[(int)(pos >> ExceptionBlockShift)].Ptr + (pos & (ExceptionBlockBytes - 1));
         return new ReadOnlySpan<byte>(src, len);
+    }
+
+    /// <summary>
+    /// The same bytes as a <see cref="ReadOnlyMemory{T}"/> over the block they sit in — what
+    /// <see cref="LogEvent.RawException"/> holds for a materialised row — costing nothing per row:
+    /// a struct over the block's <see cref="ArenaBlockMemory"/>, no copy. Valid while the tier is,
+    /// which the reader snapshot that found the row guarantees for the scan; a row kept past it copies
+    /// (<see cref="LogEvent.OwnRawBytes"/>). Once the tier is disposed a view left over throws on its
+    /// first touch instead of reading freed memory (<see cref="ArenaBlockMemory.Invalidate"/>).
+    /// </summary>
+    public ReadOnlyMemory<byte> GetExceptionMemory(int eventIndex)
+    {
+        int ci    = eventIndex / ChunkEventCapacity;
+        int si    = eventIndex % ChunkEventCapacity;
+        ref var h = ref ChunkHeadersPtr(ci)[si];
+        int len   = h.ExceptionByteLength;
+        if (len == 0) return default;
+        long pos  = _chunkExcOffsets[ci]![si];
+        return _excBlocks[(int)(pos >> ExceptionBlockShift)].View.Memory.Slice((int)(pos & (ExceptionBlockBytes - 1)), len);
     }
 
     // ── IHotTierReader ────────────────────────────────────────────────────────
@@ -508,12 +567,20 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <inheritdoc/>
     public IEnumerable<LogEvent> ReadAll() => ReadAll(null);
 
-    /// <summary>Iterates a snapshot of all events with optional template resolution.</summary>
+    /// <summary>
+    /// Iterates a snapshot of all events with optional template resolution. Each event owns its
+    /// bytes (<see cref="LogEvent.OwnRawBytes"/>): this is the whole-tier road — tests, the reader
+    /// interface's fallback — not the scan's, and its rows are kept more often than not.
+    /// </summary>
     public IEnumerable<LogEvent> ReadAll(StringInternPool? pool)
     {
         int snapshot = _count;
         for (int i = 0; i < snapshot; i++)
-            yield return MaterialiseEvent(i, pool);
+        {
+            var ev = MaterialiseEvent(i, pool);
+            ev.OwnRawBytes();
+            yield return ev;
+        }
     }
 
     // ── Header-only aggregation ─────────────────────────────────────────────────
@@ -611,7 +678,12 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte* ChunkPayloadPtr(int ci) => (byte*)_chunkArenas[ci] + ChunkHeaderBytes;
 
-    /// <summary>Materialises the event at <paramref name="index"/> (query-path sorted scan).</summary>
+    /// <summary>
+    /// Materialises the event at <paramref name="index"/> (query-path sorted scan). Its
+    /// <see cref="LogEvent.RawException"/> is a VIEW into this tier's exception arena, valid while
+    /// the reader snapshot that holds the tier is: a filter reads it where it sits, and a consumer
+    /// that keeps the event past the snapshot calls <see cref="LogEvent.OwnRawBytes"/> first.
+    /// </summary>
     public LogEvent Materialise(int index, StringInternPool? pool) => MaterialiseEvent(index, pool);
 
     private LogEvent MaterialiseEvent(int index, StringInternPool? pool)
@@ -633,12 +705,16 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             ? payloadSpan.ToArray()
             : default;
 
-        // The exception the same way: its bytes, for LogEvent.RawException — delivered straight to
-        // JSON, read field by field by a filter, and decoded into a tree only by a caller that asks
-        // for LogEvent.Exception. It used to be the tier's own ExceptionInfo, shared by reference —
-        // free per row, 3.5 KB of UTF-16 per event for the life of the tier.
+        // The exception NOT copied: a view over its block (GetExceptionMemory), free per row as the
+        // tier's own ExceptionInfo used to be when it was shared by reference. The scan materialises
+        // every candidate its header test lets through and the filter rejects most of them after
+        // reading the exception's fields where they sit — a free-text query over an Error tier reads
+        // every row's @x — so a copy here was ~1.5 KB of gen0 per scanned candidate, 60 MB per query
+        // over a 64 MB tier. The rows a consumer keeps past the reader snapshot (a page the events
+        // list serialises after releasing it) copy once, through LogEvent.OwnRawBytes. The properties
+        // above could travel the same way; they are left as they were.
         ReadOnlyMemory<byte> rawExc = h.ExceptionByteLength > 0
-            ? GetExceptionPayload(index).ToArray()
+            ? GetExceptionMemory(index)
             : default;
 
         // Prefer the template carried alongside the event; this is robust to pool
@@ -708,24 +784,61 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         }
         for (int b = 0; b < _excBlockCount; b++)
         {
-            NativeMemory.Free((void*)_excBlocks[b]);
-            _excBlocks[b] = 0;
+            // The view first: a LogEvent that still holds one (a consumer that kept a row past the
+            // snapshot without OwnRawBytes) then throws on its next touch rather than read freed memory.
+            _excBlocks[b].View.Invalidate();
+            NativeMemory.Free((void*)_excBlocks[b].Ptr);
+            _excBlocks[b] = default;
         }
         _excBlockCount = 0;
+        Volatile.Write(ref _excAllocated, 0);
     }
 
     /// <summary>
-    /// One more block for the exception arena. Allocated before anything of the event is stored, so
-    /// an out-of-memory here is a write that stored nothing. Alloc, not AllocZeroed, as for a chunk:
-    /// only the pages written become resident.
+    /// One more block for the exception arena, of <paramref name="bytes"/> — <see cref="ExceptionBlockBytes"/>,
+    /// or an exception longer than that, which gets a block of its own and is the only thing in it.
+    /// Allocated before anything of the event is stored, so an out-of-memory here is a write that
+    /// stored nothing. Alloc, not AllocZeroed, as for a chunk: only the pages written become resident.
     /// </summary>
-    private void AllocExceptionBlock()
+    private void AllocExceptionBlock(long bytes)
     {
+        _beforeSlotRentForTest?.Invoke(SlotKind.ExceptionBlock);
         if (_excBlockCount == _excBlocks.Length)
             Array.Resize(ref _excBlocks, _excBlocks.Length * 2);   // the old array stays valid for every reader holding it
-        _excBlocks[_excBlockCount] = (nuint)NativeMemory.Alloc((nuint)ExceptionBlockBytes);
+        byte* ptr = (byte*)NativeMemory.Alloc((nuint)bytes);
+        _excBlocks[_excBlockCount] = new ExceptionBlock { Ptr = (nuint)ptr, Bytes = (int)bytes, View = new ArenaBlockMemory(ptr, (int)bytes) };
         _excBlockCount++;
+        Volatile.Write(ref _excAllocated, _excAllocated + bytes);
         _excTail = 0;
+    }
+
+    /// <summary>
+    /// A <see cref="MemoryManager{T}"/> over one block of the exception arena, set once for the
+    /// block's life: what lets a materialised row carry its exception as a <see cref="ReadOnlyMemory{T}"/>
+    /// (a struct over this object, no copy) that a <c>MessagePackReader</c> reads where it sits.
+    /// <see cref="Invalidate"/> at the tier's disposal empties it, so a slice taken earlier throws
+    /// <see cref="ArgumentOutOfRangeException"/> on its next <c>Span</c> rather than read freed memory —
+    /// a guard against a row kept past the tier (which the engine's rule that a tier is disposed
+    /// only once no snapshot holds it makes unreachable), not against a read racing the disposal,
+    /// which no guard here could cover: what covers that is the same rule.
+    /// </summary>
+    private sealed class ArenaBlockMemory(byte* ptr, int length) : MemoryManager<byte>
+    {
+        private byte* _ptr = ptr;
+        private int   _len = length;
+
+        /// <summary>The length first: a reader that sees the null pointer sees no length to read with it.</summary>
+        public void Invalidate() { _len = 0; _ptr = null; }
+
+        public override Memory<byte> Memory => CreateMemory(_len);
+
+        public override Span<byte> GetSpan() => new(_ptr, _len);
+
+        public override MemoryHandle Pin(int elementIndex = 0) => new(_ptr + elementIndex);
+
+        public override void Unpin() { }
+
+        protected override void Dispose(bool disposing) { }
     }
 
     /// <summary>
@@ -744,8 +857,11 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         return arr;
     }
 
-    /// <summary>The columns a chunk rents a slot array for, in the order the write path rents them.</summary>
-    internal enum SlotKind : byte { Template, Service, ExceptionOffsets }
+    /// <summary>
+    /// The columns a chunk rents a slot array for, in the order the write path rents them — and the
+    /// exception block, allocated by the same rule (before anything of the event is stored).
+    /// </summary>
+    internal enum SlotKind : byte { Template, Service, ExceptionOffsets, ExceptionBlock }
 
     /// <summary><see cref="RentSlots{T}"/> for the write path, behind its test seam.</summary>
     private T[] RentSlotsFor<T>(SlotKind kind)
@@ -755,9 +871,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     }
 
     /// <summary>
-    /// Test seam: called with the column as the write path is about to rent a chunk's template
-    /// or service array — throwing from it is a rent that ran out of memory. Reached once per
-    /// chunk and kind, not per event. Null in production.
+    /// Test seam: called with the column as the write path is about to rent a chunk's template,
+    /// service or exception-positions array, or to allocate an exception block — throwing from it
+    /// is a rent or an allocation that ran out of memory. Reached once per chunk and kind (per
+    /// block for the arena), not per event. Null in production.
     /// </summary>
     internal Action<SlotKind>? _beforeSlotRentForTest;
 }
@@ -818,8 +935,10 @@ internal struct HotTierAdmission
     /// bytes of properties and <paramref name="exceptionLength"/> bytes of exception, bringing
     /// <paramref name="ownManagedBytes"/> of text of its own (<see cref="HotTierSegment.TryWrite"/>),
     /// next; false, and nothing changes, when it would refuse it. The exception counts against the
-    /// payload limit with the properties, and never against the chunk, whose payload area holds the
-    /// properties alone; one longer than <see cref="HotTierSegment.ExceptionBlockBytes"/> is refused.
+    /// payload limit with the properties — hard, as the text does: past the limit an exception-bearing
+    /// event is refused unless the tier is empty — and never against the chunk, whose payload area
+    /// holds the properties alone. One longer than <see cref="HotTierSegment.ExceptionBlockBytes"/>
+    /// is taken as the tier takes it, in a block of its own.
     ///
     /// <para>The text is what bounds a spilled block's to a tier's (round-5 H-D): the despill replays the
     /// block into one tier that counts none of it — its log bounds it — and a block admitted on payload
@@ -830,7 +949,7 @@ internal struct HotTierAdmission
     {
         if (_count >= _maxEvents) return false;
         if (ownManagedBytes > 0 && _count > 0 && _managedBytes + ownManagedBytes > _maxPayloadBytes) return false;
-        if (exceptionLength > HotTierSegment.ExceptionBlockBytes) return false;
+        if (exceptionLength > 0 && _count > 0 && _payloadBytes + payloadLength + exceptionLength > _maxPayloadBytes) return false;
 
         int ci = _count / HotTierSegment.ChunkEventCapacity;
         if (ci > _lastChunk)
