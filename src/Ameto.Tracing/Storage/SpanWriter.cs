@@ -310,6 +310,10 @@ internal static class SpanWriter
         // Finals already renamed, for rollback if a later step of the publish fails.
         var published = new List<string>(3);
 
+        // The LZ4 frames of every block and of the index, pickled into one rented buffer — the
+        // engine's between flushes — instead of a fresh LOH array per block (PooledLz4Pickler).
+        var pickler = new PooledLz4Pickler(scratch);
+
         try
         {
             using (var fs = new FileStream(trcTmp, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
@@ -339,11 +343,8 @@ internal static class SpanWriter
                 {
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
-                    var block      = WriteBlock(in spans, written, batchCount, written, blockBuf, blockIdx,
-                                                traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms, level);
-                    bw.Write((uint)block.UncompressedSize);
-                    bw.Write((uint)block.CompressedBytes.Length);
-                    bw.Write(block.CompressedBytes);
+                    WriteBlock(bw, in spans, written, batchCount, written, blockBuf, blockIdx,
+                               traceRefs, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms, pickler, level);
                     written += batchCount;
                 }
 
@@ -388,7 +389,7 @@ internal static class SpanWriter
                     // Compress from the stream's own backing array — ToArray() duplicated the
                     // whole index (LOH-sized on a busy segment) for nothing.
                     var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
-                    var compressed = LZ4Pickler.Pickle(raw, level);
+                    var compressed = pickler.Pickle(raw, level);
                     bw.Write((uint)raw.Length);
                     bw.Write((uint)compressed.Length);
                     bw.Write(compressed);
@@ -428,6 +429,10 @@ internal static class SpanWriter
             TryDelete(tracesumFinal + ".tmp");
             if (traceRefs is not null) new TraceIndexPairs(traceRefs, 0, 0, scratch).Release();
             throw;
+        }
+        finally
+        {
+            pickler.Return();
         }
 
         // After the publish, so a map only ever describes a segment that exists on disk. The
@@ -604,6 +609,7 @@ internal static class SpanWriter
         var bloomHashes = new HashSet<ulong>();
         var blockBuf    = new ArrayBufferWriter<byte>(1024 * 1024);
         var block       = new List<SpanRecord>(BlockSize);
+        var pickler     = new PooledLz4Pickler(scratch);          // one frame buffer for every block, see the flush
 
         int  count = 0, traceCount = 0, open = 0, maxOpen = 0;
         long minNano = 0, maxNano = long.MinValue, weight = 0;
@@ -691,7 +697,7 @@ internal static class SpanWriter
                         WriteV3TraceIndexFromRefs(idxBw, traceRefs.AsSpan(0, count), traceCount);
                     }
                     var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
-                    var compressed = LZ4Pickler.Pickle(raw, MergeLevel);
+                    var compressed = pickler.Pickle(raw, MergeLevel);
                     bw.Write((uint)raw.Length);
                     bw.Write((uint)compressed.Length);
                     bw.Write(compressed);
@@ -740,6 +746,7 @@ internal static class SpanWriter
         finally
         {
             for (int i = 0; i < n; i++) cursors[i]?.Dispose();
+            pickler.Return();
         }
 
         if (traceRefs is not null)
@@ -771,11 +778,8 @@ internal static class SpanWriter
             int  first    = count - block.Count;
             uint blockIdx = (uint)(first / BlockSize);
             var  batch    = new OrderedSpans(block);
-            var  written  = WriteBlock(in batch, 0, block.Count, first, blockBuf, blockIdx,
-                                       traceRefs, svcBlockMap, spanSvc: null, bloomHashes, svcStats, blooms, MergeLevel);
-            bw.Write((uint)written.UncompressedSize);
-            bw.Write((uint)written.CompressedBytes.Length);
-            bw.Write(written.CompressedBytes);
+            WriteBlock(bw, in batch, 0, block.Count, first, blockBuf, blockIdx,
+                       traceRefs, svcBlockMap, spanSvc: null, bloomHashes, svcStats, blooms, pickler, MergeLevel);
             block.Clear();
             _afterMergedBlockForTest?.Invoke(count);
         }
@@ -946,7 +950,10 @@ internal static class SpanWriter
     /// a merge hands over one block at a time.</param>
     /// <param name="spanSvc">span → service for <c>.svcgraph</c>, or null when the caller derives its
     /// edges another way (the merge — see <see cref="ServiceGraphSidecar.MergeEdges"/>).</param>
-    private static (byte[] CompressedBytes, int UncompressedSize) WriteBlock(
+    /// <param name="bw">The segment, positioned at the block: its two lengths and its frame are written here.</param>
+    /// <param name="pickler">The frame buffer every block of the file shares — see <see cref="PooledLz4Pickler"/>.</param>
+    private static void WriteBlock(
+        BinaryWriter                             bw,
         in OrderedSpans                          spans,
         int                                      offset,
         int                                      count,
@@ -959,6 +966,7 @@ internal static class SpanWriter
         HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms,
+        PooledLz4Pickler                         pickler,
         LZ4Level                                 level)
     {
         // Caller-owned buffer, reused across blocks: reset the index without
@@ -1072,12 +1080,16 @@ internal static class SpanWriter
         blooms.Add(SpanBloom.Build(bloomHashes));
 
         writer.Flush();
-        // Pickle straight from the written span — the ToArray() copy the old code made
-        // here existed only to hand Pickle a byte[] it never kept.
-        // At the level the caller writes at: FlushLevel for a flush, MergeLevel for a merge (see both).
+        // Pickled straight from the written span into the file's one frame buffer, at the level the
+        // caller writes at (FlushLevel for a flush, MergeLevel for a merge — see both). The frame used
+        // to come back from LZ4Pickler.Pickle in a fresh array per block — 140 KB to half a megabyte,
+        // on the LOH, three to fourteen times a flush; the same bytes without the array, see
+        // PooledLz4Pickler. Written out here, before the next block overwrites it.
         var raw        = bufWriter.WrittenSpan;
-        var compressed = LZ4Pickler.Pickle(raw, level);
-        return (compressed, raw.Length);
+        var compressed = pickler.Pickle(raw, level);
+        bw.Write((uint)raw.Length);
+        bw.Write((uint)compressed.Length);
+        bw.Write(compressed);
     }
 
     /// <summary>Inline typed attribute map — no nested serializer, no per-span buffers.</summary>

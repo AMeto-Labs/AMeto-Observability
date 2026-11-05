@@ -5,7 +5,8 @@ namespace Ameto.Tracing.Storage;
 
 /// <summary>
 /// The segment writer's big scratch arrays, kept BY THE ENGINE between flushes (#90): the sort
-/// permutation and its keys, the <c>.tracesum</c> body, and the trace-index refs (TS#7(c)).
+/// permutation and its keys, the <c>.tracesum</c> body, the trace-index refs (TS#7(c)), and the
+/// buffer the LZ4 frames are pickled into (<see cref="PooledLz4Pickler"/>).
 ///
 /// <para>WHY NOT JUST <c>ArrayPool.Shared</c>. A flush runs on whatever thread-pool thread its task
 /// lands on, and the shared pool keeps a returned array in the RETURNING thread's slot first — so a
@@ -16,10 +17,11 @@ namespace Ameto.Tracing.Storage;
 /// thread flushes next.</para>
 ///
 /// <para>BOUNDED, because an engine slot is never trimmed. An array is kept only up to a flush's own
-/// size (<see cref="MaxKeptElements"/> spans, <see cref="MaxKeptBodyBytes"/> of body); a compaction
-/// pass's larger arrays go back to the shared pool as before. What this holds at rest is what one
-/// ordinary flush used — 3 MiB for 50 000 spans of 10-span traces, 10 MiB for 50 000 single-span
-/// traces, and never more than 10 MiB (0.25 + 0.5 + 1.25 + 8).</para>
+/// size (<see cref="MaxKeptElements"/> spans, <see cref="MaxKeptBodyBytes"/> of body,
+/// <see cref="MaxKeptPickleBytes"/> of frame buffer); a compaction pass's larger arrays go back to the
+/// shared pool as before. What this holds at rest is what one ordinary flush used — 5 MiB for 50 000
+/// spans of 10-span traces, 12 MiB for 50 000 single-span traces (2 MiB of each the frame buffer), and
+/// never more than 14 MiB (0.25 + 0.5 + 1.25 + 8 + 4).</para>
 ///
 /// <para>Exclusive by exchange: a flush and a compaction pass running together each take a slot
 /// with <see cref="Interlocked.Exchange{T}(ref T, T)"/>, so the second finds it empty and rents from
@@ -56,24 +58,40 @@ internal sealed class SpanWriteScratch
     /// </summary>
     internal const int MaxKeptBodyBytes = 8 << 20;
 
+    /// <summary>
+    /// The largest LZ4 frame buffer kept: a span block of ordinary spans plus its header
+    /// (<see cref="PooledLz4Pickler"/>). The writer pickles every block of a segment into one buffer sized
+    /// to the largest block's raw bytes — a 4096-span block of ~250-byte spans is ~1 MiB, which rents 2 MiB;
+    /// resource-shaped spans twice that, which rents 4 MiB — and before #141's follow-up each block came back
+    /// in a fresh LOH array from <c>LZ4Pickler.Pickle</c>. A segment of heavier spans rents more and gives
+    /// it to the shared pool, like a body that outgrows its estimate.
+    /// </summary>
+    internal const int MaxKeptPickleBytes = 4 << 20;
+
     private int[]?          _order;
     private long[]?         _keys;
     private byte[]?         _body;
     private TraceSpanRef[]? _pairs;
+    private byte[]?         _pickle;
 
-    public int[]          RentOrder(int n) => Take(ref _order, n);
-    public long[]         RentKeys(int n)  => Take(ref _keys, n);
-    public byte[]         RentBody(int n)  => Take(ref _body, n);
-    public TraceSpanRef[] RentPairs(int n) => Take(ref _pairs, n);
+    public int[]          RentOrder(int n)  => Take(ref _order,  n);
+    public long[]         RentKeys(int n)   => Take(ref _keys,   n);
+    public byte[]         RentBody(int n)   => Take(ref _body,   n);
+    public TraceSpanRef[] RentPairs(int n)  => Take(ref _pairs,  n);
+    public byte[]         RentPickle(int n) => Take(ref _pickle, n);
 
-    public void Return(int[] a)          => Give(ref _order, a, MaxKeptElements);
-    public void Return(long[] a)         => Give(ref _keys,  a, MaxKeptElements);
-    public void ReturnBody(byte[] a)     => Give(ref _body,  a, MaxKeptBodyBytes);
-    public void Return(TraceSpanRef[] a) => Give(ref _pairs, a, MaxKeptElements);
+    public void Return(int[] a)          => Give(ref _order,  a, MaxKeptElements);
+    public void Return(long[] a)         => Give(ref _keys,   a, MaxKeptElements);
+    public void ReturnBody(byte[] a)     => Give(ref _body,   a, MaxKeptBodyBytes);
+    public void Return(TraceSpanRef[] a) => Give(ref _pairs,  a, MaxKeptElements);
+    public void ReturnPickle(byte[] a)   => Give(ref _pickle, a, MaxKeptPickleBytes);
 
     /// <summary>Test hook: the arrays held right now (null where a slot is empty or taken).</summary>
     internal (int[]? Order, long[]? Keys, byte[]? Body, TraceSpanRef[]? Pairs) HeldForTest =>
         (Volatile.Read(ref _order), Volatile.Read(ref _keys), Volatile.Read(ref _body), Volatile.Read(ref _pairs));
+
+    /// <summary>Test hook: the LZ4 frame buffer held right now (null while a write has it, or before the first).</summary>
+    internal byte[]? HeldPickleForTest => Volatile.Read(ref _pickle);
 
     private static T[] Take<T>(ref T[]? slot, int n)
     {
