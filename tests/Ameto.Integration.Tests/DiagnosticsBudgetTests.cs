@@ -121,6 +121,29 @@ public sealed class DiagnosticsBudgetTests : IClassFixture<DiagnosticsBudgetTest
     }
 
     /// <summary>
+    /// THE GC'S PAUSE TIME, WHERE AN OPERATOR CAN SEE IT (#141 follow-up): the milliseconds every thread
+    /// has stood still for collections since the process started — what the collection shapes the server
+    /// asks for by hand cost, which showed nowhere but a GC trace. Cumulative, so a dashboard differences
+    /// it across polls; the MEM line <c>RamPressureService</c> writes every 30 s carries the same figure.
+    /// The host runs in this process, so the field can be checked against the runtime's own counter:
+    /// never ahead of a reading taken after the reply, and never negative.
+    /// </summary>
+    [Fact]
+    public async Task Diagnostics_reports_the_GC_pause_total()
+    {
+        var json = await Diagnostics();
+
+        double pauseMs = json.GetProperty("gcPauseTotalMs").GetDouble();
+        Assert.True(pauseMs >= 0, $"gcPauseTotalMs = {pauseMs}");
+        Assert.True(pauseMs <= GC.GetTotalPauseDuration().TotalMilliseconds + 0.05,     // rounded to a tenth
+                    $"gcPauseTotalMs = {pauseMs} is ahead of the process's own {GC.GetTotalPauseDuration().TotalMilliseconds}");
+
+        // Beside the GC fields it belongs with.
+        foreach (string gc in new[] { "gen0Collections", "gen1Collections", "gen2Collections", "gcHeapBytes", "gcCommittedBytes" })
+            Assert.True(json.TryGetProperty(gc, out _), gc);
+    }
+
+    /// <summary>
     /// ONE GATE FOR BOTH BACKGROUND REWRITES (#125). A metric rewrite chunk and a trace compaction
     /// pass spend the same share of the heap by taking turns; that holds only if the composition gives
     /// both engines the SAME gate — two would let them run side by side, twice the share.

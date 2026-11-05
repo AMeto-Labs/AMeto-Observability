@@ -62,12 +62,18 @@ public sealed class RamPressureService : BackgroundService
                 // dashboard poll re-sampling on its own would cut this window short.
                 double cpuPct = _cpu.Sample();
 
+                // gc_pause is the time the GC has had every thread stopped since the process started
+                // (GC.GetTotalPauseDuration), cumulative — the figure /api/diagnostics reports as
+                // gcPauseTotalMs. Differenced between two lines it is what the collections of that
+                // half-minute cost, which is how the shape a merge or a rollup asks for (#141) shows
+                // on a stand without a GC trace.
                 _logger.LogInformation(
-                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}% cpu={Cpu}% ({Cores} cores)",
+                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB gc_pause={Pause}ms hot_tier={Hot}MB mode={Mode} sys_ram={Pct}% cpu={Cpu}% ({Cores} cores)",
                     Environment.WorkingSet      / MB,
                     gc.HeapSizeBytes            / MB,
                     gc.TotalCommittedBytes      / MB,
                     gc.FragmentedBytes          / MB,
+                    (long)GC.GetTotalPauseDuration().TotalMilliseconds,
                     _storage.HotTierAllocatedBytes / MB,
                     System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation",
                     pct,
