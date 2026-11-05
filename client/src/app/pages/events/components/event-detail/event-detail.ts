@@ -10,8 +10,9 @@ import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto } from '../../../../core/models/event.model';
+import { EventDto, levelShort } from '../../../../core/models/event.model';
 import { SpanDto } from '../../../../core/models/span.model';
+import { BottomSheetComponent } from '../../../../shared/components/bottom-sheet/bottom-sheet';
 import { MetricSeriesDto } from '../../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
 import { ApiService } from '../../../../core/services/api.service';
@@ -132,6 +133,34 @@ export function buildClefView(ev: EventDto): Record<string, unknown> {
   return view;
 }
 
+/** Property keys that name the machine the event came from, in the order they are tried. */
+const MACHINE_KEYS = ['MachineName', 'machine.name', 'host.name', 'HostName', 'hostname', 'host'];
+
+/**
+ * How many rows of the JSON tab a search term lights: a key or a leaf value containing it, as
+ * the viewer highlights them (json-viewer.ts, rowMatches). The phone's JSON toolbar shows it.
+ */
+export function countJsonHits(value: unknown, term: string): number {
+  const q = term.trim().toLowerCase();
+  if (!q) return 0;
+  let hits = 0;
+  const leafText = (v: unknown): string =>
+    v === null || v === undefined ? 'null' : typeof v === 'string' ? `"${v}"` : String(v);
+  const visit = (v: unknown, inArray: boolean, key: string | null): void => {
+    const isContainer = v !== null && typeof v === 'object' && Object.keys(v as object).length > 0;
+    const keyHit = key !== null && !inArray && key.toLowerCase().includes(q);
+    if (!isContainer) {
+      if (keyHit || leafText(v).toLowerCase().includes(q)) hits++;
+      return;
+    }
+    if (keyHit) hits++;
+    const arr = Array.isArray(v);
+    for (const [k, child] of Object.entries(v as Record<string, unknown>)) visit(child, arr, k);
+  };
+  visit(value, false, null);
+  return hits;
+}
+
 function wfFmtMs(ms: number): string {
   if (ms < 0.001) return `${(ms * 1_000_000).toFixed(0)}ns`;
   if (ms < 1)     return `${(ms * 1_000).toFixed(0)}µs`;
@@ -145,20 +174,40 @@ function wfFmtMs(ms: number): string {
  * block and the shared property/timestamp context menu. The collapsed log row is
  * a separate component; this one takes the already-selected event as a required
  * input and shows one event at a time.
+ *
+ * <p>On a phone ({@link phone}; design canvas, "Телефон — событие") the Logs page shows it as a
+ * layer over the list, and it grows a 48px header — back, the level and service, the time and
+ * machine, copy and close — over an unclamped message, scrolling tabs and rows a finger can hit.
+ * On a touch screen ({@link touch}) the property menu and the facts' menus open as bottom sheets
+ * instead of overlays anchored to a cursor. Both are inputs, not media queries: the Traces page
+ * shows this component in a modal and keeps the drawer's layout there.</p>
  */
 @Component({
   selector: 'app-event-detail',
-  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent, ModalComponent, PropertyMenuComponent],
+  imports: [
+    LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent,
+    ModalComponent, PropertyMenuComponent, BottomSheetComponent,
+  ],
   providers: [JsonViewerActions],
   templateUrl: './event-detail.html',
-  styleUrl: './event-detail.scss',
+  // The phone and touch layers in a second stylesheet: the component-style budget is per
+  // stylesheet, and the drawer's own was already over its warning line.
+  styleUrls: ['./event-detail.scss', './event-detail.responsive.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
+  host: {
+    '[class.phone]': 'phone()',
+    '[class.touch]': 'touch()',
+  },
 })
 export class EventDetailComponent {
   // ── Inputs / outputs ──────────────────────────────────────────────────
   event = input.required<EventDto>();
   /** Current CLEF filter — lets the property menu compose And/Or expressions. */
   currentFilter = input<string>('');
+  /** The phone's layer: its own header, no clamp on the message, rows of a finger's height. */
+  phone = input<boolean>(false);
+  /** A touch screen: action sheets in place of the cursor-anchored menus. */
+  touch = input<boolean>(false);
   filterSelected = output<string>();
   seekRequested  = output<{ from: Date; to: Date }>();
   /** Bind a timestamp to one side of the parent time-range inputs. */
@@ -329,8 +378,10 @@ export class EventDetailComponent {
       const type = this.menuType();
       const pos  = this.menuPos();
       const tpl  = this.ctxMenuTpl();
+      // On a touch screen the same template is shown in a sheet (event-detail.html), not here.
+      const sheet = this.touch();
       untracked(() => {
-        if (type && tpl) {
+        if (type && tpl && !sheet) {
           this.menuRef = this.contextMenu.open({
             template: tpl,
             viewContainerRef: this.vcr,
@@ -355,10 +406,12 @@ export class EventDetailComponent {
     effect(() => {
       const m   = this.propMenu();
       const tpl = this.propMenuTpl();
+      // On a touch screen the property's actions are a sheet (event-detail.html), not an overlay.
+      const sheet = this.touch();
       untracked(() => {
         this.propMenuRef?.close();
         this.propMenuRef = undefined;
-        if (m && tpl) {
+        if (m && tpl && !sheet) {
           this.propMenuRef = this.contextMenu.open({
             template: tpl,
             viewContainerRef: this.vcr,
@@ -391,7 +444,29 @@ export class EventDetailComponent {
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
 
+  /** The row's three-letter badge, for the phone header. */
+  levelShort = computed(() => levelShort(this.event()['@l']));
+
   service = computed(() => this.event()['@service'] ?? '');
+
+  /** The machine the event came from, for the phone header's second line; '' when unnamed. */
+  machineName = computed(() => {
+    const p = this.event().props ?? {};
+    for (const k of MACHINE_KEYS) {
+      const v = p[k];
+      if (typeof v === 'string' && v) return v;
+    }
+    return '';
+  });
+
+  /** Where "Open in Traces" and the TraceId link go. */
+  traceHref = computed(() => {
+    const tid = this.traceId();
+    return tid ? appPath(`/traces?trace=${encodeURIComponent(tid)}`) : '';
+  });
+
+  /** How many rows the JSON tab's search lights (the phone's "N hits"). */
+  jsonHits = computed(() => countJsonHits(this.clefView(), this.jsonSearch()));
 
   /** Stable per-service colour, shared with the list rows / dropdown / waterfall. */
   svcColor = computed(() => serviceColor(this.service()));
@@ -636,6 +711,18 @@ export class EventDetailComponent {
     return `${m.entry.path} ${neq ? '<>' : '='} ${jvLiteral(m.entry.raw)}`;
   }
 
+  /** The sheet's captions: what "Filter by this value" and "Exclude this value" would run. */
+  propCondition = computed(() => this.propPredicate(false));
+  propExclusion = computed(() => this.propPredicate(true));
+
+  /** An object or array in one line, for the sheet's head. */
+  formatInlineValue(v: unknown): string {
+    return formatInline(v);
+  }
+
+  /** The ⋮ of the phone's rows; the drawer's rows keep their filter glyph. */
+  menuIcon = computed(() => this.phone() ? 'ellipsis-vertical' : 'list-filter');
+
   /** The value's path with every array index as `[%]` — null when there is none, or for an
    *  object / array, which has no equality to ask of each element. */
   propWildcard = computed<string | null>(() => {
@@ -737,6 +824,12 @@ export class EventDetailComponent {
     if (this.propMenu()) this.propMenu.set(null);
   }
 
+  /** Both sheets close themselves through this; a tap inside a sheet does not reach the document. */
+  closeSheets(): void {
+    this.menuType.set(null);
+    this.propMenu.set(null);
+  }
+
   /**
    * Escape closes the innermost open layer: context menu → modal → the drawer itself.
    * Ignores an already-consumed key (e.g. the filter autocomplete calls preventDefault
@@ -745,6 +838,8 @@ export class EventDetailComponent {
   @HostListener('document:keydown.escape', ['$event'])
   onEscape(e: Event): void {
     if (e.defaultPrevented) return;
+    // Taken, so the sheets' own Escape (bottom-sheet.ts) does not close a second layer.
+    e.preventDefault();
     if (this.propMenu())          { this.propMenu.set(null);          return; }
     if (this.menuType())          { this.menuType.set(null);          return; }
     if (this.valueModalOpen())    { this.valueModalOpen.set(false);   return; }

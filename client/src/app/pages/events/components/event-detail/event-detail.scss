@@ -452,9 +452,29 @@
   text-transform: uppercase;
   letter-spacing: .05em;
 }
+/* The axis's label column is the same element class as a row's; it has no depth to indent by. */
+.ev-wf-axis .ev-wf-label-col { padding-left: 6px; }
+/* The phone's "this event" mark, the waterfall's count and its "Open in Traces" exist only in
+   the phone layer (event-detail.html renders them there); the label row is a flex line so the
+   link can sit at its right. */
+.tr-block-label--wf {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ev-json-hits {
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .ev-wf-label-col {
   flex: 0 0 220px;
   min-width: 0;
+  /* 14px a level of depth (the row sets --depth), 6px at the root — the phone indents the whole
+     row by 10px a level instead (event-detail.responsive.scss). */
+  padding-left: calc(var(--depth, 0) * 14px + 6px);
   padding-right: 8px;
   white-space: nowrap;
   overflow: hidden;
