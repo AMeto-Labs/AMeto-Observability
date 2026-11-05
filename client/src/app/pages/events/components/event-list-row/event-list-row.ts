@@ -10,6 +10,7 @@ import { EventDto, levelShort } from '../../../../core/models/event.model';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
 import { LongPress } from '../../../../shared/utils/long-press';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
+import { excludeLikeFilter, findLikeFilter } from '../../store/events-filter.util';
 
 /**
  * Fixed-height, single-line collapsed log row for the Events virtual list.
@@ -161,16 +162,14 @@ export class EventListRowComponent {
     });
   }
 
+  /** The sheet's expressions (events-filter.util): the template quoted as the lexer reads it. */
   findSimilar(): void {
-    this.emitFilter(`@mt = '${this.messageTemplate()}'`);
+    this.emitFilter(findLikeFilter(this.event()['@mt']));
   }
 
+  /** In place of the current filter, as this menu always did; the phone's sheet narrows it instead. */
   excludeSimilar(): void {
-    this.emitFilter(`@mt <> '${this.messageTemplate()}'`);
-  }
-
-  private messageTemplate(): string {
-    return (this.event()['@mt'] ?? '').replace(/'/g, "''");
+    this.emitFilter(excludeLikeFilter(this.event()['@mt'], ''));
   }
 
   private emitFilter(expr: string): void {

@@ -5,23 +5,7 @@ import { LucideAngularModule } from 'lucide-angular';
 import { BottomSheetComponent } from '../../../../shared/components/bottom-sheet/bottom-sheet';
 import { EventDto } from '../../../../core/models/event.model';
 import { renderMessageHtml, renderTemplateHtml } from '../../../../shared/utils/clef-renderer';
-
-/** A message template as a filter literal: the quotes doubled, as the lexer reads them. */
-export function quoteTemplate(mt: string | undefined): string {
-  return `'${(mt ?? '').replace(/'/g, "''")}'`;
-}
-
-/** "Find all like this": the events on this template, in place of the current filter. */
-export function findLikeFilter(mt: string | undefined): string {
-  return `@mt = ${quoteTemplate(mt)}`;
-}
-
-/** "Exclude these": the current filter without this template — or just without it, when empty. */
-export function excludeLikeFilter(mt: string | undefined, current: string): string {
-  const cur = current.trim();
-  const pred = `@mt <> ${quoteTemplate(mt)}`;
-  return cur ? `(${cur}) and ${pred}` : pred;
-}
+import { excludeLikeFilter, findLikeFilter, quoted } from '../../store/events-filter.util';
 
 /** The expression on one line for the row's caption, cut with an ellipsis. */
 function shorten(s: string, max = 72): string {
@@ -64,7 +48,7 @@ export class MessageActionSheetComponent {
 
   readonly findCaption = computed(() => shorten(findLikeFilter(this.event()['@mt'])));
   readonly excludeCaption = computed(() =>
-    shorten(`${this.currentFilter().trim() ? '… and ' : ''}@mt <> ${quoteTemplate(this.event()['@mt'])}`));
+    shorten(`${this.currentFilter().trim() ? '… and ' : ''}@mt <> ${quoted(this.event()['@mt'] ?? '')}`));
 
   find(): void {
     this.filterSelected.emit(findLikeFilter(this.event()['@mt']));

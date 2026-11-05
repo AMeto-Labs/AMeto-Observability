@@ -448,8 +448,23 @@ export function setLevelsClause(expr: string, levels: Set<string>): string {
  * followed by text it could not use, and `'DOMAIN\svc'` the name `DOMAINsvc`. The quote is
  * doubled, as `jvLiteral` writes it; the backslash is escaped.
  */
-function quoted(s: string): string {
+export function quoted(s: string): string {
   return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+}
+
+/** "Find all like this": the events on this message template, in place of the current filter. */
+export function findLikeFilter(mt: string | undefined): string {
+  return `@mt = ${quoted(mt ?? '')}`;
+}
+
+/**
+ * "Exclude these": the current filter without this template — `(current) and @mt <> '…'` — or
+ * the exclusion alone when there is no filter.
+ */
+export function excludeLikeFilter(mt: string | undefined, current: string): string {
+  const cur = current.trim();
+  const pred = `@mt <> ${quoted(mt ?? '')}`;
+  return cur ? `(${cur}) and ${pred}` : pred;
 }
 
 /**

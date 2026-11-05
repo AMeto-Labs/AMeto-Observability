@@ -585,7 +585,8 @@ export const EventsStore = signalStore(
     /**
      * Mirrors the toolbar/filter state into the URL query params. `levels` is written as
      * null so any legacy `levels=` param is dropped — the @l clause inside `filter` is
-     * the single source of truth.
+     * the single source of truth. Exposed as `syncUrl` for the page, which rewrites the entry
+     * the browser's Back landed on when its URL is older than the state (EventsComponent).
      */
     function syncRoute(): void {
       const queryParams: Record<string, string | null> = {
@@ -1233,19 +1234,26 @@ export const EventsStore = signalStore(
       }
 
       const patch: Partial<EventsState> = { filterInput, filter: filterInput };
+      // The window moved: another preset, a preset turned into fixed bounds, or other bounds. A
+      // custom window re-applied as it stands is no move — the sheet is reopened to change the
+      // levels under it more often than not — so a tail under it keeps running.
+      let windowMoved = false;
       if (draft.preset !== 'custom') {
-        if (draft.preset !== store.timePreset()) patch.timePreset = draft.preset;
+        if (draft.preset !== store.timePreset()) {
+          patch.timePreset = draft.preset;
+          windowMoved = true;
+        }
       } else {
         const start = parseCustomDate(draft.from);
         const end = draft.to ? parseCustomDate(draft.to) : null;
         if (start && (!draft.to || (end && end > start))) {
+          windowMoved = store.timePreset() !== 'custom'
+            || draft.from !== store.customFrom() || draft.to !== store.customTo();
           patch.customFrom = draft.from;
           patch.customTo = draft.to;
           patch.timePreset = 'custom';
         }
       }
-      const windowMoved = patch.timePreset !== undefined
-        || patch.customFrom !== undefined && (patch.customFrom !== store.customFrom() || patch.customTo !== store.customTo());
       if (windowMoved && store.live()) stopLive();
 
       if (PAGE_SIZE_OPTIONS.includes(draft.pageSize)) patch.pageSize = draft.pageSize;
@@ -1360,6 +1368,7 @@ export const EventsStore = signalStore(
       selectEvent,
       toggleEvent,
       toggleWrap,
+      syncUrl: syncRoute,
       toggleSignalsPanel,
       openFilterSheet,
       closeFilterSheet,

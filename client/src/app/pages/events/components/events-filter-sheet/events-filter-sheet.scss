@@ -89,3 +89,13 @@
 }
 .fs-label-tight { margin-bottom: 4px; }
 .fs-wrap { padding-top: 16px; }
+
+// Under an aggregation, in the place of the levels, services and page size: the chip strip's note.
+.fs-agg-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  font-size: 10.5px;
+  color: var(--txt-dim);
+}

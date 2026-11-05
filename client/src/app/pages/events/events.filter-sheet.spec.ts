@@ -1,16 +1,17 @@
 import { TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection } from '@angular/core';
 import { provideRouter } from '@angular/router';
+import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { NEVER, of } from 'rxjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { EventsStore } from './store/events.store';
 import { ApiService } from '../../core/services/api.service';
 import { EventQueryParams } from '../../core/models/event.model';
+import { excludeLikeFilter, findLikeFilter, quoted } from './store/events-filter.util';
 import {
-  excludeLikeFilter, findLikeFilter,
-} from './components/message-action-sheet/message-action-sheet';
-import { fromInputDateTime, toInputDateTime } from './components/events-filter-sheet/events-filter-sheet';
+  EventsFilterSheetComponent, fromInputDateTime, toInputDateTime,
+} from './components/events-filter-sheet/events-filter-sheet';
 
 /**
  * The phone's filter sheet applies its whole draft in ONE load (design canvas, "Телефон — лист
@@ -35,6 +36,7 @@ describe('Events store — the filter sheet', () => {
         provideZonelessChangeDetection(),
         provideRouter([]),
         { provide: ApiService, useValue: api },
+        { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider({ ...icons }) },
         EventsStore,
       ],
     });
@@ -103,6 +105,50 @@ describe('Events store — the filter sheet', () => {
     store.applyFilterSheet({ preset: '3d', from: '', to: '', levels: all, services: new Set(), pageSize: 100, wrap: false });
     expect(store.live()).toBe(false);
     expect(store.timePreset()).toBe('3d');
+
+    // A custom window: moving to it is a move; re-applying it as it stands, to change the levels
+    // under it, is not; other bounds are.
+    store.applyFilterSheet({ preset: 'custom', from: '2026-11-02 14:22', to: '', levels: all, services: new Set(), pageSize: 100, wrap: false });
+    store.startLive();
+    expect(store.live()).toBe(true);
+    store.applyFilterSheet({ preset: 'custom', from: '2026-11-02 14:22', to: '', levels: new Set(['Error']), services: new Set(), pageSize: 100, wrap: false });
+    expect(store.live()).toBe(true);
+    expect(store.filter()).toBe("@l = 'Error'");
+    store.applyFilterSheet({ preset: 'custom', from: '2026-11-02 14:22', to: '2026-11-03 09:00', levels: new Set(['Error']), services: new Set(), pageSize: 100, wrap: false });
+    expect(store.live()).toBe(false);
+    expect(store.customTo()).toBe('2026-11-03 09:00');
+  });
+
+  it('under an aggregation applies the window alone: there is no clause to splice', () => {
+    store.applyFilter('select count(*) from stream group by @service');
+    expect(store.isAggregation()).toBe(true);
+    store.applyFilterSheet({
+      preset: '3d', from: '', to: '',
+      levels: new Set(['Error']), services: new Set(['api']), pageSize: 50, wrap: false,
+    });
+    expect(store.filter()).toBe('select count(*) from stream group by @service');
+    expect(store.timePreset()).toBe('3d');
+    expect(store.filterSheetOpen()).toBe(false);
+  });
+
+  it('under an aggregation the sheet offers the time range alone, with the chip strip\'s note', async () => {
+    store.applyFilter('select count(*) from stream group by @service');
+    const fixture = TestBed.createComponent(EventsFilterSheetComponent);
+    await fixture.whenStable();
+    const el = fixture.nativeElement as HTMLElement;
+    expect(el.querySelector('.fs-presets')).not.toBeNull();
+    expect(el.querySelector('.fs-range')).not.toBeNull();
+    expect(el.querySelector('.fs-svc-search')).toBeNull();
+    expect(el.querySelector('.bs-seg')).toBeNull();
+    expect(el.querySelector('.bs-switch')).toBeNull();
+    expect(el.querySelector('.fs-agg-note')?.textContent).toContain('Aggregation');
+    expect(el.querySelector('.bs-note')?.textContent).toContain('Aggregation');
+
+    // Off the aggregation, the sections are back.
+    store.applyFilter('');
+    await fixture.whenStable();
+    expect(el.querySelector('.fs-svc-search')).not.toBeNull();
+    expect(el.querySelector('.fs-agg-note')).toBeNull();
   });
 
   it('counts the restrictions the "Filters · N" button shows', () => {
@@ -119,8 +165,13 @@ describe('Events store — the filter sheet', () => {
 });
 
 describe('the message action sheet — its expressions', () => {
-  it('finds all like this on the template, quotes doubled', () => {
+  it('finds all like this on the template, quoted as the lexer reads it', () => {
     expect(findLikeFilter("User {Name} said 'hi'")).toBe("@mt = 'User {Name} said ''hi'''");
+    // The lexer takes a backslash as an escape, so each one is doubled — and a template ending
+    // in one no longer escapes the closing quote.
+    expect(findLikeFilter('Reading C:\\data\\{File}')).toBe("@mt = 'Reading C:\\\\data\\\\{File}'");
+    expect(quoted('ends with \\')).toBe("'ends with \\\\'");
+    expect(findLikeFilter(undefined)).toBe("@mt = ''");
   });
 
   it('excludes these from the current filter, or alone when there is none', () => {

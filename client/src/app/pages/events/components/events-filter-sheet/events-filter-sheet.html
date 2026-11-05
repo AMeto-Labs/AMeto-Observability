@@ -1,7 +1,7 @@
 <app-bottom-sheet label="Log filters" (closed)="close()">
   <div class="bs-head">
     <h2 class="bs-title">Filters</h2>
-    <span class="bs-note">{{ fmtCount(store.totalCount()) }} events loaded</span>
+    <span class="bs-note">{{ store.isAggregation() ? 'Aggregation' : fmtCount(store.totalCount()) + ' events loaded' }}</span>
   </div>
 
   <div class="bs-scroll fs-body">
@@ -30,6 +30,10 @@
       </div>
     </section>
 
+    <!-- An aggregation names its own levels, services and limit (design canvas, "Телефон —
+         агрегация": the Filters button acts on the range alone), so under one the sections below
+         give way to the note the chip strip shows — Apply would have dropped their draft anyway. -->
+    @if (!store.isAggregation()) {
     <!-- ── Levels: toggle chips with the loaded counts ─────────────────────────────────── -->
     <section>
       <div class="bs-label">
@@ -90,6 +94,12 @@
                 aria-label="Full messages" (click)="wrap.set(!wrap())"></button>
       </label>
     </section>
+    } @else {
+    <div class="fs-agg-note">
+      <lucide-icon name="sigma" [size]="12" />
+      <span>Aggregation — levels, services and page size come from the query itself</span>
+    </div>
+    }
   </div>
 
   <div class="bs-foot">
