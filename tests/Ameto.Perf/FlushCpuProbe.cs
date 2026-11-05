@@ -73,14 +73,18 @@ public sealed class FlushCpuProbe
         // RamPressureService forces under memory pressure, and the background gen2 a log merge asks for
         // in its place (StorageEngine.ReleaseMaintenanceMemory, through AggressiveGcGate). The second
         // figure is the time the REQUEST takes — the suspension the caller pays — not the collection,
-        // which runs on the background GC thread while everything else goes on.
+        // which runs on the background GC thread while everything else goes on. Each with the gate's
+        // own arguments for its shape (AggressiveGcGate.ArgumentsOf), so the probe times what the
+        // server asks for even if that changes.
+        var aggressive = AggressiveGcGate.ArgumentsOf(AggressiveGcGate.Shape.Aggressive);
+        var background = AggressiveGcGate.ArgumentsOf(AggressiveGcGate.Shape.Background);
         var swGc = Stopwatch.StartNew();
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.Collect(2, aggressive.Mode, aggressive.Blocking, aggressive.Compacting);
         swGc.Stop();
         _out.WriteLine("");
         _out.WriteLine($"  aggressive blocking compacting gen2 (RamPressureService, under pressure): {swGc.Elapsed.TotalMilliseconds:F0} ms");
         swGc.Restart();
-        GC.Collect(2, GCCollectionMode.Default, blocking: false, compacting: false);
+        GC.Collect(2, background.Mode, background.Blocking, background.Compacting);
         swGc.Stop();
         _out.WriteLine($"  background gen2 asked for after a merge (ReleaseMaintenanceMemory), time to return on the heap the collection above just emptied — the best case: {swGc.Elapsed.TotalMilliseconds:F1} ms");
     }

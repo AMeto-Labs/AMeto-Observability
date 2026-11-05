@@ -697,6 +697,15 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal static long CompactionThresholdBytesFor(long mergeBudgetBytes) => mergeBudgetBytes / 2;
 
     /// <summary>
+    /// Whether a materialising pass (<see cref="SelectCompactionBatch"/>) will never take
+    /// <paramref name="s"/> on its weight: at or past <paramref name="thresholdBytes"/>
+    /// (<see cref="CompactionThresholdBytesFor"/>). One rule, asked by the planner for every segment
+    /// and by <see cref="FlushLevelFor"/> for a flush about to be written, so the two cannot drift apart.
+    /// </summary>
+    internal static bool SettledForMaterialising(SpanSegmentInfo s, long thresholdBytes) =>
+        EstimatedSegmentBytes(s) >= thresholdBytes;
+
+    /// <summary>
     /// The LZ4 level a flush of <paramref name="spanCount"/> spans in <paramref name="traceCount"/>
     /// traces, weighing <paramref name="weightBytes"/> read back (<see cref="ReadBackBytesOf"/>), is
     /// written at. <see cref="SpanWriter.FlushLevel"/> when the compaction planner will take the
@@ -710,23 +719,27 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <see cref="CompactionThresholdBytesFor"/>. Rows are priced as the traces, which is what the
     /// <c>.tracesum</c> the flush writes will hold (a long trace takes two) and what the planner reads
     /// off that sidecar later. On the 512 MB stand (24 MB pass budget) this is what tells a full flush
-    /// of short traces, which settles on its own, from one the hourly merge will fold.
+    /// of short traces, which settles on its own, from one the hourly merge will fold. The rules are
+    /// the planner's own functions (<see cref="SettledForStreaming"/>, <see cref="SettledForMaterialising"/>),
+    /// not a copy of them.
+    ///
+    /// <para>ONE CASE IT CANNOT SEE: a restart before the merge. The weight is not persisted, so after a
+    /// restart the planner prices this segment by its span count and its file
+    /// (<see cref="EstimatedSegmentBytes"/>) rather than by what it weighed — and for spans lighter
+    /// than the ordinary one that price is the heavier. On the stand a full flush of 100-byte-attribute
+    /// spans settles at up to ~5.6 spans a trace by its weight but at up to ~9.5 by its count, so a flush in
+    /// between, written here at the flush level, settles if the process restarts within the hour or
+    /// two before its first merge, and keeps the flush level until retention. Accepted: a restart
+    /// inside that window, on a flush in that band, against paying the merge level on every one.</para>
     /// </summary>
     internal static LZ4Level FlushLevelFor(int spanCount, int traceCount, long weightBytes, long mergeBudgetBytes, bool streaming)
     {
         var asSegment = new SpanSegmentInfo { SpanCount = spanCount, FormatVersion = SpanWriter.DefaultVersion }
             .WithWeight(weightBytes);
-        bool settles;
-        if (streaming)
-        {
-            long available = mergeBudgetBytes - StreamedFixedBytes(mergeBudgetBytes);
-            settles = available <= 0
-                   || StreamedBlockBytes(asSegment) + StreamedStateBytes(asSegment, traceCount) >= available / 2;
-        }
-        else
-        {
-            settles = EstimatedSegmentBytes(asSegment) >= CompactionThresholdBytesFor(mergeBudgetBytes);
-        }
+        bool settles = streaming
+            ? SettledForStreaming(StreamedBlockBytes(asSegment), StreamedStateBytes(asSegment, traceCount),
+                                  StreamedAvailableBytes(mergeBudgetBytes))
+            : SettledForMaterialising(asSegment, CompactionThresholdBytesFor(mergeBudgetBytes));
         return settles ? SpanWriter.MergeLevel : SpanWriter.FlushLevel;
     }
 
@@ -3849,7 +3862,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         long thresholdBytes = CompactionThresholdBytesFor(mergeBudgetBytes);
         var candidates = segments
-            .Where(s => (EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3 || rewrite?.Invoke(s) == true)
+            .Where(s => (!SettledForMaterialising(s, thresholdBytes) || s.FormatVersion < 3 || rewrite?.Invoke(s) == true)
                      && (quarantined is null || !quarantined.Contains(s.FilePath)))
             .OrderBy(s => s.MinStartNano)
             .ToList();
@@ -4410,6 +4423,20 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// <summary>What a streaming pass holds whatever it merges: the writer's buffers and the sidecar windows.</summary>
     internal static long StreamedFixedBytes(long mergeBudgetBytes) => StreamedWriterFixedBytes + mergeBudgetBytes / 8;
 
+    /// <summary>What a streaming pass may spend on its sources' blocks and state: the budget less <see cref="StreamedFixedBytes"/>. At or below zero no pass fits at all.</summary>
+    internal static long StreamedAvailableBytes(long mergeBudgetBytes) => mergeBudgetBytes - StreamedFixedBytes(mergeBudgetBytes);
+
+    /// <summary>
+    /// Whether a segment whose block costs <paramref name="blockBytes"/> and whose output-side state costs
+    /// <paramref name="stateBytes"/> has SETTLED: half or more of what a streaming pass may spend
+    /// (<paramref name="availableBytes"/>, <see cref="StreamedAvailableBytes"/>) on its own, so
+    /// <see cref="SelectStreamingBatch"/> never takes it. Every segment settles when no pass fits. One
+    /// rule, asked by the planner for every segment and by <see cref="FlushLevelFor"/> for a flush
+    /// about to be written, so the two cannot drift apart.
+    /// </summary>
+    internal static bool SettledForStreaming(long blockBytes, long stateBytes, long availableBytes) =>
+        availableBytes <= 0 || blockBytes + stateBytes >= availableBytes / 2;
+
     /// <summary>
     /// One decoded block of <paramref name="s"/> — what reading it costs a streaming merge while the
     /// merge is inside its range. Priced at the segment's own per-span read-back weight
@@ -4450,7 +4477,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     {
         const long MaxSpanNanos = 24L * 3600 * 1_000_000_000;
 
-        long available = mergeBudgetBytes - StreamedFixedBytes(mergeBudgetBytes);
+        long available = StreamedAvailableBytes(mergeBudgetBytes);
         if (available <= 0) return [];
         long ageCutoff = nowNano - Math.Max(0, minAgeNanos);
 
@@ -4462,7 +4489,7 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             if (eligible is not null && !eligible(s)) continue;
             long block = StreamedBlockBytes(s);
             long state = StreamedStateBytes(s, rowsOf?.Invoke(s) ?? s.SpanCount);
-            if (block + state >= available / 2) continue;      // settled: more than half a pass by itself
+            if (SettledForStreaming(block, state, available)) continue;      // settled: more than half a pass by itself
             candidates.Add((s, block, state));
         }
         candidates.Sort(static (a, b) => a.Seg.MinStartNano.CompareTo(b.Seg.MinStartNano));
