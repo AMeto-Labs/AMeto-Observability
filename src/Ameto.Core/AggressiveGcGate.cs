@@ -57,7 +57,7 @@ public static class AggressiveGcGate
     {
         long now = Now();
         if (!TryClaim(ref _lastAggressiveMs, now, minInterval)) return false;
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        Collect(Shape.Aggressive);
         return true;
     }
 
@@ -73,8 +73,9 @@ public static class AggressiveGcGate
     /// runs beside the application. That is the common case, not a guarantee — the runtime decides
     /// the shape, and with <c>GCConserveMemory</c> set and the heap fragmented past its threshold
     /// it may take the chance to compact instead; with concurrent GC off every collection blocks.
-    /// It does not decommit what it frees, so it is not what hands pages back to the OS; that is
-    /// the aggressive shape, under pressure. And the request takes the gate whether or not the
+    /// It does not decommit what it frees, so it is not what hands pages back to the OS; the
+    /// aggressive shape is — RAM pressure's, and a metric rollup's after a pass that rewrote at least
+    /// <see cref="MaintenancePassBytesFloor"/>. And the request takes the gate whether or not the
     /// runtime starts a collection for it (one may already be running), which costs at most one
     /// skipped request an interval later. It replaced the aggressive collection on this path: a
     /// stop-the-world mark and compaction of the whole heap — 40–65 ms on a 20-core box, longer on
@@ -89,11 +90,39 @@ public static class AggressiveGcGate
         long aggressive = Interlocked.Read(ref _lastAggressiveMs);
         if (aggressive != 0 && now - aggressive < (long)minInterval.TotalMilliseconds) return false;
         if (!TryClaim(ref _lastBackgroundMs, now, minInterval)) return false;
-        GC.Collect(2, GCCollectionMode.Default, blocking: false, compacting: false);
+        Collect(Shape.Background);
         return true;
     }
 
     private static long Now() => Math.Max(1, Environment.TickCount64);
+
+    /// <summary>The two collections the gate fronts — what <see cref="_collectForTest"/> is handed.</summary>
+    internal enum Shape { Aggressive, Background }
+
+    /// <summary>
+    /// What each shape asks <see cref="GC.Collect(int, GCCollectionMode, bool, bool)"/> for. Data rather
+    /// than two call sites, so a fact can pin it: the two argument lists swapped would otherwise pass
+    /// every fact about which shape yields to which.
+    /// </summary>
+    internal static (GCCollectionMode Mode, bool Blocking, bool Compacting) ArgumentsOf(Shape shape) => shape switch
+    {
+        Shape.Aggressive => (GCCollectionMode.Aggressive, true,  true),
+        _                => (GCCollectionMode.Default,    false, false),
+    };
+
+    /// <summary>
+    /// Test seam: when set, the gate hands it the shape it would collect and collects nothing, so a fact
+    /// can see which collection a caller asks for without stopping a parallel test run's world for an
+    /// aggressive compaction. Process-wide, like the gate; never assigned in production.
+    /// </summary>
+    internal static Action<Shape>? _collectForTest;
+
+    private static void Collect(Shape shape)
+    {
+        if (_collectForTest is { } seam) { seam(shape); return; }
+        var (mode, blocking, compacting) = ArgumentsOf(shape);
+        GC.Collect(2, mode, blocking, compacting);
+    }
 
     /// <summary>
     /// Claims <paramref name="slot"/> for a collection at <paramref name="now"/> unless one went

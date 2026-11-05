@@ -1191,7 +1191,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                     // dump this used to force (see ReleaseMaintenanceMemory). What it no longer does
                     // is hand the freed pages back to the OS at once: after the last merge of a
                     // backlog the heap stays committed, and on Windows resident, until the GC's own
-                    // policy or RamPressureService under pressure gives it back. RSS on an idle server
+                    // policy or an aggressive collection gives it back — RamPressureService's under
+                    // pressure, or a metric rollup's after a large pass. RSS on an idle server
                     // therefore settles at the merge's high-water mark rather than falling right after
                     // it, which is the price of not stopping the world every two minutes while merges
                     // run.
@@ -1288,14 +1289,18 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// fires the gen2 callbacks the pools trim on (<see cref="PoolTrimPolicy.OnGen2Collection"/>),
     /// with two short suspensions in the common case — the runtime decides the shape, and under
     /// <c>GCConserveMemory</c> with a fragmented heap it may compact instead. It does not decommit
-    /// what it frees: handing pages back to the OS stays <see cref="RamPressureService"/>'s job,
-    /// under pressure only, so an idle server's RSS now settles at the merge's high-water mark
+    /// what it frees: handing pages back to the OS is the aggressive shape's job —
+    /// <see cref="RamPressureService"/>'s under pressure, and the metric rollup's after a pass that
+    /// rewrote enough to matter — so an idle server's RSS now settles at the merge's high-water mark
     /// instead of dropping right after it. Routed through <see cref="AggressiveGcGate"/>, which
-    /// keeps a timestamp per shape: this request yields to a recent pressure collection, and a
-    /// pressure collection never yields to it. Skipping is fine: the next natural gen2 reclaims the
-    /// garbage either way.</para>
+    /// keeps a timestamp per shape: this request yields to a recent aggressive collection, and an
+    /// aggressive collection never yields to it. Skipping is fine: the next natural gen2 reclaims
+    /// the garbage either way.</para>
+    ///
+    /// <para>Internal so a fact can pin which shape a merge asks for (<c>MaintenanceCollectShapeTests</c>):
+    /// back on the aggressive entry point, every fact about the gate itself would stay green.</para>
     /// </summary>
-    private static void ReleaseMaintenanceMemory() =>
+    internal static void ReleaseMaintenanceMemory() =>
         AggressiveGcGate.TryCollectInBackground(TimeSpan.FromMinutes(2));
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────

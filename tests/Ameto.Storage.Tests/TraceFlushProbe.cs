@@ -92,8 +92,8 @@ public sealed class TraceFlushProbe : IDisposable
     // .trc constants only: 415 544 → 423 433 B (v3) and 354 149 → 361 597 B (v4); the three sidecars
     // did not move. The block CONTENT is what it was — only its compression changed — and that is
     // proved twice over: The_flush_changes_nothing_but_the_bloom_index writes at L09_HC explicitly and
-    // still lands on the pre-#86 constants, and Lz4_level_of_the_flush_blocks_measured inflates the
-    // L03_HC sections and re-pickles them at L09_HC to exactly the old on-disk total (402 755 B).
+    // still lands on the pre-#86 constants, and The_flush_blocks_repickled_at_L09_HC_come_to_the_old_on_disk_total
+    // inflates the L03_HC sections and re-pickles them at L09_HC to exactly the old on-disk total (402 755 B).
     //
     // THE TWO .trc CONSTANTS WERE RE-RECORDED FOR #86, DELIBERATELY, AND ONLY THOSE TWO. The bloom
     // index changed format: its values are hashed from a culture-invariant, case-folded text taken
@@ -197,6 +197,25 @@ public sealed class TraceFlushProbe : IDisposable
         string sha = Sha(trc);
         _out.WriteLine($"v{version} with the pre-#86 bloom section: {sha}");
         Assert.Equal(pre86, sha);
+    }
+
+    /// <summary>
+    /// THE RE-BASELINE'S SECOND PROOF, ASSERTED. The flush's blocks moved from L09_HC to
+    /// <see cref="SpanWriter.FlushLevel"/>; what they hold did not. Inflate today's v3 sections — the
+    /// span blocks and the trace-index block, as the flush writes them — and pickle them at L09_HC
+    /// again, and they come to the 402 755 B the L09_HC flush put on disk for this corpus before the
+    /// level moved. A change to what any block holds moves that total; a change of the flush's level
+    /// alone cannot. Re-record it only with the <c>.trc</c> constants above, for the same reason.
+    /// </summary>
+    [Fact]
+    public void The_flush_blocks_repickled_at_L09_HC_come_to_the_old_on_disk_total()
+    {
+        string trc = SpanWriter.Write(NewDir("old-level"), BuildCorpus(), version: 3).FilePath;
+
+        long atL09 = 0;
+        foreach (var raw in ReadCompressedSections(trc, out _)) atL09 += LZ4Pickler.Pickle(raw, LZ4Level.L09_HC).Length;
+
+        Assert.Equal(402_755, atL09);
     }
 
     /// <summary>

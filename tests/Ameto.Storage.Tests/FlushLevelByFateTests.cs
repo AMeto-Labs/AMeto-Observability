@@ -64,24 +64,38 @@ public sealed class FlushLevelByFateTests : IDisposable
     }
 
     [Fact]
-    public void The_decision_is_the_streaming_planners_own_candidate_test()
+    public void The_decision_agrees_with_what_the_streaming_planner_does()
     {
-        // Not a second model of the planner: FlushLevelFor asks the same three functions
-        // SelectStreamingBatch asks, with the same halving, so the two cannot disagree. Checked
-        // across the shapes a stand produces, including ones that sit near the line.
-        long available = StandBudget - TraceStorageEngine.StreamedFixedBytes(StandBudget);
+        // Not the formula a second time: the planner itself, handed the flush and a one-span peer
+        // after it that any pass can take. A flush FlushLevelFor keeps at the flush level is one the
+        // planner merges; one it writes at the merge level, the planner leaves alone. Across the
+        // shapes a stand produces, including ones that sit near the line.
         foreach (int spans in new[] { 500, 4_096, 12_000, 37_631, 50_000 })
         foreach (int perTrace in new[] { 1, 2, 5, 10 })
         {
-            int  traces  = Math.Max(1, spans / perTrace);
-            long weight  = spans * OrdinarySpanBytes;
-            var  seg     = new SpanSegmentInfo { SpanCount = spans }.WithWeight(weight);
-            bool settles = TraceStorageEngine.StreamedBlockBytes(seg)
-                         + TraceStorageEngine.StreamedStateBytes(seg, traces) >= available / 2;
-            Assert.Equal(settles ? SpanWriter.MergeLevel : SpanWriter.FlushLevel,
-                TraceStorageEngine.FlushLevelFor(spans, traces, weight, StandBudget, streaming: true));
+            int  traces = Math.Max(1, spans / perTrace);
+            long weight = spans * OrdinarySpanBytes;
+            var  flush  = Segment("flush", spans, weight, minNano: 0,  maxNano: 1);
+            var  peer   = Segment("peer",  1,     OrdinarySpanBytes, minNano: 10, maxNano: 11);
+            var  batch  = TraceStorageEngine.SelectStreamingBatch([flush, peer], StandBudget, nowNano: 1_000, minAgeNanos: 0,
+                                                                  rowsOf: s => s.FilePath == flush.FilePath ? traces : 1);
+            bool merged = batch.Exists(s => s.FilePath == flush.FilePath);
+
+            Assert.True(merged == (TraceStorageEngine.FlushLevelFor(spans, traces, weight, StandBudget, streaming: true)
+                                   == SpanWriter.FlushLevel),
+                $"{spans} spans in {traces} traces: the planner {(merged ? "merges" : "leaves")} it, FlushLevelFor disagrees");
         }
     }
+
+    private static SpanSegmentInfo Segment(string name, int spans, long weight, long minNano, long maxNano) => new SpanSegmentInfo
+    {
+        FilePath      = name + ".trc",
+        MinStartNano  = minNano,
+        MaxStartNano  = maxNano,
+        SpanCount     = spans,
+        Services      = ["ledger"],
+        FormatVersion = SpanWriter.DefaultVersion,
+    }.WithWeight(weight);
 
     [Fact]
     public void A_budget_too_small_for_any_streaming_pass_settles_every_flush()

@@ -9,12 +9,23 @@ namespace Ameto.Core.Tests;
 /// request yields only to an aggressive one — a merge's sweep must never cost the pressure path
 /// its compaction. Intervals here are an hour or more, and "just inside" means ten seconds short
 /// of it, so no tick of <c>Environment.TickCount64</c> can move a test over the line.
+///
+/// <para>NOTHING HERE COLLECTS FOR REAL. The gate's test seam records the shape it would have
+/// collected: this assembly runs its classes in parallel, and an aggressive compaction would stop
+/// every one of them — and the recording is what lets each fact say WHICH collection went through,
+/// not only that one did.</para>
 /// </summary>
-public sealed class AggressiveGcGateTests
+public sealed class AggressiveGcGateTests : IDisposable
 {
     private static readonly TimeSpan Interval  = TimeSpan.FromHours(1);
     private static readonly TimeSpan Inside    = Interval - TimeSpan.FromSeconds(10);
     private static readonly TimeSpan WellPast  = Interval + TimeSpan.FromSeconds(10);
+
+    private readonly List<AggressiveGcGate.Shape> _collected = [];
+
+    public AggressiveGcGateTests() => AggressiveGcGate._collectForTest = _collected.Add;
+
+    public void Dispose() => AggressiveGcGate._collectForTest = null;
 
     [Fact]
     public void A_background_request_is_let_through_once_per_interval()
@@ -23,6 +34,7 @@ public sealed class AggressiveGcGateTests
 
         Assert.True(AggressiveGcGate.TryCollectInBackground(Interval));
         Assert.False(AggressiveGcGate.TryCollectInBackground(Interval));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Background }, _collected);
     }
 
     [Fact]
@@ -34,6 +46,7 @@ public sealed class AggressiveGcGateTests
         AggressiveGcGate.SetForTest(aggressiveAgo: null, backgroundAgo: TimeSpan.FromSeconds(1));
 
         Assert.True(AggressiveGcGate.TryCollect(Interval));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Aggressive }, _collected);
     }
 
     [Fact]
@@ -44,6 +57,7 @@ public sealed class AggressiveGcGateTests
 
         AggressiveGcGate.SetForTest(aggressiveAgo: WellPast, backgroundAgo: null);
         Assert.True(AggressiveGcGate.TryCollectInBackground(Interval));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Background }, _collected);
     }
 
     [Fact]
@@ -54,6 +68,7 @@ public sealed class AggressiveGcGateTests
 
         AggressiveGcGate.SetForTest(aggressiveAgo: null, backgroundAgo: WellPast);
         Assert.True(AggressiveGcGate.TryCollectInBackground(Interval));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Background }, _collected);
     }
 
     [Fact]
@@ -61,6 +76,7 @@ public sealed class AggressiveGcGateTests
     {
         AggressiveGcGate.SetForTest(aggressiveAgo: Inside, backgroundAgo: WellPast);
         Assert.False(AggressiveGcGate.TryCollect(Interval));
+        Assert.Empty(_collected);
     }
 
     [Fact]
@@ -73,6 +89,7 @@ public sealed class AggressiveGcGateTests
 
         Assert.True(AggressiveGcGate.TryCollectInBackground(Interval));
         Assert.True(AggressiveGcGate.TryCollect(Interval));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Background, AggressiveGcGate.Shape.Aggressive }, _collected);
     }
 
     [Fact]
@@ -82,5 +99,17 @@ public sealed class AggressiveGcGateTests
 
         Assert.True(AggressiveGcGate.TryCollectInBackground(TimeSpan.Zero));
         Assert.True(AggressiveGcGate.TryCollectInBackground(TimeSpan.Zero));
+        Assert.Equal(new[] { AggressiveGcGate.Shape.Background, AggressiveGcGate.Shape.Background }, _collected);
+    }
+
+    [Fact]
+    public void Each_shape_asks_the_runtime_for_what_its_name_says()
+    {
+        // The arguments themselves, which no fact above can see through the seam: swapped, the
+        // merge loop would stop the world every two minutes again and the pressure path would sweep.
+        Assert.Equal((GCCollectionMode.Aggressive, true, true),
+                     AggressiveGcGate.ArgumentsOf(AggressiveGcGate.Shape.Aggressive));
+        Assert.Equal((GCCollectionMode.Default, false, false),
+                     AggressiveGcGate.ArgumentsOf(AggressiveGcGate.Shape.Background));
     }
 }
