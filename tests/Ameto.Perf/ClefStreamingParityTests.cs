@@ -18,7 +18,7 @@ public sealed class ClefStreamingParityTests
     // ── Capturing sink ───────────────────────────────────────────────────────
 
     private sealed record Captured(
-        long TsTicks, byte Level, string Template, ExceptionInfo? Exception,
+        long TsTicks, byte Level, string Template, byte[] Exception,
         byte[] Props, ulong TraceHi, ulong TraceLo, ulong SpanId, string Service);
 
     private sealed class CaptureSink : LogEventSerializer.IClefBatchSink
@@ -26,14 +26,14 @@ public sealed class ClefStreamingParityTests
         public readonly List<Captured> Events = [];
 
         public bool TryIngestClef(
-            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8)
         {
             Events.Add(new Captured(
                 tsTicks, level,
                 System.Text.Encoding.UTF8.GetString(templateUtf8),
-                exception,
+                exceptionMsgpack.ToArray(),
                 msgpackProps.ToArray(),
                 traceHi, traceLo, spanId,
                 System.Text.Encoding.UTF8.GetString(serviceUtf8)));
@@ -225,7 +225,10 @@ public sealed class ClefStreamingParityTests
             Assert.True(ev.RawProperties.Span.SequenceEqual(c.Props),
                 $"{why}: property bytes differ\n  old={Convert.ToHexString(ev.RawProperties.Span)}\n  new={Convert.ToHexString(c.Props)}");
 
-            AssertSameException(ev.Exception, c.Exception, why);
+            // The bytes the batch copies — what reaches the tier, the WAL and the segment — and the tree they decode to.
+            Assert.True(ev.RawException.Span.SequenceEqual(c.Exception),
+                $"{why}: exception bytes differ\n  old={Convert.ToHexString(ev.RawException.Span)}\n  new={Convert.ToHexString(c.Exception)}");
+            AssertSameException(ev.Exception, ExceptionInfo.FromBytes(c.Exception), why);
         }
 
         // Properties is never materialised on the ingest path — RawProperties is the truth,
@@ -327,7 +330,7 @@ public sealed class ClefStreamingParityTests
     {
         private int _n;
         public bool TryIngestClef(
-            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8)
             => ++_n == 3 ? throw new InvalidOperationException("sink fault") : true;
@@ -337,7 +340,7 @@ public sealed class ClefStreamingParityTests
     {
         private int _n;
         public bool TryIngestClef(
-            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8) => (_n++ % 2) == 0;
     }

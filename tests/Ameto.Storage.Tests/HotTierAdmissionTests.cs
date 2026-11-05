@@ -97,6 +97,55 @@ public sealed class HotTierAdmissionTests
     }
 
     /// <summary>
+    /// The exception's bytes: counted against the payload limit with the properties, never against
+    /// the chunk's payload area, and refused past a block — every answer equal to a tier's, with the
+    /// limit met by exceptions alone and by the two together.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void It_answers_every_event_with_an_exception_exactly_as_a_tier_does(int seed)
+    {
+        long maxPayload = 2 * HotTierSegment.ChunkPayloadBytes + 123;
+        int  maxEvents  = HotTierSegment.EventCapacityFor(maxPayload);
+        using var tier  = new HotTierSegment(maxEvents, maxPayload);
+        var admission   = new HotTierAdmission(maxEvents, maxPayload);
+
+        var rng     = new Random(seed);
+        var payload = new byte[HotTierSegment.ExceptionBlockBytes + 64];
+        int withException = 0, refused = 0, overBlock = 0;
+        for (int i = 0; i < 40_000; i++)
+        {
+            int len = rng.Next(0, 600);
+            int exc = rng.Next(100) switch
+            {
+                0    => HotTierSegment.ExceptionBlockBytes + rng.Next(1, 64),   // longer than a block: never admitted
+                < 3  => rng.Next(256 * 1024, 3 * 1024 * 1024),
+                < 40 => rng.Next(100, 6 * 1024),
+                _    => 0,
+            };
+            bool byTier      = tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i }, payload.AsSpan(0, len), null, payload.AsSpan(0, exc));
+            bool byAdmission = admission.TryAdmit(len, 0, exc);
+            Assert.True(byTier == byAdmission, $"event {i} of {len} B with a {exc} B exception: tier {byTier}, admission {byAdmission}");
+            if (byTier && exc > 0) withException++;
+            if (!byTier) refused++;
+            if (!byTier && exc > HotTierSegment.ExceptionBlockBytes) overBlock++;
+            if (byTier)
+            {
+                var stored = tier.GetExceptionPayload(tier.Count - 1);
+                Assert.True(stored.SequenceEqual(payload.AsSpan(0, exc)), $"event {i}: the exception read back differs");
+            }
+        }
+
+        Assert.Equal(tier.Count, admission.Count);
+        Assert.Equal(tier.IsFull, admission.PayloadBytes >= maxPayload || admission.Count >= maxEvents);
+        Assert.True(withException > 1_000 && refused > 0 && overBlock > 0, $"setup: {withException} with an exception, {refused} refused, {overBlock} over a block");
+        Assert.True(tier.ExceptionBytes > HotTierSegment.ExceptionBlockBytes, "setup: the arena never grew past one block");
+        Assert.True(tier.AllocatedBytes >= tier.ExceptionBytes, "the exception blocks are not counted in the native bytes");
+    }
+
+    /// <summary>
     /// What a despill and a WAL replay rely on to size their tier from the block rather than from
     /// today's configuration: a sequence a tier of some limits takes whole, a tier of larger limits
     /// takes whole too.

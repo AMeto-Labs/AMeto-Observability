@@ -155,7 +155,7 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
             var exc = n % 17 == 0
                 ? new ExceptionInfo { Type = "System.InvalidOperationException", Message = "boom " + n }
                 : null;
-            Assert.True(_engine.TryWrite(header, Props(n), exception: exc));
+            Assert.True(_engine.TryWrite(header, Props(n), exception: exc?.ToBytes()));
         }
         await _engine.FlushHotTierAsync();
     }

@@ -372,7 +372,7 @@ public sealed class LegacySegmentFormatTests : IDisposable
                 TraceIdHi                = r.TraceHi,
                 TraceIdLo                = r.TraceLo,
                 SpanId                   = r.SpanId,
-            }, r.Props, r.Template, r.Exception));
+            }, r.Props, r.Template, r.Exception?.ToBytes()));
         }
         hot.Freeze();
 

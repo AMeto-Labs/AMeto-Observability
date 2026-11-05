@@ -15,9 +15,9 @@ namespace Ameto.Ingestion;
 /// <see cref="IngestionEndpoint.StageClef"/>); this holds what they stage.</para>
 ///
 /// <para><b>What it holds is counted as it is taken</b> (<see cref="ILogBatchBudget"/>): the arrays
-/// its <see cref="LogWriteBatch"/> grows — charged before they are taken — and the strings and
-/// exceptions the decode creates for it, which a pool with room shares and a full pool makes once
-/// per record. Past the batch's limit (<c>Ingestion.MaxDecodedLogBatchBytes</c>) the decode stops
+/// its <see cref="LogWriteBatch"/> grows — charged before they are taken, an event's exception
+/// bytes among the payloads — and the strings the decode creates for it, which a pool with room
+/// shares and a full pool makes once per record. Past the batch's limit (<c>Ingestion.MaxDecodedLogBatchBytes</c>) the decode stops
 /// with <see cref="LogBatchTooHeavyException"/> — 413, nothing written; past what the batches held
 /// at once may hold (<c>Ingestion.MaxDecodedLogBytesInFlight</c>), with
 /// <see cref="LogBatchBudgetFullException"/> — 503, nothing written. The weight a receiver puts on
@@ -119,7 +119,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         _staged.ClientEvents = _staged.Count;   // the markers go in after them (see LogWriteBatch.ClientEvents)
         if (_markers is not null)
             foreach (var m in _markers)
-                _staged.AddReserved(m.Header, m.Payload.Span, m.Template, exception: null, m.Service);
+                _staged.AddReserved(m.Header, m.Payload.Span, m.Template, exception: default, m.Service);
         _sealed = true;
         return _staged;
     }
@@ -229,9 +229,6 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
     /// <summary>A string the decode made for this batch alone: its size in the heap.</summary>
     internal void ChargeString(string s) => Charge(StringBytes(s));
 
-    /// <summary>An exception tree the decode made for this batch alone (CLEF's <c>@x</c>): its size in the heap.</summary>
-    internal void ChargeException(ExceptionInfo exception) => Charge(HotTierSegment.ManagedBytesOf(exception));
-
     /// <summary>
     /// A string's size in a 64-bit heap, as the hot tier counts it (<see cref="HotTierSegment.ManagedBytesOf(string?)"/>):
     /// one rule, so a batch charges what the tier it is written into counts (the ultra review's LOW: this was a copy).
@@ -298,11 +295,11 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
         long tsTicks,
         byte level,
         ReadOnlySpan<byte> templateUtf8,
-        ExceptionInfo? exception,
+        ReadOnlySpan<byte> exceptionMsgpack,
         ReadOnlySpan<byte> msgpackProps,
         ulong traceHi, ulong traceLo, ulong spanId,
         ReadOnlySpan<byte> serviceUtf8)
-        => Count(_owner.StageClef(this, tsTicks, level, templateUtf8, exception, msgpackProps, traceHi, traceLo, spanId, serviceUtf8));
+        => Count(_owner.StageClef(this, tsTicks, level, templateUtf8, exceptionMsgpack, msgpackProps, traceHi, traceLo, spanId, serviceUtf8));
 
     private bool Count(bool staged)
     {
@@ -312,7 +309,7 @@ public sealed class LogIngestBatch : IOtlpLogSink, LogEventSerializer.IClefBatch
 
     // ── Staging (from the endpoint) ───────────────────────────────────────────
 
-    internal void Add(long tsTicks, byte level, int templateIdx, string? template, ExceptionInfo? exception,
+    internal void Add(long tsTicks, byte level, int templateIdx, string? template, ReadOnlySpan<byte> exception,
                       ReadOnlySpan<byte> payload, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx,
                       string? service = null)
     {

@@ -312,13 +312,13 @@ public sealed class HotTierChunkArrayProbe
     public void ChunkSlotArrays_PerTierFill()
     {
         const int events = HotTierSegment.ChunkEventCapacity * 2 + 1;
-        var ex = new ExceptionInfo { Type = "T" };
+        byte[] exBytes = new ExceptionInfo { Type = "T" }.ToBytes();
         long Round()
         {
             long before = GC.GetAllocatedBytesForCurrentThread();
             using var tier = new HotTierSegment(events + 1, 32L * 1024 * 1024);
             for (int i = 0; i < events; i++)
-                Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i, MessageTemplatePoolIndex = -1 }, ReadOnlySpan<byte>.Empty, "t", ex));
+                Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i, MessageTemplatePoolIndex = -1 }, ReadOnlySpan<byte>.Empty, "t", exBytes));
             return GC.GetAllocatedBytesForCurrentThread() - before;
         }
         Round();

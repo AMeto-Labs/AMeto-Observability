@@ -39,6 +39,70 @@ public sealed class LogEventJsonParityTests
         }
     }
 
+    /// <summary>
+    /// An event read from a segment, the hot tier or an ingest body carries its exception as BYTES
+    /// (<see cref="LogEvent.RawException"/>), and the direct writer goes from them to JSON with no
+    /// tree in between. Same bytes on the wire as the DTO road makes from the decoded tree — for
+    /// the canonical shape and for the shapes a client may send that a decode used to normalise.
+    /// </summary>
+    [Fact]
+    public void Raw_exception_bytes_serialise_as_the_decoded_tree_does()
+    {
+        foreach (byte[] raw in RawExceptionShapes())
+        {
+            LogEvent Build(bool asBytes) => new()
+            {
+                Id              = new EventId(7u, 11u),
+                Timestamp       = new DateTimeOffset(2026, 11, 5, 10, 0, 0, TimeSpan.Zero),
+                Level           = Ameto.Core.LogLevel.Error,
+                MessageTemplate = "failed {Id}",
+                ServiceName     = "Office.API",
+                RawException    = asBytes ? raw : default,
+                Exception       = asBytes ? null : ExceptionInfo.FromBytes(raw.AsMemory()),
+                RawProperties   = FatProps(),
+            };
+            var viaBytes = Build(asBytes: true);
+            Assert.Equal(ViaDto(Build(asBytes: false)), ViaDirect(viaBytes));
+            Assert.False(viaBytes.ExceptionMaterialised, "the direct writer built the tree");
+        }
+    }
+
+    private static IEnumerable<byte[]> RawExceptionShapes()
+    {
+        yield return new ExceptionInfo
+        {
+            Type = "System.InvalidOperationException", Message = "outer \"boom\"\n\ttab", StackTrace = "   at A.B()",
+            Inner = new ExceptionInfo { Type = "System.NullReferenceException", Inner = new ExceptionInfo { Type = "System.Exception" } },
+        }.ToBytes();
+        yield return PackMsgpack((ref MessagePackWriter w) => w.Write("System.Exception: plain text"));
+        yield return PackMsgpack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(4);
+            w.Write("zzz");   w.Write("ignored");
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("msg"); w.Write("inner first"); w.Write("type"); w.Write("I");
+            w.Write("msg");   w.Write("ünïcødé 😀 \"q\"");
+            w.Write("type");  w.WriteNil();
+        });
+        yield return PackMsgpack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2); w.Write("type"); w.Write("L1");
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("L2");
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("L3");
+            w.Write("inner"); w.WriteMapHeader(1); w.Write("type"); w.Write("L4");
+        });
+    }
+
+    private delegate void PackAction(ref MessagePackWriter writer);
+
+    private static byte[] PackMsgpack(PackAction write)
+    {
+        var buf = new ArrayBufferWriter<byte>(128);
+        var w   = new MessagePackWriter(buf);
+        write(ref w);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
     [Fact]
     public void Whole_page_serialises_identically_as_one_array()
     {

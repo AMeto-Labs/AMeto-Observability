@@ -153,7 +153,7 @@ public sealed class SegmentWriterAllocProbe
                 MessageTemplatePoolIndex = tmplIdx,
                 ServiceNamePoolIndex     = svcIdx,
             };
-            Assert.True(hot.TryWrite(h, buf.WrittenSpan, tmpl, exc));
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan, tmpl, exc.ToBytes()));
         }
         hot.Freeze();
         return hot;

@@ -159,7 +159,7 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
                     Level                    = LogLevel.Error,
                     MessageTemplatePoolIndex = tmpl,
                     ServiceNamePoolIndex     = svc,
-                }, Props(n), exception: exc));
+                }, Props(n), exception: exc?.ToBytes()));
             }
             await _engine.FlushHotTierAsync();
         }

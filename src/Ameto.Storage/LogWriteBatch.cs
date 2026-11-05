@@ -58,10 +58,13 @@ public sealed class LogWriteBatch : IDisposable
 {
     private struct Item
     {
-        /// <summary>The event's header; <see cref="LogEventHeader.PropertiesArenaOffset"/> is its offset in <see cref="_payload"/>.</summary>
+        /// <summary>
+        /// The event's header; <see cref="LogEventHeader.PropertiesArenaOffset"/> is its offset in
+        /// <see cref="_payload"/>, where its exception's bytes (<see cref="LogEventHeader.ExceptionByteLength"/>)
+        /// follow its properties.
+        /// </summary>
         public LogEventHeader Header;
         public string?        Template;
-        public ExceptionInfo? Exception;
         /// <summary>The <c>@service</c> of an event whose service has no pool index (the pool was full); null otherwise.</summary>
         public string?        Service;
     }
@@ -123,15 +126,21 @@ public sealed class LogWriteBatch : IDisposable
     /// Stages one event. <paramref name="header"/>'s id and payload offset are ignored — the writer
     /// assigns the one and this batch the other; everything else is kept as given.
     /// </summary>
+    /// <param name="exception">
+    /// The event's <c>@x</c> as its msgpack arrived (see <see cref="ExceptionInfo.Validate"/>), copied
+    /// into the payload array behind the properties: it is payload, charged and bounded as such.
+    /// Empty for none.
+    /// </param>
     /// <param name="service">
     /// The event's <c>@service</c> when it has no pool index (<see cref="LogEventHeader.ServiceNamePoolIndex"/>
     /// -1: the pool was full) — the only copy of the name, kept by the tier and the WAL as a template is.
     /// </param>
-    public void Add(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+    public void Add(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ReadOnlySpan<byte> exception,
                     string? service = null)
     {
+        int bytes = payload.Length + exception.Length;
         if (_count + _tailItems >= _items.Length) GrowItems(_count + _tailItems + 1);
-        if (_payload.Length - _payloadLength - _tailPayload < payload.Length) GrowPayload(payload.Length + _tailPayload);
+        if (_payload.Length - _payloadLength - _tailPayload < bytes) GrowPayload(bytes + _tailPayload);
         Store(header, payload, template, exception, service);
     }
 
@@ -152,17 +161,18 @@ public sealed class LogWriteBatch : IDisposable
     /// Appends an event into the room <see cref="ReserveTail"/> kept: never grows an array, so it
     /// cannot run out of memory. The payload must be no longer than the room reserved for it.
     /// </summary>
-    public void AddReserved(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+    public void AddReserved(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ReadOnlySpan<byte> exception,
                             string? service = null)
     {
-        if (_tailItems == 0 || payload.Length > _tailPayload)
+        int bytes = payload.Length + exception.Length;
+        if (_tailItems == 0 || bytes > _tailPayload)
             throw new InvalidOperationException("an event appended past the room reserved for it");
         _tailItems--;
-        _tailPayload -= payload.Length;
+        _tailPayload -= bytes;
         Store(header, payload, template, exception, service);
     }
 
-    private void Store(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+    private void Store(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ReadOnlySpan<byte> exception,
                        string? service)
     {
         ref var item = ref _items[_count];
@@ -170,13 +180,14 @@ public sealed class LogWriteBatch : IDisposable
         item.Header.Id                    = 0;
         item.Header.PropertiesArenaOffset = _payloadLength;
         item.Header.PropertiesByteLength  = payload.Length;
-        item.Header.HasException          = exception is not null;
+        item.Header.ExceptionByteLength   = exception.Length;
+        item.Header.HasException          = exception.Length > 0;
         item.Template                     = template;
-        item.Exception                    = exception;
         item.Service                      = header.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? service : null;
 
         payload.CopyTo(_payload.AsSpan(_payloadLength));
-        _payloadLength += payload.Length;
+        exception.CopyTo(_payload.AsSpan(_payloadLength + payload.Length));
+        _payloadLength += payload.Length + exception.Length;
         _count++;
     }
 
@@ -190,15 +201,21 @@ public sealed class LogWriteBatch : IDisposable
         return _payload.AsSpan(h.PropertiesArenaOffset, h.PropertiesByteLength);
     }
 
+    /// <summary>The exception bytes of event <paramref name="index"/>, behind its properties; empty for none.</summary>
+    internal ReadOnlySpan<byte> ExceptionAt(int index)
+    {
+        ref readonly var h = ref _items[index].Header;
+        return _payload.AsSpan(h.PropertiesArenaOffset + h.PropertiesByteLength, h.ExceptionByteLength);
+    }
+
     /// <summary>Records the batch's record array has room for: what it holds of them is this times <see cref="ItemBytes"/>.</summary>
     internal int ItemCapacity => _items.Length;
 
     /// <summary>The length of the batch's payload array: what it holds of payloads.</summary>
     internal int PayloadCapacity => _payload.Length;
 
-    internal string?        TemplateAt(int index)  => _items[index].Template;
-    internal ExceptionInfo? ExceptionAt(int index) => _items[index].Exception;
-    internal string?        ServiceAt(int index)   => _items[index].Service;
+    internal string? TemplateAt(int index) => _items[index].Template;
+    internal string? ServiceAt(int index)  => _items[index].Service;
 
     /// <summary>A write begins on this batch: a <see cref="Dispose"/> from now waits for <see cref="EndLease"/>.</summary>
     internal void Lease() => Interlocked.Increment(ref _leases);
@@ -230,8 +247,8 @@ public sealed class LogWriteBatch : IDisposable
         {
             if (_items.Length != 0)
             {
-                // Cleared: the records hold template and exception references, and a pooled array that
-                // kept them would keep an old request's exceptions alive for as long as it sat there.
+                // Cleared: the records hold template and service references, and a pooled array that
+                // kept them would keep an old request's strings alive for as long as it sat there.
                 ArrayPool<Item>.Shared.Return(_items, clearArray: true);
                 _items = [];
             }

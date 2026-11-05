@@ -723,7 +723,7 @@ public sealed class IndexCacheHitProbe : IClassFixture<IndexCacheHitProbe.Corpus
                     break;
             }
             w.Flush();
-            return engine.TryWrite(header, buf.WrittenSpan, exception: exc);
+            return engine.TryWrite(header, buf.WrittenSpan, exception: exc?.ToBytes());
         }
     }
 }

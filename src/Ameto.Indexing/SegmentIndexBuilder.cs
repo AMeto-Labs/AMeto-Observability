@@ -204,9 +204,8 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         }
 
         // Exception (structured). The index is the ONLY consumer that needs anything of it —
-        // type, message and inner type — so this is where the decode belongs. On the merge
-        // path that is a span read that skips the stack trace; the writer copies the same
-        // bytes through untouched.
+        // type, message and inner type — so this is where the decode belongs: a span read that
+        // skips the stack trace; the writer copies the same bytes through untouched.
         IndexException(in ev, offset);
 
         // TraceId / SpanId — 32 / 16 lowercase hex digits, formatted straight into stack scratch.
@@ -250,22 +249,6 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
     private void IndexException(in SegmentEventRef ev, uint offset)
     {
-        if (ev.Exception is { } exception)
-        {
-            // Flush path: the hot tier holds the decoded object.
-            AddExists(offset);
-            if (!string.IsNullOrEmpty(exception.Type))
-            {
-                AddString(offset, "@x.type"u8, exception.Type);
-                if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
-            }
-            if (!string.IsNullOrEmpty(exception.Message) && exception.Message.Length >= 3)
-                _trigram.Add(offset, exception.Message);
-            if (exception.Inner is { Type.Length: > 0 } inner)
-                AddString(offset, "@x.inner.type"u8, inner.Type);
-            return;
-        }
-
         // nil, an empty legacy string and any non-string, non-map value are "no exception" to
         // ExceptionInfo.FromBytes, not a malformed one. TryReadIndexFields answers false for all
         // three as it does for a broken map, so they are told apart here, before the count below
@@ -278,9 +261,10 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             return;
         }
 
-        // Merge path: the raw msgpack. Read only the three fields the index wants, in place —
-        // the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded. That
-        // decode cost an Error-level merge 4 879 B per row for three short strings.
+        // The raw msgpack, on the flush path and the merge path alike (the hot tier keeps the bytes
+        // the client sent, as a segment's column does). Read only the three fields the index wants,
+        // in place — the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded.
+        // That decode cost an Error-level merge 4 879 B per row for three short strings.
         fixed (byte* p = ev.ExceptionPayload)
         {
             _exception.Set(p, ev.ExceptionPayload.Length);
@@ -395,24 +379,6 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     {
         if (_inverted.AddUtf8(offset, "@x.exists"u8, "true"u8) != IndexAddOutcome.Existing) _bloom.Add("@x.exists"u8);
         _bloomPresented++;
-    }
-
-    /// <summary>A header string through the transcoding overload — exception fields on the flush path.</summary>
-    private void AddString(uint offset, ReadOnlySpan<byte> property, string value)
-    {
-        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
-        byte[]? rented = max > 512 ? ArrayPool<byte>.Shared.Rent(max) : null;
-        Span<byte> buf = rented ?? stackalloc byte[512];
-        try
-        {
-            int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
-            if (_inverted.AddUtf8(offset, property, buf[..n]) != IndexAddOutcome.Existing) _bloom.AddUtf8(buf[..n]);
-            _bloomPresented++;
-        }
-        finally
-        {
-            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
-        }
     }
 
     /// <summary>Trigram of a UTF-8 value: byte-wise fold when ASCII, the UTF-16 path otherwise.</summary>

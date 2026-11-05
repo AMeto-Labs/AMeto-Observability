@@ -98,15 +98,36 @@ public sealed class LogBatchHeldMemoryTests : IClassFixture<LogBatchHeldMemoryTe
         Assert.Equal(0, _endpoint.DecodedBytesInFlight);
     }
 
+    /// <summary>
+    /// A CLEF <c>@x</c> used to be decoded into a tree of UTF-16 strings — twice the bytes it came in,
+    /// and this body's thousand three-deep exceptions were ~6 MB of them against a 4 MiB limit, refused
+    /// 413. It is held as its bytes now, behind the event's properties, and this body is ~3 MB of them:
+    /// taken, every event written, and nothing left reserved once the batch is done.
+    /// </summary>
     [Fact]
-    public async Task Clef_events_whose_exceptions_decode_to_trees_of_strings_are_refused_413()
+    public async Task Clef_events_exceptions_cost_their_bytes_and_this_body_is_taken()
     {
         byte[] body = ClefEventsWithExceptions(events: 1_000, stackChars: 1_000);   // ~3 MB of UTF-8 stacks
         long   weight = IngestionEndpoint.WeighClef(body, out _);
         Assert.InRange(weight, Limit / 2, Limit);
         long accepted = _endpoint.AcceptedTotal;
 
-        using var response = await PostClefAsync(body);   // ~6 MB of UTF-16 exception text, besides the payloads
+        using var response = await PostClefAsync(body);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(accepted + 1_000, _endpoint.AcceptedTotal);
+        Assert.Equal(0, _endpoint.DecodedBytesInFlight);
+    }
+
+    /// <summary>The same shape past the limit in bytes alone — stacks four times as long — is still refused, nothing written.</summary>
+    [Fact]
+    public async Task Clef_events_whose_exception_bytes_pass_the_limit_are_refused_413()
+    {
+        byte[] body = ClefEventsWithExceptions(events: 1_000, stackChars: 4_000);   // ~12 MB of UTF-8 stacks
+        Assert.True(body.Length > Limit, $"the body is {body.Length:N0} B");
+        long accepted = _endpoint.AcceptedTotal;
+
+        using var response = await PostClefAsync(body);
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         Assert.Equal(accepted, _endpoint.AcceptedTotal);

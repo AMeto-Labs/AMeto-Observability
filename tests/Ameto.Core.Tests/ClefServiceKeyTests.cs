@@ -196,7 +196,7 @@ public sealed class ClefServiceKeyTests
         public readonly List<(string Service, byte[] Props)> Events = [];
 
         public bool TryIngestClef(
-            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8)
         {

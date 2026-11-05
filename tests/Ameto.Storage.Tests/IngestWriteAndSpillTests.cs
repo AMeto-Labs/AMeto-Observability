@@ -349,7 +349,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
                     {
                         TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Error,
                         MessageTemplatePoolIndex = tmpl, ServiceNamePoolIndex = -1,
-                    }, Props(i), "event {n}", trace);
+                    }, Props(i), "event {n}", trace.ToBytes());
                 Assert.Equal(new LogBatchWriteResult(Heavy, 0, 0), await engine.WriteBatchAsync(heavy, HangGuard));
             }
 
@@ -3974,7 +3974,9 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// its commit. 41 requests of a distinct 4 M-character template ran a 384 MiB heap out while the tier's
     /// native memory sat at 9 MiB; a CLEF exception did the same with no pool involved. The tier counts that
     /// text against its size now, and a full one is swapped like any other: 600 events of 40 KB of text
-    /// each (24 MB) go into at least three 8 MB tiers — one used to take them all.
+    /// each (24 MB) go into at least three 8 MB tiers — one used to take them all. An exception is bytes
+    /// now, in the tier's exception arena, counted against the same limit as the properties: 40 KB of them
+    /// an event, the same 24 MB, the same three tiers.
     /// </summary>
     [Theory]
     [InlineData("template")]
@@ -3982,13 +3984,14 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     public async Task A_tier_counts_the_text_its_events_carry_of_their_own_and_is_swapped_when_that_reaches_its_size(string carried)
     {
         const int Events = 600, Chars = 20_000;
+        int chars  = carried == "exception" ? 2 * Chars : Chars;   // a UTF-16 string is two bytes a char; an exception's msgpack one
         var engine = Engine(Options(NewDir(), tierBytes: 8 * MB));
         try
         {
             int tmpl = engine.TemplatePool.Intern("event {n}");
             for (int i = 0; i < Events; i++)
             {
-                string own = new string((char)('a' + i % 26), Chars) + i;   // a fresh string of the event's own, as past the budget
+                string own = new string((char)('a' + i % 26), chars) + i;   // a fresh string of the event's own, as past the budget
                 using var batch = new LogWriteBatch();
                 if (carried == "template")
                     batch.Add(new LogEventHeader
@@ -4001,14 +4004,14 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
                     {
                         TimestampUtcTicks = T0 + i * TimeSpan.TicksPerMillisecond, Level = LogLevel.Information,
                         MessageTemplatePoolIndex = tmpl, ServiceNamePoolIndex = -1,
-                    }, Props(i), "event {n}", new ExceptionInfo { Type = "E", Message = "m", StackTrace = own });
+                    }, Props(i), "event {n}", new ExceptionInfo { Type = "E", Message = "m", StackTrace = own }.ToBytes());
                 Assert.Equal(1, (await engine.WriteBatchAsync(batch, HangGuard)).Written);
             }
             // A tier of text that found the frozen ones at their share of it spilled, or waited (see the test below).
             await FlushEverythingAsync(engine, ShortGuard);
 
             int tiers = engine.ListSegments().Count;   // one level: one segment a tier or spilled block
-            Assert.True(tiers >= 3, $"{Events} events with {Events * (long)Chars * 2 / MB} MB of their own text went into {tiers} tier(s) of 8 MB");
+            Assert.True(tiers >= 3, $"{Events} events with {Events * (long)Chars * 2 / MB} MB of their own went into {tiers} tier(s) of 8 MB");
             Assert.Equal(Events, ReadAll(engine).Count);
         }
         finally { await engine.DisposeAsync(); }
@@ -6671,7 +6674,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         for (int i = 0; i < 3; i++)
             wal.Append(T0 + i * TimeSpan.TicksPerMillisecond, i == 1 ? LogLevel.Error : LogLevel.Information,
                        i == 1 ? 41 : 40, i == 1 ? "failed {n}" : "event {n}", Props(i),
-                       exception: i == 1 ? WalkedException : null, serviceIndex: 42, service: "spill.svc",
+                       exception: (i == 1 ? WalkedException : null)?.ToBytes(), serviceIndex: 42, service: "spill.svc",
                        traceIdHi: 0xA000_0000_0000_0000UL | (uint)i, traceIdLo: (ulong)i * 7 + 1, spanId: (ulong)i * 13 + 1);
     }
 
@@ -7275,7 +7278,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         string wal    = Path.Combine(walDir, $"{opts.NodeId.Value}-9000.wal");
         string marker = Path.Combine(walDir, $"{opts.NodeId.Value}-9000.flushed");
         using (var log = WriteAheadLog.Open(wal, opts.NodeId, new SegmentId(9_000), 1 << 20))
-            log.Append(T0, LogLevel.Error, 41, "failed {n}", Props(0), exception: WalkedException);
+            log.Append(T0, LogLevel.Error, 41, "failed {n}", Props(0), exception: WalkedException.ToBytes());
         File.WriteAllText(marker, "");
 
         int decodes = 0;

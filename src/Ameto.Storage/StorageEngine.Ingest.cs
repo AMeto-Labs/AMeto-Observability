@@ -84,8 +84,8 @@ public sealed partial class StorageEngine
     /// been asked for), the write path is closed, or no tier can hold an event that large. A throw
     /// (out of memory in the tier) also means nothing was written.
     /// </summary>
-    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null,
-                         string? service = null)
+    public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null,
+                         ReadOnlySpan<byte> exception = default, string? service = null)
     {
         lock (_writerLock) return WriteLocked(header, propertiesPayload, template, exception, service) == WriteOutcome.Written;
     }
@@ -381,16 +381,17 @@ public sealed partial class StorageEngine
     /// <summary>
     /// What an event brings that no other event shares, which a tier — and a spilled block, for the tier
     /// its despill makes — counts against its size (round-5 H-D): a template or a service the intern pool
-    /// did not take (past its budget, or longer than it takes), and an exception. A pooled one is the
-    /// pool's instance, shared by every event of it, and so is the empty string. Allocates nothing.
+    /// did not take (past its budget, or longer than it takes). A pooled one is the pool's instance, shared
+    /// by every event of it, and so is the empty string. (The exception used to count here as a tree of
+    /// strings; it is bytes in the tier's exception arena now, counted as payload.)
+    /// Allocates nothing.
     /// </summary>
-    private static long OwnManagedBytes(in LogEventHeader h, string? template, ExceptionInfo? exception, string? service) =>
+    private static long OwnManagedBytes(in LogEventHeader h, string? template, string? service) =>
         (h.MessageTemplatePoolIndex < 0 && !string.IsNullOrEmpty(template) ? HotTierSegment.ManagedBytesOf(template) : 0)
-        + (h.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? HotTierSegment.ManagedBytesOf(service) : 0)
-        + HotTierSegment.ManagedBytesOf(exception);
+        + (h.ServiceNamePoolIndex < 0 && !string.IsNullOrEmpty(service) ? HotTierSegment.ManagedBytesOf(service) : 0);
 
     /// <summary>The body of every write; the caller holds <see cref="_writerLock"/>.</summary>
-    private WriteOutcome WriteLocked(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ExceptionInfo? exception,
+    private WriteOutcome WriteLocked(in LogEventHeader header, ReadOnlySpan<byte> payload, string? template, ReadOnlySpan<byte> exception,
                                      string? service = null)
     {
         // Shut by DisposeAsync. Refused like a full tier — the caller keeps the event — and before
@@ -402,8 +403,9 @@ public sealed partial class StorageEngine
 
         _afterWriteGate?.Invoke();
 
-        // Never admitted by any tier, empty or not: waiting for room would wait for ever.
-        if (payload.Length > HotTierSegment.ChunkPayloadBytes)
+        // Never admitted by any tier, empty or not: waiting for room would wait for ever. The properties
+        // must fit a chunk's payload area, the exception a block of the exception arena.
+        if (payload.Length > HotTierSegment.ChunkPayloadBytes || exception.Length > HotTierSegment.ExceptionBlockBytes)
             return WriteOutcome.TooLarge;
 
         // ONE capture: tier, WAL and spill target are used from the same state, so the event can
@@ -430,7 +432,7 @@ public sealed partial class StorageEngine
         var h = header;
         h.Id  = _idGen.Next(header.TimestampUtcTicks);
 
-        if (!w.Hot.TryWrite(h, payload, template, exception, service, OwnManagedBytes(h, template, exception, service)))
+        if (!w.Hot.TryWrite(h, payload, template, exception, service, OwnManagedBytes(h, template, service)))
         {
             // Full (or wedged on a chunk an event does not fit): ask for a swap — or, with no flush
             // slot free, for a spill — and tell the caller to wait. The flag is what lets the swap

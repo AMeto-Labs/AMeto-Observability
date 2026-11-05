@@ -59,10 +59,7 @@ public sealed class LogBatchChargeTests : IAsyncLifetime
                 held += LogIngestBatch.StringBytes(t);
             if (staged.ServiceAt(i) is { } s && seen.Add(s))
                 held += LogIngestBatch.StringBytes(s);
-            for (var e = staged.ExceptionAt(i); e is not null; e = e.Inner)
-                if (seen.Add(e))
-                    held += 48 + LogIngestBatch.StringBytes(e.Type) + LogIngestBatch.StringBytes(e.Message)
-                               + LogIngestBatch.StringBytes(e.StackTrace);
+            // An exception is bytes in the payload array — counted with its capacity above.
         }
         return held;
     }
@@ -111,8 +108,13 @@ public sealed class LogBatchChargeTests : IAsyncLifetime
         Assert.Equal(2_500, batch.StagedEvents);
     }
 
+    /// <summary>
+    /// A CLEF <c>@x</c> is held as the bytes it arrived in — in the batch's payload array, behind the
+    /// event's properties — and counted as such: a thousand three-deep exceptions with a 1 000-byte
+    /// stack at each level are ~3 MB of payload, not the ~6 MB of UTF-16 trees they used to decode to.
+    /// </summary>
     [Fact]
-    public void A_clef_events_exception_tree_is_counted()
+    public void A_clef_events_exception_is_counted_as_its_bytes()
     {
         var    endpoint = Endpoint(limit: 64L * 1024 * 1024);
         byte[] body     = LogBatchHeldMemoryTests.ClefEventsWithExceptions(events: 1_000, stackChars: 1_000);
@@ -121,7 +123,11 @@ public sealed class LogBatchChargeTests : IAsyncLifetime
 
         LogEventSerializer.StreamBatch(body, batch, ref progress);
 
-        AssertCountsWhatItHolds(batch, atLeast: 1_000L * 3 * 2 * 1_000);
+        Assert.Equal(1_000, batch.StagedEvents);
+        Assert.True(batch.Staged.PayloadBytes >= 1_000L * 3 * 1_000, $"the exceptions' bytes are not in the payload: {batch.Staged.PayloadBytes:N0} B");
+        Assert.True(batch.Staged.ExceptionAt(0).Length >= 3 * 1_000, "the first event's exception is not behind its properties");
+        AssertCountsWhatItHolds(batch, atLeast: 1_000L * 3 * 1_000);
+        Assert.True(batch.ChargedBytes < 1_000L * 3 * 2 * 1_000, $"counted {batch.ChargedBytes:N0} B: the trees, not the bytes");
     }
 
     /// <summary>

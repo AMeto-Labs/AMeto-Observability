@@ -935,7 +935,7 @@ public sealed class IngestionEndpoint
         if (tmplIdx < 0 && tmpl is not null) batch.ChargeString(tmpl);
         if (service is not null)             batch.ChargeString(service);
 
-        batch.Add(tsTicks, level, tmplIdx, tmpl, exception: null, msgpackProps, traceHi, traceLo, spanId, serviceIdx, service);
+        batch.Add(tsTicks, level, tmplIdx, tmpl, exception: default, msgpackProps, traceHi, traceLo, spanId, serviceIdx, service);
         return true;
     }
 
@@ -1026,7 +1026,7 @@ public sealed class IngestionEndpoint
         long tsTicks,
         byte level,
         ReadOnlySpan<byte> templateUtf8,
-        ExceptionInfo? exception,
+        ReadOnlySpan<byte> exception,
         ReadOnlySpan<byte> msgpackProps,
         ulong traceHi, ulong traceLo, ulong spanId,
         ReadOnlySpan<byte> serviceUtf8)
@@ -1056,10 +1056,10 @@ public sealed class IngestionEndpoint
         int     svcIdx   = _pool.Intern(serviceUtf8, out string svcText, ref batch.Share);   // -1 when empty
         string? service  = svcIdx < 0 && svcText.Length != 0 ? svcText : null;   // see StageRaw: kept past saturation
 
-        // Charged as in StageRaw — and the event's @x, decoded into a tree of strings for it alone.
+        // Charged as in StageRaw. The event's @x is bytes in the batch's payload array — charged as
+        // that array grows, like the properties — not a tree of strings decoded for it alone.
         if (tmplIdx < 0 && tmpl is not null) batch.ChargeString(tmpl);
         if (service is not null)             batch.ChargeString(service);
-        if (exception is not null)           batch.ChargeException(exception);
 
         batch.Add(tsTicks, level, tmplIdx, tmpl, exception, msgpackProps, traceHi, traceLo, spanId, svcIdx, service);
         return true;

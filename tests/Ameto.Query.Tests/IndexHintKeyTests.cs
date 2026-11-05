@@ -499,7 +499,7 @@ public sealed class IndexHintKeyTests : IDisposable
             TraceIdLo                = trace ? TraceLo : 0,
             SpanId                   = trace ? Span    : 0,
         };
-        Assert.True(_hot.TryWrite(header, props, template, exception));
+        Assert.True(_hot.TryWrite(header, props, template, exception?.ToBytes()));
     }
 
     /// <summary>Msgpack map of the given (key, value) pairs — the payload shape ingest writes.</summary>

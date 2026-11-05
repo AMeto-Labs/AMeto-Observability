@@ -568,7 +568,7 @@ public sealed class MergeCompressionProbe : IDisposable
                 SpanId                   = (ulong)rng.NextInt64(),
             };
             var exc = (i % 20) == 0 ? Exception(i) : null;
-            if (!hot.TryWrite(h, buf.WrittenSpan, null, exc)) break;
+            if (!hot.TryWrite(h, buf.WrittenSpan, null, exc?.ToBytes())) break;
         }
         hot.Freeze();
 

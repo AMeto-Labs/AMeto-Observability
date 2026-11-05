@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace Ameto.Indexing;
+namespace Ameto.Core;
 
 /// <summary>
 /// A <see cref="MemoryManager{T}"/> over a raw pointer, re-pointed per event, so a
@@ -13,7 +13,7 @@ namespace Ameto.Indexing;
 /// clears it before leaving, so the memory is pinned for exactly the walk; nothing keeps the
 /// <see cref="Memory{T}"/> beyond it.</para>
 /// </summary>
-internal sealed unsafe class PinnedSpanMemoryManager : MemoryManager<byte>
+public sealed unsafe class PinnedSpanMemoryManager : MemoryManager<byte>
 {
     private byte* _ptr;
     private int   _len;

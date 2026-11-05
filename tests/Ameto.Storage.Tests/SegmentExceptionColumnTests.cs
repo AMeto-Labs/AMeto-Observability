@@ -6,16 +6,19 @@ using Xunit;
 namespace Ameto.Storage.Tests;
 
 /// <summary>
-/// The exception column is the one column the writer has to SERIALISE rather than copy: the hot
-/// tier holds an exception as an object graph, the segment stores it as msgpack. The writer does
-/// that straight into the column's scratch through an <c>IBufferWriter</c> now, where it used to
-/// call <c>ExceptionInfo.ToBytes()</c> and copy the array in.
+/// The exception column is copied, not serialised: the hot tier holds an exception as the msgpack
+/// it arrived in (behind the event's properties, in its arena), and the writer copies those bytes
+/// into the column as it copies every other column. It used to serialise the tier's object graph
+/// here — straight into the column's scratch through an <c>IBufferWriter</c>, and before that
+/// through <c>ExceptionInfo.ToBytes()</c> and a copy.
 ///
 /// <para>Same bytes, or the format moved: these tests compare the column against
 /// <c>ToBytes()</c> — the definition the pre-streaming writer, the WAL and every other producer
-/// of this blob share — for a single exception, for a chain of inner exceptions, for one with no
-/// message and no stack, and for a tier that mixes exception-carrying rows with plain ones, where
-/// the column's offsets are what say which is which.</para>
+/// of this blob shared, and the shape every client that sends a structured <c>@x</c> sends — for a
+/// single exception, for a chain of inner exceptions, for one with no message and no stack, and
+/// for a tier that mixes exception-carrying rows with plain ones, where the column's offsets are
+/// what say which is which. And, since the column now holds what the client sent, for the shapes
+/// the old decode used to normalise away.</para>
 /// </summary>
 public sealed class SegmentExceptionColumnTests
 {
@@ -71,7 +74,7 @@ public sealed class SegmentExceptionColumnTests
                 MessageTemplatePoolIndex = tmplIdx,
                 ServiceNamePoolIndex     = svcIdx,
             };
-            Assert.True(hot.TryWrite(h, Props(i), tmpl, Sample(i)));
+            Assert.True(hot.TryWrite(h, Props(i), tmpl, Sample(i)?.ToBytes()));
         }
         hot.Freeze();
         return hot;
@@ -130,6 +133,90 @@ public sealed class SegmentExceptionColumnTests
             }
         }
         finally { File.Delete(path); }
+    }
+
+    /// <summary>
+    /// The column holds the client's bytes whatever their shape — a legacy plain string, a map with
+    /// its keys in the client's order and unknown ones among them, a chain deeper than the decoder
+    /// reads — unchanged through the flush, and a row read back carries them as
+    /// <see cref="LogEvent.RawException"/>, decoding to what the decoder makes of them.
+    /// </summary>
+    [Fact]
+    public void ExceptionColumn_KeepsTheClientsBytesWhateverTheirShape()
+    {
+        byte[][] shapes =
+        [
+            Pack((ref MessagePackWriter w) => w.Write("System.Exception: plain text")),
+            Pack((ref MessagePackWriter w) =>
+            {
+                w.WriteMapHeader(4);
+                w.Write("zzz");   w.Write("ignored");
+                w.Write("inner"); w.WriteMapHeader(2); w.Write("msg"); w.Write("inner first"); w.Write("type"); w.Write("I");
+                w.Write("msg");   w.Write("only a message");
+                w.Write("type");  w.Write("Some.Type");
+            }),
+            Pack((ref MessagePackWriter w) =>
+            {
+                w.WriteMapHeader(2); w.Write("type"); w.Write("L1");
+                w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("L2");
+                w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("L3");
+                w.Write("inner"); w.WriteMapHeader(1); w.Write("type"); w.Write("L4");
+            }),
+            [],   // a row without one, between the others
+        ];
+        string path = Path.Combine(Path.GetTempPath(), $"Ameto-exccol-{Guid.NewGuid():N}.seg");
+        try
+        {
+            var pool = new StringInternPool();
+            using (var hot = new HotTierSegment(16, 1 << 20))
+            using (var w = new SegmentWriter(path))
+            {
+                int tmplIdx = pool.Intern("request {n} failed");
+                for (int i = 0; i < shapes.Length; i++)
+                    Assert.True(hot.TryWrite(new LogEventHeader
+                    {
+                        Id = new EventId(0u, (uint)i).RawValue, TimestampUtcTicks = 1_000 + i, Level = LogLevel.Error,
+                        MessageTemplatePoolIndex = tmplIdx, ServiceNamePoolIndex = -1,
+                    }, Props(i), pool.Get(tmplIdx), shapes[i]));
+                hot.Freeze();
+                for (int i = 0; i < shapes.Length; i++)
+                    Assert.True(hot.GetExceptionPayload(i).SequenceEqual(shapes[i]));
+                w.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot));
+                w.Finalise(new NodeId(3), new SegmentId(9UL));
+            }
+
+            using (var src = MergingSegmentEventSource.Open([path]))
+            {
+                int i = 0;
+                while (src.TryReadNext(out var ev))
+                    Assert.True(ev.ExceptionPayload.SequenceEqual(shapes[i++]), $"row {i - 1}");
+                Assert.Equal(shapes.Length, i);
+            }
+
+            var read = ReadBack(path);
+            Assert.Equal(shapes.Length, read.Count);
+            for (int i = 0; i < shapes.Length; i++)
+            {
+                Assert.True(read[i].RawException.Span.SequenceEqual(shapes[i]), $"row {i}");
+                Assert.Equal(ExceptionInfo.FromBytes(shapes[i].AsMemory())?.Type, read[i].Exception?.Type);
+            }
+            Assert.Equal("Exception", read[0].Exception?.Type);
+            Assert.Equal("I",         read[1].Exception?.Inner?.Type);
+            Assert.Null(read[2].Exception?.Inner?.Inner?.Inner);
+            Assert.Null(read[3].Exception);
+        }
+        finally { File.Delete(path); }
+    }
+
+    private delegate void PackAction(ref MessagePackWriter writer);
+
+    private static byte[] Pack(PackAction write)
+    {
+        var buf = new ArrayBufferWriter<byte>(64);
+        var w   = new MessagePackWriter(buf);
+        write(ref w);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
     }
 
     /// <summary>

@@ -307,9 +307,9 @@ public sealed class SegmentInvertedBuildParityTests
                 Level = (LogLevel)(i % 6), MessageTemplatePoolIndex = tmplIdx, ServiceNamePoolIndex = svcIdx,
                 TraceIdHi = i % 4 == 0 ? (ulong)rng.NextInt64() : 0, TraceIdLo = i % 4 == 0 ? (ulong)rng.NextInt64() : 0,
                 SpanId = i % 2 == 0 ? (ulong)rng.NextInt64() : 0,
-            }, buf.WrittenSpan, tmpl, i % 9 == 0
+            }, buf.WrittenSpan, tmpl, (i % 9 == 0
                 ? new ExceptionInfo { Type = "System.TimeoutException", Message = "Ожидание истекло", StackTrace = "   at X.Y()", Inner = new ExceptionInfo { Type = "Inner.Ex" } }
-                : null);
+                : null)?.ToBytes());
         }
 
         using var streaming = new SegmentIndexBuilder(events);
