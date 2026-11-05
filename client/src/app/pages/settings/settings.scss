@@ -1,3 +1,5 @@
+@use 'breakpoints' as bp;
+
 :host {
   display: flex;
   flex-direction: column;
@@ -7,7 +9,7 @@
 
 .settings-body {
   display: flex;
-  gap: 16px;
+  gap: var(--section-pad);
   min-height: 0;
   flex: 1;
 }
@@ -17,7 +19,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  width: 168px;
+  width: 160px;
   flex-shrink: 0;
   padding: 4px;
   background: var(--bg-secondary);
@@ -30,13 +32,14 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 5px 10px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: none;
   color: var(--text-secondary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
   text-align: left;
   cursor: pointer;
   transition: all .12s;
@@ -63,6 +66,18 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--section-pad);
   overflow-y: auto;
+}
+
+/* ── Phone: one column, the rail a strip of tabs above the content ── */
+@include bp.below(bp.$bp-sm) {
+  .settings-body { flex-direction: column; }
+  .settings-tabs {
+    flex-direction: row;
+    width: auto;
+    align-self: stretch;
+    overflow-x: auto;
+  }
+  .settings-tab { flex-shrink: 0; }
 }

@@ -1,191 +1,260 @@
-<div class="traces-page">
+<!-- The page is a CSS grid of named areas (traces.scss) rather than a column of rows, because
+     the same elements have to land in three different arrangements: on a desktop the range,
+     Live and Rows controls sit on the title row with the search area under them; on a tablet
+     they drop to a second, horizontally scrolling row; on a phone they move into a bottom sheet
+     together with the search area. Grid areas let one DOM order serve all three, so nothing is
+     rendered twice and every spec selector keeps pointing at the one element it always did. -->
+<div class="traces-page" [class.has-trace]="selectedTraceId()" [class.sheet-open]="filtersOpen()">
 
   <!-- ── Page header ──────────────────────────────────────────────────────── -->
-  <div class="page-hdr">
-    <div class="page-title">
-      <h1>Traces</h1>
-      <span class="page-subtitle">Request flow and distributed tracing</span>
-    </div>
-    <div class="hdr-actions">
-      <div class="preset-group">
-        @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
-          <button class="preset-btn" [class.active]="preset === p"
-                  (click)="setPreset(p)">{{ p }}</button>
-        }
-        <button class="preset-btn" [class.active]="preset === 'custom'"
-                (click)="setPreset('custom')">Custom</button>
-      </div>
-      @if (preset === 'custom') {
-        <div class="custom-range">
-          <input class="custom-dt" type="datetime-local" [(ngModel)]="customFrom" (keyup.enter)="applyCustom()" />
-          <span class="custom-sep">→</span>
-          <input class="custom-dt" type="datetime-local" [(ngModel)]="customTo" (keyup.enter)="applyCustom()" />
-          <button class="btn-apply" (click)="applyCustom()" [disabled]="!customFrom">Apply</button>
-        </div>
+  <div class="page-title">
+    <h1>Traces</h1>
+    <span class="page-subtitle">Request flow and distributed tracing</span>
+  </div>
+
+  <!-- The buttons that stay in the header at every width. The first two exist for the phone
+       only (CSS hides them wider): the range button opens the sheet where the range chips live,
+       and the Live button is the switch half of .live-group, which has moved into the sheet
+       with its cadence menu. Both act on the same signals as the controls they stand in for. -->
+  <div class="hdr-quick">
+    <button type="button" class="range-btn" (click)="openFilters()" title="Time range and filters">
+      {{ presetLabel() }}
+      <lucide-icon name="chevron-down" [size]="12" />
+    </button>
+    <button type="button" class="live-btn" [class.off]="!liveOn()" role="switch"
+            [attr.aria-checked]="liveOn()" [title]="liveTitle()" (click)="toggleLive()">
+      <span class="live-dot"></span>{{ liveOn() ? 'Live' : 'Paused' }}
+    </button>
+    <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
+      <lucide-icon name="history" [size]="14" />
+    </button>
+  </div>
+
+  <!-- Phone only: the one search field that stays on the page, plus the button that opens the
+       sheet with everything else. It binds the SAME fields as the bar inside the sheet, so a
+       word typed here is the word the sheet shows. -->
+  <div class="phone-search">
+    <div class="phone-search-field">
+      <lucide-icon name="search" [size]="13" class="fi-icon" />
+      @if (traceqlMode()) {
+        <input class="fi-input" [(ngModel)]="traceqlInput"
+               placeholder="TraceQL query" spellcheck="false" autocomplete="off"
+               (keyup.enter)="runTraceQLUser()" />
+      } @else {
+        <input class="fi-input" [(ngModel)]="filterName"
+               placeholder="Operation / span name"
+               (keyup.enter)="applyFilters()" />
       }
-      <!-- One signal, two controls: the badge is a switch (pause / resume) and the menu beside
-           it picks the cadence. Its Off entry and the switch's off are the same state — both are
-           liveMs === 0 — so the two can never show different things. -->
-      <div class="live-group" [class.off]="!liveOn()">
-        <button type="button" class="live-toggle" role="switch"
-                [attr.aria-checked]="liveOn()" [title]="liveTitle()" (click)="toggleLive()">
-          <span class="live-dot"></span>{{ liveOn() ? 'Live' : 'Paused' }}
-        </button>
-        <select class="live-select" aria-label="Auto-refresh interval"
-                [title]="liveTitle()"
-                [ngModel]="liveMs()" (ngModelChange)="setLiveMs($event)">
-          @for (o of liveIntervals; track o.ms) {
-            <option [ngValue]="o.ms">{{ o.label }}</option>
-          }
-        </select>
-      </div>
-      <!-- How many rows one stream may deliver. Beside the cadence because the two answer the
-           same question from opposite ends — how often the list is refetched, and how much of
-           it — and a user tuning one almost always wants the other in reach. -->
-      <div class="rows-group">
-        <span class="rows-label">Rows</span>
-        <select class="rows-select" aria-label="Maximum rows to load"
-                title="How many trace rows one search loads before the server stops sending"
-                [ngModel]="streamMax()" (ngModelChange)="setStreamMax($event)">
-          @for (o of rowLimits; track o.rows) {
-            <option [ngValue]="o.rows">{{ o.label }}</option>
-          }
-        </select>
-      </div>
-      <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
-        <lucide-icon name="history" [size]="14" />
-      </button>
     </div>
+    <button type="button" class="filters-btn" [class.active]="activeFilterCount() > 0" (click)="openFilters()">
+      <lucide-icon name="sliders-horizontal" [size]="13" />
+      Filters
+      @if (activeFilterCount() > 0) {
+        <span class="filters-count">· {{ activeFilterCount() }}</span>
+      }
+    </button>
   </div>
 
-  <!-- ── Search / filter area ─────────────────────────────────────────────── -->
-  <div class="search-area">
-
-    <!-- Mode toggle -->
-    <div class="mode-toggle">
-      <button class="mode-btn" [class.active]="!traceqlMode()" (click)="setTraceqlMode(false)">
-        <lucide-icon name="sliders-horizontal" [size]="12" />
-        Filter
-      </button>
-      <button class="mode-btn" [class.active]="traceqlMode()" (click)="setTraceqlMode(true)">
-        <lucide-icon name="terminal" [size]="12" />
-        TraceQL
+  <!-- On a phone this is the bottom sheet; wider it is `display: contents`, so .hdr-actions and
+       .search-area take their own grid areas as if the wrapper were not there. -->
+  <div class="hdr-sheet" [class.open]="filtersOpen()">
+    <div class="sheet-hdr">
+      <span class="sheet-title">Filters</span>
+      <button class="icon-btn" (click)="closeFilters()" title="Close">
+        <lucide-icon name="x" [size]="14" />
       </button>
     </div>
 
-    @if (!traceqlMode()) {
-      <!-- ── Filter bar ───────────────────────────────────────────────────── -->
-      <div class="filter-bar">
-        <div class="filter-search">
-          <lucide-icon name="search" [size]="13" class="fi-icon" />
-          <input class="fi-input" [(ngModel)]="filterName"
-                 placeholder="Operation / span name"
-                 (keyup.enter)="applyFilters()" />
+    <div class="sheet-scroll">
+      <div class="hdr-actions">
+        <div class="preset-group">
+          @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
+            <button class="preset-btn" [class.active]="preset === p"
+                    (click)="setPreset(p)">{{ p }}</button>
+          }
+          <button class="preset-btn" [class.active]="preset === 'custom'"
+                  (click)="setPreset('custom')">Custom</button>
         </div>
-
-        <select class="filter-select" [(ngModel)]="filterService">
-          <option value="">All services</option>
-          @for (sv of serviceOptions(); track sv) { <option [value]="sv">{{ sv }}</option> }
-        </select>
-
-        <select class="filter-select" [(ngModel)]="filterStatus">
-          <option value="">All statuses</option>
-          <option value="Ok">OK</option>
-          <option value="Error">Error</option>
-        </select>
-
-        <div class="dur-wrap">
-          <lucide-icon name="clock" [size]="12" class="fi-icon" />
-          <input class="dur-input" type="number" min="1" [(ngModel)]="filterMinDurationMs" placeholder="Min ms" />
+        @if (preset === 'custom') {
+          <div class="custom-range">
+            <input class="custom-dt" type="datetime-local" [(ngModel)]="customFrom" (keyup.enter)="applyCustom()" />
+            <span class="custom-sep">→</span>
+            <input class="custom-dt" type="datetime-local" [(ngModel)]="customTo" (keyup.enter)="applyCustom()" />
+            <button class="btn-apply" (click)="applyCustom()" [disabled]="!customFrom">Apply</button>
+          </div>
+        }
+        <!-- One signal, two controls: the badge is a switch (pause / resume) and the menu beside
+             it picks the cadence. Its Off entry and the switch's off are the same state — both are
+             liveMs === 0 — so the two can never show different things. -->
+        <div class="live-group" [class.off]="!liveOn()">
+          <button type="button" class="live-toggle" role="switch"
+                  [attr.aria-checked]="liveOn()" [title]="liveTitle()" (click)="toggleLive()">
+            <span class="live-dot"></span>{{ liveOn() ? 'Live' : 'Paused' }}
+          </button>
+          <select class="live-select" aria-label="Auto-refresh interval"
+                  [title]="liveTitle()"
+                  [ngModel]="liveMs()" (ngModelChange)="setLiveMs($event)">
+            @for (o of liveIntervals; track o.ms) {
+              <option [ngValue]="o.ms">{{ o.label }}</option>
+            }
+          </select>
         </div>
-
-        <div class="dur-wrap">
-          <lucide-icon name="clock" [size]="12" class="fi-icon" />
-          <input class="dur-input" type="number" min="1" [(ngModel)]="filterMaxDurationMs" placeholder="Max ms" />
+        <!-- How many rows one stream may deliver. Beside the cadence because the two answer the
+             same question from opposite ends — how often the list is refetched, and how much of
+             it — and a user tuning one almost always wants the other in reach. -->
+        <div class="rows-group">
+          <span class="rows-label">Rows</span>
+          <select class="rows-select" aria-label="Maximum rows to load"
+                  title="How many trace rows one search loads before the server stops sending"
+                  [ngModel]="streamMax()" (ngModelChange)="setStreamMax($event)">
+            @for (o of rowLimits; track o.rows) {
+              <option [ngValue]="o.rows">{{ o.label }}</option>
+            }
+          </select>
         </div>
-
-        <select class="filter-select filter-select--http" [(ngModel)]="filterHttpStatus">
-          <option value="">All HTTP</option>
-          <option value="2xx">2xx</option>
-          <option value="4xx">4xx</option>
-          <option value="5xx">5xx</option>
-          <option value="400">400</option>
-          <option value="401">401</option>
-          <option value="403">403</option>
-          <option value="404">404</option>
-          <option value="500">500</option>
-          <option value="502">502</option>
-          <option value="503">503</option>
-        </select>
-
-        <button class="btn-apply" (click)="applyFilters()">Apply</button>
-        <button class="btn-clear" (click)="clearFilters()">
-          Clear
-        </button>
       </div>
 
-    } @else {
-      <!-- ── TraceQL search bar ─────────────────────────────────────────── -->
-      <div class="traceql-bar">
-        <div class="tql-wrap" [class.has-error]="traceqlError()">
-          <lucide-icon name="braces" [size]="13" class="tql-icon" />
-          <input class="tql-input"
-                 [(ngModel)]="traceqlInput"
-                 [appSuggestInput]="traceqlSuggestions"
-                 (suggestSubmit)="runTraceQLUser()"
-                 placeholder='{ .http.status_code = 500 && duration > 500ms }'
-                 spellcheck="false"
-                 autocomplete="off" />
-          @if (traceqlInput) {
-            <button class="tql-clear" (click)="clearTraceql()" title="Clear">
-              <lucide-icon name="x" [size]="11" />
+      <!-- ── Search / filter area ─────────────────────────────────────────── -->
+      <div class="search-area">
+
+        <!-- Mode toggle -->
+        <div class="mode-toggle">
+          <button class="mode-btn" [class.active]="!traceqlMode()" (click)="setTraceqlMode(false)">
+            <lucide-icon name="sliders-horizontal" [size]="12" />
+            Filter
+          </button>
+          <button class="mode-btn" [class.active]="traceqlMode()" (click)="setTraceqlMode(true)">
+            <lucide-icon name="terminal" [size]="12" />
+            TraceQL
+          </button>
+        </div>
+
+        @if (!traceqlMode()) {
+          <!-- ── Filter bar ─────────────────────────────────────────────── -->
+          <div class="filter-bar">
+            <div class="filter-search">
+              <lucide-icon name="search" [size]="13" class="fi-icon" />
+              <input class="fi-input" [(ngModel)]="filterName"
+                     placeholder="Operation / span name"
+                     (keyup.enter)="applyFilters()" />
+            </div>
+
+            <select class="filter-select" [(ngModel)]="filterService">
+              <option value="">All services</option>
+              @for (sv of serviceOptions(); track sv) { <option [value]="sv">{{ sv }}</option> }
+            </select>
+
+            <select class="filter-select" [(ngModel)]="filterStatus">
+              <option value="">All statuses</option>
+              <option value="Ok">OK</option>
+              <option value="Error">Error</option>
+            </select>
+
+            <div class="dur-wrap">
+              <lucide-icon name="clock" [size]="12" class="fi-icon" />
+              <input class="dur-input" type="number" min="1" [(ngModel)]="filterMinDurationMs" placeholder="Min ms" />
+            </div>
+
+            <div class="dur-wrap">
+              <lucide-icon name="clock" [size]="12" class="fi-icon" />
+              <input class="dur-input" type="number" min="1" [(ngModel)]="filterMaxDurationMs" placeholder="Max ms" />
+            </div>
+
+            <select class="filter-select filter-select--http" [(ngModel)]="filterHttpStatus">
+              <option value="">All HTTP</option>
+              <option value="2xx">2xx</option>
+              <option value="4xx">4xx</option>
+              <option value="5xx">5xx</option>
+              <option value="400">400</option>
+              <option value="401">401</option>
+              <option value="403">403</option>
+              <option value="404">404</option>
+              <option value="500">500</option>
+              <option value="502">502</option>
+              <option value="503">503</option>
+            </select>
+
+            <button class="btn-apply" (click)="applyFilters()">Apply</button>
+            <button class="btn-clear" (click)="clearFilters()">
+              Clear
             </button>
-          }
+          </div>
+
+        } @else {
+          <!-- ── TraceQL search bar ───────────────────────────────────────── -->
+          <div class="traceql-bar">
+            <div class="tql-wrap" [class.has-error]="traceqlError()">
+              <lucide-icon name="braces" [size]="13" class="tql-icon" />
+              <input class="tql-input"
+                     [(ngModel)]="traceqlInput"
+                     [appSuggestInput]="traceqlSuggestions"
+                     (suggestSubmit)="runTraceQLUser()"
+                     placeholder='{ .http.status_code = 500 && duration > 500ms }'
+                     spellcheck="false"
+                     autocomplete="off" />
+              @if (traceqlInput) {
+                <button class="tql-clear" (click)="clearTraceql()" title="Clear">
+                  <lucide-icon name="x" [size]="11" />
+                </button>
+              }
+            </div>
+            <button class="btn-apply" (click)="runTraceQLUser()">
+              <lucide-icon name="play" [size]="12" />
+              Run
+            </button>
+          </div>
+          <div class="tql-hints">
+            <span class="tql-hint-label">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd> for suggestions · Examples:</span>
+            <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
+            <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
+            <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
+            <button class="tql-hint-chip" (click)="traceqlInput = '{ service = \'api\' && duration > 200ms }'">&#123; service = "api" &amp;&amp; duration > 200ms &#125;</button>
+          </div>
+        }
+
+        <!-- Outside the mode branch: a stream can die halfway in EITHER mode (spent time budget,
+             unreadable segment), and inside the @else the filter bar's failures had nowhere to
+             appear — the rows it managed to load sat there looking complete.
+
+             listBanner(), not traceqlError(): the same vanished segment is reported by the server
+             as a `query-error` sentence when the walk reached the end of the window and as a bare
+             `truncatedBy` code when the row ceiling bit first, and only the first of those used to
+             reach this strip. One dead file was a red banner over a frozen list at max=1000 and a
+             grey count suffix over a live one at max=50 — which of the two the operator saw decided
+             by how many rows happened to fit. The banner now follows the LOSS; the frame that
+             carried it decides nothing. -->
+        @if (listBanner(); as banner) {
+          <div class="tql-error">
+            <lucide-icon name="alert-circle" [size]="12" />
+            {{ banner }}
+          </div>
+        }
+
+        <!-- Jump to trace -->
+        <div class="jump-bar">
+          <lucide-icon name="hash" [size]="13" class="fi-icon" />
+          <input class="jump-input" [(ngModel)]="traceIdInput"
+                 placeholder="Paste trace ID to jump directly…"
+                 (keyup.enter)="jumpToTrace()" />
+          <button class="btn-jump" [disabled]="!traceIdInput.trim()" (click)="jumpToTrace()">
+            <lucide-icon name="arrow-right" [size]="12" />
+            Open
+          </button>
         </div>
-        <button class="btn-apply" (click)="runTraceQLUser()">
-          <lucide-icon name="play" [size]="12" />
-          Run
-        </button>
       </div>
-      <div class="tql-hints">
-        <span class="tql-hint-label">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd> for suggestions · Examples:</span>
-        <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
-        <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
-        <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
-        <button class="tql-hint-chip" (click)="traceqlInput = '{ service = \'api\' && duration > 200ms }'">&#123; service = "api" &amp;&amp; duration > 200ms &#125;</button>
-      </div>
-    }
+    </div>
 
-    <!-- Outside the mode branch: a stream can die halfway in EITHER mode (spent time budget,
-         unreadable segment), and inside the @else the filter bar's failures had nowhere to
-         appear — the rows it managed to load sat there looking complete.
-
-         listBanner(), not traceqlError(): the same vanished segment is reported by the server
-         as a `query-error` sentence when the walk reached the end of the window and as a bare
-         `truncatedBy` code when the row ceiling bit first, and only the first of those used to
-         reach this strip. One dead file was a red banner over a frozen list at max=1000 and a
-         grey count suffix over a live one at max=50 — which of the two the operator saw decided
-         by how many rows happened to fit. The banner now follows the LOSS; the frame that
-         carried it decides nothing. -->
-    @if (listBanner(); as banner) {
-      <div class="tql-error">
-        <lucide-icon name="alert-circle" [size]="12" />
-        {{ banner }}
-      </div>
-    }
-
-    <!-- Jump to trace -->
-    <div class="jump-bar">
-      <lucide-icon name="hash" [size]="13" class="fi-icon" />
-      <input class="jump-input" [(ngModel)]="traceIdInput"
-             placeholder="Paste trace ID to jump directly…"
-             (keyup.enter)="jumpToTrace()" />
-      <button class="btn-jump" [disabled]="!traceIdInput.trim()" (click)="jumpToTrace()">
-        <lucide-icon name="arrow-right" [size]="12" />
-        Open
-      </button>
+    <!-- Phone only: the sheet's sticky footer. Apply runs whichever search the mode means and
+         closes the sheet; Clear blanks that mode's fields and leaves it open to fill again. -->
+    <div class="sheet-foot">
+      <button type="button" class="sheet-clear" (click)="clearSheet()">Clear</button>
+      <button type="button" class="sheet-apply" (click)="applySheet()">{{ traceqlMode() ? 'Run' : 'Apply' }}</button>
     </div>
   </div>
+
+  @if (filtersOpen()) {
+    <div class="sheet-backdrop" (click)="closeFilters()"></div>
+  }
 
   <!-- ── Stats row ─────────────────────────────────────────────────────────── -->
   <div class="stats-row">
@@ -360,6 +429,11 @@
                    [attr.data-index]="vRow.index"
                    [style.transform]="'translateY(' + vRow.start + 'px)'">
                 @if (trace) {
+                  <!-- Three lines and no right-hand column (design canvas, "Traces — плотно"):
+                       when / how long / how it ended, then the method and path, then the
+                       services. The old right column stacked the badge, the duration and the
+                       span count beside the body, which made every row as tall as the three of
+                       them and left the path a narrower strip than the panel. -->
                   <div class="trace-row"
                        [class.active]="selectedTraceId() === trace.traceId"
                        (click)="openTrace(trace.traceId)">
@@ -367,7 +441,16 @@
                     <span class="status-dot" [class]="statusCls(trace.status)"></span>
 
                     <div class="trace-row-body">
-                      <div class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</div>
+                      <div class="trace-ts-line">
+                        <span class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</span>
+                        <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
+                        @if (trace.spanCount > 1) {
+                          <span class="span-count">{{ trace.spanCount }} spans</span>
+                        }
+                        <span class="status-badge" [class]="statusBadgeCls(trace.httpStatusCode, trace.status)">
+                          {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
+                        </span>
+                      </div>
                       <div class="trace-path-line">
                         @if (trace.httpMethod) {
                           <span class="http-method" [class]="'m-' + trace.httpMethod.toLowerCase()">
@@ -389,16 +472,6 @@
                         }
                       </div>
                     </div>
-
-                    <div class="trace-row-right">
-                      <span class="status-badge" [class]="statusBadgeCls(trace.httpStatusCode, trace.status)">
-                        {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
-                      </span>
-                      <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
-                      @if (trace.spanCount > 1) {
-                        <span class="span-count">{{ trace.spanCount }} spans</span>
-                      }
-                    </div>
                   </div>
                 }
               </div>
@@ -408,9 +481,10 @@
       }
     </div>
 
-    <!-- Right: trace detail panel -->
+    <!-- Right: trace detail panel. `has-span` lets the phone stylesheet leave room under the
+         waterfall for the span sheet that then covers its bottom. -->
     @if (selectedTraceId()) {
-      <div class="trace-detail-panel">
+      <div class="trace-detail-panel" [class.has-span]="selectedSpan()">
 
         @if (traceLoading()) {
           <div class="panel-empty">
@@ -420,6 +494,13 @@
 
           <!-- Detail header -->
           <div class="detail-header">
+            <!-- Below the tablet breakpoint the list is hidden while a trace is open (phone: the
+                 detail is a layer over it), so this is the only way back to it. Hidden on a
+                 desktop, where the list is beside the detail and the X closes it. -->
+            <button class="detail-back" (click)="closeTrace()" title="Back to the list">
+              <lucide-icon name="chevron-left" [size]="16" />
+              <span class="detail-back-count">{{ filteredTraces().length }} traces</span>
+            </button>
             <div class="detail-title">
               <span class="detail-trace-label">Trace</span>
               <span class="detail-trace-id mono">{{ selectedTraceId() }}</span>
@@ -431,7 +512,7 @@
               <span class="meta-chip">{{ totalDurLabel() }}</span>
               <span class="meta-chip">{{ traceSpans().length }} spans</span>
             </div>
-            <button class="icon-btn" (click)="closeTrace()" title="Close">
+            <button class="icon-btn detail-close" (click)="closeTrace()" title="Close">
               <lucide-icon name="x" [size]="14" />
             </button>
           </div>
@@ -462,7 +543,9 @@
                 <div class="wf-dur-col">Duration</div>
               </div>
 
-              <!-- Span rows -->
+              <!-- Span rows. The nesting depth goes out as a CSS variable rather than a computed
+                   padding, so the stylesheet decides the step per level — 14px on a desktop,
+                   less on a phone, where a deep trace would otherwise indent the label away. -->
               <div class="wf-body">
                 @for (span of traceSpans(); track span.spanId) {
                   <div class="wf-row"
@@ -470,7 +553,7 @@
                        [class.error-span]="span.status === 'Error'"
                        (click)="selectSpan(span)">
 
-                    <div class="wf-label-col" [style.padding-left.px]="spanDepth(span) * 14 + 8">
+                    <div class="wf-label-col" [style.--depth]="spanDepth(span)">
                       <span class="svc-dot" [style.background]="svcColor(span.serviceName)"></span>
                       <div class="wf-names">
                         <span class="wf-svc">{{ span.serviceName }}</span>
@@ -494,8 +577,12 @@
             </div>
 
             <!-- ── Span detail bottom panel ──────────────────────────────── -->
+            <!-- The dragged height arrives as a CSS variable, not as an inline height: the
+                 tablet and phone stylesheets fix the panel's height themselves (300px column,
+                 372px sheet), and a rule in a media query cannot override an inline style
+                 without !important. -->
             @if (selectedSpan(); as span) {
-              <div class="span-detail" [style.height.px]="prefs.spanDetailHeight()">
+              <div class="span-detail" [style.--span-h]="prefs.spanDetailHeight() + 'px'">
                 <div class="span-resizer" (mousedown)="startSpanResize($event)"
                      title="Drag to resize"></div>
 
@@ -503,8 +590,11 @@
                   <lucide-icon name="x" [size]="14" />
                 </button>
 
+                <!-- The modifier classes name the fields so the phone sheet can pick its three
+                     KPIs (service, HTTP status or start, duration), make the operation its title
+                     and drop the ids. -->
                 <div class="span-detail-left">
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--service">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'service.name', span.serviceName, 'service', 'service.name')" title="Filter / copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -516,7 +606,7 @@
                       {{ span.serviceName }}
                     </span>
                   </div>
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--op">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'name', span.name, 'name', null)" title="Filter / copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -526,7 +616,7 @@
                     <span class="sd-val">{{ span.name }}</span>
                   </div>
                   @if (span.httpStatusCode) {
-                    <div class="sd-field">
+                    <div class="sd-field sd-field--http">
                       <span class="sd-key">
                         <button class="tag-menu-btn" (click)="openFieldMenu($event, 'http.status_code', span.httpStatusCode, '.http.status_code', null)" title="Filter / copy">
                           <lucide-icon name="list-filter" [size]="12" />
@@ -540,7 +630,7 @@
                       </span>
                     </div>
                   }
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--id">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Span ID', span.spanId, null, null)" title="Copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -549,7 +639,7 @@
                     </span>
                     <span class="sd-val mono small">{{ span.spanId }}</span>
                   </div>
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--parent">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Parent', span.parentSpanId || '', null, null)" title="Copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -558,7 +648,7 @@
                     </span>
                     <span class="sd-val mono small">{{ span.parentSpanId || '—' }}</span>
                   </div>
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--start">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Start', fmtTraceTime(span.startTimeUnixNano), null, null, span.startTimeUnixNano / 1000000)" title="Seek / copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -567,7 +657,7 @@
                     </span>
                     <span class="sd-val mono small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
                   </div>
-                  <div class="sd-field">
+                  <div class="sd-field sd-field--dur">
                     <span class="sd-key">
                       <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Duration', fmtDurNs(span.durationNanos), null, null)" title="Copy">
                         <lucide-icon name="list-filter" [size]="12" />
@@ -706,7 +796,8 @@
 
   <!-- Search history — mounted under @if so opening reloads (server round trip on
        every open, same as the Events Signals panel). Chrome copied from the Events
-       Signals panel (signals-panel.html); the section markup itself is shared. -->
+       Signals panel (signals-panel.html); the section markup itself is shared. A docked
+       column on a wide desktop, an overlay below 1280px (traces.scss). -->
   @if (historyOpen()) {
     <div class="history-panel">
       <div class="history-hdr">

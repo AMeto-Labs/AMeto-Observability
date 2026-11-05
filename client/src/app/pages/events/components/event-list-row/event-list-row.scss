@@ -1,10 +1,11 @@
-/* Fixed-height (29px) collapsed log row — extracted from the old EventRow
-   `.ev-main`. Height is pinned and overflow clipped so rows stay uniform for
-   virtual scrolling; the detail panel lives in a separate drawer. */
+/* Fixed-height collapsed log row — extracted from the old EventRow `.ev-main`. The height is
+   pinned to --log-row-h (24px; events.ts estimates the virtual list with the same number, so
+   the two move together) and overflow is clipped so rows stay uniform for virtual scrolling;
+   the detail panel lives in a separate drawer. */
 :host {
   display: block;
   position: relative;
-  height: 29px;
+  height: var(--log-row-h);
   box-sizing: border-box;
   overflow: hidden;
   border-bottom: 1px solid rgba(255, 255, 255, .03);
@@ -110,8 +111,8 @@
    actually scans and carries the row. */
 .ev-ts {
   flex-shrink: 0;
-  width: 160px;
-  font-size: 11px;
+  width: 154px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   cursor: default;
@@ -122,16 +123,16 @@
 
 .ev-level {
   flex-shrink: 0;
-  width: 45px;
+  width: 42px;
   display: flex;
   align-items: center;
   padding-right: 6px;
 }
 .ev-lvl-badge {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: var(--fs-2xs);
+  font-weight: 700;
   letter-spacing: .3px;
-  padding: 2px 8px;
+  padding: 1px 6px;
   border-radius: 999px;
   background: var(--lc-bg, rgba(255, 255, 255, .06));
   color: var(--lc);
@@ -144,11 +145,11 @@
    the timestamp's tone (--row-ts-time), keeping the row's metadata on one level. */
 /* One width for the column, the SERVICE header's: sized to its own name it was a different
    width on every row, and the message after it started somewhere else on each. The Events page
-   sets --svc-col from its longest service name, up to 155px; a longer name ends in an ellipsis
+   sets --svc-col from its longest service name, up to 140px; a longer name ends in an ellipsis
    and is in full on hover. */
 .ev-svc {
   flex-shrink: 0;
-  width: var(--svc-col, 155px);
+  width: var(--svc-col, 140px);
   display: flex;
   align-items: center;
   gap: 5px;
@@ -163,7 +164,7 @@
   color: var(--ev-svc-color);
 }
 .ev-svc-name {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -188,18 +189,18 @@
 .ev-msg:hover { color: var(--txt); }
 
 /* Wrap mode: the row grows to show the full message across multiple lines.
-   (The parent renders wrapped rows non-virtualized, so variable heights are fine.) */
+   (The parent measures each wrapped row instead of assuming a height, so variable heights are fine.) */
 :host.ev-wrap-mode {
   height: auto;
-  min-height: 29px;
+  min-height: var(--log-row-h);
   overflow: visible;
 }
 :host.ev-wrap-mode .ev-main {
   height: auto;
-  min-height: 29px;
+  min-height: var(--log-row-h);
   align-items: flex-start;
-  padding-top: 6px;
-  padding-bottom: 6px;
+  padding-top: 4px;
+  padding-bottom: 4px;
 }
 :host.ev-wrap-mode .ev-ts,
 :host.ev-wrap-mode .ev-level,

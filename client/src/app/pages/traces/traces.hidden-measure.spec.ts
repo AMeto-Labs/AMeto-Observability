@@ -57,7 +57,7 @@ if (typeof window !== 'undefined') (window as any).ResizeObserver = CapturingRes
 // high renders nothing. Same shim as the other traces specs.
 Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
   configurable: true,
-  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 82; },
+  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 62; },
 });
 
 /**
@@ -171,7 +171,7 @@ describe('traces list — a hidden row is not a zero-height row', () => {
     const v = (fixture.componentInstance as any).rowVirtualizer;
     const el = renderedRows(fixture)[0];
 
-    // The component's own afterRender pass has already measured it at the jsdom shim's 82; drop
+    // The component's own afterRender pass has already measured it at the jsdom shim's 62; drop
     // that so the row is genuinely unmeasured when the panel goes away.
     v.itemSizeCache.delete('u0');
     const before = v.getTotalSize();

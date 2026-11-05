@@ -29,7 +29,7 @@ class NoopResizeObserver {
 
 Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
   configurable: true,
-  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 82; },
+  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 62; },
 });
 
 class LiveStream {

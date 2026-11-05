@@ -173,7 +173,7 @@ const TRACEQL_TOKENS: readonly string[] = [
   selector: 'app-traces',
   imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent, EventListRowComponent, PropertyMenuComponent, SearchHistoryComponent],
   templateUrl: './traces.html',
-  styleUrl: './traces.scss',
+  styleUrls: ['./traces.scss', './traces.responsive.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class TracesComponent implements OnInit, OnDestroy {
@@ -269,6 +269,15 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   /** Right-hand search-history panel — mounted under @if so opening reloads. */
   historyOpen = signal(false);
+
+  /**
+   * The phone's filter sheet (traces.scss, `.hdr-sheet` below 640px). The range chips, the
+   * Live / Rows controls and the whole search area live inside it there, so this is also what
+   * the header's range button and the "Filters · N" button open. Wider than a phone the sheet
+   * is `display: contents` and this signal changes nothing visible — which is why every search
+   * run from inside it may close it unconditionally (see {@link applyFilters}).
+   */
+  readonly filtersOpen = signal(false);
 
   private _poll: ReturnType<typeof setInterval> | null = null;
 
@@ -491,10 +500,10 @@ export class TracesComponent implements OnInit, OnDestroy {
    *
    *  It bounds the ARRAY, not the DOM. A trace row is 13 elements before its second service
    *  chip, so 2000 of them rendered flat is ~26k — a bill the old 200-row page cap never sent
-   *  the browser. What bounds the DOM is the virtualizer below: at a 600px viewport and ~82px
-   *  a row, a 2000-row answer stands at 16 rendered rows / 209 elements behind a spacer 2000
+   *  the browser. What bounds the DOM is the virtualizer below: at a 600px viewport and ~62px
+   *  a row, a 2000-row answer stands at 18 rendered rows / ~235 elements behind a spacer 2000
    *  rows tall (measured, traces.background-intent.spec.ts). That is also what makes the live
-   *  refresh affordable: re-streaming 2000 rows re-diffs 2000 array entries but touches ~200
+   *  refresh affordable: re-streaming 2000 rows re-diffs 2000 array entries but touches ~250
    *  elements. Raising this costs memory and wire time, not paint — which is why it is safe to
    *  put on a menu at all. */
   readonly streamMax = signal(TracesComponent.DefaultStreamMax);
@@ -623,13 +632,16 @@ export class TracesComponent implements OnInit, OnDestroy {
    * already drives the Events list, so this is the house pattern rather than a new one.
    *
    * MEASURED, not fixed-height, which is where it differs from Events: a trace row is a
-   * timestamp, a path that wraps to a second line when the method badge crowds it, and a
+   * timestamp line, a path that wraps to a second line when the method badge crowds it, and a
    * service-chip row that wraps once per ~3 services — in a panel that itself narrows from
-   * 400px to 320px when a trace is open. Events could pin 29px because its rows are one line
-   * by construction; pinning a height here would mean clipping the service chips, and hiding
-   * which services a trace touched to save a measurement is not a trade worth making on this
-   * page. `estimateSize` is the common case (one line each) and every rendered row corrects
-   * itself; the correction is a no-op once measured, since resizeItem ignores a zero delta.
+   * 360px to 300px when a trace is open (and is the whole screen on a phone). Events could pin
+   * 29px because its rows are one line by construction; pinning a height here would mean
+   * clipping the service chips, and hiding which services a trace touched to save a measurement
+   * is not a trade worth making on this page. `estimateSize` is the common case — the three
+   * lines of the dense row at one line each, 62px with its padding and border (design canvas,
+   * "Traces — плотно"; it was 82 when the badge, the duration and the span count stood in a
+   * column beside the body) — and every rendered row corrects itself; the correction is a no-op
+   * once measured, since resizeItem ignores a zero delta.
    */
   /**
    * A measurement, unless there is nothing to measure — in which case KEEP WHAT WE KNEW.
@@ -673,7 +685,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   readonly rowVirtualizer = injectVirtualizer(() => ({
     count:          this.filteredTraces().length,
     scrollElement:  this.traceScroll(),
-    estimateSize:   () => 82,
+    estimateSize:   () => 62,
     overscan:       8,
     getItemKey:     (i: number) => this.filteredTraces()[i]?.traceId ?? i,
     measureElement: this.measureOnlyWhenRendered,
@@ -936,8 +948,9 @@ export class TracesComponent implements OnInit, OnDestroy {
   setPreset(p: string) {
     this.preset = p;
     this.syncUrl();
-    // 'custom' just reveals the date inputs; the query runs on Apply.
-    if (p !== 'custom') { this.setWindow(); this.loadAll(); }
+    // 'custom' just reveals the date inputs; the query runs on Apply — so the phone sheet stays
+    // open for them, and closes for a chip that runs the search there and then.
+    if (p !== 'custom') { this.setWindow(); this.loadAll(); this.filtersOpen.set(false); }
   }
 
   /** Apply a custom range. `from` is required; `to` optional (empty → open-ended / now). */
@@ -946,6 +959,45 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.syncUrl();
     this.setWindow();
     this.loadAll();
+    this.filtersOpen.set(false);
+  }
+
+  /** The range button's label on a phone: the chip that is active, or "Custom". */
+  presetLabel(): string {
+    return this.preset === 'custom' ? 'Custom' : this.preset;
+  }
+
+  // ── Phone filter sheet ────────────────────────────────────────────────────
+  openFilters(): void  { this.filtersOpen.set(true); }
+  closeFilters(): void { this.filtersOpen.set(false); }
+
+  /** The sheet's Apply: whichever search the mode means. Both paths close the sheet themselves. */
+  applySheet(): void {
+    if (this.traceqlMode()) this.runTraceQLUser();
+    else this.applyFilters();
+  }
+
+  /** The sheet's Clear: the mode's own reset. The sheet stays open to be filled again. */
+  clearSheet(): void {
+    if (this.traceqlMode()) this.clearTraceql();
+    else this.clearFilters();
+  }
+
+  /**
+   * What the "Filters · N" button counts: the filter-bar fields that are set, or — in TraceQL
+   * mode, where the one box is the whole filter — 1 when it holds a query. The range is not a
+   * filter here: it always has a value, and it has its own button in the header.
+   */
+  activeFilterCount(): number {
+    if (this.traceqlMode()) return this.traceqlInput.trim() ? 1 : 0;
+    let n = 0;
+    if (this.filterName)                 n++;
+    if (this.filterService)              n++;
+    if (this.filterStatus)               n++;
+    if (this.filterMinDurationMs != null) n++;
+    if (this.filterMaxDurationMs != null) n++;
+    if (this.filterHttpStatus)           n++;
+    return n;
   }
 
   setTraceqlMode(on: boolean) {
@@ -1561,6 +1613,8 @@ export class TracesComponent implements OnInit, OnDestroy {
     // A search the user asked for outranks whatever was holding the list.
     this.releaseList();
     this.runTraceQL();
+    // A search run from the phone sheet is a reason to see the list, so the sheet goes.
+    this.filtersOpen.set(false);
   }
 
   applyFilters() {
@@ -1572,6 +1626,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.activeMainTab = 'traces';
     this.syncUrl();
     this.loadAll();
+    this.filtersOpen.set(false);
   }
 
   /** The filter bar's Clear: blank every field and re-run. Deliberately NOT applyFilters() —
@@ -1627,6 +1682,8 @@ export class TracesComponent implements OnInit, OnDestroy {
     const id = this.traceIdInput.trim();
     if (!id) return;
     this.openTrace(id);
+    // On a phone the jump box is inside the sheet and the trace opens as a layer behind it.
+    this.filtersOpen.set(false);
   }
 
   openTrace(traceId: string) {
@@ -1864,6 +1921,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   @HostListener('document:keydown.escape')
   onEscape(): void {
     if (this.attrMenu()) { this.attrMenu.set(null); return; }
+    if (this.filtersOpen()) { this.filtersOpen.set(false); return; }
     if (this.historyOpen()) { this.historyOpen.set(false); return; }
     if (this.logModalEvent()) return;
     if (this.selectedSpan()) this.selectedSpan.set(null);

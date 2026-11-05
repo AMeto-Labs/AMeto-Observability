@@ -8,30 +8,31 @@
   border-radius: var(--radius);
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px;
+  gap: var(--gap);
+  padding: var(--section-pad);
 }
 
 .section__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--gap);
 }
 
+/* A section caption is the scale's 10px small caps; a little tracking keeps it legible. */
 .section__title {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
-  letter-spacing: 0;
+  letter-spacing: .04em;
   margin: 0;
   text-transform: uppercase;
 }
 
 .section__description {
   color: var(--text-secondary);
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-body);
   margin: 0;
 }
 

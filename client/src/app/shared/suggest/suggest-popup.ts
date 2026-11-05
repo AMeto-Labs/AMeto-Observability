@@ -28,6 +28,8 @@ import { ChangeDetectionStrategy, Component, input, output } from '@angular/core
     }
   `,
   styles: [`
+    /* 11.5px is the design's one-off for list rows, between --fs-xs and --fs-sm; with --lh-ui
+       and 4px of padding a row is the 24px the design draws. */
     :host.suggest-pop {
       position: fixed;
       display: block;
@@ -41,11 +43,12 @@ import { ChangeDetectionStrategy, Component, input, output } from '@angular/core
       box-shadow: var(--shadow);
       padding: 4px 0;
       z-index: 1000;
-      font-size: 12px;
+      font-size: 11.5px;
+      line-height: var(--lh-ui);
       font-family: var(--font-mono);
     }
     .suggest-item {
-      padding: 3px 10px;
+      padding: 4px 10px;
       color: var(--txt);
       cursor: pointer;
       white-space: nowrap;

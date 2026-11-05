@@ -39,8 +39,9 @@
 }
 
 .logo-name {
-  font-size: 22px;
+  font-size: var(--fs-2xl);
   font-weight: 700;
+  line-height: var(--lh-tight);
   color: var(--txt);
   font-family: var(--ui);
   letter-spacing: -.4px;
@@ -48,10 +49,10 @@
 
 .logo-slogan {
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--txt-dim);
   font-family: var(--ui);
-  line-height: 1.5;
+  line-height: var(--lh-body);
   max-width: 260px;
   margin: 0;
   letter-spacing: .1px;
@@ -64,14 +65,17 @@
 }
 
 .field-label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   font-weight: 500;
 }
 
+/* The sign-in form keeps its roomier fields: the global .field-input is the dense 26px
+   control, and a login page is the one place the design leaves almost as it was. */
 .field-input {
+  height: auto;
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: var(--fs-md);
   transition: border-color .15s;
 }
 
@@ -83,7 +87,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--error);
 }
 
@@ -98,7 +102,7 @@
   border-radius: var(--radius);
   color: var(--text-on-primary);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
   transition: opacity .15s, background .15s;
 }
@@ -118,7 +122,7 @@
   align-items: center;
   gap: 10px;
   color: var(--txt-dim);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 
   &::before, &::after {
     content: '';
@@ -139,7 +143,7 @@
   border-radius: var(--radius);
   color: var(--txt);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 500;
   transition: background .15s, border-color .15s;
   cursor: pointer;

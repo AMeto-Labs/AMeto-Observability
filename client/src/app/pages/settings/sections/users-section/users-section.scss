@@ -1,10 +1,10 @@
 .sublabel {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
 .mono-sm {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-family: var(--font-mono);
 }
 
@@ -22,7 +22,7 @@
 }
 
 .role-badge {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 1px 6px;
   border-radius: 99px;
   background: var(--bg-main);
@@ -34,7 +34,7 @@
 
 .blocked-badge {
   margin-left: 4px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   padding: 1px 6px;
   border-radius: 99px;
   border: 1px solid var(--error);
@@ -48,13 +48,14 @@
 }
 
 .role-select {
-  padding: 2px 6px;
+  height: var(--ctl-h-sm);
+  padding: 0 6px;
   background: var(--bg-main);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font: inherit;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
 
   &:hover {
@@ -63,7 +64,7 @@
 }
 
 .provider-badge {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   padding: 1px 6px;
   border-radius: 99px;
   background: var(--bg-main);
@@ -80,19 +81,21 @@
 .add-user-tabs {
   display: flex;
   gap: 4px;
-  margin: 12px 0 8px;
+  flex-wrap: wrap;
+  margin: var(--gap) 0 6px;
 }
 
 .add-tab {
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 10px;
+  height: var(--ctl-h-sm);
+  padding: 0 8px;
   border-radius: var(--radius-sm);
   background: none;
   border: 1px solid var(--border);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   transition: all .12s;
 
@@ -117,18 +120,19 @@
 }
 
 .field-select {
-  padding: 5px 8px;
+  height: var(--ctl-h);
+  padding: 0 8px;
   background: var(--bg-main);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   outline: none;
 }
 
 .form-error {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--error);
 }
 
@@ -143,7 +147,7 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   cursor: pointer;
   white-space: nowrap;
@@ -151,6 +155,7 @@
   input { cursor: pointer; margin: 0; }
 }
 .field-select.sm {
-  padding: 2px 6px;
-  font-size: 12px;
+  height: var(--ctl-h-sm);
+  padding: 0 6px;
+  font-size: var(--fs-xs);
 }

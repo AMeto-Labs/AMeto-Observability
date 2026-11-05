@@ -29,7 +29,7 @@ class NoopResizeObserver {
 // container a viewport and the rows their estimated height makes the window it computes real.
 Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
   configurable: true,
-  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 82; },
+  get(this: HTMLElement) { return this.classList.contains('trace-rows') ? 600 : 62; },
 });
 
 /**
@@ -672,10 +672,10 @@ describe('traces list — who asked decides who owns the failure', () => {
     expect(c.streamCapped()).toBe(true);
     expect(el.querySelector('.list-more-hint')?.textContent?.trim())
       .toBe(`· newest ${c.streamMax()} — narrow the range or the query for older traces`);
-    // 600px of viewport at ~82px a row, plus 8 rows of overscan on each side.
+    // 600px of viewport at ~62px a row, plus 8 rows of overscan on each side.
     expect(rendered).toBeGreaterThan(0);
     expect(rendered).toBeLessThan(40);
     expect(elements).toBeLessThan(600);
-    expect(spacer).toBe('164000px');              // the scrollbar still spans all 2000 rows
+    expect(spacer).toBe('124000px');              // the scrollbar still spans all 2000 rows
   });
 });

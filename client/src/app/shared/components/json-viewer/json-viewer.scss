@@ -1,8 +1,10 @@
 :host {
   display: inline;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.55;
+  /* 11.5px / 1.45 is a one-off (design canvas: JSON sits half a step under the 12px drawer text,
+     tighter than --lh-body), so no scale token. */
+  font-size: 11.5px;
+  line-height: 1.45;
   vertical-align: top;
 }
 

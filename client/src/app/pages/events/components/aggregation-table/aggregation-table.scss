@@ -17,7 +17,7 @@
   align-items: center;
   gap: 8px;
   padding: 7px 14px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--warning);
   background: var(--warning-soft);
   border-bottom: 1px solid var(--border);
@@ -39,8 +39,8 @@
   z-index: 1;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
-  padding: 5px 14px;
-  font-size: 10px;
+  padding: 4px 14px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: .05em;
@@ -61,7 +61,7 @@
 .agg-row {
   display: grid;
   align-items: center;
-  padding: 6px 14px;
+  padding: 3px 14px; /* with the 12px cell and the border, about one log row (--log-row-h) */
   border-bottom: 1px solid var(--border);
 
   &:last-child { border-bottom: none; }
@@ -69,7 +69,7 @@
 }
 
 .agg-cell {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -98,9 +98,9 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 14px;
+  padding: 4px 14px; /* about the events footer's 26px */
   border-top: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   flex-shrink: 0;
 }
