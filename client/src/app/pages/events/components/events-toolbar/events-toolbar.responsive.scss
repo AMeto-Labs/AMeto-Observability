@@ -1,0 +1,357 @@
+// The phone's top of the Logs page (design canvas, "Телефон — список логов", "— поиск в фокусе",
+// "— агрегация"): the 48px header, the search row, the chip strip and, with the field in focus,
+// the suggestion strip and the recent searches. The markup exists below 640px only
+// (events-toolbar.html), so these rules need no media query of their own; the breakpoint is
+// the one events-toolbar.ts reads through ViewportService. Its own stylesheet to keep the
+// desktop bar's within the per-stylesheet style budget.
+
+// Visually hidden, read by a screen reader — the field's name.
+.ph-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+// ── Header: 48px, "Logs" 14/600, the range · Live · Signals group at the right ──────────────
+.ph-hdr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 48px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  font-family: var(--ui);
+}
+.ph-title {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  color: var(--txt);
+}
+.ph-quick {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+// The three header buttons are 32px: a finger's control at the design's size.
+.ph-range,
+.ph-live,
+.ph-bell {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 0 9px;
+}
+.ph-range {
+  gap: 4px;
+  color: var(--txt);
+  font-variant-numeric: tabular-nums;
+}
+.ph-range-caret { color: var(--txt-dim); }
+.ph-live {
+  gap: 5px;
+  font-weight: 600;
+  color: var(--txt-muted);
+}
+.ph-live .live-dot { width: 6px; height: 6px; }
+// On: the desktop's .live-on — the error red says "recording".
+.ph-live.live-on {
+  color: var(--lvl-e);
+  border-color: var(--lvl-e);
+  background: var(--lvl-e-bg);
+}
+.ph-live:disabled {
+  color: var(--txt-dim);
+  opacity: .45;
+  cursor: default;
+}
+.ph-bell {
+  width: 32px;
+  justify-content: center;
+  padding: 0;
+  color: var(--txt-dim);
+}
+.ph-bell.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+// ── Search row: the field at 36px, radius 8, and "Filters · N" ──────────────────────────────
+.ph-search {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+  font-family: var(--ui);
+}
+.ph-field {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;        // one line is 36; the textarea grows to three lines (filterRows)
+  padding: 0 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: var(--fs-sm);
+  min-width: 0;
+  box-sizing: border-box;
+  transition: border-color .12s, box-shadow .12s;
+}
+.ph-field.focused {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.ph-field-icon { color: var(--txt-dim); flex-shrink: 0; }
+// The field's highlight overlay and textarea come from events-toolbar.scss; the phone's field
+// is the plain one — no shadow of its own, no Ctrl+Space hint.
+.ph-field .filter-hl-wrap { padding: 8px 0; }
+.ph-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--txt-dim);
+  cursor: pointer;
+}
+.ph-filters {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 11px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--txt-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.ph-filters.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.ph-filters-n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+// ── The strip under the row: level chips, or suggestions, or the aggregation note ────────────
+.ph-strip {
+  display: flex;
+  align-items: center;
+  padding: 0 12px 8px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  font-family: var(--ui);
+  &::-webkit-scrollbar { display: none; }
+}
+
+// Level chips: 24px, 11px, the counts at 10px — the filter bar's chips in the phone's sizes.
+.ph-chips {
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.lc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--txt-dim);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: .3px;
+  white-space: nowrap;
+  opacity: .6;
+  cursor: pointer;
+}
+.lc-chip.active { opacity: 1; }
+.lc-all.active {
+  color: var(--txt);
+  background: var(--surface-hover);
+}
+.lc-chip[data-level="verbose"].active     { color: var(--lvl-v); border-color: var(--lvl-v); background: var(--lvl-v-bg); }
+.lc-chip[data-level="debug"].active       { color: var(--lvl-d); border-color: var(--lvl-d); background: var(--lvl-d-bg); }
+.lc-chip[data-level="information"].active { color: var(--lvl-i); border-color: var(--lvl-i); background: var(--lvl-i-bg); }
+.lc-chip[data-level="warning"].active     { color: var(--lvl-w); border-color: var(--lvl-w); background: var(--lvl-w-bg); }
+.lc-chip[data-level="error"].active       { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); }
+.lc-chip[data-level="fatal"].active       { color: var(--lvl-f); border-color: var(--lvl-f); background: var(--lvl-f-bg); }
+.lc-num {
+  font-size: var(--fs-2xs);
+  opacity: .75;
+}
+
+// The aggregation's note in the strip's place: 32px, 10.5px.
+.ph-agg-note {
+  gap: 6px;
+  height: 32px;
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  overflow: hidden;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+// Suggestions: 28px chips at 11.5px, the first lit in the accent; and / or; the ↵ chip.
+.ph-suggest { gap: 6px; }
+.ph-sg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--txt);
+  font: inherit;
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ph-sg.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.ph-sg-kw { color: var(--accent); }
+.ph-sg-nl {
+  width: 36px;
+  justify-content: center;
+  padding: 0;
+}
+.ph-sg-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+// ── Recent searches: over the list while the field has focus ────────────────────────────────
+// 136px: the header (48), the search row (52) and the suggestion strip (36). The page is
+// position: relative on a phone (events.responsive.scss).
+.ph-recent {
+  position: absolute;
+  top: 136px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  overflow-y: auto;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-family: var(--ui);
+}
+.ph-recent-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 12px;
+}
+.ph-recent-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--txt-dim);
+}
+.ph-recent-sum {
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  font-variant-numeric: tabular-nums;
+}
+.ph-recent-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-sub);
+  cursor: pointer;
+}
+.ph-recent-lead { color: var(--txt-dim); flex-shrink: 0; }
+.ph-recent-lead.pinned { color: var(--accent); }
+.ph-recent-q {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--txt-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ph-recent-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--txt-dim);
+  cursor: pointer;
+}
+.ph-recent-empty {
+  padding: 16px 12px;
+  font-size: var(--fs-sm);
+  color: var(--txt-dim);
+  text-align: center;
+}

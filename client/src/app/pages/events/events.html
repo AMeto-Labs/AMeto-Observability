@@ -1,14 +1,19 @@
-<div class="events-page">
+<div class="events-page" [class.events-page--phone]="viewport.phone()">
 
+  <!-- The toolbar renders the desktop bar, or on a phone the 48px header, the search row and the
+       level chips. The filter bar is the desktop's and the tablet's; the phone has the sheet. -->
   <app-events-toolbar />
-  <app-events-filter-bar />
+  @if (!viewport.phone()) {
+    <app-events-filter-bar />
+  }
 
   <!-- ── Main body ────────────────────────────────────────────────────── -->
   <div class="events-body">
-    <div class="events-list-wrap" [style.--svc-col]="svcColWidth() + 'px'">
+    <div class="events-list-wrap" [style.--svc-col]="svcCol()">
       <!-- Column headers — for the EVENT list. An aggregation's columns are whatever its
-           query asked for, so it brings its own header. -->
-      @if (!store.aggregation()) {
+           query asked for, so it brings its own header; the phone's two-line rows have no
+           columns to head. -->
+      @if (!store.aggregation() && !viewport.phone()) {
       <div class="events-header">
         <span class="ev-h-stripe"></span>
         <span class="ev-h-col ev-h-ts">TIME <lucide-icon name="arrow-up" [size]="10" /></span>
@@ -41,7 +46,17 @@
         <!-- A table of totals, not a list of events. Nothing below applies to it: no virtual
              scroller (the rows are bounded by the query's own limit), no infinite scroll, no
              detail drawer — an aggregate row is not an event to open. -->
-        <app-aggregation-table [result]="agg" />
+        <app-aggregation-table [result]="agg" [phone]="viewport.phone()" />
+        @if (viewport.phone()) {
+          <!-- The phone's footer under a table (design canvas, "Телефон — агрегация"): the
+               table's own summary where the list's counter is, and a Go live that cannot go. -->
+          <div class="events-footer">
+            <span class="ev-footer-count">{{ aggSummary(agg) }}</span>
+            <button class="ev-footer-live" disabled>
+              Go live <lucide-icon name="arrow-right" [size]="12" />
+            </button>
+          </div>
+        }
       } @else {
 
       <!-- Held arrivals. While the reader is scrolled away the tail stops writing entirely, so
@@ -54,54 +69,47 @@
         </button>
       }
 
-      <!-- List: fixed-height virtual (default) or natural-height wrapped rows -->
+      <!-- The virtual list. Rows are fixed-height (24px) and unmeasured by default; wrapped rows
+           and the phone's two-line rows are MEASURED — this is the mode that produces the tallest
+           rows, so rendering all of them was how a wrapped answer of a few thousand logs stopped
+           the page. `#evRowEl` + `data-index` are what the component hands to
+           virtualizer.measureElement; in fixed mode nothing reads them. On a phone the list also
+           holds day separators (events.ts, withDaySeparators) in place of the date column. -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
-        @if (store.wrapMessages()) {
-          <!-- Wrap mode: rows grow to show the full message, so their heights are MEASURED
-               rather than assumed. It is virtualized all the same — this is the mode that
-               produces the tallest rows, so rendering all of them was how a wrapped answer
-               of a few thousand logs stopped the page. `#evRowEl` + `data-index` are what the
-               component hands to virtualizer.measureElement. -->
-          <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
-            @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
-              @let ev = store.displayedEvents()[vRow.index];
-              <div #evRowEl class="ev-vrow"
-                   [attr.data-index]="vRow.index"
-                   [style.transform]="'translateY(' + vRow.start + 'px)'">
-                @if (ev) {
-                  <app-event-list-row
-                    [event]="ev"
-                    [selected]="ev.id === store.selectedId()"
-                    [wrap]="true"
-                    [isNew]="store.newEventIds().has(ev.id)"
-                    (selectRequested)="store.toggleEvent(ev.id)"
-                    (filterSelected)="store.applyFilter($event)"
-                  />
-                }
-              </div>
-            }
-          </div>
-        } @else {
-          <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
-            @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
-              @let ev = store.displayedEvents()[vRow.index];
-              <div class="ev-vrow" [style.transform]="'translateY(' + vRow.start + 'px)'">
-                @if (ev) {
-                  <app-event-list-row
-                    [event]="ev"
-                    [selected]="ev.id === store.selectedId()"
-                    [wrap]="false"
-                    [isNew]="store.newEventIds().has(ev.id)"
-                    (selectRequested)="store.toggleEvent(ev.id)"
-                    (filterSelected)="store.applyFilter($event)"
-                  />
-                }
-              </div>
-            }
+        @if (stickyDay(); as day) {
+          <div class="ev-day ev-day--sticky" aria-hidden="true">
+            <span class="ev-day-date">{{ day }}</span><span class="ev-day-rule"></span>
           </div>
         }
+        <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
+          @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
+            @let item = listItems()[vRow.index];
+            <div #evRowEl class="ev-vrow"
+                 [attr.data-index]="vRow.index"
+                 [style.transform]="'translateY(' + vRow.start + 'px)'">
+              @if (asDay(item); as day) {
+                <div class="ev-day" role="separator" [attr.aria-label]="day.date">
+                  <span class="ev-day-date">{{ day.date }}</span><span class="ev-day-rule"></span>
+                </div>
+              } @else if (asEvent(item); as ev) {
+                <app-event-list-row
+                  [event]="ev"
+                  [selected]="ev.id === store.selectedId() || ev.id === lastViewedId()"
+                  [wrap]="store.wrapMessages()"
+                  [phone]="viewport.phone()"
+                  [dateless]="viewport.tablet()"
+                  [touch]="touch()"
+                  [isNew]="store.newEventIds().has(ev.id)"
+                  (selectRequested)="store.toggleEvent(ev.id)"
+                  (filterSelected)="store.applyFilter($event)"
+                  (messageActionsRequested)="openMessageSheet(ev)"
+                />
+              }
+            </div>
+          }
+        </div>
         @if (store.loadingMore()) {
-          <div class="load-more"><span class="load-more-spin"></span></div>
+          <div class="load-more"><span class="load-more-spin"></span><span class="load-more-text">Loading older events…</span></div>
         }
         @if (!store.loading() && !store.error() && store.displayedEvents().length === 0) {
           <!-- Three different nothings. `displayedEvents` is `events` narrowed client-side by
@@ -122,8 +130,10 @@
         }
       </div>
 
-      <!-- Footer -->
-      <div class="events-footer">
+      <!-- Footer. On a phone (design canvas, "Телефон — история") the Older / Newer pair is a
+           pair of arrows, shown outside live only: in a tail "Jump to live" is the way up, and
+           the way down chases a tail that is running away. -->
+      <div class="events-footer" [class.is-live]="store.live()">
         <!-- During a tail the old line read "Showing 200 of 200 events" for ever — both halves
              are the same capped array — so the one number on screen was a constant, and a user
              on a busy stand had no way to know they were seeing a fraction of the stream. -->
@@ -137,11 +147,11 @@
           <span class="ev-footer-count">Showing {{ store.displayedEvents().length }} of {{ fmtCount(store.totalCount()) }} events</span>
         }
         <div class="ev-footer-nav">
-          <button class="ev-footer-btn" (click)="scrollToOlderLogs()">
-            <lucide-icon name="arrow-down" [size]="12" /> Older logs
+          <button class="ev-footer-btn" aria-label="Older logs" (click)="scrollToOlderLogs()">
+            <lucide-icon name="arrow-down" [size]="12" /><span class="ev-footer-btn-txt">Older logs</span>
           </button>
-          <button class="ev-footer-btn" (click)="scrollToNewerLogs()">
-            <lucide-icon name="arrow-up" [size]="12" /> Newer logs
+          <button class="ev-footer-btn" aria-label="Newer logs" (click)="scrollToNewerLogs()">
+            <lucide-icon name="arrow-up" [size]="12" /><span class="ev-footer-btn-txt">Newer logs</span>
           </button>
         </div>
         <button class="ev-footer-live" [class.live-on]="store.live()"
@@ -152,13 +162,21 @@
       }
     </div>
 
-    <!-- Detail drawer — resizable; width persisted in localStorage -->
+    <!-- Detail drawer — resizable; width persisted in localStorage. On a tablet a 440px
+         slide-over behind a scrim; on a phone a layer over the whole page (events.responsive.scss). -->
     @if (store.selectedEvent(); as ev) {
-      <div class="event-drawer" #drawerEl [style.width.px]="prefs.drawerWidth()">
-        <div class="drawer-resizer" (mousedown)="startResize($event)" title="Drag to resize"></div>
+      @if (viewport.tablet()) {
+        <div class="body-scrim" (click)="store.selectEvent(null)"></div>
+      }
+      <div class="event-drawer" #drawerEl [style.width.px]="drawerWidth()">
+        @if (!viewport.phone() && !viewport.tablet()) {
+          <div class="drawer-resizer" (mousedown)="startResize($event)" title="Drag to resize"></div>
+        }
         <app-event-detail
           [event]="ev"
           [currentFilter]="store.filter()"
+          [phone]="viewport.phone()"
+          [touch]="touch()"
           (closed)="store.selectEvent(null)"
           (filterSelected)="store.applyFilter($event)"
           (seekRequested)="store.seek($event.from, $event.to)"
@@ -168,12 +186,42 @@
     }
 
     @if (store.signalsPanelOpen()) {
-      <app-signals-panel
-        [currentFilter]="store.filter()"
-        (filterSelected)="store.applyFilter($event)"
-        (closed)="store.toggleSignalsPanel()"
-      />
+      @if (viewport.phone()) {
+        <!-- The bell's sheet (design canvas, "Телефон — Signals"). -->
+        <app-bottom-sheet label="Signals" (closed)="store.toggleSignalsPanel()">
+          <app-signals-panel
+            [currentFilter]="store.filter()"
+            (filterSelected)="store.applyFilter($event); store.toggleSignalsPanel()"
+            (closed)="store.toggleSignalsPanel()"
+          />
+        </app-bottom-sheet>
+      } @else {
+        @if (viewport.tablet()) {
+          <div class="body-scrim" (click)="store.toggleSignalsPanel()"></div>
+        }
+        <app-signals-panel
+          [currentFilter]="store.filter()"
+          (filterSelected)="store.applyFilter($event)"
+          (closed)="store.toggleSignalsPanel()"
+        />
+      }
     }
   </div>
+
+  <!-- The phone's sheets. Mounted under @if so each open starts afresh — the filter sheet
+       reads its draft from the store on creation. -->
+  @if (store.filterSheetOpen()) {
+    <app-events-filter-sheet />
+  }
+  @if (messageSheetEvent(); as mev) {
+    <app-message-action-sheet
+      [event]="mev"
+      [currentFilter]="store.filter()"
+      [likeCount]="messageSheetLikeCount()"
+      (filterSelected)="store.applyFilter($event); closeMessageSheet()"
+      (openRequested)="openFromMessageSheet(mev)"
+      (closed)="closeMessageSheet()"
+    />
+  }
 
 </div>

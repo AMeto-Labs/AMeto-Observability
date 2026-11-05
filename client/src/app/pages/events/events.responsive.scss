@@ -1,0 +1,163 @@
+// The Events page below the desktop width: the tablet (640–899) and the phone (< 640) layers
+// over events.scss, in that order. Its own stylesheet so that each layer stays within the
+// per-stylesheet style budget (angular.json); both files style this one component and events.ts
+// lists them in cascade order. The numbers are the design canvas's ("Логи на телефоне (390) и
+// планшете (768)"); the breakpoints are the ones events.ts reads through ViewportService.
+@use 'breakpoints' as bp;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Tablet (640–899): the table without its date column; the drawer and the Signals panel slide
+// over the list behind a scrim. The filter bar's two rows are in events-filter-bar.scss. The
+// band, not everything under 900: the phone's drawer is a layer and its Signals panel sits in a
+// sheet, and a slide-over rule reaching them put the panel at the sheet's right edge.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.between(bp.$bp-sm, bp.$bp-md) {
+  // Anchors the slide-overs; the list keeps the whole width under them.
+  .events-body { position: relative; }
+
+  // TIME holds the time alone (event-list-row.scss, .ev-dateless); SERVICE is the fixed 120px
+  // events.ts sets in --svc-col for this width.
+  .ev-h-ts { width: 88px; }
+
+  .body-scrim {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    background: rgb(0 0 0 / .45);
+  }
+
+  // The drawer: 440px over the list, its right edge the page's; the resizer is gone (events.html).
+  .event-drawer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    width: 440px;
+    max-width: 100%;
+    box-shadow: var(--shadow);
+  }
+
+  // The Signals panel: the same slide-over at its own width.
+  app-signals-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    box-shadow: var(--shadow);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phone (< 640): a 48px header, a search row and a chip strip (events-toolbar), two-line rows
+// with day separators, a 28px footer, the detail as a layer, everything else a sheet.
+// ═════════════════════════════════════════════════════════════════════════════
+@include bp.below(bp.$bp-sm) {
+  // The toolbar's recent-searches overlay is positioned against the page.
+  .events-page { position: relative; }
+
+  // The list sits under a 1px rule (design: the strip's bottom edge); its rows have no header.
+  .events-list-wrap { border-top: 1px solid var(--border); }
+
+  // ── Day separator ────────────────────────────────────────────────────────
+  // 24px: the date in 10.5px / 600 tabular small caps on --surface, a rule to the right edge.
+  // The height is DAY_SEPARATOR_H in events.ts, which the virtualizer takes as exact.
+  .ev-day {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 24px;
+    padding: 0 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--ui);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    color: var(--txt-dim);
+    box-sizing: border-box;
+  }
+  .ev-day-date { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ev-day-rule { flex: 1; height: 1px; background: var(--border-sub); }
+  // The copy that stays at the top while its own separator has scrolled away: the same 24px
+  // line, sticky, and taking no room in the flow (its negative margin gives the 24px back), so
+  // the virtual rows under it start where they would without it.
+  .ev-day--sticky {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin-bottom: -24px;
+  }
+
+  // ── The held-arrivals pill: 8px under the top of the list (there is no header row) ───────
+  .ev-new-pill {
+    top: 8px;
+    height: 30px;
+    padding: 0 12px;
+    font-size: 11.5px;
+    font-weight: 600;
+    gap: 6px;
+  }
+
+  // ── Footer: 28px, 10.5px; arrows for Older / Newer outside live, "Jump to live" in it ────
+  .events-footer {
+    height: 28px;
+    gap: 6px;
+    padding: 0 6px 0 12px;
+  }
+  .ev-footer-count {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .ev-footer-nav { gap: 2px; }
+  .ev-footer-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    justify-content: center;
+    color: var(--txt-muted);
+  }
+  .ev-footer-btn ::ng-deep svg { width: 13px; height: 13px; }
+  .ev-footer-btn-txt { display: none; }
+  .events-footer.is-live .ev-footer-nav { display: none; }
+  .events-footer.is-live .ev-footer-count { margin-right: auto; }
+  .ev-footer-live {
+    height: 22px;
+    padding: 0 9px;
+    margin-left: 4px;
+    flex-shrink: 0;
+    font-size: 10.5px;
+  }
+  .ev-footer-live:disabled { opacity: .6; }
+
+  .load-more {
+    height: 36px;
+    padding: 0;
+    gap: 8px;
+    font-family: var(--ui);
+    font-size: 10.5px;
+    color: var(--txt-dim);
+  }
+
+  // ── The detail: a layer over the page, above the bottom bar's inset ──────────────────────
+  .event-drawer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: var(--bottom-nav-h, 0px);
+    z-index: 50;
+    width: auto;
+    max-width: none;
+    border-left: none;
+  }
+}
+
+// The "Loading older events…" caption exists for the phone's spinner row only.
+.load-more-text { display: none; }
+@include bp.below(bp.$bp-sm) {
+  .load-more-text { display: inline; }
+}

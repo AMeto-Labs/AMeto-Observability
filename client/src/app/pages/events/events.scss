@@ -232,6 +232,9 @@
   align-items: center;
   padding: 10px 0 14px;
 }
+/* Only the tablet's and desktop's drawer and Signals panel need a scrim, and only below 900px
+   (events.responsive.scss draws it); wider, the drawer is docked and the element is not rendered. */
+.body-scrim { display: none; }
 .load-more-spin {
   display: inline-block;
   width: 16px;
