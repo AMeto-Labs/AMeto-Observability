@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\ManualTimeProvider.cs" Link="Shared\ManualTimeProvider.cs" />
+    <Compile Include="..\Shared\ExceptionShapes.cs" Link="Shared\ExceptionShapes.cs" />
   </ItemGroup>
 
   <ItemGroup>

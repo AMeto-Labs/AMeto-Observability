@@ -479,6 +479,13 @@ public sealed class QueryExecutor : IQueryExecutor
     /// filter the header can answer (<see cref="CompiledFilter.HeaderPredicate"/>: level,
     /// trace / span id, service); the compiled filter then runs here, per materialised
     /// event, as the correctness gate — the same division of labour the cold scan uses.
+    ///
+    /// <para>A materialised hot row carries its exception as a view into the tier's arena,
+    /// valid while <paramref name="hotReader"/> is — which is the whole of this enumeration,
+    /// and is what lets the filter read <c>@x</c> on every candidate without a copy. A row that
+    /// passes leaves the snapshot: the page is serialised after <see cref="ExecuteAsync"/>'s
+    /// finally has released the reader, by when the tier may have flushed and freed its blocks,
+    /// so the row makes its bytes its own here, once, for the rows kept alone.</para>
     /// </summary>
     private static async IAsyncEnumerable<LogEvent> HotEventsAsync(
         IHotTierReader                hotReader,
@@ -499,6 +506,7 @@ public sealed class QueryExecutor : IQueryExecutor
             if (ct.IsCancellationRequested) yield break;
             if (pace.Due()) await ScanPace.Yield();
             if (!filter.Matches(ev)) continue;
+            ev.OwnRawBytes();   // the row outlives the snapshot; its exception was a view into the tier until now
             yield return ev;
         }
     }

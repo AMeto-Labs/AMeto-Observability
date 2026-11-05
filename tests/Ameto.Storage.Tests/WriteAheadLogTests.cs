@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using MessagePack;
 using System.Text;
 using Ameto.Core;
 using Ameto.Storage;
@@ -45,9 +46,9 @@ public sealed class WriteAheadLogTests
         {
             using (var wal = WriteAheadLog.Open(path, new NodeId(0), new SegmentId(1UL), initialCapacity: 1024 * 1024))
             {
-                wal.Append(100, Ameto.Core.LogLevel.Error,       0, "tmpl-a", payloadA, excA);
+                wal.Append(100, Ameto.Core.LogLevel.Error,       0, "tmpl-a", payloadA, excA.ToBytes());
                 wal.Append(200, Ameto.Core.LogLevel.Information, 1, "tmpl-b", payloadB, exception: null);
-                wal.Append(300, Ameto.Core.LogLevel.Fatal,       2, "tmpl-c", ReadOnlySpan<byte>.Empty, excB);
+                wal.Append(300, Ameto.Core.LogLevel.Fatal,       2, "tmpl-c", ReadOnlySpan<byte>.Empty, excB.ToBytes());
             }
 
             var (segId, entries) = WriteAheadLog.ReadForRecovery(path);
@@ -57,6 +58,7 @@ public sealed class WriteAheadLogTests
 
             Assert.Equal(100, entries[0].TimestampTicks);
             Assert.Equal(payloadA, entries[0].Payload);
+            Assert.Equal(excA.ToBytes(), entries[0].ExceptionBytes);   // the bytes as they went in, not a re-encoding
             Assert.NotNull(entries[0].Exception);
             Assert.Equal(excA.Type,          entries[0].Exception!.Type);
             Assert.Equal(excA.Message,       entries[0].Exception!.Message);
@@ -77,6 +79,57 @@ public sealed class WriteAheadLogTests
             File.Delete(path);
             File.Delete(path + ".pool");
         }
+    }
+
+    /// <summary>
+    /// The exception is logged as the bytes the client sent, whatever their shape — a legacy plain
+    /// string, a map with its keys in any order and unknown ones among them — and comes back the
+    /// same: the log normalises nothing. (An event with no exception is logged with none, an entry
+    /// of exception length 0: the round trips above.)
+    /// </summary>
+    [Fact]
+    public void Append_KeepsTheClientsExceptionBytesWhateverTheirShape()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"wal-{Guid.NewGuid():N}.wal");
+        byte[] legacy = Pack((ref MessagePackWriter w) => w.Write("System.Exception: plain text"));
+        byte[] odd    = Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(3);
+            w.Write("zzz");  w.Write("ignored");
+            w.Write("msg");  w.Write("only a message");
+            w.Write("type"); w.Write("Some.Type");
+        });
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(0), new SegmentId(1UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(100, Ameto.Core.LogLevel.Error, 0, "tmpl", [1], legacy);
+                wal.Append(200, Ameto.Core.LogLevel.Error, 0, "tmpl", [2], odd);
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(2, entries.Count);
+            Assert.Equal(legacy, entries[0].ExceptionBytes);
+            Assert.Equal(("Exception", "System.Exception: plain text"), (entries[0].Exception!.Type, entries[0].Exception!.Message));
+            Assert.Equal(odd, entries[1].ExceptionBytes);
+            Assert.Equal(("Some.Type", "only a message"), (entries[1].Exception!.Type, entries[1].Exception!.Message));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".pool");
+        }
+    }
+
+    private delegate void PackAction(ref MessagePackWriter writer);
+
+    private static byte[] Pack(PackAction write)
+    {
+        var buf = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var w   = new MessagePackWriter(buf);
+        write(ref w);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
     }
 
     /// <summary>
@@ -546,27 +599,30 @@ public sealed class WriteAheadLogTests
     /// <summary>
     /// Round-5 review L-17. The append encodes an event's exception into a per-thread scratch buffer, which
     /// kept the largest exception its thread ever wrote — megabytes on each writer thread, for the life of
-    /// the thread. Grown past a megabyte, it is let go once the entry is written; the entry is whole.
+    /// the thread. There is no scratch any more: the exception arrives as bytes and is copied into the
+    /// entry once, whatever its size, and comes back from the log byte for byte.
     /// </summary>
     [Fact]
-    public void A_writer_thread_keeps_no_exception_scratch_past_a_megabyte()
+    public void A_large_exception_is_copied_into_its_entry_once_with_no_scratch()
     {
         string path  = NewWalPath();
         var    stack = new string('s', 4_000_000);
+        byte[] exc   = new ExceptionInfo { Type = "System.Exception", Message = "boom", StackTrace = stack }.ToBytes();
         try
         {
             using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 1024 * 1024))
             {
-                wal.Append(1_000, LogLevel.Error, 0, "failed {n}", [1],
-                           new ExceptionInfo { Type = "System.Exception", Message = "boom", StackTrace = stack });
-
-                var scratch = typeof(WriteAheadLog).GetField("_tExc", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
-                                                   .GetValue(null) as System.Buffers.ArrayBufferWriter<byte>;
-                Assert.True((scratch?.Capacity ?? 0) <= 1 << 20, $"the thread kept {scratch?.Capacity:N0} B of exception scratch");
+                wal.Append(1_000, LogLevel.Error, 0, "failed {n}", [1], exc);   // the mapping grows: not counted below
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                wal.Append(2_000, LogLevel.Error, 0, "failed {n}", [2], exc);
+                long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                Assert.True(allocated < 1024, $"appending a 4 MB exception allocated {allocated:N0} B on the heap");
             }
 
             var (_, entries) = WriteAheadLog.ReadForRecovery(path);
-            Assert.Equal(stack, Assert.Single(entries).Exception!.StackTrace);
+            Assert.Equal(2, entries.Count);
+            Assert.All(entries, e => Assert.Equal(exc, e.ExceptionBytes));
+            Assert.Equal(stack, entries[1].Exception!.StackTrace);
         }
         finally { File.Delete(path); File.Delete(path + ".pool"); }
     }
@@ -644,8 +700,8 @@ public sealed class WriteAheadLogTests
             using (var wal = WriteAheadLog.Open(path, new NodeId(3), new SegmentId(42UL), initialCapacity: 64 * 1024))
             {
                 wal.Append(1_000, LogLevel.Information, 1, "event {n}",  [0xA1]);
-                wal.Append(2_000, LogLevel.Error,       2, "failed {n}", [0xB1], exception: exc);
-                wal.Append(3_000, LogLevel.Information, 1, "event {n}",  [0xC1], exception: exc);
+                wal.Append(2_000, LogLevel.Error,       2, "failed {n}", [0xB1], exception: exc.ToBytes());
+                wal.Append(3_000, LogLevel.Information, 1, "event {n}",  [0xC1], exception: exc.ToBytes());
             }
             PoisonException(path, entry: 1);
 

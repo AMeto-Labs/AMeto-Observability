@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Text.Json;
 using Ameto.Core.Serialization;
+using MessagePack;
 
 namespace Ameto.Core;
 
@@ -78,10 +80,22 @@ public static class LogEventJsonWriter
         int lvl = (int)ev.Level;
         writer.WriteString(NameLevel, (uint)lvl < (uint)LevelNames.Length ? LevelNames[lvl] : LevelNames[2]);
 
-        if (ev.Exception is { } x)
+        // From the bytes wherever the event carries them (a segment row, a hot-tier row, an ingest
+        // body), and from the tree only where something already built it — or set it directly.
+        // Delivery used to build the tree for every returned row to walk it once: the node chain
+        // and a UTF-16 copy of every stack frame, 3.5 KB per row, for bytes that go out as they are.
+        if (ev.ExceptionMaterialised)
         {
-            writer.WritePropertyName(NameException);
-            WriteException(writer, x);
+            if (ev.Exception is { } x)
+            {
+                writer.WritePropertyName(NameException);
+                WriteException(writer, x);
+            }
+        }
+        else if (!ev.RawException.IsEmpty)
+        {
+            var reader = new MessagePackReader(ev.RawException);
+            WriteException(writer, ref reader, NameException, depth: 1);
         }
 
         ev.Id.RawValue.TryFormat(scratch, out written, default, null);
@@ -134,6 +148,108 @@ public static class LogEventJsonWriter
             WriteException(writer, i);
         }
         writer.WriteEndObject();
+    }
+
+    /// <summary>The type an exception map takes when it carries none — <c>ExceptionInfo.ReadAtDepth</c>'s default.</summary>
+    private static readonly JsonEncodedText DefaultExType = JsonEncodedText.Encode("Exception");
+
+    /// <summary>
+    /// The exception property straight from its msgpack: byte for byte what
+    /// <see cref="WriteException(Utf8JsonWriter, ExceptionInfo)"/> writes for
+    /// <see cref="ExceptionInfo.FromBytes(ReadOnlyMemory{byte})"/> of the same bytes, with no tree in
+    /// between. Nothing is written — not even <paramref name="name"/> — where the value decodes to
+    /// no exception (nil, an empty legacy string, a value that is neither string nor map), which is
+    /// how an absent <c>inner</c> stays absent.
+    ///
+    /// <para>Each branch mirrors one of <c>ExceptionInfo.ReadAtDepth</c>: the fields go out in the
+    /// tree's order whatever order the map holds them in, a repeated key keeps its last value, a
+    /// <c>type</c> that is absent or nil is <c>"Exception"</c>, a nil <c>msg</c> or <c>stk</c> is
+    /// omitted, a legacy string is <c>{type: "Exception", message}</c>, and an <c>inner</c> below
+    /// <see cref="ExceptionInfo.MaxDepth"/> is dropped. A value that is not a string where the tree
+    /// read one throws what the tree's decode threw, from inside the object — the SSE writer
+    /// discards the frame it was composing, and the list endpoint fails the response, as either did
+    /// when the throw came out of <see cref="LogEvent.Exception"/>. <c>ExceptionBytesContractTests</c>
+    /// pins the two roads against each other over every shape.</para>
+    /// </summary>
+    private static void WriteException(Utf8JsonWriter writer, ref MessagePackReader reader, JsonEncodedText name, int depth)
+    {
+        if (reader.TryReadNil()) return;
+
+        if (reader.NextMessagePackType == MessagePackType.String)
+        {
+            if (!reader.TryReadStringSpan(out ReadOnlySpan<byte> legacy))
+            {
+                // A string across segments cannot occur over one memory; kept exact for the tree's sake.
+                var seq = reader.ReadStringSequence();
+                if (seq is not { IsEmpty: false } s) return;
+                legacy = s.ToArray();
+            }
+            if (legacy.IsEmpty) return;
+            writer.WritePropertyName(name);
+            writer.WriteStartObject();
+            writer.WriteString(NameExType, DefaultExType);
+            // Ill-formed UTF-8 goes the tree's road, as in WriteStringField.
+            if (System.Text.Unicode.Utf8.IsValid(legacy)) writer.WriteString(NameExMessage, legacy);
+            else                                          writer.WriteString(NameExMessage, System.Text.Encoding.UTF8.GetString(legacy));
+            writer.WriteEndObject();
+            return;
+        }
+
+        if (reader.NextMessagePackType != MessagePackType.Map)
+        {
+            reader.Skip();
+            return;
+        }
+
+        // One pass to find the LAST value of each key (bookmarks into the same memory), then the
+        // fields in the tree's order: the map's own order is the client's and carries no meaning.
+        int fields = reader.ReadMapHeader();
+        MessagePackReader typeAt = default, msgAt = default, stkAt = default, innerAt = default;
+        bool hasType = false, hasMsg = false, hasStk = false, hasInner = false;
+        for (int i = 0; i < fields; i++)
+        {
+            ExceptionInfo.ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> key)
+                ? ExceptionInfo.ClassifyKey(key)
+                : ExceptionInfo.ClassifyKey(reader.ReadString());
+            switch (field)
+            {
+                case ExceptionInfo.ExcField.Type:    typeAt  = reader; hasType  = true; break;
+                case ExceptionInfo.ExcField.Message: msgAt   = reader; hasMsg   = true; break;
+                case ExceptionInfo.ExcField.Stack:   stkAt   = reader; hasStk   = true; break;
+                case ExceptionInfo.ExcField.Inner:   innerAt = reader; hasInner = true; break;
+            }
+            reader.Skip();
+        }
+
+        writer.WritePropertyName(name);
+        writer.WriteStartObject();
+        if (hasType && !typeAt.TryReadNil()) WriteStringField(writer, NameExType, ref typeAt);
+        else                                 writer.WriteString(NameExType, DefaultExType);
+        if (hasMsg && !msgAt.TryReadNil())   WriteStringField(writer, NameExMessage, ref msgAt);
+        if (hasStk && !stkAt.TryReadNil())   WriteStringField(writer, NameExStack,   ref stkAt);
+        if (hasInner && depth < ExceptionInfo.MaxDepth)
+            WriteException(writer, ref innerAt, NameExInner, depth + 1);
+        writer.WriteEndObject();
+    }
+
+    /// <summary>
+    /// A string field from its UTF-8 in place, where the writer escapes it exactly as it escapes the
+    /// <see cref="string"/> the tree held — for well-formed UTF-8. Ill-formed bytes take the tree's
+    /// own road (<c>ReadString</c>, which replaces them with U+FFFD, then the string overload),
+    /// because the writer's UTF-8 overload escapes the replacement it makes (<c>�</c>) where the
+    /// relaxed encoder leaves a replacement character in a string as it is, and the bytes on the
+    /// wire must not depend on which road a row took. <c>ExceptionBytesContractTests</c> pins both.
+    /// A value that is not a string throws out of <c>ReadString</c>, as the tree's decode did.
+    /// </summary>
+    private static void WriteStringField(Utf8JsonWriter writer, JsonEncodedText name, ref MessagePackReader at)
+    {
+        if (!at.TryReadStringSpan(out ReadOnlySpan<byte> utf8))
+        {
+            writer.WriteString(name, at.ReadString());   // nil, a value that is not a string (throws), a string across segments
+            return;
+        }
+        if (System.Text.Unicode.Utf8.IsValid(utf8)) writer.WriteString(name, utf8);
+        else                                        writer.WriteString(name, System.Text.Encoding.UTF8.GetString(utf8));
     }
 
     /// <summary>

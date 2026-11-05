@@ -83,18 +83,24 @@ public static class LogEventSerializer
     // ── Streaming batch read (no LogEvent per event) ─────────────────────────
 
     /// <summary>
-    /// Receives one CLEF event straight off the wire — no <see cref="LogEvent"/>, no
-    /// strings except the structured exception. Every span points into the caller's body
-    /// buffer (or into per-thread scratch) and is valid only for the duration of the call.
+    /// Receives one CLEF event straight off the wire — no <see cref="LogEvent"/>, no strings.
+    /// Every span points into the caller's body buffer (or into per-thread scratch) and is valid
+    /// only for the duration of the call.
     /// </summary>
     public interface IClefBatchSink
     {
+        /// <param name="exceptionMsgpack">
+        /// The event's <c>@x</c> as it arrived — the msgpack of a structured map or of a legacy plain
+        /// string — validated to be a value <see cref="ExceptionInfo.Read"/> reads as an exception;
+        /// empty when the event has none (or one Read reads as none: nil, an empty string). Kept as
+        /// bytes all the way to the segment: see <see cref="LogEvent.RawException"/>.
+        /// </param>
         /// <returns>True when the event was ingested; false when it was dropped.</returns>
         bool TryIngestClef(
             long tsTicks,
             byte level,
             ReadOnlySpan<byte> templateUtf8,
-            ExceptionInfo? exception,
+            ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps,
             ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8);
@@ -127,7 +133,7 @@ public static class LogEventSerializer
     /// <summary>
     /// Streaming counterpart of <see cref="DeserializeBatch"/>: walks the CLEF array and
     /// hands each event to <paramref name="sink"/> as spans, with zero managed allocation
-    /// per event (the only exception is a structured <c>@x</c>, which has to be an object).
+    /// per event — the structured <c>@x</c> included, which travels as the bytes it arrived in.
     ///
     /// <para>Takes contiguous memory, not a sequence: the ingest body is always one pooled
     /// array, and contiguity is what lets every string be read as a span.</para>
@@ -237,11 +243,11 @@ public static class LogEventSerializer
         ReadOnlySpan<byte> msgUtf8   = default;   // CLEF @m — template fallback only
         ReadOnlySpan<byte> svcUtf8   = default;   // @service
         ReadOnlySpan<byte> legacySvc = default;   // service.name — see ServiceTieRule
-        ExceptionInfo? exception     = null;
-        // Where @x is: decoded once the event is known to be kept (round-5 review L-17). Decoded where
-        // it stood, an event then refused as oversized had built its exception for nothing, charged to
-        // nothing — 15.6 MB of strings for an 8.4 MB @x.
-        SequencePosition exceptionAt = default;
+        // Where @x is: its bytes are sliced, and validated, once the event is known to be kept
+        // (round-5 review L-17: decoded where it stood, an event then refused as oversized had built
+        // its exception for nothing, charged to nothing — 15.6 MB of strings for an 8.4 MB @x).
+        SequencePosition exceptionAt  = default;
+        SequencePosition exceptionEnd = default;
         bool             hasException = false;
         ulong traceIdHi = 0, traceIdLo = 0, spanId = 0;
 
@@ -268,8 +274,9 @@ public static class LogEventSerializer
                 case ClefField.LegacyServiceName: legacySvc = ReadUtf8Value(ref reader); break;
                 case ClefField.Exception:
                     exceptionAt  = reader.Position;
-                    hasException = true;
                     reader.Skip();
+                    exceptionEnd = reader.Position;
+                    hasException = true;
                     break;
                 case ClefField.TraceId:
                     TraceIdHelper.TryParseTraceId(ReadUtf8Value(ref reader), out traceIdHi, out traceIdLo);
@@ -319,10 +326,17 @@ public static class LogEventSerializer
         if (svcUtf8.IsEmpty) svcUtf8 = legacySvc;
 
         // The last @x, as the field loop's assignment kept the last; never for an event refused below.
+        // Its bytes as they lie in the body, not a tree built from them: validated the way the decoder
+        // read them, so a value the decoder refused (a non-string type, a torn map) still refuses the
+        // batch here, with the same exception, and one it read as no exception (nil, an empty string,
+        // a scalar) is none. The sink copies the bytes once, into its batch; nothing decodes them
+        // again until a consumer wants a field.
+        ReadOnlySpan<byte> exception = default;
         if (hasException && !oversized)
         {
-            var at = new MessagePackReader(sourceSequence.Slice(exceptionAt));
-            exception = ExceptionInfo.Read(ref at);
+            var slice = sourceSequence.Slice(exceptionAt, exceptionEnd);
+            ReadOnlyMemory<byte> raw = slice.IsSingleSegment ? slice.First : slice.ToArray();   // the body is one array
+            if (ExceptionInfo.Validate(raw)) exception = raw.Span;
         }
 
         if (oversized)
@@ -426,8 +440,10 @@ public static class LogEventSerializer
         var buffer = new ArrayBufferWriter<byte>(256);
         var writer = new MessagePackWriter(buffer);
 
+        // The bytes it arrived in go back out as they are; only a tree set directly is serialised.
+        bool hasException = evt.ExceptionMaterialised ? evt.Exception is not null : evt.HasException;
         int propCount = (evt.Properties?.Count ?? 0)
-                      + (evt.Exception is not null ? 1 : 0)
+                      + (hasException ? 1 : 0)
                       + 3; // @t, @mt, @l always present
 
         writer.WriteMapHeader(propCount);
@@ -441,10 +457,11 @@ public static class LogEventSerializer
         writer.Write(ClefFields.MessageTemplate);
         writer.Write(evt.MessageTemplate);
 
-        if (evt.Exception is not null)
+        if (hasException)
         {
             writer.Write(ClefFields.Exception);
-            evt.Exception.Write(ref writer);
+            if (evt.ExceptionMaterialised) evt.Exception!.Write(ref writer);
+            else                           writer.WriteRaw(evt.RawException.Span);
         }
 
         if (evt.Properties is not null)
@@ -524,7 +541,7 @@ public static class LogEventSerializer
         string? messageTemplate = null;
         string? levelStr        = null;
         string? messageFallback = null;   // CLEF @m — promoted to @mt only if @mt missing
-        ExceptionInfo? exception = null;
+        ReadOnlyMemory<byte> rawException = default;   // the last @x's bytes, copied out below
         ulong   traceIdHi = 0, traceIdLo = 0, spanId = 0;
         string? serviceName = null;          // @service
         string? legacyServiceName = null;    // service.name — see ServiceTieRule
@@ -563,8 +580,15 @@ public static class LogEventSerializer
                     messageFallback = reader.ReadString();
                     break;
                 case ClefField.Exception:
-                    exception = ExceptionInfo.Read(ref reader);
+                {
+                    // The bytes, as the streaming path keeps them (StreamEvent): the event's own copy,
+                    // validated as Read would read it, and none at all for a value Read reads as null.
+                    SequencePosition valueStart = reader.Position;
+                    reader.Skip();
+                    byte[] raw = sourceSequence.Slice(valueStart, reader.Position).ToArray();
+                    rawException = ExceptionInfo.Validate(raw) ? raw : default;
                     break;
+                }
                 case ClefField.TraceId:
                 {
                     string? hex = reader.ReadString();
@@ -647,7 +671,7 @@ public static class LogEventSerializer
             Timestamp       = ts,
             Level           = level,
             MessageTemplate = finalTemplate,
-            Exception       = exception,
+            RawException    = rawException,
             Properties      = null,
             RawProperties   = rawProps,
             TraceIdHi       = traceIdHi,

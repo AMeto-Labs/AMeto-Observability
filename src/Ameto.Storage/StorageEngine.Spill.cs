@@ -190,9 +190,10 @@ public sealed partial class StorageEngine
     /// no id here — the despill assigns it, from the same timestamp.
     /// </summary>
     private WriteOutcome SpillLocked(SpillTarget spill, in LogEventHeader h, ReadOnlySpan<byte> payload,
-                                     string? template, ExceptionInfo? exception, string? service = null)
+                                     string? template, ReadOnlySpan<byte> exception, string? service = null)
     {
-        if (spill.Full || !spill.Admission.TryAdmit(payload.Length, OwnManagedBytes(h, template, exception, service)))
+        // Admitted as a tier would admit it: the properties against the chunk, the exception against the limit.
+        if (spill.Full || !spill.Admission.TryAdmit(payload.Length, OwnManagedBytes(h, template, service), exception.Length))
         {
             // A tier would refuse this event: the block is closed here and the next one opened by
             // the swap, so the despill replays it into ONE tier. The event waits for that one. The
@@ -1505,7 +1506,7 @@ public sealed partial class StorageEngine
                 };
                 if (tier.TryWrite(header, e.Payload, tmpl, e.Exception, svcKept))
                 {
-                    ownText += OwnManagedBytes(in header, tmpl, e.Exception, svcKept);
+                    ownText += OwnManagedBytes(in header, tmpl, svcKept);
                     NotifyEventWritten(in header, tmpl ?? string.Empty);
                 }
                 else

@@ -19,7 +19,7 @@ namespace Ameto.Storage;
 ///      spanId uint64]
 ///     [Template — only with the InlineTemplate flag: byteLength uint32, then that many UTF-8 bytes]
 ///     [Service — only with the InlineService flag: byteLength uint32, then that many UTF-8 bytes]
-///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
+///     [Entry Payload — raw msgpack bytes][Exception — the CLEF @x as it arrived: a msgpack map or a legacy string]
 ///   [Entry 1 …]
 ///   ...
 ///
@@ -162,7 +162,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         public byte   Level;
         public byte   Flags;           // EntryFlag* bits; was never-written padding (see the class doc)
         public ushort TemplateIndex;   // index into companion .pool file; 0 and meaningless when Unpooled
-        public uint   ExceptionLength; // bytes of msgpack ExceptionInfo appended after payload
+        public uint   ExceptionLength; // bytes of the exception's msgpack appended after the payload
         public ushort ServiceIndex;    // v5: @service's index into the same pool; 0 and meaningless without the Service flag
         public uint   Checksum;        // CRC32C over header[0..22) + payload + exception
     }
@@ -358,17 +358,17 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // ── Append ───────────────────────────────────────────────────────────────
 
-    // Reused per thread: exception msgpack scratch — the bytes are copied into the mmap
-    // below, so nothing outlives the call. Avoids a byte[] per exception-carrying event.
-    [ThreadStatic] private static System.Buffers.ArrayBufferWriter<byte>? _tExc;
-
-    /// <summary>The most of <see cref="_tExc"/> a thread keeps between appends.</summary>
-    private const int KeepExcScratchBytes = 1 << 20;
-
     /// <summary>
     /// Appends a single event payload to the WAL. Thread-safe via lock.
     /// Fast path: a single Span copy into the mmap region.
     /// </summary>
+    /// <param name="exception">
+    /// The event's <c>@x</c> as its msgpack arrived (a map, or a legacy plain string — a value
+    /// <see cref="ExceptionInfo.Read"/> reads as an exception; see <see cref="ExceptionInfo.Validate"/>),
+    /// copied into the entry behind the payload; empty for none. It used to be serialised here from
+    /// the tier's object tree, into a scratch each writer thread kept, for every exception-carrying
+    /// event — and again by the flush.
+    /// </param>
     /// <param name="templateIndex">
     /// The event's template-pool index. Anything outside <c>[0, 65 535]</c> (-1 once the pool
     /// is full, or a claim past its cap) is logged as UNPOOLED: the entry carries the Unpooled
@@ -394,7 +394,7 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// <param name="spanId">The event's span id.</param>
     /// <returns>True once the entry is in the log. False only for a spill target's log (see <see cref="Open"/>) that has no room left for it: nothing was written, and the spill rotates.</returns>
     public unsafe bool Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload,
-                              ExceptionInfo? exception = null, int serviceIndex = -1, string? service = null,
+                              ReadOnlySpan<byte> exception = default, int serviceIndex = -1, string? service = null,
                               ulong traceIdHi = 0, ulong traceIdLo = 0, ulong spanId = 0)
     {
         // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
@@ -465,20 +465,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         int    serviceBytes  = inlineService ? Encoding.UTF8.GetByteCount(service!) : 0;
         int    inlineSvcLen  = inlineService ? 4 + serviceBytes : 0;
 
-        ReadOnlySpan<byte> excBytes = default;
-        if (exception is not null)
-        {
-            var buf = _tExc ??= new System.Buffers.ArrayBufferWriter<byte>(256);
-            buf.Clear();
-            var w = new MessagePack.MessagePackWriter(buf);
-            exception.Write(ref w);
-            w.Flush();
-            excBytes = buf.WrittenSpan;
-            // Grown past KeepExcScratchBytes, it is not kept on the thread (round-5 review L-17): each
-            // writer thread kept the largest @x it ever wrote, for the life of the thread. The span above
-            // holds the buffer until the copy below.
-            if (buf.Capacity > KeepExcScratchBytes) _tExc = null;
-        }
+        // The exception goes into the entry as it came: one copy, below, under the checksum.
+        ReadOnlySpan<byte> excBytes = exception;
         bool hasTrace  = (traceIdHi | traceIdLo | spanId) != 0;
         int  traceLen  = hasTrace ? TraceContextSize : 0;
         int  entrySize = EntryHeaderSize + traceLen + inlineLen + inlineSvcLen + payload.Length + excBytes.Length;
@@ -1093,10 +1081,15 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 return false;
         }
 
-        ExceptionInfo? exception      = null;
-        Exception?     exceptionFault = null;
+        ReadOnlySpan<byte> exception      = default;
+        Exception?         exceptionFault = null;
         if (eh.ExceptionLength > 0)
         {
+            // The bytes are handed on as they lie in the entry, and only VALIDATED here — read the way
+            // the tree's decoder reads them, building nothing (ExceptionInfo.Validate): a value it
+            // reads as no exception (nil, an empty string) is none, and a value it refuses is refused
+            // here, with the same exception.
+            //
             // v3 entries carry no checksum, so garbage here throws deep inside msgpack — treat it as
             // the end of the durable data instead of failing the whole WAL.
             //
@@ -1112,15 +1105,21 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             // start that logs neither replay line waited with it. The event is read without its
             // exception now, the rest of it whole, and the record says why (ExceptionDecodeError):
             // the replay and the despill name it in an Error.
+            var view = _tExcView ??= new PinnedSpanMemoryManager();
             try
             {
                 BeforeExceptionDecodeForTest.Value?.Invoke();   // stands in for the decode throwing
-                exception = ExceptionInfo.FromBytes(excSpan);
+                view.Set(body + (int)eh.PayloadLength, (int)eh.ExceptionLength);
+                if (ExceptionInfo.Validate(view.Memory)) exception = excSpan;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 if (layout == EntryLayout.V3) return false;
                 exceptionFault = ex;
+            }
+            finally
+            {
+                view.Set(null, 0);
             }
         }
 
@@ -1518,6 +1517,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// </summary>
     internal static readonly AsyncLocal<Action?> BeforeExceptionDecodeForTest = new();
 
+    /// <summary>
+    /// Reused per thread: a view over the mapping for <see cref="ExceptionInfo.Validate"/>, which
+    /// reads through a <c>MessagePackReader</c> and so wants memory, not a span. Re-pointed per entry,
+    /// cleared after it; the mapping is unmanaged, so nothing is pinned.
+    /// </summary>
+    [ThreadStatic] private static PinnedSpanMemoryManager? _tExcView;
+
     /// <summary>Test seam: called by <see cref="LoadPool"/> with each row's index before it reads the row. Null in production.</summary>
     internal static readonly AsyncLocal<Action<ushort>?> BeforePoolRowForTest = new();
 
@@ -1752,7 +1758,12 @@ public readonly ref struct WalRecord
     public string?            Service        { get; init; }
     /// <summary>The properties payload, over the mapping: valid until the reader is disposed.</summary>
     public ReadOnlySpan<byte> Payload        { get; init; }
-    public ExceptionInfo?     Exception      { get; init; }
+    /// <summary>
+    /// The event's exception as its msgpack lies in the entry (see <see cref="WriteAheadLog.Append"/>),
+    /// over the mapping like <see cref="Payload"/>; empty for none, and for one whose bytes verified
+    /// but do not decode (<see cref="ExceptionDecodeError"/>).
+    /// </summary>
+    public ReadOnlySpan<byte> Exception      { get; init; }
     /// <inheritdoc cref="WalEntry.ExceptionDecodeError"/>
     public Exception?         ExceptionDecodeError { get; init; }
 
@@ -1774,7 +1785,7 @@ public readonly ref struct WalRecord
         Template       = Template,
         Service        = Service,
         Payload        = Payload.IsEmpty ? [] : Payload.ToArray(),
-        Exception      = Exception,
+        ExceptionBytes = Exception.IsEmpty ? [] : Exception.ToArray(),
         ExceptionDecodeError = ExceptionDecodeError,
     };
 }
@@ -1825,10 +1836,15 @@ public sealed class WalEntry
     public string?        Service        { get; init; }
 
     public byte[]         Payload        { get; init; } = [];
-    public ExceptionInfo? Exception      { get; init; }
+
+    /// <summary>The event's exception as its msgpack lies in the entry (<see cref="WalRecord.Exception"/>), copied; empty for none.</summary>
+    public byte[]         ExceptionBytes { get; init; } = [];
+
+    /// <summary>The exception decoded from <see cref="ExceptionBytes"/>, or null for none — a materialised view for callers that want the tree.</summary>
+    public ExceptionInfo? Exception => ExceptionBytes.Length == 0 ? null : ExceptionInfo.FromBytes(ExceptionBytes);
 
     /// <summary>
-    /// Why the event's exception is not in <see cref="Exception"/>: the entry verified — its bytes are
+    /// Why the event's exception is not in <see cref="ExceptionBytes"/>: the entry verified — its bytes are
     /// the ones written — and the decode of its exception failed on them, as it will at every reading.
     /// The event is read without it, the rest of it whole; null otherwise. (An out-of-memory decoding
     /// it says nothing about the bytes, and fails the walk instead.)

@@ -25,7 +25,8 @@ namespace Ameto.Storage;
 ///   2 @l  : byte [eventCount]
 ///   3 @i  : uint64[eventCount]               — id - blockMinEventId
 ///   4 @mt : string column                    — uint32[eventCount+1] offsets + utf8 bytes
-///   5 @x  : nullable msgpack ExceptionInfo   — uint32[eventCount+1] offsets + bytes
+///   5 @x  : nullable msgpack exception      — uint32[eventCount+1] offsets + bytes: the CLEF @x as it
+///                                              arrived (a map, or a legacy string; ExceptionInfo.Read)
 ///                                              (offset[i+1] == offset[i] ⇒ null)
 ///   6 props: nullable msgpack map            — uint32[eventCount+1] offsets + bytes
 ///
@@ -404,11 +405,9 @@ public sealed class SegmentWriter : IDisposable
             // exceeds that hands out fresh instances for values it had already collapsed.
             ReadOnlySpan<byte> tmplUtf8 = _tmplUtf8.Encode(ev.MessageTemplate);
             ReadOnlySpan<byte> svcUtf8  = _svcUtf8.Encode(ev.ServiceName);
-            // Approximate: the exception blob is only serialised once, at staging time (and on
-            // the merge path not at all — its bytes are copied straight through).
+            // Exact for the exception too: its bytes are copied straight through on every path.
             int rowCost   = (int)FixedRowCostBytes
-                          + tmplUtf8.Length + svcUtf8.Length + ev.Properties.Length
-                          + (ev.HasException ? Math.Max(64, ev.ExceptionPayload.Length) : 0);
+                          + tmplUtf8.Length + svcUtf8.Length + ev.Properties.Length + ev.ExceptionPayload.Length;
 
             if (_stagedCount > 0 && _stagedBytes + rowCost > BlockSize)
             {
@@ -788,10 +787,6 @@ public sealed class SegmentWriter : IDisposable
     private readonly Utf8Memo _tmplUtf8 = new();
     private readonly Utf8Memo _svcUtf8  = new();
 
-    /// <summary>Adapter that lets a <see cref="MessagePackWriter"/> serialise into the exception
-    /// column's scratch. Allocated on the first exception-carrying event, never after.</summary>
-    private ScratchBufferWriter? _excWriter;
-
     private int   _stagedCount;
     private int   _stagedBytes;
     private long  _blockMinTs = long.MaxValue;
@@ -841,25 +836,11 @@ public sealed class SegmentWriter : IDisposable
         _tmplBytes.Append(tmplUtf8);
 
         _excOffsets[k] = (uint)_excBytes.Length;
-        // Prefer the raw payload: on the merge path the bytes are already in the shape this
-        // column stores, so re-encoding them would be a decode and an encode per row for an
-        // identical result. Only a producer that holds the decoded form (the hot tier) pays it.
-        if (!ev.ExceptionPayload.IsEmpty)
-        {
-            _excBytes.Append(ev.ExceptionPayload);
-        }
-        else if (ev.Exception is not null)
-        {
-            // Serialised STRAIGHT INTO the column. ToBytes() built an ArrayBufferWriter, grew
-            // it (a fresh array each doubling), copied the result out with ToArray() and copied
-            // that into the column — four allocations and two copies of a blob that can be
-            // kilobytes of stack trace, on every exception-carrying event. A level-split flush
-            // makes an Error tier 100 % of those.
-            _excWriter ??= new ScratchBufferWriter(_excBytes);
-            var mp = new MessagePackWriter(_excWriter);
-            ev.Exception.Write(ref mp);
-            mp.Flush();
-        }
+        // The bytes as the producer holds them — the hot tier's arena on a flush, a source file's
+        // column on a merge — copied through: the column stores the client's own msgpack, so
+        // there is nothing to encode. The flush used to serialise the tier's object tree here, a
+        // second time after the WAL had, for every exception-carrying event of an Error tier.
+        _excBytes.Append(ev.ExceptionPayload);
 
         _propsOffsets[k] = (uint)_propsBytes.Length;
         _propsBytes.Append(ev.Properties);
@@ -1084,37 +1065,6 @@ public sealed class SegmentWriter : IDisposable
             long grown = Math.Max(needed, Math.Min((long)Buffer.Length * 2, int.MaxValue));
             Array.Resize(ref Buffer, (int)grown);
         }
-    }
-
-    /// <summary>
-    /// <see cref="IBufferWriter{T}"/> over a <see cref="ScratchBuffer"/>, so a
-    /// <see cref="MessagePackWriter"/> serialises an exception into the column it is bound for
-    /// rather than into a buffer of its own that is then copied twice.
-    /// </summary>
-    private sealed class ScratchBufferWriter(ScratchBuffer target) : IBufferWriter<byte>
-    {
-        /// <summary>Free tail handed to a writer that asked for no particular size. Large
-        /// enough that msgpack's token-at-a-time writing does not re-enter per field.</summary>
-        private const int MinFreeTail = 256;
-
-        private readonly ScratchBuffer _target = target;
-
-        public void Advance(int count) => _target.Commit(count);
-
-        public Memory<byte> GetMemory(int sizeHint = 0)
-        {
-            Grow(sizeHint);
-            return _target.Buffer.AsMemory(_target.Length);
-        }
-
-        public Span<byte> GetSpan(int sizeHint = 0)
-        {
-            Grow(sizeHint);
-            return _target.Buffer.AsSpan(_target.Length);
-        }
-
-        private void Grow(int sizeHint)
-            => _target.EnsureCapacity(_target.Length + Math.Max(sizeHint, MinFreeTail));
     }
 
     /// <summary>

@@ -238,62 +238,67 @@ public sealed class HotTierSegmentTests : IDisposable
 }
 
 /// <summary>
-/// The per-chunk template / exception arrays are pooled. A recycled array must come back
-/// clean: a slot the new tier's writer never fills reads as "no template / no exception",
-/// never as whatever the previous tier left there.
+/// The per-chunk template / service arrays are pooled. A recycled array must come back
+/// clean: a slot the new tier's writer never fills reads as "no template / no service",
+/// never as whatever the previous tier left there. The exception is not a slot array at all:
+/// it is bytes in the arena, and a slot without one reads as empty.
 /// </summary>
 public sealed class HotTierSlotArrayRecyclingTests
 {
     [Fact]
     public void A_recycled_chunk_array_never_leaks_the_previous_tiers_templates()
     {
-        var ex = new ExceptionInfo { Type = "T", Message = "m" };
+        byte[] ex = new ExceptionInfo { Type = "T", Message = "m" }.ToBytes();
         for (int round = 0; round < 8; round++)
         {
             using var tier = new HotTierSegment(64, 64 * 1024);
-            // Fill slots 0..15 with a template + exception, then dispose (returns the arrays).
+            // Fill slots 0..15 with a template + service + exception, then dispose (returns the arrays).
             for (int i = 0; i < 16; i++)
-                Assert.True(tier.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, "tmpl-" + i, ex));
+                Assert.True(tier.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, "tmpl-" + i, ex, "svc-" + i));
         }
 
         using var fresh = new HotTierSegment(64, 64 * 1024);
-        // Write slots 0..15 WITHOUT a template or exception; slot 3 with both.
+        // Write slots 0..15 WITHOUT a template, a service or an exception; slot 3 with all three.
         for (int i = 0; i < 16; i++)
-            Assert.True(fresh.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, i == 3 ? "only-three" : null, i == 3 ? ex : null));
+            Assert.True(fresh.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, i == 3 ? "only-three" : null, i == 3 ? ex : default,
+                                       i == 3 ? "only-three-svc" : null));
 
         for (int i = 0; i < 16; i++)
         {
             Assert.Equal(i == 3 ? "only-three" : null, fresh.GetTemplate(i));
-            Assert.Same(i == 3 ? ex : null, fresh.GetException(i));
+            Assert.Equal(i == 3 ? "only-three-svc" : null, fresh.GetService(i));
+            Assert.True(fresh.GetExceptionPayload(i).SequenceEqual(i == 3 ? ex : ReadOnlySpan<byte>.Empty));
         }
         var events = fresh.ReadAll().ToList();
         Assert.Equal(16, events.Count);
         Assert.All(events.Where(e => e.Id.RawValue != new EventId(0u, 3u).RawValue), e => Assert.Null(e.Exception));
+        Assert.Equal("T", events.Single(e => e.Id.RawValue == new EventId(0u, 3u).RawValue).Exception?.Type);
     }
 
     /// <summary>
     /// A write that throws stored nothing — the caller takes the throw for exactly that and writes
-    /// the event again. The template used to be stored in its slot before the exception array was
+    /// the event again. The template used to be stored in its slot before the next array was
     /// rented, so a rent that ran out of memory left it there, and the next event written into the
     /// slot, with no template of its own, came back with it.
     /// </summary>
     [Fact]
-    public void A_write_that_throws_renting_its_exception_array_leaves_its_template_to_no_later_event()
+    public void A_write_that_throws_renting_its_service_array_leaves_its_template_to_no_later_event()
     {
-        var ex = new ExceptionInfo { Type = "T", Message = "m" };
+        byte[] ex = new ExceptionInfo { Type = "T", Message = "m" }.ToBytes();
         using var tier = new HotTierSegment(64, 64 * 1024);
-        tier._beforeSlotRentForTest = t =>
+        tier._beforeSlotRentForTest = kind =>
         {
-            if (t == typeof(ExceptionInfo)) throw new OutOfMemoryException("test: no 128 KB array for the exceptions");
+            if (kind == HotTierSegment.SlotKind.Service) throw new OutOfMemoryException("test: no 128 KB array for the services");
         };
-        Assert.Throws<OutOfMemoryException>(() => tier.TryWrite(Header(0), ReadOnlySpan<byte>.Empty, "the failed write's {n}", ex));
+        Assert.Throws<OutOfMemoryException>(() => tier.TryWrite(Header(0), ReadOnlySpan<byte>.Empty, "the failed write's {n}", ex, "unpooled.svc"));
         Assert.Equal(0, tier.Count);
 
         tier._beforeSlotRentForTest = null;
-        Assert.True(tier.TryWrite(Header(1), ReadOnlySpan<byte>.Empty, template: null, exception: null));   // the same slot
+        Assert.True(tier.TryWrite(Header(1), ReadOnlySpan<byte>.Empty, template: null, exception: default));   // the same slot
 
         Assert.Null(tier.GetTemplate(0));
-        Assert.Null(tier.GetException(0));
+        Assert.Null(tier.GetService(0));
+        Assert.True(tier.GetExceptionPayload(0).IsEmpty);
     }
 
     private static LogEventHeader Header(int seq) => new()
@@ -302,5 +307,6 @@ public sealed class HotTierSlotArrayRecyclingTests
         TimestampUtcTicks = DateTimeOffset.UtcNow.UtcTicks,
         Level             = LogLevel.Information,
         MessageTemplatePoolIndex = -1,
+        ServiceNamePoolIndex     = -1,   // a service given to TryWrite is kept beside the event
     };
 }

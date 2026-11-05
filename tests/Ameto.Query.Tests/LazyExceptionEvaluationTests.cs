@@ -60,11 +60,58 @@ public sealed class LazyExceptionEvaluationTests
     public static TheoryData<string> Payloads() =>
     [
         "map-full", "map-no-type", "map-nil-type", "map-no-msg", "map-nested",
+        "map-out-of-order", "map-unknown-keys", "map-repeated-keys", "map-too-deep", "map-inner-string",
         "legacy-string", "legacy-empty", "nil", "not-an-exception",
     ];
 
     private static byte[] PayloadBytes(string which) => which switch
     {
+        // The shapes a client may send that the tier used to normalise by decoding and that are
+        // kept as they are now: the tree and the bytes must still read alike.
+        "map-out-of-order" => Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(4);
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("msg"); w.Write("inner detail"); w.Write("type"); w.Write("System.FormatException");
+            w.Write("stk");   w.Write("   at Billing.Settle()");
+            w.Write("msg");   w.Write("gateway timeout on settle");
+            w.Write("type");  w.Write("System.InvalidOperationException");
+        }),
+
+        "map-unknown-keys" => Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(4);
+            w.Write("zzz");   w.Write("ignored");
+            w.Write("type");  w.Write("System.InvalidOperationException");
+            w.Write("extra"); w.WriteMapHeader(1); w.Write("type"); w.Write("not.an.inner");
+            w.Write("msg");   w.Write("gateway timeout on settle");
+        }),
+
+        // A repeated key keeps its LAST value, in the tree and in every byte-level reader.
+        "map-repeated-keys" => Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(5);
+            w.Write("type");  w.Write("System.TimeoutException");
+            w.Write("msg");   w.Write("first message");
+            w.Write("type");  w.Write("System.InvalidOperationException");
+            w.Write("msg");   w.Write("gateway timeout on settle");
+            w.Write("inner"); w.WriteMapHeader(1); w.Write("type"); w.Write("System.FormatException");
+        }),
+
+        "map-too-deep" => Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2); w.Write("type"); w.Write("System.InvalidOperationException");
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("System.FormatException");
+            w.Write("inner"); w.WriteMapHeader(2); w.Write("type"); w.Write("L3");
+            w.Write("inner"); w.WriteMapHeader(1); w.Write("type"); w.Write("L4.Beyond.The.Cap");
+        }),
+
+        "map-inner-string" => Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2);
+            w.Write("type");  w.Write("System.InvalidOperationException");
+            w.Write("inner"); w.Write("gateway timeout on settle");
+        }),
+
         "map-full" => new ExceptionInfo
         {
             Type = "System.InvalidOperationException", Message = "gateway timeout on settle",
@@ -181,6 +228,27 @@ public sealed class LazyExceptionEvaluationTests
     }
 
     /// <summary>
+    /// Nor does a predicate on a FIELD: it reads that field out of the bytes
+    /// (<see cref="ExceptionInfo.ReadField"/>) — one string, no node chain, no stack trace unless
+    /// that is the field — where it used to build the tree per candidate row.
+    /// </summary>
+    [Theory]
+    [InlineData("@x.type = 'System.AggregateException'")]
+    [InlineData("@x.type like '%Aggregate%'")]
+    [InlineData("@x.message like '%errors%'")]
+    [InlineData("@x.inner.type = 'System.FormatException'")]
+    [InlineData("@x.inner.message = 'inner detail'")]
+    [InlineData("@x.stack like '%fff%'")]
+    public void AFieldPredicateReadsItsFieldWithoutDecodingTheTree(string filter)
+    {
+        var bytes = PayloadBytes("map-nested");
+        var ev    = WithBytes(bytes);
+
+        Assert.True(Eval(filter, ev), filter);
+        Assert.False(ev.ExceptionMaterialised, $"`{filter}` built the ExceptionInfo tree");
+    }
+
+    /// <summary>
     /// THE GUARD ON THE GUARD. The presence cases above are only worth anything if they
     /// actually parse as presence checks: `has @x` without parentheses is two bare words and
     /// `@x is not null` is four, so both become a <see cref="FreeTextNode"/> and quietly test
@@ -238,15 +306,25 @@ public sealed class LazyExceptionEvaluationTests
         Assert.True (Eval("has(@x.inner.type)", WithObject(ExceptionInfo.FromBytes(nested.AsSpan()))));
     }
 
-    /// <summary>A predicate that genuinely needs a FIELD still decodes, once.</summary>
+    /// <summary>
+    /// A predicate that needs a FIELD reads that field out of the bytes and decodes nothing; the
+    /// tree is built once, by the first caller that asks for <see cref="LogEvent.Exception"/>, and
+    /// a predicate evaluated after that reads the tree it finds.
+    /// </summary>
     [Fact]
-    public void AFieldPredicateStillDecodesExactlyOnce()
+    public void AFieldPredicateDecodesNothingAndTheTreeIsBuiltOnceWhenAskedFor()
     {
         var ev = WithBytes(PayloadBytes("map-full"));
 
         Assert.True(Eval("@x.stack like '%Billing%'", ev));
+        Assert.False(ev.ExceptionMaterialised);
+
+        var tree = ev.Exception;
+        Assert.NotNull(tree);
         Assert.True(ev.ExceptionMaterialised);
-        Assert.Same(ev.Exception, ev.Exception);
+        Assert.Same(tree, ev.Exception);
+        Assert.True(Eval("@x.stack like '%Billing%'", ev));
+        Assert.Same(tree, ev.Exception);
     }
 
     /// <summary>

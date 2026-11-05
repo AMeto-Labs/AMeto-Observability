@@ -7,8 +7,8 @@ namespace Ameto.Storage.Tests;
 /// spilled block is only as safe as that copy is exact: a spill admits what this says a tier would
 /// take, and the despill replays the block into one tier, so a single answer that differs is an event
 /// a despill would refuse — lost. These drive a real tier and the copy side by side, over sizes that
-/// reach every rule: the event limit, the payload limit checked at a chunk's allocation, and the
-/// per-chunk fit that refuses an event and then takes a smaller one.
+/// reach every rule: the event limit, the payload limit checked at a chunk's allocation and met hard
+/// by an exception, and the per-chunk fit that refuses an event and then takes a smaller one.
 /// </summary>
 public sealed class HotTierAdmissionTests
 {
@@ -94,6 +94,96 @@ public sealed class HotTierAdmissionTests
         Assert.Equal(tier.ManagedBytes, admission.ManagedBytes);
         Assert.True(refusedForText > 0, "setup: the run never refused an event for its text");
         Assert.True(admission.ManagedBytes <= maxPayload + 1_000, $"{admission.ManagedBytes} B of text admitted at a limit of {maxPayload}");
+    }
+
+    /// <summary>
+    /// The exception's bytes: counted against the payload limit with the properties — hard, so past the
+    /// limit an exception-bearing event is refused where one without runs on into the chunk — never
+    /// against the chunk's payload area, and one longer than a block taken in a block of its own while
+    /// the tier has room for it. Every answer equal to a tier's, with the limit met by exceptions alone
+    /// and by the two together.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void It_answers_every_event_with_an_exception_exactly_as_a_tier_does(int seed)
+    {
+        long maxPayload = 2 * HotTierSegment.ChunkPayloadBytes + 123;
+        int  maxEvents  = HotTierSegment.EventCapacityFor(maxPayload);
+        using var tier  = new HotTierSegment(maxEvents, maxPayload);
+        var admission   = new HotTierAdmission(maxEvents, maxPayload);
+
+        var rng     = new Random(seed);
+        var payload = new byte[HotTierSegment.ExceptionBlockBytes + 64];
+        int withException = 0, refused = 0, overBlock = 0, refusedThenTaken = 0;
+        bool lastRefused = false;
+        for (int i = 0; i < 40_000; i++)
+        {
+            int len = rng.Next(0, 600);
+            // Event 10 brings an exception longer than a block while the tier has room: a block of its own.
+            int exc = i == 10 ? HotTierSegment.ExceptionBlockBytes + rng.Next(1, 64) : rng.Next(100) switch
+            {
+                < 2  => rng.Next(16 * 1024, 64 * 1024),
+                < 40 => rng.Next(100, 4 * 1024),
+                _    => 0,
+            };
+            bool byTier      = tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i }, payload.AsSpan(0, len), null, payload.AsSpan(0, exc));
+            bool byAdmission = admission.TryAdmit(len, 0, exc);
+            Assert.True(byTier == byAdmission, $"event {i} of {len} B with a {exc} B exception: tier {byTier}, admission {byAdmission}");
+            if (byTier && exc > 0) withException++;
+            if (!byTier) refused++;
+            if (byTier && exc > HotTierSegment.ExceptionBlockBytes) overBlock++;
+            if (byTier && lastRefused) refusedThenTaken++;
+            lastRefused = !byTier;
+            if (byTier)
+            {
+                var stored = tier.GetExceptionPayload(tier.Count - 1);
+                Assert.True(stored.SequenceEqual(payload.AsSpan(0, exc)), $"event {i}: the exception read back differs");
+            }
+        }
+
+        Assert.Equal(tier.Count, admission.Count);
+        Assert.Equal(tier.IsFull, admission.PayloadBytes >= maxPayload || admission.Count >= maxEvents);
+        Assert.True(withException > 1_000 && refused > 0 && overBlock == 1 && refusedThenTaken > 0,
+                    $"setup: {withException} with an exception, {refused} refused, {overBlock} over a block, {refusedThenTaken} taken after a refusal");
+        Assert.True(tier.ExceptionBytes > HotTierSegment.ExceptionBlockBytes, "setup: the arena never grew past one block");
+        Assert.True(tier.ExceptionBytes + tier.ManagedBytes <= maxPayload, $"the arena holds {tier.ExceptionBytes} B against a limit of {maxPayload} B");
+        Assert.True(tier.AllocatedBytes >= tier.ExceptionBytes, "the exception blocks are not counted in the native bytes");
+    }
+
+    /// <summary>
+    /// The limit is HARD for exception bytes, in both: past it an exception-bearing event is refused where
+    /// one without an exception still runs on into the chunk's slack — and an empty tier takes any size,
+    /// a block's worth and more.
+    /// </summary>
+    [Fact]
+    public void An_exception_bearing_event_past_the_limit_is_refused_by_both()
+    {
+        const long Limit = 1024 * 1024;
+        int maxEvents  = HotTierSegment.EventCapacityFor(Limit);
+        using var tier = new HotTierSegment(maxEvents, Limit);
+        var admission  = new HotTierAdmission(maxEvents, Limit);
+        var exc = new byte[64 * 1024];
+
+        for (int i = 0; i < 16; i++)
+        {
+            Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i }, default, null, exc), $"the tier refused event {i}");
+            Assert.True(admission.TryAdmit(0, 0, exc.Length), $"the admission refused event {i}");
+        }
+        Assert.False(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = 16 }, default, null, exc), "the tier took an exception past its limit");
+        Assert.False(admission.TryAdmit(0, 0, exc.Length), "the admission took an exception past the limit");
+        Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = 17 }, new byte[100], null, default), "the tier refused an event without an exception");
+        Assert.True(admission.TryAdmit(100), "the admission refused an event without an exception");
+        Assert.Equal(tier.Count, admission.Count);
+        Assert.True(tier.IsFull && admission.PayloadBytes >= Limit);
+
+        using var emptyTier = new HotTierSegment(maxEvents, Limit);
+        var emptyAdmission  = new HotTierAdmission(maxEvents, Limit);
+        var large = new byte[HotTierSegment.ExceptionBlockBytes + 1];
+        Assert.True(emptyTier.TryWrite(new LogEventHeader(), default, null, large), "an empty tier refused an exception larger than itself");
+        Assert.True(emptyAdmission.TryAdmit(0, 0, large.Length), "the admission refused what an empty tier takes");
+        Assert.True(emptyTier.GetExceptionPayload(0).Length == large.Length);
     }
 
     /// <summary>

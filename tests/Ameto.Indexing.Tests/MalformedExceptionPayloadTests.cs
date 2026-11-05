@@ -24,7 +24,7 @@ public sealed class MalformedExceptionPayloadTests
             if (_i == exceptions.Length) { ev = default; return false; }
             int i = _i++;
             ev = new SegmentEventRef(new EventId(0u, (uint)i).RawValue, DateTimeOffset.UtcNow.UtcTicks + i, LogLevel.Error,
-                                     0, 0, 0, "settlement failed", "Svc", exception: null, _props, exceptions[i]);
+                                     0, 0, 0, "settlement failed", "Svc", _props, exceptions[i]);
             return true;
         }
         private static byte[] Props()

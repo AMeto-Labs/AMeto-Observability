@@ -10,15 +10,15 @@ namespace Ameto.Core;
 public enum LogEventFlags : byte
 {
     None         = 0,
-    /// <summary>The event has a non-null <see cref="LogEvent.Exception"/> payload.</summary>
+    /// <summary>The event carries an exception: <see cref="LogEventHeader.ExceptionByteLength"/> is non-zero.</summary>
     HasException = 1 << 0,
     Reserved1    = 1 << 1,
 }
 
 /// <summary>
-/// Fixed-size header stored contiguously in the ring buffer and hot-tier NativeMemory array.
-/// Variable-length data (message template, properties bytes, exception) is stored separately
-/// in parallel arrays / payload buffers; offsets below point into the payload arena.
+/// Fixed-size header stored contiguously in the hot-tier NativeMemory array (and in a staged
+/// batch's record array). Variable-length data — the message template, the properties bytes
+/// and the exception bytes — is stored separately; the offsets below point into the payload arena.
 ///
 /// Total size: 64 bytes — one full cache line.
 /// </summary>
@@ -50,8 +50,18 @@ public struct LogEventHeader
     public byte   Flags;
 
     // 2 bytes padding
-    private byte  _pad1;
-    private short _pad2;
+    private short _pad;
+
+    /// <summary>
+    /// Byte length of the event's exception — the CLEF <c>@x</c> value as its msgpack arrived
+    /// (a map, or a legacy plain string); 0: no exception. Where the bytes are is the holder's
+    /// business: a staged batch keeps them right behind the properties blob, the hot tier in its
+    /// exception arena. Kept as bytes rather than decoded (see <see cref="ExceptionInfo"/>): an
+    /// exception-bearing event costs the tier its bytes, not a tree of UTF-16 strings two to three
+    /// times their size, and nothing serialises it again on the way to the write-ahead log or the
+    /// segment.
+    /// </summary>
+    public int    ExceptionByteLength;
 
     /// <summary>High 64 bits of the 128-bit TraceId (0 when absent).</summary>
     public ulong  TraceIdHi;
@@ -133,12 +143,45 @@ public sealed class LogEvent
         init => _exception = value;
     }
 
+    private ReadOnlyMemory<byte> _rawException;
+
     /// <summary>
-    /// Raw msgpack bytes of the exception map, when the event was decoded from a segment.
-    /// Empty when the event carries no exception, or when <see cref="Exception"/> was set
-    /// directly (ingestion, tests).
+    /// The exception as its msgpack arrived — the CLEF <c>@x</c> value: a map, or a legacy plain
+    /// string — when the event was decoded from a segment, the hot tier or an ingest body, which
+    /// all keep it as bytes. Empty when the event carries no exception, or when
+    /// <see cref="Exception"/> was set directly (hand-built events, tests). Delivery writes it
+    /// straight to JSON (<see cref="LogEventJsonWriter"/>) and a filter reads single fields out of
+    /// it (<see cref="ExceptionInfo.ReadField"/>), so the tree is built only by a caller that asks
+    /// for <see cref="Exception"/>.
+    ///
+    /// <para>A row materialised by the hot tier's scan holds a VIEW into the tier's exception arena
+    /// here — native memory, valid while the reader snapshot that found the row is held — so that
+    /// the candidates a filter rejects (most of a scan) pay no copy for the exception they were
+    /// tested on. A consumer that keeps the row past the snapshot calls <see cref="OwnRawBytes"/>
+    /// first; the query executor does, for every row it yields.</para>
     /// </summary>
-    public ReadOnlyMemory<byte> RawException             { get; init; }
+    public ReadOnlyMemory<byte> RawException
+    {
+        get  => _rawException;
+        init => _rawException = value;
+    }
+
+    /// <summary>
+    /// Makes the event's raw bytes its own: a view into a hot tier's arena (see <see cref="RawException"/>)
+    /// is copied once and the copy kept; bytes that are an array already — a segment row's, an ingest
+    /// body's, a copy made by an earlier call — are left as they are, so this is free to call twice
+    /// and free for every row that is not a hot-tier view. Called by whoever keeps a row past the
+    /// reader snapshot that found it: the executor for each row it yields, so a page the events list
+    /// serialises after releasing the snapshot never reads a tier that has gone. The properties
+    /// travel as a copy today; they are covered here for the day they travel as a view too.
+    /// </summary>
+    public void OwnRawBytes()
+    {
+        if (!_rawException.IsEmpty && !MemoryMarshal.TryGetArray(_rawException, out _))
+            _rawException = _rawException.ToArray();
+        if (!_rawProperties.IsEmpty && !MemoryMarshal.TryGetArray(_rawProperties, out _))
+            _rawProperties = _rawProperties.ToArray();
+    }
 
     /// <summary>
     /// True when <see cref="Exception"/> is already decoded, so reading it costs nothing —
@@ -184,7 +227,13 @@ public sealed class LogEvent
     }
 
     /// <summary>Raw msgpack bytes of the properties map (for re-serialization without re-deserializing).</summary>
-    public ReadOnlyMemory<byte> RawProperties            { get; init; }
+    public ReadOnlyMemory<byte> RawProperties
+    {
+        get  => _rawProperties;
+        init => _rawProperties = value;
+    }
+
+    private ReadOnlyMemory<byte> _rawProperties;
 
     /// <summary>
     /// Reads ONE top-level property without building <see cref="Properties"/>.

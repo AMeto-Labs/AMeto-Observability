@@ -18,6 +18,15 @@ namespace Ameto.Core;
 ///
 /// Depth is capped at <see cref="MaxDepth"/> during deserialisation to prevent
 /// untrusted clients from sending pathological trees.
+///
+/// <para>THE TREE IS A VIEW, NOT THE STORED THING. An event's <c>@x</c> is kept as the bytes it
+/// arrived in — in the ingest batch, the hot tier, the WAL entry and the segment column (see
+/// <see cref="LogEvent.RawException"/>) — validated at ingest with <see cref="Validate"/> to be a
+/// value <see cref="Read"/> reads, and read field by field where a consumer wants one: the index
+/// (<see cref="TryReadIndexFields"/>), the free-text filter (<see cref="RootTextContains"/>), the
+/// field predicates (<see cref="ReadField"/>) and the JSON writer. <see cref="Read"/> stays the
+/// definition every one of them mirrors, and <see cref="FromBytes(ReadOnlyMemory{byte})"/> builds
+/// the tree for the caller that wants the whole of it.</para>
 /// </summary>
 public sealed class ExceptionInfo
 {
@@ -58,9 +67,9 @@ public sealed class ExceptionInfo
         => ReadAtDepth(ref reader, depth: 1);
 
     /// <summary>The four keys of the wire map — matched as bytes, never built as strings.</summary>
-    private enum ExcField : byte { Unknown = 0, Type, Message, Stack, Inner }
+    internal enum ExcField : byte { Unknown = 0, Type, Message, Stack, Inner }
 
-    private static ExcField ClassifyKey(ReadOnlySpan<byte> key) =>
+    internal static ExcField ClassifyKey(ReadOnlySpan<byte> key) =>
         key.SequenceEqual("type"u8)  ? ExcField.Type    :
         key.SequenceEqual("msg"u8)   ? ExcField.Message :
         key.SequenceEqual("stk"u8)   ? ExcField.Stack   :
@@ -68,7 +77,7 @@ public sealed class ExceptionInfo
         ExcField.Unknown;
 
     /// <summary>Fallback for the rare non-contiguous key.</summary>
-    private static ExcField ClassifyKey(string? key) => key switch
+    internal static ExcField ClassifyKey(string? key) => key switch
     {
         Fields.Type    => ExcField.Type,
         Fields.Message => ExcField.Message,
@@ -183,6 +192,208 @@ public sealed class ExceptionInfo
         return buf.WrittenSpan.ToArray();
     }
 
+    // ── Keeping the bytes instead of the tree ────────────────────────────────
+    //
+    // An event's @x is kept as it arrived — in the staged batch, the hot tier, the WAL entry and
+    // the segment column — and decoded only where a consumer wants a field of it. What makes that
+    // safe is that every stored payload is one Read is KNOWN to read: ingest validates it with the
+    // walk below, which accepts and refuses exactly what Read did, and every byte-level reader
+    // after it (TryReadIndexFields, RootTextContains, ReadField, the JSON writer) mirrors a
+    // branch of ReadAtDepth. Change ReadAtDepth and change them with it; ExceptionBytesContractTests
+    // pins every one of them against the tree over the same shapes, ExceptionInfoReadTests the tree.
+
+    /// <summary>
+    /// Reads a raw <c>@x</c> value the way <see cref="Read"/> would, building nothing: true where
+    /// Read returns an object, false where it returns null (nil, an empty legacy string, a value
+    /// that is neither a string nor a map), and a throw exactly where Read throws — a key that is
+    /// neither a string nor nil, or a <c>type</c>, <c>msg</c> or <c>stk</c> that is neither a
+    /// string nor nil, at any of the <see cref="MaxDepth"/> levels Read decodes. An <c>inner</c>
+    /// below them is skipped, as Read skips it, so it is not validated either; unknown keys are
+    /// skipped (a torn value still throws out of the skip).
+    ///
+    /// <para>Allocates nothing: the one road that may is a non-string value where Read called
+    /// <c>ReadString</c>, and there the same call is made so that the exception is the same one.
+    /// One corrupt shape answers with a different type: a legacy string whose str32 header announces
+    /// 2 GB or more throws <see cref="OverflowException"/> here (<c>TryReadStringSpan</c>) where Read
+    /// throws <see cref="System.IO.EndOfStreamException"/> (<c>ReadString</c>). Nothing reaches it: the
+    /// batch decoder's skip over the <c>@x</c> value throws on such a header before this is called, a
+    /// WAL entry is under its CRC, and a v3 entry's replay stops on either throw.</para>
+    /// </summary>
+    public static bool Validate(ReadOnlyMemory<byte> bytes)
+    {
+        if (bytes.IsEmpty) return false;
+        var reader = new MessagePackReader(bytes);
+        return ValidateAtDepth(ref reader, depth: 1);
+    }
+
+    private static bool ValidateAtDepth(ref MessagePackReader reader, int depth)
+    {
+        if (reader.TryReadNil()) return false;
+
+        if (reader.NextMessagePackType == MessagePackType.String)
+        {
+            // Legacy @x: an empty string is no exception at all (string.IsNullOrEmpty in Read).
+            if (reader.TryReadStringSpan(out var legacy)) return !legacy.IsEmpty;
+            var seq = reader.ReadStringSequence();
+            return seq is { IsEmpty: false };
+        }
+
+        if (reader.NextMessagePackType != MessagePackType.Map)
+        {
+            reader.Skip();
+            return false;
+        }
+
+        int fields = reader.ReadMapHeader();
+        for (int i = 0; i < fields; i++)
+        {
+            // A nil key reads as null and classifies as unknown; any other non-string key throws
+            // out of ReadString — both exactly as in ReadAtDepth.
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());
+
+            switch (field)
+            {
+                case ExcField.Type:
+                case ExcField.Message:
+                case ExcField.Stack:
+                    SkipStringOrNil(ref reader);
+                    break;
+                case ExcField.Inner:
+                    if (depth < MaxDepth) ValidateAtDepth(ref reader, depth + 1);
+                    else reader.Skip();
+                    break;
+                default:
+                    reader.Skip();
+                    break;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Steps over a string or a nil without building the string. Anything else is handed to
+    /// <c>ReadString</c>, which is what Read calls there: it throws for the value's code, and
+    /// a value it would accept is accepted here too, at the cost Read paid.
+    /// </summary>
+    private static void SkipStringOrNil(ref MessagePackReader reader)
+    {
+        if (reader.TryReadNil()) return;
+        if (reader.NextMessagePackType == MessagePackType.String) { reader.Skip(); return; }
+        reader.ReadString();
+    }
+
+    /// <summary>A field of the exception a byte-level read can answer: see <see cref="ReadField"/>.</summary>
+    public enum Field : byte
+    {
+        /// <summary><see cref="Type"/> of the root.</summary>
+        Type,
+        /// <summary><see cref="Message"/> of the root.</summary>
+        Message,
+        /// <summary><see cref="StackTrace"/> of the root.</summary>
+        StackTrace,
+        /// <summary><see cref="Type"/> of the root's <see cref="Inner"/>.</summary>
+        InnerType,
+        /// <summary><see cref="Message"/> of the root's <see cref="Inner"/>.</summary>
+        InnerMessage,
+    }
+
+    /// <summary>
+    /// ONE field of a stored payload, as the decoded tree would answer it — <c>FromBytes(bytes)?.Type</c>,
+    /// <c>?.Message</c>, <c>?.StackTrace</c>, <c>?.Inner?.Type</c>, <c>?.Inner?.Message</c> — allocating
+    /// that one string and nothing else: no node, no inner chain and, unless it is the field asked for,
+    /// no stack trace.
+    ///
+    /// <para>This is what a predicate on <c>@x.type</c>, <c>@x.message</c> or <c>@x.inner.type</c> reads per
+    /// candidate row. Going through <see cref="LogEvent.Exception"/> built the whole tree for it — the
+    /// stack trace's 1-5 KB of UTF-16 included — on rows the predicate then rejected. Same answers as
+    /// the tree, by the same rules: a repeated key keeps its last value, a <c>type</c> that is absent or
+    /// nil is <c>"Exception"</c>, a legacy string is type <c>"Exception"</c> with the string for a message,
+    /// and a payload that decodes to no exception at all answers null for every field. Malformed bytes
+    /// throw what the tree's decode throws.</para>
+    /// </summary>
+    public static string? ReadField(ReadOnlyMemory<byte> bytes, Field field)
+    {
+        if (bytes.IsEmpty) return null;
+        var reader = new MessagePackReader(bytes);
+
+        if (reader.TryReadNil()) return null;
+
+        if (reader.NextMessagePackType == MessagePackType.String)
+            return LegacyField(ref reader, field == Field.Type, field == Field.Message);
+
+        if (reader.NextMessagePackType != MessagePackType.Map) return null;
+
+        ExcField wanted = field switch
+        {
+            Field.Type       => ExcField.Type,
+            Field.Message    => ExcField.Message,
+            Field.StackTrace => ExcField.Stack,
+            _                => ExcField.Inner,
+        };
+
+        // The LAST occurrence of the wanted key wins, as it does in ReadAtDepth, so the whole level
+        // is walked and the value is read from a bookmark afterwards.
+        if (!FindLast(ref reader, wanted, out MessagePackReader at))
+            return wanted == ExcField.Type ? DefaultType : null;
+
+        if (wanted != ExcField.Inner)
+            return ReadStringValue(ref at) ?? (wanted == ExcField.Type ? DefaultType : null);
+
+        // The inner (depth 2 of MaxDepth = 3): nil, an empty string and a non-map non-string are no
+        // inner at all; a string is type "Exception" with the string for a message.
+        if (at.TryReadNil()) return null;
+        if (at.NextMessagePackType == MessagePackType.String)
+            return LegacyField(ref at, field == Field.InnerType, field == Field.InnerMessage);
+        if (at.NextMessagePackType != MessagePackType.Map) return null;
+
+        ExcField innerWanted = field == Field.InnerType ? ExcField.Type : ExcField.Message;
+        if (!FindLast(ref at, innerWanted, out MessagePackReader innerAt))
+            return innerWanted == ExcField.Type ? DefaultType : null;
+        return ReadStringValue(ref innerAt) ?? (innerWanted == ExcField.Type ? DefaultType : null);
+    }
+
+    /// <summary>
+    /// Walks one map level and leaves <paramref name="at"/> positioned on the LAST value under
+    /// <paramref name="wanted"/>; false, and <paramref name="at"/> unset, when the key is absent.
+    /// Every value is skipped, read or not, so the reader ends past the map.
+    /// </summary>
+    private static bool FindLast(ref MessagePackReader reader, ExcField wanted, out MessagePackReader at)
+    {
+        at = default;
+        bool found  = false;
+        int  fields = reader.ReadMapHeader();
+        for (int i = 0; i < fields; i++)
+        {
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());
+            if (field == wanted) { at = reader; found = true; }
+            reader.Skip();
+        }
+        return found;
+    }
+
+    /// <summary>A string value, or null for nil; anything else throws as <c>ReadString</c> does for the tree.</summary>
+    private static string? ReadStringValue(ref MessagePackReader at) => at.ReadString();
+
+    /// <summary>
+    /// A field of a legacy plain-string exception, positioned on the string: type <c>"Exception"</c>,
+    /// the string itself for the message, null for the rest — and null for everything when the
+    /// string is empty, which is no exception at all. The string is built only when it is the answer.
+    /// </summary>
+    private static string? LegacyField(ref MessagePackReader at, bool wantType, bool wantMessage)
+    {
+        if (wantMessage)
+        {
+            string? legacy = at.ReadString();
+            return string.IsNullOrEmpty(legacy) ? null : legacy;
+        }
+        bool empty = at.TryReadStringSpan(out var span) ? span.IsEmpty : at.ReadStringSequence() is not { IsEmpty: false };
+        return !empty && wantType ? DefaultType : null;
+    }
+
     /// <summary>
     /// Reads just what the segment index files — <c>type</c>, <c>msg</c> and the inner
     /// exception's <c>type</c> — as UTF-8 spans into <paramref name="payload"/>, skipping the
@@ -194,10 +405,14 @@ public sealed class ExceptionInfo
     /// makes 100 % exceptions for every Error segment — gigabytes of gen0 garbage per large
     /// merge for three short strings. The same shapes <see cref="Read"/> accepts are accepted
     /// here: nil (false), a legacy plain string (type <c>Exception</c>, the string as message),
-    /// or a map; a map deeper than <see cref="MaxDepth"/> is truncated the same way. Malformed
-    /// input returns false rather than throwing. The spans alias <paramref name="payload"/>, which
-    /// is a <see cref="ReadOnlyMemory{T}"/> only because <see cref="MessagePackReader"/> has no
-    /// span constructor — a caller holding a span pins it and wraps it, without a copy.</para>
+    /// or a map; a map deeper than <see cref="MaxDepth"/> is truncated the same way, and a key
+    /// repeated keeps its LAST value, the <c>inner</c> included — an inner repeated to nil, to an
+    /// empty string or to a scalar is no inner, as it is to the tree. Malformed input returns false
+    /// rather than throwing. The spans alias <paramref name="payload"/>, which is a
+    /// <see cref="ReadOnlyMemory{T}"/> only because <see cref="MessagePackReader"/> has no span
+    /// constructor — a caller holding a span pins it and wraps it, without a copy — and they are the
+    /// bytes as stored: a client's ill-formed UTF-8 comes back as it is, and the index builder
+    /// re-encodes it as the tree's string would be (U+FFFD) before it files a term.</para>
     /// </summary>
     public static bool TryReadIndexFields(ReadOnlyMemory<byte> payload,
         out ReadOnlySpan<byte> type, out ReadOnlySpan<byte> message, out ReadOnlySpan<byte> innerType)
@@ -216,6 +431,12 @@ public sealed class ExceptionInfo
                 return true;
             }
             if (reader.NextMessagePackType != MessagePackType.Map) return false;
+
+            // The inner is read AFTER the walk, from a bookmark on its last occurrence — the walk
+            // overwrites type and message as it goes, which is last-wins by itself, but an inner
+            // read in place left an earlier inner's type standing when the last one was nil.
+            MessagePackReader innerAt = default;
+            bool hasInner = false;
 
             int fields = reader.ReadMapHeader();
             for (int i = 0; i < fields; i++)
@@ -237,34 +458,13 @@ public sealed class ExceptionInfo
                 }
                 else if (key.SequenceEqual("inner"u8))
                 {
-                    // Depth 2 of MaxDepth = 3: the inner's type is indexed, nothing below it is.
-                    if (reader.TryReadNil()) continue;
-                    if (reader.NextMessagePackType == MessagePackType.String)
-                    {
-                        // A legacy inner string reads as type "Exception" — unless it is empty,
-                        // which ReadAtDepth turns into no inner at all.
-                        if (reader.TryReadStringSpan(out var legacyInner)) { if (!legacyInner.IsEmpty) innerType = "Exception"u8; }
-                        else reader.Skip();
-                        continue;
-                    }
-                    if (reader.NextMessagePackType != MessagePackType.Map) { reader.Skip(); continue; }
-                    innerType = "Exception"u8;
-                    int innerFields = reader.ReadMapHeader();
-                    for (int j = 0; j < innerFields; j++)
-                    {
-                        if (!reader.TryReadStringSpan(out var ik)) { reader.Skip(); reader.Skip(); continue; }
-                        if (ik.SequenceEqual("type"u8))
-                        {
-                            if (reader.TryReadNil()) innerType = "Exception"u8;
-                            else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var it)) innerType = it;
-                            else return false;
-                        }
-                        else reader.Skip();
-                    }
+                    innerAt  = reader;
+                    hasInner = true;
+                    reader.Skip();
                 }
                 else reader.Skip();   // stk, unknown keys
             }
-            return true;
+            return !hasInner || TryReadInnerType(ref innerAt, out innerType);
         }
         // Every content-shaped failure, not the two this used to name. A count or length of 2^31
         // or more — a map32 root, an inner map32, an array32 under a skipped key, a str32 — hits
@@ -277,12 +477,47 @@ public sealed class ExceptionInfo
         }
     }
 
+    /// <summary>
+    /// The inner's type as the index files it, from a reader positioned on the root's last
+    /// <c>inner</c> value (depth 2 of <see cref="MaxDepth"/> = 3: the inner's type is indexed, nothing
+    /// below it). Empty where the tree has no inner — nil, an empty legacy string, a scalar; <c>Exception</c>
+    /// for a legacy string or a map without a type; false, as malformed, for a type that is neither a
+    /// string nor nil, which the tree's decode throws on.
+    /// </summary>
+    private static bool TryReadInnerType(scoped ref MessagePackReader reader, out ReadOnlySpan<byte> innerType)
+    {
+        innerType = default;
+        if (reader.TryReadNil()) return true;
+        if (reader.NextMessagePackType == MessagePackType.String)
+        {
+            if (reader.TryReadStringSpan(out var legacyInner) && !legacyInner.IsEmpty) innerType = "Exception"u8;
+            return true;
+        }
+        if (reader.NextMessagePackType != MessagePackType.Map) return true;
+
+        innerType = "Exception"u8;
+        int innerFields = reader.ReadMapHeader();
+        for (int j = 0; j < innerFields; j++)
+        {
+            if (!reader.TryReadStringSpan(out var ik)) { reader.Skip(); reader.Skip(); continue; }
+            if (ik.SequenceEqual("type"u8))
+            {
+                if (reader.TryReadNil()) innerType = "Exception"u8;
+                else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var it)) innerType = it;
+                else return false;
+            }
+            else reader.Skip();
+        }
+        return true;
+    }
+
     // ── Decode-free questions about a stored payload ─────────────────────────
     //
     // Both of these answer, from the bytes alone, a question a filter asks per SCANNED row —
     // where building the object graph to answer it is the whole cost the lazy Exception was
     // added to avoid. Each one mirrors a specific branch of ReadAtDepth above; if that method
-    // changes shape, these change with it, and ExceptionInfoReadTests pins them together.
+    // changes shape, these change with it, and ExceptionInfoReadTests (IsPresent) and
+    // ExceptionBytesContractTests (RootTextContains) pin them together.
 
     /// <summary>
     /// Whether these bytes decode to a NON-NULL <see cref="ExceptionInfo"/> — decided from the
@@ -370,35 +605,33 @@ public sealed class ExceptionInfo
 
         if (reader.NextMessagePackType != MessagePackType.Map) return false;
 
-        int  fields      = reader.ReadMapHeader();
-        bool typeIsDefault = true;
-
+        // The LAST type and the LAST msg are the ones the tree holds (a repeated key keeps its
+        // last value in ReadAtDepth), so the level is walked whole and the two are read from
+        // bookmarks afterwards. Stack and Inner are NOT searched, exactly as the object-side check
+        // did not search them. Skipping is also the point: the stack trace is the payload.
+        int fields = reader.ReadMapHeader();
+        MessagePackReader typeAt = default, msgAt = default;
+        bool hasType = false, hasMsg = false;
         for (int i = 0; i < fields; i++)
         {
             ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
                 ? ClassifyKey(keySpan)
                 : ClassifyKey(reader.ReadString());
-
             switch (field)
             {
-                case ExcField.Type:
-                    if (reader.TryReadNil()) break;                 // nil ⇒ Type stays "Exception"
-                    typeIsDefault = false;
-                    if (ReadStringContains(ref reader, term)) return true;
-                    break;
-
-                case ExcField.Message:
-                    if (reader.TryReadNil()) break;
-                    if (ReadStringContains(ref reader, term)) return true;
-                    break;
-
-                // Stack and Inner are NOT searched, exactly as the object-side check did not
-                // search them. Skipping is also the point: the stack trace is the payload.
-                default:
-                    reader.Skip();
-                    break;
+                case ExcField.Type:    typeAt = reader; hasType = true; break;
+                case ExcField.Message: msgAt  = reader; hasMsg  = true; break;
             }
+            reader.Skip();
         }
+
+        bool typeIsDefault = true;
+        if (hasType && !typeAt.TryReadNil())                     // nil ⇒ Type stays "Exception"
+        {
+            typeIsDefault = false;
+            if (ReadStringContains(ref typeAt, term)) return true;
+        }
+        if (hasMsg && !msgAt.TryReadNil() && ReadStringContains(ref msgAt, term)) return true;
 
         return typeIsDefault && Contains(DefaultType, term);
     }

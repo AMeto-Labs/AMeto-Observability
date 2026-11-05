@@ -43,7 +43,7 @@ public sealed class LogBatchScratchTests
 
         public void NotifyBatchEnqueued() { }
 
-        public bool TryIngestClef(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+        public bool TryIngestClef(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
                                   ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId, ReadOnlySpan<byte> serviceUtf8)
         {
             Assembled.Add(msgpackProps.Length);

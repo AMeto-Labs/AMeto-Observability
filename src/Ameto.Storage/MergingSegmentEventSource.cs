@@ -139,7 +139,7 @@ internal sealed class SegmentEventCursor : IDisposable
             var props    = RawColumn(span, _layout.PrOff, _layout.PrLen, i, n);
 
             return new SegmentEventRef(Id, TsTicks, (LogLevel)level, trHi, trLo, spanId,
-                                       template, service, exception: null, props, excBytes);
+                                       template, service, props, excBytes);
         }
     }
 

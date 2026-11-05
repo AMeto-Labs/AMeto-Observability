@@ -389,7 +389,7 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             var exc = n % 50 == 0
                 ? new ExceptionInfo { Type = "System.InvalidOperationException", Message = "boom " + n }
                 : null;
-            Assert.True(_engine.TryWrite(header, Props(n, padBytes), exception: exc));
+            Assert.True(_engine.TryWrite(header, Props(n, padBytes), exception: exc?.ToBytes()));
         }
         await _engine.FlushHotTierAsync();
     }

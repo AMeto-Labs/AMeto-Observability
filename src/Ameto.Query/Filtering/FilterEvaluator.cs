@@ -416,11 +416,11 @@ public static class FilterEvaluator
     {
         BuiltinField.Level                 => ev.Level.ToSeqString(),
         BuiltinField.MessageTemplate       => ev.MessageTemplate,
-        BuiltinField.ExceptionType         => ev.Exception?.Type,
-        BuiltinField.ExceptionMessage      => ev.Exception?.Message,
-        BuiltinField.ExceptionStack        => ev.Exception?.StackTrace,
-        BuiltinField.InnerExceptionType    => ev.Exception?.Inner?.Type,
-        BuiltinField.InnerExceptionMessage => ev.Exception?.Inner?.Message,
+        BuiltinField.ExceptionType         => ExceptionField(ev, ExceptionInfo.Field.Type),
+        BuiltinField.ExceptionMessage      => ExceptionField(ev, ExceptionInfo.Field.Message),
+        BuiltinField.ExceptionStack        => ExceptionField(ev, ExceptionInfo.Field.StackTrace),
+        BuiltinField.InnerExceptionType    => ExceptionField(ev, ExceptionInfo.Field.InnerType),
+        BuiltinField.InnerExceptionMessage => ExceptionField(ev, ExceptionInfo.Field.InnerMessage),
         BuiltinField.Timestamp             => ev.Timestamp.ToString("O"),
         BuiltinField.TraceId               => TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
         BuiltinField.SpanId                => TraceIdHelper.FormatSpanId(ev.SpanId),
@@ -428,6 +428,31 @@ public static class FilterEvaluator
         BuiltinField.ServiceName           => ev.ServiceName,
         _                                  => null,
     };
+
+    /// <summary>
+    /// One field of the event's exception — read out of the bytes wherever the event carries them
+    /// (<see cref="ExceptionInfo.ReadField"/>: one string, no tree, no stack trace unless asked for),
+    /// and off the tree where something already built it, or set it directly. Reading
+    /// <see cref="LogEvent.Exception"/> here decoded the whole tree per candidate row for
+    /// <c>@x.type = '…'</c>, stack trace included, on every row of an Error segment the predicate then
+    /// rejected. Both roads answer alike: LazyExceptionEvaluationTests holds them to it.
+    /// </summary>
+    private static string? ExceptionField(LogEvent ev, ExceptionInfo.Field field)
+    {
+        if (!ev.ExceptionMaterialised && !ev.RawException.IsEmpty)
+            return ExceptionInfo.ReadField(ev.RawException, field);
+
+        var x = ev.Exception;
+        return field switch
+        {
+            ExceptionInfo.Field.Type         => x?.Type,
+            ExceptionInfo.Field.Message      => x?.Message,
+            ExceptionInfo.Field.StackTrace   => x?.StackTrace,
+            ExceptionInfo.Field.InnerType    => x?.Inner?.Type,
+            ExceptionInfo.Field.InnerMessage => x?.Inner?.Message,
+            _                                => null,
+        };
+    }
 
     /// <summary>
     /// Walks a separator-delimited path through nested

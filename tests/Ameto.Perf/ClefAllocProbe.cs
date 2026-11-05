@@ -23,7 +23,7 @@ public sealed class ClefAllocProbe
         public int Count;
         public long PropBytes;
         public bool TryIngestClef(
-            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
             ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
             ReadOnlySpan<byte> serviceUtf8)
         {

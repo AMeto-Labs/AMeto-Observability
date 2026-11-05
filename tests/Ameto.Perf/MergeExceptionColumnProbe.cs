@@ -105,7 +105,7 @@ public sealed class MergeExceptionColumnProbe : IAsyncLifetime
                     Level                    = LogLevel.Error,
                     MessageTemplatePoolIndex = _engine.TemplatePool.Intern("settlement failed for {wallet}"),
                     ServiceNamePoolIndex     = _engine.TemplatePool.Intern("Svc.Payments"),
-                }, Props(n), exception: withExceptions ? Exception(n) : null));
+                }, Props(n), exception: withExceptions ? Exception(n).ToBytes() : default));
             await _engine.FlushHotTierAsync();
         }
 

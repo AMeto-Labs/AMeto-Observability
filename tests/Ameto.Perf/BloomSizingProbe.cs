@@ -353,7 +353,7 @@ public sealed class BloomSizingProbe : IDisposable
                       Inner   = new ExceptionInfo { Type = "System.TimeoutException", Message = "ledger did not answer in 30s" },
                   }
                 : null;
-            if (!hot.TryWrite(h, buf.WrittenSpan, null, exc)) break;
+            if (!hot.TryWrite(h, buf.WrittenSpan, null, exc?.ToBytes())) break;
         }
         hot.Freeze();
 

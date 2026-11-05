@@ -158,7 +158,7 @@ public sealed class SegmentGoldenFormatTests
                 TraceIdLo                = i % 4 == 0 ? 0UL : (ulong)i * 0xBF58476D1CE4E5B9UL,
                 SpanId                   = i % 3 == 0 ? 0UL : (ulong)i * 0x94D049BB133111EBUL,
             };
-            Assert.True(hot.TryWrite(h, buf.WrittenSpan, pool.Get(tmplIdx[t2]), exc));
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan, pool.Get(tmplIdx[t2]), exc?.ToBytes()));
         }
         hot.Freeze();
         return hot;

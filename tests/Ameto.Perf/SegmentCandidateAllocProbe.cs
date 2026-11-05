@@ -158,7 +158,7 @@ public sealed class SegmentCandidateAllocProbe
                 ServiceNamePoolIndex     = svcIdx,
                 HasException             = true,
             };
-            Assert.True(hot.TryWrite(h, buf.WrittenSpan, pool.Get(tmplIdx[t]), exc));
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan, pool.Get(tmplIdx[t]), exc.ToBytes()));
         }
         hot.Freeze();
 
