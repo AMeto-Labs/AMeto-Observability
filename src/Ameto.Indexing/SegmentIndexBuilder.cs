@@ -286,16 +286,19 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 AddExists(offset);
                 if (!type.IsEmpty)
                 {
+                    type = WellFormed(type);
                     if (_inverted.AddUtf8(offset, "@x.type"u8, type) != IndexAddOutcome.Existing) _bloom.AddUtf8(type);
                     _bloomPresented++;
                     TrigramUtf8(offset, type);
                 }
                 // ExceptionInfo.Read keeps an empty message as "" and the object path indexes
                 // only a message of 3+ chars; a UTF-8 length of 3+ can be a 1-char non-ASCII
-                // message, which the trigram then ignores itself — same outcome.
+                // message, which the trigram then ignores itself — same outcome. The trigram
+                // decodes the bytes itself, so an ill-formed message needs no WellFormed.
                 if (!message.IsEmpty) TrigramUtf8(offset, message);
                 if (!innerType.IsEmpty)
                 {
+                    innerType = WellFormed(innerType);
                     if (_inverted.AddUtf8(offset, "@x.inner.type"u8, innerType) != IndexAddOutcome.Existing) _bloom.AddUtf8(innerType);
                     _bloomPresented++;
                 }
@@ -308,6 +311,31 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     }
 
     private readonly PinnedSpanMemoryManager _exception = new();
+
+    private char[]? _wellFormedChars;
+    private byte[]? _wellFormedBytes;
+
+    /// <summary>
+    /// An exception's type as the reference oracle's string road files it. The hot tier keeps
+    /// <c>@x</c> as the client sent it, and a client that mishandles encodings sends ill-formed
+    /// UTF-8 in it; the tree reads that as U+FFFD per invalid sequence (<c>Encoding.UTF8</c>), and
+    /// a term filed from the raw bytes instead differed from the oracle's — harmless to a lookup,
+    /// which decodes stored terms the same way, but a term that is not UTF-8 on disk all the same.
+    /// Well-formed bytes, which is every type a real client sends, come back as they are after one
+    /// vectorised check; the transcode, through scratch of the builder's own, runs on the exception.
+    /// (A property value on this path is filed as its bytes, as it always was.)
+    /// </summary>
+    private ReadOnlySpan<byte> WellFormed(ReadOnlySpan<byte> utf8)
+    {
+        if (System.Text.Unicode.Utf8.IsValid(utf8)) return utf8;
+
+        if (_wellFormedChars is null || _wellFormedChars.Length < utf8.Length) _wellFormedChars = new char[Math.Max(utf8.Length, 64)];
+        System.Text.Unicode.Utf8.ToUtf16(utf8, _wellFormedChars, out _, out int chars, replaceInvalidSequences: true, isFinalBlock: true);
+        int max = chars * 3;   // U+FFFD is three bytes; nothing decodes to more per char
+        if (_wellFormedBytes is null || _wellFormedBytes.Length < max) _wellFormedBytes = new byte[Math.Max(max, 192)];
+        System.Text.Unicode.Utf8.FromUtf16(_wellFormedChars.AsSpan(0, chars), _wellFormedBytes, out _, out int bytes, isFinalBlock: true);
+        return _wellFormedBytes.AsSpan(0, bytes);
+    }
 
     /// <summary>
     /// Whether a payload <see cref="ExceptionInfo.IsPresent"/> calls absent really is "no

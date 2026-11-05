@@ -322,4 +322,51 @@ public sealed class SegmentInvertedBuildParityTests
         Assert.Equal(reference.SerialisedBloomFilter,   streaming.SerialisedBloomFilter);
         Assert.Equal(reference.BloomTermsAdded,         streaming.BloomTermsAdded);
     }
+
+    /// <summary>
+    /// The exceptions as clients send them. The hot tier keeps <c>@x</c> as it arrived, so the flush
+    /// builds its index from client shapes now, where it used to see the canonical map the tier
+    /// re-encoded: keys in any order, repeated (the last wins, to nil included), unknown ones, nil and
+    /// empty values, a legacy string, invalid UTF-8, a chain deeper than the decoder reads. The terms
+    /// the bytes road files must be the terms the tree road files, byte for byte, in all three structures.
+    /// </summary>
+    [Fact]
+    public void StreamingWalk_MatchesReferenceBuild_OnClientShapedExceptions()
+    {
+        var pool    = new StringInternPool();
+        int svcIdx  = pool.Intern("billing");
+        int tmplIdx = pool.Intern("order {Id} failed");
+        string tmpl = pool.Get(tmplIdx);
+        var shapes  = Ameto.Testing.ExceptionShapes.Payloads.Values.ToArray();
+        int events  = shapes.Length * 8;
+        using var hot = new HotTierSegment(events + 1, (long)events * 4096 + 1024 * 1024);
+        long baseTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var buf = new ArrayBufferWriter<byte>(64);
+
+        for (int i = 0; i < events; i++)
+        {
+            buf.Clear();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(1);
+            w.Write("Id"); w.Write((long)i);
+            w.Flush();
+            // Only what ingest stores: a shape the decoder reads as no exception is never written as one.
+            byte[] x = shapes[i % shapes.Length];
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id = new EventId(0u, (uint)i).RawValue, TimestampUtcTicks = baseTicks + i,
+                Level = LogLevel.Error, MessageTemplatePoolIndex = tmplIdx, ServiceNamePoolIndex = svcIdx,
+            }, buf.WrittenSpan, tmpl, ExceptionInfo.Validate(x) ? x : default));
+        }
+
+        using var streaming = new SegmentIndexBuilder(events);
+        streaming.Build(hot, pool);
+        using var reference = new SegmentIndexBuilder(events);
+        reference.BuildReference(hot, pool);
+
+        Assert.Equal(reference.SerialisedInvertedIndex, streaming.SerialisedInvertedIndex);
+        Assert.Equal(reference.SerialisedTrigramIndex,  streaming.SerialisedTrigramIndex);
+        Assert.Equal(reference.SerialisedBloomFilter,   streaming.SerialisedBloomFilter);
+        Assert.Equal(reference.BloomTermsAdded,         streaming.BloomTermsAdded);
+    }
 }
