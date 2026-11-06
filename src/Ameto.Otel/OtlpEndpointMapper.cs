@@ -164,6 +164,18 @@ public static class OtlpEndpointMapper
                 return;
             }
 
+            // NOTHING OF THE BATCH WAS TAKEN: the span ring had no room for its first span, and so for
+            // the rest (a refused batch is a prefix). Answered 503 with Retry-After, which the exporter
+            // retries — and a retry duplicates nothing — the log road's rule for a store with no room
+            // (#138; it used to be 200 with every span as dropped, which OTLP exporters never retry).
+            // A batch the ring took part of is 200 with the rest as dropped, as before: OTLP's partial
+            // success.
+            if (ingested == 0 && refused > 0)
+            {
+                WriteRetryLater(ctx, TraceBufferFullMessage);
+                return;
+            }
+
             LogTracesDecoded(tracesLogger, ingested + refused);
             await WriteJsonOk(ctx, ingested, refused);
         };
@@ -655,6 +667,13 @@ public static class OtlpEndpointMapper
     /// Nothing was written, so the retry stores the batch once.
     /// </summary>
     internal static ReadOnlySpan<byte> LogStoreBusyMessage => "the log store is behind and had no room for this batch; retry"u8;
+
+    /// <summary>
+    /// What a 503 says when the span ring had no room for any of the batch (#138): the drainer is behind
+    /// — or holding a tail the engine would not take — and nothing was taken, so the retry stores the
+    /// batch once.
+    /// </summary>
+    internal static ReadOnlySpan<byte> TraceBufferFullMessage => "the trace ingest buffer is full and had no room for this batch; retry"u8;
 
     /// <summary>
     /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and

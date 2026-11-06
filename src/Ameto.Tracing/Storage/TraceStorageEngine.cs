@@ -1126,7 +1126,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
         var batch = new ItemSpanBatch(items);
-        try     { return WriteBatch(ref batch); }
+        int taken = 0;
+        try     { WriteBatch(ref batch, ref taken); return taken; }
         finally { batch.Dispose(); }
     }
 
@@ -1138,19 +1139,35 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// That is what keeps the lock-free aggregate passes (which walk captured
     /// <see cref="SpanRecord"/>s long after the lock is gone) clear of the arena's reuse.
     /// </summary>
-    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct =>
-        WriteBatch(ref batch);
+    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    {
+        int taken = 0;
+        WriteBatch(ref batch, ref taken);
+        return taken;
+    }
+
+    /// <summary>
+    /// <see cref="WriteRaw{TBatch}(ref TBatch)"/> for a caller that must know how far the write got when
+    /// it THROWS: <paramref name="taken"/> counts the spans that are in the log and the tier, advanced at
+    /// the end of every hold, and is current when an exception leaves. The drainer reads it to release
+    /// the spans the engine took and keep the rest for another pass (#138); the return value of the
+    /// other overload is lost to a throw.
+    /// </summary>
+    internal void WriteRaw<TBatch>(ref TBatch batch, ref int taken) where TBatch : ISpanBatch, allows ref struct
+        => WriteBatch(ref batch, ref taken);
 
     /// <summary>
     /// The one write core. Per hold: the tier's strings and blob copies are resolved OUTSIDE the
     /// lock (an intern lookup and a copy per span have no business in a hold every reader waits
     /// out), then the log and the tier take them under ONE hold, exactly as before.
+    /// <paramref name="takenSoFar"/> mirrors the count of spans taken after every hold, so a caller
+    /// reads it even when this throws.
     /// </summary>
-    private int WriteBatch<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    private void WriteBatch<TBatch>(ref TBatch batch, ref int takenSoFar) where TBatch : ISpanBatch, allows ref struct
     {
         int count = batch.Count;
-        if (count == 0) return 0;
-        if (!TryEnterEngine()) return 0;
+        if (count == 0) return;
+        if (!TryEnterEngine()) return;
         int taken = 0;
 
         // A hold is at most 4 096 spans whatever a probe sets (the production cap is 128), so the
@@ -1216,7 +1233,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                         for (int j = 0; j < appended; j++)
                             AddToHotTierLocked(batch.Header(taken + j), names[j], pooled[2 * j],
                                                services[j], pooled[2 * j + 1], blobs[j]);
-                        taken += appended;
+                        taken      += appended;
+                        takenSoFar  = taken;   // what the caller keeps if the throw below this is the last thing it hears
                     }
 
                     // max(spanCount ≥ N, hotBytes ≥ budget): whichever the tier reaches first. The
@@ -1261,7 +1279,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             System.Buffers.ArrayPool<bool>.Shared.Return(pooled);
             ExitEngine();
         }
-        return taken;
     }
 
     // ── A FLUSH THAT CANNOT START IS SAID, AT MOST ONCE A MINUTE ─────────────────
