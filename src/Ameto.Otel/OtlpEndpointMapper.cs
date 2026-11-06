@@ -130,7 +130,8 @@ public static class OtlpEndpointMapper
             }
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
-            int ingested, refused;
+            int  ingested, refused;
+            bool forRoom;
             try
             {
                 var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
@@ -146,7 +147,7 @@ public static class OtlpEndpointMapper
                     // arena. Protobuf is what SDK exporters and the collector send (see
                     // OtlpTraceProtoParser). A malformed tail leaves its prefix ingested and answers
                     // 400, which OTLP defines as not retryable — the log route's behaviour.
-                    (ingested, refused) = isProto
+                    (ingested, refused, forRoom) = isProto
                         ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
                         : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
                 }
@@ -164,13 +165,15 @@ public static class OtlpEndpointMapper
                 return;
             }
 
-            // NOTHING OF THE BATCH WAS TAKEN: the span ring had no room for its first span, and so for
-            // the rest (a refused batch is a prefix). Answered 503 with Retry-After, which the exporter
-            // retries — and a retry duplicates nothing — the log road's rule for a store with no room
-            // (#138; it used to be 200 with every span as dropped, which OTLP exporters never retry).
-            // A batch the ring took part of is 200 with the rest as dropped, as before: OTLP's partial
-            // success.
-            if (ingested == 0 && refused > 0)
+            // NOTHING OF THE BATCH WAS TAKEN, FOR WANT OF ROOM: the span ring was full — slots, arena or
+            // bytes in flight — at its first span, and so for the rest (a refused batch is a prefix).
+            // Answered 503 with Retry-After, which the exporter retries — and a retry duplicates nothing
+            // — the log road's rule for a store with no room (#138; it used to be 200 with every span as
+            // dropped, which OTLP exporters never retry). A batch the ring took part of is 200 with the
+            // rest as dropped, as before: OTLP's partial success. So is a batch whose first span is
+            // heavier than the whole ring: no retry fits it, and a 503 would only have the exporter
+            // send it again until its retries ran out.
+            if (ingested == 0 && refused > 0 && forRoom)
             {
                 WriteRetryLater(ctx, TraceBufferFullMessage);
                 return;

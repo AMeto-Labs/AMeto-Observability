@@ -25,10 +25,15 @@ namespace Ameto.Integration.Tests;
 /// </summary>
 public sealed class TraceRingFullAnswerTests : IClassFixture<TraceRingFullAnswerTests.RefusingSinkFactory>
 {
-    /// <summary>A span sink that takes the first <see cref="TakeFirst"/> spans of each request and refuses the rest.</summary>
+    /// <summary>
+    /// A span sink that takes the first <see cref="TakeFirst"/> spans of each request and refuses the rest —
+    /// for room (the ring full, which a retry finds freer), or with <see cref="ForRoom"/> false for a span
+    /// heavier than the whole ring, which no retry fits.
+    /// </summary>
     public sealed class RefusingSink : ISpanSink
     {
-        public volatile int TakeFirst;
+        public volatile int  TakeFirst;
+        public volatile bool ForRoom = true;
         private int _offered;
 
         public int InternService(ReadOnlySpan<byte> serviceUtf8) => 0;
@@ -37,6 +42,8 @@ public sealed class TraceRingFullAnswerTests : IClassFixture<TraceRingFullAnswer
             long durationNanos, ReadOnlySpan<byte> nameUtf8, int serviceIdx, ReadOnlySpan<byte> serviceUtf8,
             SpanKind kind, SpanStatusCode status, short httpStatusCode, ReadOnlySpan<byte> msgpackAttributes)
             => Interlocked.Increment(ref _offered) <= TakeFirst;
+
+        public bool RefusedForRoom => ForRoom;
 
         public void EndBatch() => Interlocked.Exchange(ref _offered, 0);
     }
@@ -99,6 +106,27 @@ public sealed class TraceRingFullAnswerTests : IClassFixture<TraceRingFullAnswer
         Assert.Equal("{\"ingested\":2,\"dropped\":0}", await resp.Content.ReadAsStringAsync());
     }
 
+    /// <summary>
+    /// The first span is heavier than the whole ring: refused, and the rest of the batch with it, but not
+    /// for room — no retry fits it, and a 503 would only have the exporter send the batch again until its
+    /// retries ran out. The answer stays the partial success, which exporters do not retry
+    /// (<c>DiagnosticsBudgetTests</c> drives the same case through the real ring).
+    /// </summary>
+    [Fact]
+    public async Task A_batch_whose_first_span_can_never_fit_is_200_with_every_span_dropped()
+    {
+        _factory.Sink.TakeFirst = 0;
+        _factory.Sink.ForRoom   = false;
+        try
+        {
+            using var resp = await PostJson(TwoSpansJson());
+
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            Assert.Equal("{\"ingested\":0,\"dropped\":2}", await resp.Content.ReadAsStringAsync());
+        }
+        finally { _factory.Sink.ForRoom = true; }
+    }
+
     // ── gRPC ──────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -124,6 +152,24 @@ public sealed class TraceRingFullAnswerTests : IClassFixture<TraceRingFullAnswer
         Assert.Equal("0", call.Response.Headers["grpc-status"].ToString());
         Assert.Equal(OtlpGrpcFraming.Frame(OtlpGrpcFraming.ExportResponse(1, "the ingest buffer was full")),
                      ((MemoryStream)call.Response.Body).ToArray());
+    }
+
+    [Fact]
+    public async Task Over_grpc_a_batch_whose_first_span_can_never_fit_is_OK_with_every_span_rejected()
+    {
+        _factory.Sink.TakeFirst = 0;
+        _factory.Sink.ForRoom   = false;
+        try
+        {
+            var call = GrpcCall(Frame(TwoSpansProto()));
+
+            await Export(call);
+
+            Assert.Equal("0", call.Response.Headers["grpc-status"].ToString());
+            Assert.Equal(OtlpGrpcFraming.Frame(OtlpGrpcFraming.ExportResponse(2, OtlpGrpcEndpointMapper.SpanTooHeavyReason)),
+                         ((MemoryStream)call.Response.Body).ToArray());
+        }
+        finally { _factory.Sink.ForRoom = true; }
     }
 
     // ── Harness ───────────────────────────────────────────────────────────────

@@ -31,6 +31,13 @@ public static class OtlpGrpcEndpointMapper
     private const string BufferFullReason = "the ingest buffer was full";
 
     /// <summary>
+    /// Why spans were refused when the first of them was heavier than the whole ring (#138): no retry
+    /// fits it, so the batch is a partial success, never UNAVAILABLE — and the rest of the batch went
+    /// with it, a refused batch being a prefix.
+    /// </summary>
+    internal const string SpanTooHeavyReason = "a span heavier than the whole ingest buffer, and the rest of its batch, were refused";
+
+    /// <summary>
     /// What UNAVAILABLE says when the span ring had no room for ANY of the batch (#138): the drainer is
     /// behind — or holding spans the store would not take — and nothing was taken, so the retry stores
     /// the batch once. Every OTLP exporter with retry enabled retries it.
@@ -159,13 +166,14 @@ public static class OtlpGrpcEndpointMapper
     /// </summary>
     internal static (bool Ok, int Rejected, string? Why, bool Busy) IngestTraces(ReadOnlySpan<byte> message, ISpanSink sink)
     {
-        var (ingested, refused) = OtlpTraceProtoParser.Parse(message, sink);
+        var (ingested, refused, forRoom) = OtlpTraceProtoParser.Parse(message, sink);
         if (ingested + refused == 0) return (true, 0, null, false);
-        // NOTHING OF THE BATCH WAS TAKEN: the ring had no room for its first span, and so for the rest.
-        // Busy — answered UNAVAILABLE, which exporters retry, and a retry duplicates nothing (#138). It
-        // used to be OK with every span rejected, which OTLP exporters never retry. A batch the ring took
-        // part of is OK with the rest as rejected, as before: OTLP's partial success.
-        return (true, refused, BufferFullReason, Busy: ingested == 0);
+        // NOTHING OF THE BATCH WAS TAKEN, FOR WANT OF ROOM: the ring was full at its first span, and so
+        // for the rest. Busy — answered UNAVAILABLE, which exporters retry, and a retry duplicates nothing
+        // (#138). It used to be OK with every span rejected, which OTLP exporters never retry. A batch the
+        // ring took part of is OK with the rest as rejected, as before: OTLP's partial success — and so is
+        // one whose first span is heavier than the whole ring, which no retry fits.
+        return (true, refused, forRoom ? BufferFullReason : SpanTooHeavyReason, Busy: ingested == 0 && forRoom);
     }
 
     /// <summary>
