@@ -79,7 +79,7 @@ public sealed class TraceRingFullAnswerTests : IClassFixture<TraceRingFullAnswer
         using var resp = await PostJson(TwoSpansJson());
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, resp.StatusCode);
-        Assert.Equal("1", resp.Headers.RetryAfter?.Delta?.TotalSeconds.ToString() ?? resp.Headers.GetValues("Retry-After").Single());
+        Assert.Equal(TimeSpan.FromSeconds(1), resp.Headers.RetryAfter?.Delta);
         var body = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()).RootElement;
         Assert.Equal("the trace ingest buffer is full and had no room for this batch; retry", body.GetProperty("message").GetString());
     }

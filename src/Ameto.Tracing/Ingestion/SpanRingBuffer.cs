@@ -217,7 +217,8 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// Whether the calling thread's last refusal was FOR ROOM — slots, arena, or a byte budget spent
     /// by spans in flight, all of which a retry finds freer as the drainer works — rather than for a
     /// span heavier than <see cref="MaxBytes"/> on its own, which no retry fits (#138). Set as
-    /// <see cref="TryEnqueueRaw"/> refuses; meaningful until <see cref="EndBatch"/>.
+    /// <see cref="TryEnqueueRaw"/> refuses; read on the refusing thread, right after the refusal — it
+    /// answers for the ring this thread last produced into, and <see cref="EndBatch"/> resets it.
     /// </summary>
     public bool LastRefusalWasForRoom => !t_producer.LastRefusalNeverFits;
 

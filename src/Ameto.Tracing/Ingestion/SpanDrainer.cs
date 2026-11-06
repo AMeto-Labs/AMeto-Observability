@@ -10,8 +10,9 @@ namespace Ameto.Tracing.Ingestion;
 /// <para><b>A drained batch is headers and arena windows</b> (TI#3): the ring hands over each span's
 /// 72-byte header and keeps its payload reserved; the engine appends the payload's UTF-8 to the
 /// log as it lies, copies the blob out for the tier and resolves the name and service into pool
-/// strings; and only then does this give the payloads back (<see cref="SpanRingBuffer.Release"/>),
-/// whatever happened in between.</para>
+/// strings; and only then does this give back the payloads of the spans the engine took
+/// (<see cref="SpanRingBuffer.Release"/>). The ones it did not take stay reserved, at the front of
+/// the run, for the next pass (#138).</para>
 /// </summary>
 internal sealed class SpanDrainer : IAsyncDisposable
 {
@@ -51,6 +52,20 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private int _retryPauseMs = RetryPauseMinMs;
     private const int RetryPauseMinMs = 100;
     private const int RetryPauseMaxMs = 1_000;
+
+    /// <summary>
+    /// The streak of failing passes: when it began (<see cref="Environment.TickCount64"/>; 0 outside a
+    /// streak), when the last Error about it was written, and the passes failed since that line. A
+    /// volume that stays full would otherwise be an Error with a stack trace every second for as long
+    /// as it lasts — some 3 600 an hour, into log sinks short of room themselves — so the first failure
+    /// is said in full and the rest at most once a minute (<see cref="FailureLineIntervalMs"/>), and the
+    /// first pass that goes through again says how long the store refused. One consumer thread: no
+    /// interlocked.
+    /// </summary>
+    private long _refusingSinceTicks;
+    private long _lastFailureLineTicks;
+    private int  _failedPassesSinceLine;
+    private const long FailureLineIntervalMs = 60_000;
 
     /// <summary>Test observer: the spans of the last run the engine did not take, waiting for the next pass.</summary>
     internal int HeldForTest => _held;
@@ -125,6 +140,10 @@ internal sealed class SpanDrainer : IAsyncDisposable
     /// front of the run's arrays, their payloads still reserved, and the next pass offers them again
     /// after a pause. A ring whose tail is stuck fills, and the receivers then turn a batch it has no
     /// room for away with 503 / UNAVAILABLE, which exporters retry: acknowledged means written.</para>
+    ///
+    /// <para>An engine that has closed its write path takes nothing and throws nothing, so its run stays
+    /// held and every later call answers the same count: a caller that loops on the count must stop on
+    /// <paramref name="taken"/> &lt; the count, as the loop and the final drain do.</para>
     /// </summary>
     internal int DrainOnce(out int taken)
     {
@@ -176,7 +195,7 @@ internal sealed class SpanDrainer : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
+                NoteFailedPass(ex);
                 MaybeFlush();
                 // The tail is still ours (DrainOnce). Offered again after a pause that doubles while the
                 // engine keeps refusing, 100 ms to a second: a volume that is full is not hammered, and
@@ -189,6 +208,7 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 continue;
             }
             _retryPauseMs = RetryPauseMinMs;
+            if (_refusingSinceTicks != 0 && taken > 0) NoteRecovered();
 
             if (count == 0)
             {
@@ -230,16 +250,20 @@ internal sealed class SpanDrainer : IAsyncDisposable
         while (true)
         {
             int remaining, taken;
+            int heldBefore = _held;
             try
             {
                 remaining = DrainOnce(out taken);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain");
+                _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain — {Kept} span(s) of it are kept and offered again", _held);
+                // A failing pass that still shrank the tail is the engine taking spans, slowly: the
+                // eight failures that end this pass are eight that took NOTHING.
+                if (_held < heldBefore) consecutiveFailures = 0;
                 if (++consecutiveFailures < MaxConsecutiveFinalDrainFailures) continue;
                 _logger.LogError(
-                    "SpanDrainer: the final drain stopped after {Failures} failing batches in a row — "
+                    "SpanDrainer: the final drain stopped after {Failures} failing batches in a row that took nothing — "
                   + "{Lost} span(s) still in the ring were not stored",
                     consecutiveFailures, _ring.ApproximateCount + _held);
                 return;
@@ -251,11 +275,47 @@ internal sealed class SpanDrainer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Failing batches in a row after which the final drain gives up: at <see cref="BatchSize"/>
-    /// spans a batch, eight is 4 096 spans the engine refused one after another — past a bad batch,
-    /// into an engine that is not taking anything.
+    /// Failing passes in a row, none of which took a span, after which the final drain gives up: since
+    /// a failed pass keeps its tail (#138), this cap is what ends a final drain into an engine that is
+    /// not taking anything — without it the disposal would never return, and the host's shutdown
+    /// timeout does not stop the drain task.
     /// </summary>
     private const int MaxConsecutiveFinalDrainFailures = 8;
+
+    /// <summary>
+    /// A pass failed: the first of a streak is said in full, with its exception; the rest at most once a
+    /// minute, with the passes failed since the last line, how long the store has refused, and the held
+    /// tail (see <see cref="_refusingSinceTicks"/>).
+    /// </summary>
+    private void NoteFailedPass(Exception ex)
+    {
+        long now = Environment.TickCount64;
+        _failedPassesSinceLine++;
+        if (_refusingSinceTicks == 0)
+        {
+            _refusingSinceTicks   = now;
+            _lastFailureLineTicks = now;
+            _failedPassesSinceLine = 0;
+            _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
+            return;
+        }
+        if (now - _lastFailureLineTicks < FailureLineIntervalMs) return;
+        _lastFailureLineTicks = now;
+        _logger.LogError(ex,
+            "SpanDrainer: the trace store refused {Failures} more pass(es), {Seconds} s into the outage — "
+          + "{Kept} span(s) are kept and offered again",
+            _failedPassesSinceLine, (now - _refusingSinceTicks) / 1000, _held);
+        _failedPassesSinceLine = 0;
+    }
+
+    /// <summary>The first pass that went through after a streak of failures: the one sign the outage is over.</summary>
+    private void NoteRecovered()
+    {
+        _logger.LogInformation("SpanDrainer: the trace store takes spans again, after refusing for {Seconds} s",
+                               (Environment.TickCount64 - _refusingSinceTicks) / 1000);
+        _refusingSinceTicks    = 0;
+        _failedPassesSinceLine = 0;
+    }
 
     /// <summary>
     /// Says, once, that the engine stopped taking spans. It is not an error: the spans were

@@ -1148,10 +1148,12 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     /// <summary>
     /// <see cref="WriteRaw{TBatch}(ref TBatch)"/> for a caller that must know how far the write got when
-    /// it THROWS: <paramref name="taken"/> counts the spans that are in the log and the tier, advanced at
-    /// the end of every hold, and is current when an exception leaves. The drainer reads it to release
-    /// the spans the engine took and keep the rest for another pass (#138); the return value of the
-    /// other overload is lost to a throw.
+    /// it THROWS: <paramref name="taken"/> counts the spans that are in the log and the tier, advanced as
+    /// each appended span is inserted into the tier, and is current when an exception leaves. The
+    /// drainer reads it to release the spans the engine took and keep the rest for another pass (#138);
+    /// the return value of the other overload is lost to a throw. A span the log took and the tier did
+    /// not — an insert that ran out of memory — is behind the count, and the retry appends it to the
+    /// log a second time: the tier holds it once, the log twice until the next flush commits it.
     /// </summary>
     internal void WriteRaw<TBatch>(ref TBatch batch, ref int taken) where TBatch : ISpanBatch, allows ref struct
         => WriteBatch(ref batch, ref taken);
@@ -1230,11 +1232,17 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     finally
                     {
                         scope.Dispose();
+                        // ONE STORE PER SPAN. The insert allocates (a SpanRecord, the tier list's and the
+                        // trace index's growth), and one that ran out of memory at span j must leave the
+                        // caller counting [0, j): mirrored once at the end of the hold, the whole hold came
+                        // back and the tier held [0, j) twice (#138 review).
                         for (int j = 0; j < appended; j++)
+                        {
                             AddToHotTierLocked(batch.Header(taken + j), names[j], pooled[2 * j],
                                                services[j], pooled[2 * j + 1], blobs[j]);
-                        taken      += appended;
-                        takenSoFar  = taken;   // what the caller keeps if the throw below this is the last thing it hears
+                            takenSoFar = taken + j + 1;   // in the log and the tier: what the caller keeps if the next line is the last thing it hears
+                        }
+                        taken += appended;
                     }
 
                     // max(spanCount ≥ N, hotBytes ≥ budget): whichever the tier reaches first. The

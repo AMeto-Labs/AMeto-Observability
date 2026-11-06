@@ -218,6 +218,6 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
     }
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Span ring buffer full: refused {RefusedSpans} span(s) from {RefusedRequests} request(s) since the last warning — the drainer is behind")]
+        Message = "Span ring buffer full: refused {RefusedSpans} span(s) from {RefusedRequests} request(s) since the last warning — the drainer is behind, or the trace store is refusing writes (see the SpanDrainer errors)")]
     private static partial void LogRingFull(ILogger logger, long refusedSpans, long refusedRequests);
 }

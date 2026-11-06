@@ -157,12 +157,14 @@ public static class OtlpGrpcEndpointMapper
     /// <see cref="ISpanIngester.TryIngest"/>, paying 566-622 B/span on the route every SDK
     /// exporter and the collector use.
     ///
-    /// <para><b>The answer is the one it always gave.</b> An empty batch is OK with nothing to
-    /// report; otherwise the spans the ring refused are reported as <c>rejected_spans</c> with the
-    /// buffer-full reason, and a refused batch is a PREFIX (the sink refuses the rest of a batch after
-    /// its first refusal, as <c>TryIngest</c>'s <c>break</c> did). The one difference is shared with
-    /// the HTTP route and the log route: a message that fails to parse part-way has its prefix
-    /// ingested before INVALID_ARGUMENT, which OTLP defines as not retryable.</para>
+    /// <para><b>The answer.</b> An empty batch is OK with nothing to report. A batch the ring took
+    /// NONE of for want of room is busy — UNAVAILABLE, which exporters retry and which duplicates
+    /// nothing (#138). Otherwise the spans the ring refused are reported as <c>rejected_spans</c> with
+    /// their reason — the buffer was full, or a span heavier than the whole buffer that no retry fits —
+    /// and a refused batch is a PREFIX (the sink refuses the rest of a batch after its first refusal,
+    /// as <c>TryIngest</c>'s <c>break</c> did). As on the HTTP route and the log route, a message that
+    /// fails to parse part-way has its prefix ingested before INVALID_ARGUMENT, which OTLP defines as
+    /// not retryable.</para>
     /// </summary>
     internal static (bool Ok, int Rejected, string? Why, bool Busy) IngestTraces(ReadOnlySpan<byte> message, ISpanSink sink)
     {
