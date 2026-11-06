@@ -2160,22 +2160,22 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
+    /// Whether the log this engine opened is still in the data directory, asked only once the listing has
+    /// found no segment file at all (<see cref="MeetMissingSegmentFile"/>). There only when the file system
+    /// says so: a look that FAILS answers false, and the guard then keeps the snapshot and asks again — the
+    /// recoverable answer, as for a data directory that cannot be probed (above). With every segment file
+    /// already reported gone, a log that cannot be looked at is no evidence that this is the directory the
+    /// engine opened; answering true removed the segment and recorded a loss over a blip. (Its doc once said
+    /// a probe failure answers true, "the same direction as NoSegmentFilesLeft" — but true is the road to
+    /// the loss claim here, and File.Exists, which never throws, had in fact answered false; #138 item 7.)
+    /// </summary>
+    private bool WalFileStillThere() => FileLook.Of(_walPath) == FilePresence.There;
+
+    /// <summary>
     /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
     /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
     /// "keep retrying for ever" over data that may really be gone.
     /// </summary>
-    /// <summary>
-    /// Whether the log this engine opened is still in the data directory. A probe failure answers
-    /// TRUE — the same direction as <see cref="NoSegmentFilesLeft"/>, because an I/O error is not
-    /// evidence that the volume was swapped, and answering otherwise would turn a busy disk into a
-    /// permanent loss claim.
-    /// </summary>
-    private bool WalFileStillThere()
-        // Asked as a look, not File.Exists, which never throws and answered false for a file it could not
-        // look at: the catch that was to answer TRUE on a probe failure never ran, and a flickering mount
-        // read as a swapped volume (#138 item 7).
-        => FileLook.Of(_walPath) != FilePresence.Gone;
-
     private static bool NoSegmentFilesLeft(string dir)
     {
         try
@@ -3404,8 +3404,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (_mergingPaths.Contains(path)) continue;
 
                 var seg = Array.Find(_coldSegments, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
-                // Gone only when the file system says so: a file that could not be looked at stays queued for
-                // the next pass rather than being unnamed for the life of the process (#138 item 7).
+                // Gone only when the file system says so. A file that could not be looked at is ADOPTED, as a
+                // file that is there would be: the snapshot lists it, and one that is really gone is dropped at
+                // the next start, when the file system says so — where File.Exists's false unnamed it for the
+                // life of the process (#138 item 7).
                 if (seg is null || seg.SegmentId != 0 || FileLook.Of(path) == FilePresence.Gone)
                 {
                     lock (_unnamedSegments) _unnamedSegments.Remove(path);
@@ -3717,7 +3719,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// index vouching for a file that is not there is the silent under-report this engine keeps
     /// closing.</para>
     ///
-    /// <para>"No file" means <c>File.Exists</c> said so, not merely "absent from this scan". The
+    /// <para>"No file" means the file system said so (<see cref="FileLook.Of"/> answered Gone, not
+    /// Unknown), not merely "absent from this scan". The
     /// scan deliberately skips the segment a flush is publishing, and a flush that lands while the
     /// scan runs is already in the snapshot — neither is gone, and dropping either would retire an
     /// id that something may already have recorded against.</para>

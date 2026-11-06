@@ -110,7 +110,8 @@ internal static class AuthServiceExtensions
         // Read first; generate only when the file system says there is no file (#138 item 7). File.Exists
         // answered false for a file it could not look at too, and a new secret then overwrote the one that
         // existed: every session invalidated. A read that fails otherwise fails the start instead, and the
-        // new file is created with CreateNew, never over one that appeared meanwhile.
+        // new file is written owner-only, flushed to disk and moved into place without overwrite
+        // (KeyFile.WriteNew), never over one that appeared meanwhile.
         try
         {
             secret = File.ReadAllText(secretPath, Encoding.UTF8);
@@ -118,9 +119,7 @@ internal static class AuthServiceExtensions
         catch (FileNotFoundException)
         {
             secret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));
-            using var fs = new FileStream(secretPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            using var w  = new StreamWriter(fs, Encoding.UTF8);
-            w.Write(secret);
+            Ameto.Core.KeyFile.WriteNew(secretPath, Encoding.UTF8.GetBytes(secret));
         }
 
         var issuer = new JwtIssuer(secret);

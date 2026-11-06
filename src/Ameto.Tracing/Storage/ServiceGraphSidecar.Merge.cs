@@ -21,12 +21,14 @@ internal static partial class ServiceGraphSidecar
         var path = Path.ChangeExtension(trcFilePath, ".svcgraph");
         // No sidecar is no edges, truthfully. A sidecar that cannot be LOOKED at is not that: File.Exists
         // answered false for it too, and the merge then wrote its output without this source's edges, for
-        // good (#138 item 7). Unknown answers false, as an unreadable sidecar does: the merge that rebuilds
-        // edges from spans takes the source.
+        // good (#138 item 7). A look that failed is the machine's fault around one file, as a failed open
+        // below is — thrown, so the merge's MergeSourceException has the source sit out this run and the
+        // next run asks again. Answered false, it retired the source from streaming merges for the life
+        // of the process and had it rewritten alone (NeedsSidecarRebuild) over a blip.
         switch (FileLook.Of(path))
         {
             case FilePresence.Gone:    return true;
-            case FilePresence.Unknown: return false;
+            case FilePresence.Unknown: throw new IOException($"The service-graph sidecar {path} could not be looked at");
         }
 
         try

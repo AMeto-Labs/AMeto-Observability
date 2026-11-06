@@ -496,9 +496,11 @@ internal sealed class TraceManifest
         try
         {
             // Read, and let the file system say "no file": File.Exists said so for a manifest it could not
-            // look at too, and the engine then started on an EMPTY catalog in silence — segment ids reissued,
-            // orphaned index runs deleted (#138 item 7). A manifest that is there and cannot be read lands
-            // in the loud catch below instead.
+            // look at too, and the engine then started on an EMPTY catalog in silence (#138 item 7). A
+            // manifest that is there and cannot be read lands in the loud catch below instead — loud, not
+            // safe: the engine still starts on an empty catalog, the constructor's sweep then deletes the
+            // merged index runs it no longer names, and the reconcile issues fresh segment ids and saves
+            // over the file. Making a manifest that failed to read read-only for the run is the follow-up.
             byte[] raw;
             try { raw = File.ReadAllBytes(path); }
             catch (FileNotFoundException)      { return new TraceManifest(dir, logger, State.Empty); }

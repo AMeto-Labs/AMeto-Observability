@@ -120,21 +120,19 @@ public static class SecretProtectorFactory
         try
         {
             FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Open);
-            fileKey = DecodeKey(File.ReadAllText(path).Trim());
+            fileKey = DecodeKey(File.ReadAllText(path).Trim(), $"the key file {path}");
         }
         catch (FileNotFoundException)
         {
             fileKey = RandomNumberGenerator.GetBytes(32);
-            using (var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            using (var w  = new StreamWriter(fs))
-                w.Write(Convert.ToBase64String(fileKey));
-            TrySetOwnerOnly(path);
+            KeyFile.WriteNew(path, Encoding.ASCII.GetBytes(Convert.ToBase64String(fileKey)));
             onGeneratedKey?.Invoke(path);
         }
         return new AesGcmSecretProtector(fileKey);
     }
 
-    private static byte[] DecodeKey(string s)
+    /// <param name="source">What held the text, for the message: the configuration key, or the key file.</param>
+    private static byte[] DecodeKey(string s, string source = "Ameto:MasterKey")
     {
         // 64 hex chars → 32 bytes
         if (s.Length == 64 && s.All(Uri.IsHexDigit))
@@ -142,17 +140,37 @@ public static class SecretProtectorFactory
 
         byte[] bytes;
         try { bytes = Convert.FromBase64String(s); }
-        catch (FormatException) { throw new InvalidOperationException("Ameto:MasterKey must be base64 or 64-char hex."); }
+        catch (FormatException) { throw new InvalidOperationException($"{source} must be base64 or 64-char hex."); }
 
         if (bytes.Length != 32)
-            throw new InvalidOperationException($"Ameto:MasterKey must decode to 32 bytes (got {bytes.Length}).");
+            throw new InvalidOperationException($"{source} must decode to 32 bytes (got {bytes.Length}).");
         return bytes;
     }
+}
 
-    private static void TrySetOwnerOnly(string path)
+/// <summary>
+/// Writes a new key file — <c>secret.key</c>, <c>jwt-secret.bin</c> — so that neither a crash nor a power
+/// loss can leave it empty or missing, and no other user can read it meanwhile (#138 item 7 review). A
+/// temp file is created owner-only from its creation (a mode set after the write left the file at the
+/// umask's 0644 for a moment), written, flushed to the platter, and moved into place without overwrite,
+/// so a key that appeared meanwhile is never replaced. Written in place and unflushed, a crash between
+/// the create and the write left an empty file (every start then failed, with a message naming the
+/// configuration key), and a power loss under ext4's delayed allocation could leave it missing: a new
+/// key was generated, and every secret stored under the old one became undecryptable.
+/// </summary>
+public static class KeyFile
+{
+    public static void WriteNew(string path, ReadOnlySpan<byte> content)
     {
-        if (OperatingSystem.IsWindows()) return; // POSIX modes not supported on Windows
-        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
-        catch { /* best effort */ }
+        string tmp = path + ".tmp";
+        File.Delete(tmp);   // a crash's leftover: UnixCreateMode applies at creation only, so the file is made afresh
+        var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        using (var fs = new FileStream(tmp, options))
+        {
+            fs.Write(content);
+            fs.Flush(flushToDisk: true);
+        }
+        File.Move(tmp, path, overwrite: false);   // IOException when a key appeared meanwhile: never over one that exists
     }
 }

@@ -19,11 +19,12 @@ namespace Ameto.Otel;
 /// <c>JsonSerializer.Deserialize&lt;ExportLogsServiceRequest&gt;</c> + <c>OtlpLogMapper.Map</c>
 /// path that dominated GC pressure above ~60k events/s.
 ///
-/// Assumes standard OTLP document order (a resourceLogs' <c>resource</c> precedes its
-/// <c>scopeLogs</c>; a KeyValue's <c>key</c> precedes its <c>value</c>) — true for every
-/// conformant exporter. Out-of-order input degrades gracefully (missing resource attrs),
-/// it never corrupts. A nested array or kvlist value is counted on a copy of the reader and then
-/// written in place, so nothing is buffered for it.
+/// Reads the standard OTLP document order in one pass (a resourceLogs' <c>resource</c> precedes its
+/// <c>scopeLogs</c>; a KeyValue's <c>key</c> precedes its <c>value</c>) — what every conformant
+/// exporter writes. A <c>resource</c> after the block's scopes is looked for ahead, once per block, on a
+/// copy of the reader (#138 item 2); other out-of-order input degrades gracefully, it never corrupts.
+/// A nested array or kvlist value is counted on a copy of the reader and then written in place, so
+/// nothing is buffered for it.
 ///
 /// <para>The resource's <c>service.name</c> becomes the event's <c>@service</c> header and
 /// leaves the property map, exactly as the mapper and the protobuf parser do it — see
@@ -186,6 +187,12 @@ public static class OtlpLogStreamParser
         // the real reader skips it when it gets there.
         bool resourceReadAhead = false;
         bool resourceSeen      = false;
+        // ONCE PER BLOCK. The look-ahead walks the rest of the block, and the rest after any later "scopeLogs"
+        // key is part of what it walked, so a second look-ahead can find nothing new. Run per key, a block of
+        // N such keys and no resource (JSON allows the duplicates; OTLP does not send them) cost N²/2: 64 000
+        // keys took 28 s, and an 8 MiB body — 16 KB gzipped — about forty minutes of one core, with its
+        // inflate slot held the while (#138 review).
+        bool lookedAhead = false;
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -226,10 +233,14 @@ public static class OtlpLogStreamParser
                 // to get wrong. So before the first record of a block that began with its scopes is
                 // assembled, the resource is looked for ahead, on a copy of the reader — a checkpoint, as
                 // TryCaptureService uses one — and read from there; the real reader skips it later.
-                if (!resourceSeen && TryReadResourceAhead(reader, sink, resBuf, ref resKeyCount, ref svc, ref map, ref svcIdx))
+                if (!resourceSeen && !lookedAhead)
                 {
-                    resourceSeen      = true;
-                    resourceReadAhead = true;
+                    lookedAhead = true;
+                    if (TryReadResourceAhead(reader, sink, resBuf, ref resKeyCount, ref svc, ref map, ref svcIdx))
+                    {
+                        resourceSeen      = true;
+                        resourceReadAhead = true;
+                    }
                 }
 
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
@@ -264,16 +275,21 @@ public static class OtlpLogStreamParser
         svcIdx = svc.Len > 0 ? sink.InternService(svc.Buf.AsSpan(0, svc.Len)) : -1;
     }
 
+    /// <summary>Test hook: look-aheads run on this thread — one per block at most, whatever the block holds.</summary>
+    [ThreadStatic] internal static int ResourceLookAheadsForTest;
+
     /// <summary>
     /// Looks past the <c>scopeLogs</c> property <paramref name="peek"/> stands on for a <c>resource</c>
     /// among the block's remaining properties, and reads the first one it finds through
     /// <see cref="ParseResource"/>. <paramref name="peek"/> is a COPY of the reader — a struct over the
-    /// whole body — so nothing of this moves the caller's reader; true when a resource was read.
+    /// whole body — so nothing of this moves the caller's reader; true when a resource was read. Run
+    /// once per block (the caller's <c>lookedAhead</c>): it walks the rest of the block.
     /// </summary>
     private static bool TryReadResourceAhead(
         Utf8JsonReader peek, IOtlpLogSink sink, ArrayBufferWriter<byte> resBuf, ref int resKeyCount,
         ref ServiceCapture svc, ref MapBudget map, ref int svcIdx)
     {
+        ResourceLookAheadsForTest++;
         peek.Skip();   // the scopeLogs value: the records are the real reader's to assemble
         while (peek.Read() && peek.TokenType != JsonTokenType.EndObject)
         {
@@ -957,16 +973,17 @@ public static class OtlpLogStreamParser
     /// The level a <c>severityText</c> string token names, by the rule the protobuf parser applies
     /// (<see cref="OtlpSeverity.Map"/>; #138 item 3): this parser compared the raw token with two
     /// spellings per level, so <c>"Error"</c> or <c>"Warning"</c> stored as Information over JSON and as
-    /// their level over protobuf. An escaped token is unescaped first — a level name is a few ASCII
-    /// bytes, so one that does not fit the stack buffer once unescaped is no level name.
+    /// their level over protobuf. An escaped token is unescaped first, into a 16-byte stack buffer, as
+    /// much of it as fits: the rule reads a five-byte prefix or a whole word of at most eleven bytes,
+    /// and a text cut here is thirteen bytes or more — past every whole word, as the whole text is, and
+    /// with the same first five bytes — so a cut text maps as its whole would (<c>"ERROR in payments"</c>
+    /// is Error, escaped or not).
     /// </summary>
     private static LogLevel MapSeverityText(ref Utf8JsonReader reader)
     {
         if (!reader.ValueIsEscaped) return OtlpSeverity.Map(0, reader.ValueSpan);
         Span<byte> buf = stackalloc byte[16];
-        return JsonStringText.TryUnescape(reader.ValueSpan, buf, out int n)
-            ? OtlpSeverity.Map(0, buf[..n])
-            : LogLevel.Information;
+        return OtlpSeverity.Map(0, buf[..JsonStringText.Unescape(reader.ValueSpan, buf)]);
     }
 }
 

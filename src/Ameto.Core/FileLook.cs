@@ -17,7 +17,8 @@ public enum FilePresence
 /// decided from that false that a file was gone did the wrong thing on a share that did not answer, an
 /// antivirus hold or an access check: a secret key regenerated over the one that existed (every stored
 /// secret undecryptable), a live trace segment dropped from the catalog with its index runs, a merge
-/// written without a source's edges, a manifest read as empty so segment ids were reissued (#138 item 7).
+/// written without a source's edges, a manifest that could not be read taken for no manifest, in silence
+/// (#138 item 7).
 /// The log engine kept its own copy of this since round 5 (<c>StorageEngine.Look</c>, which now delegates here).
 /// </summary>
 public static class FileLook

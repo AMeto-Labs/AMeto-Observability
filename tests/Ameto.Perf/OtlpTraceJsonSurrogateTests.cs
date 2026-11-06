@@ -57,6 +57,30 @@ public sealed class OtlpTraceJsonSurrogateTests
         Assert.Equal(0, span.Http);                                            // and promoted nothing
     }
 
+    /// <summary>
+    /// An escape beside bytes that are not UTF-8: the reader takes such a token (it checks escapes, not
+    /// UTF-8), each byte is stored as U+FFFD — three for one — and the text was unescaped into a buffer sized
+    /// at its ESCAPED length, so it was cut wherever the rent rounded to: "\n" and 65 535 bytes of 0xFF are
+    /// 65 537 bytes escaped and 196 606 stored, and the 131 072-byte rent kept 131 071. On main the parse
+    /// threw (CopyString), a 400 with the batch's prefix already in the ring.
+    /// </summary>
+    [Fact]
+    public void An_escaped_value_beside_bytes_that_are_not_utf8_is_stored_whole()
+    {
+        byte[] value = new byte[2 + 65_535];
+        value[0] = (byte)'\\'; value[1] = (byte)'n'; value.AsSpan(2).Fill(0xFF);
+        byte[] body = [.. Encoding.UTF8.GetBytes(
+            "{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"traceId\":\"0af7651916cd43dd8448eb211c80319c\"," +
+            "\"spanId\":\"b7ad6b7169203331\",\"name\":\"x\",\"attributes\":[{\"key\":\"k\",\"value\":{\"stringValue\":\""),
+            .. value, .. Encoding.UTF8.GetBytes("\"}}]}]}]}]}")];
+        var sink = new CapturingSpanSink();
+
+        var (ingested, refused) = OtlpTraceStreamParser.Parse(body, sink);
+
+        Assert.Equal((1, 0), (ingested, refused));
+        Assert.Equal(1 + 65_535, Attributes(Assert.Single(sink.Spans).Attrs)["k"]!.Length);   // "\n" and one U+FFFD a byte
+    }
+
     [Fact]
     public void Ordinary_escapes_still_read_as_before()
     {

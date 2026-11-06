@@ -101,20 +101,65 @@ public sealed class OtlpJsonResourceOrderTests
         Assert.All(sink.Maps, m => Assert.DoesNotContain("deployment.environment", Keys(m)));
     }
 
+    private const string SecondResource = "\"resource\":{\"attributes\":[{\"key\":\"host.name\",\"value\":{\"stringValue\":\"h1\"}}]}";
+
     [Fact]
-    public void A_resource_given_before_and_after_merges_once_each()
+    public void A_second_resource_after_the_scopes_reaches_no_record()
     {
-        // The look-ahead reads the one after the scopes; the real reader then meets it and skips it (once);
-        // the one before is read in place. Both sets of attributes reach the records, none twice.
-        const string second = "\"resource\":{\"attributes\":[{\"key\":\"host.name\",\"value\":{\"stringValue\":\"h1\"}}]}";
+        // A resource is read in place before the scopes, so none is looked for: the one after them merges
+        // into the scratch once the records are written, and reaches none. Protobuf merges both into every
+        // record (its pass 1); full parity would cost the common resource-first block a second pass over its
+        // scopes, for input OTLP does not produce (a "resource" key given twice).
         var sink = new Sink();
-        var (ingested, _) = OtlpLogStreamParser.Parse(Utf8("{\"resourceLogs\":[{" + Resource + "," + Scopes + "," + second + "}]}"), sink);
+        var (ingested, _) = OtlpLogStreamParser.Parse(Utf8("{\"resourceLogs\":[{" + Resource + "," + Scopes + "," + SecondResource + "}]}"), sink);
 
         Assert.Equal(2, ingested);
         var keys = Keys(sink.Maps[1]);
         Assert.Contains("deployment.environment", keys);
-        // The second resource came after the scopes and was not looked for: a resource had been seen.
         Assert.DoesNotContain("host.name", keys);
+    }
+
+    [Fact]
+    public void A_second_resource_after_a_looked_ahead_one_reaches_no_record()
+    {
+        // scopeLogs, resource, resource: the look-ahead reads the first; the real reader skips it and reads
+        // the second in place, counted on from the first's budget, and it merges after the records.
+        var sink = new Sink();
+        var (ingested, _) = OtlpLogStreamParser.Parse(Utf8("{\"resourceLogs\":[{" + Scopes + "," + Resource + "," + SecondResource + "}]}"), sink);
+
+        Assert.Equal(2, ingested);
+        Assert.All(sink.Services, s => Assert.Equal("orders", Encoding.UTF8.GetString(s)));
+        Assert.All(sink.Maps, m => Assert.Contains("deployment.environment", Keys(m)));
+        Assert.All(sink.Maps, m => Assert.DoesNotContain("host.name", Keys(m)));
+    }
+
+    /// <summary>
+    /// A block of many "scopeLogs" keys and no resource (JSON allows the duplicates; OTLP does not send them):
+    /// the look-ahead walked the rest of the block from EACH of them, N²/2 in all — 64 000 keys took 28 s, an
+    /// 8 MiB body about forty minutes of one core. Once per block: a later key's rest is part of what the first
+    /// one walked.
+    /// </summary>
+    [Fact]
+    public void Many_scopeLogs_keys_with_no_resource_are_looked_past_once()
+    {
+        var json = "{\"resourceLogs\":[{" + string.Join(",", Enumerable.Repeat(Scopes, 1_000)) + "}]}";
+        OtlpLogStreamParser.ResourceLookAheadsForTest = 0;
+
+        var (ingested, _) = OtlpLogStreamParser.Parse(Utf8(json), new Sink());
+
+        Assert.Equal(2_000, ingested);
+        Assert.Equal(1, OtlpLogStreamParser.ResourceLookAheadsForTest);   // per key it was 1 000
+    }
+
+    [Fact]
+    public void A_resource_after_several_scopes_reaches_all_their_records()
+    {
+        var sink = new Sink();
+        var json = "{\"resourceLogs\":[{" + Scopes + "," + Scopes + "," + Scopes + "," + Resource + "}]}";
+
+        Assert.Equal((6, 0), OtlpLogStreamParser.Parse(Utf8(json), sink));
+        Assert.All(sink.Services, s => Assert.Equal("orders", Encoding.UTF8.GetString(s)));
+        Assert.All(sink.Maps, m => Assert.Contains("deployment.environment", Keys(m)));
     }
 
     [Theory]
@@ -131,6 +176,8 @@ public sealed class OtlpJsonResourceOrderTests
     [InlineData("Fatal",       LogLevel.Fatal)]
     [InlineData("Critical",    LogLevel.Information)]   // no rule: the default, as over protobuf
     [InlineData("Err\\u006fr", LogLevel.Error)]         // escaped: unescaped before the comparison
+    [InlineData("ERROR\\u0020in\\u0020payments", LogLevel.Error)]   // escaped and longer than the 16-byte buffer: the prefix still decides
+    [InlineData("ERROR in payments", LogLevel.Error)]
     public void severityText_is_read_by_the_protobuf_rule(string text, LogLevel expected)
     {
         var sink = new Sink();
@@ -139,7 +186,7 @@ public sealed class OtlpJsonResourceOrderTests
 
         Assert.Equal(1, ingested);
         Assert.Equal((byte)expected, Assert.Single(sink.Levels));
-        Assert.Equal(expected, OtlpSeverity.Map(0, Utf8(text.Replace("\\u006f", "o"))));   // the shared rule says the same
+        Assert.Equal(expected, OtlpSeverity.Map(0, Utf8(System.Text.RegularExpressions.Regex.Unescape(text))));   // the shared rule says the same
     }
 
     [Fact]

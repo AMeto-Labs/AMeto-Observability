@@ -29,16 +29,27 @@ public sealed class ServiceGraphSidecarLookTests : IDisposable
         Assert.Empty(edges);
     }
 
+    /// <summary>
+    /// A sidecar that READS, whose look fails: thrown, so the merge's <c>MergeSourceException</c> has the
+    /// source sit out this run and the next run asks again — not false, which retired it from streaming
+    /// merges for the life of the process and had it rewritten alone over a blip, and not true with its
+    /// edge, which is what <c>File.Exists</c> gave.
+    /// </summary>
     [Fact]
-    public void A_sidecar_that_cannot_be_looked_at_is_not_no_edges()
+    public void A_sidecar_that_cannot_be_looked_at_is_a_read_that_failed()
     {
         string trc     = Path.Combine(_dir, "seg.trc");
         string sidecar = Path.ChangeExtension(trc, ".svcgraph");
-        File.WriteAllBytes(sidecar, [0, 0, 0, 0]);
+        var edges = new ServiceGraphSidecar.MergeEdges(windowNanos: 1, maxSpans: 16);
+        edges.AddRecorded([new ServiceEdgeRecord { From = "a", To = "b", CallCount = 3, ErrorCount = 0, Buckets = new uint[HistogramBuckets.Count] }]);
+        edges.Write(sidecar);
+        Assert.True(ServiceGraphSidecar.TryReadEdges(trc, out var read));   // the control: a sidecar that reads, with its one edge
+        Assert.Single(read);
+
         FileRefusal.ForTest.Value = (path, access) =>
             path == sidecar && access == FileRefusal.Access.Look ? new IOException("the share did not answer (test seam)") : null;
 
-        Assert.False(ServiceGraphSidecar.TryReadEdges(trc, out _));
+        Assert.Throws<IOException>(() => ServiceGraphSidecar.TryReadEdges(trc, out _));
     }
 
     [Fact]

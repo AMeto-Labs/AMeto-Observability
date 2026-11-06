@@ -40,7 +40,6 @@ public sealed class FileLookTests : IDisposable
             path == file && access == FileRefusal.Access.Look ? new IOException("the share did not answer (test seam)") : null;
 
         Assert.Equal(FilePresence.Unknown, FileLook.Of(file));
-        Assert.False(File.Exists(file) == false && FileLook.Of(file) == FilePresence.Gone);   // never Gone on a failed look
     }
 
     // ── The secret key ───────────────────────────────────────────────────────
@@ -61,7 +60,9 @@ public sealed class FileLookTests : IDisposable
     /// <summary>
     /// The key file is there but cannot be read (a share that did not answer): before, <c>File.Exists</c>
     /// answered false, a new key was generated and written over it, and every stored secret was lost. Now the
-    /// start fails — recoverable — and the file is untouched.
+    /// start fails — recoverable — and the file is untouched. This pins the new contract: main never consulted
+    /// the seam (its <c>Create</c> returned normally), so on main this fact is red on the null exception, not
+    /// on the harmful branch, which no seam reaches.
     /// </summary>
     [Fact]
     public void A_secret_key_that_cannot_be_read_is_not_overwritten()
