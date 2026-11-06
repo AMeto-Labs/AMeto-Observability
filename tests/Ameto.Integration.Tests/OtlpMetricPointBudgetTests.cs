@@ -481,7 +481,109 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Contains("buckets.beside.grpc", QueryNames("buckets.beside.grpc"));
     }
 
+    /// <summary>
+    /// A point of more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels is refused at decode and
+    /// reported as dropped; the rest of its batch is ingested (#132). A point of 20 000 attributes used to
+    /// cost half a second of one core — the label dedupe scanned the keys already present for each one —
+    /// and the point budget, which counts points, let an 8 MiB body of them through. A point AT the cap
+    /// is taken as before.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_point_of_more_than_256_labels_is_dropped_and_the_rest_of_its_batch_ingested(bool protobuf)
+    {
+        string tag = protobuf ? "proto" : "json";
+        string wide = "labels.wide." + tag, beside = "labels.beside." + tag;
+
+        using var refused = await PostAsync(GaugeBeside(wide, MetricLabelSetBuilder.MaxLabels + 1, beside, protobuf), protobuf);
+
+        Assert.Equal(HttpStatusCode.OK, refused.StatusCode);
+        Assert.Equal("{\"ingested\":1,\"dropped\":1}", await refused.Content.ReadAsStringAsync());
+        Assert.Empty(QueryNames(wide));
+        Assert.Contains(beside, QueryNames(beside));
+
+        string atCap = "labels.at-cap." + tag, beside2 = "labels.beside2." + tag;
+        using var accepted = await PostAsync(GaugeBeside(atCap, MetricLabelSetBuilder.MaxLabels, beside2, protobuf), protobuf);
+
+        Assert.Equal("{\"ingested\":2,\"dropped\":0}", await accepted.Content.ReadAsStringAsync());
+        Assert.Contains(atCap, QueryNames(atCap));
+    }
+
+    /// <summary>The same over gRPC: OK, with the point in <c>partial_success</c> and the reason.</summary>
+    [Fact]
+    public async Task A_grpc_point_of_more_than_256_labels_is_a_rejected_point_with_its_reason()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var noLog = new OtlpGzipTooLargeLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var noMemoryLog = new OtlpOutOfMemoryLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var call = GrpcCall(Frame(GaugeBeside("labels.wide.grpc", MetricLabelSetBuilder.MaxLabels + 1,
+                                              "labels.beside.grpc", protobuf: true)));
+
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, noLog, noMemoryLog,
+            (c, msg) => OtlpGrpcEndpointMapper.DecodeMetrics(c, msg.AsSpan(), Limit));
+
+        Assert.Equal("0", call.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(OtlpGrpcFraming.Frame(OtlpGrpcFraming.ExportResponse(1, OtlpGrpcEndpointMapper.TooManyLabelsReason)),
+                     ((MemoryStream)call.Response.Body).ToArray());
+        Assert.Empty(QueryNames("labels.wide.grpc"));
+        Assert.Contains("labels.beside.grpc", QueryNames("labels.beside.grpc"));
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One batch: a gauge point of <paramref name="attributes"/> distinct string attributes and a gauge
+    /// point beside it with none, both stamped a minute ago and without a resource, so the first point's
+    /// label count is exactly its attribute count.
+    /// </summary>
+    private static byte[] GaugeBeside(string wide, int attributes, string gauge, bool protobuf)
+    {
+        long now = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60_000) * 1_000_000L;
+        string ts = now.ToString(CultureInfo.InvariantCulture);
+        if (!protobuf)
+        {
+            var sb = new StringBuilder("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"name\":\"")
+                .Append(wide).Append("\",\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"").Append(ts)
+                .Append("\",\"asDouble\":1.5,\"attributes\":[");
+            for (int i = 0; i < attributes; i++)
+                sb.Append(i == 0 ? "" : ",").Append("{\"key\":\"k").Append(i).Append("\",\"value\":{\"stringValue\":\"v\"}}");
+            sb.Append("]}]}},{\"name\":\"").Append(gauge).Append("\",\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"")
+              .Append(ts).Append("\",\"asDouble\":1.5}]}}]}]}]}");
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        return Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm =>
+        {
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(wide);
+                Sub(metric, 5, Msg(g => Sub(g, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                    for (int i = 0; i < attributes; i++)
+                        Sub(dp, 7, StringAttribute("k" + i, "v"));                   // field 7: attributes
+                }))));
+            }));
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(gauge);
+                Sub(metric, 5, Msg(g => Sub(g, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                }))));
+            }));
+        })))));
+    }
+
+    /// <summary>An OTLP KeyValue with a string AnyValue.</summary>
+    private static byte[] StringAttribute(string key, string value) => Msg(kv =>
+    {
+        kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString(key);
+        Sub(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString(value); }));
+    });
 
     /// <summary>
     /// One batch: a histogram point of <paramref name="buckets"/> zero counts — packed varints, one byte

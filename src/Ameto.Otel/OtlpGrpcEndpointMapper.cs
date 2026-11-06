@@ -112,16 +112,28 @@ public static class OtlpGrpcEndpointMapper
             throw new OtlpMetricPointBudget.TooManyPointsException(weight, maxPoints);
         }
 
-        var points = OtlpMetricProtoParser.Parse(message, out int tooManyBuckets);
+        var points = OtlpMetricProtoParser.Parse(message, out MetricDecodeRefusals refusedAtDecode);
         int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()
             .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-        return (true, tooManyBuckets + stale, (tooManyBuckets, stale) switch
-        {
-            ( > 0, > 0) => TooManyBucketsAndFutureReason,
-            ( > 0, _)   => TooManyBucketsReason,
-            _           => FutureReason,
-        });
+        return (true, refusedAtDecode.Total + stale, RefusalReason(refusedAtDecode, stale));
     }
+
+    /// <summary>
+    /// The partial success's message: which of the three refusals the batch met, as one sentence out
+    /// of the constants below (no string is built on the ingest path). <see cref="FutureReason"/> when
+    /// none did: the caller reads the message only beside a count above zero.
+    /// </summary>
+    internal static string RefusalReason(MetricDecodeRefusals decode, int stale) =>
+        (decode.TooManyBuckets > 0, decode.TooManyLabels > 0, stale > 0) switch
+        {
+            (true,  false, false) => TooManyBucketsReason,
+            (false, true,  false) => TooManyLabelsReason,
+            (true,  true,  false) => TooManyBucketsAndLabelsReason,
+            (true,  false, true)  => TooManyBucketsAndFutureReason,
+            (false, true,  true)  => TooManyLabelsAndFutureReason,
+            (true,  true,  true)  => EveryReason,
+            _                     => FutureReason,
+        };
 
     /// <summary>Why metric points were rejected: a timestamp more than 24 h ahead (the store's refusal).</summary>
     internal const string FutureReason = "points stamped more than 24 h in the future were refused";
@@ -132,9 +144,21 @@ public static class OtlpGrpcEndpointMapper
     /// </summary>
     internal const string TooManyBucketsReason = "histogram points of more than 65535 buckets were refused";
 
-    /// <summary>Both of the above in one batch.</summary>
+    /// <summary>
+    /// Why metric points were rejected: a point of more than <see cref="MetricLabelSetBuilder.MaxLabels"/>
+    /// labels — its own attributes with the resource's — refused at decode (#132).
+    /// </summary>
+    internal const string TooManyLabelsReason = "points of more than 256 labels were refused";
+
+    /// <summary>Two or three of the above in one batch.</summary>
     internal const string TooManyBucketsAndFutureReason =
         "histogram points of more than 65535 buckets, and points stamped more than 24 h in the future, were refused";
+    internal const string TooManyLabelsAndFutureReason =
+        "points of more than 256 labels, and points stamped more than 24 h in the future, were refused";
+    internal const string TooManyBucketsAndLabelsReason =
+        "histogram points of more than 65535 buckets, and points of more than 256 labels, were refused";
+    internal const string EveryReason =
+        "histogram points of more than 65535 buckets, points of more than 256 labels, and points stamped more than 24 h in the future, were refused";
 
     /// <summary>
     /// The trace Export's decode: the protobuf STREAMS into the raw span sink (TI#3) — no

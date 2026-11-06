@@ -16,23 +16,36 @@ namespace Ameto.Otel;
 public static class OtlpMetricMapper
 {
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request) =>
-        Map(request, MetricLabelInterner.Shared, out _);
+        Map(request, MetricLabelInterner.Shared, out MetricDecodeRefusals _);
 
     /// <summary>
-    /// <see cref="Map(ExportMetricsServiceRequest)"/>, and how many histogram points it refused for
-    /// carrying more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets — the count the
-    /// receiver reports as rejected (#126 review NEW-0).
+    /// <see cref="Map(ExportMetricsServiceRequest)"/>, and how many points it refused at decode —
+    /// histogram points of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126
+    /// review NEW-0), points of more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels (#132)
+    /// — the count the receiver reports as rejected.
     /// </summary>
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, out int refused) =>
         Map(request, MetricLabelInterner.Shared, out refused);
 
-    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner) =>
-        Map(request, interner, out _);
+    /// <summary><see cref="Map(ExportMetricsServiceRequest, out int)"/>, the refusals by reason.</summary>
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, out MetricDecodeRefusals refused) =>
+        Map(request, MetricLabelInterner.Shared, out refused);
 
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner) =>
+        Map(request, interner, out MetricDecodeRefusals _);
+
+    /// <summary><see cref="Map(ExportMetricsServiceRequest, MetricLabelInterner, out MetricDecodeRefusals)"/>, the refusals as one count.</summary>
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner, out int refused)
     {
+        var items = Map(request, interner, out MetricDecodeRefusals byReason);
+        refused = byReason.Total;
+        return items;
+    }
+
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner, out MetricDecodeRefusals refused)
+    {
         var result = new List<MetricIngestItem>();
-        refused = 0;
+        int tooManyBuckets = 0, tooManyLabels = 0;
         // The label rule is the protobuf parser's too — one builder, so the two encodings cannot
         // disagree on a series' identity.
         var labels = new MetricLabelSetBuilder(interner);
@@ -51,18 +64,19 @@ public static class OtlpMetricMapper
                 string unit = interner.Intern(metric.Unit ?? "");
 
                 if (metric.Gauge is not null)
-                    MapNumberPoints(name, unit, MetricKind.Gauge, metric.Gauge.DataPoints, labels, result);
+                    MapNumberPoints(name, unit, MetricKind.Gauge, metric.Gauge.DataPoints, labels, result, ref tooManyLabels);
 
                 else if (metric.Sum is not null)
                     MapNumberPoints(name, unit,
                         metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
-                        metric.Sum.DataPoints, labels, result);
+                        metric.Sum.DataPoints, labels, result, ref tooManyLabels);
 
                 else if (metric.Histogram is not null)
-                    refused += MapHistogramPoints(name, unit, metric.Histogram.DataPoints, labels, result);
+                    MapHistogramPoints(name, unit, metric.Histogram.DataPoints, labels, result, ref tooManyBuckets, ref tooManyLabels);
             }
         }
 
+        refused = new MetricDecodeRefusals(tooManyBuckets, tooManyLabels);
         return result;
     }
 
@@ -83,7 +97,9 @@ public static class OtlpMetricMapper
     {
         if (attrs is null) return;
 
-        for (int i = 0; i < attrs.Count; i++)
+        // Past MaxLabels the resource is done for: every point under it is refused (#132), so nothing
+        // more of it is kept or interned.
+        for (int i = 0; i < attrs.Count && !labels.ResourceOverflowed; i++)
         {
             var kv = attrs[i];
             if (kv.Key is null || kv.Value is null) continue;
@@ -114,46 +130,57 @@ public static class OtlpMetricMapper
         return null;
     }
 
+    /// <param name="tooManyLabels">Counts the points refused for more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels (#132).</param>
     private static void MapNumberPoints(
         string                                   name,
         string                                   unit,
         MetricKind                               kind,
         List<OtlpNumberDataPoint>?               points,
         MetricLabelSetBuilder                    labels,
-        List<MetricIngestItem>                   result)
+        List<MetricIngestItem>                   result,
+        ref int                                  tooManyLabels)
     {
         foreach (var dp in points ?? [])
         {
             double value = dp.AsDouble
                 ?? (dp.AsInt is not null && long.TryParse(dp.AsInt, out var i) ? (double)i : 0);
 
+            var labelSet = ExtractLabels(dp.Attributes, labels);
+            if (labels.Overflowed)
+            {
+                tooManyLabels++;   // refused, not built: the protobuf parser's rule (#132)
+                continue;
+            }
+
             result.Add(new MetricIngestItem
             {
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = ExtractLabels(dp.Attributes, labels),
+                Labels            = labelSet,
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 ScalarValue       = value,
             });
         }
     }
 
-    /// <returns>The points refused for carrying more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets.</returns>
-    private static int MapHistogramPoints(
+    /// <param name="tooManyBuckets">Counts the points refused for more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets.</param>
+    /// <param name="tooManyLabels">Counts the points refused for more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels (#132).</param>
+    private static void MapHistogramPoints(
         string                                   name,
         string                                   unit,
         List<OtlpHistogramDataPoint>?            points,
         MetricLabelSetBuilder                    labels,
-        List<MetricIngestItem>                   result)
+        List<MetricIngestItem>                   result,
+        ref int                                  tooManyBuckets,
+        ref int                                  tooManyLabels)
     {
-        int refused = 0;
         foreach (var dp in points ?? [])
         {
             // Refused, not built: the protobuf parser's rule (#126 review NEW-0).
             if (dp.BucketCounts is { Count: > MetricIngestItem.MaxBucketCounts })
             {
-                refused++;
+                tooManyBuckets++;
                 continue;
             }
 
@@ -197,12 +224,19 @@ public static class OtlpMetricMapper
                 if (list.Count > 0) exemplars = list.ToArray();
             }
 
+            var labelSet = ExtractLabels(dp.Attributes, labels);
+            if (labels.Overflowed)
+            {
+                tooManyLabels++;   // refused, not built: the protobuf parser's rule (#132)
+                continue;
+            }
+
             result.Add(new MetricIngestItem
             {
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = ExtractLabels(dp.Attributes, labels),
+                Labels            = labelSet,
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 HistogramCount    = count,
                 HistogramSum      = dp.Sum ?? 0,
@@ -211,15 +245,19 @@ public static class OtlpMetricMapper
                 Exemplars         = exemplars,
             });
         }
-        return refused;
     }
 
-    /// <summary>The point's label set through the builder the protobuf parser uses too.</summary>
+    /// <summary>
+    /// The point's label set through the builder the protobuf parser uses too. Stops at the attribute
+    /// that takes the point past <see cref="MetricLabelSetBuilder.MaxLabels"/>: the point is refused
+    /// (<see cref="MetricLabelSetBuilder.Overflowed"/>, the caller's to count) and the rest of its
+    /// attributes are not interned (#132).
+    /// </summary>
     private static LabelSet ExtractLabels(List<OtlpKeyValue>? attrs, MetricLabelSetBuilder labels)
     {
         labels.BeginPoint();
         if (attrs is not null)
-        for (int i = 0; i < attrs.Count; i++)
+        for (int i = 0; i < attrs.Count && !labels.Overflowed; i++)
         {
             var kv = attrs[i];
             if (kv.Key is null || kv.Value is null) continue;
