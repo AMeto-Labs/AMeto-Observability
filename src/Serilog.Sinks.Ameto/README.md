@@ -6,7 +6,7 @@ MessagePack CLEF endpoint (`POST /api/events`). Seq-compatible API key header.
 ## Install
 
 ```xml
-<PackageReference Include="Serilog.Sinks.Ameto" Version="1.0.0" />
+<PackageReference Include="Serilog.Sinks.Ameto" Version="1.1.0" />
 ```
 
 ## Usage
@@ -68,17 +68,51 @@ then override your own fields:
 
 | Property                   | Default             | Description                                                    |
 |----------------------------|---------------------|----------------------------------------------------------------|
-| `BatchSizeLimit`           | `1000`              | Max events per HTTP request.                                   |
+| `BatchSizeLimit`           | `1000`              | Max events per batch.                                          |
+| `BatchBytesLimit`          | `3 MB`              | Max serialised bytes per HTTP request. A batch past it goes as several requests, each under the limit (an event larger than the limit on its own still goes, alone). Keep it under the server's `Ingestion.MaxBatchBytes` (4 MB default). `0` = one request per batch. |
 | `Period`                   | `1s`                | Flush interval (also flushes early when a batch fills).        |
 | `QueueLimit`               | `100_000`           | In-memory buffer cap; excess events are dropped (back-pressure).|
 | `EagerlyEmitFirstEvent`    | `true`              | Emit the first event immediately instead of waiting a period.  |
 | `RestrictedToMinimumLevel` | `LevelAlias.Minimum`| Static minimum level for this sink.                            |
 | `LevelSwitch`              | `null`              | Runtime-adjustable level (overrides `RestrictedToMinimumLevel`).|
 | `HttpClient`               | `null` (sink-owned) | Inject a pre-configured `HttpClient` (shared pool/proxy).      |
-| `EventBodyLimitBytes`      | `65_536`            | Max serialised size of one event. An oversized event (e.g. a runaway `{@Object}`) is replaced by a compact **Error** marker carrying `OriginalTemplate`, `OriginalLevel` and the measured size — visible and searchable in Ameto instead of being silently rejected by the server's payload cap. `0` = unlimited. |
+| `PropertiesLimitBytes`     | `65_536`            | Max serialised size of one event's **properties** — what the server measures against its `Ingestion.MaxEventPayloadBytes` (64 KB default). An event over it (a runaway `{@Object}`) is replaced by an **Error** marker (below). `0` = unlimited. Was `EventBodyLimitBytes` before 1.1, which still works and sets the same value. |
+| `ExceptionLimitBytes`      | `262_144`           | Max serialised size of one event's exception (`@x`). Over it the type is kept, the message and stack trace are cut and inner exceptions dropped — the event itself still arrives. `0` = unlimited. |
 
-> An explicit-parameter overload (`Ameto(serverUrl, apiKey:, serviceName:, …)`) is also
-> available for simple cases and delegates to the same builder.
+## Delivery
+
+The sink answers the server's status codes the way the server means them
+(`docs/API.md`, "POST /api/events"):
+
+| Server says | The sink does |
+|-------------|---------------|
+| `200` | Done. |
+| `400` with `failedAtElement: K` | The K events before it are stored and stay so. Event K is dropped with a `SelfLog` line; the events after it are sent again. |
+| `400` without `failedAtElement` | The server could not read the request at all; it is dropped, never retried. |
+| `413` | The request is cut in half and sent again, down to one event. One event the server still refuses is replaced by an **Error** marker. |
+| `429`, `503` | Nothing was stored. One retry after `Retry-After` (1 s when absent, 10 s at most), then the batch is handed back to Serilog's batching layer, which retries it with back-off for up to its retry time limit (10 minutes by default). |
+| `500`, `502`, `504`, transport failure | Handed to the batching layer at once. |
+| `401`, `403`, `404`, other `4xx` | Configuration, which no retry fixes: the batch is dropped with a `SelfLog` line. |
+
+A batch the batching layer retries **resumes** past the requests that already went through, so
+the server — which does not de-duplicate — never stores an event twice because of a retry.
+
+Failures are reported through [`SelfLog`](https://github.com/serilog/serilog/wiki/Debugging-and-Diagnostics)
+(`Serilog.Debugging.SelfLog.Enable(Console.Error)`), one line per dropped event or request.
+
+### Markers
+
+An event the sink cannot send as it is leaves an **Error**-level event in its place, with the
+original's timestamp, trace context and `service.name`, searchable in Ameto by `DroppedBy = 'sink'`
+or `OriginalTemplate`:
+
+| Why | `@mt` | Properties |
+|-----|-------|------------|
+| Properties over `PropertiesLimitBytes` | `Log event properties of {EventBodyBytes} bytes exceeded the sink limit of {EventBodyLimitBytes} bytes; the event was dropped: {OriginalTemplate}` | `DroppedBy`, `EventBodyBytes`, `EventBodyLimitBytes`, `OriginalTemplate`, `OriginalLevel` |
+| The server refused the event alone with `413` | `Log event of {EventBodyBytes} bytes was refused by the server as too large; the event was dropped: {OriginalTemplate}` | `DroppedBy`, `EventBodyBytes`, `OriginalTemplate`, `OriginalLevel` |
+| Formatting threw (a property whose `ToString()` fails) | `Log event could not be serialised by the Ameto sink ({SinkError}); the event was dropped: {OriginalTemplate}` | `DroppedBy`, `SinkError`, `OriginalTemplate`, `OriginalLevel` |
+
+The field names are the server's own drop marker's (`DroppedBy = 'server'`), so one filter finds both.
 
 ## Wire format
 

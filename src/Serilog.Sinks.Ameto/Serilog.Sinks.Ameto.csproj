@@ -10,18 +10,26 @@
 
     <!-- NuGet metadata -->
     <PackageId>Serilog.Sinks.Ameto</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.1.0</Version>
     <Authors>Ameto</Authors>
     <Description>Serilog sink that ships events to an Ameto server (Seq-compatible CLEF over MessagePack).</Description>
     <PackageTags>serilog;sink;logging;ameto;seq;clef</PackageTags>
     <PackageIcon>logo.png</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/AMeto-Labs/AMeto-Observability</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/AMeto-Labs/AMeto-Observability</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Packaged (not compiled) assets: NuGet gallery icon + package README. -->
     <None Include="logo.png"  Pack="true" PackagePath="\" />
     <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The sink's tests drive AmetoBatchedSink and AmetoClefFormatter directly. -->
+    <InternalsVisibleTo Include="Serilog.Sinks.Ameto.Tests" />
   </ItemGroup>
 
   <ItemGroup>
