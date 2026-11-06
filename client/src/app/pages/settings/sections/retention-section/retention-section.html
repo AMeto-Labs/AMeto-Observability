@@ -1,7 +1,7 @@
 <app-section title="Retention policy">
   <span class="sublabel">
-    How long events are kept per log level. The retention worker runs every hour.
-    Changes take effect on the next run.
+    How long events are kept per log level, 1 to 36 500 days; 36 500 (100 years) keeps data indefinitely.
+    The retention worker runs every hour. Changes take effect on the next run.
   </span>
 
   @if (loading()) {
@@ -22,6 +22,7 @@
             class="days-input"
             type="number"
             min="1"
+            [max]="maxDays"
             [ngModel]="signals[f.key]()"
             (ngModelChange)="signals[f.key].set(+$event)"
             [title]="f.label + ' retention days'"
@@ -32,7 +33,9 @@
     </div>
 
     <div class="retention-footer">
-      @if (runResult(); as r) {
+      @if (actionError(); as err) {
+        <span class="run-result err" role="alert">{{ err }}</span>
+      } @else if (runResult(); as r) {
         <span class="run-result ok">
           Logs: {{ r.deletedSegments }} seg · {{ (r.freedBytes / 1048576).toFixed(1) }} MB freed
           @if (r.deletedMetricFiles > 0) { &nbsp;· Metrics: {{ r.deletedMetricFiles }} file(s) }

@@ -68,7 +68,7 @@ public sealed class OtlpTraceProtoParityTests
     public void RawSink_InternsTheServiceOncePerResourceBlock()
     {
         var sink = new CapturingSpanSink();
-        var (ingested, _) = OtlpTraceProtoParser.Parse(OtlpProtoPayloads.Traces_Realistic(200, nestedAttr: false), sink);
+        var (ingested, _, _) = OtlpTraceProtoParser.Parse(OtlpProtoPayloads.Traces_Realistic(200, nestedAttr: false), sink);
 
         Assert.Equal(200, ingested);
         Assert.Equal(1, sink.InternCalls);
@@ -115,7 +115,7 @@ public sealed class OtlpTraceProtoParityTests
         });
 
         var proto = new CapturingSpanSink();
-        var (ingested, _) = OtlpTraceProtoParser.Parse(payload, proto);
+        var (ingested, _, _) = OtlpTraceProtoParser.Parse(payload, proto);
         Assert.Equal(1, ingested);
         Assert.Equal(1, proto.InternCalls);
         Assert.Equal("checkout"u8.ToArray(), Assert.Single(proto.Interned));
@@ -128,7 +128,7 @@ public sealed class OtlpTraceProtoParityTests
             + "{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"checkout\"}}]},"
             + "\"scopeSpans\":[{\"spans\":[{\"traceId\":\"0af7651916cd43dd8448eb211c80319c\",\"spanId\":\"b7ad6b7169203331\",\"name\":\"GET /cart\"}]}]}]}";
         var viaJson = new CapturingSpanSink();
-        var (jsonIngested, _) = OtlpTraceStreamParser.Parse(System.Text.Encoding.UTF8.GetBytes(json), viaJson);
+        var (jsonIngested, _, _) = OtlpTraceStreamParser.Parse(System.Text.Encoding.UTF8.GetBytes(json), viaJson);
         Assert.Equal(1, jsonIngested);
         Assert.Equal(1, viaJson.InternCalls);
         Assert.Equal("checkout"u8.ToArray(), Assert.Single(viaJson.Interned));
@@ -310,7 +310,7 @@ public sealed class OtlpTraceProtoParityTests
     {
         var dom  = ViaDom(payload);
         var sink = new CapturingSpanSink();
-        var (ingested, refused) = OtlpTraceProtoParser.Parse(payload, sink);
+        var (ingested, refused, _) = OtlpTraceProtoParser.Parse(payload, sink);
         var raw = sink.AssertMatches(dom);
         Assert.Equal((dom.Count, 0), (ingested, refused));
         Assert.Equal(1, sink.EndBatches);

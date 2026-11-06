@@ -130,7 +130,8 @@ public static class OtlpEndpointMapper
             }
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
 
-            int ingested, refused;
+            int  ingested, refused;
+            bool forRoom;
             try
             {
                 var (body, bodyLen, slot) = await ReadBodyAsync(ctx, inflateGate, tooLargeLog);
@@ -146,7 +147,7 @@ public static class OtlpEndpointMapper
                     // arena. Protobuf is what SDK exporters and the collector send (see
                     // OtlpTraceProtoParser). A malformed tail leaves its prefix ingested and answers
                     // 400, which OTLP defines as not retryable — the log route's behaviour.
-                    (ingested, refused) = isProto
+                    (ingested, refused, forRoom) = isProto
                         ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen), sink)
                         : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen), sink);
                 }
@@ -161,6 +162,20 @@ public static class OtlpEndpointMapper
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {
                 RefuseOutOfMemory(ctx, outOfMemoryLog, ex);
+                return;
+            }
+
+            // NOTHING OF THE BATCH WAS TAKEN, FOR WANT OF ROOM: the span ring was full — slots, arena or
+            // bytes in flight — at its first span, and so for the rest (a refused batch is a prefix).
+            // Answered 503 with Retry-After, which the exporter retries — and a retry duplicates nothing
+            // — the log road's rule for a store with no room (#138; it used to be 200 with every span as
+            // dropped, which OTLP exporters never retry). A batch the ring took part of is 200 with the
+            // rest as dropped, as before: OTLP's partial success. So is a batch whose first span is
+            // heavier than the whole ring: no retry fits it, and a 503 would only have the exporter
+            // send it again until its retries ran out.
+            if (ingested == 0 && refused > 0 && forRoom)
+            {
+                WriteRetryLater(ctx, TraceBufferFullMessage);
                 return;
             }
 
@@ -187,7 +202,7 @@ public static class OtlpEndpointMapper
                 if (body is null) return;
 
                 List<Ameto.Metrics.MetricIngestItem> points;
-                int tooManyBuckets;   // histogram points refused at decode (#126 review NEW-0)
+                MetricDecodeRefusals refusedAtDecode;   // points refused at decode: too many buckets (#126 review NEW-0) or labels (#132)
                 try
                 {
                     bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
@@ -213,14 +228,14 @@ public static class OtlpEndpointMapper
                         // Protobuf: parse straight to ingest items — no OTLP object graph, no
                         // parser object per nested message, no wire-int→string→int round trip
                         // (see OtlpMetricProtoParser). This is the encoding SDK exporters use.
-                        points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen), out tooManyBuckets);
+                        points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen), out refusedAtDecode);
                     }
                     else
                     {
                         var request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(
                             body.AsSpan(0, bodyLen), _jsonOptions);
                         if (request is null) { ctx.Response.StatusCode = 400; return; }
-                        points = OtlpMetricMapper.Map(request, out tooManyBuckets);
+                        points = OtlpMetricMapper.Map(request, out refusedAtDecode);
                     }
                     OnMetricsParsedForTest?.Invoke(points);
                 }
@@ -235,7 +250,7 @@ public static class OtlpEndpointMapper
                 // what keeps them, and it stores the filed ones a second time — at least once.
                 int stale = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
                 accepted  = points.Count - stale;
-                refused   = stale + tooManyBuckets;
+                refused   = stale + refusedAtDecode.Total;
             }
             catch (Exception ex) when (OtlpOutOfMemoryLog.IsOutOfMemory(ex) && !ctx.Response.HasStarted)
             {
@@ -655,6 +670,13 @@ public static class OtlpEndpointMapper
     /// Nothing was written, so the retry stores the batch once.
     /// </summary>
     internal static ReadOnlySpan<byte> LogStoreBusyMessage => "the log store is behind and had no room for this batch; retry"u8;
+
+    /// <summary>
+    /// What a 503 says when the span ring had no room for any of the batch (#138): the drainer is behind
+    /// — or holding a tail the engine would not take — and nothing was taken, so the retry stores the
+    /// batch once.
+    /// </summary>
+    internal static ReadOnlySpan<byte> TraceBufferFullMessage => "the trace ingest buffer is full and had no room for this batch; retry"u8;
 
     /// <summary>
     /// How long a 503 asks the exporter to wait. One second: a slot is held for one inflate and

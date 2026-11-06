@@ -24,25 +24,31 @@ public sealed class RetentionStore
         _connStr = $"Data Source={Path.Combine(options.DataDirectory, "Ameto.db")}";
         InitTable();
         var loaded = LoadFromDb();
-        if (loaded is null)
+        var source = loaded is null ? "configuration" : "database";
+        var dto    = loaded ?? new RetentionDto
         {
-            _current = new RetentionDto
-            {
-                VerboseDays     = options.Retention.VerboseDays,
-                DebugDays       = options.Retention.DebugDays,
-                InformationDays = options.Retention.InformationDays,
-                WarningDays     = options.Retention.WarningDays,
-                ErrorDays       = options.Retention.ErrorDays,
-                FatalDays       = options.Retention.FatalDays,
-                MetricsDays     = options.Retention.MetricsDays,
-                TracesDays      = options.Retention.TracesDays,
-            };
-            SaveToDb(_current);
-        }
-        else
-        {
-            _current = loaded;
-        }
+            VerboseDays     = options.Retention.VerboseDays,
+            DebugDays       = options.Retention.DebugDays,
+            InformationDays = options.Retention.InformationDays,
+            WarningDays     = options.Retention.WarningDays,
+            ErrorDays       = options.Retention.ErrorDays,
+            FatalDays       = options.Retention.FatalDays,
+            MetricsDays     = options.Retention.MetricsDays,
+            TracesDays      = options.Retention.TracesDays,
+        };
+
+        // A window outside the bounds — "forever" typed as 200 000 days, which wrapped the trace
+        // cutoff into the future and deleted every trace file every hour (#130) — is clamped here,
+        // before any prune sees it, and written back so the next start reads a sound policy.
+        // Set() refuses such a window outright; this is for what a database or a config file held
+        // before the bounds existed.
+        var clamped = dto.Clamped(out bool changed);
+        if (changed)
+            _logger.LogWarning(
+                "Retention windows from the {Source} were outside {Min}…{Max} days and were clamped: {Before} → {After}",
+                source, RetentionMath.MinDays, RetentionMath.MaxDays, dto, clamped);
+        _current = clamped;
+        if (loaded is null || changed) SaveToDb(_current);
     }
 
     /// <summary>Returns the current retention settings DTO.</summary>
@@ -51,9 +57,18 @@ public sealed class RetentionStore
     /// <summary>Returns the current settings as a <see cref="RetentionPolicy"/>.</summary>
     public RetentionPolicy GetPolicy() => _current.ToPolicy();
 
-    /// <summary>Updates settings and persists to the database.</summary>
+    /// <summary>
+    /// Updates settings and persists to the database. A window outside
+    /// [<see cref="RetentionMath.MinDays"/>, <see cref="RetentionMath.MaxDays"/>] is refused whole, with an
+    /// <see cref="ArgumentOutOfRangeException"/> whose <c>ParamName</c> is the field's wire name (#130).
+    /// </summary>
     public void Set(RetentionDto dto)
     {
+        var field = dto.FirstInvalidField();
+        if (field is not null)
+            throw new ArgumentOutOfRangeException(field,
+                $"{field} must be between {RetentionMath.MinDays} and {RetentionMath.MaxDays} days");
+
         lock (_lock)
         {
             _current = dto;
@@ -180,13 +195,57 @@ public sealed class RetentionDto
         FatalDays       = (int)policy.GetTtl(CoreLogLevel.Fatal).TotalDays,
     };
 
+    /// <summary>The TTLs, each clamped into the bounds (<see cref="RetentionMath.TtlOf"/>): what the log engine expires by.</summary>
     public RetentionPolicy ToPolicy() => new(new Dictionary<CoreLogLevel, TimeSpan>
     {
-        [CoreLogLevel.Verbose]     = TimeSpan.FromDays(Math.Max(1, VerboseDays)),
-        [CoreLogLevel.Debug]       = TimeSpan.FromDays(Math.Max(1, DebugDays)),
-        [CoreLogLevel.Information] = TimeSpan.FromDays(Math.Max(1, InformationDays)),
-        [CoreLogLevel.Warning]     = TimeSpan.FromDays(Math.Max(1, WarningDays)),
-        [CoreLogLevel.Error]       = TimeSpan.FromDays(Math.Max(1, ErrorDays)),
-        [CoreLogLevel.Fatal]       = TimeSpan.FromDays(Math.Max(1, FatalDays)),
+        [CoreLogLevel.Verbose]     = RetentionMath.TtlOf(VerboseDays),
+        [CoreLogLevel.Debug]       = RetentionMath.TtlOf(DebugDays),
+        [CoreLogLevel.Information] = RetentionMath.TtlOf(InformationDays),
+        [CoreLogLevel.Warning]     = RetentionMath.TtlOf(WarningDays),
+        [CoreLogLevel.Error]       = RetentionMath.TtlOf(ErrorDays),
+        [CoreLogLevel.Fatal]       = RetentionMath.TtlOf(FatalDays),
     });
+
+    /// <summary>
+    /// The wire name of the first window outside [<see cref="RetentionMath.MinDays"/>, <see cref="RetentionMath.MaxDays"/>],
+    /// in wire order, or <c>null</c> when every window is in range.
+    /// </summary>
+    public string? FirstInvalidField()
+    {
+        if (!RetentionMath.IsValidDays(VerboseDays))     return "verboseDays";
+        if (!RetentionMath.IsValidDays(DebugDays))       return "debugDays";
+        if (!RetentionMath.IsValidDays(InformationDays)) return "informationDays";
+        if (!RetentionMath.IsValidDays(WarningDays))     return "warningDays";
+        if (!RetentionMath.IsValidDays(ErrorDays))       return "errorDays";
+        if (!RetentionMath.IsValidDays(FatalDays))       return "fatalDays";
+        if (!RetentionMath.IsValidDays(MetricsDays))     return "metricsDays";
+        if (!RetentionMath.IsValidDays(TracesDays))      return "tracesDays";
+        return null;
+    }
+
+    /// <summary>A copy with every window clamped into the bounds; <paramref name="changed"/> says whether any was.</summary>
+    public RetentionDto Clamped(out bool changed)
+    {
+        var c = new RetentionDto
+        {
+            VerboseDays     = Clamp(VerboseDays),
+            DebugDays       = Clamp(DebugDays),
+            InformationDays = Clamp(InformationDays),
+            WarningDays     = Clamp(WarningDays),
+            ErrorDays       = Clamp(ErrorDays),
+            FatalDays       = Clamp(FatalDays),
+            MetricsDays     = Clamp(MetricsDays),
+            TracesDays      = Clamp(TracesDays),
+        };
+        changed = c.VerboseDays != VerboseDays || c.DebugDays != DebugDays || c.InformationDays != InformationDays
+               || c.WarningDays != WarningDays || c.ErrorDays != ErrorDays || c.FatalDays != FatalDays
+               || c.MetricsDays != MetricsDays || c.TracesDays != TracesDays;
+        return c;
+    }
+
+    private static int Clamp(int days) => Math.Clamp(days, RetentionMath.MinDays, RetentionMath.MaxDays);
+
+    public override string ToString()
+        => $"verbose {VerboseDays} d, debug {DebugDays} d, information {InformationDays} d, warning {WarningDays} d, "
+         + $"error {ErrorDays} d, fatal {FatalDays} d, metrics {MetricsDays} d, traces {TracesDays} d";
 }

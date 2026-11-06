@@ -1038,6 +1038,37 @@ public sealed class SpanRingRawTests : IDisposable
 
     // ── fixtures ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// #138: the receivers answer 503/UNAVAILABLE — which exporters retry — for a batch refused whole,
+    /// but only for want of ROOM. A span heavier than the whole ring is refused for bytes exactly like a
+    /// span that found the budget spent by others, and only the ring can tell them apart: no retry fits
+    /// the first, while the drainer frees room for the second. The endpoint carries the answer to the
+    /// parsers as <see cref="ISpanSink.RefusedForRoom"/>.
+    /// </summary>
+    [Fact]
+    public void A_refusal_says_whether_a_retry_could_fit_the_span()
+    {
+        using var ring = new SpanRingBuffer(capacity: 16, maxBytes: 64 * 1024);
+        var sink = new SpanIngestionEndpoint(ring, NullLogger<SpanIngestionEndpoint>.Instance);
+
+        // Heavier than the ring on its own: refused for bytes, and no retry fits it.
+        Assert.False(Raw(sink, 0, Filled(100_000)));
+        Assert.False(ring.LastRefusalWasForRoom);
+        Assert.False(sink.RefusedForRoom);
+        Assert.Equal(1, ring.RefusedForBytes);
+        sink.EndBatch();
+
+        // The budget spent by spans that fit: refused for bytes too, but a retry finds it freer.
+        int filled = 0;
+        while (Raw(sink, 100 + filled, Filled(16 * 1024)))
+            Assert.True(++filled < 16, "the budget never ran out");
+        Assert.InRange(filled, 1, 15);
+        Assert.True(ring.LastRefusalWasForRoom);
+        Assert.True(sink.RefusedForRoom);
+        Assert.Equal(2, ring.RefusedForBytes);
+        sink.EndBatch();
+    }
+
     private const int Traces = 100;
 
     private static int ChunkOf(in SpanHeader h) => h.PayloadArenaOffset / SpanRingBuffer.ChunkBytes;

@@ -23,11 +23,12 @@ public sealed class OtlpGrpcTraceSinkTests
         byte[] payload = OtlpProtoPayloads.Traces_Realistic(200, nestedAttr: false);
         var sink = new CapturingSpanSink();
 
-        var (ok, rejected, why) = OtlpGrpcEndpointMapper.IngestTraces(payload, sink);
+        var (ok, rejected, why, busy) = OtlpGrpcEndpointMapper.IngestTraces(payload, sink);
 
         Assert.True(ok);
         Assert.Equal(0, rejected);
         Assert.NotNull(why);                                              // shown only when something is rejected
+        Assert.False(busy);
         sink.AssertMatches(OtlpTraceMapper.Map(OtlpProtoDecoder.DecodeTraces(payload, payload.Length)));
         Assert.Equal(1, sink.EndBatches);
         Assert.Equal(1, sink.InternCalls);                                // once for the block, not per span
@@ -39,18 +40,39 @@ public sealed class OtlpGrpcTraceSinkTests
         byte[] payload = OtlpProtoPayloads.Traces_Realistic(20, nestedAttr: false);
         var sink = new CapturingSpanSink { RefuseFrom = 7 };
 
-        var (ok, rejected, why) = OtlpGrpcEndpointMapper.IngestTraces(payload, sink);
+        var (ok, rejected, why, busy) = OtlpGrpcEndpointMapper.IngestTraces(payload, sink);
 
         Assert.True(ok);
         Assert.Equal(13, rejected);                                        // 20 offered, the first 7 taken
         Assert.Equal("the ingest buffer was full", why);
+        Assert.False(busy);                                                // part of it was taken: partial success, not a retry
         Assert.Equal(7, sink.Spans.Count);
+    }
+
+    /// <summary>
+    /// A batch the sink took NOTHING of is busy, not a partial success (#138): answered UNAVAILABLE,
+    /// which exporters retry — and a retry duplicates nothing. It used to be OK with every span rejected,
+    /// which no OTLP exporter retries: the batch was acknowledged and gone.
+    /// </summary>
+    [Fact]
+    public void A_batch_the_sink_took_nothing_of_is_busy()
+    {
+        byte[] payload = OtlpProtoPayloads.Traces_Realistic(20, nestedAttr: false);
+        var sink = new CapturingSpanSink { RefuseFrom = 0 };
+
+        var (ok, rejected, why, busy) = OtlpGrpcEndpointMapper.IngestTraces(payload, sink);
+
+        Assert.True(ok);
+        Assert.Equal(20, rejected);
+        Assert.Equal("the ingest buffer was full", why);
+        Assert.True(busy);
+        Assert.Empty(sink.Spans);
     }
 
     [Fact]
     public void An_empty_export_has_nothing_to_report()
     {
-        Assert.Equal((true, 0, (string?)null),
+        Assert.Equal((true, 0, (string?)null, false),
                      OtlpGrpcEndpointMapper.IngestTraces(OtlpProtoPayloads.EmptyTraces(), new CapturingSpanSink()));
     }
 

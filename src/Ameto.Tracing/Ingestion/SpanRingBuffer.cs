@@ -143,6 +143,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         public SpanRingBuffer? Owner;
         public int             Chunk;   // -1 = none
         public int             Used;
+        public bool            LastRefusalNeverFits;   // the last refusal was a span heavier than the whole ring (#138)
     }
 
     [ThreadStatic] private static ProducerState t_producer;
@@ -212,6 +213,15 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// <summary>Spans refused because no arena chunk could be had (exhausted, or its pages could not be committed).</summary>
     public long RefusedNoArena => Interlocked.Read(ref _refusedNoArena);
 
+    /// <summary>
+    /// Whether the calling thread's last refusal was FOR ROOM — slots, arena, or a byte budget spent
+    /// by spans in flight, all of which a retry finds freer as the drainer works — rather than for a
+    /// span heavier than <see cref="MaxBytes"/> on its own, which no retry fits (#138). Set as
+    /// <see cref="TryEnqueueRaw"/> refuses; read on the refusing thread, right after the refusal — it
+    /// answers for the ring this thread last produced into, and <see cref="EndBatch"/> resets it.
+    /// </summary>
+    public bool LastRefusalWasForRoom => !t_producer.LastRefusalNeverFits;
+
     /// <summary>Bytes of the arena the ring has ever reached — its residency (nothing below it is given back).</summary>
     public long ArenaHighWaterBytes => Volatile.Read(ref _chunkHighWater) * ChunkBytes;
 
@@ -268,7 +278,8 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
     /// <summary>
     /// Takes one span. <paramref name="fields"/> supplies ids, times, kind, status and HTTP status;
     /// the payload fields are the ring's own. False when refused — by bytes, by slots, or for want
-    /// of an arena chunk. The calling thread must end its batch with <see cref="EndBatch"/>.
+    /// of an arena chunk; <see cref="LastRefusalWasForRoom"/> then says whether a retry could fit
+    /// it. The calling thread must end its batch with <see cref="EndBatch"/>.
     /// </summary>
     public bool TryEnqueueRaw(
         in SpanHeader fields,
@@ -280,11 +291,14 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
 
         int payload = nameUtf8.Length + serviceUtf8.Length + attributes.Length;
 
-        // 1. BYTES FIRST, as a strict bound: reserve, then check, and give back on refusal.
+        // 1. BYTES FIRST, as a strict bound: reserve, then check, and give back on refusal. A span
+        //    heavier than the whole budget is refused the same way, but no retry fits it, and the
+        //    receivers must not have the exporter retry it until its retries run out (#138).
         if (Interlocked.Add(ref _bytesInFlight, payload) > _maxBytes)
         {
             Interlocked.Add(ref _bytesInFlight, -payload);
             Interlocked.Increment(ref _refusedForBytes);
+            st.LastRefusalNeverFits = payload > _maxBytes;
             return false;
         }
 
@@ -298,6 +312,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             {
                 Interlocked.Add(ref _bytesInFlight, -payload);
                 Interlocked.Increment(ref _refusedNoArena);
+                st.LastRefusalNeverFits = false;
                 return false;
             }
             offset = -2 - park;
@@ -306,6 +321,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
         {
             Interlocked.Add(ref _bytesInFlight, -payload);
             Interlocked.Increment(ref _refusedNoArena);
+            st.LastRefusalNeverFits = false;
             return false;
         }
 
@@ -325,6 +341,7 @@ internal sealed unsafe class SpanRingBuffer : IDisposable
             {
                 GiveBack(ref st, payload, offset, park);
                 Interlocked.Increment(ref _refusedNoSlot);
+                st.LastRefusalNeverFits = false;
                 return false;                                            // every slot unread
             }
             // diff > 0: another producer published past us; look again
