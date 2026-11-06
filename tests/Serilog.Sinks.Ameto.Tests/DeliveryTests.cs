@@ -200,6 +200,26 @@ public class DeliveryTests
         Assert.Equal(Enumerable.Range(3, 7).Select(i => (long)i), last.Skip(1).Select(Wire.I));
     }
 
+    /// <summary>
+    /// The server — or a proxy answering 413 to everything, a body limit configured absurdly low — refuses
+    /// even the ~300 B marker. Without the guard: [event] → 413 → [marker] → 413 → [marker] … for ever, one
+    /// request a turn, the batching loop blocked and CloseAndFlush hanging. With it: the event, then its
+    /// marker, then the event is given up with a line. Run on the pool, since the fake answers synchronously
+    /// and a loop would never yield.
+    /// </summary>
+    [Fact]
+    public async Task A_marker_the_server_refuses_too_is_dropped_not_retried_forever()
+    {
+        var server = FakeServer.Always(() => FakeServer.Status(HttpStatusCode.RequestEntityTooLarge));
+        var sink   = Sinks.Over(server);
+
+        var send = Task.Run(() => sink.EmitBatchAsync([Make("Big {Blob}", properties: [P("Blob", new string('x', 3000))])]));
+        Assert.Same(send, await Task.WhenAny(send, Task.Delay(TimeSpan.FromSeconds(10))));
+        await send;
+
+        Assert.Equal(2, server.Count);   // the event, then its marker; nothing after
+    }
+
     [Fact]
     public async Task A_refused_events_marker_is_retried_as_the_marker_not_as_the_event()
     {
@@ -362,7 +382,8 @@ public class DeliveryTests
     {
         // The real batching layer (Serilog's BatchingSink, which PeriodicBatching 5.0 wraps): the second
         // request is answered 502, the layer hands the SAME batch back after one Period, and the sink
-        // resumes past the first request. Events logged after the failure ride along on the retry.
+        // resumes past the first request. (All twelve are logged before the first send, so the layer's
+        // top-up of a retried batch with newer events is not what this exercises.)
         var server = new FakeServer((i, _) => i == 1 ? FakeServer.Status(HttpStatusCode.BadGateway) : FakeServer.Ok());
         var logger = new LoggerConfiguration()
             .WriteTo.Ameto("http://ameto.test", "k", "svc", o =>

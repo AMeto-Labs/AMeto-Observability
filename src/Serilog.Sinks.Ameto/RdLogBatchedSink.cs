@@ -120,6 +120,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         // In long arithmetic: twice a cap past 1 GiB overflowed to a negative keep size, which trimmed
         // after every batch.
         _keepBufferBytes      = batchBytesLimit > 0 ? (int)Math.Min(2L * batchBytesLimit, int.MaxValue) : 16 * 1024 * 1024;
+        _bufWriter.KeepBytes  = _keepBufferBytes;
         // The trailing slash is not cosmetic. Uri resolution replaces the last path SEGMENT, so
         // "http://host/ameto" + "api/events" silently becomes "http://host/api/events" — the
         // prefix is dropped and, because Serilog swallows transport failures, the operator sees
@@ -189,7 +190,13 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     private int ResumePoint(IList<LogEvent> events)
     {
         int n = _handled.Count;
-        if (n == 0) return 0;
+        if (n == 0)
+        {
+            // Nothing handled, so a pending refused event can only be the batch's first; one that is not
+            // belongs to a batch the layer dropped, and would otherwise be pinned until this one completes.
+            if (_refused is not null && (events.Count == 0 || !ReferenceEquals(events[0], _refused))) _refused = null;
+            return 0;
+        }
         if (n <= events.Count)
         {
             int i = 0;
@@ -707,6 +714,14 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     /// <summary>The rented buffer's length; what <see cref="Trim"/> looks at.</summary>
     public int Capacity => _buf.Length;
 
+    /// <summary>
+    /// The largest buffer worth handing back to the shared pool when it is outgrown or trimmed: the pool
+    /// keeps what it is handed until memory pressure trims it, so returning a buffer of tens of megabytes
+    /// only moves the pinned memory from here into the pool. Larger ones are left to the GC. The sink
+    /// sets it to its keep size.
+    /// </summary>
+    public int KeepBytes { get; set; } = int.MaxValue;
+
     /// <summary>Rolls the writer back to an earlier <see cref="Position"/> (discards bytes after it).</summary>
     public void Rewind(int position) => _pos = position;
 
@@ -732,7 +747,9 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
         int newSize = Math.Max(_buf.Length * 2, _pos + needed);
         var next = ArrayPool<byte>.Shared.Rent(newSize);
         _buf.AsSpan(0, _pos).CopyTo(next);
-        ArrayPool<byte>.Shared.Return(_buf);
+        // An outgrown buffer goes back to the pool only while it is worth keeping: on the way to one huge
+        // event, 32 + 16 + 8 + … MB of outgrown buffers would otherwise be parked in the pool for good.
+        if (_buf.Length <= KeepBytes) ArrayPool<byte>.Shared.Return(_buf);
         _buf = next;
     }
 
