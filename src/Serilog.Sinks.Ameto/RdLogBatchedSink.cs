@@ -20,29 +20,34 @@ namespace Serilog.Sinks.Ameto;
 /// passes <c>BatchBytesLimit</c> (the server refuses a body over <c>Ingestion.MaxBatchBytes</c>, 4 MB
 /// by default, with 413). The server's answers (see <c>IngestionEndpoint</c>) are taken apart:
 /// <list type="bullet">
-///   <item>200: stored.</item>
+///   <item>200: stored. Its <c>dropped</c> count — events over the server's size limit, each with the
+///     server's own marker in its place, and the tail of a request the store had no room for — goes
+///     to SelfLog; the sink cannot tell the two apart, so it resends neither.</item>
 ///   <item>400 with <c>failedAtElement</c> K: the K events before it are stored and stay so, event K
 ///     is dropped with a SelfLog line, the rest are sent again. A 400 without it is a request the
 ///     server could not read at all; it is dropped, never retried.</item>
-///   <item>413: the request is cut in half and sent again, down to one event; one event the server
-///     still refuses is replaced by an Error marker (<see cref="AmetoClefFormatter.WriteRefusedMarker"/>).</item>
+///   <item>413: the request is cut in half and sent again, down to one event. One event the server
+///     still refuses is written as an Error marker (<see cref="AmetoClefFormatter.WriteRefusedMarker"/>)
+///     in its place from then on, so the marker is delivered, retried and resumed like any other event.</item>
 ///   <item>429 and 503 (the server had no room; nothing of the request was written): one retry inline
 ///     after <c>Retry-After</c> (one second when absent, ten at most), then the batching layer's turn.</item>
-///   <item>500, 502, 504 and a transport failure: the batching layer's turn at once.</item>
+///   <item>408, 500, 502, 504 and a transport failure: the batching layer's turn at once.</item>
 ///   <item>401, 403, 404 and any other 4xx: configuration, which no retry fixes; the batch is dropped
 ///     with a SelfLog line.</item>
 /// </list>
 /// "The batching layer's turn" means <see cref="EmitBatchAsync"/> throws: the batching sink keeps the
 /// batch and retries it with growing back-off for its retry time limit. A retried batch RESUMES past
 /// the events this sink already stored or dropped (remembered by reference, <see cref="ResumePoint"/>),
-/// so a request that went through is never repeated: the server does not de-duplicate.</para>
+/// so a request the server answered is never repeated. A request whose answer never arrived — a
+/// timeout, a connection dropped after the server wrote it — is sent again and can be stored twice:
+/// the server does not de-duplicate.</para>
 ///
 /// <para><b>Limits.</b> The properties map of one event is measured against <c>PropertiesLimitBytes</c>
-/// — what the server measures against <c>Ingestion.MaxEventPayloadBytes</c> — and an event over it is
-/// replaced by an Error marker that names it. The exception is measured on its own against
-/// <c>ExceptionLimitBytes</c>; over it, the stack trace is cut and the inner chain dropped, and the
-/// event still arrives. An event whose formatting throws costs only that event: a marker takes its
-/// place and the rest of the batch is unaffected.</para>
+/// — map header and pairs, what the server measures against <c>Ingestion.MaxEventPayloadBytes</c> —
+/// and an event over it is replaced by an Error marker that names it. The exception is measured on
+/// its own against <c>ExceptionLimitBytes</c>; over it, the stack trace is cut and the inner chain
+/// dropped, and the event still arrives. An event whose formatting throws costs only that event: a
+/// marker takes its place and the rest of the batch is unaffected.</para>
 /// </summary>
 internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
 {
@@ -52,25 +57,35 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     internal static readonly TimeSpan DefaultRetryAfter = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// The longest the sink waits inline on a <c>Retry-After</c>. Past it the batching layer waits
-    /// instead, where a shutdown can interrupt the wait; this sink has no cancellation token.
+    /// The longest the sink waits inline on a <c>Retry-After</c>; a longer one is clamped to it. The
+    /// batching layer never sees the header (its retries come after its own back-off), and this sink
+    /// has no cancellation token, so a shutdown cannot interrupt the wait: ten seconds is the most a
+    /// <c>CloseAndFlush</c> is made to wait for it.
     /// </summary>
     internal static readonly TimeSpan MaxInlineRetryAfter = TimeSpan.FromSeconds(10);
 
     /// <summary>The array header the sink writes: array32, five bytes, patched with the count at the end.</summary>
     private const int ArrayHeaderBytes = 5;
 
+    /// <summary>How much of a reply body the sink reads: the server's counts take ~50 bytes, and a proxy's error page is not worth more.</summary>
+    internal const int MaxReplyBodyBytes = 4096;
+
     /// <summary>How much of a reply body a SelfLog line carries.</summary>
     private const int SelfLogBodyChars = 512;
+
+    /// <summary>How much of a template a SelfLog line carries: a line is read by a person, a marker (<see cref="AmetoClefFormatter.MarkerTemplateChars"/>) is searched.</summary>
+    private const int SelfLogTemplateChars = 96;
 
     private readonly Uri                  _endpoint;
     private readonly string?              _apiKey;
     private readonly ReadOnlyMemory<byte> _serviceNameUtf8;
     private readonly HttpClient           _http;
     private readonly bool                 _ownsHttp;
+    private readonly TimeSpan             _replyTimeout;
     private readonly int                  _propertiesLimitBytes;
     private readonly int                  _exceptionLimitBytes;
     private readonly int                  _batchBytesLimit;
+    private readonly int                  _keepBufferBytes;
     private readonly PooledBufferWriter   _bufWriter = new(65_536);
 
     /// <summary>
@@ -79,6 +94,17 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     /// Cleared when a batch completes or a different batch arrives.
     /// </summary>
     private readonly List<LogEvent> _handled = new();
+
+    /// <summary>
+    /// The event the server refused alone with 413, and its serialised size: from then on
+    /// <see cref="Serialize"/> writes its marker in its place, so the marker rides in the request
+    /// stream — delivered, retried and resumed like any other event — instead of going as a
+    /// best-effort POST of its own, which a 503 or a dropped connection lost, and whose throw made the
+    /// batching layer upload the whole event again. Kept and cleared with <see cref="_handled"/>, so a
+    /// retried batch writes the marker too.
+    /// </summary>
+    private LogEvent? _refused;
+    private int       _refusedBytes;
 
     /// <summary>Test seam: the wait before the inline retry. <see cref="Task.Delay(TimeSpan)"/> in production.</summary>
     internal Func<TimeSpan, Task> Delay { get; set; } = static wait => Task.Delay(wait);
@@ -89,6 +115,11 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         _propertiesLimitBytes = propertiesLimitBytes;
         _exceptionLimitBytes  = exceptionLimitBytes;
         _batchBytesLimit      = batchBytesLimit;
+        // A batch that grew the buffer far past the request cap (one huge event) does not pin that
+        // memory for the life of the logger: a buffer over twice the cap is let go at the batch's end.
+        // In long arithmetic: twice a cap past 1 GiB overflowed to a negative keep size, which trimmed
+        // after every batch.
+        _keepBufferBytes      = batchBytesLimit > 0 ? (int)Math.Min(2L * batchBytesLimit, int.MaxValue) : 16 * 1024 * 1024;
         // The trailing slash is not cosmetic. Uri resolution replaces the last path SEGMENT, so
         // "http://host/ameto" + "api/events" silently becomes "http://host/api/events" — the
         // prefix is dropped and, because Serilog swallows transport failures, the operator sees
@@ -110,6 +141,9 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             _http     = httpClient;
             _ownsHttp = false;
         }
+        // The reply body is read unbuffered (ReadBodyAsync), where HttpClient.Timeout no longer
+        // applies: the read gets the same bound, or 30 s under a client whose timeout is infinite.
+        _replyTimeout = _http.Timeout == Timeout.InfiniteTimeSpan ? TimeSpan.FromSeconds(30) : _http.Timeout;
     }
 
     public async Task EmitBatchAsync(IEnumerable<LogEvent> batch)
@@ -118,7 +152,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         int start = ResumePoint(list);
         if (start >= list.Count)
         {
-            _handled.Clear();
+            Forget();
             return;
         }
 
@@ -130,15 +164,20 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         try
         {
             await DeliverAsync(list, start).ConfigureAwait(false);
-            _handled.Clear();
+            Forget();
         }
         finally
         {
             Activity.Current = savedActivity;
-            // A batch that grew the buffer far past the request cap (one huge event) does not pin
-            // that memory for the life of the logger.
-            _bufWriter.Trim(_batchBytesLimit > 0 ? 2 * _batchBytesLimit : 16 * 1024 * 1024);
+            _bufWriter.Trim(_keepBufferBytes);
         }
+    }
+
+    /// <summary>The batch in flight is done with: nothing to resume past, no marker to write.</summary>
+    private void Forget()
+    {
+        _handled.Clear();
+        _refused = null;
     }
 
     /// <summary>
@@ -157,7 +196,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             while (i < n && ReferenceEquals(events[i], _handled[i])) i++;
             if (i == n) return n;
         }
-        _handled.Clear();
+        Forget();
         return 0;
     }
 
@@ -174,7 +213,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     /// </summary>
     private async Task DeliverAsync(IList<LogEvent> events, int start)
     {
-        int  maxEvents = int.MaxValue;   // halved on 413, kept for the rest of the batch
+        int  maxEvents = int.MaxValue;   // halved on 413 until the request fits, or is down to one event
         bool retried   = false;          // the one inline retry, per request
 
         while (start < events.Count)
@@ -185,6 +224,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             switch (reply.Kind)
             {
                 case ReplyKind.Delivered:
+                    NoteDropped(in reply, taken);
                     MarkHandled(events, start, taken);
                     start  += taken;
                     retried = false;
@@ -204,10 +244,10 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
                     }
                     else
                     {
-                        var template = events[start + k].MessageTemplate.Text;
+                        NoteDropped(in reply, taken);
                         SelfLog.WriteLine("Ameto sink: server could not read event {0} of a request of {1} (400, template: {2}); " +
                                           "dropped, the {0} before it are stored, the rest are sent again",
-                            k, taken, Head(template));
+                            k, taken, Head(events[start + k].MessageTemplate.Text));
                         MarkHandled(events, start, k + 1);
                         start += k + 1;
                     }
@@ -219,12 +259,29 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
                     if (taken > 1)
                     {
                         maxEvents = taken / 2;   // the loop serialises the first half next
+                        retried   = false;
                         break;
                     }
-                    await PostRefusedMarkerAsync(events[start], _bufWriter.Position - ArrayHeaderBytes).ConfigureAwait(false);
-                    MarkHandled(events, start, 1);
-                    start  += 1;
-                    retried = false;
+                    if (ReferenceEquals(events[start], _refused))
+                    {
+                        // The marker itself — a few hundred bytes — is refused: nothing this sink can
+                        // send would pass whatever answered, so the event is given up with a line.
+                        SelfLog.WriteLine("Ameto sink: server refused even the marker for a refused event as too large (413); dropped (template: {0})",
+                            Head(events[start].MessageTemplate.Text));
+                        MarkHandled(events, start, 1);
+                        start += 1;
+                    }
+                    else
+                    {
+                        _refused      = events[start];
+                        _refusedBytes = _bufWriter.Position - ArrayHeaderBytes;
+                        SelfLog.WriteLine("Ameto sink: server refused a {0} B event as too large (413); replaced with an Error marker (template: {1})",
+                            _refusedBytes, Head(events[start].MessageTemplate.Text));
+                    }
+                    // The culprit is out of the way, so the next request is a full one again: a limit
+                    // really below the byte cap halves it again, log₂ N requests rather than one per event.
+                    maxEvents = int.MaxValue;
+                    retried   = false;
                     break;
 
                 case ReplyKind.Rejected:
@@ -247,6 +304,19 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     }
 
     /// <summary>
+    /// The <c>dropped</c> count of an answer that stored the rest of the request: events over the
+    /// server's size limit, each with the server's own marker in its place, and — when the store was
+    /// short of room — the request's unwritten tail. The sink cannot tell the two apart, so it resends
+    /// neither; this line is the client's only record of the loss.
+    /// </summary>
+    private static void NoteDropped(in Reply reply, int taken)
+    {
+        if (reply.Dropped > 0)
+            SelfLog.WriteLine("Ameto sink: server answered {0} but dropped {1} of the request's {2} events (over its size limit, or not written for want of room)",
+                reply.StatusCode, reply.Dropped, taken);
+    }
+
+    /// <summary>
     /// Encodes <paramref name="events"/> from <paramref name="start"/> into the reused buffer as one
     /// MessagePack array, stopping before the event that would take the request past
     /// <c>BatchBytesLimit</c> — never before the first, which goes alone however large — or at
@@ -261,7 +331,9 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         for (int i = start; i < start + maxCount; i++)
         {
             int before = _bufWriter.Position;
-            WriteEvent(events[i]);
+            var evt    = events[i];
+            if (ReferenceEquals(evt, _refused)) WriteRefusedMarker(evt);
+            else                               WriteEvent(evt);
             if (taken > 0 && _batchBytesLimit > 0 && _bufWriter.Position > _batchBytesLimit)
             {
                 _bufWriter.Rewind(before);
@@ -310,7 +382,7 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             AmetoClefFormatter.WriteProperties(ref writer, evt);
             writer.Flush();
 
-            int propertiesBytes = _bufWriter.Position - propertiesAt;
+            int propertiesBytes = MapHeaderBytes(evt.Properties.Count) + (_bufWriter.Position - propertiesAt);
             if (_propertiesLimitBytes > 0 && propertiesBytes > _propertiesLimitBytes)
             {
                 // Replace with a compact Error-level marker: the oversized event is VISIBLE in Ameto
@@ -330,19 +402,51 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             // A property whose ToString() throws, an exception whose StackTrace getter does: that event
             // alone is lost, as a marker that names the failure; the rest of the batch is unaffected.
             _bufWriter.Rewind(before);
-            try
-            {
-                var marker = new MessagePackWriter(_bufWriter);
-                AmetoClefFormatter.WriteFormatFailureMarker(ref marker, evt, _serviceNameUtf8, $"{ex.GetType().Name}: {ex.Message}");
-                marker.Flush();
-            }
-            catch
-            {
-                _bufWriter.Rewind(before);
-            }
-            SelfLog.WriteLine("Ameto sink: could not serialise an event (template: {0}); replaced with an Error marker: {1}",
-                Head(evt.MessageTemplate.Text), ex);
+            WriteFormatFailureMarker(evt, ex, before);
         }
+    }
+
+    /// <summary>
+    /// The map header the server counts in front of the properties it keeps
+    /// (<c>LogEventSerializer.StreamEvent</c>): without it the sink let through an event the server
+    /// then refused, when the pairs alone came within the header's size of the limit.
+    /// </summary>
+    private static int MapHeaderBytes(int count) => count < 16 ? 1 : count < 65_536 ? 3 : 5;
+
+    /// <summary>
+    /// The marker for an event whose formatting threw. Should even the marker fail (an exception whose
+    /// <c>Message</c> throws is caught here; the rest is memory running out), a nil takes the element's
+    /// place: the request then still holds the number of elements its header declares, and the server
+    /// refuses exactly this one (400 with <c>failedAtElement</c>), which the sink drops by name — where
+    /// an element short pointed the 400 at the request's last event, which was in fact stored.
+    /// </summary>
+    private void WriteFormatFailureMarker(LogEvent evt, Exception ex, int before)
+    {
+        string error, detail;
+        try   { error = $"{ex.GetType().Name}: {ex.Message}"; detail = ex.ToString(); }
+        catch { error = detail = ex.GetType().Name; }
+        try
+        {
+            var marker = new MessagePackWriter(_bufWriter);
+            AmetoClefFormatter.WriteFormatFailureMarker(ref marker, evt, _serviceNameUtf8, error);
+            marker.Flush();
+        }
+        catch
+        {
+            _bufWriter.Rewind(before);
+            _bufWriter.GetSpan(1)[0] = 0xc0;
+            _bufWriter.Advance(1);
+        }
+        SelfLog.WriteLine("Ameto sink: could not serialise an event (template: {0}); replaced with an Error marker: {1}",
+            Head(evt.MessageTemplate.Text), detail);
+    }
+
+    /// <summary>The marker that stands in for <see cref="_refused"/>; it reads nothing of the event that can throw.</summary>
+    private void WriteRefusedMarker(LogEvent evt)
+    {
+        var writer = new MessagePackWriter(_bufWriter);
+        AmetoClefFormatter.WriteRefusedMarker(ref writer, evt, _serviceNameUtf8, _refusedBytes);
+        writer.Flush();
     }
 
     /// <summary>
@@ -372,27 +476,6 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             bytes, _exceptionLimitBytes, Head(evt.MessageTemplate.Text));
     }
 
-    /// <summary>
-    /// The marker for an event the server refused with 413 on its own, sent as a request of one. Best
-    /// effort: a reply other than success is logged and the event is given up either way.
-    /// </summary>
-    private async Task PostRefusedMarkerAsync(LogEvent evt, int eventBytes)
-    {
-        SelfLog.WriteLine("Ameto sink: server refused a {0} B event as too large (413); replaced with an Error marker (template: {1})",
-            eventBytes, Head(evt.MessageTemplate.Text));
-
-        _bufWriter.Reset();
-        BeginArray();
-        var writer = new MessagePackWriter(_bufWriter);
-        AmetoClefFormatter.WriteRefusedMarker(ref writer, evt, _serviceNameUtf8, eventBytes);
-        writer.Flush();
-        EndArray(1);
-
-        Reply reply = await PostAsync(_bufWriter.WrittenMemory).ConfigureAwait(false);
-        if (reply.Kind != ReplyKind.Delivered)
-            SelfLog.WriteLine("Ameto sink: the marker for the refused event was not stored ({0})", reply.StatusCode);
-    }
-
     // ── HTTP ─────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -410,19 +493,21 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
             if (!string.IsNullOrEmpty(_apiKey))
                 request.Headers.Add("X-Seq-ApiKey", _apiKey);
 
-            using var response = await _http.SendAsync(request).ConfigureAwait(false);
+            // Headers only: the body is read by ReadBodyAsync up to MaxReplyBodyBytes, so a proxy's
+            // error page is neither buffered whole by HttpClient nor decoded whole for a SelfLog line.
+            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
 
-            int status = (int)response.StatusCode;
-            if (response.IsSuccessStatusCode) return Reply.Delivered;
-
-            byte[] body = await SafeReadBodyAsync(response).ConfigureAwait(false);
+            int    status = (int)response.StatusCode;
+            byte[] body   = await ReadBodyAsync(response, _replyTimeout).ConfigureAwait(false);
+            Counts counts = ReadCounts(body);
+            if (response.IsSuccessStatusCode) return Reply.Delivered(status, counts.Dropped);
             return status switch
             {
-                400        => Reply.BadElement(ReadFailedAtElement(body), body),
-                413        => Reply.TooLarge,
-                429 or 503 => Reply.Retry(status, body, RetryAfterOf(response)),
-                >= 500     => Reply.Retry(status, body, retryAfter: null),
-                _          => Reply.Rejected(status, body),
+                400           => Reply.BadElement(counts.FailedAtElement, counts.Dropped, body),
+                413           => Reply.TooLarge,
+                429 or 503    => Reply.Retry(status, body, RetryAfterOf(response)),
+                408 or >= 500 => Reply.Retry(status, body, retryAfter: null),
+                _             => Reply.Rejected(status, body),
             };
         }
         catch (Exception ex) when (ex is not AmetoDeliveryException)
@@ -433,28 +518,76 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     }
 
     /// <summary>
-    /// <c>failedAtElement</c> of the server's 400 body — <c>{"ingested":N,"dropped":M,"failedAtElement":K}</c>
-    /// — or −1 when the body has none (the server could not read the array header) or is not that JSON.
+    /// The reply body up to <see cref="MaxReplyBodyBytes"/>, or empty when it cannot be read. The read
+    /// has a bound of its own: <c>HttpClient.Timeout</c> ends with the headers once the body is left
+    /// unbuffered, and a server that sends its headers and then stalls must not hold the batch for good.
     /// </summary>
-    internal static int ReadFailedAtElement(ReadOnlySpan<byte> json)
+    private static async Task<byte[]> ReadBodyAsync(HttpResponseMessage response, TimeSpan timeout)
     {
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(MaxReplyBodyBytes);
+        try
+        {
+            using var timer  = new CancellationTokenSource(timeout);
+            using var stream = await response.Content.ReadAsStreamAsync(timer.Token).ConfigureAwait(false);
+            int total = 0;
+            while (total < MaxReplyBodyBytes)
+            {
+                int read = await stream.ReadAsync(buffer.AsMemory(total, MaxReplyBodyBytes - total), timer.Token).ConfigureAwait(false);
+                if (read == 0) break;
+                total += read;
+            }
+            if (total == 0) return [];
+            var body = new byte[total];
+            Array.Copy(buffer, body, total);
+            return body;
+        }
+        catch
+        {
+            return [];
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>The server's counts as its JSON gives them; −1 for one the body lacks.</summary>
+    internal readonly record struct Counts(int Ingested, int Dropped, int FailedAtElement);
+
+    /// <summary>
+    /// <c>{"ingested":N,"dropped":M,"failedAtElement":K}</c> in one pass. A count the body lacks, or a
+    /// body that is not that JSON (a proxy's page, nothing at all), reads as −1; <c>failedAtElement</c>
+    /// is absent when the server could not read the array header, and the 400 is then the whole request's.
+    /// </summary>
+    internal static Counts ReadCounts(byte[] json)
+    {
+        int ingested = -1, dropped = -1, failedAt = -1;
         try
         {
             var reader = new Utf8JsonReader(json);
-            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return -1;
-            while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+            if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
             {
-                bool hit = reader.ValueTextEquals("failedAtElement"u8);
-                if (!reader.Read()) return -1;
-                if (hit)
-                    return reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int k) ? k : -1;
-                reader.Skip();
+                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    int slot = reader.ValueTextEquals("ingested"u8)        ? 0
+                             : reader.ValueTextEquals("dropped"u8)         ? 1
+                             : reader.ValueTextEquals("failedAtElement"u8) ? 2 : -1;
+                    if (!reader.Read()) break;
+                    if (slot >= 0)
+                    {
+                        int n = reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int value) ? value : -1;
+                        if (slot == 0)      ingested = n;
+                        else if (slot == 1) dropped  = n;
+                        else                failedAt = n;
+                    }
+                    reader.Skip();   // a nested value is passed over whole; a scalar is already read
+                }
             }
         }
         catch (JsonException)
         {
         }
-        return -1;
+        return new Counts(ingested, dropped, failedAt);
     }
 
     /// <summary>The reply's <c>Retry-After</c> as a wait: delta seconds or a date, clamped to [0, <see cref="MaxInlineRetryAfter"/>]; <see cref="DefaultRetryAfter"/> without one.</summary>
@@ -470,15 +603,9 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         return wait;
     }
 
-    private static async Task<byte[]> SafeReadBodyAsync(HttpResponseMessage response)
-    {
-        try   { return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false); }
-        catch { return []; }
-    }
-
-    /// <summary>The first <see cref="AmetoClefFormatter.MarkerTemplateChars"/> of a template, for SelfLog lines.</summary>
+    /// <summary>The first <see cref="SelfLogTemplateChars"/> of a template, for SelfLog lines.</summary>
     private static string Head(string template)
-        => template.Length <= 96 ? template : template[..96];
+        => template.Length <= SelfLogTemplateChars ? template : template[..SelfLogTemplateChars];
 
     public Task OnEmptyBatchAsync() => Task.CompletedTask;
 
@@ -492,26 +619,27 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
 
     private enum ReplyKind
     {
-        /// <summary>2xx: the request is stored.</summary>
+        /// <summary>2xx: the request is stored, less what <see cref="Reply.Dropped"/> counts.</summary>
         Delivered,
         /// <summary>400: the request stopped being a CLEF array at <see cref="Reply.FailedAtElement"/> (−1: at the start).</summary>
         BadElement,
         /// <summary>413: the request is too large for the server; nothing of it is stored.</summary>
         TooLarge,
-        /// <summary>429, 503, 5xx: nothing stored, worth sending again later.</summary>
+        /// <summary>408, 429, 503, 5xx: nothing stored (a 408 never arrived whole), worth sending again later.</summary>
         Retry,
         /// <summary>Any other status: configuration, which sending again does not fix.</summary>
         Rejected,
     }
 
-    private readonly record struct Reply(ReplyKind Kind, int StatusCode, byte[]? Body, int FailedAtElement, TimeSpan? RetryAfter)
+    private readonly record struct Reply(ReplyKind Kind, int StatusCode, byte[]? Body, int FailedAtElement, int Dropped, TimeSpan? RetryAfter)
     {
-        public static readonly Reply Delivered = new(ReplyKind.Delivered, 200, null, -1, null);
-        public static readonly Reply TooLarge  = new(ReplyKind.TooLarge, 413, null, -1, null);
+        public static readonly Reply TooLarge = new(ReplyKind.TooLarge, 413, null, -1, 0, null);
 
-        public static Reply BadElement(int failedAt, byte[] body)              => new(ReplyKind.BadElement, 400, body, failedAt, null);
-        public static Reply Retry(int status, byte[] body, TimeSpan? retryAfter) => new(ReplyKind.Retry, status, body, -1, retryAfter);
-        public static Reply Rejected(int status, byte[] body)                 => new(ReplyKind.Rejected, status, body, -1, null);
+        /// <summary><paramref name="dropped"/> as the body counts it; a body without the count (−1) counts as none.</summary>
+        public static Reply Delivered(int status, int dropped)                   => new(ReplyKind.Delivered, status, null, -1, Math.Max(dropped, 0), null);
+        public static Reply BadElement(int failedAt, int dropped, byte[] body)   => new(ReplyKind.BadElement, 400, body, failedAt, Math.Max(dropped, 0), null);
+        public static Reply Retry(int status, byte[] body, TimeSpan? retryAfter) => new(ReplyKind.Retry, status, body, -1, 0, retryAfter);
+        public static Reply Rejected(int status, byte[] body)                    => new(ReplyKind.Rejected, status, body, -1, 0, null);
 
         /// <summary>The body as text for a SelfLog line, cut to <see cref="SelfLogBodyChars"/>.</summary>
         public string BodyText
@@ -528,9 +656,9 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
 
 /// <summary>
 /// Thrown out of <see cref="AmetoBatchedSink.EmitBatchAsync"/> for a reply worth retrying once the
-/// sink's own inline retry is spent: 429 or 503 (the server had no room, nothing was written) and 5xx.
-/// The batching layer logs it to SelfLog and sends the batch again with back-off, and the sink resumes
-/// past what the server already stored.
+/// sink's own inline retry is spent: 429 or 503 (the server had no room, nothing was written), 408
+/// (the request never arrived whole) and 5xx. The batching layer logs it to SelfLog and sends the
+/// batch again with back-off, and the sink resumes past what the server already stored.
 /// </summary>
 internal sealed class AmetoDeliveryException(int statusCode, string body)
     : Exception($"Ameto server returned {statusCode}: {body}")
@@ -585,14 +713,15 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     public void Reset() => _pos = 0;
 
     /// <summary>
-    /// Lets go of a buffer that grew past <paramref name="keepBytes"/>, returning it to the pool and
-    /// renting the initial size again; the written bytes are discarded. For the end of a batch, when
+    /// Lets go of a buffer that grew past <paramref name="keepBytes"/>, renting the initial size again;
+    /// the written bytes are discarded. The old buffer is left to the GC, not returned: the shared pool
+    /// keeps what it is handed until memory pressure trims it, so returning a buffer of tens of
+    /// megabytes only moved the pinned memory from here into the pool. For the end of a batch, when
     /// one huge event has grown the buffer far beyond what the next batches need.
     /// </summary>
     public void Trim(int keepBytes)
     {
         if (_buf.Length <= keepBytes) return;
-        ArrayPool<byte>.Shared.Return(_buf);
         _buf = ArrayPool<byte>.Shared.Rent(_initialCapacity);
         _pos = 0;
     }

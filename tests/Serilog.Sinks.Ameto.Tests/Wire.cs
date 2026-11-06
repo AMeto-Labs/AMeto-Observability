@@ -70,6 +70,18 @@ internal sealed class Unrenderable
     public override string ToString() => throw new InvalidOperationException("ToString failed on purpose");
 }
 
+/// <summary>An exception whose <c>Message</c> throws: the marker's error text cannot be built from it.</summary>
+internal sealed class MessagelessException : Exception
+{
+    public override string Message => throw new InvalidOperationException("Message failed on purpose");
+}
+
+/// <summary>A property value whose rendering throws an exception that cannot even say what it is.</summary>
+internal sealed class UnrenderableWithoutMessage
+{
+    public override string ToString() => throw new MessagelessException();
+}
+
 /// <summary>The wire as the server reads it: bodies decoded by <see cref="LogEventSerializer"/>.</summary>
 internal static class Wire
 {
@@ -82,6 +94,19 @@ internal static class Wire
     }
 
     public static AmetoEvent DecodeOne(byte[] body) => Assert.Single(Decode(body));
+
+    /// <summary>
+    /// The wire as the server INGESTS it: <c>StreamBatch</c> with a sink that caps the properties map
+    /// at <paramref name="maxEventPayloadBytes"/>, as <c>IngestionEndpoint.StageClef</c> does — the only
+    /// place the server measures it. An event the sink let through under its own limit is thereby
+    /// proved to pass the server's, header and all.
+    /// </summary>
+    public static List<Streamed> Stream(byte[] body, int maxEventPayloadBytes = int.MaxValue)
+    {
+        var sink = new CapturingClefSink(maxEventPayloadBytes);
+        LogEventSerializer.StreamBatch(body, sink, out _);
+        return sink.Events;
+    }
 
     /// <summary>The events through the formatter alone (no limits), as one array body.</summary>
     public static byte[] Body(string? service, params SerilogEvent[] events)
@@ -104,14 +129,43 @@ internal static class Wire
     public static List<long> Is(IEnumerable<byte[]> bodies) => bodies.SelectMany(Decode).Select(I).ToList();
 }
 
+/// <summary>One event as the server's streaming decode handed it to its sink.</summary>
+internal sealed record Streamed(string Template, LogLevel Level, long PropertiesBytes, bool Oversized, Dictionary<string, object?>? Properties);
+
+/// <summary>The server's side of <c>StreamBatch</c>, keeping what it was handed and refusing what the limit refuses.</summary>
+internal sealed class CapturingClefSink(int maxEventPayloadBytes) : LogEventSerializer.IClefBatchSink
+{
+    public List<Streamed> Events { get; } = new();
+
+    public int MaxEventPayloadBytes => maxEventPayloadBytes;
+
+    public bool TryIngestClef(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ReadOnlySpan<byte> exceptionMsgpack,
+        ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId, ReadOnlySpan<byte> serviceUtf8)
+    {
+        Events.Add(new Streamed(Encoding.UTF8.GetString(templateUtf8), (LogLevel)level, msgpackProps.Length, Oversized: false,
+            msgpackProps.IsEmpty ? null : LogEventSerializer.DeserializePropertiesMap(msgpackProps)));
+        return true;
+    }
+
+    public bool TryIngestOversizedClef(long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, long payloadBytes,
+        ulong traceHi, ulong traceLo, ulong spanId, ReadOnlySpan<byte> serviceUtf8)
+    {
+        Events.Add(new Streamed(Encoding.UTF8.GetString(templateUtf8), (LogLevel)level, payloadBytes, Oversized: true, Properties: null));
+        return false;
+    }
+}
+
 /// <summary>
 /// A stand-in for the Ameto server: records every request body (copied out before the sink reuses
-/// its buffer) and answers from a script keyed by request number.
+/// its buffer) and answers from a script keyed by request number. A body is recorded before the
+/// script answers, so a request the script fails on the wire is in <see cref="Bodies"/> too.
 /// </summary>
 internal sealed class FakeServer : HttpMessageHandler
 {
     private readonly Func<int, byte[], HttpResponseMessage> _script;
+    private readonly Lock _gate = new();
 
+    /// <summary>Every body so far, in request order. Read on the test's thread once the sink's call returned; a test whose requests come from the batching layer's thread takes <see cref="Snapshot"/>.</summary>
     public readonly List<byte[]>  Bodies  = new();
     public readonly List<string?> ApiKeys = new();
 
@@ -122,13 +176,30 @@ internal sealed class FakeServer : HttpMessageHandler
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
         byte[] body = await request.Content!.ReadAsByteArrayAsync(ct);
-        Bodies.Add(body);
-        ApiKeys.Add(request.Headers.TryGetValues("X-Seq-ApiKey", out var keys) ? string.Join(",", keys) : null);
-        return _script(Bodies.Count - 1, body);
+        int index;
+        lock (_gate)
+        {
+            Bodies.Add(body);
+            ApiKeys.Add(request.Headers.TryGetValues("X-Seq-ApiKey", out var keys) ? string.Join(",", keys) : null);
+            index = Bodies.Count - 1;
+        }
+        return _script(index, body);
     }
 
-    public static HttpResponseMessage Ok(int ingested = 0)
-        => Json(HttpStatusCode.OK, $"{{\"ingested\":{ingested},\"dropped\":0}}");
+    /// <summary>Requests so far, safe to read while the batching layer's thread is sending.</summary>
+    public int Count
+    {
+        get { lock (_gate) return Bodies.Count; }
+    }
+
+    /// <summary>A copy of <see cref="Bodies"/>, safe to take while the batching layer's thread is sending.</summary>
+    public List<byte[]> Snapshot()
+    {
+        lock (_gate) return new List<byte[]>(Bodies);
+    }
+
+    public static HttpResponseMessage Ok(int ingested = 0, int dropped = 0)
+        => Json(HttpStatusCode.OK, $"{{\"ingested\":{ingested},\"dropped\":{dropped}}}");
 
     public static HttpResponseMessage BadElement(int ingested, int failedAt)
         => Json(HttpStatusCode.BadRequest, $"{{\"ingested\":{ingested},\"dropped\":0,\"failedAtElement\":{failedAt}}}");

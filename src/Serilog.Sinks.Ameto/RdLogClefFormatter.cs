@@ -14,9 +14,12 @@ internal readonly record struct ExceptionBudget(int MaxMessageChars, int MaxStac
   public static readonly ExceptionBudget Unlimited = new(int.MaxValue, int.MaxValue, KeepInner: true);
 
   /// <summary>
-  /// The budget for a limit: half of it for the stack trace, an eighth (128–4096 chars) for the
-  /// message, no inner exceptions. Chars, not bytes — a stack trace is ASCII, so the cut form of
-  /// an exception that fits a type name lands under the limit.
+  /// The budget for a limit: about half of it for the stack trace, an eighth (128–4096 chars) for the
+  /// message, no inner exceptions. Chars, not bytes, so the limit is a target rather than a cap: a
+  /// mostly-ASCII stack trace lands the cut form under it, one full of non-ASCII paths and identifiers
+  /// can run up to three times over, the type name is never cut, and the floors keep the cut form
+  /// above a limit of a few hundred bytes. The server has no cap of its own on <c>@x</c>, and the
+  /// request cap still bounds every request, so the sink does not measure a second time.
   /// </summary>
   public static ExceptionBudget For(int limitBytes) => new(
       MaxMessageChars: Math.Clamp(limitBytes / 8, 128, 4096),
@@ -398,9 +401,16 @@ internal static class AmetoClefFormatter
     }
   }
 
-  /// <summary>The first <paramref name="maxChars"/> of a string that overran its budget, marked as cut; the string itself otherwise.</summary>
+  /// <summary>
+  /// The first <paramref name="maxChars"/> of a string that overran its budget, marked as cut; the
+  /// string itself otherwise. A cut never splits a surrogate pair: its halves would be written as U+FFFD.
+  /// </summary>
   private static string Cut(string s, int maxChars)
-      => s.Length <= maxChars ? s : string.Concat(s.AsSpan(0, maxChars), " … [cut by Serilog.Sinks.Ameto]");
+  {
+    if (s.Length <= maxChars) return s;
+    if (maxChars > 0 && char.IsHighSurrogate(s[maxChars - 1])) maxChars--;
+    return string.Concat(s.AsSpan(0, maxChars), " … [cut by Serilog.Sinks.Ameto]");
+  }
 
   /// <summary>
   /// Writes all-ASCII <paramref name="chars"/> as a MessagePack string directly via

@@ -44,6 +44,39 @@ public class EventLimitTests
         Assert.False(p.ContainsKey("Blob"));
     }
 
+    [Theory]
+    [InlineData(65_527, false)]   // 5 B key + 3 B str16 header + 65 527 = 65 535 B of pairs, + the 1 B map header = the limit: through
+    [InlineData(65_528, true)]    // 65 536 B of pairs + the map header: one over, as the server counts it
+    public async Task The_properties_limit_counts_the_map_header_as_the_server_does(int blobChars, bool overLimit)
+    {
+        const int limit = 65_536;
+        var server = FakeServer.Always(() => FakeServer.Ok());
+        var sink   = Sinks.Over(server, propertiesLimit: limit);
+
+        var got = await SendAsync(sink, server, Make("Big {Blob}", properties: [P("Blob", new string('x', blobChars))]));
+
+        var evt = Assert.Single(got);
+        Assert.Equal(overLimit ? AmetoClefFormatter.OversizedTemplate : "Big {Blob}", evt.MessageTemplate);
+        if (overLimit) Assert.Equal(limit + 1L, Convert.ToInt64(evt.Properties!["EventBodyBytes"]));
+
+        // What the sink let through, the server takes under the same limit: its streaming decode, the
+        // one place it measures the map, refuses nothing of the body.
+        var streamed = Assert.Single(Wire.Stream(server.Bodies[0], maxEventPayloadBytes: limit));
+        Assert.False(streamed.Oversized, $"the server would refuse a {streamed.PropertiesBytes} B map");
+        if (!overLimit) Assert.Equal(limit, streamed.PropertiesBytes);
+    }
+
+    [Fact]
+    public void The_server_refuses_the_event_a_measure_without_the_header_let_through()
+    {
+        // The pairs alone are exactly the limit; the server counts the map header too and drops the event.
+        var body     = Wire.Body(Make("Big {Blob}", properties: [P("Blob", new string('x', 65_528))]));
+        var streamed = Assert.Single(Wire.Stream(body, maxEventPayloadBytes: 65_536));
+
+        Assert.True(streamed.Oversized);
+        Assert.Equal(65_537, streamed.PropertiesBytes);
+    }
+
     [Fact]
     public async Task The_properties_limit_measures_the_properties_not_the_exception()
     {
@@ -114,6 +147,19 @@ public class EventLimitTests
         Assert.Contains("ToString failed on purpose", (string)p["SinkError"]!);
         Assert.Equal("Bad {Obj}", p["OriginalTemplate"]);
         Assert.Equal("Debug", p["OriginalLevel"]);
+    }
+
+    [Fact]
+    public async Task A_failure_whose_exception_cannot_say_its_message_still_leaves_a_marker_naming_the_type()
+    {
+        var server = FakeServer.Always(() => FakeServer.Ok());
+        var sink   = Sinks.Over(server);
+        var bad    = Make("Bad {Obj}", properties: [P("Obj", new UnrenderableWithoutMessage())]);
+
+        var got = await SendAsync(sink, server, Make("Before"), bad, Make("After"));
+
+        Assert.Equal(["Before", AmetoClefFormatter.FormatFailureTemplate, "After"], got.Select(e => e.MessageTemplate));
+        Assert.Equal(nameof(MessagelessException), got[1].Properties!["SinkError"]);
     }
 
     [Fact]

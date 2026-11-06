@@ -157,6 +157,32 @@ public class ClefFormatterTests
     }
 
     [Fact]
+    public void A_cut_never_splits_a_surrogate_pair()
+    {
+        // 'a' then 100 emoji of two UTF-16 units each: the 128th unit, where the message budget for a
+        // 1 KB limit ends, is the high half of a pair. Split, it would be written as U+FFFD.
+        var message = "a" + string.Concat(Enumerable.Repeat("\U0001F600", 100));
+        var ex      = Thrown(message);
+        var evt     = Make("Boom", LogEventLevel.Error, exception: ex);
+
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+        var writer = new MessagePack.MessagePackWriter(buffer);
+        writer.WriteArrayHeader(1);
+        AmetoClefFormatter.WriteHeader(ref writer, evt, "svc"u8.ToArray());
+        writer.WriteString("@x"u8);
+        AmetoClefFormatter.WriteException(ref writer, ex, ExceptionBudget.For(1024));
+        AmetoClefFormatter.WriteProperties(ref writer, evt);
+        writer.Flush();
+
+        var x = Wire.DecodeOne(buffer.WrittenSpan.ToArray()).Exception!;
+
+        Assert.StartsWith("a\U0001F600", x.Message);
+        Assert.DoesNotContain("�", x.Message);
+        Assert.EndsWith("[cut by Serilog.Sinks.Ameto]", x.Message);
+        Assert.Equal(127, x.Message!.IndexOf(" … [cut", StringComparison.Ordinal));   // 127 units kept, not 128
+    }
+
+    [Fact]
     public void The_budget_for_a_limit_scales_with_it()
     {
         var small = ExceptionBudget.For(1024);
