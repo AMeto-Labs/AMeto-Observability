@@ -162,15 +162,27 @@ public static class KeyFile
 {
     public static void WriteNew(string path, ReadOnlySpan<byte> content)
     {
-        string tmp = path + ".tmp";
-        File.Delete(tmp);   // a crash's leftover: UnixCreateMode applies at creation only, so the file is made afresh
+        // A temp of this writer's own: with one shared name, a second process starting on the same directory
+        // (not supported, but nothing locks the directory before this runs) unlinked the first's temp
+        // mid-write on POSIX, and the first's Move then published the second's key while the first kept
+        // its own in memory — every secret it sealed undecryptable after its restart. With a name of its
+        // own each writer moves its own bytes, and the loser's Move finds the key there and fails its start.
+        string tmp = $"{path}.{Guid.NewGuid():N}.tmp";
         var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
         if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-        using (var fs = new FileStream(tmp, options))
+        try
         {
-            fs.Write(content);
-            fs.Flush(flushToDisk: true);
+            using (var fs = new FileStream(tmp, options))
+            {
+                fs.Write(content);
+                fs.Flush(flushToDisk: true);
+            }
+            File.Move(tmp, path, overwrite: false);   // IOException when a key appeared meanwhile: never over one that exists
         }
-        File.Move(tmp, path, overwrite: false);   // IOException when a key appeared meanwhile: never over one that exists
+        catch
+        {
+            try { File.Delete(tmp); } catch { /* an orphan temp is read by nothing */ }
+            throw;
+        }
     }
 }

@@ -91,4 +91,20 @@ public sealed class FileLookTests : IDisposable
 
         Assert.Equal(1, generated);
     }
+
+    /// <summary>
+    /// The key file's write: two writers on one path, the second finds the first's key in place and fails
+    /// (never over one that exists), the first's bytes are on disk, and neither leaves a temp behind.
+    /// </summary>
+    [Fact]
+    public void A_key_file_is_written_once_and_a_second_writer_fails_without_a_temp_left_behind()
+    {
+        string path = Path.Combine(_dir, "k.key");
+
+        KeyFile.WriteNew(path, "first"u8);
+        Assert.Throws<IOException>(() => KeyFile.WriteNew(path, "second"u8));
+
+        Assert.Equal("first", File.ReadAllText(path));
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
+    }
 }
