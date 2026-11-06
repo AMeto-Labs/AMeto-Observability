@@ -160,22 +160,23 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
     }
 
     /// <summary>
-    /// A DRAIN LOOP THAT ENDS IN A FAULT STILL ENDS IN THE DRAINER'S OWN FLUSH (#94, review F3).
-    /// <c>DisposeAsync</c> caught only <c>OperationCanceledException</c> around the join: any other
-    /// exception out of the drain task left the disposal, and the <c>FlushHotTier</c> after it never
-    /// ran. bd43e15 met it through a final drain that threw; both drains now catch per batch (the
-    /// next fact), so what can still fault the task is a throw outside them.
+    /// A FAULT OUTSIDE A BATCH WRITE IS LOGGED, THE LOOP GOES ON, AND THE DISPOSAL STILL FLUSHES (#94
+    /// review F3; #137). <c>DisposeAsync</c> once caught only <c>OperationCanceledException</c> around the
+    /// join: any other exception out of the drain task left the disposal, and the <c>FlushHotTier</c>
+    /// after it never ran. bd43e15 met it through a final drain that threw; both drains then caught per
+    /// batch, and a throw outside them — the park, a log line — faulted the task, which the join logged.
+    /// Since #137 such a throw does not end the loop either: it is logged as an Error and the loop pauses
+    /// a second and goes round (a ring whose loop has died fills, and every request with spans is refused).
     ///
     /// <para>At the seams: the first park publishes one span and returns, so the loop writes it into
     /// the hot tier; the second park — the loop is idle again — throws an
-    /// <see cref="InvalidOperationException"/>, which no catch in the loop takes, and the task
-    /// faults. The span is then in the tier and nowhere else.</para>
+    /// <see cref="InvalidOperationException"/>. The span is then in the tier and nowhere else.</para>
     ///
     /// <para>Reverted (only the cancellation caught at the join): <c>DisposeAsync</c> throws the
     /// seam's exception, and the span is still in the hot tier with no cold segment.</para>
     /// </summary>
     [Fact]
-    public async Task A_drain_loop_that_faults_is_logged_and_the_tier_is_still_flushed()
+    public async Task A_park_that_faults_is_logged_the_loop_goes_on_and_the_tier_is_still_flushed()
     {
         var pools = new SpanStringPools();
         using var ring   = new SpanRingBuffer(capacity: 1_024, maxBytes: 8 * 1024 * 1024, pools);
@@ -213,8 +214,8 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
         Assert.True(engine.HotBytesForTest > 0, "the span did not reach the hot tier before the fault");
         var disposal = await Record.ExceptionAsync(() => drainer.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
 
-        Assert.Null(disposal);                                   // the fault stayed inside the disposal
-        Assert.Equal(2, Volatile.Read(ref parks));               // the loop parked twice, and the second one faulted it
+        Assert.Null(disposal);                                   // the fault stayed inside the loop and the disposal
+        Assert.True(Volatile.Read(ref parks) >= 2);              // the second park faulted; a loop that went on may have parked again
         Assert.Equal(0, engine.HotBytesForTest);                 // the drainer's own flush ran
         Assert.Equal(1, engine.ColdSegmentCountForTest);
         Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error

@@ -27,6 +27,15 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private static readonly TimeSpan EvalInterval = TimeSpan.FromSeconds(15);
     private const int HistoryCapacity = 2_000;
 
+    /// <summary>
+    /// Test seam: the loop's interval for an evaluator constructed while this is set — the production
+    /// <see cref="EvalInterval"/> is fifteen seconds, which no test that watches the loop go round can
+    /// wait for. An <see cref="AsyncLocal{T}"/>, read in the constructor; null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<TimeSpan?> EvalIntervalForTest = new();
+
+    private readonly TimeSpan _evalInterval;
+
     private readonly AlertRuleStore        _store;
     private readonly AlertDispatcher       _dispatcher;
     private readonly AlertPersistence      _persist;
@@ -85,6 +94,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
         _logger = logger;
         _time   = time ?? TimeProvider.System;
         _evaluateOnDegraded = options?.EvaluateOnDegradedStore ?? false;
+        _evalInterval = EvalIntervalForTest.Value ?? EvalInterval;
         LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
     }
@@ -253,11 +263,29 @@ public sealed class AlertEvaluator : IAsyncDisposable
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(EvalInterval, ct); }
-            catch (OperationCanceledException) { break; }
+            try
+            {
+                try { await Task.Delay(_evalInterval, ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
 
-            try { await EvaluateAllAsync(ct); }
-            catch (Exception ex) { _logger.LogError(ex, "Alert evaluation cycle failed"); }
+                try { await EvaluateAllAsync(ct); }
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "Alert evaluation cycle failed"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                }
+            }
+            catch (Exception ex)
+            {
+                // A FAILURE OUTSIDE THE CYCLE — the error line above running out of memory, a delay
+                // that could not be set up — used to end the loop: alerts then silently stopped being
+                // evaluated for the life of the process, and DisposeAsync rethrew the fault (#137; the
+                // log engine's e6fe109). Said, if the logger can; one blocked second, which allocates
+                // nothing; and the loop goes on — the shutdown flag is read at the top.
+                try { _logger.LogError(ex, "The alert evaluation loop failed outside a cycle; it goes on"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                Thread.Sleep(1000);
+            }
         }
     }
 
@@ -1023,7 +1051,15 @@ public sealed class AlertEvaluator : IAsyncDisposable
         try
         {
             StopEvaluating();
-            try { await _loop.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            try { await _loop.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                // A loop that had ended in a fault before shutdown: said, and the teardown goes on —
+                // it used to rethrow out of here and skip the source's disposal (#137).
+                try { _logger.LogError(ex, "The alert evaluation loop had failed before shutdown — the teardown goes on"); }
+                catch (Exception) { /* the line is lost; the teardown is not */ }
+            }
             _cts.Dispose();
         }
         finally { _disposeCompleted.TrySetResult(); }

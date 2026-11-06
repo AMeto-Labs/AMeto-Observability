@@ -38,6 +38,9 @@ public sealed class PeerProber : IHostedService, IDisposable
     public int ProbeCycles => Volatile.Read(ref _cycles);
     private int _cycles;
 
+    /// <summary>Test seam: runs before each probe cycle; throwing from it is a cycle that failed. Null in production.</summary>
+    internal Action? _beforeProbeForTest;
+
     public PeerProber(
         IOptions<ReplicationOptions> opts,
         NodeRegistry                 registry,
@@ -102,29 +105,46 @@ public sealed class PeerProber : IHostedService, IDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                if (!HasSomethingToProbe)
+                try
                 {
-                    timer?.Dispose();
-                    timer = null;
-                    // No seeds and no peers: an inbound ping (NodeRegistry.Upsert) is the only
-                    // event that can change that, and it pulses us. Until then, no wakes.
-                    await _wake.WaitAsync(ct);
-                    continue;
+                    if (!HasSomethingToProbe)
+                    {
+                        timer?.Dispose();
+                        timer = null;
+                        // No seeds and no peers: an inbound ping (NodeRegistry.Upsert) is the only
+                        // event that can change that, and it pulses us. Until then, no wakes.
+                        await _wake.WaitAsync(ct);
+                        continue;
+                    }
+
+                    // Seeds are probed on the first pass so the registry is populated before the
+                    // first SegmentReplicator flush, then re-probed on the interval.
+                    _beforeProbeForTest?.Invoke();
+                    await ProbeAllAsync(ct);
+                    Interlocked.Increment(ref _cycles);
+
+                    timer ??= new PeriodicTimer(_opts.ProbeInterval);
+                    if (!await timer.WaitForNextTickAsync(ct)) break;
                 }
-
-                // Seeds are probed on the first pass so the registry is populated before the
-                // first SegmentReplicator flush, then re-probed on the interval.
-                await ProbeAllAsync(ct);
-                Interlocked.Increment(ref _cycles);
-
-                timer ??= new PeriodicTimer(_opts.ProbeInterval);
-                if (!await timer.WaitForNextTickAsync(ct)) break;
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    // ONE CYCLE'S FAILURE COSTS ONE CYCLE. The whole loop used to sit in one try, so
+                    // anything that threw — the payload, the LINQ over the registry, a timer that could
+                    // not be made, a log line on a stand out of memory — ended probing for the life of
+                    // the process (#137; the log engine's e6fe109). Said (guarded), one blocked second,
+                    // and the loop goes on; the shutdown flag is read at the top.
+                    try { _logger.LogError(ex, "PeerProber cycle failed; the loop continues"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    Thread.Sleep(1000);
+                }
             }
         }
-        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "PeerProber loop failed");
+            // Nothing above lets an exception out any more; this is the last resort, and it may not throw itself.
+            try { _logger.LogError(ex, "PeerProber loop failed"); }
+            catch (Exception) { }
         }
         finally
         {

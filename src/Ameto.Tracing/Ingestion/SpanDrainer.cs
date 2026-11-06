@@ -130,43 +130,59 @@ internal sealed class SpanDrainer : IAsyncDisposable
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
-            int count, taken;
             try
             {
-                count = DrainOnce(out taken);
+                int count, taken;
+                try
+                {
+                    count = DrainOnce(out taken);
+                }
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "SpanDrainer: error writing a drained batch"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    MaybeFlush();
+                    continue;
+                }
+
+                if (count == 0)
+                {
+                    MaybeFlush();
+                    MaybeTrimArena();
+                    // Park until a producer signals new spans. The 1 s timeout is only a
+                    // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
+                    //
+                    // A SHUTDOWN THAT LANDS WHILE PARKED IS A BREAK, NOT A THROW. The park throws
+                    // OperationCanceledException then — even with a span published and signalled a
+                    // moment before, since a cancelled token wins over a ready count — and letting it
+                    // out skipped the final drain below: whatever was published after the last empty
+                    // pass (a slot claimed before that pass and published after it included) stayed in
+                    // the ring, acknowledged and never written.
+                    _beforeParkForTest?.Invoke(_cts);
+                    try { await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                    continue;
+                }
+
+                // The engine has closed its write path. Every further span would be refused
+                // too, so stop draining rather than spinning the ring empty into a closed
+                // engine — and say so once, with the count, instead of once per span.
+                if (taken < count) { ReportRefused(count - taken); return; }
+
+                MaybeFlush();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SpanDrainer: error writing a drained batch");
-                MaybeFlush();
-                continue;
+                // A FAILURE OUTSIDE THE BATCH WRITE — a log line that ran out of memory, a flush or
+                // trim whose own warning did, a park that could not be set up — used to end the loop
+                // for the life of the process: the ring then filled and every request with spans was
+                // refused until a restart (#137; the log engine's e6fe109). Said, if the logger can;
+                // one blocked second, which allocates nothing; and the loop goes on — the shutdown
+                // flag is read at the top.
+                try { _logger.LogError(ex, "SpanDrainer: the drain loop failed outside a batch write; it goes on"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                Thread.Sleep(1000);
             }
-
-            if (count == 0)
-            {
-                MaybeFlush();
-                MaybeTrimArena();
-                // Park until a producer signals new spans. The 1 s timeout is only a
-                // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
-                //
-                // A SHUTDOWN THAT LANDS WHILE PARKED IS A BREAK, NOT A THROW. The park throws
-                // OperationCanceledException then — even with a span published and signalled a
-                // moment before, since a cancelled token wins over a ready count — and letting it
-                // out skipped the final drain below: whatever was published after the last empty
-                // pass (a slot claimed before that pass and published after it included) stayed in
-                // the ring, acknowledged and never written.
-                _beforeParkForTest?.Invoke(_cts);
-                try { await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { break; }
-                continue;
-            }
-
-            // The engine has closed its write path. Every further span would be refused
-            // too, so stop draining rather than spinning the ring empty into a closed
-            // engine — and say so once, with the count, instead of once per span.
-            if (taken < count) { ReportRefused(count - taken); return; }
-
-            MaybeFlush();
         }
 
         // Drain remaining items before shutdown.
@@ -284,8 +300,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 // of here skipped the flush below — the spans already in the tier were then left to
                 // the engine's own teardown, which the host timeout may cut short — and threw out of
                 // a disposal the host runs on two chains at once. Logged, then the tier is flushed
-                // all the same.
-                _logger.LogError(ex, "SpanDrainer: the drain loop ended in a fault; flushing what reached the hot tier");
+                // all the same — and the line itself may not throw past the flush (#137).
+                try { _logger.LogError(ex, "SpanDrainer: the drain loop ended in a fault; flushing what reached the hot tier"); }
+                catch (Exception) { /* the line is lost; the flush is not */ }
             }
 
             // Final flush so spans drained from the ring buffer at shutdown reach disk

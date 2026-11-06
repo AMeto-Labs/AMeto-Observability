@@ -19,6 +19,12 @@ namespace Ameto.Server;
 /// </summary>
 internal sealed class QueryGuard
 {
+    /// <summary>
+    /// The longest pause between two tries at a slot: under one tick of the Windows timer (15.6 ms),
+    /// which rounds a pause up to a whole tick. The log engine's owner polls use the same figure.
+    /// </summary>
+    internal const int QueuePollMaxMs = 8;
+
     private readonly SemaphoreSlim? _slots;
 
     public TimeSpan Timeout   { get; }
@@ -42,12 +48,35 @@ internal sealed class QueryGuard
     /// <summary>
     /// Waits (briefly) for a slot. Null means the server is saturated and the caller should
     /// refuse the request; otherwise dispose the lease when the query is finished.
+    ///
+    /// <para><b>A try, then timed pauses — never <see cref="SemaphoreSlim.WaitAsync(TimeSpan, CancellationToken)"/>.</b>
+    /// Under contention <c>WaitAsync</c> enqueues the waiter and only then allocates (the task, the
+    /// cancellation registration, the timer); an <see cref="OutOfMemoryException"/> there — a 512 MB
+    /// stand under load — left a waiter in the queue that the next <see cref="Lease.Dispose"/>
+    /// handed the slot to, and nobody took it: one of the 2–16 slots was gone until a restart, and
+    /// once they all were, every query was refused as overload (#137; the log engine's cc46791).
+    /// Nothing stands in the semaphore's queue here: a slot is taken in this frame with
+    /// <see cref="SemaphoreSlim.Wait(int)"/> or not at all, and a pause that cannot be set up costs
+    /// the request that asked, never a slot. The price: a freed slot is seen up to one pause late
+    /// (8 ms nominal, one 15.6 ms timer tick on Windows) and the queue is no longer first come,
+    /// first served — a request waiting long can be passed by a newer one until its
+    /// <see cref="QueueWait"/> is up, which is what the log engine's waits accepted too.</para>
     /// </summary>
     public async ValueTask<Lease?> TryEnterAsync(CancellationToken ct)
     {
         _onEnteringForTest?.Invoke();
         if (_slots is null) return new Lease(null);
-        return await _slots.WaitAsync(QueueWait, ct).ConfigureAwait(false) ? new Lease(_slots) : null;
+        if (_slots.Wait(0)) return new Lease(_slots);
+
+        long deadline = Environment.TickCount64 + (long)QueueWait.TotalMilliseconds;
+        for (int pause = 1; ; pause = Math.Min(2 * pause, QueuePollMaxMs))
+        {
+            _beforeQueuePollForTest?.Invoke();
+            long left = deadline - Environment.TickCount64;
+            if (left <= 0) return null;
+            await Task.Delay((int)Math.Min(pause, left), ct).ConfigureAwait(false);
+            if (_slots.Wait(0)) return new Lease(_slots);
+        }
     }
 
     /// <summary>
@@ -63,6 +92,13 @@ internal sealed class QueryGuard
     /// instant a request is past everything it checked before queueing. Null in production.
     /// </summary>
     internal Action? _onEnteringForTest;
+
+    /// <summary>
+    /// Test seam: called before each pause of a contended <see cref="TryEnterAsync"/>; throwing from
+    /// it is a pause that could not be set up (out of memory), the failure that used to cost a slot.
+    /// Null in production.
+    /// </summary>
+    internal Action? _beforeQueuePollForTest;
 
     internal readonly struct Lease(SemaphoreSlim? slots) : IDisposable
     {
