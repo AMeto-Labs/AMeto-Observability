@@ -54,6 +54,12 @@ public static class OtlpMetricProtoParser
         public int Refused;
 
         /// <summary>
+        /// Points refused for carrying more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels, or
+        /// sitting under a resource that does (#132) — reported as rejected, never built.
+        /// </summary>
+        public int RefusedForLabels;
+
+        /// <summary>
         /// The bounds array of the previous histogram point in this batch. Every point of an
         /// instrument carries the same bounds and nothing downstream mutates them (the hot tier
         /// keeps its series' first array, the log and the writer only read), so a point whose
@@ -70,11 +76,12 @@ public static class OtlpMetricProtoParser
         Parse(payload, MetricLabelInterner.Shared, out _);
 
     /// <summary>
-    /// <see cref="Parse(ReadOnlySpan{byte})"/>, and how many histogram points it refused for carrying
-    /// more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets — the count the receivers
-    /// report as rejected.
+    /// <see cref="Parse(ReadOnlySpan{byte})"/>, and the points it refused at decode by reason —
+    /// histogram points of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets, points of
+    /// more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels — the count the receivers report
+    /// as rejected.
     /// </summary>
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, out int refused) =>
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, out MetricDecodeRefusals refused) =>
         Parse(payload, MetricLabelInterner.Shared, out refused);
 
     /// <summary>
@@ -86,10 +93,11 @@ public static class OtlpMetricProtoParser
         Parse(payload, interner, out _);
 
     /// <summary>
-    /// The parse itself: the items, and the histogram points refused for carrying more than
-    /// <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126 review NEW-0).
+    /// The parse itself: the items, and the points refused at decode by reason — histogram points of
+    /// more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126 review NEW-0), points of
+    /// more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels (#132).
     /// </summary>
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner, out int refused)
+    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner, out MetricDecodeRefusals refused)
     {
         var st = new ParseState(interner);
         var r  = new ProtoReader(payload);
@@ -99,7 +107,7 @@ public static class OtlpMetricProtoParser
             if (tag == 10) ReadResourceMetrics(r.ReadLengthDelimited(), st);   // field 1
             else r.SkipField(tag);
         }
-        refused = st.Refused;
+        refused = new MetricDecodeRefusals(st.Refused, st.RefusedForLabels);
         return st.Result;
     }
 
@@ -137,7 +145,9 @@ public static class OtlpMetricProtoParser
     {
         var r = new ProtoReader(bytes);
         uint tag;
-        while ((tag = r.ReadTag()) != 0)
+        // Past MaxLabels the resource is done for: every point under it is refused (#132), so nothing
+        // more of it is read or interned.
+        while (!st.Labels.ResourceOverflowed && (tag = r.ReadTag()) != 0)
         {
             if (tag != 10) { r.SkipField(tag); continue; }                       // field 1: attributes
             if (!TryReadKeyValue(r.ReadLengthDelimited(), out var keyUtf8, out var value)) continue;
@@ -244,12 +254,19 @@ public static class OtlpMetricProtoParser
                 }
             }
 
+            var labels = BuildLabels(dp, 7, st);
+            if (st.Labels.Overflowed)
+            {
+                st.RefusedForLabels++;   // more than MaxLabels labels: refused, not built (#132)
+                continue;
+            }
+
             st.Result.Add(new MetricIngestItem
             {
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = BuildLabels(dp, 7, st),
+                Labels            = labels,
                 TimestampUnixNano = ts,
                 ScalarValue       = haveDouble ? value : (haveInt ? asInt : 0),
             });
@@ -334,12 +351,19 @@ public static class OtlpMetricProtoParser
                 continue;
             }
 
+            var labels = BuildLabels(dp, 9, st);
+            if (st.Labels.Overflowed)
+            {
+                st.RefusedForLabels++;   // more than MaxLabels labels: refused, not built (#132)
+                continue;
+            }
+
             st.Result.Add(new MetricIngestItem
             {
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = BuildLabels(dp, 9, st),
+                Labels            = labels,
                 TimestampUnixNano = ts,
                 HistogramCount    = count,
                 HistogramSum      = sum,
@@ -415,7 +439,9 @@ public static class OtlpMetricProtoParser
     /// Builds the point's label set through the shared <see cref="MetricLabelSetBuilder"/>: service
     /// name, the point's own attributes, then any resource label not already present. Re-walks the
     /// data point for just the attribute fields — a second pass over a span already in L1 is cheaper
-    /// than buffering attributes during the first.
+    /// than buffering attributes during the first. Stops at the attribute that takes the point past
+    /// <see cref="MetricLabelSetBuilder.MaxLabels"/>: the point is refused (<see cref="MetricLabelSetBuilder.Overflowed"/>,
+    /// the caller's to count), and the rest of its attributes are neither read nor interned (#132).
     /// </summary>
     private static LabelSet BuildLabels(ReadOnlySpan<byte> dp, int attrField, ParseState st)
     {
@@ -425,7 +451,7 @@ public static class OtlpMetricProtoParser
         uint attrTag = ((uint)attrField << 3) | 2;
         var r = new ProtoReader(dp);
         uint tag;
-        while ((tag = r.ReadTag()) != 0)
+        while (!labels.Overflowed && (tag = r.ReadTag()) != 0)
         {
             if (tag != attrTag) { r.SkipField(tag); continue; }
             if (!TryReadKeyValue(r.ReadLengthDelimited(), out var keyUtf8, out var value)) continue;
