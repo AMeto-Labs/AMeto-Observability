@@ -42,7 +42,7 @@ public sealed class OtlpTraceJsonSurrogateTests
     {
         var sink = new CapturingSpanSink();
 
-        var (ingested, refused) = OtlpTraceStreamParser.Parse(
+        var (ingested, refused, _) = OtlpTraceStreamParser.Parse(
             Json(spanName: "GET \\ud800/x", attrKey: "k\\ud800", attrValue: "v\\udc00", service: "svc\\ud800"), sink);
 
         Assert.Equal((1, 0), (ingested, refused));
@@ -75,7 +75,7 @@ public sealed class OtlpTraceJsonSurrogateTests
             .. value, .. Encoding.UTF8.GetBytes("\"}}]}]}]}]}")];
         var sink = new CapturingSpanSink();
 
-        var (ingested, refused) = OtlpTraceStreamParser.Parse(body, sink);
+        var (ingested, refused, _) = OtlpTraceStreamParser.Parse(body, sink);
 
         Assert.Equal((1, 0), (ingested, refused));
         Assert.Equal(1 + 65_535, Attributes(Assert.Single(sink.Spans).Attrs)["k"]!.Length);   // "\n" and one U+FFFD a byte
@@ -86,7 +86,7 @@ public sealed class OtlpTraceJsonSurrogateTests
     {
         var sink = new CapturingSpanSink();
 
-        var (ingested, _) = OtlpTraceStreamParser.Parse(
+        var (ingested, _, _) = OtlpTraceStreamParser.Parse(
             Json(spanName: "GET \\u002fapi", attrKey: "http.url", attrValue: "http:\\/\\/h\\/p", service: "svc"), sink);
 
         Assert.Equal(1, ingested);
