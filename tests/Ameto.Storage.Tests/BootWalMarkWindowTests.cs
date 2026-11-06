@@ -22,6 +22,7 @@ public sealed class BootWalMarkWindowTests : IDisposable
 
     public void Dispose()
     {
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();   // the retention store's Ameto.db, or the delete fails on Windows
         try { Directory.Delete(_root, recursive: true); } catch { /* best-effort */ }
     }
 
@@ -54,12 +55,11 @@ public sealed class BootWalMarkWindowTests : IDisposable
         }
         Assert.Single(Directory.GetFiles(Path.Combine(dir, "wal"), "*.wal"));   // the clean stop's empty log
 
-        StorageEngine.BeforeBootWalOpenForTest.Value = static () => throw new IOException("crash before the boot log (test seam)");
-        try
-        {
-            var crash = Record.Exception(() => NewEngine(dir));
-            Assert.IsType<IOException>(crash);
-        }
+        // A sentinel, not a type: an IOException from elsewhere in the constructor (a refused boot reservation
+        // on a full runner disk) would leave the spent log too, with a misleading message.
+        var crash = new IOException("crash before the boot log (test seam)");
+        StorageEngine.BeforeBootWalOpenForTest.Value = () => throw crash;
+        try { Assert.Same(crash, Record.Exception(() => NewEngine(dir))); }
         finally { StorageEngine.BeforeBootWalOpenForTest.Value = null; }
 
         // Before: the replay had deleted run one's log, run two died before writing its own, and this
@@ -96,26 +96,34 @@ public sealed class BootWalMarkWindowTests : IDisposable
     }
 
     /// <summary>
-    /// A log whose header cannot be read (its first 32 bytes zeroed: magic, version, block id) still
-    /// reserves the block its NAME carries — and is cleaned up once the boot log exists, not before.
+    /// Window 3 on disk. A log whose header cannot be read (its first 32 bytes zeroed: magic, version,
+    /// block id) reserves the block its NAME carries in memory — but it was deleted on the spot, so a crash
+    /// before the boot log left nothing on disk to say so. It now stays until the boot log exists.
     /// </summary>
     [Fact]
-    public async Task A_log_whose_header_cannot_be_read_still_reserves_the_block_its_name_carries()
+    public async Task A_log_whose_header_cannot_be_read_keeps_its_named_block_through_a_crash_before_the_boot_log()
     {
         string dir    = Dir("corrupt-header");
         string walDir = Path.Combine(dir, "wal");
         Directory.CreateDirectory(walDir);
         string wal = Path.Combine(walDir, "0-5000.wal");
-        WriteAheadLog.Open(wal, new NodeId(0), new SegmentId(5000)).Dispose();
+        WriteAheadLog.Open(wal, new NodeId(0), new SegmentId(5000), initialCapacity: 1 << 20).Dispose();
         using (var fs = new FileStream(wal, FileMode.Open, FileAccess.ReadWrite))
             fs.Write(new byte[32]);
+
+        var crash = new IOException("crash before the boot log (test seam)");
+        StorageEngine.BeforeBootWalOpenForTest.Value = () => throw crash;
+        try { Assert.Same(crash, Record.Exception(() => NewEngine(dir))); }
+        finally { StorageEngine.BeforeBootWalOpenForTest.Value = null; }
+        Assert.True(File.Exists(wal), "the unreadable log was deleted before the boot log existed");   // main: deleted by the replay
 
         ulong boot;
         await using (var engine = NewEngine(dir))
         {
             await engine.CatalogLoaded;
             boot = engine.LiveWalSegmentId;
-            Assert.True(boot >= 5000 + (ulong)Slots, $"the boot block {boot} overlaps the block the unreadable log is named for");
+            Assert.True(boot >= 5000 + (ulong)Slots,                                                    // main: 1
+                $"the boot block {boot} overlaps the block the unreadable log is named for");
             Assert.False(File.Exists(wal), "the unreadable log was not cleaned up once the boot log existed");
         }
 
@@ -123,5 +131,34 @@ public sealed class BootWalMarkWindowTests : IDisposable
         await using var next = NewEngine(dir);
         await next.CatalogLoaded;
         Assert.True(next.LiveWalSegmentId >= boot + (ulong)Slots);
+    }
+
+    /// <summary>
+    /// Room for one log on the volume, and the spent log holds it. Deleted by the replay, as before #131,
+    /// its blocks were the boot log's; kept whole until the boot log existed, they were not, and a start
+    /// main came up from refused its boot log — a restart loop until someone freed a whole log's room by
+    /// hand. The spent log is cut to its 32-byte header before it waits, so the room is the boot log's again.
+    /// </summary>
+    [Fact]
+    public async Task A_start_whose_volume_has_room_only_for_the_spent_logs_blocks_still_opens_its_boot_log()
+    {
+        string dir = Dir("full");
+        string spent;
+        await using (var first = NewEngine(dir))
+        {
+            await first.CatalogLoaded;
+            spent = Assert.Single(Directory.GetFiles(Path.Combine(dir, "wal"), "*.wal"));
+        }
+
+        // Full but for what the spent log holds: a reservation is refused while it still holds its blocks.
+        FileSpace.ReserveForTest.Value = (_, _, _) =>
+            new FileInfo(spent) is { Exists: true, Length: > 32 } ? new IOException("test: the volume is full") : null;
+        try
+        {
+            await using var next = NewEngine(dir);
+            await next.CatalogLoaded;
+            Assert.False(File.Exists(spent), "the spent log was not removed once the boot log existed");
+        }
+        finally { FileSpace.ReserveForTest.Value = null; }
     }
 }
