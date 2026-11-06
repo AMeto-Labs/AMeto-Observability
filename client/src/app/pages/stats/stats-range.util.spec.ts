@@ -86,9 +86,10 @@ describe('resolving the window', () => {
     expect(windowLabel(quick, NOW)).toMatch(/^30 Oct 14:22 → now · 85 buckets of 2 h · UTC/);
     expect(windowCaption(quick, NOW)).toBe('Last 7 days');
 
-    // Five days: 2-hour buckets (an hour would be 120 columns, past the 96 the table allows).
+    // Five days: 2-hour buckets (an hour would be 120 columns, past the 96 the table allows). The
+    // count is 60 or 61 by the zone: the grid is aligned to the epoch, local midnight is not.
     const custom = resolveWindow('custom', '2026-10-12 00:00', '2026-10-16 23:59', NOW)!;
-    expect(windowLabel(custom, NOW)).toMatch(/^12 Oct 00:00 → 16 Oct 23:59 · 61 buckets of 2 h · UTC/);
+    expect(windowLabel(custom, NOW)).toMatch(/^12 Oct 00:00 → 16 Oct 23:59 · 6[01] buckets of 2 h · UTC/);
     expect(windowCaption(custom, NOW)).toBe('12 – 16 Oct');
     expect(windowCaption(resolveWindow('custom', '2026-09-28 00:00', '2026-10-02 00:00', NOW)!, NOW)).toBe('28 Sep – 2 Oct');
     expect(windowCaption(resolveWindow('custom', '2026-11-01 00:00', '', NOW)!, NOW)).toBe('Since 1 Nov');
