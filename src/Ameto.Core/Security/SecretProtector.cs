@@ -111,14 +111,23 @@ public static class SecretProtectorFactory
         Directory.CreateDirectory(dataDirectory);
         var path = Path.Combine(dataDirectory, "secret.key");
         byte[] fileKey;
-        if (File.Exists(path))
+        // READ FIRST, GENERATE ONLY WHEN THE FILE SYSTEM SAYS THERE IS NO FILE (#138 item 7). This asked
+        // File.Exists, which answers false for a file it could not look at as well as for one that is gone —
+        // a share that did not answer, an antivirus hold, an access check — and then generated a new key
+        // and wrote it OVER the one that existed: every secret stored under the old key undecryptable, for
+        // good. A read that fails any other way than "not found" now fails the start, which is recoverable;
+        // and the new file is created with CreateNew, so a key that appeared meanwhile is never overwritten.
+        try
         {
+            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Open);
             fileKey = DecodeKey(File.ReadAllText(path).Trim());
         }
-        else
+        catch (FileNotFoundException)
         {
             fileKey = RandomNumberGenerator.GetBytes(32);
-            File.WriteAllText(path, Convert.ToBase64String(fileKey));
+            using (var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var w  = new StreamWriter(fs))
+                w.Write(Convert.ToBase64String(fileKey));
             TrySetOwnerOnly(path);
             onGeneratedKey?.Invoke(path);
         }

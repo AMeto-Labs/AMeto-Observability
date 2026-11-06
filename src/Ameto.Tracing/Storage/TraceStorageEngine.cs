@@ -2171,10 +2171,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// permanent loss claim.
     /// </summary>
     private bool WalFileStillThere()
-    {
-        try { return File.Exists(_walPath); }
-        catch { return true; }
-    }
+        // Asked as a look, not File.Exists, which never throws and answered false for a file it could not
+        // look at: the catch that was to answer TRUE on a probe failure never ran, and a flickering mount
+        // read as a swapped volume (#138 item 7).
+        => FileLook.Of(_walPath) != FilePresence.Gone;
 
     private static bool NoSegmentFilesLeft(string dir)
     {
@@ -3404,7 +3404,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (_mergingPaths.Contains(path)) continue;
 
                 var seg = Array.Find(_coldSegments, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
-                if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+                // Gone only when the file system says so: a file that could not be looked at stays queued for
+                // the next pass rather than being unnamed for the life of the process (#138 item 7).
+                if (seg is null || seg.SegmentId != 0 || FileLook.Of(path) == FilePresence.Gone)
                 {
                     lock (_unnamedSegments) _unnamedSegments.Remove(path);
                     continue;
@@ -3749,8 +3751,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             for (int i = 0; i < unknown.Count; i++) named.Add(unknown[i].WithSegmentId(fresh[i]));
             int adopted = unknown.Count;
 
+            // Dropped from the catalog — with its index runs retired — only when the file system says the
+            // file is gone. File.Exists answered false for a file it could not look at as well, and a live
+            // segment then lost its id and its index runs on a share that did not answer (#138 item 7).
             var vanished = _manifest.Segments
-                .Where(kv => !File.Exists(kv.Value.FilePath))
+                .Where(kv => FileLook.Of(kv.Value.FilePath) == FilePresence.Gone)
                 .Select(kv => kv.Key)
                 .ToList();
             if (vanished.Count > 0) RetireDroppedRuns(_manifest.RemoveSegments(vanished));

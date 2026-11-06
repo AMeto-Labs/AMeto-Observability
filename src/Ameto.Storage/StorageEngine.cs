@@ -6672,15 +6672,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private static Presence Look(string path)
     {
         if (LookFailsForTest.Value is { } fails && fails(path)) return Presence.Unknown;
-        try
+        // The one look every engine uses now (#138 item 7); this enum stays for the many readers in this file.
+        return FileLook.Of(path) switch
         {
-            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Look);
-            File.GetAttributes(path);
-            return Presence.There;
-        }
-        catch (FileNotFoundException)      { return Presence.Gone; }
-        catch (DirectoryNotFoundException) { return Presence.Gone; }
-        catch (Exception)                  { return Presence.Unknown; }
+            FilePresence.There => Presence.There,
+            FilePresence.Gone  => Presence.Gone,
+            _                  => Presence.Unknown,
+        };
     }
 
     /// <summary>Test seam: true for a path whose look fails (<see cref="Presence.Unknown"/>). A static

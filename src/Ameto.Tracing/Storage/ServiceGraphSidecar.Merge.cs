@@ -19,7 +19,15 @@ internal static partial class ServiceGraphSidecar
     {
         edges = [];
         var path = Path.ChangeExtension(trcFilePath, ".svcgraph");
-        if (!File.Exists(path)) return true;
+        // No sidecar is no edges, truthfully. A sidecar that cannot be LOOKED at is not that: File.Exists
+        // answered false for it too, and the merge then wrote its output without this source's edges, for
+        // good (#138 item 7). Unknown answers false, as an unreadable sidecar does: the merge that rebuilds
+        // edges from spans takes the source.
+        switch (FileLook.Of(path))
+        {
+            case FilePresence.Gone:    return true;
+            case FilePresence.Unknown: return false;
+        }
 
         try
         {
