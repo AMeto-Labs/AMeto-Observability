@@ -20,6 +20,7 @@
     <Project Path="tests/Ameto.Perf/Ameto.Perf.csproj" />
     <Project Path="tests/Ameto.Query.Tests/Ameto.Query.Tests.csproj" />
     <Project Path="tests/Ameto.Storage.Tests/Ameto.Storage.Tests.csproj" />
+    <Project Path="tests/Serilog.Sinks.Ameto.Tests/Serilog.Sinks.Ameto.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/loggen/loggen.csproj" />

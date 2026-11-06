@@ -56,8 +56,8 @@ jobs:
       # allocation the probe exists to see, and the probe then reports a healthy number over
       # defective code.
       #
-      # SIX test projects are in Ameto.slnx, and `dotnet test` at the root runs all of them:
-      # Core, Query, Indexing, Storage, Integration — and Ameto.Perf, which is an OutputType=Exe
+      # SEVEN test projects are in Ameto.slnx, and `dotnet test` at the root runs all of them:
+      # Core, Query, Indexing, Storage, Integration, Serilog.Sinks.Ameto — and Ameto.Perf, which is an OutputType=Exe
       # BenchmarkDotNet host that also carries ~53 [Fact]s and takes 2m40s-3m45s of the ~11 minute
       # job. Its probes measure allocation and CPU on a shared two-core runner, so its timings vary
       # by ~40% between runs of identical code; it is in the gate deliberately for now, and if it
@@ -107,7 +107,7 @@ jobs:
           # is false, so a change in the runner's summary format (a move to Microsoft.Testing
           # Platform, say) would retire this check in silence — the exact failure it exists to
           # prevent. Requiring one summary line per test project makes that a red build instead.
-          $expectedProjects = 6   # Core, Query, Indexing, Storage, Perf, Integration — see Ameto.slnx
+          $expectedProjects = 7   # Core, Query, Indexing, Storage, Perf, Integration, Serilog.Sinks.Ameto — see Ameto.slnx
           $summaries = @(Select-String -Path test-output.txt -Pattern 'Skipped:\s+(\d+)' -AllMatches |
                          ForEach-Object { $_.Matches } |
                          ForEach-Object { [int]$_.Groups[1].Value })
