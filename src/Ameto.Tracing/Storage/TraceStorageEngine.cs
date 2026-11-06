@@ -1126,7 +1126,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
         var batch = new ItemSpanBatch(items);
-        try     { return WriteBatch(ref batch); }
+        int taken = 0;
+        try     { WriteBatch(ref batch, ref taken); return taken; }
         finally { batch.Dispose(); }
     }
 
@@ -1138,19 +1139,37 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// That is what keeps the lock-free aggregate passes (which walk captured
     /// <see cref="SpanRecord"/>s long after the lock is gone) clear of the arena's reuse.
     /// </summary>
-    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct =>
-        WriteBatch(ref batch);
+    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    {
+        int taken = 0;
+        WriteBatch(ref batch, ref taken);
+        return taken;
+    }
+
+    /// <summary>
+    /// <see cref="WriteRaw{TBatch}(ref TBatch)"/> for a caller that must know how far the write got when
+    /// it THROWS: <paramref name="taken"/> counts the spans that are in the log and the tier, advanced as
+    /// each appended span is inserted into the tier, and is current when an exception leaves. The
+    /// drainer reads it to release the spans the engine took and keep the rest for another pass (#138);
+    /// the return value of the other overload is lost to a throw. A span the log took and the tier did
+    /// not — an insert that ran out of memory — is behind the count, and the retry appends it to the
+    /// log a second time: the tier holds it once, the log twice until the next flush commits it.
+    /// </summary>
+    internal void WriteRaw<TBatch>(ref TBatch batch, ref int taken) where TBatch : ISpanBatch, allows ref struct
+        => WriteBatch(ref batch, ref taken);
 
     /// <summary>
     /// The one write core. Per hold: the tier's strings and blob copies are resolved OUTSIDE the
     /// lock (an intern lookup and a copy per span have no business in a hold every reader waits
     /// out), then the log and the tier take them under ONE hold, exactly as before.
+    /// <paramref name="takenSoFar"/> mirrors the count of spans taken after every hold, so a caller
+    /// reads it even when this throws.
     /// </summary>
-    private int WriteBatch<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    private void WriteBatch<TBatch>(ref TBatch batch, ref int takenSoFar) where TBatch : ISpanBatch, allows ref struct
     {
         int count = batch.Count;
-        if (count == 0) return 0;
-        if (!TryEnterEngine()) return 0;
+        if (count == 0) return;
+        if (!TryEnterEngine()) return;
         int taken = 0;
 
         // A hold is at most 4 096 spans whatever a probe sets (the production cap is 128), so the
@@ -1213,9 +1232,16 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     finally
                     {
                         scope.Dispose();
+                        // ONE STORE PER SPAN. The insert allocates (a SpanRecord, the tier list's and the
+                        // trace index's growth), and one that ran out of memory at span j must leave the
+                        // caller counting [0, j): mirrored once at the end of the hold, the whole hold came
+                        // back and the tier held [0, j) twice (#138 review).
                         for (int j = 0; j < appended; j++)
+                        {
                             AddToHotTierLocked(batch.Header(taken + j), names[j], pooled[2 * j],
                                                services[j], pooled[2 * j + 1], blobs[j]);
+                            takenSoFar = taken + j + 1;   // in the log and the tier: what the caller keeps if the next line is the last thing it hears
+                        }
                         taken += appended;
                     }
 
@@ -1261,7 +1287,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             System.Buffers.ArrayPool<bool>.Shared.Return(pooled);
             ExitEngine();
         }
-        return taken;
     }
 
     // ── A FLUSH THAT CANNOT START IS SAID, AT MOST ONCE A MINUTE ─────────────────
@@ -5872,7 +5897,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private Task<int> PruneCore(TimeSpan ttl, CancellationToken ct)
     {
-        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+        // Saturating (#130): computed in DateTimeOffset and multiplied out, a TTL of some centuries —
+        // 200 000 days typed for "forever" — wrapped into a cutoff in the FUTURE and this prune deleted
+        // every trace file, every hour; a TTL past year 1 threw instead. Past the epoch, nothing is older.
+        var cutoffNano = RetentionMath.CutoffNano(DateTimeOffset.UtcNow, ttl);
 
         List<SpanSegmentInfo> toDelete;
         _lock.EnterWriteLock();
@@ -5918,9 +5946,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         if (toDelete.Count > 0 || forgotten > 0)
             _logger.LogInformation(
-                "Retention pruned {Count} trace file(s) older than {Days} days " +
+                "Retention pruned {Count} trace file(s) older than {Days:N0} days " +
                 "(and forgot {Forgotten} vanished-segment range(s) below the cutoff)",
-                toDelete.Count, (int)ttl.TotalDays, forgotten);
+                toDelete.Count, ttl.TotalDays, forgotten);
 
         return Task.FromResult(toDelete.Count);
     }

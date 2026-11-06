@@ -450,7 +450,7 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         using (var ledger = IngestBufferPoolLedger.Open())
         {
             await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, NoLog, NoMemoryLog,
-                (_, _) => { decoded++; return (true, 0, null); });
+                (_, _) => { decoded++; return (true, 0, null, false); });
 
             Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
             Assert.Equal(OtlpGrpcEndpointMapper.IngestMemoryShortMessage, call.Response.Headers["grpc-message"].ToString());
@@ -474,7 +474,7 @@ public sealed class OtlpOutOfMemoryTests : IClassFixture<OtlpOutOfMemoryTests.Fa
         using var ledger = IngestBufferPoolLedger.Open();
         ledger.FailRent(1, new OutOfMemoryException("injected: the body read ran out"));
         await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, NoLog, NoMemoryLog,
-            (_, _) => { decoded++; return (true, 0, null); });
+            (_, _) => { decoded++; return (true, 0, null, false); });
 
         Assert.Equal("14", call.Response.Headers["grpc-status"].ToString());
         Assert.Equal(OtlpGrpcEndpointMapper.IngestMemoryShortMessage, call.Response.Headers["grpc-message"].ToString());

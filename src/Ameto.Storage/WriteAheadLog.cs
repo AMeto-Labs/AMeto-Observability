@@ -118,6 +118,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private const ushort WalVersionV3      = 3;
     private const int    FileHeaderSize    = 32;
     private const int    EntryHeaderSize   = 26;
+
+    /// <summary>The file header's size: what a spent log is cut to (<c>StorageEngine.CutSpentLogToHeader</c>, #131).</summary>
+    internal const int FileHeaderBytes = FileHeaderSize;
     private const int    EntryHeaderSizeV4 = 24;
     private const int    EntryHeaderSizeV3 = 20;
     // Bytes of the entry header covered by the checksum (everything except the crc itself).

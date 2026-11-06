@@ -181,13 +181,18 @@ public static class OtlpTraceStreamParser
     }
 
     /// <summary>
-    /// Streams the batch into <paramref name="sink"/> (TI#3) and says how many spans it took and
-    /// how many it refused. A malformed body throws with its prefix already ingested; the sink's
-    /// batch is ended either way.
+    /// Streams the batch into <paramref name="sink"/> (TI#3) and says how many spans it took, how
+    /// many it refused, and whether it refused them for room (<see cref="ISpanSink.RefusedForRoom"/>:
+    /// a retry would find some) rather than for a span no retry fits. A malformed body throws with
+    /// its prefix already ingested; the sink's batch is ended either way.
     /// </summary>
-    public static (int Ingested, int Refused) Parse(ReadOnlySpan<byte> json, ISpanSink sink)
+    public static (int Ingested, int Refused, bool RefusedForRoom) Parse(ReadOnlySpan<byte> json, ISpanSink sink)
     {
-        try { return ParseBatch(json, sink); }
+        try
+        {
+            var (ingested, refused) = ParseBatch(json, sink);
+            return (ingested, refused, refused == 0 || sink.RefusedForRoom);   // asked before EndBatch forgets it
+        }
         finally
         {
             sink.EndBatch();

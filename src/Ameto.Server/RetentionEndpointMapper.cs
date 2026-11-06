@@ -22,8 +22,19 @@ public static class RetentionEndpointMapper
             Results.Ok(store.Get()))
             .RequireAuthorization();
 
-        app.MapPut("/api/retention", (RetentionDto dto, RetentionStore store) =>
+        app.MapPut("/api/retention", IResult (RetentionDto dto, RetentionStore store) =>
         {
+            // #130: a window outside the bounds — "forever" typed as 200 000 days, which overflowed
+            // the trace cutoff — is refused whole, naming the field. The store refuses it too; this
+            // answer says why in the body instead of a 500.
+            var field = dto.FirstInvalidField();
+            if (field is not null)
+                return Results.BadRequest(new
+                {
+                    error = $"{field} must be between {RetentionMath.MinDays} and {RetentionMath.MaxDays} days",
+                    field,
+                });
+
             store.Set(dto);
             return Results.Ok(store.Get());
         }).RequireAuthorization(AuthServiceExtensions.PolicyAdmin);
@@ -45,7 +56,7 @@ public static class RetentionEndpointMapper
                     "traces"  => dto.TracesDays,
                     _         => 30,
                 };
-                var pruned = await target.PruneAsync(TimeSpan.FromDays(Math.Max(1, days)));
+                var pruned = await target.PruneAsync(RetentionMath.TtlOf(days));
                 if (target.RetentionKey == "metrics") metricFiles += pruned;
                 else if (target.RetentionKey == "traces") traceFiles += pruned;
             }

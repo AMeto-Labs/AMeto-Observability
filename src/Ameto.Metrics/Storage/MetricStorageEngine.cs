@@ -2853,14 +2853,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// 2 025 years) threw, so retention never ran and — once the clip shared the formula — every
     /// rewrite failed; and a TTL some centuries long (roughly 350 to 585 years: "200000 days" for
     /// "forever") wrapped the multiplication into a cutoff in the FUTURE, so retention deleted every
-    /// metric file, every hour.
+    /// metric file, every hour. The arithmetic now lives in <see cref="RetentionMath.CutoffNano"/>,
+    /// shared with the trace prune (#130); this is the name the rewrite and the tests know.
     /// </summary>
     internal static long RetentionCutoffNano(DateTimeOffset now, TimeSpan ttl)
-    {
-        long nowMs = now.ToUnixTimeMilliseconds();
-        long ttlMs = Math.Max(0, ttl.Ticks / TimeSpan.TicksPerMillisecond);
-        return ttlMs >= nowMs ? long.MinValue : (nowMs - ttlMs) * 1_000_000L;
-    }
+        => RetentionMath.CutoffNano(now, ttl);
 
     /// <summary>The TTL the last retention run pruned with; 0 until one has run. See <see cref="RetentionKeepFromNano"/>.</summary>
     private long _retentionTtlTicks;

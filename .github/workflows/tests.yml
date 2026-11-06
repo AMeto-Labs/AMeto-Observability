@@ -56,8 +56,8 @@ jobs:
       # allocation the probe exists to see, and the probe then reports a healthy number over
       # defective code.
       #
-      # SIX test projects are in Ameto.slnx, and `dotnet test` at the root runs all of them:
-      # Core, Query, Indexing, Storage, Integration — and Ameto.Perf, which is an OutputType=Exe
+      # SEVEN test projects are in Ameto.slnx, and `dotnet test` at the root runs all of them:
+      # Core, Query, Indexing, Storage, Integration, Serilog.Sinks.Ameto — and Ameto.Perf, which is an OutputType=Exe
       # BenchmarkDotNet host that also carries ~53 [Fact]s and takes 2m40s-3m45s of the ~11 minute
       # job. Its probes measure allocation and CPU on a shared two-core runner, so its timings vary
       # by ~40% between runs of identical code; it is in the gate deliberately for now, and if it
@@ -107,7 +107,7 @@ jobs:
           # is false, so a change in the runner's summary format (a move to Microsoft.Testing
           # Platform, say) would retire this check in silence — the exact failure it exists to
           # prevent. Requiring one summary line per test project makes that a red build instead.
-          $expectedProjects = 6   # Core, Query, Indexing, Storage, Perf, Integration — see Ameto.slnx
+          $expectedProjects = 7   # Core, Query, Indexing, Storage, Perf, Integration, Serilog.Sinks.Ameto — see Ameto.slnx
           $summaries = @(Select-String -Path test-output.txt -Pattern 'Skipped:\s+(\d+)' -AllMatches |
                          ForEach-Object { $_.Matches } |
                          ForEach-Object { [int]$_.Groups[1].Value })
@@ -342,7 +342,7 @@ jobs:
         run: |
           set -o pipefail
           dotnet test tests/Ameto.Storage.Tests -c Debug --nologo -v minimal \
-            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker|FullyQualifiedName~_cannot_open_is_kept_and_its_events_come_back|FullyQualifiedName~whose_marker_the_|FullyQualifiedName~whose_pool_the_startup_replay_cannot_open|FullyQualifiedName~On_linux_a_block_without_a_marker_is_cleaned_up" \
+            --filter "FullyQualifiedName~Pool_files_whose_log_is_gone_are_swept_at_the_start|FullyQualifiedName~A_log_the_startup_sweep_cannot_look_at_keeps_its_pool_and_its_marker|FullyQualifiedName~A_wal_whose_delete_failed_and_that_cannot_be_looked_at_keeps_its_marker|FullyQualifiedName~_cannot_open_is_kept_and_its_events_come_back|FullyQualifiedName~whose_marker_the_|FullyQualifiedName~whose_pool_the_startup_replay_cannot_open|FullyQualifiedName~On_linux_a_block_without_a_marker_is_cleaned_up|FullyQualifiedName~BootWalMarkWindowTests" \
             --logger "console;verbosity=normal" 2>&1 | tee sweep-output.txt
 
           # And (round 6) the recovery reads and the marker checks that a look or an open the file system

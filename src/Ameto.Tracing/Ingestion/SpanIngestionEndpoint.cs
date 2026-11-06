@@ -41,11 +41,17 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
     /// <summary>The timestamp (<see cref="TimeProvider.GetTimestamp"/>) before which no further warning is written.</summary>
     private long _nextWarningAt;
 
-    /// <summary>The calling thread's raw batch into this endpoint: how many of its spans were refused.</summary>
+    /// <summary>
+    /// The calling thread's raw batch into this endpoint: how many of its spans were refused, and
+    /// whether the first of them was refused for room — the ring full, which a retry finds freer —
+    /// rather than for being heavier than the whole ring, which no retry fits (#138). The prefix
+    /// refused after it inherits the reason.
+    /// </summary>
     private struct RawBatch
     {
         public SpanIngestionEndpoint? Owner;
         public int                    Refused;
+        public bool                   ForRoom;
     }
 
     [ThreadStatic] private static RawBatch t_batch;
@@ -166,7 +172,18 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
         if (_ring.TryEnqueueRaw(in fields, nameUtf8, serviceIdx, serviceUtf8, msgpackAttributes)) return true;
 
         batch.Refused = 1;
+        batch.ForRoom = _ring.LastRefusalWasForRoom;
         return false;
+    }
+
+    /// <inheritdoc/>
+    public bool RefusedForRoom
+    {
+        get
+        {
+            ref var batch = ref t_batch;
+            return batch.Owner != this || batch.Refused == 0 || batch.ForRoom;
+        }
     }
 
     /// <inheritdoc/>
@@ -201,6 +218,6 @@ internal sealed partial class SpanIngestionEndpoint : ISpanIngester, ISpanSink
     }
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Span ring buffer full: refused {RefusedSpans} span(s) from {RefusedRequests} request(s) since the last warning — the drainer is behind")]
+        Message = "Span ring buffer full: refused {RefusedSpans} span(s) from {RefusedRequests} request(s) since the last warning — the drainer is behind, or the trace store is refusing writes (see the SpanDrainer errors)")]
     private static partial void LogRingFull(ILogger logger, long refusedSpans, long refusedRequests);
 }
