@@ -647,31 +647,9 @@ public static class OtlpLogProtoParser
     }
 
     /// <summary>
-    /// OTLP severity → Ameto level, matching <c>OtlpLogMapper.MapSeverity</c> exactly:
-    /// the number decides whenever it is set, and the text is the fallback — prefix match
-    /// for the levels with no synonyms, whole-word for WARN/INFO, which have one each.
+    /// OTLP severity → Ameto level: the one rule every log road applies (<see cref="OtlpSeverity.Map"/>;
+    /// it lived here, and the JSON stream parser had a stricter copy — #138 item 3).
     /// </summary>
     private static LogLevel MapSeverity(int severityNumber, ReadOnlySpan<byte> severityText)
-    {
-        if (severityNumber >= 21) return LogLevel.Fatal;
-        if (severityNumber >= 17) return LogLevel.Error;
-        if (severityNumber >= 13) return LogLevel.Warning;
-        if (severityNumber >= 9)  return LogLevel.Information;
-        if (severityNumber >= 5)  return LogLevel.Debug;
-        if (severityNumber >= 1)  return LogLevel.Verbose;
-
-        if (severityText.IsEmpty) return LogLevel.Information;
-        if (StartsWithFold(severityText, "FATAL"u8)) return LogLevel.Fatal;
-        if (StartsWithFold(severityText, "ERROR"u8)) return LogLevel.Error;
-        if (Ascii.EqualsIgnoreCase(severityText, "WARN"u8) ||
-            Ascii.EqualsIgnoreCase(severityText, "WARNING"u8)) return LogLevel.Warning;
-        if (Ascii.EqualsIgnoreCase(severityText, "INFO"u8) ||
-            Ascii.EqualsIgnoreCase(severityText, "INFORMATION"u8)) return LogLevel.Information;
-        if (StartsWithFold(severityText, "DEBUG"u8)) return LogLevel.Debug;
-        if (StartsWithFold(severityText, "TRACE"u8)) return LogLevel.Verbose;
-        return LogLevel.Information;
-    }
-
-    private static bool StartsWithFold(ReadOnlySpan<byte> text, ReadOnlySpan<byte> prefix)
-        => text.Length >= prefix.Length && Ascii.EqualsIgnoreCase(text[..prefix.Length], prefix);
+        => OtlpSeverity.Map(severityNumber, severityText);
 }

@@ -2714,7 +2714,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             {
                 // The file's failure, not the work's: it leaves every later rewrite, and the rest of
                 // the group goes at the metric's next turn without it — no back-off (#125 review F1).
-                QuarantineFromRewrites(ex.Source, ex.InnerException!);
+                QuarantineFromRewrites(ex.Segment, ex.InnerException!);
             }
             catch (Exception ex)
             {
@@ -3172,7 +3172,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             catch (UnreadableSourceException ex)
             {
                 // As in CompactSegments: the file leaves, the rest of the group does not wait on it.
-                QuarantineFromRewrites(ex.Source, ex.InnerException!);
+                QuarantineFromRewrites(ex.Segment, ex.InnerException!);
             }
             catch (Exception ex)
             {
@@ -3335,7 +3335,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     private sealed class UnreadableSourceException(MetricSegmentInfo source, Exception inner)
         : Exception($"Metric file {source.FilePath} will not decode", inner)
     {
-        public MetricSegmentInfo Source { get; } = source;
+        /// <summary>The source that failed (named <c>Segment</c>, not <c>Source</c>: that hides <see cref="Exception.Source"/>, CS0114).</summary>
+        public MetricSegmentInfo Segment { get; } = source;
     }
 
     /// <summary>Whether a read failed on what the file holds, not on the machine reading it.</summary>

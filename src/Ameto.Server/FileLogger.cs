@@ -97,13 +97,15 @@ public sealed class FileLoggerProvider : ILoggerProvider
         catch (InvalidOperationException)  { /* collection completed or disposed */ }
         finally
         {
-            try { _writer?.Flush(); _writer?.Dispose(); } catch { }
+            // Dispose alone: it flushes, and its own finally closes the stream even when that flush
+            // throws, where a Flush before it left the file open on a throw (#138 item 8).
+            try { _writer?.Dispose(); } catch { }
         }
     }
 
     private void Roll(DateOnly day)
     {
-        try { _writer?.Flush(); _writer?.Dispose(); } catch { }
+        try { _writer?.Dispose(); } catch { }
         var path = Path.Combine(_dir, $"ameto-{day:yyyyMMdd}.log");
         _writer  = new StreamWriter(
             new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),

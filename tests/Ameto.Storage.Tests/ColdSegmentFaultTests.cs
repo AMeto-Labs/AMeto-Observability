@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
+using Ameto.Core;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using Xunit.Abstractions;
@@ -486,5 +487,35 @@ public sealed class ColdSegmentFaultTests : IDisposable
         // Now replay the loser exactly: a reader still holding the pre-removal snapshot meets the
         // same file. It must reach the same verdict, not "handover".
         Assert.Equal(TraceStorageEngine.ColdReadFault.Lost, e.MeetMissingSegmentFileVerdictForTest(doomed));
+    }
+
+    /// <summary>
+    /// The unpopulated-volume guard's tie-breaker, when the look at spans.wal FAILS (a stale handle, EIO as
+    /// a share comes back): with every segment file already reported gone, a log that cannot be looked at
+    /// is no evidence that this is the directory the engine opened, so the segment is KEPT and the next
+    /// request asks again — the recoverable answer, as for a data directory that cannot be probed. Read as
+    /// "still there", the guard did not apply, the segment left the snapshot until a restart and a loss was
+    /// recorded over a blip: the outcome the guard was built and measured to prevent (#138 item 7 review).
+    /// </summary>
+    [Fact]
+    public void A_WAL_that_cannot_be_looked_at_keeps_a_segment_whose_directory_lists_nothing()
+    {
+        string dir = Path.Combine(_root, "walunknown");
+        Directory.CreateDirectory(dir);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        for (int k = 0; k < 10; k++) Write(e, 9_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        var seg = Assert.Single(e.ColdSegmentsForTest);
+        UnlinkSegmentFiles(seg.FilePath);                       // the listing now finds no segment file
+
+        string wal = Path.Combine(dir, "spans.wal");
+        FileRefusal.ForTest.Value = (p, a) =>
+            a == FileRefusal.Access.Look && p == wal ? new IOException("test: the share did not answer") : null;
+        try
+        {
+            Assert.Equal(TraceStorageEngine.ColdReadFault.Transient, e.MeetMissingSegmentFileVerdictForTest(seg));
+            Assert.Single(e.ColdSegmentsForTest);
+        }
+        finally { FileRefusal.ForTest.Value = null; }
     }
 }

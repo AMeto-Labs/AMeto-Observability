@@ -889,9 +889,13 @@ internal static class SpanWriter
     }
     private static bool MoveIntoPlaceIfWritten(string finalPath)
     {
+        // The move itself says whether the file was written: File.Exists answered false for a .tmp it could
+        // not look at as well as for one never written, and the sidecar then stayed unpublished, swept at
+        // the next start (#138 item 7). Any failure of the move but "not there" is still the caller's.
         string tmp = finalPath + ".tmp";
-        if (!File.Exists(tmp)) return false;
-        File.Move(tmp, finalPath);
+        try { File.Move(tmp, finalPath); }
+        catch (FileNotFoundException)      { return false; }
+        catch (DirectoryNotFoundException) { return false; }
         return true;
     }
 
