@@ -30,7 +30,7 @@ namespace Ameto.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IMemoryShedder, IAsyncDisposable
+public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IMetricStats, IRetentionTarget, IMemoryShedder, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     //
@@ -1438,6 +1438,38 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     private static bool IsLastOfItsRun(ReadOnlySpan<string> kv, int i) =>
         i + 2 >= kv.Length || !string.Equals(kv[i], kv[i + 2]);
+
+    // ── IMetricStats ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// What <c>GET /api/metrics/stats</c> aggregates: the cold catalogue copied under its read lock,
+    /// the hot tier's counters, and the metric names the hot tier holds series for. Nothing here
+    /// opens a file; a segment's bytes are the size it was catalogued with. A closed cold tier
+    /// answers with no segments, and the endpoint asks <see cref="Availability"/> to say so.
+    /// </summary>
+    public MetricStoreSnapshot GetStoreSnapshot()
+    {
+        List<MetricSegmentInfo> cold = [];
+        if (TryEnterColdRead())
+        {
+            try { cold = [.. _coldSegments]; }
+            finally { _coldLock.ExitReadLock(); }
+        }
+
+        var hotNames = new List<string>();
+        foreach (var (name, byName) in _hotByName)
+            if (!byName.IsEmpty) hotNames.Add(name);
+
+        return new MetricStoreSnapshot
+        {
+            ColdSegments   = cold,
+            HotMetricNames = hotNames,
+            // Count takes every lock in the table — a page's request, never a poll; see HotSeriesCount.
+            HotSeries      = _hot.Count,
+            HotPoints      = Volatile.Read(ref _hotPointCount),
+            HotBytes       = Volatile.Read(ref _hotPointBytes),
+        };
+    }
 
     // ── IMetricCatalog ────────────────────────────────────────────────────────
 

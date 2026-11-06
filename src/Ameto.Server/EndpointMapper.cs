@@ -16,14 +16,33 @@ public static class EndpointMapper
         app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }));
 
         // ── Stats ─────────────────────────────────────────────────────────────
+        // The log store's counters for the Statistics page: the segment catalogue summed, with the
+        // span of time it covers. A closed store (#95) is refused like every other read of it, so
+        // the page shows the store's own sentence rather than zeros.
         app.MapGet("/api/stats", (StorageEngine storage) =>
         {
-            var segs = storage.GetSegments(null, null);
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
+            var  segs = storage.GetSegments(null, null);
+            long events = 0, compressed = 0, uncompressed = 0, oldest = long.MaxValue, newest = long.MinValue;
+            for (int i = 0; i < segs.Count; i++)
+            {
+                var s = segs[i];
+                events       += s.EventCount;
+                compressed   += s.CompressedBytes;
+                uncompressed += s.UncompressedBytes;
+                if (s.MinTimestampTicks < oldest) oldest = s.MinTimestampTicks;
+                if (s.MaxTimestampTicks > newest) newest = s.MaxTimestampTicks;
+            }
             return Results.Ok(new
             {
-                segments        = segs.Count,
-                totalEvents     = segs.Sum(s => (long)s.EventCount),
-                compressedBytes = segs.Sum(s => s.CompressedBytes),
+                segments          = segs.Count,
+                totalEvents       = events,
+                compressedBytes   = compressed,
+                uncompressedBytes = uncompressed,
+                // The earliest and latest event any segment holds — null with no segments.
+                oldestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(oldest, TimeSpan.Zero).ToString("O"),
+                newestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(newest, TimeSpan.Zero).ToString("O"),
             });
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewStats);
 

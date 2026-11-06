@@ -21,26 +21,56 @@ public static class TraceQueryEndpointMapper
         // All trace read endpoints require the Traces view scope (admin bypasses).
         var group = app.MapGroup("").RequireAuthorization(ViewPolicies.Traces);
 
-        // GET /api/traces/stats?from=&to=
+        // GET /api/traces/stats?from=&to=&buckets=
         // Fully sidecar-based: percentiles from .stats, volume/sparkline from the .tracesum
         // volume headers. No span deserialization — sub-millisecond for any dataset/window.
+        //   buckets — sparkline columns (default 20, the Traces page's tiles; the Statistics page
+        //             asks for the grid its other charts use, so the three line up).
+        // The answer also carries the merged duration histogram and the store's counters
+        // (ITraceStoreStats: one pass over the segment catalogue), both for the Statistics page.
         group.MapGet("/api/traces/stats", async (HttpContext ctx) =>
         {
             var statsProvider   = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
             var summaryProvider = ctx.RequestServices.GetRequiredService<ITraceSummaryProvider>();
+            var storeStats      = ctx.RequestServices.GetService<ITraceStoreStats>();
             var (from, to)      = ParseFromTo(ctx);
+            int buckets         = ParseInt(ctx.Request.Query["buckets"], 20, 1, 2000);
 
-            var perService    = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
-            var mergedBuckets = new uint[HistogramBuckets.Count];
+            var  perService    = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
+            var  mergedBuckets = new uint[HistogramBuckets.Count];
+            long spans = 0, maxDuration = 0;
             foreach (var svc in perService)
+            {
                 for (int i = 0; i < HistogramBuckets.Count; i++)
                     mergedBuckets[i] += svc.Buckets[i];
+                spans += svc.SpanCount;
+                if (svc.MaxDurationNanos > maxDuration) maxDuration = svc.MaxDurationNanos;
+            }
 
-            const int Buckets = 20;
-            var volume = await summaryProvider.GetTraceVolumeAsync(from, to, Buckets, ctx.RequestAborted);
+            var volume = await summaryProvider.GetTraceVolumeAsync(from, to, buckets, ctx.RequestAborted);
+            var store  = storeStats?.GetStoreStats();
             if (TraceStoreGate.RefuseIfClosed(ctx, statsProvider, summaryProvider) is { } closed) { await closed; return; }
 
             double windowSeconds = Math.Max(1, (to - from).TotalSeconds);
+
+            TraceStoreDto? storeDto = null;
+            if (store is not null)
+            {
+                // The services the store knows: the cold headers' names, plus those the window's
+                // aggregate saw (the hot tier has no header to list them in).
+                var names = new HashSet<string>(store.Services, StringComparer.OrdinalIgnoreCase);
+                foreach (var svc in perService) names.Add(svc.ServiceName);
+                storeDto = new TraceStoreDto
+                {
+                    Spans         = store.Spans,
+                    HotSpans      = store.HotSpans,
+                    Segments      = store.Segments,
+                    FileBytes     = store.FileBytes,
+                    Services      = names.Count,
+                    OldestStartMs = store.OldestStartNano / 1_000_000L,
+                    NewestStartMs = store.NewestStartNano / 1_000_000L,
+                };
+            }
 
             var stats = new TraceStatsDto
             {
@@ -52,6 +82,13 @@ public static class TraceQueryEndpointMapper
                 ThroughputRps  = volume.TotalTraces / windowSeconds,
                 TotalSparkline = volume.TotalSparkline,
                 ErrorSparkline = volume.ErrorSparkline,
+                From           = from.ToString("O"),
+                To             = to.ToString("O"),
+                MaxLatencyMs   = maxDuration / 1_000_000.0,
+                SpanCount      = spans,
+                ServiceCount   = perService.Count,
+                Histogram      = new TraceHistogramDto { BoundsMs = HistogramBoundsMs, Counts = mergedBuckets },
+                Store          = storeDto,
             };
 
             await ctx.Response.WriteAsJsonAsync(stats);
@@ -1268,6 +1305,17 @@ public static class TraceQueryEndpointMapper
         return new TracePage(traces, scanFloor, page.Unreadable);
     }
 
+    /// <summary><see cref="HistogramBuckets.Bounds"/> in milliseconds, computed once: the bounds every histogram answer carries.</summary>
+    private static readonly double[] HistogramBoundsMs = BoundsToMs();
+
+    private static double[] BoundsToMs()
+    {
+        var bounds = HistogramBuckets.Bounds;
+        var ms     = new double[bounds.Length];
+        for (int i = 0; i < bounds.Length; i++) ms[i] = bounds[i] / 1_000_000.0;
+        return ms;
+    }
+
     private static (DateTimeOffset from, DateTimeOffset to) ParseFromTo(HttpContext ctx, double defaultHours = 1)
     {
         var to   = DateTimeOffset.UtcNow;
@@ -1906,7 +1954,7 @@ public sealed class TraceQueryRequest
     public int     Limit { get; init; } = 100;
 }
 
-/// <summary>Aggregate stats for the trace stats cards.</summary>
+/// <summary>Aggregate stats for the trace stats cards and the Statistics page's Traces band.</summary>
 public sealed class TraceStatsDto
 {
     public int      TotalTraces    { get; init; }
@@ -1917,4 +1965,33 @@ public sealed class TraceStatsDto
     public double   ThroughputRps  { get; init; }
     public double[] TotalSparkline { get; init; } = [];
     public double[] ErrorSparkline { get; init; } = [];
+    /// <summary>The window the sparklines divide into <c>buckets</c> equal columns, as the server read it.</summary>
+    public string   From           { get; init; } = string.Empty;
+    public string   To             { get; init; } = string.Empty;
+    public double   MaxLatencyMs   { get; init; }
+    /// <summary>Spans and distinct services in the window, from the per-service aggregate.</summary>
+    public long     SpanCount      { get; init; }
+    public int      ServiceCount   { get; init; }
+    public TraceHistogramDto Histogram { get; init; } = new();
+    /// <summary>The store's counters; null when the host registers no <see cref="ITraceStoreStats"/>.</summary>
+    public TraceStoreDto? Store    { get; init; }
+}
+
+/// <summary>The window's spans by duration: <see cref="HistogramBuckets"/>' 19 buckets, bounds in ms (the last bucket is open).</summary>
+public sealed class TraceHistogramDto
+{
+    public double[] BoundsMs { get; init; } = [];
+    public uint[]   Counts   { get; init; } = [];
+}
+
+/// <summary>The trace store as a whole — see <see cref="TraceStoreStats"/>.</summary>
+public sealed class TraceStoreDto
+{
+    public long  Spans         { get; init; }
+    public int   HotSpans      { get; init; }
+    public int   Segments      { get; init; }
+    public long  FileBytes     { get; init; }
+    public int   Services      { get; init; }
+    public long? OldestStartMs { get; init; }
+    public long? NewestStartMs { get; init; }
 }
