@@ -54,18 +54,23 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private const int RetryPauseMaxMs = 1_000;
 
     /// <summary>
-    /// The streak of failing passes: when it began (<see cref="Environment.TickCount64"/>; 0 outside a
-    /// streak), when the last Error about it was written, and the passes failed since that line. A
-    /// volume that stays full would otherwise be an Error with a stack trace every second for as long
-    /// as it lasts — some 3 600 an hour, into log sinks short of room themselves — so the first failure
-    /// is said in full and the rest at most once a minute (<see cref="FailureLineIntervalMs"/>), and the
-    /// first pass that goes through again says how long the store refused. One consumer thread: no
+    /// The failing passes, said at most once a minute (<see cref="FailureLineIntervalMs"/>): when the
+    /// current streak began (<see cref="Environment.TickCount64"/>; 0 outside a streak) and whether a line
+    /// has said so, when the last Error about failures was written — kept across streaks, so a store that
+    /// flaps between taking and refusing is limited too — and the passes failed since that line. A volume
+    /// that stays full would otherwise be an Error with a stack trace every second for as long as it
+    /// lasts, some 3 600 an hour, into log sinks short of room themselves. The first pass that goes
+    /// through after a streak that was said says how long the store refused. One consumer thread: no
     /// interlocked.
     /// </summary>
     private long _refusingSinceTicks;
+    private bool _streakSaid;
     private long _lastFailureLineTicks;
     private int  _failedPassesSinceLine;
     private const long FailureLineIntervalMs = 60_000;
+
+    /// <summary>What the last pass took, as <see cref="DrainOnce"/> leaves it: the final drain's cap counts passes that took nothing.</summary>
+    private int _lastPassTook;
 
     /// <summary>Test observer: the spans of the last run the engine did not take, waiting for the next pass.</summary>
     internal int HeldForTest => _held;
@@ -177,7 +182,8 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 Array.Copy(_apart,   written, _apart,   0, left);
                 Array.Clear(_apart, left, written);
             }
-            _held = left;
+            _held         = left;
+            _lastPassTook = written;
         }
         taken = written;
         return count;
@@ -250,7 +256,6 @@ internal sealed class SpanDrainer : IAsyncDisposable
         while (true)
         {
             int remaining, taken;
-            int heldBefore = _held;
             try
             {
                 remaining = DrainOnce(out taken);
@@ -258,9 +263,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain — {Kept} span(s) of it are kept and offered again", _held);
-                // A failing pass that still shrank the tail is the engine taking spans, slowly: the
-                // eight failures that end this pass are eight that took NOTHING.
-                if (_held < heldBefore) consecutiveFailures = 0;
+                // A failing pass that still took spans is the engine taking them, slowly: the eight
+                // failures that end this pass are eight that took NOTHING.
+                if (_lastPassTook > 0) consecutiveFailures = 0;
                 if (++consecutiveFailures < MaxConsecutiveFinalDrainFailures) continue;
                 _logger.LogError(
                     "SpanDrainer: the final drain stopped after {Failures} failing batches in a row that took nothing — "
@@ -283,38 +288,41 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private const int MaxConsecutiveFinalDrainFailures = 8;
 
     /// <summary>
-    /// A pass failed: the first of a streak is said in full, with its exception; the rest at most once a
-    /// minute, with the passes failed since the last line, how long the store has refused, and the held
-    /// tail (see <see cref="_refusingSinceTicks"/>).
+    /// A pass failed. Said at most once a minute, whatever the streaks: a failure a minute or more after
+    /// the last line is said in full with its exception when it is the first since that line, else with
+    /// the count failed since it, how long the current streak has lasted, and the held tail; one within a
+    /// minute of the last line is counted and said with the next (see <see cref="_refusingSinceTicks"/>).
     /// </summary>
     private void NoteFailedPass(Exception ex)
     {
         long now = Environment.TickCount64;
+        if (_refusingSinceTicks == 0) { _refusingSinceTicks = now; _streakSaid = false; }
         _failedPassesSinceLine++;
-        if (_refusingSinceTicks == 0)
-        {
-            _refusingSinceTicks   = now;
-            _lastFailureLineTicks = now;
-            _failedPassesSinceLine = 0;
-            _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
-            return;
-        }
-        if (now - _lastFailureLineTicks < FailureLineIntervalMs) return;
+        if (_lastFailureLineTicks != 0 && now - _lastFailureLineTicks < FailureLineIntervalMs) return;
         _lastFailureLineTicks = now;
-        _logger.LogError(ex,
-            "SpanDrainer: the trace store refused {Failures} more pass(es), {Seconds} s into the outage — "
-          + "{Kept} span(s) are kept and offered again",
-            _failedPassesSinceLine, (now - _refusingSinceTicks) / 1000, _held);
+        _streakSaid           = true;
+        if (_failedPassesSinceLine == 1)
+            _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
+        else
+            _logger.LogError(ex,
+                "SpanDrainer: the trace store refused {Failures} pass(es) since the last such line ({Seconds} s into this outage) — "
+              + "{Kept} span(s) are kept and offered again",
+                _failedPassesSinceLine, (now - _refusingSinceTicks) / 1000, _held);
         _failedPassesSinceLine = 0;
     }
 
-    /// <summary>The first pass that went through after a streak of failures: the one sign the outage is over.</summary>
+    /// <summary>
+    /// The first pass that took spans after a streak of failures: the one sign the outage is over, said
+    /// when the streak was. The streak is forgotten BEFORE the line is written: a logger that throws here
+    /// must not have every later pass say it again (and, under #137's guard, sleep a second each time).
+    /// </summary>
     private void NoteRecovered()
     {
-        _logger.LogInformation("SpanDrainer: the trace store takes spans again, after refusing for {Seconds} s",
-                               (Environment.TickCount64 - _refusingSinceTicks) / 1000);
-        _refusingSinceTicks    = 0;
-        _failedPassesSinceLine = 0;
+        long seconds = (Environment.TickCount64 - _refusingSinceTicks) / 1000;
+        bool said    = _streakSaid;
+        _refusingSinceTicks = 0;
+        _streakSaid         = false;
+        if (said) _logger.LogInformation("SpanDrainer: the trace store takes spans again, after refusing for {Seconds} s", seconds);
     }
 
     /// <summary>
