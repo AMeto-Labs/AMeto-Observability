@@ -231,8 +231,10 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
     ///
     /// <para>At the seams: the park seam publishes three batches' worth (1 536 spans) and cancels, so
     /// the final drain has three batches to take; the engine's after-hold seam throws once, in the
-    /// first batch's first hold (128 spans in the tier, the rest of that batch released). Reverted
-    /// (the pass stops at the throw): 1 024 spans left in the ring, 128 written.</para>
+    /// first batch's first hold (128 spans in the tier). Reverted (the pass stops at the throw):
+    /// 1 024 spans left in the ring, 128 written. Since #138 the 384 spans of the bad batch the engine
+    /// had not taken are kept rather than released, and the next pass of the final drain writes them
+    /// too: every one of the 1 536 is stored.</para>
     /// </summary>
     [Fact]
     public async Task A_batch_that_throws_in_the_final_drain_does_not_strand_the_batches_behind_it()
@@ -279,7 +281,7 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
         long written = 0;
         foreach (var s in engine.ColdSegmentsForTest) written += s.SpanCount;
         Assert.Equal(0, ring.ApproximateCount);                              // nothing left behind
-        Assert.Equal(128 + 2 * 512, written);                                 // the batches after the bad one
+        Assert.Equal(Published, written);                                     // the bad batch's kept tail included (#138)
         Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error
                                           && e.Error is InvalidOperationException);
         int found = 0;

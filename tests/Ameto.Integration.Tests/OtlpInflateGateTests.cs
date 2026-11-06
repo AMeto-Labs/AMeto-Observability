@@ -422,7 +422,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         var gate = new OtlpInflateGate(1, TimeSpan.Zero);
         byte[] message = EmptyExport("/v1/logs", protobuf: true);
         int decoded = 0;
-        Func<HttpContext, ArraySegment<byte>, (bool, int, string?)> decode = (_, _) => { decoded++; return (true, 0, null); };
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why, bool Busy)> decode = (_, _) => { decoded++; return (true, 0, null, false); };
 
         Assert.True(await gate.TryEnterAsync(default));
         var full = GrpcCall(Frame(OtlpGzipTests.Gzip(message), compressed: true));
@@ -484,7 +484,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
         var first = GrpcCall(Frame(gz, compressed: true));
         first.Response.Body = stalled;
         Task handling = OtlpGrpcEndpointMapper.HandleAsync(first, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
-            static (_, _) => (true, 0, null));
+            static (_, _) => (true, 0, null, false));
 
         await stalled.Writing.Task.WaitAsync(TimeSpan.FromSeconds(15));   // decoded; the response is stuck
         try
@@ -493,7 +493,7 @@ public sealed class OtlpInflateGateTests : IClassFixture<OtlpInflateGateTests.Fa
 
             var second = GrpcCall(Frame(gz, compressed: true));
             await OtlpGrpcEndpointMapper.HandleAsync(second, ApiKeyPermissions.Logs, gate, NoLog, NoMemoryLog,
-                static (_, _) => (true, 0, null));
+                static (_, _) => (true, 0, null, false));
             Assert.Equal("0", second.Response.Headers["grpc-status"].ToString());
         }
         finally

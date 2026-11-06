@@ -31,6 +31,20 @@ public static class OtlpGrpcEndpointMapper
     private const string BufferFullReason = "the ingest buffer was full";
 
     /// <summary>
+    /// Why spans were refused when the first of them was heavier than the whole ring (#138): no retry
+    /// fits it, so the batch is a partial success, never UNAVAILABLE — and the rest of the batch went
+    /// with it, a refused batch being a prefix.
+    /// </summary>
+    internal const string SpanTooHeavyReason = "a span heavier than the whole ingest buffer, and the rest of its batch, were refused";
+
+    /// <summary>
+    /// What UNAVAILABLE says when the span ring had no room for ANY of the batch (#138): the drainer is
+    /// behind — or holding spans the store would not take — and nothing was taken, so the retry stores
+    /// the batch once. Every OTLP exporter with retry enabled retries it.
+    /// </summary>
+    internal const string TraceBufferFullMessage = "the trace ingest buffer is full and had no room for this batch; retry";
+
+    /// <summary>
     /// Why log records were refused: over the per-event size limit (each leaves a marker event in
     /// its place), or not written because the store had no room for them within the wait.
     /// </summary>
@@ -83,7 +97,7 @@ public static class OtlpGrpcEndpointMapper
             // handler would be a new closure per call.
             int maxMetricPoints = app.Services.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.EffectiveMaxOtlpMetricPoints;
             OtlpMetricBudgetLog metricBudgetLog = app.Services.GetRequiredService<OtlpMetricBudgetLog>();
-            Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decodeMetrics = (c, msg) =>
+            Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why, bool Busy)> decodeMetrics = (c, msg) =>
                 DecodeMetrics(c, msg.AsSpan(), maxMetricPoints, metricBudgetLog);
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, inflateGate, tooLargeLog, outOfMemoryLog, decodeMetrics));
@@ -101,8 +115,8 @@ public static class OtlpGrpcEndpointMapper
     /// resource's included (#132), are refused at decode and reported in the partial success beside the
     /// store's own refusals, each with its reason.
     /// </summary>
-    internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints,
-                                                                       OtlpMetricBudgetLog? budgetLog = null)
+    internal static (bool Ok, int Rejected, string? Why, bool Busy) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints,
+                                                                                  OtlpMetricBudgetLog? budgetLog = null)
     {
         var weight = OtlpMetricPointBudget.WeighProto(message);
         if (!OtlpMetricPointBudget.Fits(weight, maxPoints))
@@ -116,7 +130,7 @@ public static class OtlpGrpcEndpointMapper
         var points = OtlpMetricProtoParser.Parse(message, out MetricDecodeRefusals refusedAtDecode);
         int stale  = ctx.RequestServices.GetRequiredService<IMetricIngester>()
             .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-        return (true, refusedAtDecode.Total + stale, RefusalReason(refusedAtDecode, stale));
+        return (true, refusedAtDecode.Total + stale, RefusalReason(refusedAtDecode, stale), Busy: false);
     }
 
     /// <summary>
@@ -168,17 +182,25 @@ public static class OtlpGrpcEndpointMapper
     /// <see cref="ISpanIngester.TryIngest"/>, paying 566-622 B/span on the route every SDK
     /// exporter and the collector use.
     ///
-    /// <para><b>The answer is the one it always gave.</b> An empty batch is OK with nothing to
-    /// report; otherwise the spans the ring refused are reported as <c>rejected_spans</c> with the
-    /// buffer-full reason, and a refused batch is a PREFIX (the sink refuses the rest of a batch after
-    /// its first refusal, as <c>TryIngest</c>'s <c>break</c> did). The one difference is shared with
-    /// the HTTP route and the log route: a message that fails to parse part-way has its prefix
-    /// ingested before INVALID_ARGUMENT, which OTLP defines as not retryable.</para>
+    /// <para><b>The answer.</b> An empty batch is OK with nothing to report. A batch the ring took
+    /// NONE of for want of room is busy — UNAVAILABLE, which exporters retry and which duplicates
+    /// nothing (#138). Otherwise the spans the ring refused are reported as <c>rejected_spans</c> with
+    /// their reason — the buffer was full, or a span heavier than the whole buffer that no retry fits —
+    /// and a refused batch is a PREFIX (the sink refuses the rest of a batch after its first refusal,
+    /// as <c>TryIngest</c>'s <c>break</c> did). As on the HTTP route and the log route, a message that
+    /// fails to parse part-way has its prefix ingested before INVALID_ARGUMENT, which OTLP defines as
+    /// not retryable.</para>
     /// </summary>
-    internal static (bool Ok, int Rejected, string? Why) IngestTraces(ReadOnlySpan<byte> message, ISpanSink sink)
+    internal static (bool Ok, int Rejected, string? Why, bool Busy) IngestTraces(ReadOnlySpan<byte> message, ISpanSink sink)
     {
-        var (ingested, refused) = OtlpTraceProtoParser.Parse(message, sink);
-        return ingested + refused == 0 ? (true, 0, null) : (true, refused, BufferFullReason);
+        var (ingested, refused, forRoom) = OtlpTraceProtoParser.Parse(message, sink);
+        if (ingested + refused == 0) return (true, 0, null, false);
+        // NOTHING OF THE BATCH WAS TAKEN, FOR WANT OF ROOM: the ring was full at its first span, and so
+        // for the rest. Busy — answered UNAVAILABLE, which exporters retry, and a retry duplicates nothing
+        // (#138). It used to be OK with every span rejected, which OTLP exporters never retry. A batch the
+        // ring took part of is OK with the rest as rejected, as before: OTLP's partial success — and so is
+        // one whose first span is heavier than the whole ring, which no retry fits.
+        return (true, refused, forRoom ? BufferFullReason : SpanTooHeavyReason, Busy: ingested == 0 && forRoom);
     }
 
     /// <summary>
@@ -192,7 +214,7 @@ public static class OtlpGrpcEndpointMapper
         OtlpInflateGate inflateGate,
         OtlpGzipTooLargeLog tooLargeLog,
         OtlpOutOfMemoryLog outOfMemoryLog,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why, bool Busy)> decode)
         => HandleCoreAsync(ctx, required, inflateGate, tooLargeLog, outOfMemoryLog, decode, logs: false);
 
     /// <summary>
@@ -218,7 +240,7 @@ public static class OtlpGrpcEndpointMapper
         OtlpInflateGate inflateGate,
         OtlpGzipTooLargeLog tooLargeLog,
         OtlpOutOfMemoryLog outOfMemoryLog,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)>? decode,
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why, bool Busy)>? decode,
         bool logs)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
@@ -390,6 +412,7 @@ public static class OtlpGrpcEndpointMapper
             bool ok;
             int rejected;
             string? why;
+            bool busy = false;   // the signal's sink took nothing of the batch (traces: the ring was full) — UNAVAILABLE, retried
             try
             {
                 if (logs)
@@ -410,7 +433,7 @@ public static class OtlpGrpcEndpointMapper
                 }
                 else
                 {
-                    (ok, rejected, why) = decode!(ctx, segment);
+                    (ok, rejected, why, busy) = decode!(ctx, segment);
                 }
             }
             catch (OtlpMetricPointBudget.TooManyPointsException)
@@ -499,6 +522,14 @@ public static class OtlpGrpcEndpointMapper
             if (!ok)
             {
                 await FinishAsync(ctx, StatusInvalidArgument, "could not decode the payload");
+                return;
+            }
+
+            if (busy)
+            {
+                // Traces: the span ring had no room for any of the batch, so nothing was taken and the
+                // retry duplicates nothing (#138) — the log road's rule for a store with no room, below.
+                await FinishAsync(ctx, StatusUnavailable, TraceBufferFullMessage);
                 return;
             }
 

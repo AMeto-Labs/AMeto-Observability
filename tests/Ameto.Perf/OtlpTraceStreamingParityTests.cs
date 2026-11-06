@@ -33,7 +33,7 @@ public sealed class OtlpTraceStreamingParityTests
         var dom  = OtlpTraceMapper.Map(JsonSerializer.Deserialize<ExportTraceServiceRequest>(utf8, DomOptions)!);
 
         var sink = new CapturingSpanSink();
-        var (ingested, refused) = OtlpTraceStreamParser.Parse(utf8, sink);
+        var (ingested, refused, _) = OtlpTraceStreamParser.Parse(utf8, sink);
 
         sink.AssertMatches(dom);
         Assert.Equal((4, 0), (ingested, refused));
@@ -51,7 +51,7 @@ public sealed class OtlpTraceStreamingParityTests
     {
         byte[] utf8 = Encoding.UTF8.GetBytes(SampleBatch);
         var refusing = new CapturingSpanSink { RefuseFrom = 1 };
-        Assert.Equal((1, 3), OtlpTraceStreamParser.Parse(utf8, refusing));
+        Assert.Equal((1, 3, true), OtlpTraceStreamParser.Parse(utf8, refusing));   // a sink that cannot say why it refused: for room
         Assert.Single(refusing.Spans);
 
         byte[] truncated = utf8.AsSpan(0, utf8.Length * 3 / 4).ToArray();
