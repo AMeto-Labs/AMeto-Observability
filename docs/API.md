@@ -542,7 +542,16 @@ Updates and persists retention settings to SQLite.
 }
 ```
 
+Every window is a whole number of days from 1 to 36 500 (100 years); 36 500 is how "keep forever" is spelled. A field left out keeps its default, not its current value.
+
 **Response `200 OK`:** updated retention object.
+
+**Response `400 Bad Request`:** a window outside 1…36 500 days; nothing of the request is kept. The body names the field:
+```json
+{ "error": "tracesDays must be between 1 and 36500 days", "field": "tracesDays" }
+```
+
+A window a database or a configuration file already holds outside the bounds is clamped into them at startup, with a warning in the server log, and written back.
 
 ### `POST /api/retention/run`
 

@@ -18,10 +18,14 @@ public sealed class SegmentInfo
     public DateTimeOffset MinTimestamp => new(MinTimestampTicks, TimeSpan.Zero);
     public DateTimeOffset MaxTimestamp => new(MaxTimestampTicks, TimeSpan.Zero);
 
-    /// <summary>True when all events in this segment are past their retention deadline.</summary>
+    /// <summary>
+    /// True when all events in this segment are past their retention deadline: the newest is older
+    /// than the level's TTL. Tick arithmetic rather than <c>DateTimeOffset.Add</c>, which throws for a
+    /// TTL reaching past year 9999 — and threw out of the whole retention run, metric and trace prunes
+    /// included (#130).
+    /// </summary>
     public bool IsExpired(RetentionPolicy policy, DateTimeOffset now) =>
-        new DateTimeOffset(MaxTimestampTicks, TimeSpan.Zero)
-            .Add(policy.GetTtl(MinLevel)) < now;
+        now.UtcTicks - MaxTimestampTicks > policy.GetTtl(MinLevel).Ticks;
 }
 
 /// <summary>
