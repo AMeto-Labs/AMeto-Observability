@@ -181,6 +181,17 @@ public sealed class OtlpMetricLabelCapTests
             Assert.Equal(MetricLabelSetBuilder.MaxLabels, kept.Labels.Count);
             Assert.Equal(1, refused.TooManyLabels);
         }
+
+        // Up front, not in Build: a refused point's own attributes are never read, so never interned.
+        // Refused in Build, the point beside's loop interned 1, a, 2, b, 3, c first. TryGet claims nothing.
+        foreach (bool proto in new[] { true, false })
+        {
+            var interner = new MetricLabelInterner(65_536, 64);
+            byte[] p = Payload(pointAttrs: 0, resourceAttrs: MetricLabelSetBuilder.MaxLabels);
+            if (proto) OtlpMetricProtoParser.Parse(p, interner, out _);
+            else       OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(p, p.Length), interner, out _);
+            Assert.False(interner.Strings.TryGet("a"u8, out _, out _));
+        }
     }
 
     [Fact]

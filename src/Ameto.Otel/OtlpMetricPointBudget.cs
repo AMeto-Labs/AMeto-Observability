@@ -69,8 +69,10 @@ internal static class OtlpMetricPointBudget
     /// <summary>
     /// The resource attributes a point carries at no extra weight: what an SDK and a k8s processor put
     /// on a resource, and where a point costs what a typical one does (32 labels: 1.3–3.5 µs, no
-    /// allocation). The raw count includes <c>service.name</c> and the SDK's self-description, about
-    /// five attributes the label set never carries; the allowance absorbs that.
+    /// allocation). The raw count includes <c>service.instance.id</c> and the SDK's self-description
+    /// (<c>telemetry.sdk.*</c>, <c>telemetry.distro.*</c>), four to six attributes no label set
+    /// carries; the allowance absorbs them. <c>service.name</c> is carried, as every point's
+    /// <c>service.name</c> label.
     /// </summary>
     internal const int FreeResourceLabels = 32;
 
