@@ -96,9 +96,10 @@ public static class OtlpGrpcEndpointMapper
     /// would decode past <c>Ingestion.MaxOtlpMetricPoints</c> points' worth throws
     /// <see cref="OtlpMetricPointBudget.TooManyPointsException"/>, answered RESOURCE_EXHAUSTED — its
     /// own decode would otherwise run the heap out, which is answered UNAVAILABLE and retried. A
-    /// histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets is refused
-    /// at decode and reported in the partial success beside the store's own refusals, each with its
-    /// reason (#126 review NEW-0).
+    /// histogram point of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126 review
+    /// NEW-0), and a point of more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels, its
+    /// resource's included (#132), are refused at decode and reported in the partial success beside the
+    /// store's own refusals, each with its reason.
     /// </summary>
     internal static (bool Ok, int Rejected, string? Why) DecodeMetrics(HttpContext ctx, ReadOnlySpan<byte> message, int maxPoints,
                                                                        OtlpMetricBudgetLog? budgetLog = null)

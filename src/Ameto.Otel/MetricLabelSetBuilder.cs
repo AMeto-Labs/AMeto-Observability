@@ -36,7 +36,11 @@ internal sealed class MetricLabelSetBuilder
     /// also what keeps the dedupe affordable: <see cref="Add"/> scans the keys already present, so a
     /// point was O(n²) in its attribute count — 20 000 attributes cost half a second of one core, and
     /// the point budget, which counts points, let an 8 MiB body of them through (#132). Below
-    /// <see cref="MaxLabels"/> the scan is at most 256 compares an attribute.
+    /// <see cref="MaxLabels"/> the scan is at most 256 compares an attribute in <see cref="Add"/>,
+    /// and up to ~32 600 compares and a 256-pair sort a point in <see cref="Build"/>, where the
+    /// resource's labels are merged in again for every point. What a request may cost is the point
+    /// budget's to bound: <c>OtlpMetricPointBudget</c> charges a resource's attributes past its first
+    /// 32 on every point under them (#132).
     /// </summary>
     internal const int MaxLabels = 256;
 
@@ -123,11 +127,18 @@ internal sealed class MetricLabelSetBuilder
         Append(ref _resKv, ref _resIds, ref _resUsed, key, value);
     }
 
-    /// <summary>A new data point: its labels start as the resource's service name, if any.</summary>
+    /// <summary>
+    /// A new data point: its labels start as the resource's service name, if any. A point under a
+    /// resource whose labels alone — with the service name — pass <see cref="MaxLabels"/> is refused
+    /// here, before its attributes are read: no attribute of its own can bring the merged set under the
+    /// cap (an attribute adds a key or overwrites one), and <see cref="Build"/> would otherwise pay the
+    /// whole merge before refusing it. The resource is counted as it was stated, repeats included, as
+    /// <see cref="AddResourceLabel"/> counts it.
+    /// </summary>
     public void BeginPoint()
     {
         _used     = 0;
-        _overflow = _resOverflow;
+        _overflow = _resOverflow || (_resUsed >> 1) + (_serviceName is null ? 0 : 1) > MaxLabels;
         if (_serviceName is { } service)
             Append(ref _kv, ref _ids, ref _used, _serviceNameKey, service);
     }

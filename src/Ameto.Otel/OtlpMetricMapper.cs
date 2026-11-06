@@ -16,31 +16,19 @@ namespace Ameto.Otel;
 public static class OtlpMetricMapper
 {
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request) =>
-        Map(request, MetricLabelInterner.Shared, out MetricDecodeRefusals _);
+        Map(request, MetricLabelInterner.Shared, out _);
 
     /// <summary>
-    /// <see cref="Map(ExportMetricsServiceRequest)"/>, and how many points it refused at decode —
+    /// <see cref="Map(ExportMetricsServiceRequest)"/>, and the points it refused at decode by reason —
     /// histogram points of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets (#126
     /// review NEW-0), points of more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels (#132)
     /// — the count the receiver reports as rejected.
     /// </summary>
-    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, out int refused) =>
-        Map(request, MetricLabelInterner.Shared, out refused);
-
-    /// <summary><see cref="Map(ExportMetricsServiceRequest, out int)"/>, the refusals by reason.</summary>
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, out MetricDecodeRefusals refused) =>
         Map(request, MetricLabelInterner.Shared, out refused);
 
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner) =>
-        Map(request, interner, out MetricDecodeRefusals _);
-
-    /// <summary><see cref="Map(ExportMetricsServiceRequest, MetricLabelInterner, out MetricDecodeRefusals)"/>, the refusals as one count.</summary>
-    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner, out int refused)
-    {
-        var items = Map(request, interner, out MetricDecodeRefusals byReason);
-        refused = byReason.Total;
-        return items;
-    }
+        Map(request, interner, out _);
 
     public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner, out MetricDecodeRefusals refused)
     {
@@ -184,6 +172,15 @@ public static class OtlpMetricMapper
                 continue;
             }
 
+            // Labels before the arrays, so a point refused for them allocates none of the arrays below.
+            // The refusal order stays the protobuf parser's: buckets first.
+            var labelSet = ExtractLabels(dp.Attributes, labels);
+            if (labels.Overflowed)
+            {
+                tooManyLabels++;   // refused, not built: the protobuf parser's rule (#132)
+                continue;
+            }
+
             long count = dp.Count is not null && long.TryParse(dp.Count, out var c) ? c : 0;
 
             // for loops — no LINQ iterator allocations for bucket data
@@ -222,13 +219,6 @@ public static class OtlpMetricMapper
                     });
                 }
                 if (list.Count > 0) exemplars = list.ToArray();
-            }
-
-            var labelSet = ExtractLabels(dp.Attributes, labels);
-            if (labels.Overflowed)
-            {
-                tooManyLabels++;   // refused, not built: the protobuf parser's rule (#132)
-                continue;
             }
 
             result.Add(new MetricIngestItem

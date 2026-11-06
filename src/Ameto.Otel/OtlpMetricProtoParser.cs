@@ -73,17 +73,14 @@ public static class OtlpMetricProtoParser
     }
 
     public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload) =>
-        Parse(payload, MetricLabelInterner.Shared, out MetricDecodeRefusals _);
+        Parse(payload, MetricLabelInterner.Shared, out _);
 
     /// <summary>
-    /// <see cref="Parse(ReadOnlySpan{byte})"/>, and how many points it refused at decode — histogram
-    /// points of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets, points of more than
-    /// <see cref="MetricLabelSetBuilder.MaxLabels"/> labels — the count the receivers report as rejected.
+    /// <see cref="Parse(ReadOnlySpan{byte})"/>, and the points it refused at decode by reason —
+    /// histogram points of more than <see cref="MetricIngestItem.MaxBucketCounts"/> buckets, points of
+    /// more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels — the count the receivers report
+    /// as rejected.
     /// </summary>
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, out int refused) =>
-        Parse(payload, MetricLabelInterner.Shared, out refused);
-
-    /// <summary><see cref="Parse(ReadOnlySpan{byte}, out int)"/>, the refusals by reason.</summary>
     public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, out MetricDecodeRefusals refused) =>
         Parse(payload, MetricLabelInterner.Shared, out refused);
 
@@ -93,15 +90,7 @@ public static class OtlpMetricProtoParser
     /// bounds.
     /// </summary>
     public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner) =>
-        Parse(payload, interner, out MetricDecodeRefusals _);
-
-    /// <summary><see cref="Parse(ReadOnlySpan{byte}, MetricLabelInterner, out MetricDecodeRefusals)"/>, the refusals as one count.</summary>
-    public static List<MetricIngestItem> Parse(ReadOnlySpan<byte> payload, MetricLabelInterner interner, out int refused)
-    {
-        var items = Parse(payload, interner, out MetricDecodeRefusals byReason);
-        refused = byReason.Total;
-        return items;
-    }
+        Parse(payload, interner, out _);
 
     /// <summary>
     /// The parse itself: the items, and the points refused at decode by reason — histogram points of

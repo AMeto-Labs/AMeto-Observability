@@ -142,6 +142,47 @@ public sealed class OtlpMetricLabelCapTests
         }
     }
 
+    /// <summary>
+    /// The resource's overflow does not carry over to the next resource: two requests concatenated are
+    /// one request with resource_metrics repeated, and only the first resource's points are refused.
+    /// </summary>
+    [Fact]
+    public void A_resource_past_the_cap_refuses_only_its_own_points()
+    {
+        byte[] both = [.. Payload(pointAttrs: 0, resourceAttrs: MetricLabelSetBuilder.MaxLabels + 1),
+                       .. Payload(pointAttrs: 0, resourceAttrs: 2)];
+        foreach (var decode in BothPaths())
+        {
+            var (items, refused) = decode(both);
+            Assert.Equal(2, refused.TooManyLabels);   // the first resource's two points
+            Assert.Equal(2, items.Count);             // the second's two
+        }
+    }
+
+    /// <summary>
+    /// A resource of exactly 256 labels and a service name can carry no point: the merged set is 257 at
+    /// the least. It is refused at <see cref="MetricLabelSetBuilder.BeginPoint"/>, before the point's
+    /// attributes are read or its ~32 600-compare merge is paid; one of 255 is taken.
+    /// </summary>
+    [Fact]
+    public void A_resource_whose_labels_with_the_service_name_pass_the_cap_refuses_its_points_up_front()
+    {
+        foreach (var decode in BothPaths())
+        {
+            var (items, refused) = decode(Payload(pointAttrs: 0, resourceAttrs: MetricLabelSetBuilder.MaxLabels));
+            Assert.Empty(items);
+            Assert.Equal(2, refused.TooManyLabels);
+
+            // One fewer: the point with no attributes of its own is taken at exactly the cap; the one
+            // beside it, with three, is refused in Build.
+            (items, refused) = decode(Payload(pointAttrs: 0, resourceAttrs: MetricLabelSetBuilder.MaxLabels - 1));
+            var kept = Assert.Single(items);
+            Assert.Equal(Wide, kept.Name);
+            Assert.Equal(MetricLabelSetBuilder.MaxLabels, kept.Labels.Count);
+            Assert.Equal(1, refused.TooManyLabels);
+        }
+    }
+
     [Fact]
     public void A_key_repeated_a_thousand_times_is_one_label_and_the_last_value_wins()
     {
@@ -166,6 +207,8 @@ public sealed class OtlpMetricLabelCapTests
             var dom  = ViaDom(payload);
             Assert.Equal(dom.Refused, span.Refused);
             Assert.Equal(dom.Items.Select(i => i.Name), span.Items.Select(i => i.Name));
+            // The boundary itself, at Add: 255 own + service.name is taken, 256 own + service.name refused.
+            Assert.Equal(attrs + 1 > MetricLabelSetBuilder.MaxLabels ? 1 : 0, span.Refused.TooManyLabels);
         }
     }
 
@@ -195,21 +238,36 @@ public sealed class OtlpMetricLabelCapTests
             $"20 000 attributes: {tBig.TotalMilliseconds:F1} ms for 10 parses; 1 000: {tSmall.TotalMilliseconds:F1} ms");
     }
 
-    /// <summary>Nothing past the cap is interned: the refused point's attributes do not become strings.</summary>
+    /// <summary>
+    /// Nothing past the cap is interned: the refused point's attributes do not become pooled strings, on
+    /// either encoding. Asserted on the pool itself — an allocation check alone passed with the stop
+    /// removed, since a warm-up over the same payload had pooled every one of the 40 000 strings.
+    /// </summary>
     [Fact]
     public void Nothing_past_the_cap_is_interned()
     {
         byte[] payload = Payload(20_000);
-        var interner = new MetricLabelInterner(65_536, 64);
-        OtlpMetricProtoParser.Parse(payload, interner, out MetricDecodeRefusals _);   // warm: the kept point's strings
+        // Into a fresh pool: service.name, svc, the two names, a/b/c/1/2/3 and the first 256 keys and
+        // values (the 256th own attribute is the 257th label, interned before Add refuses it): 522
+        // strings. Interning past the cap would be ~40 000.
+        const int MostPooled = 2 * MetricLabelSetBuilder.MaxLabels + 32;
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        OtlpMetricProtoParser.Parse(payload, interner, out MetricDecodeRefusals refused);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-
+        var span = new MetricLabelInterner(65_536, 64);
+        OtlpMetricProtoParser.Parse(payload, span, out MetricDecodeRefusals refused);
         Assert.Equal(1, refused.TooManyLabels);
-        // 20 000 keys and values as strings would be ~2 MB; the first 257 keys, already pooled by
-        // the warm-up, cost nothing, and the parse state itself is a few KB.
+        Assert.InRange(span.Strings.ClaimedCount, 1, MostPooled);
+
+        var dom = new MetricLabelInterner(65_536, 64);
+        OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length), dom, out _);
+        Assert.InRange(dom.Strings.ClaimedCount, 1, MostPooled);
+
+        // Nor allocated: warmed on a point that stops at the same key, so k256…k19999 are NOT pooled by
+        // the warm-up, and a parse that interned them would show up here.
+        var interner = new MetricLabelInterner(65_536, 64);
+        OtlpMetricProtoParser.Parse(Payload(MetricLabelSetBuilder.MaxLabels + 1), interner, out _);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        OtlpMetricProtoParser.Parse(payload, interner, out _);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.True(allocated < 256 * 1024, $"allocated {allocated:N0} B parsing a refused point of 20 000 attributes");
     }
 }

@@ -25,6 +25,17 @@ namespace Ameto.Otel;
 /// <c>points × 128</c> — by default the request-body share of the heap (<c>IngestBufferBytes</c>).
 /// A per-point bucket cap alone would not do: 128 points of 65 535 buckets fit the same 8.4 MB.</para>
 ///
+/// <para><b>A resource's attributes are paid on every point under it</b> (#132). They cost nothing per
+/// point on the wire, and <c>MetricLabelSetBuilder.Build</c> merges them into every point's label set
+/// with a scan and sorts the set again: at 256 of them that is ~32 600 compares and a 256-pair sort a
+/// point, 73–244 µs, and a set of 4 KB kept when it is new. The per-point label cap bounds one point,
+/// not a request: 131 040 empty points under a 255-attribute resource — 265 KB of protobuf, under 1 KB
+/// gzipped — weighed exactly the floor limit and cost 10–30 s of one core on the smallest host; with a
+/// distinct attribute on each point, 157 000 of them decoded to ~670 MB against the 20 MB the budget
+/// allowed. So a resource is charged <see cref="ResourceLabelBytes"/> for each attribute past
+/// <see cref="FreeResourceLabels"/>, on every point under it — as buckets were charged above, and for
+/// the same reason. A point's own attributes are paid for on the wire and need no charge.</para>
+///
 /// <para>The weights are upper bounds on what the parsers build: every data point of a gauge, sum or
 /// histogram, including a metric's that the parser skips for having no name; a packed bucket array by
 /// its length (a varint is at least a byte, and a length that is a multiple of 8 is read as fixed64, as
@@ -46,11 +57,28 @@ internal static class OtlpMetricPointBudget
     /// <summary>What an exemplar weighs: the object and its two hex id strings.</summary>
     internal const int ExemplarBytes = 160;
 
+    /// <summary>
+    /// What a resource attribute weighs on every point under it, past <see cref="FreeResourceLabels"/>
+    /// (#132): twice the 16 B it adds to a point's label set (kept by a point whose set is new), for
+    /// the merge and the sort it also costs every point. A resource's labels cost nothing per point
+    /// on the wire and are rebuilt for every point, so a per-point cap alone does not bound them, as
+    /// it did not bound buckets.
+    /// </summary>
+    internal const int ResourceLabelBytes = 32;
+
+    /// <summary>
+    /// The resource attributes a point carries at no extra weight: what an SDK and a k8s processor put
+    /// on a resource, and where a point costs what a typical one does (32 labels: 1.3–3.5 µs, no
+    /// allocation). The raw count includes <c>service.name</c> and the SDK's self-description, about
+    /// five attributes the label set never carries; the allowance absorbs that.
+    /// </summary>
+    internal const int FreeResourceLabels = 32;
+
     /// <summary>What a refusal says, over HTTP and gRPC. Printable ASCII, under 128 bytes.</summary>
-    internal const string RefusalMessage = "the batch decodes to more data points and buckets than this server takes in one request; split it";
+    internal const string RefusalMessage = "the batch decodes to more data points, buckets and resource labels than this server takes in one request; split it";
 
     /// <inheritdoc cref="RefusalMessage"/>
-    internal static ReadOnlySpan<byte> RefusalMessageUtf8 => "the batch decodes to more data points and buckets than this server takes in one request; split it"u8;
+    internal static ReadOnlySpan<byte> RefusalMessageUtf8 => "the batch decodes to more data points, buckets and resource labels than this server takes in one request; split it"u8;
 
     /// <summary>What one batch carries, as the walks below count it.</summary>
     internal struct Weight
@@ -59,11 +87,22 @@ internal static class OtlpMetricPointBudget
         public long Buckets;
         public long Bounds;
         public long Exemplars;
+        /// <summary>Resource attributes past <see cref="FreeResourceLabels"/>, summed over the points under them.</summary>
+        public long ResourceLabels;
 
         /// <summary>What the batch decodes to, about — never less (see the class remarks).</summary>
         public readonly long DecodedBytes =>
-            Points * PointBytes + Buckets * BucketBytes + Bounds * BoundBytes + Exemplars * ExemplarBytes;
+            Points * PointBytes + Buckets * BucketBytes + Bounds * BoundBytes + Exemplars * ExemplarBytes
+            + ResourceLabels * ResourceLabelBytes;
     }
+
+    /// <summary>
+    /// What each point under a resource of <paramref name="attributes"/> attributes is charged for
+    /// them: the attributes past <see cref="FreeResourceLabels"/>, and no more than the label cap, past
+    /// which every point under the resource is refused at decode without a merge.
+    /// </summary>
+    internal static long ChargedPerPoint(int attributes) =>
+        Math.Max(0, Math.Min(attributes, MetricLabelSetBuilder.MaxLabels) - FreeResourceLabels);
 
     /// <summary>The decode a limit of <paramref name="maxPoints"/> plain points allows, in bytes.</summary>
     internal static long BudgetBytes(int maxPoints) => (long)maxPoints * PointBytes;
@@ -83,8 +122,10 @@ internal static class OtlpMetricPointBudget
     /// <summary>
     /// The weight of an <c>ExportMetricsServiceRequest</c> in protobuf: resource_metrics (1) →
     /// scope_metrics (2) → metrics (2) → gauge (5) / sum (7) / histogram (9) → data_points (1), and in a
-    /// histogram point its bucket_counts (6), explicit_bounds (7) and exemplars (8). Every field is
-    /// skipped by its length, never decoded. A malformed message throws as the parse would.
+    /// histogram point its bucket_counts (6), explicit_bounds (7) and exemplars (8); a resource_metrics'
+    /// resource (1) has its attributes counted and is charged on every point under it as the
+    /// resource_metrics closes, whichever order the two fields come in. Every field is skipped by its
+    /// length, never decoded. A malformed message throws as the parse would.
     /// </summary>
     internal static Weight WeighProto(ReadOnlySpan<byte> payload)
     {
@@ -94,9 +135,12 @@ internal static class OtlpMetricPointBudget
         while ((tag = request.ReadTag()) != 0)
         {
             if (tag != 10) { request.SkipField(tag); continue; }                    // resource_metrics
-            var resource = new ProtoReader(request.ReadLengthDelimited());
+            var  resource           = new ProtoReader(request.ReadLengthDelimited());
+            long pointsBefore       = weight.Points;
+            int  resourceAttributes = 0;
             while ((tag = resource.ReadTag()) != 0)
             {
+                if (tag == 10) { resourceAttributes += CountAttributes(resource.ReadLengthDelimited()); continue; }   // resource
                 if (tag != 18) { resource.SkipField(tag); continue; }               // scope_metrics
                 var scope = new ProtoReader(resource.ReadLengthDelimited());
                 while ((tag = scope.ReadTag()) != 0)
@@ -118,8 +162,19 @@ internal static class OtlpMetricPointBudget
                     }
                 }
             }
+            weight.ResourceLabels += (weight.Points - pointsBefore) * ChargedPerPoint(resourceAttributes);
         }
         return weight;
+    }
+
+    /// <summary>A protobuf Resource's attributes (field 1), counted by tag, never decoded.</summary>
+    private static int CountAttributes(ReadOnlySpan<byte> resource)
+    {
+        var r = new ProtoReader(resource);
+        int n = 0;
+        uint tag;
+        while ((tag = r.ReadTag()) != 0) { if (tag == 10) n++; r.SkipField(tag); }
+        return n;
     }
 
     /// <summary>A protobuf HistogramDataPoint's arrays, as the parser reads them.</summary>
@@ -170,11 +225,12 @@ internal static class OtlpMetricPointBudget
     /// deserializer binds: <c>resourceMetrics</c> → <c>scopeMetrics</c> → <c>metrics</c> →
     /// <c>gauge</c> / <c>sum</c> / <c>histogram</c> → <c>dataPoints</c>, and in a histogram point its
     /// <c>bucketCounts</c>, <c>explicitBounds</c> and <c>exemplars</c> — the property names matched
-    /// exactly as it matches them (escapes undone), with the same leniency (trailing commas). Points of
-    /// a kind the model does not have — <c>exponentialHistogram</c>, <c>summary</c> — are skipped
-    /// unread, as the deserializer skips them (#126 review NEW-6). A property given twice is counted
-    /// twice: the deserializer builds both before the second replaces the first. A malformed document
-    /// throws as the parse would.
+    /// exactly as it matches them (escapes undone), with the same leniency (trailing commas); a
+    /// <c>resourceMetrics</c>' <c>resource.attributes</c> are counted and charged on every point under
+    /// them as the object closes, whichever order its members come in. Points of a kind the model does
+    /// not have — <c>exponentialHistogram</c>, <c>summary</c> — are skipped unread, as the deserializer
+    /// skips them (#126 review NEW-6). A property given twice is counted twice: the deserializer builds
+    /// both before the second replaces the first. A malformed document throws as the parse would.
     /// </summary>
     internal static Weight WeighJson(ReadOnlySpan<byte> json)
     {
@@ -209,7 +265,6 @@ internal static class OtlpMetricPointBudget
             JsonLevel? array = level switch
             {
                 JsonLevel.Request         when reader.ValueTextEquals("resourceMetrics"u8) => JsonLevel.ResourceMetrics,
-                JsonLevel.ResourceMetrics when reader.ValueTextEquals("scopeMetrics"u8)    => JsonLevel.ScopeMetrics,
                 JsonLevel.ScopeMetrics    when reader.ValueTextEquals("metrics"u8)         => JsonLevel.Metric,
                 JsonLevel.NumberPoints    when reader.ValueTextEquals("dataPoints"u8)      => JsonLevel.NumberPoint,
                 JsonLevel.HistogramPoints when reader.ValueTextEquals("dataPoints"u8)      => JsonLevel.HistogramPoint,
@@ -234,6 +289,7 @@ internal static class OtlpMetricPointBudget
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
                     if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
+                    if (element == JsonLevel.ResourceMetrics) { WeighResourceMetrics(ref reader, ref weight); continue; }
                     if (element is JsonLevel.NumberPoint or JsonLevel.HistogramPoint) weight.Points++;
                     if (element == JsonLevel.NumberPoint) reader.Skip();          // nothing in a gauge or sum point expands
                     else JsonObject(ref reader, element, ref weight);
@@ -258,5 +314,54 @@ internal static class OtlpMetricPointBudget
             }
             else reader.Skip();
         }
+    }
+
+    /// <summary>
+    /// One <c>resourceMetrics</c> object, the reader on its <c>StartObject</c> and left on its
+    /// <c>EndObject</c>: its <c>scopeMetrics</c> walked for points, its <c>resource</c>'s attributes
+    /// counted — in whichever order the two members come — and the resource charged on every point
+    /// under it as the object closes (#132, <see cref="ChargedPerPoint"/>).
+    /// </summary>
+    private static void WeighResourceMetrics(ref Utf8JsonReader reader, ref Weight weight)
+    {
+        long pointsBefore = weight.Points;
+        int  attributes   = 0;
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            bool scopes   = reader.ValueTextEquals("scopeMetrics"u8);
+            bool resource = reader.ValueTextEquals("resource"u8);
+            reader.Read();                                                     // the value
+            if (scopes && reader.TokenType == JsonTokenType.StartArray)
+            {
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    if (reader.TokenType == JsonTokenType.StartObject) JsonObject(ref reader, JsonLevel.ScopeMetrics, ref weight);
+                    else reader.Skip();
+                }
+            }
+            else if (resource && reader.TokenType == JsonTokenType.StartObject) attributes += CountResourceAttributes(ref reader);
+            else reader.Skip();
+        }
+        weight.ResourceLabels += (weight.Points - pointsBefore) * ChargedPerPoint(attributes);
+    }
+
+    /// <summary>
+    /// The elements of a <c>resource</c> object's <c>attributes</c> array, never decoded; the reader on
+    /// the object's <c>StartObject</c> and left on its <c>EndObject</c>.
+    /// </summary>
+    private static int CountResourceAttributes(ref Utf8JsonReader reader)
+    {
+        int n = 0;
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            bool attributes = reader.ValueTextEquals("attributes"u8);
+            reader.Read();                                                     // the value
+            if (attributes && reader.TokenType == JsonTokenType.StartArray)
+            {
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray) { n++; reader.Skip(); }
+            }
+            else reader.Skip();
+        }
+        return n;
     }
 }
