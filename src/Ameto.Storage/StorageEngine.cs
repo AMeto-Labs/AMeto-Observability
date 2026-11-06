@@ -1027,6 +1027,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         DiscoverSpillFiles();
         var (bootWal, bootSegId) = OpenWalCore();
         _write = new WriteState(_write.Hot, bootWal, bootSegId);
+        // The empty and corrupt logs the replay spent: deleted only now, with the boot log — the new
+        // record on disk of the last block handed out — in place (#131; see ReplayOrphanedWal).
+        DeleteLogsSpentBeforeBootWal();
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
@@ -6570,6 +6573,37 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     internal static readonly AsyncLocal<Action<string>?> BeforeWalReplayReadForTest = new();
 
     /// <summary>
+    /// Test seam: called at the top of <see cref="OpenWalCore"/>, after the replay and the spill
+    /// discovery and before the boot log is opened — the window a crash used to leave no log in
+    /// (#131). Throwing from it is that crash. An <see cref="AsyncLocal{T}"/>, like
+    /// <see cref="BeforeWalReplayReadForTest"/>: it runs in the constructor. Null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> BeforeBootWalOpenForTest = new();
+
+    /// <summary>
+    /// The logs <see cref="ReplayOrphanedWal"/> read nothing from — empty, or a header it could not
+    /// read — with their pools and completion markers, waiting for the boot log to exist before they go.
+    /// Filled by the replay, emptied by <see cref="DeleteLogsSpentBeforeBootWal"/>, both in the constructor.
+    /// </summary>
+    private readonly List<string> _logsSpentBeforeBootWal = new();
+
+    /// <summary>
+    /// Deletes what <see cref="_logsSpentBeforeBootWal"/> holds. Called once the boot log is open and
+    /// so is the record on disk of the last block handed out (#131). Best-effort: a file that will not
+    /// go is one the next start's replay spends again and the sweeps in <see cref="ReplayOrphanedWals"/>
+    /// take once its log is gone.
+    /// </summary>
+    private void DeleteLogsSpentBeforeBootWal()
+    {
+        foreach (var path in _logsSpentBeforeBootWal)
+        {
+            try { File.Delete(path); }
+            catch (Exception) { /* the next start takes it */ }
+        }
+        _logsSpentBeforeBootWal.Clear();
+    }
+
+    /// <summary>
     /// Test seam: called with the WAL's path once the startup replay has read every entry into its
     /// recovery tier, before the tier is flushed — on the thread that read them, as
     /// <see cref="BeforeWalReplayReadForTest"/> is, so the two bracket the read. Null in production.
@@ -6868,15 +6902,27 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             }
         }
 
-        // Empty or corrupt WAL — clean up
+        // Empty or corrupt WAL — spent, and cleaned up once the boot log exists.
+        //
+        // NOT DELETED HERE (#131). The empty log a clean stop leaves is the only record on disk of the
+        // last block that run handed out: the allocator seeds itself from segment file NAMES, of which
+        // a run that flushed nothing left none, and from the logs' names and headers. The boot log
+        // that takes this one's place is created in OpenWalCore, after every orphan has been replayed
+        // and the spill files discovered — seconds to minutes with a large orphan ahead in the
+        // listing. A crash between this delete and that create, or a throw (a boot log the full
+        // volume refuses, DiscoverSpillFiles failing), left no log on disk at all, and the next start
+        // handed the same block out again: a replica holding a segment of that (node, id) answered 409
+        // different-segment, and the segment written under the old id could meet a log not yet
+        // replayed. So the file, its pool and its completion marker wait on a list the constructor
+        // empties right after the boot log is open (DeleteLogsSpentBeforeBootWal). Until then the
+        // sweeps in ReplayOrphanedWals leave the pool and the marker alone: their log is still there.
         bool any = reader.TryReadNext(out var record);
         if (segId == 0 || !any)
         {
-            reader.Dispose();
-            try { File.Delete(walFile); } catch { }
-            try { File.Delete(poolPath); } catch { }
-            if (segId != 0)
-                try { File.Delete(FlushMarkerPath(segId)); } catch { }
+            reader.Dispose();   // unmapped before the delete: on Windows a mapped file cannot be
+            _logsSpentBeforeBootWal.Add(walFile);
+            _logsSpentBeforeBootWal.Add(poolPath);
+            if (segId != 0) _logsSpentBeforeBootWal.Add(FlushMarkerPath(segId));
             return;
         }
 
@@ -7673,6 +7719,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private (WriteAheadLog Wal, ulong SegId) OpenWalCore()
     {
+        BeforeBootWalOpenForTest.Value?.Invoke();
         ulong walSegId = AllocateSegmentIdBlock();
 
         var segId   = new SegmentId(walSegId);
