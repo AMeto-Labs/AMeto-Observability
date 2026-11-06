@@ -1,125 +1,72 @@
-<div class="page">
-  <app-page-header icon="chart-pie" title="Statistics" subtitle="Log ingest volume and store overview">
-    <div class="range-tabs">
-      @for (r of ranges; track r.key) {
-        <button class="range-tab" [class.active]="range() === r.key" (click)="setRange(r.key)">{{ r.label }}</button>
-      }
-    </div>
-  </app-page-header>
+<div class="page stats-page" [class.stats-page--phone]="viewport.phone()">
 
-  <!-- Summary tiles -->
-  <div class="stat-tiles">
-    <div class="stat-tile">
-      <span class="stat-tile-label">Events · last {{ range() }}</span>
-      <span class="stat-tile-value">{{ fmtNum(totalEvents()) }}</span>
-      @if (truncated()) { <span class="stat-tile-note">sampled</span> }
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Peak ingest</span>
-      <span class="stat-tile-value">{{ fmtRate(peakRate()) }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Avg ingest</span>
-      <span class="stat-tile-value">{{ fmtRate(avgRate()) }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Services</span>
-      <span class="stat-tile-value">{{ fmtNum(serviceCount()) }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Segments on disk</span>
-      <span class="stat-tile-value">{{ fmtNum(segments()) }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Stored events</span>
-      <span class="stat-tile-value">{{ fmtNum(storageEvents()) }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-tile-label">Compressed size</span>
-      <span class="stat-tile-value">{{ fmtBytes(compressedBytes()) }}</span>
-    </div>
-  </div>
-
-  <!-- Ingest volume chart -->
-  <section class="stat-card">
-    <div class="stat-card-head">
-      <span class="stat-card-title">Ingest volume</span>
-      @if (maxCount() > 0) {
-        <span class="stat-card-sub">peak {{ fmtNum(maxCount()) }} / bucket</span>
-      }
-    </div>
-
-    @if (hasData()) {
-      <div class="vol-chart">
-        <div class="vol-bars">
-          @for (bar of bars(); track bar.index) {
-            <button type="button" class="vol-bar" [title]="bar.title" (click)="openBucket(bar)">
-              <span class="vol-fill" [style.height.%]="bar.heightPct">
-                @for (seg of bar.segments; track seg.service) {
-                  <span class="vol-seg" [style.flexGrow]="seg.weight" [style.background]="seg.color"></span>
-                }
-              </span>
-            </button>
+  @if (!viewport.phone()) {
+    <app-page-header icon="chart-pie" title="Statistics" [subtitle]="store.subtitle()">
+      <div class="range-ctl">
+        <div class="seg" role="group" aria-label="Quick ranges">
+          @for (r of quickRanges; track r) {
+            <button type="button" class="seg-btn" [class.active]="store.preset() === r"
+                    [attr.aria-pressed]="store.preset() === r" (click)="store.setPreset(r)">{{ r }}</button>
           }
         </div>
-        <div class="vol-axis">
-          @for (t of axisTicks(); track t.pct) {
-            <span class="vol-tick" [style.left.%]="t.pct">{{ t.label }}</span>
-          }
-        </div>
+        <button #customBtn type="button" class="custom-btn"
+                [class.open]="customOpen()" [class.filtered]="store.preset() === 'custom'"
+                aria-haspopup="dialog" [attr.aria-expanded]="customOpen()" (click)="openCustom(customBtn)">
+          <lucide-icon name="calendar" [size]="13" />
+          <span>{{ customLabel().text }}</span>
+          @if (customLabel().extra) { <span class="custom-extra">· {{ customLabel().extra }}</span> }
+          <lucide-icon name="chevron-down" [size]="11" class="custom-caret" [class.rotated]="customOpen()" />
+        </button>
+        <button type="button" class="refresh-btn" aria-label="Refresh" title="Refresh" (click)="store.refresh()">
+          <lucide-icon name="refresh-cw" [size]="13" />
+        </button>
       </div>
-    } @else if (loading()) {
-      <div class="stat-loading">Loading…</div>
-    } @else if (countsError(); as err) {
-      <app-empty-state icon="triangle-alert" [text]="err" role="alert"></app-empty-state>
-    } @else {
-      <app-empty-state icon="chart-pie" text="No events in this window"></app-empty-state>
-    }
-  </section>
-
-  <!-- Levels breakdown + error rate -->
-  @if (levelRows().length) {
-    <section class="stat-card">
-      <div class="stat-card-head">
-        <span class="stat-card-title">Levels</span>
-        <span class="stat-card-sub err-rate" [class.hot]="errorRate() >= 5">{{ errorRateLabel() }} error rate</span>
+    </app-page-header>
+  } @else {
+    <!-- The phone's 48px header (design canvas, "Телефон — вкладка Logs"): the range button opens the sheet. -->
+    <header class="ph-hdr">
+      <h1 class="ph-title">Statistics</h1>
+      <div class="ph-quick">
+        <button type="button" class="ph-range tn" aria-haspopup="dialog" aria-label="Time range" (click)="store.openSheet()">
+          <lucide-icon name="calendar" [size]="12" />
+          <span class="ph-range-txt">{{ phoneRangeLabel() }}</span>
+          <lucide-icon name="chevron-down" [size]="10" class="ph-range-caret" />
+        </button>
+        <button type="button" class="ph-icon" aria-label="Refresh" (click)="store.refresh()">
+          <lucide-icon name="refresh-cw" [size]="14" />
+        </button>
       </div>
-      <div class="svc-list">
-        @for (l of levelRows(); track l.level) {
-          <div class="svc-row">
-            <span class="svc-dot" [style.background]="l.color"></span>
-            <span class="svc-name">{{ l.level }}</span>
-            <span class="svc-bar-wrap">
-              <span class="svc-bar" [style.width.%]="l.pct" [style.background]="l.color"></span>
-            </span>
-            <span class="svc-count">{{ fmtNum(l.count) }}</span>
-            <span class="svc-pct">{{ l.pctLabel }}</span>
-          </div>
-        }
-      </div>
-    </section>
+    </header>
+    <!-- One band at a time: the three tabs in place of the stacked bands. -->
+    <div class="ph-tabs" role="tablist" aria-label="Signal">
+      @for (s of signals; track s.id) {
+        <button type="button" role="tab" class="ph-tab" [attr.aria-selected]="store.tab() === s.id" (click)="store.setTab(s.id)">
+          <lucide-icon [name]="s.icon" [size]="13" />{{ s.label }}
+        </button>
+      }
+    </div>
   }
 
-  <!-- Top services -->
-  <section class="stat-card">
-    <div class="stat-card-head"><span class="stat-card-title">Top services</span></div>
-
-    @if (topServices().length) {
-      <div class="svc-list">
-        @for (s of topServices(); track s.service) {
-          <div class="svc-row">
-            <span class="svc-dot" [style.background]="s.color"></span>
-            <span class="svc-name">{{ s.service || '(no service)' }}</span>
-            <span class="svc-bar-wrap">
-              <span class="svc-bar" [style.width.%]="s.pct" [style.background]="s.color"></span>
-            </span>
-            <span class="svc-count">{{ fmtNum(s.count) }}</span>
-            <span class="svc-pct">{{ s.pctLabel }}</span>
-          </div>
-        }
-      </div>
-    } @else {
-      <div class="stat-loading">No service data.</div>
+  <div class="bands">
+    @if (viewport.phone()) {
+      <div class="ph-win tn">{{ store.subtitle() }}</div>
     }
-  </section>
+    @if (store.window(); as w) {
+      @if (!viewport.phone() || store.tab() === 'logs') {
+        <app-stats-logs [window]="w" [caption]="store.caption()" />
+      }
+      @if (!viewport.phone() || store.tab() === 'metrics') {
+        <app-stats-metrics [window]="w" [caption]="store.caption()" />
+      }
+      @if (!viewport.phone() || store.tab() === 'traces') {
+        <app-stats-traces [window]="w" [caption]="store.caption()" />
+      }
+    } @else {
+      <app-empty-state icon="calendar" text="Pick a start for the custom range" />
+    }
+  </div>
+
+  @if (store.sheetOpen()) {
+    <app-stats-range-sheet />
+  }
 </div>

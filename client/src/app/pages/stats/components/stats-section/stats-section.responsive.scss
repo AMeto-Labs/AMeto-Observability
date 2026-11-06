@@ -1,0 +1,55 @@
+@use 'breakpoints' as bp;
+
+/* The band at other widths (design canvas, "Планшет 768 — 3 месяца", "Телефон — вкладка …").
+   Wide desktops get the wider breakdown; under 900px the three parts stack and the tiles go four
+   across in two captioned rows; under 640px the tiles are two across again, the rows taller, the
+   "Open …" link an icon. */
+
+@include bp.from(1600px) {
+  .band { grid-template-columns: 352px minmax(0, 1fr) 440px; }
+}
+
+/* ── Tablet, 640–899: stacked, tiles 4 × 2 ─────────────────────────── */
+@include bp.below(bp.$bp-md) {
+  .band-wrap { gap: 8px; }
+  .band {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+  .card { contain: none; }
+  .tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-flow: row dense;
+  }
+  /* The DOM alternates window | store for the two-column layout; here the window's tiles make
+     row 2 under their caption and the store's row 4 under theirs. */
+  .ct-win   { grid-row: 1; grid-column: 1 / -1; }
+  .ct-store { grid-row: 3; grid-column: 1 / -1; margin-top: 4px; }
+  .tile.win   { grid-row: 2; }
+  .tile.store { grid-row: 4; }
+  .bars { flex: none; height: 120px; }
+  .empty { min-height: 142px; }
+}
+
+/* ── Phone, < 640: tiles 2 across, taller rows, the chart lower ─────── */
+@include bp.below(bp.$bp-sm) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ct-win   { grid-row: auto; grid-column: auto; }
+  .ct-store { grid-row: auto; grid-column: auto; margin-top: 0; }
+  .tile.win,
+  .tile.store { grid-row: auto; }
+  .tile { padding: 8px 10px; }
+  .sh-sub { display: none; }
+  .sh-open {
+    width: 28px;
+    height: 28px;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .sh-open-txt { display: none; }
+  .bars { height: 110px; }
+  .empty { min-height: 132px; }
+  .tab { height: 24px; padding: 0 9px; font-size: var(--fs-xs); }
+  .sk-row { height: 28px; }
+}

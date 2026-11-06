@@ -45,10 +45,15 @@ export interface EventQueryParams {
   levels?: string;
 }
 
+/** The log store's counters (GET /api/stats): the segment catalogue summed, with the span it covers. */
 export interface StatsDto {
   segments: number;
   totalEvents: number;
   compressedBytes: number;
+  uncompressedBytes: number;
+  /** The earliest and latest event any segment holds, ISO-8601; null while there are no segments. */
+  oldestTimestamp: string | null;
+  newestTimestamp: string | null;
 }
 
 /** Per-service event counts bucketed over time (GET /api/events/counts). */

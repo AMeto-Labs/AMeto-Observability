@@ -1,0 +1,268 @@
+/* One band of the Statistics page: the header row, then tiles | chart | breakdown (design canvas,
+   "Статистика 1920×1080"). Sizes are the dense scale's: tiles 10/18, captions 10 caps, cards padded
+   10/12, rows 24. The responsive layer (stats-section.responsive.scss) restacks it under 900px. */
+:host { display: block; }
+
+.band-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ── The header row ───────────────────────────────────────────────── */
+.sh {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  min-width: 0;
+}
+.sh-icon { color: var(--txt-muted); flex-shrink: 0; }
+.sh-title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  color: var(--txt);
+}
+.sh-sub {
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sh-tag {
+  font-size: var(--fs-3xs);
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--error);
+  border: 1px solid var(--error);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 14px;
+}
+.sh-open {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.sh-open:hover { text-decoration: underline; }
+
+/* ── The band: tiles 352 | chart | breakdown 400 (440 from 1600px) ─── */
+.band {
+  display: grid;
+  grid-template-columns: 352px minmax(0, 1fr) 400px;
+  gap: 12px;
+  align-items: stretch;
+}
+
+/* ── Tiles: two columns, the window's and the store's, four rows ──── */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 8px;
+  grid-auto-rows: min-content;
+}
+.ct {
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--txt-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  min-width: 0;
+}
+.tl {
+  font-size: var(--fs-2xs);
+  color: var(--txt-dim);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tv {
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  font-variant-numeric: tabular-nums;
+  color: var(--txt);
+  white-space: nowrap;
+}
+.tv.muted { color: var(--txt-dim); }
+
+/* ── Cards: the chart and the breakdown ───────────────────────────── */
+/* The tiles set the band's height: the two cards are sized as if empty (`contain: size`), so
+   the grid row is the tiles' height and the cards stretch to it — the chart fills it, the
+   breakdown shows the eight rows that fit. The responsive layer lifts this where the band
+   stacks and every card is as tall as its content. */
+.card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  contain: size;
+}
+.ch {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.sub {
+  font-size: 10.5px;
+  color: var(--txt-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tn { font-variant-numeric: tabular-nums; }
+.lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+}
+.lg i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+/* The chart fills the card's height; the bars' percentages are of that height. */
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+}
+.bar {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  padding: 0;
+  border: 0;
+  border-radius: 2px 2px 0 0;
+  background: var(--surface-up);
+  cursor: pointer;
+  transition: filter .1s, background .1s;
+}
+button.bar:hover { background: var(--surface-hover); }
+button.bar:hover .fill { filter: brightness(1.2); }
+.fill {
+  width: 100%;
+  min-height: 1px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 2px 2px 0 0;
+  overflow: hidden;
+}
+.sg { flex-basis: 0; width: 100%; }
+.ax {
+  position: relative;
+  height: 16px;
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 9.5px;
+  color: var(--txt-dim);
+  flex-shrink: 0;
+}
+.ax span {
+  position: absolute;
+  top: 3px;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+/* ── The breakdown's tabs ─────────────────────────────────────────── */
+.tabs { display: inline-flex; gap: 2px; }
+.tab {
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--txt-dim);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.tab:hover { color: var(--txt); }
+.tab[aria-selected="true"] {
+  color: var(--txt);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+/* ── Empty and unavailable: in the chart's place, and a line in the breakdown's ── */
+.empty {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--txt-dim);
+  text-align: center;
+  padding: 8px 12px;
+}
+.empty p { margin: 0; font-size: var(--fs-sm); color: var(--txt-muted); }
+.empty span { font-size: var(--fs-xs); }
+.empty-err { color: var(--error); }
+.empty.quiet { min-height: 80px; }
+
+/* ── Skeletons while loading (the pulse is the global .skeleton) ──── */
+.sk-label { height: 9px; margin: 2px 0 3px; display: block; }
+.sk-value { height: 16px; width: 70%; margin: 3px 0 2px; display: block; }
+.sk-caption { height: 9px; width: 150px; display: inline-block; }
+.sk-bar { width: 100%; border-radius: 2px 2px 0 0; display: block; }
+.lst { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.sk-row {
+  display: grid;
+  grid-template-columns: 14px minmax(80px, 1.1fr) minmax(60px, 1fr) 64px 48px;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  padding: 0 4px;
+}
+.sk-dot { width: 9px; height: 9px; border-radius: 3px; }
+.sk-name { height: 9px; }
+.sk-track { height: 7px; border-radius: 999px; }
+.sk-num { height: 9px; width: 40px; justify-self: end; }
+.sk-pct { height: 9px; width: 28px; justify-self: end; }

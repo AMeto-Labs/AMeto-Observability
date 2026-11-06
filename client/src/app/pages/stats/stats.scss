@@ -1,10 +1,26 @@
-@use 'breakpoints' as bp;
-
+/* The Statistics page's own chrome: the range control in the header and the stack of bands. The
+   bands themselves are app-stats-section; the phone's header, tabs and sheet are the responsive
+   layer (stats.responsive.scss). Layout and scroll come from the global `.page`. */
 :host { display: block; height: 100%; }
-/* Layout comes from the global `.page` wrapper (padding + gap + scroll). */
 
-/* ── Range tabs (page-header actions) ─────────────────────────────── */
-.range-tabs {
+.stats-page { gap: 12px; }
+
+.bands {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ── The range control: six quick ranges, Custom, Refresh ─────────── */
+.range-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* The quick ranges: the Logs page's range-tabs box, --ctl-h-sm tall. */
+.seg {
   display: inline-flex;
   gap: 2px;
   padding: 2px;
@@ -12,199 +28,65 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
-.range-tab {
-  height: var(--ctl-h-sm);
-  padding: 0 10px;
+.seg-btn {
+  height: 18px;
+  padding: 0 9px;
   background: none;
-  border: none;
+  border: 0;
   border-radius: var(--radius-sm);
   color: var(--txt-muted);
   font-size: var(--fs-xs);
   font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
   transition: background .12s, color .12s;
 }
-.range-tab:hover { color: var(--txt); }
-.range-tab.active { background: var(--surface-hover); color: var(--accent); font-weight: 600; }
-
-/* ── Summary tiles ────────────────────────────────────────────────── */
-.stat-tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: var(--gap);
-}
-.stat-tile {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-}
-.stat-tile-label {
-  font-size: var(--fs-2xs);
-  font-family: var(--ui);
-  color: var(--txt-dim);
-  text-transform: uppercase;
-  letter-spacing: .05em;
-}
-.stat-tile-value {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: var(--txt);
-  line-height: var(--lh-tight);
-}
-.stat-tile-note {
-  position: absolute;
-  top: 8px;
-  right: 10px;
-  font-size: var(--fs-3xs);
-  font-weight: 700;
-  letter-spacing: .04em;
-  text-transform: uppercase;
+.seg-btn:hover { color: var(--txt); }
+.seg-btn.active {
+  background: var(--surface-hover);
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  border-radius: 999px;
-  padding: 1px 6px;
-}
-
-/* ── Cards ────────────────────────────────────────────────────────── */
-.stat-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  padding: var(--section-pad);
-}
-.stat-card-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--gap);
-  margin-bottom: var(--gap);
-}
-.stat-card-title {
-  font-size: var(--fs-2xs);
   font-weight: 600;
-  font-family: var(--ui);
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  color: var(--txt-muted);
-}
-.stat-card-sub {
-  font-size: var(--fs-xs);
-  color: var(--txt-dim);
-  font-variant-numeric: tabular-nums;
-}
-/* Error-rate badge in the Levels card header. */
-.err-rate { font-weight: 500; }
-.err-rate.hot { color: var(--lvl-e, #EF4444); font-weight: 600; }
-.stat-loading {
-  color: var(--txt-muted);
-  font-size: var(--fs-sm);
-  padding: 16px 2px;
 }
 
-/* ── Volume chart ─────────────────────────────────────────────────── */
-.vol-chart { width: 100%; }
-.vol-bars {
+/* Custom: the filter bar's trigger (`.fb-btn`), carrying the window once one is applied. */
+.custom-btn {
   display: flex;
-  align-items: flex-end;
-  gap: 1px;
-  height: 150px;
-  width: 100%;
-  overflow: hidden;   /* buckets share width via flex — no horizontal scroll */
-}
-.vol-bar {
-  flex: 1 1 0;
-  min-width: 0;
-  height: 100%;
-  display: flex;
-  align-items: flex-end;
-  padding: 0;
-  border: none;
-  border-radius: 2px 2px 0 0;
-  background: var(--surface-up);
-  transition: filter .1s, background .1s;
-  cursor: pointer;
-}
-.vol-bar:hover { background: var(--surface-hover); }
-.vol-bar:hover .vol-fill { filter: brightness(1.2); }
-.vol-fill {
-  width: 100%;
-  min-height: 1px;
-  display: flex;
-  flex-direction: column;
-  border-radius: 2px 2px 0 0;
-  overflow: hidden;
-}
-.vol-seg { flex-basis: 0; width: 100%; }
-
-.vol-axis {
-  position: relative;
-  height: 16px;
-  margin-top: 6px;
-  border-top: 1px solid var(--border);
-}
-.vol-tick {
-  position: absolute;
-  top: 4px;
-  transform: translateX(-50%);
-  font-size: var(--fs-2xs);
-  color: var(--txt-dim);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.vol-tick:first-child  { transform: none; }
-.vol-tick:last-child   { transform: translateX(-100%); }
-
-/* ── Top services ─────────────────────────────────────────────────── */
-.svc-list { display: flex; flex-direction: column; gap: 2px; }
-.svc-row {
-  display: grid;
-  grid-template-columns: 10px minmax(120px, 200px) 1fr 72px 48px;
   align-items: center;
-  gap: var(--gap);
-  padding: 4px;
-  border-radius: 5px;
-}
-.svc-row:hover { background: var(--surface-hover); }
-.svc-dot { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
-.svc-name {
-  font-size: var(--fs-sm);
-  color: var(--txt);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.svc-bar-wrap {
-  height: 8px;
+  gap: 5px;
+  height: var(--icon-btn);
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
   background: var(--surface-up);
-  border-radius: 999px;
-  overflow: hidden;
-}
-.svc-bar { display: block; height: 100%; border-radius: 999px; min-width: 2px; opacity: .85; }
-.svc-count {
-  font-size: var(--fs-sm);
-  color: var(--txt);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-.svc-pct {
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  font-family: var(--ui);
   font-size: var(--fs-xs);
-  color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
-  text-align: right;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all .12s;
 }
+.custom-btn:hover { color: var(--txt); border-color: var(--accent); }
+.custom-btn.open { border-color: var(--accent); color: var(--txt); }
+.custom-btn.filtered { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.custom-extra { color: var(--txt-dim); }
+.custom-caret { color: var(--txt-dim); transition: transform .15s; flex-shrink: 0; }
+.custom-caret.rotated { transform: rotate(180deg); }
 
-/* ── Phone ────────────────────────────────────────────────────────── */
-@include bp.below(bp.$bp-sm) {
-  .stat-tiles { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
-  /* The name column gives up its fixed minimum, or five columns overflow a 360px screen. */
-  .svc-row {
-    grid-template-columns: 10px minmax(64px, 1fr) minmax(40px, 1fr) 60px 40px;
-    gap: 6px;
-  }
+.refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-up);
+  color: var(--txt-dim);
+  cursor: pointer;
+  transition: color .12s, border-color .12s;
 }
+.refresh-btn:hover { color: var(--txt); border-color: var(--accent); }
+
+.tn { font-variant-numeric: tabular-nums; }

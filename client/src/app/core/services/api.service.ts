@@ -11,7 +11,9 @@ import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDetailDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
-import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
+import {
+  MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest, MetricStatsDto,
+} from '../models/metric.model';
 import { SearchHistoryDto, SearchScope } from '../models/search-history.model';
 import { StreamEndDto, StreamFrame } from '../models/stream.model';
 import { UpdateStatusDto } from '../models/update.model';
@@ -481,9 +483,11 @@ export class ApiService {
   deleteApiKey(id: string): Observable<void> { return this.http.delete<void>(`/api/auth/keys/${id}`); }
 
   // ── Traces ─────────────────────────────────────────────────────────────────
-  getTraceStats(from: string, to?: string): Observable<TraceStatsDto> {
+  /** `buckets`: the sparklines' columns (the server's default is 20, the Traces page's tiles). */
+  getTraceStats(from: string, to?: string, buckets?: number): Observable<TraceStatsDto> {
     const p = new URLSearchParams({ from });
     if (to) p.set('to', to);
+    if (buckets) p.set('buckets', String(buckets));
     return this.http.get<TraceStatsDto>(`/api/traces/stats?${p.toString()}`);
   }
 
@@ -610,6 +614,17 @@ export class ApiService {
   getMetricCatalog(search?: string): Observable<MetricCatalogDto[]> {
     const p = search ? `?search=${encodeURIComponent(search)}` : '';
     return this.http.get<MetricCatalogDto[]>(`/api/metrics/catalog${p}`);
+  }
+
+  /**
+   * The metric store for the Statistics page: the catalog by kind, the cold segments' bytes
+   * bucketed over the window, the top metrics by bytes and the store's totals. `to` omitted
+   * leaves the upper bound to the server's own "now", as the event counts do.
+   */
+  getMetricStats(params: { from: string; to?: string; bucket: number }): Observable<MetricStatsDto> {
+    const p = new URLSearchParams({ from: params.from, bucket: String(params.bucket) });
+    if (params.to) p.set('to', params.to);
+    return this.http.get<MetricStatsDto>(`/api/metrics/stats?${p.toString()}`);
   }
 
   getMetricLabelKeys(name: string): Observable<string[]> {
