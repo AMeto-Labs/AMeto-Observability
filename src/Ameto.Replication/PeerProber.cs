@@ -38,6 +38,9 @@ public sealed class PeerProber : IHostedService, IDisposable
     public int ProbeCycles => Volatile.Read(ref _cycles);
     private int _cycles;
 
+    /// <summary>Test seam: runs before each probe cycle; throwing from it is a cycle that failed. Null in production.</summary>
+    internal Action? _beforeProbeForTest;
+
     public PeerProber(
         IOptions<ReplicationOptions> opts,
         NodeRegistry                 registry,
@@ -58,7 +61,11 @@ public sealed class PeerProber : IHostedService, IDisposable
 
         _registry.PeerAdded += OnPeerAdded;
         _cts  = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _loop = RunAsync(_cts.Token);
+        // On the pool, as every other loop starts: called here, the loop ran on the host's startup thread
+        // until its first await, and a cycle that failed before one — a timer that could not be made, a
+        // probe failing synchronously — slept its guarded second THERE, holding the start for as long as
+        // it repeated. The first probes start microseconds later all the same.
+        _loop = Task.Run(() => RunAsync(_cts.Token));
         return Task.CompletedTask;
     }
 
@@ -102,29 +109,48 @@ public sealed class PeerProber : IHostedService, IDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                if (!HasSomethingToProbe)
+                try
                 {
-                    timer?.Dispose();
-                    timer = null;
-                    // No seeds and no peers: an inbound ping (NodeRegistry.Upsert) is the only
-                    // event that can change that, and it pulses us. Until then, no wakes.
-                    await _wake.WaitAsync(ct);
-                    continue;
+                    if (!HasSomethingToProbe)
+                    {
+                        timer?.Dispose();
+                        timer = null;
+                        // No seeds and no peers: an inbound ping (NodeRegistry.Upsert) is the only
+                        // event that can change that, and it pulses us. Until then, no wakes.
+                        await _wake.WaitAsync(ct);
+                        continue;
+                    }
+
+                    // Seeds are probed on the first pass so the registry is populated before the
+                    // first SegmentReplicator flush, then re-probed on the interval.
+                    _beforeProbeForTest?.Invoke();
+                    await ProbeAllAsync(ct);
+                    Interlocked.Increment(ref _cycles);
+
+                    // A ProbeInterval of zero or less is not validated where the options are bound, and a
+                    // PeriodicTimer refuses it: that was one Error and a probe every second, for ever.
+                    timer ??= new PeriodicTimer(_opts.ProbeInterval > TimeSpan.Zero ? _opts.ProbeInterval : TimeSpan.FromSeconds(10));
+                    if (!await timer.WaitForNextTickAsync(ct)) break;
                 }
-
-                // Seeds are probed on the first pass so the registry is populated before the
-                // first SegmentReplicator flush, then re-probed on the interval.
-                await ProbeAllAsync(ct);
-                Interlocked.Increment(ref _cycles);
-
-                timer ??= new PeriodicTimer(_opts.ProbeInterval);
-                if (!await timer.WaitForNextTickAsync(ct)) break;
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    // ONE CYCLE'S FAILURE COSTS ONE CYCLE. The whole loop used to sit in one try, so
+                    // anything that threw — the payload, the LINQ over the registry, a timer that could
+                    // not be made, a log line on a stand out of memory — ended probing for the life of
+                    // the process (#137; the log engine's e6fe109). Said (guarded), one blocked second,
+                    // and the loop goes on; the shutdown flag is read at the top.
+                    try { _logger.LogError(ex, "PeerProber cycle failed; the loop continues"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    Thread.Sleep(1000);
+                }
             }
         }
-        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "PeerProber loop failed");
+            // Nothing above lets an exception out any more; this is the last resort, and it may not throw itself.
+            try { _logger.LogError(ex, "PeerProber loop failed"); }
+            catch (Exception) { }
         }
         finally
         {
@@ -177,6 +203,15 @@ public sealed class PeerProber : IHostedService, IDisposable
             var peer = await resp.Content.ReadFromJsonAsync<PeerPayload>(cts.Token);
             if (peer is not null)
                 _registry.Upsert(peer);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The probe's own five seconds ran out — a peer that accepts and never answers, or an address
+            // whose packets are dropped (a host down behind a firewall or a security group). A failed probe
+            // like any other. It used to escape as a cancellation and end probing for good, without a line;
+            // let out of here once the loop was guarded (#137), it failed the whole cycle as an Error every
+            // ~6 s per unreachable peer.
+            _logger.LogDebug("Probe of {Addr} timed out", baseAddress);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

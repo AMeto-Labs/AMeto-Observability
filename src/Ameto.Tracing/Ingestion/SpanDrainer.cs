@@ -194,53 +194,68 @@ internal sealed class SpanDrainer : IAsyncDisposable
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
-            int count, taken;
             try
             {
-                count = DrainOnce(out taken);
+                int count, taken;
+                try
+                {
+                    count = DrainOnce(out taken);
+                }
+                catch (Exception ex)
+                {
+                    NoteFailedPass(ex);   // its lines are guarded: a logger that throws costs the line, not a pass
+                    MaybeFlush();
+                    // The tail is still ours (DrainOnce). Offered again after a pause that doubles while the
+                    // engine keeps refusing, 100 ms to a second: a volume that is full is not hammered, and
+                    // meanwhile the ring fills behind the held tail until the receivers turn batches away
+                    // for the exporters to retry (#138). A shutdown that lands in the pause goes to the
+                    // final drain below, which offers the tail again.
+                    try { await Task.Delay(_retryPauseMs, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                    _retryPauseMs = Math.Min(_retryPauseMs * 2, RetryPauseMaxMs);
+                    continue;
+                }
+                _retryPauseMs = RetryPauseMinMs;
+                if (_refusingSinceTicks != 0 && taken > 0) NoteRecovered();
+
+                if (count == 0)
+                {
+                    MaybeFlush();
+                    MaybeTrimArena();
+                    // Park until a producer signals new spans. The 1 s timeout is only a
+                    // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
+                    //
+                    // A SHUTDOWN THAT LANDS WHILE PARKED IS A BREAK, NOT A THROW. The park throws
+                    // OperationCanceledException then — even with a span published and signalled a
+                    // moment before, since a cancelled token wins over a ready count — and letting it
+                    // out skipped the final drain below: whatever was published after the last empty
+                    // pass (a slot claimed before that pass and published after it included) stayed in
+                    // the ring, acknowledged and never written.
+                    _beforeParkForTest?.Invoke(_cts);
+                    try { await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                    continue;
+                }
+
+                // The engine has closed its write path. Every further span would be refused
+                // too, so stop draining rather than spinning the ring empty into a closed
+                // engine — and say so once, with the count, instead of once per span.
+                if (taken < count) { ReportRefused(count - taken); return; }
+
+                MaybeFlush();
             }
             catch (Exception ex)
             {
-                NoteFailedPass(ex);
-                MaybeFlush();
-                // The tail is still ours (DrainOnce). Offered again after a pause that doubles while the
-                // engine keeps refusing, 100 ms to a second: a volume that is full is not hammered, and
-                // meanwhile the ring fills behind the held tail until the receivers turn batches away
-                // for the exporters to retry (#138). A shutdown that lands in the pause goes to the
-                // final drain below, which offers the tail again.
-                try { await Task.Delay(_retryPauseMs, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { break; }
-                _retryPauseMs = Math.Min(_retryPauseMs * 2, RetryPauseMaxMs);
-                continue;
+                // A FAILURE OUTSIDE THE BATCH WRITE — a log line that ran out of memory, a flush or
+                // trim whose own warning did, a park that could not be set up — used to end the loop
+                // for the life of the process: the ring then filled and every request with spans was
+                // refused until a restart (#137; the log engine's e6fe109). Said, if the logger can;
+                // one blocked second, which allocates nothing; and the loop goes on — the shutdown
+                // flag is read at the top.
+                try { _logger.LogError(ex, "SpanDrainer: the drain loop failed outside a batch write; it goes on"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                Thread.Sleep(1000);
             }
-            _retryPauseMs = RetryPauseMinMs;
-            if (_refusingSinceTicks != 0 && taken > 0) NoteRecovered();
-
-            if (count == 0)
-            {
-                MaybeFlush();
-                MaybeTrimArena();
-                // Park until a producer signals new spans. The 1 s timeout is only a
-                // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
-                //
-                // A SHUTDOWN THAT LANDS WHILE PARKED IS A BREAK, NOT A THROW. The park throws
-                // OperationCanceledException then — even with a span published and signalled a
-                // moment before, since a cancelled token wins over a ready count — and letting it
-                // out skipped the final drain below: whatever was published after the last empty
-                // pass (a slot claimed before that pass and published after it included) stayed in
-                // the ring, acknowledged and never written.
-                _beforeParkForTest?.Invoke(_cts);
-                try { await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { break; }
-                continue;
-            }
-
-            // The engine has closed its write path. Every further span would be refused
-            // too, so stop draining rather than spinning the ring empty into a closed
-            // engine — and say so once, with the count, instead of once per span.
-            if (taken < count) { ReportRefused(count - taken); return; }
-
-            MaybeFlush();
         }
 
         // Drain remaining items before shutdown.
@@ -262,15 +277,23 @@ internal sealed class SpanDrainer : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain — {Kept} span(s) of it are kept and offered again", _held);
+                // Both lines guarded (#137): a batch that throws at shutdown, followed by an error line that
+                // throws, ended the final drain at that batch, and every span behind it stayed in the ring,
+                // acknowledged and never written.
+                try { _logger.LogError(ex, "SpanDrainer: error writing a drained batch in the final drain — {Kept} span(s) of it are kept and offered again", _held); }
+                catch (Exception) { /* the line is lost; the drain is not */ }
                 // A failing pass that still took spans is the engine taking them, slowly: the eight
                 // failures that end this pass are eight that took NOTHING.
                 if (_lastPassTook > 0) consecutiveFailures = 0;
                 if (++consecutiveFailures < MaxConsecutiveFinalDrainFailures) continue;
-                _logger.LogError(
-                    "SpanDrainer: the final drain stopped after {Failures} failing batches in a row that took nothing — "
-                  + "{Lost} span(s) still in the ring were not stored",
-                    consecutiveFailures, _ring.ApproximateCount + _held);
+                try
+                {
+                    _logger.LogError(
+                        "SpanDrainer: the final drain stopped after {Failures} failing batches in a row that took nothing — "
+                      + "{Lost} span(s) still in the ring were not stored",
+                        consecutiveFailures, _ring.ApproximateCount + _held);
+                }
+                catch (Exception) { /* the line is lost */ }
                 return;
             }
             consecutiveFailures = 0;
@@ -301,14 +324,21 @@ internal sealed class SpanDrainer : IAsyncDisposable
         if (_lastFailureLineTicks != 0 && now - _lastFailureLineTicks < FailureLineIntervalMs) return;
         _lastFailureLineTicks = now;
         _streakSaid           = true;
-        if (_failedPassesSinceLine == 1)
-            _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
-        else
-            _logger.LogError(ex,
-                "SpanDrainer: the trace store refused {Failures} pass(es) since the last such line ({Seconds} s into this outage) — "
-              + "{Kept} span(s) are kept and offered again",
-                _failedPassesSinceLine, (now - _refusingSinceTicks) / 1000, _held);
+        int failed = _failedPassesSinceLine;
         _failedPassesSinceLine = 0;
+        // Guarded (#137): a logger that runs out of memory here costs the line, not the pass — unguarded,
+        // the throw reached the loop's outer catch and cost a blocked second per pass for as long as it lasted.
+        try
+        {
+            if (failed == 1)
+                _logger.LogError(ex, "SpanDrainer: error writing a drained batch — {Kept} span(s) of it are kept and offered again", _held);
+            else
+                _logger.LogError(ex,
+                    "SpanDrainer: the trace store refused {Failures} pass(es) since the last such line ({Seconds} s into this outage) — "
+                  + "{Kept} span(s) are kept and offered again",
+                    failed, (now - _refusingSinceTicks) / 1000, _held);
+        }
+        catch (Exception) { /* the line is lost; the loop is not */ }
     }
 
     /// <summary>
@@ -322,7 +352,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
         bool said    = _streakSaid;
         _refusingSinceTicks = 0;
         _streakSaid         = false;
-        if (said) _logger.LogInformation("SpanDrainer: the trace store takes spans again, after refusing for {Seconds} s", seconds);
+        if (!said) return;
+        try { _logger.LogInformation("SpanDrainer: the trace store takes spans again, after refusing for {Seconds} s", seconds); }
+        catch (Exception) { /* the line is lost; the loop is not */ }
     }
 
     /// <summary>
@@ -330,10 +362,19 @@ internal sealed class SpanDrainer : IAsyncDisposable
     /// never durable, the refusal is what keeps them from being queryable-but-unrecoverable,
     /// and by this point the process is going down anyway.
     /// </summary>
-    private void ReportRefused(int dropped) =>
-        _logger.LogWarning(
-            "SpanDrainer: the trace engine has closed its write path — {Dropped} span(s) from "
-          + "this batch, and whatever is still in the ring, were not stored", dropped);
+    private void ReportRefused(int dropped)
+    {
+        // Never throws (#137), so the callers' `return` always happens: a throwing line here turned the
+        // loop's stop into its outer catch's pause, and the loop then drained another batch into the
+        // closed engine once a second until the line got through.
+        try
+        {
+            _logger.LogWarning(
+                "SpanDrainer: the trace engine has closed its write path — {Dropped} span(s) from "
+              + "this batch, and whatever is still in the ring, were not stored", dropped);
+        }
+        catch (Exception) { /* the line is lost; the stop is not */ }
+    }
 
     /// <summary>
     /// Gives the ring's arena back above its low-water mark, at most once per
@@ -401,14 +442,21 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 // of here skipped the flush below — the spans already in the tier were then left to
                 // the engine's own teardown, which the host timeout may cut short — and threw out of
                 // a disposal the host runs on two chains at once. Logged, then the tier is flushed
-                // all the same.
-                _logger.LogError(ex, "SpanDrainer: the drain loop ended in a fault; flushing what reached the hot tier");
+                // all the same — and the line itself may not throw past the flush (#137).
+                try { _logger.LogError(ex, "SpanDrainer: the drain loop ended in a fault; flushing what reached the hot tier"); }
+                catch (Exception) { /* the line is lost; the flush is not */ }
             }
 
             // Final flush so spans drained from the ring buffer at shutdown reach disk
             // even if the engine's own Dispose flush is cut short by the host timeout.
             try { _storage.FlushHotTier(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: shutdown hot-tier flush failed"); }
+            catch (Exception ex)
+            {
+                // Guarded (#137): a throw here skipped _cts.Dispose() and left DisposeAsync, which the
+                // paragraph above says this disposal must not do.
+                try { _logger.LogWarning(ex, "SpanDrainer: shutdown hot-tier flush failed"); }
+                catch (Exception) { /* the line is lost; the disposal ends normally */ }
+            }
 
             // Cancelling/disposing the CTS twice throws ObjectDisposedException — one caller only.
             _cts.Dispose();

@@ -2244,36 +2244,60 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private async Task RunSegmentDeleteRetryLoopAsync(CancellationToken ct)
     {
         TimeSpan delay = SegmentDeleteRetryInitialDelay;
-        while (true)
+        // True once the running flag is no longer this loop's to clear: it stood down and found nothing
+        // to do, or another loop took the flag in the window below. Every other way out — the
+        // cancellation, and a fault nothing in the body caught — leaves the flag for the finally.
+        bool handedOver = false;
+        try
         {
-            try { await Task.Delay(delay, ct).ConfigureAwait(false); }
-            catch (OperationCanceledException)
+            while (true)
             {
+                try { await Task.Delay(delay, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;   // shutdown: DisposeAsync makes one last attempt
+                }
+                catch (Exception)
+                {
+                    // The pause could not be set up (a stand out of memory): a blocked second instead,
+                    // which allocates nothing, and the pass goes on (#137).
+                    Thread.Sleep(1000);
+                }
+
+                bool more;
+                try { more = RetrySegmentDeletesInBackground(); }
+                catch (Exception ex)
+                {
+                    try { _logger.LogWarning(ex, "Deferred segment delete pass failed"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                    more = true;
+                }
+
+                if (more)
+                {
+                    delay = delay * 2 < SegmentDeleteRetryMaxDelay ? delay * 2 : SegmentDeleteRetryMaxDelay;
+                    continue;
+                }
+
+                // Nothing left to this loop. Stand down, then look once more: a path parked after the
+                // pass above saw this loop still running, and so did not start another.
                 Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
-                return;   // shutdown: DisposeAsync makes one last attempt
+                handedOver = true;    // the flag is not this loop's from here: the look below allocates, and a
+                                      // throw out of it must not clear a flag another loop may have taken since
+                if (!HasSegmentDeletesForBackground()
+                    || Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0)
+                    return;           // the flag is down, or another loop's
+                handedOver = false;   // taken back: this loop's again
+                delay = SegmentDeleteRetryInitialDelay;
             }
-
-            bool more;
-            try { more = RetrySegmentDeletesInBackground(); }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Deferred segment delete pass failed");
-                more = true;
-            }
-
-            if (more)
-            {
-                delay = delay * 2 < SegmentDeleteRetryMaxDelay ? delay * 2 : SegmentDeleteRetryMaxDelay;
-                continue;
-            }
-
-            // Nothing left to this loop. Stand down, then look once more: a path parked after the
-            // pass above saw this loop still running, and so did not start another.
-            Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
-            if (!HasSegmentDeletesForBackground()
-                || Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0)
-                return;
-            delay = SegmentDeleteRetryInitialDelay;
+        }
+        finally
+        {
+            // A LOOP THAT ENDED ANY OTHER WAY MUST NOT KEEP THE FLAG. It used to end with the flag at 1
+            // when its own warning threw or its pause failed for a reason other than cancellation, and
+            // EnsureSegmentDeleteRetryLoop then never started another: parked deletes waited for the
+            // next maintenance or retention pass, the disk freed later than it should (#137).
+            if (!handedOver) Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
         }
     }
 
