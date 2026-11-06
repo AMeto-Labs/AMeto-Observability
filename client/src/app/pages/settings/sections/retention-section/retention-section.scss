@@ -77,6 +77,10 @@
   &.ok {
     color: var(--success);
   }
+
+  &.err {
+    color: var(--error);
+  }
 }
 
 .btn-group {

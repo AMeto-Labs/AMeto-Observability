@@ -33,7 +33,8 @@ internal sealed class OtlpMetricBudgetLog
             new EventId(5, "OtlpMetricsOverBudget"),
             "OTLP: {Count} metrics batch(es) refused since the last such warning for decoding past "
           + "Ingestion:MaxOtlpMetricPoints = {Limit} points; the latest held {Points} data points, about {DecodedBytes} bytes "
-          + "decoded, and came with API key {KeyPreview} from {RemoteAddress}. The exporter does not retry it: split its "
+          + "decoded (points, histogram arrays, and a resource's attributes past its first 32 on every point under it), and "
+          + "came with API key {KeyPreview} from {RemoteAddress}. The exporter does not retry it: split its "
           + "batches, or raise the setting");
 
     private readonly ILogger      _logger;

@@ -5897,7 +5897,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private Task<int> PruneCore(TimeSpan ttl, CancellationToken ct)
     {
-        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+        // Saturating (#130): computed in DateTimeOffset and multiplied out, a TTL of some centuries —
+        // 200 000 days typed for "forever" — wrapped into a cutoff in the FUTURE and this prune deleted
+        // every trace file, every hour; a TTL past year 1 threw instead. Past the epoch, nothing is older.
+        var cutoffNano = RetentionMath.CutoffNano(DateTimeOffset.UtcNow, ttl);
 
         List<SpanSegmentInfo> toDelete;
         _lock.EnterWriteLock();
@@ -5943,9 +5946,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         if (toDelete.Count > 0 || forgotten > 0)
             _logger.LogInformation(
-                "Retention pruned {Count} trace file(s) older than {Days} days " +
+                "Retention pruned {Count} trace file(s) older than {Days:N0} days " +
                 "(and forgot {Forgotten} vanished-segment range(s) below the cutoff)",
-                toDelete.Count, (int)ttl.TotalDays, forgotten);
+                toDelete.Count, ttl.TotalDays, forgotten);
 
         return Task.FromResult(toDelete.Count);
     }

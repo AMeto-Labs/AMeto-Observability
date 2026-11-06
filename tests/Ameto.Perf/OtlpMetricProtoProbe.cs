@@ -68,6 +68,9 @@ public sealed class OtlpMetricProtoProbe
         // that alone put it at 1 199 B/point, 5.6x under the DOM path; interned it is ~174.
         Assert.True(spanBytes * 8 < domBytes,
             $"expected >=8x less allocation, got dom={domBytes} span={spanBytes}");
+        // The absolute figure too (#132's "allocations on the no-duplicate path do not grow"): a ratio
+        // alone would pass a doubling on both sides.
+        Assert.True(spanB < 256, $"the span parser allocates {spanB:F0} B/point; it was ~174");
     }
 
     private static (double MsPerIter, long Bytes) Best(int iters, Action body)
