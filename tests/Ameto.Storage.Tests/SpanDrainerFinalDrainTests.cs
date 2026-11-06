@@ -172,8 +172,8 @@ public sealed class SpanDrainerFinalDrainTests : IDisposable
     /// the hot tier; the second park — the loop is idle again — throws an
     /// <see cref="InvalidOperationException"/>. The span is then in the tier and nowhere else.</para>
     ///
-    /// <para>Reverted (only the cancellation caught at the join): <c>DisposeAsync</c> throws the
-    /// seam's exception, and the span is still in the hot tier with no cold segment.</para>
+    /// <para>Since #137 the park's fault is caught in the loop and never reaches the join; the join's
+    /// catch-all in <c>DisposeAsync</c> is a last resort no seam reaches.</para>
     /// </summary>
     [Fact]
     public async Task A_park_that_faults_is_logged_the_loop_goes_on_and_the_tier_is_still_flushed()

@@ -61,7 +61,11 @@ public sealed class PeerProber : IHostedService, IDisposable
 
         _registry.PeerAdded += OnPeerAdded;
         _cts  = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _loop = RunAsync(_cts.Token);
+        // On the pool, as every other loop starts: called here, the loop ran on the host's startup thread
+        // until its first await, and a cycle that failed before one — a timer that could not be made, a
+        // probe failing synchronously — slept its guarded second THERE, holding the start for as long as
+        // it repeated. The first probes start microseconds later all the same.
+        _loop = Task.Run(() => RunAsync(_cts.Token));
         return Task.CompletedTask;
     }
 
@@ -123,7 +127,9 @@ public sealed class PeerProber : IHostedService, IDisposable
                     await ProbeAllAsync(ct);
                     Interlocked.Increment(ref _cycles);
 
-                    timer ??= new PeriodicTimer(_opts.ProbeInterval);
+                    // A ProbeInterval of zero or less is not validated where the options are bound, and a
+                    // PeriodicTimer refuses it: that was one Error and a probe every second, for ever.
+                    timer ??= new PeriodicTimer(_opts.ProbeInterval > TimeSpan.Zero ? _opts.ProbeInterval : TimeSpan.FromSeconds(10));
                     if (!await timer.WaitForNextTickAsync(ct)) break;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
@@ -197,6 +203,15 @@ public sealed class PeerProber : IHostedService, IDisposable
             var peer = await resp.Content.ReadFromJsonAsync<PeerPayload>(cts.Token);
             if (peer is not null)
                 _registry.Upsert(peer);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The probe's own five seconds ran out — a peer that accepts and never answers, or an address
+            // whose packets are dropped (a host down behind a firewall or a security group). A failed probe
+            // like any other. It used to escape as a cancellation and end probing for good, without a line;
+            // let out of here once the loop was guarded (#137), it failed the whole cycle as an Error every
+            // ~6 s per unreachable peer.
+            _logger.LogDebug("Probe of {Addr} timed out", baseAddress);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

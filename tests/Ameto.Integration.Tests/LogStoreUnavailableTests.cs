@@ -382,7 +382,7 @@ public sealed class LogStoreUnavailableTests
         var storage = factory.Services.GetRequiredService<StorageEngine>();
         var guard   = factory.Services.GetRequiredService<QueryGuard>();
 
-        var held = await guard.TryEnterAsync(CancellationToken.None);
+        var held = await guard.TryEnterAsync(CancellationToken.None, out _);
         Assert.NotNull(held);
         var queued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         guard._onEnteringForTest = () => queued.TrySetResult();

@@ -109,8 +109,18 @@ public static class EndpointMapper
             if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             QueryGuard.Lease? lease;
-            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
-            catch (OperationCanceledException) { return Results.Empty; }   // client left the queue
+            QueryGuard.Claim? claim = null;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+            catch (Exception e)
+            {
+                // This await can be this endpoint's first real suspension, where its state machine is
+                // boxed: a box that cannot be allocated throws here with the guard's wait still pending
+                // (round-5 H-G). Abandoned, a slot that wait takes goes back to the guard; a cancelled
+                // wait took none. A catch, not a finally: that throw skips finallys.
+                claim?.Abandon();
+                if (e is OperationCanceledException) return Results.Empty;   // client left the queue
+                throw;
+            }
             if (lease is null)
                 return Refused(ctx);
 
@@ -208,8 +218,14 @@ public static class EndpointMapper
             }
 
             QueryGuard.Lease? lease;
-            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
-            catch (OperationCanceledException) { return Results.Empty; }
+            QueryGuard.Claim? claim = null;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+            catch (Exception e)
+            {
+                claim?.Abandon();   // a wait whose caller's await threw owes the guard its slot (see /api/events)
+                if (e is OperationCanceledException) return Results.Empty;
+                throw;
+            }
             if (lease is null) return Refused(ctx);
 
             var now     = DateTimeOffset.UtcNow;
@@ -287,8 +303,14 @@ public static class EndpointMapper
             // Guarded like the search it is: this scans up to 5 000 events over a day and
             // competes for exactly the mmap and decompression the limit exists to ration.
             QueryGuard.Lease? lease;
-            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
-            catch (OperationCanceledException) { return Results.Empty; }
+            QueryGuard.Claim? claim = null;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+            catch (Exception e)
+            {
+                claim?.Abandon();   // a wait whose caller's await threw owes the guard its slot (see /api/events)
+                if (e is OperationCanceledException) return Results.Empty;
+                throw;
+            }
             if (lease is null) return Refused(ctx);
 
             using (lease)
@@ -332,8 +354,14 @@ public static class EndpointMapper
             };
 
             QueryGuard.Lease? lease;
-            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
-            catch (OperationCanceledException) { return Results.Empty; }
+            QueryGuard.Claim? claim = null;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+            catch (Exception e)
+            {
+                claim?.Abandon();   // a wait whose caller's await threw owes the guard its slot (see /api/events)
+                if (e is OperationCanceledException) return Results.Empty;
+                throw;
+            }
             if (lease is null) return Refused(ctx);
 
             using (lease)
@@ -609,7 +637,10 @@ public static class EndpointMapper
                     int newCount = 0;
                     // A slot per POLL, never for the life of the connection: a tail is open
                     // for hours and would otherwise hold a search slot the whole time.
-                    var lease = await guard.TryEnterAsync(ctx.RequestAborted);
+                    QueryGuard.Lease? lease;
+                    QueryGuard.Claim? claim = null;
+                    try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+                    catch { claim?.Abandon(); throw; }   // a wait whose caller's await threw owes the guard its slot (see /api/events)
                     if (lease is null)
                     {
                         // The server is at its limit. A tail can wait — but not silently
@@ -840,8 +871,14 @@ public static class EndpointMapper
         HttpContext ctx, IQueryExecutor executor, IQueryAvailability store, QueryGuard guard, QueryRequest request)
     {
         QueryGuard.Lease? lease;
-        try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
-        catch (OperationCanceledException) { return; }
+        QueryGuard.Claim? claim = null;
+        try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+        catch (Exception e)
+        {
+            claim?.Abandon();   // a wait whose caller's await threw owes the guard its slot (see /api/events)
+            if (e is OperationCanceledException) return;
+            throw;
+        }
         if (lease is null)
         {
             ctx.Response.StatusCode         = StatusCodes.Status503ServiceUnavailable;

@@ -61,13 +61,29 @@ internal sealed class QueryGuard
     /// (8 ms nominal, one 15.6 ms timer tick on Windows) and the queue is no longer first come,
     /// first served — a request waiting long can be passed by a newer one until its
     /// <see cref="QueueWait"/> is up, which is what the log engine's waits accepted too.</para>
+    ///
+    /// <para><b>A wait whose caller is gone takes no slot for good</b> (the inflate gate's <c>Claim</c>,
+    /// round-6 review R5-M12). The caller's await of a pending wait can throw — its state machine's box
+    /// at its first real suspension, which the guard's await is for most endpoints, or the registration
+    /// of its continuation, out of memory — and the wait then went on to take the next freed slot for
+    /// nobody: one of the 2–16 slots, gone until a restart, the harm above in a smaller window. A wait
+    /// that begins hands its caller a <see cref="Claim"/> through <paramref name="claim"/>; the caller
+    /// abandons it when its await throws, the wait grants it as it takes a slot, and whichever of the
+    /// two comes second gives the slot back. Null when no wait began: the slot was free, or there is no
+    /// limit. The uncontended path allocates nothing.</para>
     /// </summary>
-    public async ValueTask<Lease?> TryEnterAsync(CancellationToken ct)
+    public ValueTask<Lease?> TryEnterAsync(CancellationToken ct, out Claim? claim)
     {
+        claim = null;
         _onEnteringForTest?.Invoke();
-        if (_slots is null) return new Lease(null);
-        if (_slots.Wait(0)) return new Lease(_slots);
+        if (_slots is null) return new(new Lease(null));
+        if (_slots.Wait(0)) return new(new Lease(_slots));
+        claim = new Claim(_slots);   // before the wait begins: one that cannot be made throws here, with nothing pending
+        return WaitForSlotAsync(claim, ct);
+    }
 
+    private async ValueTask<Lease?> WaitForSlotAsync(Claim claim, CancellationToken ct)
+    {
         long deadline = Environment.TickCount64 + (long)QueueWait.TotalMilliseconds;
         for (int pause = 1; ; pause = Math.Min(2 * pause, QueuePollMaxMs))
         {
@@ -75,7 +91,40 @@ internal sealed class QueryGuard
             long left = deadline - Environment.TickCount64;
             if (left <= 0) return null;
             await Task.Delay((int)Math.Min(pause, left), ct).ConfigureAwait(false);
-            if (_slots.Wait(0)) return new Lease(_slots);
+            if (_slots!.Wait(0)) return claim.Grant() ? new Lease(_slots) : null;
+        }
+    }
+
+    /// <summary>
+    /// Who gives back the slot of a wait whose caller may not be there to take it (the inflate gate's
+    /// <c>Claim</c>): the wait marks the claim granted as it takes a slot, a caller whose await threw marks
+    /// it abandoned, and whichever comes second gives the slot back. Nothing waits for anything. One per
+    /// contended wait, never on the uncontended path.
+    /// </summary>
+    internal sealed class Claim(SemaphoreSlim slots)
+    {
+        private const int Waiting = 0, Granted = 1, Abandoned = 2;
+        private int _state;
+
+        /// <summary>The wait took a slot: true when its caller is still there to hold it; false when the caller abandoned the claim first, and the slot went back here.</summary>
+        internal bool Grant()
+        {
+            if (Interlocked.CompareExchange(ref _state, Granted, Waiting) == Waiting) return true;
+            slots.Release();
+            return false;
+        }
+
+        /// <summary>
+        /// Said by a caller whose await threw, however it threw: it will never take the answer. A slot the
+        /// wait has already taken goes back now; one it takes later goes back as it is taken
+        /// (<see cref="Grant"/>). A wait that ended without a slot — null, cancelled, out of memory — owes
+        /// none. Once: a second call gives nothing back. Allocates nothing and never throws.
+        /// </summary>
+        public void Abandon()
+        {
+            if (Interlocked.CompareExchange(ref _state, Abandoned, Waiting) == Granted
+                && Interlocked.CompareExchange(ref _state, Abandoned, Granted) == Granted)
+                slots.Release();
         }
     }
 

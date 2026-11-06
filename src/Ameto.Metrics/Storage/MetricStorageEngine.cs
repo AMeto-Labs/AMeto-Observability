@@ -1758,7 +1758,10 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         {
             // Before the load completes, so the store goes from Loading straight to Degraded (#94).
             Volatile.Write(ref _coldScanShort, 1);
-            LogColdScanFailed(_logger, ex, _dataDir);
+            // Guarded: a scan that fails, with a line that throws, ended this method before its while —
+            // no periodic flush and no final flush for the life of the process (#137).
+            try { LogColdScanFailed(_logger, ex, _dataDir); }
+            catch (Exception) { /* the line is lost; the flush loop below is not */ }
         }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
@@ -2441,6 +2444,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
                     _beforeRollupForTest?.Invoke();
                     await PerformRollupAsync(ct);
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }   // shutdown mid-pass is not an error
                 catch (Exception ex)
                 {
                     try { _logger.LogError(ex, "Metric rollup error"); }

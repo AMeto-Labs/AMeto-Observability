@@ -25,7 +25,13 @@ public sealed class BackgroundLoopGuardTests : IDisposable
 
     public BackgroundLoopGuardTests() => Directory.CreateDirectory(_dir);
 
-    public void Dispose() { try { Directory.Delete(_dir, recursive: true); } catch { } }
+    public void Dispose()
+    {
+        // The pool keeps the retention store's Ameto.db open after the engine is gone; on Windows the
+        // delete then fails and the directory stays in TEMP for ever.
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        try { Directory.Delete(_dir, recursive: true); } catch { }
+    }
 
     private string Sub(string name)
     {
@@ -136,11 +142,17 @@ public sealed class BackgroundLoopGuardTests : IDisposable
             if (Interlocked.Increment(ref ticks) <= 2) throw new InvalidOperationException("flush fault (test seam)");
         };
 
-        await WaitUntil(() => logger.Thrown >= 2, TimeSpan.FromSeconds(20), "two error lines to throw");
-        await WaitUntil(() => Volatile.Read(ref ticks) >= 3, TimeSpan.FromSeconds(20), "a third flush tick");
-        Assert.False(engine.FlushLoopForTest.IsCompleted, "the flush loop ended");
-
-        var disposal = await Record.ExceptionAsync(() => engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
+        Exception? disposal;
+        try
+        {
+            await WaitUntil(() => logger.Thrown >= 2, TimeSpan.FromSeconds(20), "two error lines to throw");
+            await WaitUntil(() => Volatile.Read(ref ticks) >= 3, TimeSpan.FromSeconds(20), "a third flush tick");
+            Assert.False(engine.FlushLoopForTest.IsCompleted, "the flush loop ended");
+        }
+        finally   // a fact that fails must not leave a 50 ms loop and an open metric log in the test host
+        {
+            disposal = await Record.ExceptionAsync(() => engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
+        }
         Assert.Null(disposal);
     }
 
@@ -160,11 +172,17 @@ public sealed class BackgroundLoopGuardTests : IDisposable
             if (Interlocked.Increment(ref passes) <= 2) throw new InvalidOperationException("rollup fault (test seam)");
         };
 
-        await WaitUntil(() => logger.Thrown >= 2, TimeSpan.FromSeconds(20), "two error lines to throw");
-        await WaitUntil(() => Volatile.Read(ref passes) >= 3, TimeSpan.FromSeconds(20), "a third rollup pass");
-        Assert.False(engine.RollupLoopForTest.IsCompleted, "the rollup loop ended");
-
-        var disposal = await Record.ExceptionAsync(() => engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
+        Exception? disposal;
+        try
+        {
+            await WaitUntil(() => logger.Thrown >= 2, TimeSpan.FromSeconds(20), "two error lines to throw");
+            await WaitUntil(() => Volatile.Read(ref passes) >= 3, TimeSpan.FromSeconds(20), "a third rollup pass");
+            Assert.False(engine.RollupLoopForTest.IsCompleted, "the rollup loop ended");
+        }
+        finally
+        {
+            disposal = await Record.ExceptionAsync(() => engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)));
+        }
         Assert.Null(disposal);
     }
 

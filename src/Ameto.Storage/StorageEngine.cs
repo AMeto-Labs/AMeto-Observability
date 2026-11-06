@@ -2278,12 +2278,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // Nothing left to this loop. Stand down, then look once more: a path parked after the
                 // pass above saw this loop still running, and so did not start another.
                 Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+                handedOver = true;    // the flag is not this loop's from here: the look below allocates, and a
+                                      // throw out of it must not clear a flag another loop may have taken since
                 if (!HasSegmentDeletesForBackground()
                     || Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0)
-                {
-                    handedOver = true;   // the flag is down, or another loop's
-                    return;
-                }
+                    return;           // the flag is down, or another loop's
+                handedOver = false;   // taken back: this loop's again
                 delay = SegmentDeleteRetryInitialDelay;
             }
         }
