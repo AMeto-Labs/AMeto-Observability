@@ -542,11 +542,11 @@ Updates and persists retention settings to SQLite.
 }
 ```
 
-Every window is a whole number of days from 1 to 36 500 (100 years); 36 500 is how "keep forever" is spelled. A field left out keeps its default, not its current value.
+Every window is a whole number of days from 1 to 36 500 (100 years); 36 500 is how "keep forever" is spelled. A field left out is **reset to its default** (the values in the example above), not left at its current value: send all eight.
 
 **Response `200 OK`:** updated retention object.
 
-**Response `400 Bad Request`:** a window outside 1…36 500 days; nothing of the request is kept. The body names the field:
+**Response `400 Bad Request`:** a window outside 1…36 500 days; nothing of the request is kept. The body names the field (a value that is not a whole number in the range of a 32-bit integer — `1.5`, `3000000000` — is refused by the request binding with a plain 400, without this body; a number in a string, `"30"`, is accepted):
 ```json
 { "error": "tracesDays must be between 1 and 36500 days", "field": "tracesDays" }
 ```

@@ -32,10 +32,15 @@ export class RetentionSectionComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly dirtyService = inject(SettingsDirtyService);
 
+  /** `RetentionMath.MaxDays` on the server: 100 years, how "keep forever" is spelled (#130). */
+  readonly maxDays = 36_500;
+
   readonly loading = signal(false);
   readonly saving = signal(false);
   readonly running = signal(false);
   readonly runResult = signal<RetentionRunResult | null>(null);
+  /** Why the last save or run was refused — the server's `error` sentence (a window outside 1…36 500 days, for one). */
+  readonly actionError = signal<string | null>(null);
 
   /** Last persisted snapshot — used to detect unsaved edits. */
   private readonly saved = signal<RetentionDto | null>(null);
@@ -115,18 +120,28 @@ export class RetentionSectionComponent implements OnInit {
       tracesDays: this.tracesDays(),
     };
     this.saving.set(true);
+    this.actionError.set(null);
     this.api.putRetention(dto).subscribe({
       next: () => { this.saved.set({ ...dto }); this.saving.set(false); },
-      error: () => this.saving.set(false),
+      error: e => {
+        // The server refuses a window outside 1…36 500 days with 400 { error, field } (#130); the
+        // sentence is what the person who typed "forever" as 200 000 needs to see.
+        this.actionError.set(e?.error?.error ?? 'Failed to save the retention policy.');
+        this.saving.set(false);
+      },
     });
   }
 
   run(): void {
     this.running.set(true);
     this.runResult.set(null);
+    this.actionError.set(null);
     this.api.runRetention().subscribe({
       next: r => { this.runResult.set(r); this.running.set(false); },
-      error: () => this.running.set(false),
+      error: e => {
+        this.actionError.set(e?.error?.error ?? 'Failed to run retention.');
+        this.running.set(false);
+      },
     });
   }
 }

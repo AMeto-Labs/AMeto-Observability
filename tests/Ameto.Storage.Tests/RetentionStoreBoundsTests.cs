@@ -16,7 +16,13 @@ public sealed class RetentionStoreBoundsTests : IDisposable
 
     public RetentionStoreBoundsTests() => Directory.CreateDirectory(_dir);
 
-    public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
+    public void Dispose()
+    {
+        // The pool keeps Ameto.db open after the store is gone, and on Windows the delete then fails and
+        // the directory stays in TEMP for ever (see QuerySegmentFixtures.DeleteDataDirectory).
+        SqliteConnection.ClearAllPools();
+        try { Directory.Delete(_dir, true); } catch { }
+    }
 
     private RetentionStore Store(ServerOptions? options = null)
         => new(options ?? new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance);
@@ -67,7 +73,18 @@ public sealed class RetentionStoreBoundsTests : IDisposable
         Assert.Equal(RetentionMath.MinDays, store.Get().DebugDays);
         Assert.Equal(TimeSpan.FromDays(RetentionMath.MaxDays), RetentionMath.TtlOf(store.Get().TracesDays));
 
-        // Healed where it was stored: a second start reads the clamped values straight from the database.
+        // Healed where it was stored: the rows now hold the bounds, so a rollback to a build without the
+        // clamp reads 36 500 (a cutoff in 1926, nothing deleted), not 200 000 (a cutoff in the future,
+        // every trace file deleted every hour). An in-memory clamp alone would pass the asserts above.
+        using (var conn = new SqliteConnection($"Data Source={Path.Combine(_dir, "Ameto.db")}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT days FROM retention WHERE level = 'traces'";
+            Assert.Equal((long)RetentionMath.MaxDays, (long)cmd.ExecuteScalar()!);
+            cmd.CommandText = "SELECT days FROM retention WHERE level = 'debug'";
+            Assert.Equal((long)RetentionMath.MinDays, (long)cmd.ExecuteScalar()!);
+        }
         Assert.Equal(RetentionMath.MaxDays, Store().Get().TracesDays);
     }
 

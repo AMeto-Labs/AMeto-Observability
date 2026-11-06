@@ -24,7 +24,8 @@ public static class RetentionMath
     /// <summary>
     /// The TTL of a day count that may come from anywhere — a request, the database, a config file —
     /// clamped into [<see cref="MinDays"/>, <see cref="MaxDays"/>], so that no count can make the
-    /// arithmetic below, or <see cref="TimeSpan.FromDays(double)"/>, throw or wrap.
+    /// arithmetic below, or <see cref="TimeSpan.FromDays(int)"/> (which throws past 10 675 199 days),
+    /// throw or wrap.
     /// </summary>
     public static TimeSpan TtlOf(int days) => TimeSpan.FromDays(Math.Clamp(days, MinDays, MaxDays));
 
@@ -34,7 +35,8 @@ public static class RetentionMath
     /// nothing is older — when the TTL reaches back past the Unix epoch, which is where computing
     /// it in <see cref="DateTimeOffset"/> and multiplying out went wrong (see the class doc).
     /// Millisecond arithmetic in <see cref="long"/>: a TTL of <see cref="TimeSpan.MaxValue"/> is
-    /// 9.2 × 10¹⁴ ms and nothing overflows.
+    /// 9.2 × 10¹⁴ ms and nothing overflows — for a <paramref name="now"/> before 2262-04-11, where
+    /// Unix nanoseconds stop fitting a <see cref="long"/>; every caller passes the current time.
     /// </summary>
     public static long CutoffNano(DateTimeOffset now, TimeSpan ttl)
     {

@@ -354,6 +354,8 @@ These seed the SQLite retention table **on first run only**. Afterwards, change 
 | `MetricsDays` | int | `30` |
 | `TracesDays` | int | `14` |
 
+Each is a whole number of days from 1 to 36 500 (100 years, how "keep forever" is spelled). A value outside that range — in this configuration or already in the table from an earlier release — is clamped into it at startup, with a warning in the server log, and the clamped value is what the table holds from then on. A window of some centuries used to wrap the trace cutoff into the future and delete every trace file every hour (#130).
+
 ---
 
 ## Update check (`Ameto:Updates`)
