@@ -5,11 +5,11 @@ import {
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 
-import { DateMaskDirective } from '../../../shared/directives/date-mask.directive';
-import { OverlayPanelRef } from '../../../shared/services/overlay';
+import { DateMaskDirective } from '../../directives/date-mask.directive';
+import { OverlayPanelRef } from '../../services/overlay';
 import {
   DEFAULT_PRESET, TimePreset, fmtPoint, parseCustomDate, utcOffsetLabel,
-} from '../store/events-filter.util';
+} from '../../utils/time-range';
 
 /**
  * Controller handed to the time range popover via {@link OverlayPanelRef.data}.

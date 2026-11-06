@@ -8,7 +8,9 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vite
 import { EventsStore } from './store/events.store';
 import { ApiService } from '../../core/services/api.service';
 import { OverlayPanelRef } from '../../shared/services/overlay';
-import { DateDropdownController, DateRangeDropdownComponent } from './dropdowns/date-range-dropdown';
+import {
+  DateDropdownController, DateRangeDropdownComponent,
+} from '../../shared/components/date-range-dropdown/date-range-dropdown';
 import {
   TimePreset, customRangeLabel, endOfMinuteIso, fmtSpan, parsePreset, presetRange,
 } from './store/events-filter.util';

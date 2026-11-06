@@ -1,21 +1,29 @@
-import { subDays, startOfDay, format, isSameDay } from 'date-fns';
 import { LEVELS, Level, levelShort } from '../../../core/models/event.model';
+import { type TimePreset, QUICK_RANGE_LABELS } from '../../../shared/utils/time-range';
 
 /** The levels in the order every picker and chip strip lists them, each with its badge. */
 export const LEVEL_ITEMS: readonly { key: Level; short: string }[] =
   LEVELS.map(key => ({ key, short: levelShort(key) }));
 
-export type TimePreset = '1d' | '3d' | '7d' | 'custom';
+/**
+ * The time range — its presets, bounds, formats and labels — lives in shared/utils/time-range,
+ * which the Statistics page shares; re-exported here so the Logs page's imports read as they did.
+ */
+export {
+  type TimePreset, type QuickRange, DEFAULT_PRESET, fmtDateInput, endOfMinuteIso, parseCustomDate,
+  presetRange, fmtSpan, fmtPoint, customRangeLabel, utcOffsetLabel,
+} from '../../../shared/utils/time-range';
+
+/** The quick ranges the Logs page offers — the first three of the shared six. */
+export type LogsQuickRange = '1d' | '3d' | '7d';
+export const LOGS_QUICK_RANGES: readonly LogsQuickRange[] = ['1d', '3d', '7d'];
 
 /** The time range dropdown's quick ranges, in the order it lists them. */
-export const PRESET_LABELS: Readonly<Record<Exclude<TimePreset, 'custom'>, string>> = {
-  '1d': 'Last 1 day',
-  '3d': 'Last 3 days',
-  '7d': 'Last 7 days',
+export const PRESET_LABELS: Readonly<Record<LogsQuickRange, string>> = {
+  '1d': QUICK_RANGE_LABELS['1d'],
+  '3d': QUICK_RANGE_LABELS['3d'],
+  '7d': QUICK_RANGE_LABELS['7d'],
 };
-
-/** The window a fresh page opens on, and the one Reset and Clear return to. */
-export const DEFAULT_PRESET: TimePreset = '1d';
 
 /** Presets that saved links still carry, read as the one that replaced each. */
 const LEGACY_PRESETS: Readonly<Record<string, TimePreset>> = { '24h': '1d' };
@@ -514,84 +522,3 @@ export function levelsParam(levels: Set<string>): string | undefined {
   return levels.size === LEVELS.length ? undefined : [...levels].join(',');
 }
 
-export function fmtDateInput(d: Date): string {
-  return format(d, 'yyyy-MM-dd HH:mm');
-}
-
-/**
- * The last instant of `d`'s minute as an ISO-8601 UTC string with seven fractional digits —
- * the server's 100 ns tick. A To bound is a minute and the whole minute is in the window, while
- * the server's `to` is inclusive (API.md): sending the next minute would also take in events
- * stamped exactly on it, so this sends the tick before it. `2026-10-18 23:59` becomes
- * `…T18:59:59.9999999Z` at UTC+5: everything up to, and nothing at, 2026-10-19 00:00.
- */
-export function endOfMinuteIso(d: Date): string {
-  const nextMinute = Math.floor(d.getTime() / 60_000) * 60_000 + 60_000;
-  // toISOString stops at milliseconds (…59.999Z); the four 9s after it are the sub-ms ticks.
-  return new Date(nextMinute - 1).toISOString().replace(/Z$/, '9999Z');
-}
-
-/** Parses `yyyy-MM-dd [HH:mm]` (also accepts legacy `dd/MM/yyyy [HH:mm]`). */
-export function parseCustomDate(val: string): Date | null {
-  if (!val) return null;
-  const iso = val.match(/^(\d{4})-(\d{2})-(\d{2})(?:[\s,T]+(\d{1,2}):(\d{2}))?$/);
-  if (iso) {
-    const [, y, mo, d, h = '0', min = '0'] = iso;
-    const dt = new Date(+y, +mo - 1, +d, +h, +min);
-    return isNaN(dt.getTime()) ? null : dt;
-  }
-  const leg = val.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[\s,T]+(\d{1,2}):(\d{2}))?$/);
-  if (leg) {
-    const [, d, mo, y, h = '0', min = '0'] = leg;
-    const dt = new Date(+y, +mo - 1, +d, +h, +min);
-    return isNaN(dt.getTime()) ? null : dt;
-  }
-  return null;
-}
-
-/**
- * A preset's bounds as of now, in the date inputs' format: N days back to the minute, up to now
- * (`to` ''). Calendar days, so a DST switch inside the window moves no bound by an hour.
- * `custom` has no bounds of its own.
- */
-export function presetRange(preset: TimePreset, now = new Date()): { from: string; to: string } {
-  const days: Record<Exclude<TimePreset, 'custom'>, number> = { '1d': 1, '3d': 3, '7d': 7 };
-  if (preset === 'custom') return { from: '', to: '' };
-  return { from: fmtDateInput(subDays(now, days[preset])), to: '' };
-}
-
-/** A duration in its two largest units, rounded to the minute: `45 m`, `4 h`, `4 d 9 h`. */
-export function fmtSpan(ms: number): string {
-  const min = Math.max(0, Math.round(ms / 60_000));
-  if (min < 60) return `${min} m`;
-  const h = Math.floor(min / 60);
-  if (h < 24) return min % 60 ? `${h} h ${min % 60} m` : `${h} h`;
-  const d = Math.floor(h / 24);
-  return h % 24 ? `${d} d ${h % 24} h` : `${d} d`;
-}
-
-/** `17 Oct 09:00`, with the year only when it is not the current one. */
-export function fmtPoint(d: Date, now: Date): string {
-  return format(d, d.getFullYear() === now.getFullYear() ? 'd MMM HH:mm' : 'd MMM yyyy HH:mm');
-}
-
-/**
- * How a custom window reads on its button: `17 Oct 09:00 → 13:00` plus its length when both ends
- * are set (the date once when they share a day), `Since 17 Oct 09:00` when the end is open.
- * `extra` is the length, drawn quieter than the window itself.
- */
-export function customRangeLabel(from: Date | null, to: Date | null, now = new Date()): { text: string; extra: string } {
-  if (!from) return { text: 'Custom', extra: '' };
-  if (!to) return { text: `Since ${fmtPoint(from, now)}`, extra: '' };
-  const end = isSameDay(from, to) ? format(to, 'HH:mm') : fmtPoint(to, now);
-  return { text: `${fmtPoint(from, now)} → ${end}`, extra: fmtSpan(to.getTime() - from.getTime()) };
-}
-
-/** The browser's offset from UTC as `UTC+05:00` — the zone every time on the page is in. */
-export function utcOffsetLabel(d = new Date()): string {
-  const off = -d.getTimezoneOffset();
-  const abs = Math.abs(off);
-  const hh = String(Math.floor(abs / 60)).padStart(2, '0');
-  const mm = String(abs % 60).padStart(2, '0');
-  return `UTC${off < 0 ? '−' : '+'}${hh}:${mm}`;
-}
