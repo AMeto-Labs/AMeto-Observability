@@ -9,9 +9,7 @@ namespace Serilog.Sinks.Ameto;
 /// <summary>
 /// Tuning knobs for the Ameto sink, configured through an <c>Action</c> delegate:
 /// <code>
-/// .WriteTo.Ameto("http://ameto:5341", o => {
-///     o.ServiceName    = "orders-api";
-///     o.ApiKey         = "…";
+/// .WriteTo.Ameto("http://ameto:5341", "api-key", "orders-api", o => {
 ///     o.BatchSizeLimit = 2000;
 /// })
 /// </code>
@@ -21,7 +19,7 @@ public sealed class AmetoSinkOptions
     // Note: apiKey and serviceName are required and passed as explicit arguments to
     // WriteTo.Ameto(...), not set here — so they can't be accidentally omitted.
 
-    /// <summary>Max events per HTTP POST batch.</summary>
+    /// <summary>Max events per batch. A batch larger in bytes than <see cref="BatchBytesLimit"/> still goes as several requests.</summary>
     public int                 BatchSizeLimit           { get; set; } = 1000;
 
     /// <summary>How often batches are flushed (also flushes early when the batch fills).</summary>
@@ -43,18 +41,50 @@ public sealed class AmetoSinkOptions
     public HttpClient?         HttpClient               { get; set; }
 
     /// <summary>
-    /// Max serialised size of a single event, in bytes. An event over the limit is
-    /// replaced by a compact Error-level marker (original template, level, size and
-    /// trace context preserved) — so a runaway <c>{@Object}</c> is VISIBLE in Ameto
-    /// instead of being silently rejected by the server's payload cap. Matches the
-    /// server's default <c>Ingestion.MaxEventPayloadBytes</c> (64 KB). 0 = unlimited.
+    /// Max serialised bytes of one HTTP request. A batch that serialises past it is sent as several
+    /// requests, each under the limit (an event larger than the limit on its own still goes, alone).
+    /// Keep it under the server's <c>Ingestion.MaxBatchBytes</c> (4 MB by default), which answers 413
+    /// to a larger body; the sink then halves the request and tries again. 0 = one request per batch.
     /// </summary>
-    public int                 EventBodyLimitBytes      { get; set; } = 65_536;
+    public int                 BatchBytesLimit          { get; set; } = 3 * 1024 * 1024;
+
+    /// <summary>
+    /// Max serialised size of one event's PROPERTIES, in bytes — the map header and its pairs, what
+    /// the server measures against its <c>Ingestion.MaxEventPayloadBytes</c> (64 KB by default). An
+    /// event over the limit is replaced by a compact Error-level marker (original template, level,
+    /// size and trace context preserved) — so a runaway <c>{@Object}</c> is VISIBLE in Ameto instead
+    /// of being rejected by the server. The exception has its own limit, <see cref="ExceptionLimitBytes"/>.
+    /// 0 = unlimited.
+    /// </summary>
+    public int                 PropertiesLimitBytes     { get; set; } = 65_536;
+
+    /// <summary>
+    /// About the most one event's exception (<c>@x</c>) takes serialised, in bytes. Over it the sink
+    /// keeps the exception type, cuts the message and the stack trace and drops the inner exceptions —
+    /// the event itself still arrives. A target rather than a hard cap: the cut is by characters, and
+    /// a stack trace full of non-ASCII names can land over it. The server takes the exception apart
+    /// from the properties and has no comparable cap of its own. 0 = unlimited.
+    /// </summary>
+    public int                 ExceptionLimitBytes      { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// The 1.0 name of <see cref="PropertiesLimitBytes"/>. Up to 1.0.x it measured the whole serialised
+    /// event, exception included; it now sets <see cref="PropertiesLimitBytes"/>, which measures the
+    /// properties map only. The exception has <see cref="ExceptionLimitBytes"/>, which a 1.0 setting
+    /// meant for whole events — or a 0 meant as "no limit" — should set too.
+    /// </summary>
+    [Obsolete("Renamed PropertiesLimitBytes, which measures the properties map only (1.0 measured the whole event). The exception has ExceptionLimitBytes.",
+        DiagnosticId = "AMETOSINK001")]
+    public int                 EventBodyLimitBytes
+    {
+        get => PropertiesLimitBytes;
+        set => PropertiesLimitBytes = value;
+    }
 }
 
 /// <summary>
 /// Ready-made <see cref="AmetoSinkOptions"/> profiles. Pass one directly, or compose then
-/// override: <c>o => { AmetoSinkProfiles.HighThroughput(o); o.ServiceName = "api"; }</c>.
+/// override: <c>o => { AmetoSinkProfiles.HighThroughput(o); o.BatchSizeLimit = 2000; }</c>.
 /// </summary>
 public static class AmetoSinkProfiles
 {
@@ -86,8 +116,13 @@ public static class AmetoSinkProfiles
         o.QueueLimit     = 10_000;
     };
 
-    /// <summary>Large in-memory buffer to ride out transient server outages without dropping
-    /// events (PeriodicBatching retries failed batches with back-off); trades RAM for durability.</summary>
+    /// <summary>
+    /// Large in-memory buffer to ride out short server outages without dropping events; trades RAM
+    /// for durability. A batch the server could not take is retried with back-off (one period, then
+    /// 10 s doubling to 1 min) for the batching layer's retry time limit of 10 minutes, counted from
+    /// the first failure since the last success: in a longer outage every later batch gets one
+    /// attempt and is dropped, and after ten dropped batches in a row the queue is emptied.
+    /// </summary>
     public static readonly Action<AmetoSinkOptions> Resilient = static o =>
     {
         o.BatchSizeLimit = 1_000;
@@ -110,7 +145,7 @@ public static class AmetoSinkExtensions
     /// <param name="serverUrl">Base URL of the Ameto server, e.g. <c>http://ameto:5341</c>.</param>
     /// <param name="apiKey">API key sent as the <c>X-Seq-ApiKey</c> header. Required.</param>
     /// <param name="serviceName">Service identifier written as <c>service.name</c> on every event. Required.</param>
-    /// <param name="configure">Optional tuning (batch size, period, queue, level, HttpClient).</param>
+    /// <param name="configure">Optional tuning (batch size, period, queue, limits, level, HttpClient).</param>
     public static LoggerConfiguration Ameto(
         this LoggerSinkConfiguration sinkConfiguration,
         string                       serverUrl,
@@ -129,7 +164,8 @@ public static class AmetoSinkExtensions
         var opts = new AmetoSinkOptions();
         configure?.Invoke(opts);
 
-        var batched = new AmetoBatchedSink(serverUrl, apiKey, serviceName, opts.HttpClient, opts.EventBodyLimitBytes);
+        var batched = new AmetoBatchedSink(serverUrl, apiKey, serviceName, opts.HttpClient,
+            opts.PropertiesLimitBytes, opts.ExceptionLimitBytes, opts.BatchBytesLimit);
 
         var batchOptions = new PeriodicBatchingSinkOptions
         {

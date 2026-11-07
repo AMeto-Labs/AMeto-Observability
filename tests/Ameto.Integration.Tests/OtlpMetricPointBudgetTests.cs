@@ -33,7 +33,7 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
 {
     private const int Limit = 100_000;
 
-    private const string Refusal = "the batch decodes to more data points and buckets than this server takes in one request; split it";
+    private const string Refusal = "the batch decodes to more data points, buckets and resource labels than this server takes in one request; split it";
 
     public sealed class Factory : AmetoWebAppFactory
     {
@@ -128,6 +128,66 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
             json, new JsonSerializerOptions { AllowTrailingCommas = true });
         Assert.Equal(4, OtlpMetricMapper.Map(request!).Count);
         Assert.Equal(4, OtlpMetricPointBudget.CountJson(json));
+    }
+
+    // ── Resource labels (#132) ────────────────────────────────────────────────
+
+    /// <summary>
+    /// A resource's attributes cost nothing per point on the wire and are merged and sorted again for
+    /// every point under them — ~32 600 compares and a 256-pair sort a point at 256 of them — and a
+    /// point's weight did not see them: 131 040 empty points under a 255-attribute resource, under 1 KB
+    /// gzipped, weighed exactly the floor limit and cost 10–30 s of one core on the smallest host. So a
+    /// resource is charged on every point under it, 32 B an attribute past the first 32, on both
+    /// encodings and whichever order the resource and its scope metrics come in.
+    /// </summary>
+    [Fact]
+    public void Both_weights_charge_a_resources_attributes_past_32_on_every_point_under_it()
+    {
+        const int Attributes = 256, Points = 1_000;
+        long charged = (Attributes - OtlpMetricPointBudget.FreeResourceLabels) * (long)Points;
+
+        var proto = OtlpMetricPointBudget.WeighProto(EmptyPoints("budget.res", Points, protobuf: true,  resourceAttributes: Attributes));
+        var json  = OtlpMetricPointBudget.WeighJson (EmptyPoints("budget.res", Points, protobuf: false, resourceAttributes: Attributes));
+        Assert.Equal(Points,  proto.Points);
+        Assert.Equal(charged, proto.ResourceLabels);
+        Assert.Equal(Points * OtlpMetricPointBudget.PointBytes + charged * OtlpMetricPointBudget.ResourceLabelBytes, proto.DecodedBytes);
+        Assert.Equal(proto, json);
+
+        // Up to 32 attributes — an SDK's and a k8s processor's worth — a point weighs what it did.
+        Assert.Equal(0, OtlpMetricPointBudget.WeighProto(EmptyPoints("budget.res", Points, protobuf: true,  resourceAttributes: 32)).ResourceLabels);
+        Assert.Equal(0, OtlpMetricPointBudget.WeighJson (EmptyPoints("budget.res", Points, protobuf: false, resourceAttributes: 32)).ResourceLabels);
+
+        // Past the label cap every point under the resource is refused at decode without a merge, so the
+        // charge stops growing there.
+        Assert.Equal(charged, OtlpMetricPointBudget.WeighProto(EmptyPoints("budget.res", Points, protobuf: true, resourceAttributes: 20_000)).ResourceLabels);
+
+        // A resource that follows its scope metrics is charged the same: neither wire format orders them.
+        Assert.Equal(proto, OtlpMetricPointBudget.WeighProto(EmptyPoints("budget.res", Points, protobuf: true,  resourceAttributes: Attributes, resourceLast: true)));
+        Assert.Equal(json,  OtlpMetricPointBudget.WeighJson (EmptyPoints("budget.res", Points, protobuf: false, resourceAttributes: Attributes, resourceLast: true)));
+    }
+
+    /// <summary>
+    /// Exactly the limit of empty points is taken on its own (it weighs the whole budget) and refused
+    /// under a resource of 256 attributes, which weighs 7 168 B more a point: 265 KB of protobuf, under
+    /// 1 KB gzipped — the request the budget did not see. Under 32 attributes a point weighs what it
+    /// did, and the batch is decoded and taken as before.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_batch_at_the_point_limit_under_a_256_attribute_resource_is_413(bool protobuf)
+    {
+        string name = "budget.resource." + (protobuf ? "proto" : "json");
+        using var refused = await PostAsync(EmptyPoints(name, Limit, protobuf, resourceAttributes: 256), protobuf);
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, refused.StatusCode);
+        Assert.Equal(Refusal, StatusMessage(await refused.Content.ReadAsByteArrayAsync(), protobuf));
+        Assert.Empty(QueryNames(name));
+
+        using var accepted = await PostAsync(EmptyPoints(name, 1_000, protobuf, stamped: true, resourceAttributes: 32), protobuf);
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.Equal("{\"ingested\":1000,\"dropped\":0}", await accepted.Content.ReadAsStringAsync());
+        Assert.Contains(name, QueryNames(name));
     }
 
     // ── The limit ─────────────────────────────────────────────────────────────
@@ -481,7 +541,128 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
         Assert.Contains("buckets.beside.grpc", QueryNames("buckets.beside.grpc"));
     }
 
+    /// <summary>
+    /// A point of more than <see cref="MetricLabelSetBuilder.MaxLabels"/> labels is refused at decode and
+    /// reported as dropped; the rest of its batch is ingested (#132). A point of 20 000 attributes used to
+    /// cost half a second of one core — the label dedupe scanned the keys already present for each one —
+    /// and the point budget, which counts points, let an 8 MiB body of them through. A point AT the cap
+    /// is taken as before.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_point_of_more_than_256_labels_is_dropped_and_the_rest_of_its_batch_ingested(bool protobuf)
+    {
+        string tag = protobuf ? "proto" : "json";
+        string wide = "labels.wide." + tag, beside = "labels.beside." + tag;
+
+        using var refused = await PostAsync(GaugeBeside(wide, MetricLabelSetBuilder.MaxLabels + 1, beside, protobuf), protobuf);
+
+        Assert.Equal(HttpStatusCode.OK, refused.StatusCode);
+        Assert.Equal("{\"ingested\":1,\"dropped\":1}", await refused.Content.ReadAsStringAsync());
+        Assert.Empty(QueryNames(wide));
+        Assert.Contains(beside, QueryNames(beside));
+
+        string atCap = "labels.at-cap." + tag, beside2 = "labels.beside2." + tag;
+        using var accepted = await PostAsync(GaugeBeside(atCap, MetricLabelSetBuilder.MaxLabels, beside2, protobuf), protobuf);
+
+        Assert.Equal("{\"ingested\":2,\"dropped\":0}", await accepted.Content.ReadAsStringAsync());
+        Assert.Contains(atCap, QueryNames(atCap));
+    }
+
+    /// <summary>The same over gRPC: OK, with the point in <c>partial_success</c> and the reason.</summary>
+    [Fact]
+    public async Task A_grpc_point_of_more_than_256_labels_is_a_rejected_point_with_its_reason()
+    {
+        var gate = new OtlpInflateGate(1, TimeSpan.Zero);
+        var noLog = new OtlpGzipTooLargeLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var noMemoryLog = new OtlpOutOfMemoryLog(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, TimeProvider.System);
+        var call = GrpcCall(Frame(GaugeBeside("labels.wide.grpc", MetricLabelSetBuilder.MaxLabels + 1,
+                                              "labels.beside.grpc", protobuf: true)));
+
+        await OtlpGrpcEndpointMapper.HandleAsync(call, ApiKeyPermissions.Metrics, gate, noLog, noMemoryLog,
+            (c, msg) => OtlpGrpcEndpointMapper.DecodeMetrics(c, msg.AsSpan(), Limit));
+
+        Assert.Equal("0", call.Response.Headers["grpc-status"].ToString());
+        Assert.Equal(OtlpGrpcFraming.Frame(OtlpGrpcFraming.ExportResponse(1, OtlpGrpcEndpointMapper.TooManyLabelsReason)),
+                     ((MemoryStream)call.Response.Body).ToArray());
+        Assert.Empty(QueryNames("labels.wide.grpc"));
+        Assert.Contains("labels.beside.grpc", QueryNames("labels.beside.grpc"));
+    }
+
+    /// <summary>
+    /// Each mix of the three refusals names exactly its reasons (eight arms, of which the two tests above
+    /// pin two), and the "256" and "65535" the constants spell out cannot drift from the caps.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 0, 1, OtlpGrpcEndpointMapper.FutureReason)]
+    [InlineData(1, 0, 0, OtlpGrpcEndpointMapper.TooManyBucketsReason)]
+    [InlineData(0, 1, 0, OtlpGrpcEndpointMapper.TooManyLabelsReason)]
+    [InlineData(1, 1, 0, OtlpGrpcEndpointMapper.TooManyBucketsAndLabelsReason)]
+    [InlineData(1, 0, 1, OtlpGrpcEndpointMapper.TooManyBucketsAndFutureReason)]
+    [InlineData(0, 1, 1, OtlpGrpcEndpointMapper.TooManyLabelsAndFutureReason)]
+    [InlineData(1, 1, 1, OtlpGrpcEndpointMapper.EveryReason)]
+    public void Each_mix_of_refusals_names_its_reasons(int buckets, int labels, int stale, string reason)
+    {
+        Assert.Equal(reason, OtlpGrpcEndpointMapper.RefusalReason(new MetricDecodeRefusals(buckets, labels), stale));
+        Assert.Contains($"more than {MetricLabelSetBuilder.MaxLabels} labels",          OtlpGrpcEndpointMapper.TooManyLabelsReason);
+        Assert.Contains($"more than {MetricIngestItem.MaxBucketCounts} buckets", OtlpGrpcEndpointMapper.TooManyBucketsReason);
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One batch: a gauge point of <paramref name="attributes"/> distinct string attributes and a gauge
+    /// point beside it with none, both stamped a minute ago and without a resource, so the first point's
+    /// label count is exactly its attribute count.
+    /// </summary>
+    private static byte[] GaugeBeside(string wide, int attributes, string gauge, bool protobuf)
+    {
+        long now = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60_000) * 1_000_000L;
+        string ts = now.ToString(CultureInfo.InvariantCulture);
+        if (!protobuf)
+        {
+            var sb = new StringBuilder("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"name\":\"")
+                .Append(wide).Append("\",\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"").Append(ts)
+                .Append("\",\"asDouble\":1.5,\"attributes\":[");
+            for (int i = 0; i < attributes; i++)
+                sb.Append(i == 0 ? "" : ",").Append("{\"key\":\"k").Append(i).Append("\",\"value\":{\"stringValue\":\"v\"}}");
+            sb.Append("]}]}},{\"name\":\"").Append(gauge).Append("\",\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"")
+              .Append(ts).Append("\",\"asDouble\":1.5}]}}]}]}]}");
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        return Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm =>
+        {
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(wide);
+                Sub(metric, 5, Msg(g => Sub(g, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                    for (int i = 0; i < attributes; i++)
+                        Sub(dp, 7, StringAttribute("k" + i, "v"));                   // field 7: attributes
+                }))));
+            }));
+            Sub(sm, 2, Msg(metric =>
+            {
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(gauge);
+                Sub(metric, 5, Msg(g => Sub(g, 1, Msg(dp =>
+                {
+                    dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)now);
+                    dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                }))));
+            }));
+        })))));
+    }
+
+    /// <summary>An OTLP KeyValue with a string AnyValue.</summary>
+    private static byte[] StringAttribute(string key, string value) => Msg(kv =>
+    {
+        kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString(key);
+        Sub(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString(value); }));
+    });
 
     /// <summary>
     /// One batch: a histogram point of <paramref name="buckets"/> zero counts — packed varints, one byte
@@ -578,15 +759,19 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
 
     /// <summary>
     /// One gauge of <paramref name="points"/> data points: empty (two bytes each on the wire), or
-    /// stamped with a recent time and a value, as an exporter's would be.
+    /// stamped with a recent time and a value, as an exporter's would be — under a resource of
+    /// <paramref name="resourceAttributes"/> string attributes (<c>r0</c>…), if any, written before its
+    /// scope metrics or, with <paramref name="resourceLast"/>, after them.
     /// </summary>
-    private static byte[] EmptyPoints(string name, int points, bool protobuf, bool stamped = false)
+    private static byte[] EmptyPoints(string name, int points, bool protobuf, bool stamped = false,
+                                      int resourceAttributes = 0, bool resourceLast = false)
     {
         long now = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60_000) * 1_000_000L;
         if (!protobuf)
         {
-            var sb = new StringBuilder("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"name\":\"")
-                .Append(name).Append("\",\"gauge\":{\"dataPoints\":[");
+            var sb = new StringBuilder("{\"resourceMetrics\":[{");
+            if (resourceAttributes > 0 && !resourceLast) JsonResource(sb, resourceAttributes).Append(',');
+            sb.Append("\"scopeMetrics\":[{\"metrics\":[{\"name\":\"").Append(name).Append("\",\"gauge\":{\"dataPoints\":[");
             for (int i = 0; i < points; i++)
             {
                 if (i > 0) sb.Append(',');
@@ -595,27 +780,49 @@ public sealed class OtlpMetricPointBudgetTests : IClassFixture<OtlpMetricPointBu
                       .Append("\",\"asDouble\":1.5}");
                 else sb.Append("{}");
             }
-            return Encoding.UTF8.GetBytes(sb.Append("]}}]}]}]}").ToString());
+            sb.Append("]}}]}]");
+            if (resourceAttributes > 0 && resourceLast) JsonResource(sb.Append(','), resourceAttributes);
+            return Encoding.UTF8.GetBytes(sb.Append("}]}").ToString());
         }
 
-        return Msg(c => Sub(c, 1, Msg(rm => Sub(rm, 2, Msg(sm => Sub(sm, 2, Msg(metric =>
+        return Msg(c => Sub(c, 1, Msg(rm =>
         {
-            metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(name);
-            Sub(metric, 5, Msg(gauge =>
+            if (resourceAttributes > 0 && !resourceLast) Sub(rm, 1, Resource(resourceAttributes));
+            Sub(rm, 2, Msg(sm => Sub(sm, 2, Msg(metric =>
             {
-                for (int i = 0; i < points; i++)
+                metric.WriteTag(1, WireFormat.WireType.LengthDelimited); metric.WriteString(name);
+                Sub(metric, 5, Msg(gauge =>
                 {
-                    long ts = now + i * 1_000_000L;
-                    Sub(gauge, 1, stamped
-                        ? Msg(dp =>
-                        {
-                            dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)ts);
-                            dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
-                        })
-                        : []);
-                }
-            }));
-        })))))));
+                    for (int i = 0; i < points; i++)
+                    {
+                        long ts = now + i * 1_000_000L;
+                        Sub(gauge, 1, stamped
+                            ? Msg(dp =>
+                            {
+                                dp.WriteTag(3, WireFormat.WireType.Fixed64); dp.WriteFixed64((ulong)ts);
+                                dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(1.5);
+                            })
+                            : []);
+                    }
+                }));
+            }))));
+            if (resourceAttributes > 0 && resourceLast) Sub(rm, 1, Resource(resourceAttributes));
+        })));
+    }
+
+    /// <summary>A protobuf Resource of <paramref name="attributes"/> string attributes <c>r0</c>…, all valued <c>v</c>.</summary>
+    private static byte[] Resource(int attributes) => Msg(res =>
+    {
+        for (int i = 0; i < attributes; i++) Sub(res, 1, StringAttribute("r" + i, "v"));
+    });
+
+    /// <summary>The JSON twin of <see cref="Resource"/>, appended as the <c>resource</c> member.</summary>
+    private static StringBuilder JsonResource(StringBuilder sb, int attributes)
+    {
+        sb.Append("\"resource\":{\"attributes\":[");
+        for (int i = 0; i < attributes; i++)
+            sb.Append(i == 0 ? "" : ",").Append("{\"key\":\"r").Append(i).Append("\",\"value\":{\"stringValue\":\"v\"}}");
+        return sb.Append("]}");
     }
 
     /// <summary>A metric of <paramref name="points"/> data points under field <paramref name="kindField"/> (5 gauge, 7 sum, 9 histogram).</summary>

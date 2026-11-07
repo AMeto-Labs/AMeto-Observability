@@ -107,14 +107,19 @@ internal static class AuthServiceExtensions
         // ── JWT secret ─────────────────────────────────────────────────────────
         var secretPath = Path.Combine(dataDirectory, "jwt-secret.bin");
         string secret;
-        if (File.Exists(secretPath))
+        // Read first; generate only when the file system says there is no file (#138 item 7). File.Exists
+        // answered false for a file it could not look at too, and a new secret then overwrote the one that
+        // existed: every session invalidated. A read that fails otherwise fails the start instead, and the
+        // new file is written owner-only, flushed to disk and moved into place without overwrite
+        // (KeyFile.WriteNew), never over one that appeared meanwhile.
+        try
         {
             secret = File.ReadAllText(secretPath, Encoding.UTF8);
         }
-        else
+        catch (FileNotFoundException)
         {
             secret = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));
-            File.WriteAllText(secretPath, secret, Encoding.UTF8);
+            Ameto.Core.KeyFile.WriteNew(secretPath, Encoding.UTF8.GetBytes(secret));
         }
 
         var issuer = new JwtIssuer(secret);

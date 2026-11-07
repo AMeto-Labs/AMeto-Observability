@@ -67,6 +67,16 @@ public interface ISpanSink
     /// the batch had refused. Call it from a <c>finally</c>.
     /// </summary>
     void EndBatch();
+
+    /// <summary>
+    /// Whether what the calling thread's batch refused was refused FOR ROOM — a ring full by slots,
+    /// by arena or by bytes in flight, which a retry finds freer as the drainer works — rather than
+    /// for a span heavier than the whole ring, which no retry fits (#138). Read after a refusal and
+    /// before <see cref="EndBatch"/>, which forgets it. The receivers answer 503/UNAVAILABLE, which
+    /// exporters retry, only for a batch refused whole for room; a batch whose first span can never
+    /// fit stays a partial success. A sink that cannot tell says true.
+    /// </summary>
+    bool RefusedForRoom => true;
 }
 
 /// <summary>

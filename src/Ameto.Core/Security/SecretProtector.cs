@@ -111,21 +111,28 @@ public static class SecretProtectorFactory
         Directory.CreateDirectory(dataDirectory);
         var path = Path.Combine(dataDirectory, "secret.key");
         byte[] fileKey;
-        if (File.Exists(path))
+        // READ FIRST, GENERATE ONLY WHEN THE FILE SYSTEM SAYS THERE IS NO FILE (#138 item 7). This asked
+        // File.Exists, which answers false for a file it could not look at as well as for one that is gone —
+        // a share that did not answer, an antivirus hold, an access check — and then generated a new key
+        // and wrote it OVER the one that existed: every secret stored under the old key undecryptable, for
+        // good. A read that fails any other way than "not found" now fails the start, which is recoverable;
+        // and the new file is created with CreateNew, so a key that appeared meanwhile is never overwritten.
+        try
         {
-            fileKey = DecodeKey(File.ReadAllText(path).Trim());
+            FileRefusal.ThrowIfRefused(path, FileRefusal.Access.Open);
+            fileKey = DecodeKey(File.ReadAllText(path).Trim(), $"the key file {path}");
         }
-        else
+        catch (FileNotFoundException)
         {
             fileKey = RandomNumberGenerator.GetBytes(32);
-            File.WriteAllText(path, Convert.ToBase64String(fileKey));
-            TrySetOwnerOnly(path);
+            KeyFile.WriteNew(path, Encoding.ASCII.GetBytes(Convert.ToBase64String(fileKey)));
             onGeneratedKey?.Invoke(path);
         }
         return new AesGcmSecretProtector(fileKey);
     }
 
-    private static byte[] DecodeKey(string s)
+    /// <param name="source">What held the text, for the message: the configuration key, or the key file.</param>
+    private static byte[] DecodeKey(string s, string source = "Ameto:MasterKey")
     {
         // 64 hex chars → 32 bytes
         if (s.Length == 64 && s.All(Uri.IsHexDigit))
@@ -133,17 +140,49 @@ public static class SecretProtectorFactory
 
         byte[] bytes;
         try { bytes = Convert.FromBase64String(s); }
-        catch (FormatException) { throw new InvalidOperationException("Ameto:MasterKey must be base64 or 64-char hex."); }
+        catch (FormatException) { throw new InvalidOperationException($"{source} must be base64 or 64-char hex."); }
 
         if (bytes.Length != 32)
-            throw new InvalidOperationException($"Ameto:MasterKey must decode to 32 bytes (got {bytes.Length}).");
+            throw new InvalidOperationException($"{source} must decode to 32 bytes (got {bytes.Length}).");
         return bytes;
     }
+}
 
-    private static void TrySetOwnerOnly(string path)
+/// <summary>
+/// Writes a new key file — <c>secret.key</c>, <c>jwt-secret.bin</c> — so that neither a crash nor a power
+/// loss can leave it empty or missing, and no other user can read it meanwhile (#138 item 7 review). A
+/// temp file is created owner-only from its creation (a mode set after the write left the file at the
+/// umask's 0644 for a moment), written, flushed to the platter, and moved into place without overwrite,
+/// so a key that appeared meanwhile is never replaced. Written in place and unflushed, a crash between
+/// the create and the write left an empty file (every start then failed, with a message naming the
+/// configuration key), and a power loss under ext4's delayed allocation could leave it missing: a new
+/// key was generated, and every secret stored under the old one became undecryptable.
+/// </summary>
+public static class KeyFile
+{
+    public static void WriteNew(string path, ReadOnlySpan<byte> content)
     {
-        if (OperatingSystem.IsWindows()) return; // POSIX modes not supported on Windows
-        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
-        catch { /* best effort */ }
+        // A temp of this writer's own: with one shared name, a second process starting on the same directory
+        // (not supported, but nothing locks the directory before this runs) unlinked the first's temp
+        // mid-write on POSIX, and the first's Move then published the second's key while the first kept
+        // its own in memory — every secret it sealed undecryptable after its restart. With a name of its
+        // own each writer moves its own bytes, and the loser's Move finds the key there and fails its start.
+        string tmp = $"{path}.{Guid.NewGuid():N}.tmp";
+        var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        try
+        {
+            using (var fs = new FileStream(tmp, options))
+            {
+                fs.Write(content);
+                fs.Flush(flushToDisk: true);
+            }
+            File.Move(tmp, path, overwrite: false);   // IOException when a key appeared meanwhile: never over one that exists
+        }
+        catch
+        {
+            try { File.Delete(tmp); } catch { /* an orphan temp is read by nothing */ }
+            throw;
+        }
     }
 }

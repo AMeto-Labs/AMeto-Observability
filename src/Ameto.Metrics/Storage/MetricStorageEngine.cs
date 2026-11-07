@@ -141,6 +141,25 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// </summary>
     internal Action? OnSnapshotTakenForTest;
 
+    /// <summary>Test seam: runs before each periodic flush of the flush loop; throwing from it is a flush that failed. Null in production.</summary>
+    internal Action? _beforePeriodicFlushForTest;
+
+    /// <summary>Test seam: runs before each pass of the rollup loop; throwing from it is a pass that failed. Null in production.</summary>
+    internal Action? _beforeRollupForTest;
+
+    /// <summary>
+    /// Test seam: the rollup loop's interval for an engine constructed while this is set — the
+    /// production five minutes are more than a test that watches the loop go round can wait. An
+    /// <see cref="AsyncLocal{T}"/>, read in the constructor; null in production.
+    /// </summary>
+    internal static readonly AsyncLocal<TimeSpan?> RollupIntervalForTest = new();
+
+    private readonly TimeSpan _rollupInterval;
+
+    /// <summary>Test observers: the two background loops, to tell a loop that still runs from one that ended.</summary>
+    internal Task FlushLoopForTest  => _flushTask;
+    internal Task RollupLoopForTest => _rollupTask;
+
     /// <summary>
     /// Test seam: handed to <see cref="MetricWriter.Write"/> and invoked with each <c>.mts</c>
     /// path the moment that file is complete. Throwing from it is a PARTIAL write — the disk
@@ -594,6 +613,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         _minFlushBytes             = Math.Min(_hotFlushBytes, _options.MinFlushBytesFor(in budgets));
         _flushCheckInterval        = _options.FlushCheckInterval > TimeSpan.Zero
                                         ? _options.FlushCheckInterval : TimeSpan.FromSeconds(60);
+        _rollupInterval            = RollupIntervalForTest.Value ?? TimeSpan.FromMinutes(5);
         _maxHotAge                 = _options.MaxHotAge > TimeSpan.Zero
                                         ? _options.MaxHotAge : TimeSpan.FromHours(1);
         _staleSeriesAge            = TimeSpan.FromTicks(_maxHotAge.Ticks * 2);
@@ -1770,29 +1790,53 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         {
             // Before the load completes, so the store goes from Loading straight to Degraded (#94).
             Volatile.Write(ref _coldScanShort, 1);
-            LogColdScanFailed(_logger, ex, _dataDir);
+            // Guarded: a scan that fails, with a line that throws, ended this method before its while —
+            // no periodic flush and no final flush for the life of the process (#137).
+            try { LogColdScanFailed(_logger, ex, _dataDir); }
+            catch (Exception) { /* the line is lost; the flush loop below is not */ }
         }
         finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(_flushCheckInterval, _time, ct); }
-            catch (OperationCanceledException) { break; }
+            try
+            {
+                try { await Task.Delay(_flushCheckInterval, _time, ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
 
-            // A tick that throws must cost one tick. Bare, this await made any escaping
-            // exception terminal: the loop ended, so no periodic flush ran again for the life
-            // of the process, the final flush below never ran either, and — because
-            // DisposeAsync only catches OperationCanceledException off this task — the fault
-            // came back out of shutdown and skipped the ingest fence and the log's close. The
-            // hot tier and the log then grew without bound and nothing said why. The flush
-            // logs its own failures; this is only here so that the loop outlives them.
-            try { await FlushIfDueAsync(); }
-            catch (Exception ex) { _logger.LogError(ex, "Periodic metric flush failed; the loop continues"); }
+                // A tick that throws must cost one tick. Bare, this await made any escaping
+                // exception terminal: the loop ended, so no periodic flush ran again for the life
+                // of the process, the final flush below never ran either, and — because
+                // DisposeAsync only catches OperationCanceledException off this task — the fault
+                // came back out of shutdown and skipped the ingest fence and the log's close. The
+                // hot tier and the log then grew without bound and nothing said why. The flush
+                // logs its own failures; this is only here so that the loop outlives them.
+                try
+                {
+                    _beforePeriodicFlushForTest?.Invoke();
+                    await FlushIfDueAsync();
+                }
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "Periodic metric flush failed; the loop continues"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                }
 
-            // The label pool's reset bridge ends on its interval even when churn has stopped and no
-            // new label arrives to end it (see MetricLabelInterner.EndBridgeIfDue): a volatile read
-            // per tick while there is no bridge.
-            MetricLabelInterner.Shared.EndBridgeIfDue();
+                // The label pool's reset bridge ends on its interval even when churn has stopped and no
+                // new label arrives to end it (see MetricLabelInterner.EndBridgeIfDue): a volatile read
+                // per tick while there is no bridge.
+                MetricLabelInterner.Shared.EndBridgeIfDue();
+            }
+            catch (Exception ex)
+            {
+                // A FAILURE OUTSIDE THE FLUSH — the error line above running out of memory, a delay
+                // that could not be set up — used to end the loop all the same (#137; the log engine's
+                // e6fe109). Said, if the logger can; one blocked second, which allocates nothing; and
+                // the loop goes on — the shutdown flag is read at the top.
+                try { _logger.LogError(ex, "The metric flush loop failed outside a flush; it goes on"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                Thread.Sleep(1000);
+            }
         }
         // Final flush on shutdown — unconditional, so a clean stop leaves nothing to replay.
         try { await FlushHotTierAsync(); }
@@ -2422,13 +2466,35 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromMinutes(5), ct); }
-            catch (OperationCanceledException) { break; }
+            try
+            {
+                try { await Task.Delay(_rollupInterval, ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
 
-            try { await PerformRollupAsync(ct); }
-            catch (Exception ex) { _logger.LogError(ex, "Metric rollup error"); }
-            // Advance the round-robin so the next pass serves the next metrics.
-            _rollupCursor += MaxMetricsPerPass;
+                try
+                {
+                    _beforeRollupForTest?.Invoke();
+                    await PerformRollupAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }   // shutdown mid-pass is not an error
+                catch (Exception ex)
+                {
+                    try { _logger.LogError(ex, "Metric rollup error"); }
+                    catch (Exception) { /* the line is lost; the loop is not */ }
+                }
+                // Advance the round-robin so the next pass serves the next metrics.
+                _rollupCursor += MaxMetricsPerPass;
+            }
+            catch (Exception ex)
+            {
+                // The error line above ran out of memory, or the delay could not be set up: the loop
+                // used to end, and with it every rollup and compaction for the life of the process
+                // (#137). Said, if the logger can; one blocked second; and it goes on — the shutdown
+                // flag is read at the top.
+                try { _logger.LogError(ex, "The metric rollup loop failed outside a pass; it goes on"); }
+                catch (Exception) { /* the line is lost; the loop is not */ }
+                Thread.Sleep(1000);
+            }
         }
     }
 
@@ -2746,7 +2812,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             {
                 // The file's failure, not the work's: it leaves every later rewrite, and the rest of
                 // the group goes at the metric's next turn without it — no back-off (#125 review F1).
-                QuarantineFromRewrites(ex.Source, ex.InnerException!);
+                QuarantineFromRewrites(ex.Segment, ex.InnerException!);
             }
             catch (Exception ex)
             {
@@ -2819,14 +2885,11 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     /// 2 025 years) threw, so retention never ran and — once the clip shared the formula — every
     /// rewrite failed; and a TTL some centuries long (roughly 350 to 585 years: "200000 days" for
     /// "forever") wrapped the multiplication into a cutoff in the FUTURE, so retention deleted every
-    /// metric file, every hour.
+    /// metric file, every hour. The arithmetic now lives in <see cref="RetentionMath.CutoffNano"/>,
+    /// shared with the trace prune (#130); this is the name the rewrite and the tests know.
     /// </summary>
     internal static long RetentionCutoffNano(DateTimeOffset now, TimeSpan ttl)
-    {
-        long nowMs = now.ToUnixTimeMilliseconds();
-        long ttlMs = Math.Max(0, ttl.Ticks / TimeSpan.TicksPerMillisecond);
-        return ttlMs >= nowMs ? long.MinValue : (nowMs - ttlMs) * 1_000_000L;
-    }
+        => RetentionMath.CutoffNano(now, ttl);
 
     /// <summary>The TTL the last retention run pruned with; 0 until one has run. See <see cref="RetentionKeepFromNano"/>.</summary>
     private long _retentionTtlTicks;
@@ -3207,7 +3270,7 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             catch (UnreadableSourceException ex)
             {
                 // As in CompactSegments: the file leaves, the rest of the group does not wait on it.
-                QuarantineFromRewrites(ex.Source, ex.InnerException!);
+                QuarantineFromRewrites(ex.Segment, ex.InnerException!);
             }
             catch (Exception ex)
             {
@@ -3370,7 +3433,8 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
     private sealed class UnreadableSourceException(MetricSegmentInfo source, Exception inner)
         : Exception($"Metric file {source.FilePath} will not decode", inner)
     {
-        public MetricSegmentInfo Source { get; } = source;
+        /// <summary>The source that failed (named <c>Segment</c>, not <c>Source</c>: that hides <see cref="Exception.Source"/>, CS0114).</summary>
+        public MetricSegmentInfo Segment { get; } = source;
     }
 
     /// <summary>Whether a read failed on what the file holds, not on the machine reading it.</summary>
@@ -3971,8 +4035,13 @@ public sealed partial class MetricStorageEngine : IMetricIngester, IMetricQuery,
             // it. Catching only the cancellation let one exception out of the flush loop take
             // the whole sequence with it, while the `finally` still completed _disposeCompleted:
             // the host's other two disposers then returned believing the engine was down, with
-            // the log still mapped and the OTLP door still open.
-            catch (Exception ex) { _logger.LogError(ex, "Metric background loop faulted before shutdown"); }
+            // the log still mapped and the OTLP door still open. The line itself may not throw
+            // past this point either (#137).
+            catch (Exception ex)
+            {
+                try { _logger.LogError(ex, "Metric background loop faulted before shutdown"); }
+                catch (Exception) { /* the line is lost; the teardown is not */ }
+            }
 
             // Threshold flushes are scheduled off the ingest path, so they are in neither loop
             // and used to outlive shutdown entirely. Ingest keeps scheduling them throughout

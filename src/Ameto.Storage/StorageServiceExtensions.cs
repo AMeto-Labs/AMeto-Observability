@@ -53,7 +53,7 @@ public sealed class RetentionBackgroundService : BackgroundService
                         "traces"  => dto.TracesDays,
                         _         => 30,
                     };
-                    var pruned = await target.PruneAsync(TimeSpan.FromDays(Math.Max(1, days)), stoppingToken);
+                    var pruned = await target.PruneAsync(RetentionMath.TtlOf(days), stoppingToken);
                     if (pruned > 0)
                         _logger.LogInformation(
                             "Retention run: pruned {Count} {Key} file(s)", pruned, target.RetentionKey);

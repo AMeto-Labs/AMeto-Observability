@@ -181,13 +181,18 @@ public static class OtlpTraceStreamParser
     }
 
     /// <summary>
-    /// Streams the batch into <paramref name="sink"/> (TI#3) and says how many spans it took and
-    /// how many it refused. A malformed body throws with its prefix already ingested; the sink's
-    /// batch is ended either way.
+    /// Streams the batch into <paramref name="sink"/> (TI#3) and says how many spans it took, how
+    /// many it refused, and whether it refused them for room (<see cref="ISpanSink.RefusedForRoom"/>:
+    /// a retry would find some) rather than for a span no retry fits. A malformed body throws with
+    /// its prefix already ingested; the sink's batch is ended either way.
     /// </summary>
-    public static (int Ingested, int Refused) Parse(ReadOnlySpan<byte> json, ISpanSink sink)
+    public static (int Ingested, int Refused, bool RefusedForRoom) Parse(ReadOnlySpan<byte> json, ISpanSink sink)
     {
-        try { return ParseBatch(json, sink); }
+        try
+        {
+            var (ingested, refused) = ParseBatch(json, sink);
+            return (ingested, refused, refused == 0 || sink.RefusedForRoom);   // asked before EndBatch forgets it
+        }
         finally
         {
             sink.EndBatch();
@@ -235,7 +240,7 @@ public static class OtlpTraceStreamParser
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType == JsonTokenType.PropertyName &&
-                reader.ValueTextEquals("resourceSpans"u8) &&
+                JsonStringText.NameIs(ref reader, "resourceSpans"u8) &&
                 reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
@@ -269,7 +274,7 @@ public static class OtlpTraceStreamParser
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
 
-            if (reader.ValueTextEquals("resource"u8))
+            if (JsonStringText.NameIs(ref reader, "resource"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                 {
@@ -282,7 +287,7 @@ public static class OtlpTraceStreamParser
                 }
                 else reader.Skip();
             }
-            else if (reader.ValueTextEquals("scopeSpans"u8))
+            else if (JsonStringText.NameIs(ref reader, "scopeSpans"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
@@ -300,25 +305,27 @@ public static class OtlpTraceStreamParser
 
     /// <summary>
     /// A JSON string value's text as VALID UTF-8, copied into <paramref name="scratch"/>: the raw
-    /// bytes when they are unescaped and valid, else exactly what <c>GetString</c> makes of them —
-    /// including its throw on invalid UTF-8, which is how the list path refused such a body.
+    /// bytes when they are unescaped and valid, else unescaped as the store keeps text
+    /// (<see cref="JsonStringText"/>) — a <c>\u</c> escape of a lone surrogate becomes U+FFFD, where
+    /// <c>GetString</c> threw and the receiver answered 400 with the batch's prefix already in the ring
+    /// (#138 item 5; the log parser was given the same in round 5, H-E).
     /// </summary>
     private static int CaptureUtf8(ref Utf8JsonReader reader, ref byte[]? scratch)
     {
-        if (!reader.ValueIsEscaped && !reader.HasValueSequence)
+        // Both parsers build their reader over one span, so a value never spans segments; the GetString
+        // road this once kept for that case threw on a lone surrogate, and was unreachable.
+        System.Diagnostics.Debug.Assert(!reader.HasValueSequence, "the trace JSON reader is built over one span");
+        var raw = reader.ValueSpan;
+        if (!reader.ValueIsEscaped && System.Text.Unicode.Utf8.IsValid(raw))
         {
-            var raw = reader.ValueSpan;
-            if (System.Text.Unicode.Utf8.IsValid(raw))
-            {
-                if (scratch is null || scratch.Length < raw.Length) scratch = new byte[Math.Max(64, raw.Length)];
-                raw.CopyTo(scratch);
-                return raw.Length;
-            }
+            if (scratch is null || scratch.Length < raw.Length) scratch = new byte[Math.Max(64, raw.Length)];
+            raw.CopyTo(scratch);
+            return raw.Length;
         }
-        string text = reader.GetString() ?? string.Empty;
-        int max = System.Text.Encoding.UTF8.GetMaxByteCount(text.Length);
-        if (scratch is null || scratch.Length < max) scratch = new byte[Math.Max(64, max)];
-        return System.Text.Encoding.UTF8.GetBytes(text, scratch);
+        // Escaped, or holding bytes that are not UTF-8 (each three as U+FFFD): sized by a walk, then written.
+        long need = JsonStringText.UnescapedLength(raw);
+        if (scratch is null || scratch.Length < need) scratch = new byte[Math.Max(64, (int)need)];
+        return JsonStringText.Unescape(raw, scratch);
     }
 
     /// <summary>
@@ -339,7 +346,7 @@ public static class OtlpTraceStreamParser
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-            if (reader.ValueTextEquals("attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
+            if (JsonStringText.NameIs(ref reader, "attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
@@ -354,11 +361,11 @@ public static class OtlpTraceStreamParser
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                     {
                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-                        if (reader.ValueTextEquals("key"u8))
+                        if (JsonStringText.NameIs(ref reader, "key"u8))
                         {
                             reader.Read();
                             if (reader.TokenType != JsonTokenType.String) continue;
-                            if (reader.ValueTextEquals("service.name"u8))
+                            if (JsonStringText.NameIs(ref reader, "service.name"u8))
                             {
                                 isService = true;
                             }
@@ -368,7 +375,7 @@ public static class OtlpTraceStreamParser
                                 wroteKey = true;
                             }
                         }
-                        else if (reader.ValueTextEquals("value"u8))
+                        else if (JsonStringText.NameIs(ref reader, "value"u8))
                         {
                             if (isService)
                             {
@@ -377,7 +384,7 @@ public static class OtlpTraceStreamParser
                                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                                     {
                                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-                                        if (reader.ValueTextEquals("stringValue"u8))
+                                        if (JsonStringText.NameIs(ref reader, "stringValue"u8))
                                         {
                                             reader.Read();
                                             if (reader.TokenType == JsonTokenType.String)
@@ -428,7 +435,7 @@ public static class OtlpTraceStreamParser
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-            if (reader.ValueTextEquals("spans"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
+            if (JsonStringText.NameIs(ref reader, "spans"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                     ParseSpan(ref reader, attrBuf, resBuf, resCount, outBuf, ref st);
@@ -468,27 +475,27 @@ public static class OtlpTraceStreamParser
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
 
-            if      (reader.ValueTextEquals("traceId"u8))           { reader.Read(); trLen = CopyFixed(ref reader, trHex); }
-            else if (reader.ValueTextEquals("spanId"u8))            { reader.Read(); spLen = CopyFixed(ref reader, spHex); }
-            else if (reader.ValueTextEquals("parentSpanId"u8))      { reader.Read(); paLen = CopyFixed(ref reader, paHex); }
-            else if (reader.ValueTextEquals("name"u8))              { reader.Read(); if (reader.TokenType == JsonTokenType.String) nameLen = CaptureUtf8(ref reader, ref _tName); }
-            else if (reader.ValueTextEquals("kind"u8))              { reader.Read(); reader.TryGetInt32(out kind); }
-            else if (reader.ValueTextEquals("startTimeUnixNano"u8)) { reader.Read(); startNano = ReadUnixNano(ref reader); }
-            else if (reader.ValueTextEquals("endTimeUnixNano"u8))   { reader.Read(); endNano   = ReadUnixNano(ref reader); }
-            else if (reader.ValueTextEquals("status"u8))
+            if      (JsonStringText.NameIs(ref reader, "traceId"u8))           { reader.Read(); trLen = CopyFixed(ref reader, trHex); }
+            else if (JsonStringText.NameIs(ref reader, "spanId"u8))            { reader.Read(); spLen = CopyFixed(ref reader, spHex); }
+            else if (JsonStringText.NameIs(ref reader, "parentSpanId"u8))      { reader.Read(); paLen = CopyFixed(ref reader, paHex); }
+            else if (JsonStringText.NameIs(ref reader, "name"u8))              { reader.Read(); if (reader.TokenType == JsonTokenType.String) nameLen = CaptureUtf8(ref reader, ref _tName); }
+            else if (JsonStringText.NameIs(ref reader, "kind"u8))              { reader.Read(); reader.TryGetInt32(out kind); }
+            else if (JsonStringText.NameIs(ref reader, "startTimeUnixNano"u8)) { reader.Read(); startNano = ReadUnixNano(ref reader); }
+            else if (JsonStringText.NameIs(ref reader, "endTimeUnixNano"u8))   { reader.Read(); endNano   = ReadUnixNano(ref reader); }
+            else if (JsonStringText.NameIs(ref reader, "status"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                     {
                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-                        if (reader.ValueTextEquals("code"u8)) { reader.Read(); reader.TryGetInt32(out statusCode); }
+                        if (JsonStringText.NameIs(ref reader, "code"u8)) { reader.Read(); reader.TryGetInt32(out statusCode); }
                         else reader.Skip();
                     }
                 }
                 else reader.Skip();
             }
-            else if (reader.ValueTextEquals("attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
+            else if (JsonStringText.NameIs(ref reader, "attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                     if (WriteSpanKeyValue(ref reader, ref w, ref promo))
@@ -565,7 +572,7 @@ public static class OtlpTraceStreamParser
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
 
-            if (reader.ValueTextEquals("key"u8))
+            if (JsonStringText.NameIs(ref reader, "key"u8))
             {
                 reader.Read();
                 if (reader.TokenType == JsonTokenType.String)
@@ -582,7 +589,7 @@ public static class OtlpTraceStreamParser
                 }
                 else reader.Skip();
             }
-            else if (reader.ValueTextEquals("value"u8))
+            else if (JsonStringText.NameIs(ref reader, "value"u8))
             {
                 if (!wroteKey) { reader.Skip(); continue; } // value before key (non-standard) — skip
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
@@ -608,37 +615,37 @@ public static class OtlpTraceStreamParser
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
 
-            if (reader.ValueTextEquals("stringValue"u8))
+            if (JsonStringText.NameIs(ref reader, "stringValue"u8))
             {
                 reader.Read();
                 CaptureString(ref reader, keyKind, ref promo);
                 WriteJsonStringToMsgpack(ref reader, ref w);
                 wrote = true;
             }
-            else if (reader.ValueTextEquals("intValue"u8))
+            else if (JsonStringText.NameIs(ref reader, "intValue"u8))
             {
                 reader.Read();
                 CaptureAndWriteInt(ref reader, ref w, keyKind, ref promo);
                 wrote = true;
             }
-            else if (reader.ValueTextEquals("boolValue"u8))
+            else if (JsonStringText.NameIs(ref reader, "boolValue"u8))
             {
                 reader.Read();
                 w.Write(reader.TokenType == JsonTokenType.True); wrote = true;
             }
-            else if (reader.ValueTextEquals("doubleValue"u8))
+            else if (JsonStringText.NameIs(ref reader, "doubleValue"u8))
             {
                 reader.Read();
                 reader.TryGetDouble(out double d); w.Write(d); wrote = true;
             }
-            else if (reader.ValueTextEquals("arrayValue"u8))
+            else if (JsonStringText.NameIs(ref reader, "arrayValue"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                     WriteArrayValue(ref reader, ref w, depth);
                 else reader.Skip();
                 wrote = true;
             }
-            else if (reader.ValueTextEquals("kvlistValue"u8))
+            else if (JsonStringText.NameIs(ref reader, "kvlistValue"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                     WriteKvlistValue(ref reader, ref w, depth);
@@ -668,9 +675,9 @@ public static class OtlpTraceStreamParser
 
         if (reader.ValueSpan.Length > MaxEscapedKeyBytes) return SpanKeyKind.Plain;
 
+        // A key that outgrows the buffer once unescaped (bytes that are not UTF-8, three for one) is not ours.
         Span<byte> tmp = stackalloc byte[MaxEscapedKeyBytes];
-        int len = reader.CopyString(tmp);
-        return SpanPromotion.KindOf(tmp[..len]);
+        return JsonStringText.TryUnescape(reader.ValueSpan, tmp, out int len) ? SpanPromotion.KindOf(tmp[..len]) : SpanKeyKind.Plain;
     }
 
     /// <summary>
@@ -740,7 +747,7 @@ public static class OtlpTraceStreamParser
         if (reader.ValueSpan.Length > MaxEscapedInt64Bytes) { value = 0; return false; }
 
         Span<byte> tmp = stackalloc byte[MaxEscapedInt64Bytes];
-        int len = reader.CopyString(tmp);
+        if (!JsonStringText.TryUnescape(reader.ValueSpan, tmp, out int len)) { value = 0; return false; }   // outgrew the buffer: no int64
         return Utf8Parser.TryParse(tmp[..len], out value, out int used) && used == len;
     }
 
@@ -772,20 +779,20 @@ public static class OtlpTraceStreamParser
     private static void CaptureEscapedString(
         ref Utf8JsonReader reader, SpanKeyKind keyKind, ref SpanPromotion promo)
     {
+        // Captured only when the whole text fits its buffer: one that outgrows it (bytes that are not
+        // UTF-8, three for one) is past what the matcher looks at anyway, and is not captured cut.
         int max = reader.ValueSpan.Length;
         if (max <= MaxMatchableUrlBytes)
         {
             Span<byte> tmp = stackalloc byte[MaxMatchableUrlBytes];
-            int len = reader.CopyString(tmp);
-            promo.Capture(keyKind, tmp[..len]);
+            if (JsonStringText.TryUnescape(reader.ValueSpan, tmp, out int len)) promo.Capture(keyKind, tmp[..len]);
             return;
         }
 
         byte[] rented = ArrayPool<byte>.Shared.Rent(max);
         try
         {
-            int n = reader.CopyString(rented);
-            promo.Capture(keyKind, rented.AsSpan(0, n));
+            if (JsonStringText.TryUnescape(reader.ValueSpan, rented, out int n)) promo.Capture(keyKind, rented.AsSpan(0, n));
         }
         finally
         {
@@ -808,7 +815,7 @@ public static class OtlpTraceStreamParser
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-            if (reader.ValueTextEquals("values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
+            if (JsonStringText.NameIs(ref reader, "values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 var tmp = NestBuffer(depth);
                 var tw  = new MessagePackWriter(tmp);
@@ -837,7 +844,7 @@ public static class OtlpTraceStreamParser
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-            if (reader.ValueTextEquals("values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
+            if (JsonStringText.NameIs(ref reader, "values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 var tmp = NestBuffer(depth);
                 var tw  = new MessagePackWriter(tmp);
@@ -860,9 +867,9 @@ public static class OtlpTraceStreamParser
     ///
     /// <para>The unescape buffer is the per-thread scratch, not a pooled rent: renting and
     /// returning per escaped key or value is two interlocked operations and a bucket walk for a
-    /// buffer whose life ends four lines later. Anything past
-    /// <see cref="MaxKeptEscapeScratch"/> still goes through the pool, so one enormous attribute
-    /// cannot pin a large array to a request thread.</para>
+    /// buffer whose life ends four lines later. Anything past <see cref="MaxKeptEscapeScratch"/>,
+    /// or that outgrows the scratch once unescaped, is measured and written straight into the map,
+    /// so one enormous attribute cannot pin a large array to a request thread.</para>
     ///
     /// <para>The scratch is an array rather than a <c>stackalloc</c> because
     /// <see cref="MessagePackWriter"/> is a ref struct taken by ref, so ref-safety has to assume
@@ -871,31 +878,29 @@ public static class OtlpTraceStreamParser
     private static void WriteJsonStringToMsgpack(ref Utf8JsonReader reader, ref MessagePackWriter w)
     {
         if (reader.TokenType != JsonTokenType.String) { w.WriteNil(); return; }
-        if (!reader.ValueIsEscaped) { w.WriteString(reader.ValueSpan); return; }
+        var raw = reader.ValueSpan;
+        if (!reader.ValueIsEscaped) { w.WriteString(raw); return; }
 
-        // Unescaping never grows the text, so the escaped length bounds the result.
-        int max = reader.ValueSpan.Length;
-        if (max <= MaxKeptEscapeScratch)
+        // An escape only shortens a text, but a byte beside it that is not UTF-8 is stored as U+FFFD,
+        // three for one — the reader does not validate UTF-8 (CopyString threw on such text) — so the
+        // escaped length does not bound the result. One pass at the escaped length, which fits every
+        // valid text; a text that did not fit is measured and written straight into the map (the log
+        // parser's WriteString shape). Sized at the escaped length alone, such a text was stored cut
+        // wherever the scratch's slack happened to end (#138 review).
+        if (raw.Length <= MaxKeptEscapeScratch)
         {
-            byte[] scratch = EscapeScratch(max);
-            int len = reader.CopyString(scratch);
-            w.WriteString(scratch.AsSpan(0, len));
-            return;
+            byte[] scratch = EscapeScratch(raw.Length);
+            if (JsonStringText.TryUnescape(raw, scratch, out int len)) { w.WriteString(scratch.AsSpan(0, len)); return; }
         }
-
-        byte[] tmp = ArrayPool<byte>.Shared.Rent(max);
-        try
-        {
-            int n = reader.CopyString(tmp);
-            w.WriteString(tmp.AsSpan(0, n));
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(tmp);
-        }
+        int need = (int)JsonStringText.UnescapedLength(raw);   // at most 3 × MaxOtlpBatchBytes
+        w.WriteStringHeader(need);
+        w.Advance(JsonStringText.Unescape(raw, w.GetSpan(need)));
     }
 
-    /// <summary>Copies the current string token (unescaped) into a fixed span; returns length (0 if it doesn't fit).</summary>
+    /// <summary>
+    /// Copies the current string token (unescaped) into a fixed span; returns length (0 if it doesn't
+    /// fit, once unescaped — bytes that are not UTF-8 grow three for one).
+    /// </summary>
     private static int CopyFixed(ref Utf8JsonReader reader, scoped Span<byte> dest)
     {
         if (reader.TokenType != JsonTokenType.String) return 0;
@@ -905,7 +910,7 @@ public static class OtlpTraceStreamParser
             reader.ValueSpan.CopyTo(dest);
             return reader.ValueSpan.Length;
         }
-        return reader.CopyString(dest);
+        return JsonStringText.TryUnescape(reader.ValueSpan, dest, out int n) ? n : 0;
     }
 
     /// <summary>uint64 nano timestamp — OTLP encodes it as a JSON string; tolerate a raw number.</summary>

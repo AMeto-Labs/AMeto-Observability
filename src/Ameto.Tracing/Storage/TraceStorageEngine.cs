@@ -1126,7 +1126,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
         var batch = new ItemSpanBatch(items);
-        try     { return WriteBatch(ref batch); }
+        int taken = 0;
+        try     { WriteBatch(ref batch, ref taken); return taken; }
         finally { batch.Dispose(); }
     }
 
@@ -1138,19 +1139,37 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// That is what keeps the lock-free aggregate passes (which walk captured
     /// <see cref="SpanRecord"/>s long after the lock is gone) clear of the arena's reuse.
     /// </summary>
-    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct =>
-        WriteBatch(ref batch);
+    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    {
+        int taken = 0;
+        WriteBatch(ref batch, ref taken);
+        return taken;
+    }
+
+    /// <summary>
+    /// <see cref="WriteRaw{TBatch}(ref TBatch)"/> for a caller that must know how far the write got when
+    /// it THROWS: <paramref name="taken"/> counts the spans that are in the log and the tier, advanced as
+    /// each appended span is inserted into the tier, and is current when an exception leaves. The
+    /// drainer reads it to release the spans the engine took and keep the rest for another pass (#138);
+    /// the return value of the other overload is lost to a throw. A span the log took and the tier did
+    /// not — an insert that ran out of memory — is behind the count, and the retry appends it to the
+    /// log a second time: the tier holds it once, the log twice until the next flush commits it.
+    /// </summary>
+    internal void WriteRaw<TBatch>(ref TBatch batch, ref int taken) where TBatch : ISpanBatch, allows ref struct
+        => WriteBatch(ref batch, ref taken);
 
     /// <summary>
     /// The one write core. Per hold: the tier's strings and blob copies are resolved OUTSIDE the
     /// lock (an intern lookup and a copy per span have no business in a hold every reader waits
     /// out), then the log and the tier take them under ONE hold, exactly as before.
+    /// <paramref name="takenSoFar"/> mirrors the count of spans taken after every hold, so a caller
+    /// reads it even when this throws.
     /// </summary>
-    private int WriteBatch<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    private void WriteBatch<TBatch>(ref TBatch batch, ref int takenSoFar) where TBatch : ISpanBatch, allows ref struct
     {
         int count = batch.Count;
-        if (count == 0) return 0;
-        if (!TryEnterEngine()) return 0;
+        if (count == 0) return;
+        if (!TryEnterEngine()) return;
         int taken = 0;
 
         // A hold is at most 4 096 spans whatever a probe sets (the production cap is 128), so the
@@ -1213,9 +1232,16 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                     finally
                     {
                         scope.Dispose();
+                        // ONE STORE PER SPAN. The insert allocates (a SpanRecord, the tier list's and the
+                        // trace index's growth), and one that ran out of memory at span j must leave the
+                        // caller counting [0, j): mirrored once at the end of the hold, the whole hold came
+                        // back and the tier held [0, j) twice (#138 review).
                         for (int j = 0; j < appended; j++)
+                        {
                             AddToHotTierLocked(batch.Header(taken + j), names[j], pooled[2 * j],
                                                services[j], pooled[2 * j + 1], blobs[j]);
+                            takenSoFar = taken + j + 1;   // in the log and the tier: what the caller keeps if the next line is the last thing it hears
+                        }
                         taken += appended;
                     }
 
@@ -1261,7 +1287,6 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             System.Buffers.ArrayPool<bool>.Shared.Return(pooled);
             ExitEngine();
         }
-        return taken;
     }
 
     // ── A FLUSH THAT CANNOT START IS SAID, AT MOST ONCE A MINUTE ─────────────────
@@ -2160,22 +2185,22 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     }
 
     /// <summary>
+    /// Whether the log this engine opened is still in the data directory, asked only once the listing has
+    /// found no segment file at all (<see cref="MeetMissingSegmentFile"/>). There only when the file system
+    /// says so: a look that FAILS answers false, and the guard then keeps the snapshot and asks again — the
+    /// recoverable answer, as for a data directory that cannot be probed (above). With every segment file
+    /// already reported gone, a log that cannot be looked at is no evidence that this is the directory the
+    /// engine opened; answering true removed the segment and recorded a loss over a blip. (Its doc once said
+    /// a probe failure answers true, "the same direction as NoSegmentFilesLeft" — but true is the road to
+    /// the loss claim here, and File.Exists, which never throws, had in fact answered false; #138 item 7.)
+    /// </summary>
+    private bool WalFileStillThere() => FileLook.Of(_walPath) == FilePresence.There;
+
+    /// <summary>
     /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
     /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
     /// "keep retrying for ever" over data that may really be gone.
     /// </summary>
-    /// <summary>
-    /// Whether the log this engine opened is still in the data directory. A probe failure answers
-    /// TRUE — the same direction as <see cref="NoSegmentFilesLeft"/>, because an I/O error is not
-    /// evidence that the volume was swapped, and answering otherwise would turn a busy disk into a
-    /// permanent loss claim.
-    /// </summary>
-    private bool WalFileStillThere()
-    {
-        try { return File.Exists(_walPath); }
-        catch { return true; }
-    }
-
     private static bool NoSegmentFilesLeft(string dir)
     {
         try
@@ -3404,7 +3429,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
                 if (_mergingPaths.Contains(path)) continue;
 
                 var seg = Array.Find(_coldSegments, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
-                if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+                // Gone only when the file system says so. A file that could not be looked at is ADOPTED, as a
+                // file that is there would be: the snapshot lists it, and one that is really gone is dropped at
+                // the next start, when the file system says so — where File.Exists's false unnamed it for the
+                // life of the process (#138 item 7).
+                if (seg is null || seg.SegmentId != 0 || FileLook.Of(path) == FilePresence.Gone)
                 {
                     lock (_unnamedSegments) _unnamedSegments.Remove(path);
                     continue;
@@ -3715,7 +3744,8 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     /// index vouching for a file that is not there is the silent under-report this engine keeps
     /// closing.</para>
     ///
-    /// <para>"No file" means <c>File.Exists</c> said so, not merely "absent from this scan". The
+    /// <para>"No file" means the file system said so (<see cref="FileLook.Of"/> answered Gone, not
+    /// Unknown), not merely "absent from this scan". The
     /// scan deliberately skips the segment a flush is publishing, and a flush that lands while the
     /// scan runs is already in the snapshot — neither is gone, and dropping either would retire an
     /// id that something may already have recorded against.</para>
@@ -3749,8 +3779,11 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
             for (int i = 0; i < unknown.Count; i++) named.Add(unknown[i].WithSegmentId(fresh[i]));
             int adopted = unknown.Count;
 
+            // Dropped from the catalog — with its index runs retired — only when the file system says the
+            // file is gone. File.Exists answered false for a file it could not look at as well, and a live
+            // segment then lost its id and its index runs on a share that did not answer (#138 item 7).
             var vanished = _manifest.Segments
-                .Where(kv => !File.Exists(kv.Value.FilePath))
+                .Where(kv => FileLook.Of(kv.Value.FilePath) == FilePresence.Gone)
                 .Select(kv => kv.Key)
                 .ToList();
             if (vanished.Count > 0) RetireDroppedRuns(_manifest.RemoveSegments(vanished));
@@ -5948,7 +5981,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
     private Task<int> PruneCore(TimeSpan ttl, CancellationToken ct)
     {
-        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+        // Saturating (#130): computed in DateTimeOffset and multiplied out, a TTL of some centuries —
+        // 200 000 days typed for "forever" — wrapped into a cutoff in the FUTURE and this prune deleted
+        // every trace file, every hour; a TTL past year 1 threw instead. Past the epoch, nothing is older.
+        var cutoffNano = RetentionMath.CutoffNano(DateTimeOffset.UtcNow, ttl);
 
         List<SpanSegmentInfo> toDelete;
         _lock.EnterWriteLock();
@@ -5994,9 +6030,9 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
 
         if (toDelete.Count > 0 || forgotten > 0)
             _logger.LogInformation(
-                "Retention pruned {Count} trace file(s) older than {Days} days " +
+                "Retention pruned {Count} trace file(s) older than {Days:N0} days " +
                 "(and forgot {Forgotten} vanished-segment range(s) below the cutoff)",
-                toDelete.Count, (int)ttl.TotalDays, forgotten);
+                toDelete.Count, ttl.TotalDays, forgotten);
 
         return Task.FromResult(toDelete.Count);
     }
