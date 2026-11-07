@@ -154,12 +154,12 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
   const span = gridEndMs - gridFromMs;
   if (span <= 0) return [];
   const step = TICK_STEPS.find(s => span / s <= maxTicks) ?? Math.ceil(span / maxTicks / DAY) * DAY;
-  const advance = (t: Date) => step < DAY ? addLocalHours(t, step / HOUR) : addDays(t, step / DAY);
-  // From the local midnight before the start, in steps, so the marks fall on 00:00, 04:00, 08:00 …
-  let t = startOfDay(new Date(gridFromMs));
-  while (t.getTime() < gridFromMs) t = advance(t);
+  // Mark k from the local midnight before the start, so the marks fall on 00:00, 04:00, 08:00 …
+  const day = startOfDay(new Date(gridFromMs));
   const ticks: AxisTick[] = [];
-  for (; t.getTime() < gridEndMs; t = advance(t)) {
+  for (let k = 0; ; k++) {
+    const t = tickOfDay(day, k, step);
+    if (t.getTime() >= gridEndMs) break;
     const pct = ((t.getTime() - gridFromMs) / span) * 100;
     if (pct < 1.5 || pct > 98.5) continue;
     const midnight = t.getHours() === 0 && t.getMinutes() === 0;
@@ -169,13 +169,17 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
 }
 
 /**
- * `t` plus `hours` on the local clock, not on the timeline: midnight plus four is 04:00 on the day
- * a DST change happens too, where four absolute hours would read 03:00 or 05:00 from then on.
+ * Mark `k` of a `step` from the local midnight `day`: `k × step` on the local clock, not on the
+ * timeline, so midnight plus four reads 04:00 on the day a DST change happens too, where four
+ * absolute hours would read 03:00 or 05:00 from then on. Each mark is placed from the day, not
+ * from the mark before it: a mark that falls into a spring-forward gap (02:00 on a day that has no
+ * 02:00) is moved on to 03:00 by the Date constructor, and the marks after it still fall on 04:00,
+ * 06:00 … instead of carrying the lost hour along.
  */
-function addLocalHours(t: Date, hours: number): Date {
-  const next = new Date(t);
-  next.setHours(t.getHours() + hours);
-  return next;
+function tickOfDay(day: Date, k: number, step: number): Date {
+  return step < DAY
+    ? new Date(day.getFullYear(), day.getMonth(), day.getDate(), k * (step / HOUR))
+    : addDays(day, k * (step / DAY));
 }
 
 /** The URL's `preset`, `from`, `to` and `tab` as state; the defaults for anything it cannot read. */
