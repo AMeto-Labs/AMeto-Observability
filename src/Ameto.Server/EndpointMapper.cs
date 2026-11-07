@@ -426,11 +426,13 @@ public static class EndpointMapper
         //
         // Cheap is relative: the scan still LZ4-decodes every block in the window to read its
         // headers, so it grows with the events in the window, not with the columns asked for. A
-        // dashboard's day or week is a poll's worth of work; the Statistics page's month or quarter
-        // over a busy store is a search's worth, so a window wider than WideCountsWindow takes a
-        // search slot and runs under the search budget, exactly as /api/events/aggregate does —
-        // 503 when the guard is full, 504 when the budget runs out. A narrow window keeps the
-        // unguarded path the dashboard polls have always had.
+        // day or three is a poll's worth of work; a month or a quarter over a busy store is a
+        // search's worth, so a window wider than WideCountsWindow takes a search slot and runs
+        // under the search budget, exactly as /api/events/aggregate does — 503 when the guard is
+        // full, 504 when the budget runs out. A window of seven days or less keeps the unguarded
+        // path. The client's one caller is the Statistics page's Logs band, whose 1d and 3d stay
+        // under the threshold; its 7d asks from the bucket grid, so that window is seven days plus
+        // up to one 2-hour step and takes a slot like 14d, 1m and 3m.
         app.MapGet("/api/events/counts", async (
             HttpContext           ctx,
             StorageEngine         storage,
@@ -1163,10 +1165,12 @@ public static class EndpointMapper
 
     /// <summary>
     /// The widest <c>/api/events/counts</c> window that runs unguarded. The header scan behind the
-    /// counts decodes every block in the window, so its cost is the window's events: the Logs page
-    /// polls it for a day, a dashboard for a week at most, and that stays a poll. The Statistics
-    /// page's month and quarter are a search's worth of work on a busy store and are treated as
-    /// one — a <see cref="QueryGuard"/> slot and the search budget, like <c>/api/events/aggregate</c>.
+    /// counts decodes every block in the window, so its cost is the window's events: a day or three
+    /// is a poll's worth of work and stays a poll; a month or a quarter is a search's worth on a
+    /// busy store and is treated as one — a <see cref="QueryGuard"/> slot and the search budget,
+    /// like <c>/api/events/aggregate</c>. The client's one caller is the Statistics page's Logs
+    /// band: its 1d and 3d are under the threshold, its 7d is not — it asks from the bucket grid,
+    /// so that window is seven days plus up to one 2-hour step — and takes a slot like 14d, 1m and 3m.
     /// </summary>
     private static readonly TimeSpan WideCountsWindow = TimeSpan.FromDays(7);
 
