@@ -16,14 +16,33 @@ public static class EndpointMapper
         app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }));
 
         // ── Stats ─────────────────────────────────────────────────────────────
+        // The log store's counters for the Statistics page: the segment catalogue summed, with the
+        // span of time it covers. A closed store (#95) is refused like every other read of it, so
+        // the page shows the store's own sentence rather than zeros.
         app.MapGet("/api/stats", (StorageEngine storage) =>
         {
-            var segs = storage.GetSegments(null, null);
+            if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
+
+            var  segs = storage.GetSegments(null, null);
+            long events = 0, compressed = 0, uncompressed = 0, oldest = long.MaxValue, newest = long.MinValue;
+            for (int i = 0; i < segs.Count; i++)
+            {
+                var s = segs[i];
+                events       += s.EventCount;
+                compressed   += s.CompressedBytes;
+                uncompressed += s.UncompressedBytes;
+                if (s.MinTimestampTicks < oldest) oldest = s.MinTimestampTicks;
+                if (s.MaxTimestampTicks > newest) newest = s.MaxTimestampTicks;
+            }
             return Results.Ok(new
             {
-                segments        = segs.Count,
-                totalEvents     = segs.Sum(s => (long)s.EventCount),
-                compressedBytes = segs.Sum(s => s.CompressedBytes),
+                segments          = segs.Count,
+                totalEvents       = events,
+                compressedBytes   = compressed,
+                uncompressedBytes = uncompressed,
+                // The earliest and latest event any segment holds — null with no segments.
+                oldestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(oldest, TimeSpan.Zero).ToString("O"),
+                newestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(newest, TimeSpan.Zero).ToString("O"),
             });
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewStats);
 
@@ -404,10 +423,19 @@ public static class EndpointMapper
         //   limit   — accepted for backward compatibility; the header scan is cheap
         //             enough to always cover the full window, so it no longer bounds it.
         //   service — restrict to a single service (case-insensitive)
+        //
+        // Cheap is relative: the scan still LZ4-decodes every block in the window to read its
+        // headers, so it grows with the events in the window, not with the columns asked for. A
+        // dashboard's day or week is a poll's worth of work; the Statistics page's month or quarter
+        // over a busy store is a search's worth, so a window wider than WideCountsWindow takes a
+        // search slot and runs under the search budget, exactly as /api/events/aggregate does —
+        // 503 when the guard is full, 504 when the budget runs out. A narrow window keeps the
+        // unguarded path the dashboard polls have always had.
         app.MapGet("/api/events/counts", async (
             HttpContext           ctx,
             StorageEngine         storage,
             LogVolumeCountsCache  cache,
+            QueryGuard            guard,
             string?               from    = null,
             string?               to      = null,
             int?                  bucket  = null,
@@ -451,7 +479,8 @@ public static class EndpointMapper
             // than served the last answer it gave while open for as long as that stays cached.
             if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
-            // Cache keyed on the bucket grid so drifting "now" bounds still hit within a TTL.
+            // Cache keyed on the bucket grid so drifting "now" bounds still hit within a TTL. Asked
+            // before the guard: a cached answer costs nothing and should take no slot.
             var cacheKey = new CountsCacheKey(minB, maxB, bucketSeconds, svcFilter);
             if (cache.TryGet(cacheKey, out var cached))
                 return Results.Json(cached, EventCountsJsonContext.Default.EventCountsResponse);
@@ -460,12 +489,42 @@ public static class EndpointMapper
             // threw (its snapshot refuses once the teardown has collected its tiers) or answered
             // from a teardown in progress. Neither is a count to serve, or to keep serving.
             LogVolumeCounts result;
-            try
+            if (toUtc - fromUtc > WideCountsWindow)
             {
-                result = await storage.AggregateLogVolumeAsync(
-                    fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+                QueryGuard.Lease? lease;
+                QueryGuard.Claim? claim = null;
+                try { lease = await guard.TryEnterAsync(ctx.RequestAborted, out claim); }
+                catch (Exception e)
+                {
+                    claim?.Abandon();   // a wait whose caller's await threw owes the guard its slot (see /api/events)
+                    if (e is OperationCanceledException) return Results.Empty;
+                    throw;
+                }
+                if (lease is null) return Refused(ctx);
+
+                using (lease)
+                {
+                    if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;   // #95, after the queue
+                    using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                    try
+                    {
+                        result = await storage.AggregateLogVolumeAsync(
+                            fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, deadline.Token);
+                    }
+                    catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                    catch (OperationCanceledException) { return Results.Empty; }   // client left
+                    catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
+                }
             }
-            catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
+            else
+            {
+                try
+                {
+                    result = await storage.AggregateLogVolumeAsync(
+                        fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
+                }
+                catch (ObjectDisposedException) when (LogStoreGate.IsClosed(storage)) { return LogStoreGate.Closed; }
+            }
             if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             var buckets = new long[nBuckets];
@@ -1101,6 +1160,15 @@ public static class EndpointMapper
     /// post-cursor match set whatever the page size).
     /// </summary>
     private const int CatchUpPageFactor = 8;
+
+    /// <summary>
+    /// The widest <c>/api/events/counts</c> window that runs unguarded. The header scan behind the
+    /// counts decodes every block in the window, so its cost is the window's events: the Logs page
+    /// polls it for a day, a dashboard for a week at most, and that stays a poll. The Statistics
+    /// page's month and quarter are a search's worth of work on a busy store and are treated as
+    /// one — a <see cref="QueryGuard"/> slot and the search budget, like <c>/api/events/aggregate</c>.
+    /// </summary>
+    private static readonly TimeSpan WideCountsWindow = TimeSpan.FromDays(7);
 
     /// <summary>504 for the non-streaming endpoints, which cannot report a partial answer.</summary>
     private static IResult TimedOutJson(QueryGuard guard) =>

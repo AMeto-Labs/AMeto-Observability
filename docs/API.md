@@ -356,9 +356,11 @@ Returns the distinct `@service` values seen, for the services dropdown/filter. (
 
 ### `GET /api/events/counts`
 
-Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `filter`, `gb` (group-by), bucketing hints.
+Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `bucket` (seconds; default about 120 columns, widened past 2 000), `service`.
 
-**Auth:** JWT Bearer. **Response:** JSON `{ buckets, series, … }`.
+Header-only is not free: the scan decodes every block in the window to read its headers, so the cost is the window's events, not its columns. Answers are cached for 20 s by bucket grid. A window wider than **7 days** takes a search slot and runs under the search budget, like `GET /api/events/aggregate`: `503` with `Retry-After` when the server is at its search limit, `504` when the budget runs out. A narrower window never waits for a slot.
+
+**Auth:** JWT Bearer. **Response:** JSON `{ from, to, bucketSeconds, total, buckets[], services[], levels[] }`.
 
 ---
 
@@ -399,6 +401,8 @@ All require JWT Bearer.
 
 ### `GET /api/stats`
 
+The log store's counters: the segment catalogue summed, with the span of time it covers. Answers `503` with a sentence once the log store has shut down (#95), like every other read of it.
+
 **Auth:** JWT Bearer.
 
 **Response `200 OK`:**
@@ -406,9 +410,16 @@ All require JWT Bearer.
 {
   "segments": 7,
   "totalEvents": 462345,
-  "compressedBytes": 134217728
+  "compressedBytes": 134217728,
+  "uncompressedBytes": 1073741824,
+  "oldestTimestamp": "2026-09-29T06:12:44.0000000+00:00",
+  "newestTimestamp": "2026-11-06T13:22:31.1230000+00:00"
 }
 ```
+
+`oldestTimestamp` / `newestTimestamp` are the earliest and latest event any segment holds, `null` while there are no segments (the hot tier is not counted here — it is not on disk yet).
+
+The Statistics page draws the other two signals from `GET /api/traces/stats` (the `buckets`, `histogram` and `store=true` additions, see [Traces](#traces)) and `GET /api/metrics/stats` (see [Metrics](#metrics)), with the same `from` / `to` window and the bucket it chose for the log counts (`GET /api/events/counts`). One difference: the trace stats' columns are equal slices of `[from, to]`, so the page sends them the grid's own bounds — the first bucket's start and the last bucket's end — and the Traces band's tiles and rows therefore run to the end of the last bucket, up to one step past a closed custom window's `to` (the Logs and Metrics bands stop at `to`). What each costs: the log counts are a header scan of every event in the window, cached 20 s and guarded like a search past 7 days; the trace stats are three sidecar reads per segment in the window; the metric stats are one pass over the in-memory catalogue. No raw event, point or span reaches the client for any of them.
 
 ---
 
@@ -624,7 +635,7 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 |----------|---------|
 | `GET /api/traces` | List/search traces (root spans) by service, name, tag filter, duration, time range. |
 | `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). A field a span does not carry matches **no** comparison, including a negated one — `{ .attr != nil }` / `{ .attr = nil }` test presence. Nor does a value that cannot be compared: `{ .tenant > 5 }` and `{ !(.tenant > 5) }` both skip a span whose `.tenant` is text (Tempo answers `false` there, so its negation matches; this is deliberate). A quoted string against a numeric attribute compares the number's invariant text — `{ .ratio = "0.375" }`, never `"0,375"` — whatever the server's locale. |
-| `GET /api/traces/stats` | Aggregate trace stats (counts, error rate, latency) over a window. |
+| `GET /api/traces/stats` | Aggregate trace stats over a window: `totalTraces`, `errorRate`, `p50LatencyMs` / `p95LatencyMs` / `p99LatencyMs` / `maxLatencyMs`, `throughputRps`, `spanCount`, `serviceCount`, `totalSparkline` / `errorSparkline` (`buckets` **equal slices of `[from, to]`**, default 20, at most 2 000 — not aligned to any clock, so a caller that wants them on a grid sends the grid's own bounds, as the Statistics page does), `histogram` (`boundsMs`, `counts`: the merged duration histogram, the last bucket open) and, with `store=true`, `store` (`spans`, `hotSpans`, `segments`, `fileBytes`, `services`, `oldestStartMs`, `newestStartMs` — the whole store, window or no window; `null` without the flag). From the `.stats` and `.tracesum` sidecars (three reads per segment in the window) and the segment catalogue; no span is read. |
 | `GET /api/traces/latency` | Latency distribution / percentiles by service or operation. |
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
 | `GET /api/traces/compare` | Compare two traces / time windows. |
@@ -651,6 +662,7 @@ Metric query surface (points ingested via OTLP). All require JWT Bearer.
 |----------|---------|
 | `GET /api/metrics/names` | Distinct metric names. |
 | `GET /api/metrics/catalog` | Metric catalog (name, type, unit, label keys). |
+| `GET /api/metrics/stats` | The store for the Statistics page: `from`, `to`, `bucket` (seconds; default about 96 columns, widened past 2 000). Answers `{ from, to, bucketSeconds, buckets[], window: { metrics, bytesWritten, peakBucketBytes, rawBytes, rollupBytes }, store: { metrics, series, segments, segmentsRaw, segments5m, segments1h, bytes, bytesRaw, bytes5m, bytes1h, hotSeries, hotPoints, hotBytes, oldestMs, newestMs }, kinds: [{ kind, metrics, series }], byMetric: [{ name, kind, unit, series, bytes, points[] }], otherBytes, otherPoints[] }`. Every figure comes from the in-memory catalog and the cold tier's segment list: a segment's bytes are spread over the buckets its time range covers, in proportion to the overlap, so a three-month window costs one pass over the catalogue and no file is opened. `byMetric` holds the ten metrics with the most bytes in the window; the rest fold into `other`. `window.metrics` counts metrics with a segment in the window, plus the hot tier's when the window reaches now. `503` with a sentence once the store has shut down; `400` for a malformed bound or `from` after `to`. |
 | `GET /api/metrics/query` | Time-series query: `metric`, `agg` (avg/sum/min/max/count), `gb` (group-by label), `filters`, time range. |
 | `GET /api/metrics/expr` | Evaluate a metric expression (arithmetic over series). |
 | `GET /api/metrics/{name}` | Series for one metric. |

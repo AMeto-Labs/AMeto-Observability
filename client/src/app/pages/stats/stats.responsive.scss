@@ -1,0 +1,107 @@
+@use 'breakpoints' as bp;
+
+/* The page under 900px and under 640px (design canvas, "Планшет 768 — 3 месяца", "Телефон —
+   вкладка Logs"): the header's controls wrap onto their own row on a tablet; a phone gets the
+   48px header with the range button, the three tabs, the window line, and one band at a time. */
+
+@include bp.below(bp.$bp-md) {
+  .bands { gap: 10px; }
+}
+
+@include bp.below(bp.$bp-sm) {
+  /* Edge to edge: the header and tabs span the screen; the band keeps the page's 12px inside. */
+  .stats-page--phone { padding: 0; gap: 0; }
+  .stats-page--phone .bands { padding: 12px; gap: 8px; }
+
+  .ph-hdr {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 48px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .ph-title {
+    margin: 0;
+    font-size: var(--fs-lg);
+    font-weight: 600;
+    line-height: var(--lh-tight);
+    color: var(--txt);
+  }
+  .ph-quick {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ph-range {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 32px;
+    max-width: 180px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+    color: var(--txt);
+    font: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .ph-range-txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ph-range-caret { color: var(--txt-dim); flex-shrink: 0; }
+  .ph-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+    color: var(--txt-dim);
+    cursor: pointer;
+  }
+
+  .ph-tabs {
+    display: flex;
+    padding: 0 4px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .ph-tab {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    background: none;
+    color: var(--txt-dim);
+    font: inherit;
+    font-size: var(--fs-sm);
+    cursor: pointer;
+  }
+  .ph-tab[aria-selected="true"] {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+  }
+
+  .ph-win {
+    font-size: 10.5px;
+    color: var(--txt-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}

@@ -27,6 +27,7 @@ namespace Ameto.Metrics;
 [JsonSerializable(typeof(List<MetricSeriesDto>))]
 [JsonSerializable(typeof(List<ExemplarDto>))]
 [JsonSerializable(typeof(HeatmapDto))]
+[JsonSerializable(typeof(MetricStatsDto))]
 [JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(IReadOnlyList<string>))]
 internal partial class MetricJson : JsonSerializerContext

@@ -10,12 +10,13 @@ import { ApiService } from '../../../core/services/api.service';
 import { SearchHistoryService } from '../../../core/services/search-history.service';
 import { EventDto, LEVELS, AggregationDto } from '../../../core/models/event.model';
 import {
-  TimePreset, PRESET_LABELS, DEFAULT_PRESET,
+  TimePreset, DEFAULT_PRESET,
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
   parseCustomDate, fmtDateInput, endOfMinuteIso, presetRange, parsePreset, customRangeLabel,
   collectPropPaths, isoToDotNetUtcTicksString, isAggregationQuery,
 } from './events-filter.util';
+import { QUICK_RANGE_LABELS } from '../../../shared/utils/time-range';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
 const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
@@ -291,7 +292,7 @@ export const EventsStore = signalStore(
      */
     const rangeLabel = computed<{ text: string; extra: string }>(() => {
       const preset = store.timePreset();
-      if (preset !== 'custom') return { text: PRESET_LABELS[preset], extra: '' };
+      if (preset !== 'custom') return { text: QUICK_RANGE_LABELS[preset], extra: '' };
       return customRangeLabel(parseCustomDate(store.customFrom()), parseCustomDate(store.customTo()));
     });
 

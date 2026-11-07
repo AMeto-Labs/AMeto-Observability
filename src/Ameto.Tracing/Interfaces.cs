@@ -420,3 +420,29 @@ public interface ITraceProvider : Ameto.Core.IQueryAvailability
         SpanScanFloor?   scanFloor        = null,
         CancellationToken ct              = default);
 }
+
+/// <summary>
+/// The trace store as a whole, for the Statistics page: counts from the segment catalogue and the
+/// hot tier, with no file opened but to learn a size the catalogue did not record.
+/// </summary>
+public interface ITraceStoreStats
+{
+    /// <summary>The store's figures as of now; zeros and no bounds from a closed engine.</summary>
+    TraceStoreStats GetStoreStats();
+}
+
+/// <summary>What <see cref="ITraceStoreStats.GetStoreStats"/> answers.</summary>
+public sealed class TraceStoreStats
+{
+    /// <summary>Spans in the cold segments plus the hot tier's.</summary>
+    public long  Spans           { get; init; }
+    /// <summary>Spans not yet flushed — the hot tier and a flush in progress.</summary>
+    public int   HotSpans        { get; init; }
+    public int   Segments        { get; init; }
+    /// <summary>The segment files' lengths on disk; sidecars and the WAL are not counted.</summary>
+    public long  FileBytes       { get; init; }
+    /// <summary>Distinct service names across the cold segments' headers.</summary>
+    public IReadOnlyCollection<string> Services { get; init; } = [];
+    public long? OldestStartNano { get; init; }
+    public long? NewestStartNano { get; init; }
+}

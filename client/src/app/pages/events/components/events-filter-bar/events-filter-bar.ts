@@ -10,9 +10,11 @@ import {
 import {
   ServicesDropdownComponent, ServicesDropdownData, ServicesDropdownResult,
 } from '../../dropdowns/services-dropdown';
-import { DateRangeDropdownComponent, DateDropdownController } from '../../dropdowns/date-range-dropdown';
+import {
+  DateRangeDropdownComponent, DateDropdownController,
+} from '../../../../shared/components/date-range-dropdown/date-range-dropdown';
 import { EventsStore } from '../../store/events.store';
-import { TimePreset, PRESET_LABELS } from '../../store/events-filter.util';
+import { LOGS_QUICK_RANGES, PRESET_LABELS } from '../../store/events-filter.util';
 
 /**
  * Filter options bar: date-range / levels / services dropdown triggers, the
@@ -48,8 +50,7 @@ export class EventsFilterBarComponent {
     { key: 'Error',       short: 'ERR' },
     { key: 'Fatal',       short: 'FTL' },
   ];
-  readonly datePresets = (Object.keys(PRESET_LABELS) as Exclude<TimePreset, 'custom'>[])
-    .map(value => ({ label: PRESET_LABELS[value], value }));
+  readonly datePresets = LOGS_QUICK_RANGES.map(value => ({ label: PRESET_LABELS[value], value }));
   readonly pageSizeOptions = [50, 100, 150, 300, 500];
 
   fmtCount(n: number | undefined): string {

@@ -46,6 +46,7 @@ public static class MetricsServiceExtensions
         services.AddSingleton<IMetricQuery>(sp => sp.GetRequiredService<MetricStorageEngine>());
         services.AddSingleton<IMetricCatalog>(sp => sp.GetRequiredService<MetricStorageEngine>());
         services.AddSingleton<IMetricExemplars>(sp => sp.GetRequiredService<MetricStorageEngine>());
+        services.AddSingleton<IMetricStats>(sp => sp.GetRequiredService<MetricStorageEngine>());
         services.AddSingleton<IRetentionTarget>(sp => sp.GetRequiredService<MetricStorageEngine>());
 
         services.AddSingleton<IMetricAggregator, MetricAggregator>();

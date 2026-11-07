@@ -1,0 +1,129 @@
+<section class="band-wrap" [attr.aria-labelledby]="headingId()" [attr.aria-busy]="state() === 'loading'">
+  <div class="sh">
+    <lucide-icon class="sh-icon" [name]="meta().icon" [size]="14" [strokeWidth]="1.6" />
+    <h2 class="sh-title" [id]="headingId()">{{ meta().title }}</h2>
+    @if (state() === 'unavailable') {
+      <span class="sh-tag">Unavailable</span>
+    } @else {
+      <span class="sh-sub">{{ state() === 'loading' ? 'loading…' : meta().description }}</span>
+    }
+    <a class="sh-open" [routerLink]="route()" [queryParams]="openParams()" [attr.aria-label]="'Open ' + meta().title">
+      <span class="sh-open-txt">Open {{ meta().title }}</span>
+      <lucide-icon name="external-link" [size]="11" />
+    </a>
+  </div>
+
+  <div class="band">
+    <!-- ── Tiles: the window's column, the store's column ──────────────────────────────── -->
+    <div class="tiles">
+      <span class="ct ct-win">{{ caption() }}</span>
+      <span class="ct ct-store">Store</span>
+      @if (state() === 'loading') {
+        @for (w of skeletonTiles; track $index) {
+          <div class="tile" [class.win]="$even" [class.store]="$odd" aria-hidden="true">
+            <span class="skeleton sk-label" [style.width.px]="w"></span>
+            <span class="skeleton sk-value"></span>
+          </div>
+        }
+      } @else {
+        @for (t of tiles(); track t.label) {
+          <div class="tile" [class.win]="$even" [class.store]="$odd">
+            <span class="tl">{{ t.label }}</span>
+            <span class="tv" [class.muted]="t.muted">{{ t.value }}</span>
+          </div>
+        }
+      }
+    </div>
+
+    <!-- ── The chart: one column per bucket ────────────────────────────────────────────── -->
+    <section class="card chart" [attr.aria-label]="chartTitle()">
+      <div class="ch">
+        <span class="ct">{{ chartTitle() }}</span>
+        @switch (state()) {
+          @case ('ready') {
+            <span class="sub tn">
+              @for (l of legend(); track l.label) {
+                <span class="lg"><i [style.background]="l.color"></i>{{ l.label }}</span>
+              }
+              {{ chartCaption() }}
+            </span>
+          }
+          @case ('loading') { <span class="skeleton sk-caption"></span> }
+        }
+      </div>
+      @switch (state()) {
+        @case ('ready') {
+          <div class="bars">
+            @for (b of bars(); track b.startMs) {
+              <button type="button" class="bar" [title]="b.title" [attr.aria-label]="barLabel(b)"
+                      (click)="bucketOpen.emit(b)">
+                <span class="fill" [style.height.%]="b.heightPct">
+                  @for (s of b.segments; track $index) {
+                    <span class="sg" [style.flexGrow]="s.weight" [style.background]="s.color"></span>
+                  }
+                </span>
+              </button>
+            }
+          </div>
+          <div class="ax tn">
+            @for (t of ticks(); track t.pct) { <span [style.left.%]="t.pct">{{ t.label }}</span> }
+          </div>
+        }
+        @case ('loading') {
+          <div class="bars" aria-hidden="true">
+            @for (h of skeletonBars; track $index) {
+              <span class="bar"><span class="skeleton sk-bar" [style.height.%]="h"></span></span>
+            }
+          </div>
+          <div class="ax"></div>
+        }
+        @case ('unavailable') {
+          <div class="empty" role="alert">
+            <lucide-icon class="empty-err" name="triangle-alert" [size]="22" [strokeWidth]="1.5" />
+            <p>{{ errorText() }}</p>
+            <span>{{ unavailableHint() }}</span>
+          </div>
+          <div class="ax"></div>
+        }
+        @case ('empty') {
+          <div class="empty">
+            <lucide-icon [name]="meta().icon" [size]="24" [strokeWidth]="1.2" />
+            <p>{{ emptyText() }}</p>
+            @if (emptyHint()) { <span>{{ emptyHint() }}</span> }
+          </div>
+          <div class="ax"></div>
+        }
+      }
+    </section>
+
+    <!-- ── The breakdown: two tabs over the section's own rows ─────────────────────────── -->
+    <section class="card breakdown" aria-label="Breakdown">
+      <div class="ch">
+        <div class="tabs" role="tablist">
+          @for (t of tabs(); track t.id) {
+            <button type="button" role="tab" class="tab" [attr.aria-selected]="tab() === t.id" (click)="tab.set(t.id)">{{ t.label }}</button>
+          }
+        </div>
+        @if (state() === 'ready') { <span class="sub tn">{{ breakdownNote() }}</span> }
+      </div>
+      @switch (state()) {
+        @case ('ready') { <ng-content /> }
+        @case ('loading') {
+          <div class="lst" aria-hidden="true">
+            @for (w of skeletonRows; track $index) {
+              <div class="sk-row">
+                <span class="skeleton sk-dot"></span>
+                <span class="skeleton sk-name" [style.width.px]="w"></span>
+                <span class="skeleton sk-track" [style.width.%]="100 - $index * 14"></span>
+                <span class="skeleton sk-num"></span>
+                <span class="skeleton sk-pct"></span>
+              </div>
+            }
+          </div>
+        }
+        @case ('unavailable') { <div class="empty quiet"><span>No data while the store is unavailable.</span></div> }
+        @case ('empty') { <div class="empty quiet"><span>{{ emptyRowsText() }}</span></div> }
+      }
+    </section>
+  </div>
+</section>

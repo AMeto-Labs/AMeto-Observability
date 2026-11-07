@@ -146,3 +146,26 @@ public interface IMetricAggregator : Ameto.Core.IQueryAvailability
         IReadOnlyDictionary<string, string>? filters,
         CancellationToken ct = default);
 }
+
+/// <summary>
+/// The store as the Statistics page sees it (<c>GET /api/metrics/stats</c>): the cold tier's segment
+/// catalogue and the hot tier's counters, read without opening a file. The endpoint does the
+/// bucketing (<see cref="MetricStoreStats"/>); the engine only hands over what it already holds.
+/// </summary>
+public interface IMetricStats : Ameto.Core.IQueryAvailability
+{
+    /// <summary>A copy of the cold catalogue and the hot tier's figures as of now; empty from a closed store.</summary>
+    MetricStoreSnapshot GetStoreSnapshot();
+}
+
+/// <summary>What <see cref="IMetricStats.GetStoreSnapshot"/> answers.</summary>
+public sealed class MetricStoreSnapshot
+{
+    /// <summary>Every cold segment the catalogue lists, with the size each was catalogued at.</summary>
+    public IReadOnlyList<Storage.MetricSegmentInfo> ColdSegments { get; init; } = [];
+    /// <summary>Metric names the hot tier holds at least one series for.</summary>
+    public IReadOnlyList<string> HotMetricNames { get; init; } = [];
+    public int  HotSeries { get; init; }
+    public int  HotPoints { get; init; }
+    public long HotBytes  { get; init; }
+}

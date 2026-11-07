@@ -16,7 +16,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
+public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, ITraceStoreStats, IRetentionTarget, IAsyncDisposable, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     // _hotSpans is SWAPPED at flush start (the snapshot goes to the writer, a fresh list
@@ -5133,6 +5133,82 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
     private static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
     private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
+    // ── ITraceStoreStats ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Segment file lengths the catalogue did not record, by path. A flush publishes its segment
+    /// with <see cref="SpanSegmentInfo.FileBytes"/> 0 (only the startup scan measures files), and
+    /// a segment file never changes once written — compaction writes a NEW file and unlinks its
+    /// sources — so one stat per such file, kept until the path leaves the catalogue, is the cost.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> _segmentFileBytes = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The store as a whole for the Statistics page: one pass over the published cold array plus
+    /// the hot tier's count, no span read. Zeros and no bounds from a closed engine.
+    /// </summary>
+    public TraceStoreStats GetStoreStats()
+    {
+        if (!TryEnterEngine()) return new TraceStoreStats();
+        try
+        {
+            SpanSegmentInfo[] segs;
+            int               hotSpans;
+            _lock.EnterReadLock();
+            try
+            {
+                segs     = _coldSegments;   // published whole and never mutated: no copy needed
+                hotSpans = UnflushedCountLocked();
+            }
+            finally { _lock.ExitReadLock(); }
+
+            long spans = hotSpans, bytes = 0, oldest = long.MaxValue, newest = long.MinValue;
+            var  services = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var s in segs)
+            {
+                spans += s.SpanCount;
+                bytes += s.FileBytes > 0 ? s.FileBytes : FileBytesOf(s.FilePath);
+                if (s.MinStartNano < oldest) oldest = s.MinStartNano;
+                if (s.MaxStartNano > newest) newest = s.MaxStartNano;
+                foreach (var svc in s.Services) services.Add(svc);
+            }
+            if (_segmentFileBytes.Count > 2 * segs.Length + 64) PruneFileBytes(segs);
+
+            return new TraceStoreStats
+            {
+                Spans           = spans,
+                HotSpans        = hotSpans,
+                Segments        = segs.Length,
+                FileBytes       = bytes,
+                Services        = services,
+                OldestStartNano = segs.Length == 0 ? null : oldest,
+                NewestStartNano = segs.Length == 0 ? null : newest,
+            };
+        }
+        finally { ExitEngine(); }
+    }
+
+    /// <summary>A segment file's length, measured once; 0 — and not remembered — for a file that is not there to measure.</summary>
+    private long FileBytesOf(string path)
+    {
+        if (_segmentFileBytes.TryGetValue(path, out long known)) return known;
+        long length;
+        try { length = new FileInfo(path).Length; }
+        catch (IOException) { return 0; }                   // vanished under compaction, or not yet visible
+        catch (UnauthorizedAccessException) { return 0; }
+        _segmentFileBytes[path] = length;
+        return length;
+    }
+
+    /// <summary>Forgets the lengths of files no longer in the catalogue, so the map tracks the segment count rather than the history.</summary>
+    private void PruneFileBytes(SpanSegmentInfo[] live)
+    {
+        var keep = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var s in live) keep.Add(s.FilePath);
+        foreach (var path in _segmentFileBytes.Keys)
+            if (!keep.Contains(path)) _segmentFileBytes.TryRemove(path, out _);
+    }
+
     /// <summary>
     /// Trace volume + sparkline over [from,to]. Cold tiers are served purely from the
     /// tiny <c>.tracesum</c> volume headers (no span deserialisation); the hot tier is
@@ -5161,7 +5237,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         void Add(long startNano, uint traces, uint errors)
         {
             if (startNano < fromNano || startNano > toNano) return;
-            int b = (int)Math.Clamp((startNano - fromNano) * (long)buckets / rangeNano, 0, buckets - 1);
+            // In 128 bits: a quarter in nanoseconds (8e15) times the 2 000 columns the Statistics
+            // page may ask for is past long.MaxValue, and the overflow put every such trace in the
+            // first column (a negative product, clamped).
+            int b = (int)Int128.Clamp((Int128)(startNano - fromNano) * buckets / rangeNano, 0, buckets - 1);
             total[b]    += traces;
             error[b]    += errors;
             totalTraces += (int)traces;

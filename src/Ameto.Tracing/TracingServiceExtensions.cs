@@ -110,6 +110,7 @@ public static class TracingServiceExtensions
         services.AddSingleton<ITraceStatsProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<IServiceGraphProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<ITraceSummaryProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
+        services.AddSingleton<ITraceStoreStats>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<IRetentionTarget>(sp => sp.GetRequiredService<TraceStorageEngine>());
 
         services.AddSingleton<SpanDrainer>();

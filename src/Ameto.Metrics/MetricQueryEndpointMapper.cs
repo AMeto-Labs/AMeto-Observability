@@ -41,6 +41,35 @@ public static class MetricQueryEndpointMapper
             return Results.Json(entries, MetricJson.Web.ListMetricCatalogDto);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
+        // GET /api/metrics/stats?from=&to=&bucket=
+        // The Statistics page's Metrics band: the catalog by kind, the cold segments' bytes spread
+        // over the window's buckets, the top metrics by bytes, the store's totals and the hot tier.
+        // Everything comes from the catalogue the engine already keeps (IMetricStats) — no file is
+        // opened, so a three-month window costs the same as a day's.
+        //   from    — ISO-8601 lower bound (default: to − 24 h)
+        //   to      — ISO-8601 upper bound (default: now)
+        //   bucket  — bucket size in seconds (default: ~96 columns; widened past 2 000 columns)
+        // A metric literally named "stats" is reached as /api/metrics/stats?… never: the literal
+        // route wins, as it does for "catalog" and "names".
+        app.MapGet("/api/metrics/stats", (IMetricStats stats, IMetricCatalog catalog, string? from, string? to, int? bucket) =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (!TryParseInstant(to,   out var toParsed))   return Results.BadRequest("'to' is not an ISO-8601 instant.");
+            if (!TryParseInstant(from, out var fromParsed)) return Results.BadRequest("'from' is not an ISO-8601 instant.");
+            var toUtc   = toParsed   ?? now;
+            var fromUtc = fromParsed ?? toUtc.AddDays(-1);
+            if (fromUtc > toUtc) return Results.BadRequest("'from' is later than 'to'.");
+            // The arithmetic below is in nanoseconds since 1970 in a long, which reaches 1677–2262:
+            // a window is refused outside the years the store can hold rather than wrapped around.
+            if (fromUtc < DateTimeOffset.UnixEpoch) return Results.BadRequest("'from' is before 1970.");
+            if (toUtc > now.AddDays(1)) return Results.BadRequest("'to' is more than a day ahead.");
+
+            var dto = MetricStoreStats.Build(stats.GetStoreSnapshot(), catalog.GetCatalog(), fromUtc, toUtc, bucket ?? 0, now);
+            // After the read, before the answer, as every buffered metric endpoint asks (#95).
+            if (MetricStoreGate.IsClosed(stats)) return MetricStoreGate.Closed;
+            return Results.Json(dto, MetricJson.Web.MetricStatsDto);
+        }).RequireAuthorization(ViewPolicies.Metrics);
+
         // GET /api/metrics/{name}/labels
         app.MapGet("/api/metrics/{name}/labels", (IMetricCatalog catalog, string name) =>
             Results.Json(catalog.GetLabelKeys(name), MetricJson.Web.IReadOnlyListString)
@@ -176,6 +205,19 @@ public static class MetricQueryEndpointMapper
 
     private static DateTimeOffset? ParseDate(string? s) =>
         DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var v) ? v : null;
+
+    /// <summary>
+    /// <see cref="ParseDate"/> that tells an absent bound from a malformed one: the stats endpoint
+    /// answers 400 to the latter, where the others quietly fall back to their default window.
+    /// </summary>
+    private static bool TryParseInstant(string? s, out DateTimeOffset? value)
+    {
+        value = null;
+        if (string.IsNullOrWhiteSpace(s)) return true;
+        if (!DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var v)) return false;
+        value = v;
+        return true;
+    }
 
     /// <summary>Accepts "15", "15s", "5m", "1h", or a TimeSpan string ("00:00:15").</summary>
     private static TimeSpan? ParseStep(string? s)

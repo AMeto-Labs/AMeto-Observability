@@ -171,7 +171,15 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const range = q.get('range');
     if (range) {
       this.preset.set(range);
-      if (range === 'custom') { this.customFrom = q.get('cfrom') ?? ''; this.customTo = q.get('cto') ?? ''; }
+      if (range === 'custom') {
+        this.customFrom = q.get('cfrom') ?? '';
+        this.customTo   = q.get('cto') ?? '';
+        // The step follows the range (niceStepSec), so a deep link to a quarter has to set it as
+        // applyCustom does; left at the hour's default it asked for a quarter at a 15-second step.
+        const fromMs = new Date(this.customFrom).getTime();
+        const toMs   = this.customTo ? new Date(this.customTo).getTime() : Date.now();
+        if (!isNaN(fromMs) && !isNaN(toMs)) this.rangeSec.set(Math.max(60, (toMs - fromMs) / 1000));
+      }
       else this.rangeSec.set(this.hoursOf(range) * 3600);
     }
     if (q.get('metric')) {
