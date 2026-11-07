@@ -21,8 +21,11 @@ import { StatsRangeSheetComponent } from './components/stats-range-sheet/stats-r
  * The range is one control for the page — the six quick ranges and a Custom button that opens
  * the Logs page's own time range popover — and the bucket it chooses (15 min for a day, a day
  * for three months) is the grid every chart draws on. A phone shows one band at a time behind
- * three tabs, and the range in a sheet. Every number is an aggregate the server computes from
- * what it already keeps; no raw event, point or span reaches the page.
+ * three tabs, and the range in a sheet. Every number is an aggregate the server computes, and no
+ * raw event, point or span reaches the page — but the aggregates are not all alike in cost: the
+ * log counts are a header scan of every event in the window (cached 20 s, run as a search past
+ * seven days), the trace stats three sidecar reads per segment in the window, the metric stats one
+ * pass over the in-memory catalogue.
  */
 @Component({
   selector: 'app-stats',

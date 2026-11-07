@@ -7,9 +7,8 @@ import { format } from 'date-fns';
 import { ApiService } from '../../../core/services/api.service';
 import { EventCountsDto, LEVELS, StatsDto } from '../../../core/models/event.model';
 import { serviceColor } from '../../../shared/utils/service-color';
-import { unavailableMessage } from '../../../shared/utils/unavailable';
 import {
-  BreakdownTab, ChartBar, ChartSegment, SectionState, StatTile, StatsSectionComponent,
+  BreakdownTab, ChartBar, ChartSegment, SectionFailure, SectionState, StatTile, StatsSectionComponent, sectionFailure,
 } from '../components/stats-section/stats-section';
 import { BreakdownRow, StatsRowsComponent } from '../components/stats-rows/stats-rows';
 import {
@@ -32,15 +31,18 @@ const LEVEL_COLORS: Readonly<Record<string, string>> = {
 /** One answer of the band's two requests: the counts, or why there are none; the store's counters, or null. */
 interface LogsResult {
   counts: EventCountsDto | null;
-  error: string | null;
+  failure: SectionFailure | null;
   stats: StatsDto | null;
 }
 
 /**
- * The Logs band: ingest volume over the window bucketed by service (`GET /api/events/counts`,
- * a header scan the server caches by bucket grid) and the log store's counters (`GET /api/stats`).
- * A refusal of the counts — the store closed (#95) — is the band's unavailable state, with the
- * server's sentence; the store counters failing alone only dashes the store's tiles.
+ * The Logs band: ingest volume over the window bucketed by service (`GET /api/events/counts`) and
+ * the log store's counters (`GET /api/stats`). The counts are the one request of the page that is
+ * not a catalogue read: a header scan of every event in the window (every block LZ4-decoded for its
+ * headers), cached 20 s by bucket grid, and past seven days run as a search — a slot and a budget —
+ * so a quarter over a busy store may come back refused (503) or out of budget (504) with the
+ * server's sentence. That, or the store closed (#95), is the band's unavailable state; the store
+ * counters failing alone only dashes the store's tiles.
  */
 @Component({
   selector: 'app-stats-logs',
@@ -49,7 +51,7 @@ interface LogsResult {
     <app-stats-section signal="logs" [caption]="caption()" [tiles]="tiles()" [state]="state()"
       chartTitle="Ingest volume" [chartCaption]="chartCaption()" [bars]="bars()" [ticks]="ticks()"
       emptyText="No events in this window" [emptyHint]="emptyHint()" emptyRowsText="No service data."
-      [errorText]="error()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
+      [errorText]="error()" [refused]="refused()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
       (bucketOpen)="openBucket($event)">
       @if (tab() === 'levels') {
         <app-stats-rows [rows]="levelRows()" />
@@ -77,15 +79,15 @@ export class StatsLogsSectionComponent {
         const bounds = requestBounds(w);
         return forkJoin({
           counts: this.api.getEventCounts({ from: bounds.from, to: bounds.to, bucket: w.bucketSeconds }).pipe(
-            map(data => ({ data, error: null as string | null })),
+            map(data => ({ data, failure: null as SectionFailure | null })),
             catchError(err => of({
               data: null as EventCountsDto | null,
-              error: unavailableMessage(err) ?? 'Could not load the event counts.',
+              failure: sectionFailure(err, 'Could not load the event counts.'),
             })),
           ),
           stats: this.api.getStats().pipe(catchError(() => of(null as StatsDto | null))),
         }).pipe(
-          map(({ counts, stats }): LogsResult => ({ counts: counts.data, error: counts.error, stats })),
+          map(({ counts, stats }): LogsResult => ({ counts: counts.data, failure: counts.failure, stats })),
           startWith(null),
         );
       }),
@@ -95,12 +97,13 @@ export class StatsLogsSectionComponent {
 
   private readonly counts = computed(() => this.result()?.counts ?? null);
   private readonly stats = computed(() => this.result()?.stats ?? null);
-  readonly error = computed(() => this.result()?.error ?? '');
+  readonly error = computed(() => this.result()?.failure?.error ?? '');
+  readonly refused = computed(() => this.result()?.failure?.refused ?? false);
 
   readonly state = computed<SectionState>(() => {
     const r = this.result();
     if (!r) return 'loading';
-    if (r.error) return 'unavailable';
+    if (r.failure) return 'unavailable';
     return (r.counts?.total ?? 0) > 0 ? 'ready' : 'empty';
   });
 

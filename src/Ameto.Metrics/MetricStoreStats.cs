@@ -65,8 +65,10 @@ internal static class MetricStoreStats
         for (int i = 0; i < n; i++) buckets[i] = (minB + i) * bucketSeconds * 1000L;
 
         // ── Pass 1: the store as a whole, and each metric's share of bytes inside the window ──
+        // Names compare as the hot tier files them (OrdinalIgnoreCase): two spellings of one
+        // metric are one metric here too, not two rows.
         var store    = new MetricStatsStoreDto();
-        var inWindow = new Dictionary<string, long>(StringComparer.Ordinal);
+        var inWindow = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         long oldest = long.MaxValue, newest = long.MinValue;
         foreach (var s in snapshot.ColdSegments)
         {
@@ -83,8 +85,12 @@ internal static class MetricStoreStats
 
             // The share ranks the metrics; the figures the answer carries come from the columns
             // below, so that raw + rollups, the per-metric bytes and the total all add up exactly.
+            // A segment that only touches the window's edge has no bytes in it, and a metric with
+            // nothing but such segments is not "with data" for the window.
             if (!Overlaps(s, fromNano, toNano)) continue;
-            inWindow[s.MetricName] = inWindow.GetValueOrDefault(s.MetricName) + ShareInside(s, fromNano, toNano);
+            long share = ShareInside(s, fromNano, toNano);
+            if (share <= 0) continue;
+            inWindow[s.MetricName] = inWindow.GetValueOrDefault(s.MetricName) + share;
         }
         if (store.Segments > 0)
         {
@@ -96,7 +102,7 @@ internal static class MetricStoreStats
         store.HotBytes  = snapshot.HotBytes;
 
         // ── The catalog: every metric the store has ever seen, by kind ──
-        var byName = new Dictionary<string, MetricCatalogEntry>(catalog.Count, StringComparer.Ordinal);
+        var byName = new Dictionary<string, MetricCatalogEntry>(catalog.Count, StringComparer.OrdinalIgnoreCase);
         var kinds  = new Dictionary<MetricKind, MetricStatsKindDto>();
         foreach (var e in catalog)
         {
@@ -111,7 +117,7 @@ internal static class MetricStoreStats
         // ── Pass 2: the top metrics by bytes in the window get a column each; the rest fold into other ──
         var ranked = new List<KeyValuePair<string, long>>(inWindow);
         ranked.Sort(static (a, b) => b.Value != a.Value ? b.Value.CompareTo(a.Value) : string.CompareOrdinal(a.Key, b.Key));
-        var top = new Dictionary<string, long[]>(StringComparer.Ordinal);
+        var top = new Dictionary<string, long[]>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < ranked.Count && i < TopMetrics; i++) top[ranked[i].Key] = new long[n];
         var other = new long[n];
         var all   = new long[n];
@@ -141,7 +147,7 @@ internal static class MetricStoreStats
         }
 
         // "With data": a segment overlapping the window, or a hot series when the window is the present.
-        var withData = new HashSet<string>(inWindow.Keys, StringComparer.Ordinal);
+        var withData = new HashSet<string>(inWindow.Keys, StringComparer.OrdinalIgnoreCase);
         if (to >= now.AddMinutes(-1))
             foreach (var hot in snapshot.HotMetricNames) withData.Add(hot);
 

@@ -483,11 +483,16 @@ export class ApiService {
   deleteApiKey(id: string): Observable<void> { return this.http.delete<void>(`/api/auth/keys/${id}`); }
 
   // ── Traces ─────────────────────────────────────────────────────────────────
-  /** `buckets`: the sparklines' columns (the server's default is 20, the Traces page's tiles). */
-  getTraceStats(from: string, to?: string, buckets?: number): Observable<TraceStatsDto> {
+  /**
+   * `buckets`: the sparklines' columns (the server's default is 20, the Traces page's tiles).
+   * `store`: also the store's counters (one pass over the segment catalogue) — the Statistics page
+   * asks for them; the Traces page's poll does not and so does not pay for them.
+   */
+  getTraceStats(from: string, to?: string, buckets?: number, store = false): Observable<TraceStatsDto> {
     const p = new URLSearchParams({ from });
     if (to) p.set('to', to);
     if (buckets) p.set('buckets', String(buckets));
+    if (store) p.set('store', 'true');
     return this.http.get<TraceStatsDto>(`/api/traces/stats?${p.toString()}`);
   }
 

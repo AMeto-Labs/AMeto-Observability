@@ -21,20 +21,26 @@ public static class TraceQueryEndpointMapper
         // All trace read endpoints require the Traces view scope (admin bypasses).
         var group = app.MapGroup("").RequireAuthorization(ViewPolicies.Traces);
 
-        // GET /api/traces/stats?from=&to=&buckets=
-        // Fully sidecar-based: percentiles from .stats, volume/sparkline from the .tracesum
-        // volume headers. No span deserialization — sub-millisecond for any dataset/window.
+        // GET /api/traces/stats?from=&to=&buckets=&store=
+        // Sidecar-based: percentiles and the histogram from the .stats sidecars (three reads per
+        // segment in the window), volume/sparkline from the .tracesum volume headers. No span is
+        // deserialized, so a quarter costs its segment count, not its span count.
         //   buckets — sparkline columns (default 20, the Traces page's tiles; the Statistics page
-        //             asks for the grid its other charts use, so the three line up).
-        // The answer also carries the merged duration histogram and the store's counters
-        // (ITraceStoreStats: one pass over the segment catalogue), both for the Statistics page.
+        //             asks for the grid its other charts use, so the three line up). The columns
+        //             are EQUAL slices of [from, to], not aligned to any clock: a caller that wants
+        //             them on a grid sends the grid's own bounds, as the Statistics page does.
+        //   store   — `true` adds the store's counters (ITraceStoreStats: one pass over the segment
+        //             catalogue, a file stat for any segment the catalogue has no length for). Off
+        //             by default, so the Traces page's 30-second poll pays nothing for a figure it
+        //             does not show.
+        // The answer also carries the merged duration histogram, for the Statistics page.
         group.MapGet("/api/traces/stats", async (HttpContext ctx) =>
         {
             var statsProvider   = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
             var summaryProvider = ctx.RequestServices.GetRequiredService<ITraceSummaryProvider>();
-            var storeStats      = ctx.RequestServices.GetService<ITraceStoreStats>();
             var (from, to)      = ParseFromTo(ctx);
             int buckets         = ParseInt(ctx.Request.Query["buckets"], 20, 1, 2000);
+            var storeStats      = ParseBool(ctx.Request.Query["store"]) ? ctx.RequestServices.GetService<ITraceStoreStats>() : null;
 
             var  perService    = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
             var  mergedBuckets = new uint[HistogramBuckets.Count];
@@ -91,7 +97,7 @@ public static class TraceQueryEndpointMapper
                 Store          = storeDto,
             };
 
-            await ctx.Response.WriteAsJsonAsync(stats);
+            await ctx.Response.WriteAsJsonAsync(stats, TraceStreamJson.Default.TraceStatsDto, cancellationToken: ctx.RequestAborted);
         });
 
         // GET /api/traces?from=&to=&service=&name=&status=&limit=&minDurationMs=&maxDurationMs=&httpStatus=
@@ -1330,6 +1336,10 @@ public static class TraceQueryEndpointMapper
     private static int ParseInt(string? s, int def, int min, int max) =>
         int.TryParse(s, out var v) ? Math.Clamp(v, min, max) : def;
 
+    /// <summary><c>true</c> or <c>1</c>, in any case, is true; anything else — an absent parameter included — is false.</summary>
+    private static bool ParseBool(string? s) =>
+        string.Equals(s, "true", StringComparison.OrdinalIgnoreCase) || s == "1";
+
     private static long? ParseLong(string? s) =>
         long.TryParse(s, out var v) && v > 0 ? v : null;
 
@@ -1393,6 +1403,7 @@ public static class TraceQueryEndpointMapper
 /// </remarks>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(TraceRowDto))]
+[JsonSerializable(typeof(TraceStatsDto))]   // the Traces page polls /api/traces/stats every 30 s: no reflection on its answer
 internal partial class TraceStreamJson : JsonSerializerContext;
 
 /// <summary>One row per trace (root span) for the trace list view.</summary>

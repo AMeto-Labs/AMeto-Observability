@@ -2,11 +2,11 @@ import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@a
 
 import { BottomSheetComponent } from '../../../../shared/components/bottom-sheet/bottom-sheet';
 import {
-  DEFAULT_PRESET, QUICK_RANGES, TimePreset, fmtPoint, fromDateTimeLocal, parseCustomDate, quickRangeStart,
+  DEFAULT_PRESET, QUICK_RANGES, TimePreset, fmtDateInput, fmtPoint, fromDateTimeLocal, parseCustomDate, quickRangeStart,
   toDateTimeLocal, utcOffsetLabel,
 } from '../../../../shared/utils/time-range';
 import { StatsStore } from '../../stats.store';
-import { bucketSecondsFor, fmtBucket } from '../../stats-range.util';
+import { bucketSecondsFor, fmtBucket, resolveWindow } from '../../stats-range.util';
 
 /**
  * The phone's time range sheet (design canvas, "Телефон — лист диапазона"): the six quick ranges
@@ -41,12 +41,12 @@ import { bucketSecondsFor, fmtBucket } from '../../stats-range.util';
           <div class="rs-range">
             <label class="bs-field" [class.invalid]="!valid()">
               <span class="bs-field-k">From</span>
-              <input type="datetime-local" class="bs-field-in" aria-label="From"
+              <input type="datetime-local" class="bs-field-in" aria-label="From" [attr.aria-invalid]="valid() ? null : 'true'"
                      [value]="from()" (input)="setFrom($any($event.target).value)" />
             </label>
             <label class="bs-field">
               <span class="bs-field-k">To</span>
-              <input type="datetime-local" class="bs-field-in" aria-label="To, empty for now"
+              <input type="datetime-local" class="bs-field-in" aria-label="To, empty for now" [attr.aria-invalid]="valid() ? null : 'true'"
                      [value]="to()" (input)="setTo($any($event.target).value)" />
             </label>
           </div>
@@ -90,14 +90,9 @@ export class StatsRangeSheetComponent {
     return `${fmtPoint(from, now)} – ${to ? fmtPoint(to, now) : 'now'}`;
   });
 
-  /** A custom window needs a start, and an end after it. */
-  readonly valid = computed(() => {
-    if (this.preset() !== 'custom') return true;
-    const from = parseCustomDate(fromDateTimeLocal(this.from()));
-    const toRaw = fromDateTimeLocal(this.to());
-    const to = toRaw ? parseCustomDate(toRaw) : null;
-    return !!from && (!toRaw || (!!to && to > from));
-  });
+  /** A custom window needs what the page would accept (resolveWindow): a start from 1970 on, an end after it and no later than tomorrow. */
+  readonly valid = computed(() =>
+    this.preset() !== 'custom' || resolveWindow('custom', fromDateTimeLocal(this.from()), fromDateTimeLocal(this.to())) !== null);
 
   /** What the chart will group the draft into: `3 months = 92 buckets of 1 day`. */
   readonly bucketHint = computed(() => {
@@ -123,7 +118,7 @@ export class StatsRangeSheetComponent {
     if (p === 'custom' && !this.from()) {
       // Custom starts from where the window is now, so the fields are not blank.
       const w = this.store.window();
-      if (w) this.from.set(toDateTimeLocal(fmtLocal(new Date(w.fromMs))));
+      if (w) this.from.set(toDateTimeLocal(fmtDateInput(new Date(w.fromMs))));
     }
   }
 
@@ -141,10 +136,4 @@ export class StatsRangeSheetComponent {
     else this.store.setPreset(this.preset());
     this.store.closeSheet();
   }
-}
-
-/** `yyyy-MM-dd HH:mm` in local time, the stores' format. */
-function fmtLocal(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }

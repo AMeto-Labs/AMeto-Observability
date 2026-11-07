@@ -1,7 +1,9 @@
 import { ChangeDetectionStrategy, Component, computed, input, model, output } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
 import { Params, RouterLink } from '@angular/router';
 import { LucideAngularModule } from 'lucide-angular';
 
+import { serverSentence, unavailableMessage } from '../../../../shared/utils/unavailable';
 import { SIGNAL_ROUTE, StatsSignal } from '../../stats-range.util';
 
 /** One of the eight tiles: the window's four in the left column, the store's four in the right. */
@@ -36,6 +38,26 @@ export interface BreakdownTab { id: string; label: string; }
  */
 export type SectionState = 'loading' | 'ready' | 'empty' | 'unavailable';
 
+/** Why a band is unavailable: the sentence it shows, and whether it was the store itself refusing. */
+export interface SectionFailure {
+  error: string;
+  /**
+   * True for the store's own refusal (#95: it has shut down or is still loading — a 503 without
+   * `Retry-After`, which the store gates deliberately omit because a closed store is final for the
+   * process): the band then says the signal is back after a restart. False for everything else —
+   * the search limit's 503 (it carries `Retry-After`), the search budget's 504, a network error —
+   * where a retry is the right advice.
+   */
+  refused: boolean;
+}
+
+/** A failed request of a band as its {@link SectionFailure}: the server's sentence when the body carries one, else `fallback`. */
+export function sectionFailure(err: unknown, fallback: string): SectionFailure {
+  const refused = err instanceof HttpErrorResponse && err.status === 503 && !err.headers.get('Retry-After');
+  const sentence = refused ? unavailableMessage(err) : serverSentence(err);
+  return { error: sentence ?? fallback, refused };
+}
+
 interface SignalMeta {
   title: string;
   icon: string;
@@ -51,7 +73,7 @@ const META: Readonly<Record<StatsSignal, SignalMeta>> = {
     bucketLabel: 'Open this bucket in Logs',
   },
   metrics: {
-    title: 'Metrics', icon: 'chart-bar', description: 'storage written over the window · the metric store',
+    title: 'Metrics', icon: 'chart-bar', description: 'bytes on disk for the window · the metric store',
     unavailableHint: 'Metrics are available again once the server has restarted. Logs and traces are unaffected.',
     bucketLabel: 'Open this bucket in Metrics',
   },
@@ -92,6 +114,8 @@ export class StatsSectionComponent {
   readonly emptyRowsText = input<string>('No data.');
   /** The store's own sentence when it refused, or what went wrong with the request. */
   readonly errorText = input<string>('');
+  /** True when the store itself refused (see {@link SectionFailure}): the hint is then the restart, not a retry. */
+  readonly refused = input<boolean>(false);
   readonly tabs = input.required<BreakdownTab[]>();
   readonly tab = model.required<string>();
   readonly breakdownNote = input<string>('');
@@ -103,6 +127,13 @@ export class StatsSectionComponent {
   readonly meta = computed(() => META[this.signal()]);
   readonly route = computed(() => SIGNAL_ROUTE[this.signal()]);
   readonly headingId = computed(() => `stats-${this.signal()}`);
+  /** The hint under the sentence of an unavailable band. */
+  readonly unavailableHint = computed(() => this.refused() ? this.meta().unavailableHint : 'Refresh to try again.');
+
+  /** A bar's accessible name: what the click does, and which bucket it is (the title's first line). */
+  barLabel(bar: ChartBar): string {
+    return `${this.meta().bucketLabel}: ${bar.title.split('\n')[0]}`;
+  }
 
   /** The skeleton's shapes while loading: eight tiles, the bars' outline, six rows. */
   readonly skeletonTiles = [52, 70, 58, 50, 60, 48, 46, 62];

@@ -6,8 +6,13 @@ import {
 } from './stats-range.util';
 import { quickRangeStart } from '../../shared/utils/time-range';
 
-/** 2026-11-06 14:22:30 local, a Friday: the clock every window here is resolved against. */
-const NOW = new Date(2026, 10, 6, 14, 22, 30);
+/**
+ * 2026-11-20 14:22:30 local, a Friday: the clock every window here is resolved against. Chosen with
+ * no DST change in the fortnight before it in any zone the specs run in (the US changed on 1 Nov,
+ * Europe on 25 Oct), so a two-week window is the same number of hours everywhere and the bucket
+ * counts below hold in UTC, Los Angeles and New York alike.
+ */
+const NOW = new Date(2026, 10, 20, 14, 22, 30);
 const local = (y: number, mo: number, d: number, h = 0, mi = 0) => new Date(y, mo - 1, d, h, mi);
 
 describe('the bucket step', () => {
@@ -35,7 +40,7 @@ describe('resolving the window', () => {
   it('puts a quick range on the grid: the first bucket holds the start, the last holds now', () => {
     const w = resolveWindow('7d', '', '', NOW)!;
     expect(w.preset).toBe('7d');
-    expect(new Date(w.fromMs)).toEqual(new Date(2026, 9, 30, 14, 22, 30));
+    expect(new Date(w.fromMs)).toEqual(new Date(2026, 10, 13, 14, 22, 30));
     expect(w.fromMs).toBe(quickRangeStart('7d', NOW).getTime());
     expect(w.toMs).toBe(NOW.getTime());
     expect(w.openEnded).toBe(true);
@@ -49,10 +54,26 @@ describe('resolving the window', () => {
   });
 
   it('takes a month and three months as calendar months, a day as 15-minute buckets', () => {
-    expect(new Date(resolveWindow('1m', '', '', NOW)!.fromMs)).toEqual(new Date(2026, 9, 6, 14, 22, 30));
-    expect(new Date(resolveWindow('3m', '', '', NOW)!.fromMs)).toEqual(new Date(2026, 7, 6, 14, 22, 30));
+    expect(new Date(resolveWindow('1m', '', '', NOW)!.fromMs)).toEqual(new Date(2026, 9, 20, 14, 22, 30));
+    expect(new Date(resolveWindow('3m', '', '', NOW)!.fromMs)).toEqual(new Date(2026, 7, 20, 14, 22, 30));
     expect(resolveWindow('3m', '', '', NOW)!.bucketSeconds).toBe(86_400);
     expect(resolveWindow('1d', '', '', NOW)!.bucketSeconds).toBe(900);
+  });
+
+  it('keeps the day on 15-minute buckets on the day a DST change makes it 25 hours long', () => {
+    // The afternoon after the US fall-back (1 Nov 2026): the local day before it is 25 hours where
+    // the zone observes DST, 24 elsewhere. Either way the step is the day's nominal step.
+    const w = resolveWindow('1d', '', '', new Date(2026, 10, 1, 14, 22, 30))!;
+    expect(w.bucketSeconds).toBe(900);
+    expect(w.buckets).toBeGreaterThanOrEqual(97);
+  });
+
+  it('refuses a custom start before 1970 and an end more than a day ahead, as the server would', () => {
+    expect(resolveWindow('custom', '1969-12-30 00:00', '', NOW)).toBeNull();   // before the epoch in every zone
+    expect(resolveWindow('custom', '2026-11-20 00:00', '2026-11-22 00:00', NOW)).toBeNull();
+    expect(resolveWindow('custom', '2026-11-20 00:00', '2026-11-21 10:00', NOW)).not.toBeNull();
+    // The bound is the epoch itself, so the first local day of 1970 is before it east of Greenwich; the second is not anywhere.
+    expect(resolveWindow('custom', '1970-01-02 00:00', '1970-01-03 00:00', NOW)).not.toBeNull();
   });
 
   it('reads a custom window from the inputs, the end running to the last tick of its minute', () => {
@@ -83,8 +104,11 @@ describe('resolving the window', () => {
 
   it('labels the window as the subtitle and the tiles read it', () => {
     const quick = resolveWindow('7d', '', '', NOW)!;
-    expect(windowLabel(quick, NOW)).toMatch(/^30 Oct 14:22 → now · 85 buckets of 2 h · UTC/);
+    expect(windowLabel(quick, NOW)).toMatch(/^13 Nov 14:22 → now · 85 buckets of 2 h · UTC/);
     expect(windowCaption(quick, NOW)).toBe('Last 7 days');
+    // Buckets of 12 h and more are UTC half-days and days, whatever the zone: the subtitle says so.
+    expect(windowLabel(resolveWindow('3m', '', '', NOW)!, NOW)).toMatch(/· \d+ buckets of 1 day \(UTC days\) · UTC/);
+    expect(windowLabel(resolveWindow('1m', '', '', NOW)!, NOW)).toMatch(/buckets of 12 h \(UTC days\)/);
 
     // Five days: 2-hour buckets (an hour would be 120 columns, past the 96 the table allows). The
     // count is 60 or 61 by the zone: the grid is aligned to the epoch, local midnight is not.
@@ -101,13 +125,24 @@ describe('the axis', () => {
     const day = resolveWindow('1d', '', '', NOW)!;
     const hours = axisTicks(day.gridFromMs, day.gridEndMs, NOW);
     expect(hours.length).toBeGreaterThanOrEqual(5);
-    expect(hours.map(t => t.label)).toContain('6 Nov');
+    expect(hours.map(t => t.label)).toContain('20 Nov');
     expect(hours.filter(t => /^\d\d:\d\d$/.test(t.label)).length).toBeGreaterThanOrEqual(4);
     expect(hours.every(t => t.pct > 1.5 && t.pct < 98.5)).toBe(true);
 
     const week = resolveWindow('7d', '', '', NOW)!;
     const days = axisTicks(week.gridFromMs, week.gridEndMs, NOW).map(t => t.label);
-    expect(days).toEqual(['31 Oct', '1 Nov', '2 Nov', '3 Nov', '4 Nov', '5 Nov', '6 Nov']);
+    expect(days).toEqual(['14 Nov', '15 Nov', '16 Nov', '17 Nov', '18 Nov', '19 Nov', '20 Nov']);
+  });
+
+  it('marks the hours on the local clock, so the day of a DST change still reads 04:00, 08:00 …', () => {
+    // 1 Nov 2026, the US fall-back: 25 hours long in Los Angeles and New York (a 4-hour step), 24 in
+    // UTC (a 3-hour step). Absolute steps from midnight would read 03:00, 07:00 … after the change;
+    // on the clock, every mark is a whole multiple of the step.
+    const labels = axisTicks(local(2026, 11, 1).getTime(), local(2026, 11, 2).getTime(), NOW).map(t => t.label);
+    expect(labels.length).toBeGreaterThanOrEqual(5);
+    expect(labels.every(l => /^\d\d:00$/.test(l))).toBe(true);
+    const hours = labels.map(l => Number(l.slice(0, 2)));
+    expect(hours.every((h, i) => h === hours[0] * (i + 1))).toBe(true);
   });
 
   it('keeps a quarter to about eight labels', () => {
@@ -131,13 +166,13 @@ describe('the URL and the links out', () => {
   it("hands each page the window in its own words", () => {
     const week = resolveWindow('7d', '', '', NOW)!;
     expect(pageLinkParams('logs', week)).toEqual({ preset: '7d' });
-    expect(pageLinkParams('traces', week)).toEqual({ range: 'custom', cfrom: '2026-10-30T14:22', cto: null });
+    expect(pageLinkParams('traces', week)).toEqual({ range: 'custom', cfrom: '2026-11-13T14:22', cto: null });
 
     const day = resolveWindow('1d', '', '', NOW)!;
     expect(pageLinkParams('metrics', day)).toEqual({ range: '24h' });
 
     const month = resolveWindow('1m', '', '', NOW)!;
-    expect(pageLinkParams('logs', month)).toEqual({ preset: 'custom', from: '2026-10-06 14:22', to: null });
+    expect(pageLinkParams('logs', month)).toEqual({ preset: 'custom', from: '2026-10-20 14:22', to: null });
 
     const custom = resolveWindow('custom', '2026-10-12 09:00', '2026-10-16 18:30', NOW)!;
     expect(pageLinkParams('logs', custom)).toEqual({ preset: 'custom', from: '2026-10-12 09:00', to: '2026-10-16 18:30' });

@@ -1,5 +1,5 @@
 import { Params } from '@angular/router';
-import { addDays, addHours, format, startOfDay } from 'date-fns';
+import { addDays, format, startOfDay } from 'date-fns';
 
 import {
   DEFAULT_PRESET, QUICK_RANGE_LABELS, TimePreset, endOfMinuteIso, fmtDateInput, fmtPoint, isQuickRange,
@@ -34,6 +34,9 @@ export function bucketSecondsFor(spanMs: number): number {
   return Math.ceil(raw / 604_800) * 604_800;
 }
 
+/** The quick ranges counted in days, for the step: the months take their calendar span, which lands on 12 h or 1 day either way. */
+const NOMINAL_DAYS: Partial<Record<TimePreset, number>> = { '1d': 1, '3d': 3, '7d': 7, '14d': 14 };
+
 /**
  * The window the three bands share, resolved once against the clock. The grid is the bucket
  * axis every chart draws on: bucket starts aligned to the step from the epoch (as the server
@@ -54,7 +57,9 @@ export interface StatsWindow {
 
 /**
  * A preset as of `now`, or a custom window from the date inputs' strings; null when the custom
- * bounds do not make a window (no start, an unreadable bound, an end before the start).
+ * bounds do not make a window (no start, an unreadable bound, an end before the start) or one the
+ * server would take (a start before 1970 — its arithmetic counts from there — or an end more than
+ * a day past now: a clock ahead of the server's is tolerated, a typo in the year is not).
  */
 export function resolveWindow(preset: TimePreset, customFrom: string, customTo: string, now = new Date()): StatsWindow | null {
   let from: Date;
@@ -70,12 +75,16 @@ export function resolveWindow(preset: TimePreset, customFrom: string, customTo: 
     // A To bound is a minute and the whole minute is in the window (see endOfMinuteIso).
     to = end ? new Date(Math.floor(end.getTime() / 60_000) * 60_000 + 59_999) : now;
     if (to.getTime() <= from.getTime()) return null;
+    if (from.getTime() < 0 || to.getTime() > now.getTime() + DAY) return null;
   } else {
     from = quickRangeStart(preset, now);
     to = now;
     openEnded = true;
   }
-  const bucketSeconds = bucketSecondsFor(to.getTime() - from.getTime());
+  // The step from the window's nominal span: a day is 24 h even on the day a DST change makes
+  // 23 or 25 hours long — 25 h / 96 would give the one day a year 30-minute buckets.
+  const nominalDays = preset === 'custom' ? undefined : NOMINAL_DAYS[preset];
+  const bucketSeconds = bucketSecondsFor(nominalDays ? nominalDays * DAY : to.getTime() - from.getTime());
   const stepMs = bucketSeconds * 1000;
   const first = Math.floor(from.getTime() / stepMs);
   const last = Math.floor(to.getTime() / stepMs);
@@ -104,11 +113,16 @@ export function fmtBucket(seconds: number): string {
   return `${Math.round(seconds / 60)} min`;
 }
 
-/** The page's subtitle: `30 Oct 14:22 → now · 84 buckets of 2 h · UTC+05:00`. */
+/**
+ * The page's subtitle: `30 Oct 14:22 → now · 84 buckets of 2 h · UTC+05:00`. The grid is aligned
+ * to the epoch, so a bucket of 12 h or more is a UTC half-day or day, not a local one — a "day"
+ * bar in UTC+05:00 runs 05:00 → 05:00 — and the subtitle says so where it matters.
+ */
 export function windowLabel(w: StatsWindow, now = new Date()): string {
   const from = fmtPoint(new Date(w.fromMs), now);
   const to = w.openEnded ? 'now' : fmtPoint(new Date(w.toMs), now);
-  return `${from} → ${to} · ${w.buckets} buckets of ${fmtBucket(w.bucketSeconds)} · ${utcOffsetLabel(now)}`;
+  const utcDays = w.bucketSeconds >= 43_200 ? ' (UTC days)' : '';
+  return `${from} → ${to} · ${w.buckets} buckets of ${fmtBucket(w.bucketSeconds)}${utcDays} · ${utcOffsetLabel(now)}`;
 }
 
 /** The tiles' caption: `Last 7 days`, or `12 – 16 Oct` for a custom window. */
@@ -140,7 +154,7 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
   const span = gridEndMs - gridFromMs;
   if (span <= 0) return [];
   const step = TICK_STEPS.find(s => span / s <= maxTicks) ?? Math.ceil(span / maxTicks / DAY) * DAY;
-  const advance = (t: Date) => step < DAY ? addHours(t, step / HOUR) : addDays(t, step / DAY);
+  const advance = (t: Date) => step < DAY ? addLocalHours(t, step / HOUR) : addDays(t, step / DAY);
   // From the local midnight before the start, in steps, so the marks fall on 00:00, 04:00, 08:00 …
   let t = startOfDay(new Date(gridFromMs));
   while (t.getTime() < gridFromMs) t = advance(t);
@@ -152,6 +166,16 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
     ticks.push({ pct, label: step < DAY && !midnight ? format(t, 'HH:mm') : fmtDay(t, now) });
   }
   return ticks;
+}
+
+/**
+ * `t` plus `hours` on the local clock, not on the timeline: midnight plus four is 04:00 on the day
+ * a DST change happens too, where four absolute hours would read 03:00 or 05:00 from then on.
+ */
+function addLocalHours(t: Date, hours: number): Date {
+  const next = new Date(t);
+  next.setHours(t.getHours() + hours);
+  return next;
 }
 
 /** The URL's `preset`, `from`, `to` and `tab` as state; the defaults for anything it cannot read. */

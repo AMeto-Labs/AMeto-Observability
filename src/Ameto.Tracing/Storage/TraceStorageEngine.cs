@@ -5237,7 +5237,10 @@ public sealed partial class TraceStorageEngine : ITraceProvider, ITraceStatsProv
         void Add(long startNano, uint traces, uint errors)
         {
             if (startNano < fromNano || startNano > toNano) return;
-            int b = (int)Math.Clamp((startNano - fromNano) * (long)buckets / rangeNano, 0, buckets - 1);
+            // In 128 bits: a quarter in nanoseconds (8e15) times the 2 000 columns the Statistics
+            // page may ask for is past long.MaxValue, and the overflow put every such trace in the
+            // first column (a negative product, clamped).
+            int b = (int)Int128.Clamp((Int128)(startNano - fromNano) * buckets / rangeNano, 0, buckets - 1);
             total[b]    += traces;
             error[b]    += errors;
             totalTraces += (int)traces;

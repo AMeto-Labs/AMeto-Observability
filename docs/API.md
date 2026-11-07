@@ -356,9 +356,11 @@ Returns the distinct `@service` values seen, for the services dropdown/filter. (
 
 ### `GET /api/events/counts`
 
-Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `filter`, `gb` (group-by), bucketing hints.
+Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `bucket` (seconds; default about 120 columns, widened past 2 000), `service`.
 
-**Auth:** JWT Bearer. **Response:** JSON `{ buckets, series, … }`.
+Header-only is not free: the scan decodes every block in the window to read its headers, so the cost is the window's events, not its columns. Answers are cached for 20 s by bucket grid. A window wider than **7 days** takes a search slot and runs under the search budget, like `GET /api/events/aggregate`: `503` with `Retry-After` when the server is at its search limit, `504` when the budget runs out. A narrower window never waits for a slot.
+
+**Auth:** JWT Bearer. **Response:** JSON `{ from, to, bucketSeconds, total, buckets[], services[], levels[] }`.
 
 ---
 
@@ -417,7 +419,7 @@ The log store's counters: the segment catalogue summed, with the span of time it
 
 `oldestTimestamp` / `newestTimestamp` are the earliest and latest event any segment holds, `null` while there are no segments (the hot tier is not counted here — it is not on disk yet).
 
-The Statistics page draws the other two signals from `GET /api/traces/stats` (the `buckets`, `histogram` and `store` additions, see [Traces](#traces)) and `GET /api/metrics/stats` (see [Metrics](#metrics)), with the same `from` / `to` window and the bucket it chose for the log counts.
+The Statistics page draws the other two signals from `GET /api/traces/stats` (the `buckets`, `histogram` and `store=true` additions, see [Traces](#traces)) and `GET /api/metrics/stats` (see [Metrics](#metrics)), with the same `from` / `to` window and the bucket it chose for the log counts (`GET /api/events/counts`). One difference: the trace stats' columns are equal slices of `[from, to]`, so the page sends them the grid's own bounds — the first bucket's start and the last bucket's end — and the Traces band's tiles and rows therefore run to the end of the last bucket, up to one step past a closed custom window's `to` (the Logs and Metrics bands stop at `to`). What each costs: the log counts are a header scan of every event in the window, cached 20 s and guarded like a search past 7 days; the trace stats are three sidecar reads per segment in the window; the metric stats are one pass over the in-memory catalogue. No raw event, point or span reaches the client for any of them.
 
 ---
 
@@ -633,7 +635,7 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 |----------|---------|
 | `GET /api/traces` | List/search traces (root spans) by service, name, tag filter, duration, time range. |
 | `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). A field a span does not carry matches **no** comparison, including a negated one — `{ .attr != nil }` / `{ .attr = nil }` test presence. Nor does a value that cannot be compared: `{ .tenant > 5 }` and `{ !(.tenant > 5) }` both skip a span whose `.tenant` is text (Tempo answers `false` there, so its negation matches; this is deliberate). A quoted string against a numeric attribute compares the number's invariant text — `{ .ratio = "0.375" }`, never `"0,375"` — whatever the server's locale. |
-| `GET /api/traces/stats` | Aggregate trace stats over a window: `totalTraces`, `errorRate`, `p50LatencyMs` / `p95LatencyMs` / `p99LatencyMs` / `maxLatencyMs`, `throughputRps`, `spanCount`, `serviceCount`, `totalSparkline` / `errorSparkline` (`buckets` equal columns of the window, default 20, at most 2 000), `histogram` (`boundsMs`, `counts`: the merged duration histogram, the last bucket open) and `store` (`spans`, `hotSpans`, `segments`, `fileBytes`, `services`, `oldestStartMs`, `newestStartMs` — the whole store, window or no window). From the `.stats` and `.tracesum` sidecars and the segment catalogue; no span is read. |
+| `GET /api/traces/stats` | Aggregate trace stats over a window: `totalTraces`, `errorRate`, `p50LatencyMs` / `p95LatencyMs` / `p99LatencyMs` / `maxLatencyMs`, `throughputRps`, `spanCount`, `serviceCount`, `totalSparkline` / `errorSparkline` (`buckets` **equal slices of `[from, to]`**, default 20, at most 2 000 — not aligned to any clock, so a caller that wants them on a grid sends the grid's own bounds, as the Statistics page does), `histogram` (`boundsMs`, `counts`: the merged duration histogram, the last bucket open) and, with `store=true`, `store` (`spans`, `hotSpans`, `segments`, `fileBytes`, `services`, `oldestStartMs`, `newestStartMs` — the whole store, window or no window; `null` without the flag). From the `.stats` and `.tracesum` sidecars (three reads per segment in the window) and the segment catalogue; no span is read. |
 | `GET /api/traces/latency` | Latency distribution / percentiles by service or operation. |
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
 | `GET /api/traces/compare` | Compare two traces / time windows. |

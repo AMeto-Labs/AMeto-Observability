@@ -1,7 +1,8 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection, signal } from '@angular/core';
-import { HttpErrorResponse } from '@angular/common/http';
+import { HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { Router, provideRouter } from '@angular/router';
+import { RouterTestingHarness } from '@angular/router/testing';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { of, throwError } from 'rxjs';
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -19,8 +20,8 @@ import { MetricStatsDto } from '../../core/models/metric.model';
  * stacked bands and the popover.
  */
 
-/** 2026-11-06 14:22:30 local. */
-const NOW = new Date(2026, 10, 6, 14, 22, 30);
+/** 2026-11-20 14:22:30 local: no DST change in the day before it anywhere the specs run (see stats-range.util.spec). */
+const NOW = new Date(2026, 10, 20, 14, 22, 30);
 const STEP = 900_000;
 const GRID = Math.floor((NOW.getTime() - 86_400_000) / STEP) * STEP;
 const BUCKETS = [GRID, GRID + STEP, GRID + 2 * STEP];
@@ -40,7 +41,8 @@ const counts = (total: number): EventCountsDto => ({
 
 const stats: StatsDto = {
   segments: 186, totalEvents: 41_200_000, compressedBytes: 3.1 * 1024 ** 3, uncompressedBytes: 30 * 1024 ** 3,
-  oldestTimestamp: '2026-09-29T06:12:44.0000000+00:00', newestTimestamp: NOW.toISOString(),
+  // Noon UTC: "29 Sep" from UTC−11 to UTC+11, so the date the tiles show does not depend on the zone the specs run in.
+  oldestTimestamp: '2026-09-29T12:00:00.0000000+00:00', newestTimestamp: NOW.toISOString(),
 };
 
 const traceStats: TraceStatsDto = {
@@ -110,6 +112,25 @@ async function mount(api: ApiStub, phone = false): Promise<{ fixture: ComponentF
   return { fixture, el: fixture.nativeElement as HTMLElement, router };
 }
 
+/** The page reached through the router at `url` — a deep link, a reload — so the store reads its query string. */
+async function mountAt(api: ApiStub, url: string, phone = false): Promise<{ el: HTMLElement; cmp: StatsComponent }> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
+  TestBed.configureTestingModule({
+    providers: [
+      provideZonelessChangeDetection(),
+      provideRouter([{ path: 'stats', component: StatsComponent }]),
+      { provide: ApiService, useValue: api },
+      { provide: ViewportService, useValue: viewport(phone) },
+      { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider(icons) },
+    ],
+  });
+  const harness = await RouterTestingHarness.create(url);
+  await harness.fixture.whenStable();
+  harness.detectChanges();
+  return { el: harness.routeNativeElement as HTMLElement, cmp: harness.routeDebugElement!.componentInstance as StatsComponent };
+}
+
 const text = (el: HTMLElement) => el.textContent ?? '';
 
 async function click(fixture: ComponentFixture<StatsComponent>, target: Element | null): Promise<void> {
@@ -156,8 +177,9 @@ describe('Statistics — the three bands', () => {
     expect(countsArgs.bucket).toBe(900);
     expect(countsArgs.to).toBeUndefined();
     expect(Date.parse(countsArgs.from) % STEP).toBe(0);
-    const traceArgs = (api.getTraceStats as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, number];
+    const traceArgs = (api.getTraceStats as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, number, boolean];
     expect(traceArgs[2]).toBe(97);
+    expect(traceArgs[3]).toBe(true);   // the store's counters, which the Traces page's own poll does not ask for
     expect(Date.parse(traceArgs[0])).toBe(Date.parse(countsArgs.from));
     const metricArgs = (api.getMetricStats as ReturnType<typeof vi.fn>).mock.calls[0][0] as { bucket: number };
     expect(metricArgs.bucket).toBe(900);
@@ -173,9 +195,61 @@ describe('Statistics — the three bands', () => {
 
     expect(body).toContain('Unavailable');
     expect(body).toContain(sentence);
+    expect(body).toContain('Metrics are available again once the server has restarted.');
     expect(body).toContain('41.2M');
     expect(body).toContain('48.2K');
     expect(el.querySelectorAll('.sh-tag').length).toBe(1);
+  });
+
+  it('tells a failed request apart from a refusing store: a retry hint, the restart hint only for the store', async () => {
+    const budget = () => throwError(() => new HttpErrorResponse({
+      status: 504, error: { error: 'The query exceeded its 30s budget. Narrow the time range.' },
+    }));
+    const limit = () => throwError(() => new HttpErrorResponse({
+      status: 503, headers: new HttpHeaders({ 'Retry-After': '5' }), error: { error: 'Too many searches are running. Try again in a moment.' },
+    }));
+    const { el } = await mount(stubApi({ getEventCounts: vi.fn(budget), getTraceStats: vi.fn(limit) }));
+    const body = text(el);
+
+    expect(body).toContain('The query exceeded its 30s budget. Narrow the time range.');
+    expect(body).toContain('Too many searches are running. Try again in a moment.');
+    expect(body).toContain('Refresh to try again.');
+    expect(body).not.toContain('once the server has restarted');
+    expect(el.querySelectorAll('.sh-tag').length).toBe(2);
+  });
+
+  it('reads a custom window and the tab from the URL it is opened at', async () => {
+    const api = stubApi();
+    const { el, cmp } = await mountAt(api, '/stats?preset=custom&from=2026-10-12%2009:00&to=2026-10-16%2018:30&tab=traces', true);
+
+    expect(cmp.store.preset()).toBe('custom');
+    expect(cmp.store.customFrom()).toBe('2026-10-12 09:00');
+    expect(cmp.store.customTo()).toBe('2026-10-16 18:30');
+    expect(cmp.store.tab()).toBe('traces');
+    expect(el.querySelector('app-stats-traces')).not.toBeNull();
+    expect(el.querySelector('app-stats-logs')).toBeNull();
+    expect(text(el)).toContain('12 Oct 09:00 → 16 Oct 18:30');
+
+    // The band asked for its window on the page's grid: two-hour columns from the bucket holding the start.
+    const [from, to, buckets, store] = (api.getTraceStats as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, number, boolean];
+    expect(store).toBe(true);
+    expect(Date.parse(from)).toBeLessThanOrEqual(new Date(2026, 9, 12, 9, 0).getTime());
+    expect(Date.parse(to) - Date.parse(from)).toBe(buckets * 7_200_000);
+    expect(api.getEventCounts).not.toHaveBeenCalled();
+  });
+
+  it('lists seven metrics and folds the rest into "other metrics", the chart coloured the same way', async () => {
+    const byMetric = Array.from({ length: 10 }, (_, i) => ({
+      name: `metric_${i}`, kind: 'Gauge', unit: '1', series: 10 - i, bytes: (10 - i) * 1e6, points: [(10 - i) * 1e6, 0, 0],
+    }));
+    const { el } = await mount(stubApi({ getMetricStats: vi.fn(() => of({ ...metricStats, byMetric, otherBytes: 5e6, otherPoints: [5e6, 0, 0] })) }));
+
+    const names = [...el.querySelectorAll<HTMLElement>('app-stats-metrics .lst .row .nm')].map(n => n.textContent?.trim());
+    expect(names).toEqual(['metric_0', 'metric_1', 'metric_2', 'metric_3', 'metric_4', 'metric_5', 'metric_6', 'other metrics']);
+    // "other" is the three folded metrics (3 + 2 + 1 × 10⁶ B) plus the server's own other (5 × 10⁶ B): 11 000 000 B, 10.5 MiB.
+    expect(text(el.querySelector('app-stats-metrics .lst .row:last-child')!)).toContain('10.5 MB');
+    // The first bar: seven coloured segments and one for "other" — the rows' colours, no more.
+    expect(el.querySelectorAll('app-stats-metrics button.bar:first-child .sg').length).toBe(8);
   });
 
   it('says so when the window holds nothing, with the store\'s oldest record as the hint', async () => {
@@ -207,7 +281,7 @@ describe('Statistics — the three bands', () => {
     await click(fixture, el.querySelector('app-stats-logs button.bar'));
 
     expect(router.navigate).toHaveBeenCalledWith(['/events'], {
-      queryParams: { preset: 'custom', from: expect.stringMatching(/^2026-11-05 /), to: expect.stringMatching(/^2026-11-05 /) },
+      queryParams: { preset: 'custom', from: expect.stringMatching(/^2026-11-19 /), to: expect.stringMatching(/^2026-11-19 /) },
     });
   });
 });

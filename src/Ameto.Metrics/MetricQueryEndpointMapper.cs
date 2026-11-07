@@ -59,6 +59,10 @@ public static class MetricQueryEndpointMapper
             var toUtc   = toParsed   ?? now;
             var fromUtc = fromParsed ?? toUtc.AddDays(-1);
             if (fromUtc > toUtc) return Results.BadRequest("'from' is later than 'to'.");
+            // The arithmetic below is in nanoseconds since 1970 in a long, which reaches 1677–2262:
+            // a window is refused outside the years the store can hold rather than wrapped around.
+            if (fromUtc < DateTimeOffset.UnixEpoch) return Results.BadRequest("'from' is before 1970.");
+            if (toUtc > now.AddDays(1)) return Results.BadRequest("'to' is more than a day ahead.");
 
             var dto = MetricStoreStats.Build(stats.GetStoreSnapshot(), catalog.GetCatalog(), fromUtc, toUtc, bucket ?? 0, now);
             // After the read, before the answer, as every buffered metric endpoint asks (#95).

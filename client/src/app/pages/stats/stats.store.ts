@@ -45,7 +45,7 @@ export const StatsStore = signalStore(
     });
     const subtitle = computed(() => {
       const w = window();
-      return w ? windowLabel(w) : 'Pick a start for the custom range';
+      return w ? windowLabel(w) : 'Pick a custom range: a start from 1970 on, an end no later than tomorrow';
     });
     const caption = computed(() => {
       const w = window();

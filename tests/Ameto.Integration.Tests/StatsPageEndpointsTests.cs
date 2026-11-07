@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
+using Ameto.Server;
 using Ameto.Storage;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
@@ -16,11 +17,21 @@ namespace Ameto.Integration.Tests;
 /// cover (<c>GET /api/stats</c>), the trace stats with a chosen bucket count, the merged duration
 /// histogram and the store's counters (<c>GET /api/traces/stats</c>), and the metric store's
 /// catalogue bucketed over a window (<c>GET /api/metrics/stats</c>). Each over the real engine in
-/// the real host; the metric one is also refused once its store has closed, as its siblings are.
+/// the real host; the log and metric ones are also refused once their store has closed, as their
+/// siblings are. And the one request of the page that is NOT a catalogue read — the log counts,
+/// a header scan of every event in the window — takes a search slot once the window is wide.
 /// </summary>
 public sealed class StatsPageEndpointsTests
 {
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(60);
+
+    /// <summary>One search slot, and a queue wait short enough for a refusal to come back within the test.</summary>
+    private sealed class OneSlotFactory : AmetoWebAppFactory
+    {
+        protected override QueryOptions ConfiguredQuery => new() { MaxConcurrent = 1, QueueWait = TimeSpan.FromMilliseconds(150) };
+    }
+
+    private static string Iso(DateTimeOffset t) => Uri.EscapeDataString(t.ToString("O"));
 
     // ── Logs ──────────────────────────────────────────────────────────────────────────────────
 
@@ -66,7 +77,106 @@ public sealed class StatsPageEndpointsTests
         Assert.True((reportedNewest - newest).Duration() < TimeSpan.FromSeconds(1), $"{reportedNewest} vs {newest}");
     }
 
+    /// <summary>The store's sentence once it has closed (#95), as every other read of the log store gives it.</summary>
+    [Fact]
+    public async Task Stats_answer_503_once_the_log_store_has_closed()
+    {
+        using var factory = new AmetoWebAppFactory();
+        var client  = factory.CreateClient();
+        var storage = factory.Services.GetRequiredService<StorageEngine>();
+        await storage.CatalogLoaded.WaitAsync(Patience);
+
+        using var open = await client.GetAsync("/api/stats");
+        Assert.Equal(HttpStatusCode.OK, open.StatusCode);
+
+        await storage.DisposeAsync();   // the store closes; the host is not stopping
+        Assert.Equal(QueryAvailability.Closed, storage.Availability);
+
+        using var closed = await client.GetAsync("/api/stats");
+        string body = await closed.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, closed.StatusCode);
+        Assert.Contains("log store has shut down", body);
+    }
+
+    /// <summary>
+    /// The counts behind the Logs band decode every block in the window to read its headers, so a
+    /// month or a quarter is a search's worth of work: past seven days the request takes a
+    /// <see cref="QueryGuard"/> slot and is refused like a search when none is free, while a
+    /// dashboard's week stays the poll it always was and never waits for one.
+    /// </summary>
+    [Fact]
+    public async Task Wide_count_windows_take_a_search_slot_and_narrow_ones_do_not()
+    {
+        using var factory = new OneSlotFactory();
+        var client  = factory.CreateClient();
+        var storage = factory.Services.GetRequiredService<StorageEngine>();
+        await storage.CatalogLoaded.WaitAsync(Patience);
+        await TestHelpers.IngestAsync(client, TestHelpers.MakeEvent("one event", ts: DateTimeOffset.UtcNow.AddMinutes(-5)));
+        await TestHelpers.WaitForEventsAsync(client, 1);
+
+        var now    = DateTimeOffset.UtcNow;
+        string month = $"/api/events/counts?from={Iso(now.AddDays(-30))}&bucket=43200";
+        string week  = $"/api/events/counts?from={Iso(now.AddDays(-6))}&bucket=7200";
+
+        // The only slot is held by a search that has not finished.
+        var guard = factory.Services.GetRequiredService<QueryGuard>();
+        var held  = await guard.TryEnterAsync(default, out _);
+        Assert.NotNull(held);
+        try
+        {
+            using var refused = await client.GetAsync(month);
+            string body = await refused.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, refused.StatusCode);
+            Assert.Contains("Too many searches", body);
+            Assert.Equal(TimeSpan.FromSeconds(5), refused.Headers.RetryAfter?.Delta);
+
+            using var served = await client.GetAsync(week);
+            Assert.Equal(HttpStatusCode.OK, served.StatusCode);
+            var counts = await served.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.Equal(1, counts.GetProperty("total").GetInt64());
+        }
+        finally { held.Value.Dispose(); }
+
+        // The slot back, the same month is answered — and from the scan, not from a cached refusal.
+        var answered = await client.GetFromJsonAsync<JsonElement>(month);
+        Assert.Equal(43_200, answered.GetProperty("bucketSeconds").GetInt32());
+        Assert.Equal(1, answered.GetProperty("total").GetInt64());
+    }
+
     // ── Traces ────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The column of a trace is <c>(start − from) × buckets / range</c>; over a quarter in nanoseconds
+    /// with the 2 000 columns the Statistics page may ask for, the product overflowed a long, and
+    /// every trace of the window went to the first column (a negative product, clamped).
+    /// </summary>
+    [Fact]
+    public async Task Trace_stats_put_a_recent_trace_in_the_last_of_two_thousand_columns_over_a_quarter()
+    {
+        using var factory = new AmetoWebAppFactory();
+        var client = factory.CreateClient();
+        var engine = factory.Services.GetRequiredService<TraceStorageEngine>();
+        await engine.ColdLoadCompleted.WaitAsync(Patience);
+
+        var now = DateTimeOffset.UtcNow;
+        Assert.True(engine.WriteSpan(new SpanIngestItem
+        {
+            TraceId           = new TraceId(0, 1),
+            SpanId            = new SpanId(1),
+            StartTimeUnixNano = now.AddHours(-1).ToUnixTimeMilliseconds() * 1_000_000L,
+            DurationNanos     = 1_000_000,
+            Name              = "GET /orders",
+            ServiceName       = "checkout",
+            Kind              = SpanKind.Server,
+        }));
+
+        var stats   = await client.GetFromJsonAsync<JsonElement>($"/api/traces/stats?from={Iso(now.AddDays(-92))}&buckets=2000");
+        var columns = stats.GetProperty("totalSparkline").EnumerateArray().Select(c => c.GetDouble()).ToArray();
+        Assert.Equal(2000, columns.Length);
+        Assert.Equal(1, stats.GetProperty("totalTraces").GetInt32());
+        Assert.Equal(1.0, columns[^1]);
+        Assert.Equal(0.0, columns[0]);
+    }
 
     [Fact]
     public async Task Trace_stats_take_the_bucket_count_and_carry_the_histogram_and_the_store()
@@ -90,7 +200,7 @@ public sealed class StatsPageEndpointsTests
                 Kind              = SpanKind.Server,
             }));
 
-        var stats = await client.GetFromJsonAsync<JsonElement>("/api/traces/stats?buckets=48");
+        var stats = await client.GetFromJsonAsync<JsonElement>("/api/traces/stats?buckets=48&store=true");
 
         Assert.Equal(48, stats.GetProperty("totalSparkline").GetArrayLength());
         Assert.Equal(48, stats.GetProperty("errorSparkline").GetArrayLength());
@@ -115,11 +225,13 @@ public sealed class StatsPageEndpointsTests
         Assert.Equal(1, store.GetProperty("services").GetInt32());
         Assert.Equal(JsonValueKind.Null, store.GetProperty("oldestStartMs").ValueKind);
 
-        // The column count is bounded, and the default is the Traces page's twenty.
+        // The column count is bounded, and the default is the Traces page's twenty — without the
+        // store's counters, which the page's poll does not ask for and so does not pay for.
         var capped = await client.GetFromJsonAsync<JsonElement>("/api/traces/stats?buckets=5000");
         Assert.Equal(2000, capped.GetProperty("totalSparkline").GetArrayLength());
         var plain = await client.GetFromJsonAsync<JsonElement>("/api/traces/stats");
         Assert.Equal(20, plain.GetProperty("totalSparkline").GetArrayLength());
+        Assert.False(plain.TryGetProperty("store", out var noStore) && noStore.ValueKind != JsonValueKind.Null, plain.GetRawText());
     }
 
     // ── Metrics ───────────────────────────────────────────────────────────────────────────────
@@ -199,6 +311,16 @@ public sealed class StatsPageEndpointsTests
         Assert.Equal(HttpStatusCode.BadRequest, inverted.StatusCode);
         using var malformed = await client.GetAsync("/api/metrics/stats?from=yesterday");
         Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
+
+        // The nanosecond arithmetic behind the answer holds 1677–2262: a window outside the years the
+        // store can hold is refused, not wrapped around.
+        using var prehistoric = await client.GetAsync("/api/metrics/stats?from=1969-12-31T00:00:00Z");
+        Assert.Equal(HttpStatusCode.BadRequest, prehistoric.StatusCode);
+        Assert.Contains("1970", await prehistoric.Content.ReadAsStringAsync());
+        using var future = await client.GetAsync($"/api/metrics/stats?to={Iso(DateTimeOffset.UtcNow.AddDays(2))}");
+        Assert.Equal(HttpStatusCode.BadRequest, future.StatusCode);
+        using var tomorrow = await client.GetAsync($"/api/metrics/stats?to={Iso(DateTimeOffset.UtcNow.AddHours(20))}");
+        Assert.Equal(HttpStatusCode.OK, tomorrow.StatusCode);
     }
 
     /// <summary>The store's sentence once it has closed (#95), as every other metric read gives it.</summary>

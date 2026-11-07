@@ -17,6 +17,15 @@ export function unavailableMessage(err: unknown): string | null {
   return errorSentence(err.error) ?? UNAVAILABLE_FALLBACK;
 }
 
+/**
+ * The server's own sentence for a failed request of any status — a 504's "The query exceeded its
+ * 30s budget", a 400's named parameter — and null when the body carries none (a network error, an
+ * HTML error page). For a page that shows the server's words rather than its own guess.
+ */
+export function serverSentence(err: unknown): string | null {
+  return err instanceof HttpErrorResponse ? errorSentence(err.error) : null;
+}
+
 /** `{"error": "…"}` — the body every refusal on this server carries — as an object or as text. */
 function errorSentence(body: unknown): string | null {
   if (typeof body === 'string') {

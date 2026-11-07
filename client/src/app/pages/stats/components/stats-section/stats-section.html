@@ -55,7 +55,7 @@
         @case ('ready') {
           <div class="bars">
             @for (b of bars(); track b.startMs) {
-              <button type="button" class="bar" [title]="b.title" [attr.aria-label]="meta().bucketLabel"
+              <button type="button" class="bar" [title]="b.title" [attr.aria-label]="barLabel(b)"
                       (click)="bucketOpen.emit(b)">
                 <span class="fill" [style.height.%]="b.heightPct">
                   @for (s of b.segments; track $index) {
@@ -81,7 +81,7 @@
           <div class="empty" role="alert">
             <lucide-icon class="empty-err" name="triangle-alert" [size]="22" [strokeWidth]="1.5" />
             <p>{{ errorText() }}</p>
-            <span>{{ meta().unavailableHint }}</span>
+            <span>{{ unavailableHint() }}</span>
           </div>
           <div class="ax"></div>
         }

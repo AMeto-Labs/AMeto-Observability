@@ -6,9 +6,8 @@ import { format } from 'date-fns';
 
 import { ApiService } from '../../../core/services/api.service';
 import { MetricStatsDto } from '../../../core/models/metric.model';
-import { unavailableMessage } from '../../../shared/utils/unavailable';
 import {
-  BreakdownTab, ChartBar, ChartSegment, SectionState, StatTile, StatsSectionComponent,
+  BreakdownTab, ChartBar, ChartSegment, SectionFailure, SectionState, StatTile, StatsSectionComponent, sectionFailure,
 } from '../components/stats-section/stats-section';
 import { BreakdownHeader, BreakdownRow, StatsRowsComponent } from '../components/stats-rows/stats-rows';
 import {
@@ -29,23 +28,24 @@ const TOP_METRICS = 7;
 const KIND_LETTER: Readonly<Record<string, string>> = { Counter: 'C', Gauge: 'G', Histogram: 'H' };
 const KIND_COLOR: Readonly<Record<string, string>> = { Counter: 'var(--info)', Gauge: 'var(--success)', Histogram: '#A78BFA' };
 
-interface MetricsResult { data: MetricStatsDto | null; error: string | null; }
+interface MetricsResult { data: MetricStatsDto | null; failure: SectionFailure | null; }
 
 /**
  * The Metrics band: `GET /api/metrics/stats` — the catalog by kind, the cold segments' bytes
  * spread over the window's buckets and attributed to their metrics, the store's totals and the
- * hot tier. No point is read for it, so three months cost what a day does. The chart is bytes
- * written per bucket, stacked by the ten biggest metrics; a store refusal (#95) is the band's
- * unavailable state with the server's sentence.
+ * hot tier. No point is read for it, so three months cost what a day does. The chart is bytes on
+ * disk per bucket of the time they cover (a segment's bytes spread over its range — not the bytes
+ * written in that bucket, which the catalogue cannot tell), stacked by the biggest metrics; a
+ * store refusal (#95) is the band's unavailable state with the server's sentence.
  */
 @Component({
   selector: 'app-stats-metrics',
   imports: [StatsSectionComponent, StatsRowsComponent],
   template: `
     <app-stats-section signal="metrics" [caption]="caption()" [tiles]="tiles()" [state]="state()"
-      chartTitle="Storage written" [chartCaption]="chartCaption()" [bars]="bars()" [ticks]="ticks()"
-      emptyText="No metrics written in this window" [emptyHint]="emptyHint()" emptyRowsText="No metric data."
-      [errorText]="error()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
+      chartTitle="On disk, by the time it covers" [chartCaption]="chartCaption()" [bars]="bars()" [ticks]="ticks()"
+      emptyText="No metrics on disk for this window" [emptyHint]="emptyHint()" emptyRowsText="No metric data."
+      [errorText]="error()" [refused]="refused()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
       (bucketOpen)="openBucket($event)">
       @if (tab() === 'kinds') {
         <app-stats-rows [rows]="kindRows()" [header]="kindHeader" />
@@ -76,8 +76,8 @@ export class StatsMetricsSectionComponent {
       switchMap(w => {
         const bounds = requestBounds(w);
         return this.api.getMetricStats({ from: bounds.from, to: bounds.to, bucket: w.bucketSeconds }).pipe(
-          map((data): MetricsResult => ({ data, error: null })),
-          catchError(err => of<MetricsResult>({ data: null, error: unavailableMessage(err) ?? 'Could not load the metric statistics.' })),
+          map((data): MetricsResult => ({ data, failure: null })),
+          catchError(err => of<MetricsResult>({ data: null, failure: sectionFailure(err, 'Could not load the metric statistics.') })),
           startWith(null),
         );
       }),
@@ -86,12 +86,13 @@ export class StatsMetricsSectionComponent {
   );
 
   private readonly data = computed(() => this.result()?.data ?? null);
-  readonly error = computed(() => this.result()?.error ?? '');
+  readonly error = computed(() => this.result()?.failure?.error ?? '');
+  readonly refused = computed(() => this.result()?.failure?.refused ?? false);
 
   readonly state = computed<SectionState>(() => {
     const r = this.result();
     if (!r) return 'loading';
-    if (r.error || !r.data) return 'unavailable';
+    if (r.failure || !r.data) return 'unavailable';
     return r.data.window.bytesWritten > 0 || r.data.window.metrics > 0 ? 'ready' : 'empty';
   });
 
@@ -115,9 +116,9 @@ export class StatsMetricsSectionComponent {
     return [
       { label: 'Metrics with data', value: fmtCount(w?.metrics ?? 0), muted: !w?.metrics },
       { label: 'Series', value: fmtCount(s?.series), muted: !s },
-      { label: 'Written', value: fmtBytes(w?.bytesWritten ?? 0), muted: !w?.bytesWritten },
+      { label: 'Stored', value: fmtBytes(w?.bytesWritten ?? 0), muted: !w?.bytesWritten },
       { label: 'Segments', value: fmtCount(s?.segments), muted: !s },
-      { label: 'Peak write', value: w?.bytesWritten ? peak : '—', muted: !w?.bytesWritten },
+      { label: 'Densest bucket', value: w?.bytesWritten ? peak : '—', muted: !w?.bytesWritten },
       { label: 'On disk', value: fmtBytes(s?.bytes), muted: !s },
       { label: 'Raw points', value: rawShare, muted: !w?.bytesWritten },
       { label: 'Hot tier', value: s ? `${fmtCount(s.hotPoints)} pts` : '—', muted: !s },
@@ -144,7 +145,7 @@ export class StatsMetricsSectionComponent {
       return {
         startMs, endMs: startMs + stepMs, total, segments,
         heightPct: max > 0 && total > 0 ? Math.max(1.5, (total / max) * 100) : 0,
-        title: `${format(startMs, 'd MMM HH:mm')} – ${format(startMs + stepMs, 'HH:mm')}\n${fmtBytes(total)} written · click to open`,
+        title: `${format(startMs, 'd MMM HH:mm')} – ${format(startMs + stepMs, 'HH:mm')}\n${fmtBytes(total)} on disk · click to open`,
       };
     });
   });
@@ -190,7 +191,8 @@ export class StatsMetricsSectionComponent {
     const other = d.otherBytes + d.byMetric.slice(TOP_METRICS).reduce((a, m) => a + m.bytes, 0);
     if (other > 0) {
       rows.push({
-        key: 'other', name: 'other metrics', color: OTHER_COLOR,
+        // A key no metric name can have: `@for` tracks the rows by it, and a metric named "other" is legal.
+        key: '\u0000other', name: 'other metrics', color: OTHER_COLOR,
         barPct: (other / top) * 100,
         cols: [{ text: fmtBytes(other) }, { text: '', muted: true }],
       });

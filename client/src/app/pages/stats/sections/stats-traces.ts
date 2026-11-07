@@ -7,9 +7,8 @@ import { format } from 'date-fns';
 import { ApiService } from '../../../core/services/api.service';
 import { LatencyServiceDto, TraceStatsDto } from '../../../core/models/span.model';
 import { serviceColor } from '../../../shared/utils/service-color';
-import { unavailableMessage } from '../../../shared/utils/unavailable';
 import {
-  BreakdownTab, ChartBar, LegendItem, SectionState, StatTile, StatsSectionComponent,
+  BreakdownTab, ChartBar, LegendItem, SectionFailure, SectionState, StatTile, StatsSectionComponent, sectionFailure,
 } from '../components/stats-section/stats-section';
 import { BreakdownHeader, BreakdownRow, StatsRowsComponent } from '../components/stats-rows/stats-rows';
 import {
@@ -21,23 +20,26 @@ import { fmtBytes, fmtCount, fmtDateMs, fmtMs, fmtPct, fmtRate } from '../stats-
 const TOP_ROWS = 8;
 /** An error share at or past this reads red in the services list. */
 const ERROR_SHARE_HOT = 2;
-/** Histogram buckets from this bound up (1 s) are drawn in the warning colour. */
-const SLOW_BUCKET = 8;
+/**
+ * Histogram buckets from this index up are drawn in the warning colour: bucket 9 is the first past
+ * the 1 s bound (bucket i spans `boundsMs[i-1]` – `boundsMs[i]`; `boundsMs[8]` is 1 000 ms).
+ */
+const SLOW_BUCKET = 9;
 
 interface TracesResult {
   stats: TraceStatsDto | null;
-  error: string | null;
+  failure: SectionFailure | null;
   latency: LatencyServiceDto[];
 }
 
 interface HistogramBar { heightPct: number; color: string; title: string; }
 
 /**
- * The Traces band: `GET /api/traces/stats` with the page's bucket count (the sparklines then
- * share the Logs chart's grid), its merged duration histogram and store counters, plus
+ * The Traces band: `GET /api/traces/stats?store=true` with the page's bucket count (the sparklines
+ * then share the Logs chart's grid), its merged duration histogram and store counters, plus
  * `GET /api/traces/latency` for the per-service rows. Both answer from the `.stats` and
- * `.tracesum` sidecars: no span is read for any window. The chart stacks the error traces, red,
- * under the rest of each bucket.
+ * `.tracesum` sidecars — three reads per segment in the window, no span read — so a quarter costs
+ * its segment count. The chart stacks the error traces, red, under the rest of each bucket.
  */
 @Component({
   selector: 'app-stats-traces',
@@ -46,7 +48,7 @@ interface HistogramBar { heightPct: number; color: string; title: string; }
     <app-stats-section signal="traces" [caption]="caption()" [tiles]="tiles()" [state]="state()"
       chartTitle="Traces" [chartCaption]="chartCaption()" [legend]="legend" [bars]="bars()" [ticks]="ticks()"
       emptyText="No traces in this window" [emptyHint]="emptyHint()" emptyRowsText="No service data."
-      [errorText]="error()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
+      [errorText]="error()" [refused]="refused()" [tabs]="tabs" [(tab)]="tab" [breakdownNote]="note()" [openParams]="openParams()"
       (bucketOpen)="openBucket($event)">
       @if (tab() === 'latency') {
         <div class="lat">
@@ -110,16 +112,16 @@ export class StatsTracesSectionComponent {
         const from = new Date(w.gridFromMs).toISOString();
         const to = new Date(w.gridEndMs).toISOString();
         return forkJoin({
-          stats: this.api.getTraceStats(from, to, w.buckets).pipe(
-            map(data => ({ data, error: null as string | null })),
+          stats: this.api.getTraceStats(from, to, w.buckets, true).pipe(
+            map(data => ({ data, failure: null as SectionFailure | null })),
             catchError(err => of({
               data: null as TraceStatsDto | null,
-              error: unavailableMessage(err) ?? 'Could not load the trace statistics.',
+              failure: sectionFailure(err, 'Could not load the trace statistics.'),
             })),
           ),
           latency: this.api.getLatency(from, to).pipe(catchError(() => of([] as LatencyServiceDto[]))),
         }).pipe(
-          map(({ stats, latency }): TracesResult => ({ stats: stats.data, error: stats.error, latency })),
+          map(({ stats, latency }): TracesResult => ({ stats: stats.data, failure: stats.failure, latency })),
           startWith(null),
         );
       }),
@@ -128,12 +130,13 @@ export class StatsTracesSectionComponent {
   );
 
   private readonly stats = computed(() => this.result()?.stats ?? null);
-  readonly error = computed(() => this.result()?.error ?? '');
+  readonly error = computed(() => this.result()?.failure?.error ?? '');
+  readonly refused = computed(() => this.result()?.failure?.refused ?? false);
 
   readonly state = computed<SectionState>(() => {
     const r = this.result();
     if (!r) return 'loading';
-    if (r.error || !r.stats) return 'unavailable';
+    if (r.failure || !r.stats) return 'unavailable';
     return r.stats.totalTraces > 0 ? 'ready' : 'empty';
   });
 

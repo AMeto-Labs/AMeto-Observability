@@ -27,7 +27,7 @@
     <header class="ph-hdr">
       <h1 class="ph-title">Statistics</h1>
       <div class="ph-quick">
-        <button type="button" class="ph-range tn" aria-haspopup="dialog" aria-label="Time range" (click)="store.openSheet()">
+        <button type="button" class="ph-range tn" aria-haspopup="dialog" [attr.aria-label]="'Time range: ' + phoneRangeLabel()" (click)="store.openSheet()">
           <lucide-icon name="calendar" [size]="12" />
           <span class="ph-range-txt">{{ phoneRangeLabel() }}</span>
           <lucide-icon name="chevron-down" [size]="10" class="ph-range-caret" />
@@ -62,7 +62,7 @@
         <app-stats-traces [window]="w" [caption]="store.caption()" />
       }
     } @else {
-      <app-empty-state icon="calendar" text="Pick a start for the custom range" />
+      <app-empty-state icon="calendar" text="Pick a custom range: a start from 1970 on, an end after it and no later than tomorrow" />
     }
   </div>
 
