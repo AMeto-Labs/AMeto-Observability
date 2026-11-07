@@ -41,8 +41,9 @@ const counts = (total: number): EventCountsDto => ({
 
 const stats: StatsDto = {
   segments: 186, totalEvents: 41_200_000, compressedBytes: 3.1 * 1024 ** 3, uncompressedBytes: 30 * 1024 ** 3,
-  // Noon UTC: "29 Sep" from UTC−11 to UTC+11, so the date the tiles show does not depend on the zone the specs run in.
-  oldestTimestamp: '2026-09-29T12:00:00.0000000+00:00', newestTimestamp: NOW.toISOString(),
+  // Noon on 29 Sep LOCAL: the tiles read "29 Sep" wherever the specs run. No UTC instant has one calendar date in
+  // every zone (they span UTC−12 to UTC+14), so the noon-UTC fixture read "30 Sep" in Pacific/Auckland.
+  oldestTimestamp: new Date(2026, 8, 29, 12).toISOString(), newestTimestamp: NOW.toISOString(),
 };
 
 const traceStats: TraceStatsDto = {
@@ -195,10 +196,25 @@ describe('Statistics — the three bands', () => {
 
     expect(body).toContain('Unavailable');
     expect(body).toContain(sentence);
-    expect(body).toContain('Metrics are available again once the server has restarted.');
+    // The hint adds only what the gate's sentence lacks: the restart is named once, by the sentence.
+    expect(body).toContain('Logs and traces are unaffected.');
+    expect(body).not.toContain('Refresh to try again.');
+    expect(body.match(/once the server has restarted/g)).toHaveLength(1);
     expect(body).toContain('41.2M');
     expect(body).toContain('48.2K');
     expect(el.querySelectorAll('.sh-tag').length).toBe(1);
+  });
+
+  it('names the restart itself when a refusal carries no sentence of its own', async () => {
+    // A 503 without `Retry-After` and without a body: the store's refusal in the fallback's words,
+    // which do not name the restart — so the hint does, before the other two signals.
+    const bare = () => throwError(() => new HttpErrorResponse({ status: 503 }));
+    const { el } = await mount(stubApi({ getMetricStats: vi.fn(bare) }));
+    const body = text(el);
+
+    expect(body).toContain('The server cannot answer this right now (503). Try again shortly.');
+    expect(body).toContain('Metrics are available again once the server has restarted. Logs and traces are unaffected.');
+    expect(body).not.toContain('Refresh to try again.');
   });
 
   it('tells a failed request apart from a refusing store: a retry hint, the restart hint only for the store', async () => {

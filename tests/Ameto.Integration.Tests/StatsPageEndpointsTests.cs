@@ -101,8 +101,10 @@ public sealed class StatsPageEndpointsTests
     /// <summary>
     /// The counts behind the Logs band decode every block in the window to read its headers, so a
     /// month or a quarter is a search's worth of work: past seven days the request takes a
-    /// <see cref="QueryGuard"/> slot and is refused like a search when none is free, while a
-    /// dashboard's week stays the poll it always was and never waits for one.
+    /// <see cref="QueryGuard"/> slot and is refused like a search when none is free, while a window
+    /// of seven days or less — the page's 1d and 3d — stays the poll it always was and never waits
+    /// for one. The page's 7d is over the threshold too: it asks from the bucket grid, so its window
+    /// is seven days plus up to one 2-hour step. The narrow window below is six days, not a week.
     /// </summary>
     [Fact]
     public async Task Wide_count_windows_take_a_search_slot_and_narrow_ones_do_not()
@@ -115,8 +117,8 @@ public sealed class StatsPageEndpointsTests
         await TestHelpers.WaitForEventsAsync(client, 1);
 
         var now    = DateTimeOffset.UtcNow;
-        string month = $"/api/events/counts?from={Iso(now.AddDays(-30))}&bucket=43200";
-        string week  = $"/api/events/counts?from={Iso(now.AddDays(-6))}&bucket=7200";
+        string month   = $"/api/events/counts?from={Iso(now.AddDays(-30))}&bucket=43200";
+        string sixDays = $"/api/events/counts?from={Iso(now.AddDays(-6))}&bucket=7200";
 
         // The only slot is held by a search that has not finished.
         var guard = factory.Services.GetRequiredService<QueryGuard>();
@@ -130,7 +132,7 @@ public sealed class StatsPageEndpointsTests
             Assert.Contains("Too many searches", body);
             Assert.Equal(TimeSpan.FromSeconds(5), refused.Headers.RetryAfter?.Delta);
 
-            using var served = await client.GetAsync(week);
+            using var served = await client.GetAsync(sixDays);
             Assert.Equal(HttpStatusCode.OK, served.StatusCode);
             var counts = await served.Content.ReadFromJsonAsync<JsonElement>();
             Assert.Equal(1, counts.GetProperty("total").GetInt64());

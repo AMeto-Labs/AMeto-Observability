@@ -62,24 +62,26 @@ interface SignalMeta {
   title: string;
   icon: string;
   description: string;
-  unavailableHint: string;
+  /** Under a refused store's sentence: when the signal is back, and that the other two stand. */
+  restartHint: string;
+  unaffectedHint: string;
   bucketLabel: string;
 }
 
 const META: Readonly<Record<StatsSignal, SignalMeta>> = {
   logs: {
     title: 'Logs', icon: 'list', description: 'ingest over the window · the log store',
-    unavailableHint: 'Logs are available again once the server has restarted. Metrics and traces are unaffected.',
+    restartHint: 'Logs are available again once the server has restarted.', unaffectedHint: 'Metrics and traces are unaffected.',
     bucketLabel: 'Open this bucket in Logs',
   },
   metrics: {
     title: 'Metrics', icon: 'chart-bar', description: 'bytes on disk for the window · the metric store',
-    unavailableHint: 'Metrics are available again once the server has restarted. Logs and traces are unaffected.',
+    restartHint: 'Metrics are available again once the server has restarted.', unaffectedHint: 'Logs and traces are unaffected.',
     bucketLabel: 'Open this bucket in Metrics',
   },
   traces: {
     title: 'Traces', icon: 'activity', description: 'traces over the window · the trace store',
-    unavailableHint: 'Traces are available again once the server has restarted. Logs and metrics are unaffected.',
+    restartHint: 'Traces are available again once the server has restarted.', unaffectedHint: 'Logs and metrics are unaffected.',
     bucketLabel: 'Open this bucket in Traces',
   },
 };
@@ -127,8 +129,17 @@ export class StatsSectionComponent {
   readonly meta = computed(() => META[this.signal()]);
   readonly route = computed(() => SIGNAL_ROUTE[this.signal()]);
   readonly headingId = computed(() => `stats-${this.signal()}`);
-  /** The hint under the sentence of an unavailable band. */
-  readonly unavailableHint = computed(() => this.refused() ? this.meta().unavailableHint : 'Refresh to try again.');
+  /**
+   * The hint under the sentence of an unavailable band. A refused store's gate already ends its
+   * sentence with "… available again once the server has restarted" (LogStoreGate, MetricStoreGate,
+   * TraceStoreGate), so the hint then adds only what the sentence lacks — that the other two signals
+   * stand; a refusal worded without the restart (the 503 fallback) gets both halves.
+   */
+  readonly unavailableHint = computed(() => {
+    if (!this.refused()) return 'Refresh to try again.';
+    const { restartHint, unaffectedHint } = this.meta();
+    return /restart/i.test(this.errorText()) ? unaffectedHint : `${restartHint} ${unaffectedHint}`;
+  });
 
   /** A bar's accessible name: what the click does, and which bucket it is (the title's first line). */
   barLabel(bar: ChartBar): string {

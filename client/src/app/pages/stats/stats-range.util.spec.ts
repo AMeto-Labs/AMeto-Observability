@@ -145,6 +145,16 @@ describe('the axis', () => {
     expect(hours.every((h, i) => h === hours[0] * (i + 1))).toBe(true);
   });
 
+  it('places each hour mark from the day, so a mark lost to a spring-forward gap does not shift the rest', () => {
+    // 8 Mar 2026 00:00 → 12:00, the US spring-forward: 02:00 does not exist in New York or Los Angeles,
+    // so the window is 11 hours there (2-hour marks) and 12 elsewhere. Marks advanced from the mark
+    // before used to carry the lost hour along — 03:00, 05:00, 07:00, 09:00, 11:00. Placed from the
+    // day, only the mark inside the gap moves (JS puts 02:00 at 03:00); the rest stay on even hours.
+    const gap = local(2026, 3, 8, 2).getHours() !== 2;
+    const labels = axisTicks(local(2026, 3, 8).getTime(), local(2026, 3, 8, 12).getTime(), NOW).map(t => t.label);
+    expect(labels).toEqual(gap ? ['03:00', '04:00', '06:00', '08:00', '10:00'] : ['02:00', '04:00', '06:00', '08:00', '10:00']);
+  });
+
   it('keeps a quarter to about eight labels', () => {
     const quarter = resolveWindow('3m', '', '', NOW)!;
     const ticks = axisTicks(quarter.gridFromMs, quarter.gridEndMs, NOW);

@@ -358,7 +358,7 @@ Returns the distinct `@service` values seen, for the services dropdown/filter. (
 
 Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `bucket` (seconds; default about 120 columns, widened past 2 000), `service`.
 
-Header-only is not free: the scan decodes every block in the window to read its headers, so the cost is the window's events, not its columns. Answers are cached for 20 s by bucket grid. A window wider than **7 days** takes a search slot and runs under the search budget, like `GET /api/events/aggregate`: `503` with `Retry-After` when the server is at its search limit, `504` when the budget runs out. A narrower window never waits for a slot.
+Header-only is not free: the scan decodes every block in the window to read its headers, so the cost is the window's events, not its columns. Answers are cached for 20 s by bucket grid. A window wider than **7 days** takes a search slot and runs under the search budget, like `GET /api/events/aggregate`: `503` with `Retry-After` when the server is at its search limit, `504` when the budget runs out. A window of 7 days or less never waits for a slot. Of the Statistics page's presets, `1d` and `3d` stay under the threshold; `7d` asks from its bucket grid, so that window is 7 days plus up to one 2-hour step and takes a slot like `14d`, `1m` and `3m`.
 
 **Auth:** JWT Bearer. **Response:** JSON `{ from, to, bucketSeconds, total, buckets[], services[], levels[] }`.
 
