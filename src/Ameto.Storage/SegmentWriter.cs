@@ -37,6 +37,8 @@ namespace Ameto.Storage;
 ///   group 0: blocks… | inverted | trigram | bloom
 ///   group 1: blocks… | inverted | trigram | bloom
 ///   …
+///   counts section (optional; footer slot 1, 0 = absent): event counts per
+///     (15-minute slot, service, level) — format in SegmentCountsSummary
 ///   group directory: uint32 count + entries[56 B]
 ///     { uint32 firstBlock, blockCount, firstOrdinal, eventCount;
 ///       int64 minTs, maxTs, invertedOff, trigramOff, bloomOff }   (offset 0 = absent)
@@ -191,6 +193,22 @@ public sealed class SegmentWriter : IDisposable
     private long     _minTimestamp = long.MaxValue;
     private long     _maxTimestamp = long.MinValue;
     private LogLevel _minLevel     = LogLevel.Fatal;
+
+    /// <summary>
+    /// The segment's event counts per (15-minute slot, service, level), built as rows are staged
+    /// and written by <see cref="Finalise"/> as the counts section (see
+    /// <see cref="SegmentCountsSummary"/>). Null until the first <see cref="WriteEvents"/>, and when
+    /// <see cref="WritesCountsSummary"/> is off.
+    /// </summary>
+    private SegmentCountsBuilder? _counts;
+    private long _countsSectionOffset;
+
+    /// <summary>
+    /// Whether the file carries a counts section. On by default; off reproduces the bytes this
+    /// writer produced before the section existed, which is what the golden format test pins and
+    /// what the tests that need a pre-summary segment write.
+    /// </summary>
+    internal bool WritesCountsSummary { get; init; } = true;
 
     public SegmentWriter(string filePath) : this(filePath, DefaultGroupPayloadBudgetBytes) { }
 
@@ -387,6 +405,7 @@ public sealed class SegmentWriter : IDisposable
     {
         _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
         _sinkFactory = indexSink;
+        if (WritesCountsSummary) _counts ??= new SegmentCountsBuilder();
 
         while (source.TryReadNext(out var ev))
         {
@@ -427,6 +446,9 @@ public sealed class SegmentWriter : IDisposable
             EnsureSink(rowCost, source.RemainingEventHint)?.Add((uint)_eventsWritten, in ev);
 
             StageEvent(in ev, tmplUtf8, svcUtf8);
+            // The column's own bytes and level byte, so the summary and a later header scan of
+            // this file see the same thing. The interned name makes a repeat a reference check.
+            _counts?.Add(ev.TimestampUtcTicks, (byte)ev.Level, svcUtf8, ev.ServiceName);
             _eventsWritten++;
         }
 
@@ -676,6 +698,19 @@ public sealed class SegmentWriter : IDisposable
         if (_groupEventCount > 0 || _groups.Count == 0)
             CloseGroup();
 
+        // The counts section sits between the last group's sections and the group directory and
+        // is named by footer slot 1 — a slot v7 zeroed and every v7 reader ignores, so a reader
+        // that predates the section reads this file exactly as before. A builder that gave up,
+        // or saw something other than what the header records, leaves the slot 0: no summary.
+        if (_counts?.Build((uint)_eventsWritten,
+                           _minTimestamp == long.MaxValue ? 0 : _minTimestamp,
+                           _maxTimestamp == long.MinValue ? 0 : _maxTimestamp) is { } summary)
+        {
+            _bw.Flush();
+            _countsSectionOffset = _fs.Position;
+            summary.WriteSection(_fs);
+        }
+
         _groupDirectoryOffset = _fs.Position;
         _bw.Write((uint)_groups.Count);
         foreach (var g in _groups)
@@ -703,10 +738,11 @@ public sealed class SegmentWriter : IDisposable
         // Footer stays 44 B — the reader parses it BEFORE it knows the version, so its SIZE
         // is load-bearing across every format. v7 reinterprets slot 0 (v4-v6: the file-level
         // inverted-index offset) as the GROUP DIRECTORY offset; slots 1 and 2, which held the
-        // file-level trigram/bloom offsets, no longer name anything file-wide and are zeroed.
+        // file-level trigram/bloom offsets, no longer name anything file-wide. Slot 1 now names
+        // the counts section (0 = none); slot 2 stays zero.
         long footerOffset = _fs.Position;
         _bw.Write(_groupDirectoryOffset);
-        _bw.Write(0L);
+        _bw.Write(_countsSectionOffset);
         _bw.Write(0L);
         _bw.Write(_blockIndexOffset);
         _bw.Write(footerOffset);

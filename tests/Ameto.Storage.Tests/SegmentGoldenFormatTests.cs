@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using MessagePack;
 using Ameto.Core;
@@ -47,9 +48,22 @@ public sealed class SegmentGoldenFormatTests
     /// </summary>
     private const string GoldenSha256 = "AFCF6BFB84CD72E3A6D2B37418B5F609B4835FCC24C1B06EC2DA7F497687CEA2";
 
+    /// <summary>
+    /// SHA-256 of the same segment WITH its counts section (2026-11-09), the one addition to the
+    /// v7 bytes since <see cref="GoldenSha256"/>. Taken from the commit that added the section;
+    /// <see cref="TheCountsSectionIsTheOnlyAddition"/> proves everything around it is the bytes
+    /// above, so this pins the section's own encoding.
+    /// </summary>
+    private const string GoldenWithCountsSha256 = "B1C22F34E619BAFDDE3F7A76AC2354A12B549113BBBEFA33B6DDDFBEB69C847F";
+
     private const int    Events   = 4_000;
     private const long   BaseTicks = 640_000_000_000_000_000L;   // a fixed instant, not a clock
 
+    /// <summary>
+    /// The pre-change bytes, written as they were before the counts section existed: that section
+    /// is the one deliberate addition, and a writer told not to write it must still produce this
+    /// file to the byte.
+    /// </summary>
     [Fact]
     public void TheWriterStillProducesThePreChangeBytes()
     {
@@ -59,7 +73,7 @@ public sealed class SegmentGoldenFormatTests
             var pool = new StringInternPool();
             byte[] bytes;
             using (var hot = BuildDeterministicTier(pool))
-            using (var w = new SegmentWriter(path))
+            using (var w = new SegmentWriter(path) { WritesCountsSummary = false })
             {
                 w.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot));
                 var info = w.Finalise(new NodeId(5), new SegmentId(77UL));
@@ -73,6 +87,73 @@ public sealed class SegmentGoldenFormatTests
             Assert.Equal(GoldenSha256, actual);
         }
         finally { File.Delete(path); }
+    }
+
+    /// <summary>
+    /// The counts section (footer slot 1) is inserted before the group directory and NOTHING else
+    /// moves: the bytes before it are the pre-change bytes, the directory and block index after it
+    /// are the pre-change ones shifted by its length, and the footer differs only in the offsets
+    /// that shift and in slot 1. A v7 reader that predates the section follows slots 0 and 3,
+    /// never 1, so it reads this file as it read the old one.
+    /// </summary>
+    [Fact]
+    public void TheCountsSectionIsTheOnlyAddition()
+    {
+        string withPath    = Path.Combine(Path.GetTempPath(), $"Ameto-golden-{Guid.NewGuid():N}.seg");
+        string withoutPath = Path.Combine(Path.GetTempPath(), $"Ameto-golden-{Guid.NewGuid():N}.seg");
+        try
+        {
+            var pool = new StringInternPool();
+            SegmentInfo info;
+            using (var hot = BuildDeterministicTier(pool))
+            {
+                using (var w = new SegmentWriter(withPath))
+                {
+                    w.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot));
+                    info = w.Finalise(new NodeId(5), new SegmentId(77UL));
+                }
+                using (var w = new SegmentWriter(withoutPath) { WritesCountsSummary = false })
+                {
+                    w.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot));
+                    w.Finalise(new NodeId(5), new SegmentId(77UL));
+                }
+            }
+            byte[] with    = File.ReadAllBytes(withPath);
+            byte[] without = File.ReadAllBytes(withoutPath);
+
+            static long Slot(byte[] f, int i) => BinaryPrimitives.ReadInt64LittleEndian(f.AsSpan(f.Length - 44 + i * 8));
+            long section = Slot(with, 1);
+            int  len     = with.Length - without.Length;
+            Assert.True(len > 0);
+            Assert.Equal(0, Slot(without, 1));
+            Assert.Equal(Slot(without, 0), section);                 // where the directory used to start
+
+            // Before the section: identical. After it, up to the footer: identical, shifted.
+            Assert.True(with.AsSpan(0, (int)section).SequenceEqual(without.AsSpan(0, (int)section)));
+            Assert.True(with.AsSpan((int)section + len, with.Length - 44 - (int)section - len)
+                            .SequenceEqual(without.AsSpan((int)section, without.Length - 44 - (int)section)));
+
+            // The footer: the shifted offsets, slot 1, and nothing else.
+            Assert.Equal(Slot(without, 0) + len, Slot(with, 0));
+            Assert.Equal(Slot(without, 2),       Slot(with, 2));
+            Assert.Equal(Slot(without, 3) + len, Slot(with, 3));
+            Assert.Equal(Slot(without, 4) + len, Slot(with, 4));
+            Assert.True(with.AsSpan(with.Length - 4).SequenceEqual(without.AsSpan(without.Length - 4)));
+
+            // And the section is the segment's summary.
+            var summary = SegmentCountsSummary.Parse(with.AsSpan((int)section, len), info);
+            Assert.NotNull(summary);
+            Assert.Equal((uint)Events, summary!.EventCount);
+
+            string actual = Convert.ToHexString(SHA256.HashData(with));
+            _out.WriteLine($"segment with counts {with.Length} bytes, sha256 {actual}");
+            Assert.Equal(GoldenWithCountsSha256, actual);
+        }
+        finally
+        {
+            File.Delete(withPath);
+            File.Delete(withoutPath);
+        }
     }
 
     /// <summary>

@@ -536,14 +536,58 @@ public sealed class SegmentReader : ISegmentReader
         // The same zone map the event scan prunes with: a narrow histogram window over a
         // wide segment used to decompress every block only for the per-event window check
         // to reject them all. Pre-v6 blocks report no MinTs and are never skipped.
+        var sink = new AggregatorSink(agg);
         for (int i = 0; i < _blocks.Length; i++)
         {
             if (SkipByWindow(i, fromTicks, toTicks)) continue;
-            AggregateBlockHeaders(_blocks[i].FileOffset, agg, fromTicks, toTicks);
+            AggregateBlockHeaders(_blocks[i].FileOffset, ref sink, fromTicks, toTicks);
         }
     }
 
-    private void AggregateBlockHeaders(long blockOffset, LogVolumeAggregator agg, long fromTicks, long toTicks)
+    /// <summary>
+    /// Reads EVERY event header of the segment (no window, no zone map) into
+    /// <paramref name="counts"/>, and the ones inside [<paramref name="fromTicks"/>,
+    /// <paramref name="toTicks"/>] into <paramref name="agg"/> as well. For a segment written before
+    /// the counts section existed that lies wholly inside a counting window: the decode
+    /// <see cref="AggregateHeaders"/> would do anyway, with the segment's summary as a by-product,
+    /// so the next window costs it nothing.
+    /// </summary>
+    internal void AggregateAndSummariseHeaders(LogVolumeAggregator agg, SegmentCountsBuilder counts,
+                                               long fromTicks, long toTicks)
+    {
+        var sink = new AggregateAndSummariseSink(agg, counts, fromTicks, toTicks);
+        for (int i = 0; i < _blocks.Length; i++)
+            AggregateBlockHeaders(_blocks[i].FileOffset, ref sink, long.MinValue, long.MaxValue);
+    }
+
+    /// <summary>
+    /// Where a header scan delivers each event. The scan is generic over it so the JIT
+    /// specialises it per sink and the per-event call stays a direct, inlinable one.
+    /// </summary>
+    private interface IHeaderSink
+    {
+        void Add(long timestampTicks, LogLevel level, ReadOnlySpan<byte> serviceUtf8);
+    }
+
+    private readonly struct AggregatorSink(LogVolumeAggregator agg) : IHeaderSink
+    {
+        public void Add(long timestampTicks, LogLevel level, ReadOnlySpan<byte> serviceUtf8) =>
+            agg.AddByServiceUtf8(timestampTicks, level, serviceUtf8);
+    }
+
+    private readonly struct AggregateAndSummariseSink(
+        LogVolumeAggregator agg, SegmentCountsBuilder counts, long fromTicks, long toTicks) : IHeaderSink
+    {
+        public void Add(long timestampTicks, LogLevel level, ReadOnlySpan<byte> serviceUtf8)
+        {
+            counts.Add(timestampTicks, (byte)level, serviceUtf8);
+            if (timestampTicks >= fromTicks && timestampTicks <= toTicks)
+                agg.AddByServiceUtf8(timestampTicks, level, serviceUtf8);
+        }
+    }
+
+    private void AggregateBlockHeaders<TSink>(long blockOffset, ref TSink sink, long fromTicks, long toTicks)
+        where TSink : struct, IHeaderSink
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
@@ -561,7 +605,7 @@ public sealed class SegmentReader : ISegmentReader
             int decoded = LZ4Codec.Decode(rentedComp, 0, compressedSize, rentedUncomp, 0, uncompressedSize);
             if (decoded != uncompressedSize) return;
 
-            ScanBlockHeaders(rentedUncomp.AsSpan(0, decoded), agg, fromTicks, toTicks);
+            ScanBlockHeaders(rentedUncomp.AsSpan(0, decoded), ref sink, fromTicks, toTicks);
         }
         finally
         {
@@ -571,7 +615,8 @@ public sealed class SegmentReader : ISegmentReader
     }
 
     /// <summary>Parses a decompressed columnar block, extracting only @t / @l / @service.</summary>
-    private static void ScanBlockHeaders(ReadOnlySpan<byte> span, LogVolumeAggregator agg, long fromTicks, long toTicks)
+    private static void ScanBlockHeaders<TSink>(ReadOnlySpan<byte> span, ref TSink sink, long fromTicks, long toTicks)
+        where TSink : struct, IHeaderSink
     {
         int   pos        = 0;
         int   eventCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4)); pos += 4;
@@ -615,7 +660,7 @@ public sealed class SegmentReader : ISegmentReader
                 if (e > s) svc = svcPayload.Slice((int)s, (int)(e - s));
             }
 
-            agg.AddByServiceUtf8(ts, level, svc);
+            sink.Add(ts, level, svc);
         }
     }
 
