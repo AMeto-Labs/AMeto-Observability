@@ -160,6 +160,43 @@ public sealed class LogVolumeAggregator
         if (svc >= 0) Record(timestampTicks, level, svc);
     }
 
+    // ── Segment summary entry points (see SegmentCountsSummary) ───────────────────
+
+    /// <summary>
+    /// Resolves a summary's service, given as the @svc column's own bytes, through the same road
+    /// <see cref="AddByServiceUtf8"/> takes per event: empty is "(unknown)", the filter and the
+    /// case folding apply, and -1 means filtered out.
+    /// </summary>
+    internal int ResolveSummaryService(ReadOnlySpan<byte> serviceUtf8) => ResolveByUtf8(serviceUtf8);
+
+    /// <summary>
+    /// Counts <paramref name="count"/> events that share one bucket, one level and one service, as
+    /// that many <see cref="AddByServiceUtf8"/> calls would: every one is scanned, a filtered-out
+    /// service adds to nothing else, an out-of-range level still counts toward the total and the
+    /// service, and a bucket off the axis still counts toward the totals.
+    /// </summary>
+    /// <param name="bucket">Absolute bucket index, <c>unixSeconds / bucketSeconds</c>.</param>
+    /// <param name="svcId">From <see cref="ResolveSummaryService"/>.</param>
+    internal void AddSummaryCount(long bucket, byte level, int svcId, long count)
+    {
+        _scanned += count;
+        if (svcId < 0) return;
+        _total += count;
+
+        long offset = bucket - _minBucket;
+        int  off    = (ulong)offset < (ulong)_nBuckets ? (int)offset : -1;
+
+        int li = level;
+        if ((uint)li < LevelCount)
+        {
+            _levelTotals[li] += count;
+            if (off >= 0) _levelBuckets[li][off] += count;
+        }
+
+        _svcTotals[svcId] += count;
+        if (off >= 0) _svcBuckets[svcId][off] += count;
+    }
+
     // ── Whole-segment shortcut (TOTAL ONLY) ───────────────────────────────────────
 
     /// <summary>

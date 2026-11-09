@@ -424,10 +424,15 @@ public static class EndpointMapper
         //             enough to always cover the full window, so it no longer bounds it.
         //   service — restrict to a single service (case-insensitive)
         //
-        // Cheap is relative: the scan still LZ4-decodes every block in the window to read its
-        // headers, so it grows with the events in the window, not with the columns asked for. A
-        // day or three is a poll's worth of work; a month or a quarter over a busy store is a
-        // search's worth, so a window wider than WideCountsWindow takes a search slot and runs
+        // Cheap is relative. A segment wholly inside the window is counted from its summary when
+        // the bucket is a whole number of 15-minute slots (every Statistics preset's is; see
+        // SegmentCountsSummary), so a wide window decodes only the segments its edges cut and
+        // walks the hot tier. But a scan LZ4-decodes every block it reads, and it still reads
+        // everything for a grid that is not whole slots, once per process for a segment written
+        // before summaries existed (the first wide window after an upgrade or a restart; every
+        // time once the in-memory budget for those is full), and every time for a segment whose
+        // summary its writer gave up on. That can be a search's worth over a busy store, so a
+        // window wider than WideCountsWindow takes a search slot and runs
         // under the search budget, exactly as /api/events/aggregate does — 503 when the guard is
         // full, 504 when the budget runs out. A window of seven days or less keeps the unguarded
         // path. The client's one caller is the Statistics page's Logs band, whose 1d and 3d stay
@@ -1164,10 +1169,14 @@ public static class EndpointMapper
     private const int CatchUpPageFactor = 8;
 
     /// <summary>
-    /// The widest <c>/api/events/counts</c> window that runs unguarded. The header scan behind the
-    /// counts decodes every block in the window, so its cost is the window's events: a day or three
-    /// is a poll's worth of work and stays a poll; a month or a quarter is a search's worth on a
-    /// busy store and is treated as one — a <see cref="QueryGuard"/> slot and the search budget,
+    /// The widest <c>/api/events/counts</c> window that runs unguarded. Segments wholly inside a
+    /// window on a grid of whole 15-minute slots are counted from their summaries, but the header
+    /// scan still decodes every block it reads — every segment for any other grid, every segment
+    /// written before the summaries existed once per process (every time once the in-memory budget
+    /// for those is full), and every segment whose summary its writer gave up on — so its worst case is the
+    /// window's events: a day or three is a poll's worth of work and stays a poll; a month or a
+    /// quarter can be a search's worth on a busy store and is treated as one — a
+    /// <see cref="QueryGuard"/> slot and the search budget,
     /// like <c>/api/events/aggregate</c>. The client's one caller is the Statistics page's Logs
     /// band: its 1d and 3d are under the threshold, its 7d is not — it asks from the bucket grid,
     /// so that window is seven days plus up to one 2-hour step — and takes a slot like 14d, 1m and 3m.
