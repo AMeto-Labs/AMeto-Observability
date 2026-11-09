@@ -20,7 +20,10 @@ namespace Ameto.Storage.Tests;
 /// tests and the query path all pin numbers derived from it.</para>
 ///
 /// <para>SCOPE: the writer's own bytes — header, blocks, all nine columns, block index, group
-/// directory, footer. The index sections are excluded by writing with no sink, deliberately:
+/// directory, footer, and (since 2026-11-09) the counts section: <see cref="GoldenSha256"/> pins
+/// the file written without it, <see cref="GoldenWithCountsSha256"/> the file with it, and
+/// <see cref="TheCountsSectionIsTheOnlyAddition"/> that nothing else differs between the two.
+/// The index sections are excluded by writing with no sink, deliberately:
 /// they are built by <c>Ameto.Indexing</c>, which is a different work package, and a golden hash
 /// over them would fail for reasons that have nothing to do with the writer.</para>
 ///
@@ -32,7 +35,9 @@ namespace Ameto.Storage.Tests;
 ///
 /// <para>If it fails after a deliberate format change: re-baseline the constant, say so in the
 /// commit, and expect to bump <c>SegVersion</c> — an old reader will not understand the new
-/// bytes.</para>
+/// bytes. The exception is an addition old readers provably skip, as the counts section is (a
+/// slot of the footer v7 readers never read): then keep the old constant for the file without
+/// it, pin the new file with a second one, and prove the addition is the only difference.</para>
 /// </summary>
 public sealed class SegmentGoldenFormatTests
 {

@@ -426,11 +426,13 @@ public static class EndpointMapper
         //
         // Cheap is relative. A segment wholly inside the window is counted from its summary when
         // the bucket is a whole number of 15-minute slots (every Statistics preset's is; see
-        // SegmentCountsSummary), so a wide window decodes only the segments its edges cut and the
-        // hot tier. But a scan LZ4-decodes every block it reads, and it still reads everything
-        // for a grid that is not whole slots, and once per process for a segment written before
-        // summaries existed — the first wide window after an upgrade or a restart. That is a
-        // search's worth over a busy store, so a window wider than WideCountsWindow takes a search slot and runs
+        // SegmentCountsSummary), so a wide window decodes only the segments its edges cut and
+        // walks the hot tier. But a scan LZ4-decodes every block it reads, and it still reads
+        // everything for a grid that is not whole slots, once per process for a segment written
+        // before summaries existed (the first wide window after an upgrade or a restart; every
+        // time once the in-memory budget for those is full), and every time for a segment whose
+        // summary its writer gave up on. That can be a search's worth over a busy store, so a
+        // window wider than WideCountsWindow takes a search slot and runs
         // under the search budget, exactly as /api/events/aggregate does — 503 when the guard is
         // full, 504 when the budget runs out. A window of seven days or less keeps the unguarded
         // path. The client's one caller is the Statistics page's Logs band, whose 1d and 3d stay
@@ -1169,8 +1171,9 @@ public static class EndpointMapper
     /// <summary>
     /// The widest <c>/api/events/counts</c> window that runs unguarded. Segments wholly inside a
     /// window on a grid of whole 15-minute slots are counted from their summaries, but the header
-    /// scan still decodes every block it reads — every segment for any other grid, and, once per
-    /// process, every segment written before the summaries existed — so its worst case is the
+    /// scan still decodes every block it reads — every segment for any other grid, every segment
+    /// written before the summaries existed once per process (every time once the in-memory budget
+    /// for those is full), and every segment whose summary its writer gave up on — so its worst case is the
     /// window's events: a day or three is a poll's worth of work and stays a poll; a month or a
     /// quarter can be a search's worth on a busy store and is treated as one — a
     /// <see cref="QueryGuard"/> slot and the search budget,

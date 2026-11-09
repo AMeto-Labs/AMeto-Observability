@@ -706,6 +706,9 @@ public sealed class SegmentWriter : IDisposable
                            _minTimestamp == long.MaxValue ? 0 : _minTimestamp,
                            _maxTimestamp == long.MinValue ? 0 : _maxTimestamp) is { } summary)
         {
+            // Not needed for the bytes (BinaryWriter holds none between writes, and the section
+            // goes through the same FileStream buffer); kept as SealGroup keeps it before its
+            // sections, so the offset read here is honest by construction.
             _bw.Flush();
             _countsSectionOffset = _fs.Position;
             summary.WriteSection(_fs);

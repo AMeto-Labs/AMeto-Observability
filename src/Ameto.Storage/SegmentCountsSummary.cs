@@ -74,13 +74,23 @@ internal sealed class SegmentCountsSummary
         _services  = services;
         _cells     = cells;
         EventCount = eventCount;
+
+        // What holding it costs: the cell array, every service name with its array header, and
+        // the outer arrays and this object. The cache is budgeted in these bytes, so a summary of
+        // a few cells and many long names weighs what it holds.
+        long bytes = 96 + (long)cells.Length * Unsafe.SizeOf<Cell>() + (long)services.Length * 8;
+        foreach (var s in services) bytes += 32 + s.Length;
+        MemoryBytes = bytes;
     }
 
     /// <summary>Events the summary accounts for; equal to the segment header's count.</summary>
     public uint EventCount { get; }
 
-    /// <summary>Distinct <c>(slot, service, level)</c> cells — the summary's size, and its weight in the cache.</summary>
+    /// <summary>Distinct <c>(slot, service, level)</c> cells.</summary>
     public int CellCount => _cells.Length;
+
+    /// <summary>Approximate managed bytes the summary holds — its weight in <see cref="SegmentCountsCache"/>.</summary>
+    public long MemoryBytes { get; }
 
     internal ReadOnlySpan<Cell> Cells => _cells;
     internal IReadOnlyList<byte[]> Services => _services;
@@ -216,7 +226,7 @@ internal sealed class SegmentCountsSummary
 
     /// <summary>The largest payload the builder's limits allow; anything above is not a summary it wrote.</summary>
     internal const long MaxPayloadBytes =
-        (long)SegmentCountsBuilder.MaxServices * (2 + SegmentCountsBuilder.MaxServiceBytes)
+        (long)SegmentCountsBuilder.MaxServices * 2 + SegmentCountsBuilder.MaxServiceBytesTotal
         + (long)SegmentCountsBuilder.MaxCells * CellBytes;
 
     private static bool ReadExactly(SafeFileHandle handle, Span<byte> into, long offset)
@@ -255,15 +265,25 @@ internal sealed class SegmentCountsSummary
 
         var payload = section[SectionHeaderBytes..crcAt];
         int pos = 0;
+        long serviceBytes = 0;
         var services = new byte[serviceCount][];
         for (int i = 0; i < services.Length; i++)
         {
             if (payload.Length - pos < 2) return null;
             int len = BinaryPrimitives.ReadUInt16LittleEndian(payload[pos..]); pos += 2;
             if (len > SegmentCountsBuilder.MaxServiceBytes || payload.Length - pos < len) return null;
+            serviceBytes += len;
+            if (serviceBytes > SegmentCountsBuilder.MaxServiceBytesTotal) return null;
             services[i] = payload.Slice(pos, len).ToArray();                    pos += len;
         }
         if ((long)(payload.Length - pos) != (long)cellCount * CellBytes) return null;
+
+        // Every cell's slot lies within the slots of the segment's own first and last event: the
+        // writer counted those very rows. Only a section some other writer produced, with a CRC
+        // that still checks out, could say otherwise, and it would put events in buckets the
+        // segment never reaches.
+        long minSlot = SlotOf(info.MinTimestampTicks);
+        long maxSlot = SlotOf(info.MaxTimestampTicks);
 
         var  cells = new Cell[cellCount];
         long sum   = 0;
@@ -275,6 +295,7 @@ internal sealed class SegmentCountsSummary
             byte   level   = payload[pos];                                           pos += 1;
             uint   count   = BinaryPrimitives.ReadUInt32LittleEndian(payload[pos..]); pos += 4;
             if (service >= serviceCount || count == 0) return null;
+            if (slot < minSlot || slot > maxSlot) return null;
             long key = SortKey(slot, service, level);
             if (key <= prev) return null;   // sorted and unique, as the writer leaves them
             prev = key;
@@ -287,6 +308,16 @@ internal sealed class SegmentCountsSummary
     /// <summary>One number that orders cells by (slot, service, level).</summary>
     internal static long SortKey(int slot, ushort service, byte level) =>
         ((long)slot << 24) | ((long)service << 8) | level;
+
+    internal const long UnixEpochTicks = 621_355_968_000_000_000L;   // as LogVolumeAggregator
+    internal const long TicksPerSecond = TimeSpan.TicksPerSecond;
+
+    /// <summary>
+    /// The slot of a timestamp: the aggregator's own arithmetic (LogVolumeAggregator.BucketOffset),
+    /// then one more truncating division, which is why a slot's events share every bucket.
+    /// </summary>
+    internal static long SlotOf(long timestampTicks) =>
+        (timestampTicks - UnixEpochTicks) / TicksPerSecond / SlotSeconds;
 }
 
 /// <summary>
@@ -314,25 +345,33 @@ internal sealed class SegmentCountsBuilder
     internal const int MaxServices = 4_096;
 
     /// <summary>
-    /// The longest service name, in UTF-8 bytes, a summary keeps. Service names are short; a longer
+    /// The longest service name, in UTF-8 bytes, a summary keeps — ingestion's own limit. A longer
     /// one costs the segment its summary rather than letting one name size the section.
     /// </summary>
     internal const int MaxServiceBytes = 1_024;
 
     /// <summary>
-    /// Cells one summary may hold. A day-scale segment spans 96 slots, so ~40 service/level pairs
-    /// make ~4 000 cells; 32 768 leaves an order of magnitude for richer vocabularies and caps the
-    /// cells of one summary at 360 KB on disk and 384 KB in memory.
+    /// The service names of one summary together, in UTF-8 bytes: 2 048 names of 32 bytes. Past it
+    /// the names would outweigh the counts, and a store fed thousands of distinct long names per
+    /// segment would hold megabytes of them per summary; that segment is scanned instead.
     /// </summary>
-    internal const int MaxCells = 32_768;
+    internal const int MaxServiceBytesTotal = 65_536;
+
+    /// <summary>
+    /// Cells one summary may hold. Merges run inside an expiry bucket of a twelfth of the level's
+    /// retention, so a 90-day level (the default for most) merges into week-scale segments of up
+    /// to 672 slots, and a year-long one into month-scale segments of 2 880. 262 144 cells is 672
+    /// slots × 390 service/level pairs, or 2 880 × 91: at most 2.9 MB of section on a segment that
+    /// size, and 3 MB held in memory.
+    /// </summary>
+    internal const int MaxCells = 262_144;
 
     /// <summary>Services whose open-slot counters are a dense array (8 KB with <see cref="DenseLevels"/>).</summary>
     private const int DenseServices = 256;
     private const int DenseLevels   = 8;
 
-    private const long UnixEpochTicks = 621_355_968_000_000_000L;   // as LogVolumeAggregator
-    private const long TicksPerSecond = TimeSpan.TicksPerSecond;
-    private const long SlotTicks      = SegmentCountsSummary.SlotSeconds * TicksPerSecond;
+    private const long UnixEpochTicks = SegmentCountsSummary.UnixEpochTicks;
+    private const long SlotTicks      = SegmentCountsSummary.SlotSeconds * SegmentCountsSummary.TicksPerSecond;
 
     /// <summary>
     /// The highest slot whose tick range is kept for the no-division check; its end must not
@@ -345,6 +384,7 @@ internal sealed class SegmentCountsBuilder
     private readonly Dictionary<byte[], int> _svcIds = new(ByteSpanComparer.Instance);
     private readonly Dictionary<byte[], int>.AlternateLookup<ReadOnlySpan<byte>> _svcByBytes;
     private readonly List<byte[]> _svcNames = new();
+    private int _svcBytesTotal;
     private readonly object?[] _refKeys = new object?[64];
     private readonly int[]     _refIds  = new int[64];
 
@@ -389,10 +429,8 @@ internal sealed class SegmentCountsBuilder
 
         if (timestampTicks < _slotStart || timestampTicks >= _slotEnd)
         {
-            // The aggregator's own arithmetic (LogVolumeAggregator.BucketOffset), then one more
-            // truncating division: see SegmentCountsSummary on why that nests exactly.
-            long unixSeconds = (timestampTicks - UnixEpochTicks) / TicksPerSecond;
-            long slot        = unixSeconds / SegmentCountsSummary.SlotSeconds;
+            // See SegmentCountsSummary on why the slot nests exactly inside every bucket.
+            long slot = SegmentCountsSummary.SlotOf(timestampTicks);
             if (slot != _slot && !OpenSlot(slot)) return;
         }
 
@@ -513,7 +551,9 @@ internal sealed class SegmentCountsBuilder
     private int ResolveService(ReadOnlySpan<byte> utf8)
     {
         if (_svcByBytes.TryGetValue(utf8, out int id)) return id;
-        if (_svcNames.Count >= MaxServices || utf8.Length > MaxServiceBytes) { Abandon(); return -1; }
+        if (_svcNames.Count >= MaxServices || utf8.Length > MaxServiceBytes
+            || _svcBytesTotal + utf8.Length > MaxServiceBytesTotal) { Abandon(); return -1; }
+        _svcBytesTotal += utf8.Length;
         id = _svcNames.Count;
         byte[] key = utf8.ToArray();
         _svcIds.Add(key, id);
@@ -558,41 +598,52 @@ internal sealed class ByteSpanComparer : IEqualityComparer<byte[]>, IAlternateEq
 
 /// <summary>
 /// Summaries already read or built, by segment, so a segment is summarised once per process and
-/// a repeated wide window touches no file at all.
+/// a repeated wide window touches no file for it.
 ///
-/// <para>Bounded by cells (<see cref="DefaultMaxCells"/>, ~6 MB of them): an entry whose segment
-/// has left the catalog — merged, deleted, replaced — is dropped the next time the budget is
-/// reached, and when the live ones alone fill it nothing more is kept. A segment that is not
-/// kept is read or scanned again next time, which is what every segment cost before.</para>
+/// <para>Budgeted in bytes (<see cref="SegmentCountsSummary.MemoryBytes"/>): cells and service
+/// names both count, so a summary of a few cells and many long names weighs what it holds. When
+/// an entry does not fit, entries whose segment has left the catalog — merged, deleted, replaced —
+/// are dropped first; when the live ones alone fill the budget the entry is refused, and the cache
+/// reports itself <see cref="IsFull"/> until something leaves, so the caller can stop building
+/// summaries it could not keep. A segment that is not kept is read or scanned again next time,
+/// which is what every segment cost before summaries.</para>
 /// </summary>
 internal sealed class SegmentCountsCache
 {
-    internal const long DefaultMaxCells = 524_288;
+    /// <summary>
+    /// Summaries built by scanning segments written before summaries existed: each is a whole
+    /// segment's decode to rebuild. A 90-day store at ~100 service/level pairs per slot is ~10 MB.
+    /// </summary>
+    internal const long BuiltBudgetBytes = 12L * 1024 * 1024;
+
+    /// <summary>Summaries read off segment files: three small reads to get back, so a smaller budget.</summary>
+    internal const long ReadBudgetBytes = 4L * 1024 * 1024;
+
+    /// <summary>
+    /// How often a full cache may walk itself for stale entries. When the live segments alone fill
+    /// it, every further add or fullness check would walk it for nothing; once a second is enough
+    /// to notice the merges and deletes that free room.
+    /// </summary>
+    private const long PruneIntervalMs = 1_000;
 
     private sealed class Item(SegmentInfo info, SegmentCountsSummary summary)
     {
         public readonly SegmentInfo          Info    = info;
         public readonly SegmentCountsSummary Summary = summary;
-        public long Weight => Math.Max(1, Summary.CellCount);
+        public long Weight => Summary.MemoryBytes;
     }
 
     private readonly ConcurrentDictionary<SegmentKey, Item> _map = new();
     private readonly Lock _pruneLock = new();
-    private readonly long _maxCells;
-    private long _cells;
+    private readonly long _maxBytes;
+    private long _bytes;
     private long _lastPruneTicks = -PruneIntervalMs;   // the first prune is never throttled
+    private volatile bool _full;
 
-    /// <summary>
-    /// How often a full budget may walk the cache for stale entries. When the live segments alone
-    /// fill it, every further add would walk it for nothing; once a second is enough to notice the
-    /// merges and deletes that free room.
-    /// </summary>
-    private const long PruneIntervalMs = 1_000;
+    public SegmentCountsCache(long maxBytes) => _maxBytes = maxBytes;
 
-    public SegmentCountsCache(long maxCells = DefaultMaxCells) => _maxCells = maxCells;
-
-    /// <summary>Cells held now; for tests.</summary>
-    internal long CellsForTest => Interlocked.Read(ref _cells);
+    /// <summary>Bytes held now; for tests.</summary>
+    internal long BytesForTest => Interlocked.Read(ref _bytes);
     internal int  CountForTest => _map.Count;
 
     public bool TryGet(SegmentInfo info, [NotNullWhen(true)] out SegmentCountsSummary? summary)
@@ -606,18 +657,32 @@ internal sealed class SegmentCountsCache
         return false;
     }
 
+    /// <summary>
+    /// True when the last summary offered was refused and nothing has left since — checked before
+    /// building one, so a full cache does not cost a build per segment per request. A full cache
+    /// first drops what is stale (at most once a second), which is how it stops being full.
+    /// </summary>
+    /// <param name="isLive">Whether a cached segment is still the one the catalog serves.</param>
+    public bool IsFull(Func<SegmentInfo, bool> isLive)
+    {
+        if (!_full) return false;
+        Prune(isLive);
+        return _full;
+    }
+
     /// <param name="isLive">Whether a cached segment is still the one the catalog serves.</param>
     public void Add(SegmentInfo info, SegmentCountsSummary summary, Func<SegmentInfo, bool> isLive)
     {
         var item = new Item(info, summary);
         long weight = item.Weight;
-        if (Interlocked.Add(ref _cells, weight) > _maxCells)
+        if (Interlocked.Add(ref _bytes, weight) > _maxBytes)
         {
-            Interlocked.Add(ref _cells, -weight);
+            Interlocked.Add(ref _bytes, -weight);
             Prune(isLive);
-            if (Interlocked.Add(ref _cells, weight) > _maxCells)
+            if (Interlocked.Add(ref _bytes, weight) > _maxBytes)
             {
-                Interlocked.Add(ref _cells, -weight);
+                Interlocked.Add(ref _bytes, -weight);
+                _full = true;
                 return;
             }
         }
@@ -627,10 +692,11 @@ internal sealed class SegmentCountsCache
         {
             if (_map.TryGetValue(key, out var old))
             {
-                if (_map.TryUpdate(key, item, old)) { Interlocked.Add(ref _cells, -old.Weight); return; }
+                if (_map.TryUpdate(key, item, old)) { Interlocked.Add(ref _bytes, -old.Weight); break; }
             }
-            else if (_map.TryAdd(key, item)) return;
+            else if (_map.TryAdd(key, item)) break;
         }
+        _full = false;
     }
 
     private void Prune(Func<SegmentInfo, bool> isLive)
@@ -640,9 +706,14 @@ internal sealed class SegmentCountsCache
             long now = Environment.TickCount64;
             if (now - Interlocked.Read(ref _lastPruneTicks) < PruneIntervalMs) return;
             Interlocked.Exchange(ref _lastPruneTicks, now);
+            bool freed = false;
             foreach (var kv in _map)
                 if (!isLive(kv.Value.Info) && _map.TryRemove(kv))
-                    Interlocked.Add(ref _cells, -kv.Value.Weight);
+                {
+                    Interlocked.Add(ref _bytes, -kv.Value.Weight);
+                    freed = true;
+                }
+            if (freed) _full = false;
         }
     }
 

@@ -1471,10 +1471,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // catalog cannot answer at all, so the shortcut turns itself off.
                 bool wholeSegments = totalsOnly && svcFilter is null;
                 // A segment wholly inside the window is answered from its counts summary when the
-                // grid's buckets are whole 15-minute slots — every Statistics preset's are — and
-                // one wholly inside that has none yet gets one from the scan it has to have anyway.
-                bool countSummaries = _countSummaries;
-                bool summaryGrid    = countSummaries && SegmentCountsSummary.Answers(bucketSeconds);
+                // grid's buckets are whole 15-minute slots — every Statistics preset's are — and on
+                // such a grid one that has none gets one from the scan it has to have anyway, while
+                // there is room to keep it. Other grids (the aggregate road's one-second axis, an
+                // alert's own window) never read a summary, so they never pay for building one.
+                bool summaryGrid = _countSummaries && SegmentCountsSummary.Answers(bucketSeconds);
                 // The snapshot's keys as a set, built only if a worker meets a merged-away source
                 // (see SnapshotLists). Declared beside the other captured locals so it shares
                 // their closure rather than adding one.
@@ -1514,7 +1515,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                             {
                                 _beforeHeaderSegmentOpen?.Invoke(info);
                                 using var reader = OpenForHeaderScan(info);
-                                if (inside && countSummaries)
+                                // Here an inside segment on a slot grid had no usable summary.
+                                if (inside && summaryGrid && !_builtSummaries.IsFull(IsLiveSegment))
                                     AggregateAndSummarise(reader, info, local, fromTicks, toTicks);
                                 else
                                     reader.AggregateHeaders(local, fromTicks, toTicks);
@@ -1542,8 +1544,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     // ── Counts summaries (see SegmentCountsSummary) ───────────────────────────────
 
-    /// <summary>Summaries read off segment files or built by scans, so each is had once per process.</summary>
-    private readonly SegmentCountsCache _countsCache = new();
+    /// <summary>
+    /// Summaries built by scanning segments written before summaries existed, so each is decoded
+    /// once per process while they fit; and summaries read off segment files, so a repeated window
+    /// opens no file for them. Two budgets because the first are a decode each to get back and the
+    /// second three small reads (see <see cref="SegmentCountsCache"/>).
+    /// </summary>
+    private SegmentCountsCache _builtSummaries = new(SegmentCountsCache.BuiltBudgetBytes);
+    private SegmentCountsCache _readSummaries  = new(SegmentCountsCache.ReadBudgetBytes);
     private Func<SegmentInfo, bool>? _isLiveSegment;
 
     /// <summary>Whether a cached summary's segment is still the one the catalog serves under its key.</summary>
@@ -1560,7 +1568,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>Test seam: false makes the flush and the merge write segments without a counts section, as before it existed.</summary>
     internal bool _segmentsCarryCounts = true;
 
-    internal SegmentCountsCache CountsCacheForTest => _countsCache;
+    /// <summary>Test seams: the two caches, replaceable with smaller budgets.</summary>
+    internal SegmentCountsCache BuiltSummariesForTest { get => _builtSummaries; set => _builtSummaries = value; }
+    internal SegmentCountsCache ReadSummariesForTest  { get => _readSummaries;  set => _readSummaries  = value; }
+
+    /// <summary>Test seam: summaries built by scans so far, kept or not.</summary>
+    internal int SummaryBuildsForTest => Volatile.Read(ref _summaryBuilds);
+    private int _summaryBuilds;
 
     /// <summary>
     /// Adds a segment that lies wholly inside the window to <paramref name="local"/> from its
@@ -1570,12 +1584,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     private bool TryCountFromSummary(SegmentInfo info, LogVolumeAggregator local, int bucketSeconds)
     {
-        if (!_countsCache.TryGet(info, out var summary))
+        if (!_builtSummaries.TryGet(info, out var summary) && !_readSummaries.TryGet(info, out summary))
         {
             try { summary = SegmentCountsSummary.Read(info.FilePath, info); }
             catch (Exception) { return false; }
             if (summary is null) return false;
-            _countsCache.Add(info, summary, IsLiveSegment);
+            _readSummaries.Add(info, summary, IsLiveSegment);
         }
         summary.AddTo(local, bucketSeconds);
         return true;
@@ -1590,10 +1604,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     private void AggregateAndSummarise(SegmentReader reader, SegmentInfo info, LogVolumeAggregator local,
                                        long fromTicks, long toTicks)
     {
+        Interlocked.Increment(ref _summaryBuilds);
         var counts = new SegmentCountsBuilder();
         reader.AggregateAndSummariseHeaders(local, counts, fromTicks, toTicks);
         if (counts.Build(info.EventCount, info.MinTimestampTicks, info.MaxTimestampTicks) is { } summary)
-            _countsCache.Add(info, summary, IsLiveSegment);
+            _builtSummaries.Add(info, summary, IsLiveSegment);
     }
 
     /// <summary>

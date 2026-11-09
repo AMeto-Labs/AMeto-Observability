@@ -121,7 +121,7 @@ public sealed class SegmentCountsSummaryTests
     {
         var events  = Corpus();
         var summary = BuildFrom(events);
-        var info    = Info((uint)events.Count);
+        var info    = Info(events);
 
         var bytes = Section(summary);
         Assert.Equal(summary.SectionBytes, bytes.Length);
@@ -138,11 +138,12 @@ public sealed class SegmentCountsSummaryTests
     {
         var events  = Corpus();
         var summary = BuildFrom(events);
-        var info    = Info((uint)events.Count);
+        var info    = Info(events);
         byte[] good = Section(summary);
+        Assert.NotNull(SegmentCountsSummary.Parse(good, info));
 
-        // Any flipped byte: the CRC.
-        for (int at = 0; at < good.Length; at += 7)
+        // Every flipped byte: the CRC.
+        for (int at = 0; at < good.Length; at++)
         {
             byte[] bad = (byte[])good.Clone();
             bad[at] ^= 0x40;
@@ -153,13 +154,88 @@ public sealed class SegmentCountsSummaryTests
         Assert.Null(SegmentCountsSummary.Parse(good.AsSpan(0, good.Length - 1), info));
 
         // A segment that is not the one it was written for.
-        Assert.Null(SegmentCountsSummary.Parse(good, Info((uint)events.Count + 1)));
+        Assert.Null(SegmentCountsSummary.Parse(good, Info(events, eventsDelta: 1)));
+    }
 
-        // Consistent bytes with a correct CRC that still lie: cells out of order.
+    /// <summary>
+    /// Bytes a CRC vouches for can still be bytes no writer of this format produced. Each lie here
+    /// is internally consistent and would put events where the segment has none.
+    /// </summary>
+    [Fact]
+    public void A_well_formed_section_that_lies_is_no_summary()
+    {
+        var events  = Corpus();
+        var summary = BuildFrom(events);
+        var info    = Info(events);
+
+        // Cells out of order.
         var cells = summary.Cells.ToArray();
         Array.Reverse(cells);
-        var liar = new SegmentCountsSummary(summary.Services.ToArray(), cells, summary.EventCount);
-        Assert.Null(SegmentCountsSummary.Parse(Section(liar), info));
+        Assert.Null(SegmentCountsSummary.Parse(Section(new SegmentCountsSummary(summary.Services.ToArray(), cells, summary.EventCount)), info));
+
+        // A slot past the segment's last event: the header says the segment ends one slot sooner.
+        long q = TimeSpan.FromMinutes(15).Ticks;
+        Assert.Null(SegmentCountsSummary.Parse(Section(summary), Info(events, maxDelta: -q)));
+
+        // A slot before its first event.
+        Assert.Null(SegmentCountsSummary.Parse(Section(summary), Info(events, minDelta: q)));
+    }
+
+    /// <summary>
+    /// A 90-day level merges into week-scale segments (an expiry bucket is a twelfth of the
+    /// retention): 672 slots. Sixty services active in every one of them is 40 320 cells, which
+    /// the first cap (32 768, sized for day-scale segments) gave up on — and that segment was then
+    /// decoded on every wide request for as long as retention kept it.
+    /// </summary>
+    [Fact]
+    public void A_week_scale_segment_with_sixty_services_has_a_summary()
+    {
+        const int slots = 672, services = 60;
+        long t0 = new DateTimeOffset(2026, 3, 2, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+        long q  = TimeSpan.FromMinutes(15).Ticks;
+        var names = Enumerable.Range(0, services).Select(i => Encoding.UTF8.GetBytes("service-" + i)).ToArray();
+        var b = new SegmentCountsBuilder();
+        for (int s = 0; s < slots; s++)
+            for (int v = 0; v < services; v++)
+                b.Add(t0 + s * q, 2, names[v]);
+
+        var summary = b.Build(slots * services, t0, t0 + (slots - 1) * q);
+        Assert.NotNull(summary);
+        Assert.Equal(slots * services, summary!.CellCount);
+    }
+
+    [Fact]
+    public void Past_its_cell_limit_the_builder_gives_up_rather_than_grow()
+    {
+        long t0 = new DateTimeOffset(2026, 3, 2, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+        long q  = TimeSpan.FromMinutes(15).Ticks;
+        const int services = 64;
+        int slots = SegmentCountsBuilder.MaxCells / services + 1;
+        var names = Enumerable.Range(0, services).Select(i => Encoding.UTF8.GetBytes("s" + i)).ToArray();
+        var b = new SegmentCountsBuilder();
+        for (int s = 0; s < slots; s++)
+            for (int v = 0; v < services; v++)
+                b.Add(t0 + s * q, 2, names[v]);
+
+        Assert.True(b.Abandoned);
+        Assert.Null(b.Build((uint)(slots * services), t0, t0 + (slots - 1) * q));
+    }
+
+    [Fact]
+    public void Past_its_service_bytes_limit_the_builder_gives_up()
+    {
+        long t = new DateTimeOffset(2026, 3, 1, 10, 0, 0, TimeSpan.Zero).UtcTicks;
+        int n = SegmentCountsBuilder.MaxServiceBytesTotal / SegmentCountsBuilder.MaxServiceBytes + 1;
+        var b = new SegmentCountsBuilder();
+        for (int i = 0; i < n; i++)
+        {
+            byte[] name = new byte[SegmentCountsBuilder.MaxServiceBytes];
+            Array.Fill(name, (byte)'a');
+            Encoding.ASCII.GetBytes(i.ToString("D6")).CopyTo(name, 0);
+            b.Add(t, 2, name);
+        }
+
+        Assert.True(b.Abandoned);
     }
 
     // ── The writer ──────────────────────────────────────────────────────────────────
@@ -310,10 +386,13 @@ public sealed class SegmentCountsSummaryTests
         return ms.ToArray();
     }
 
-    private static SegmentInfo Info(uint events) => new()
+    /// <summary>The catalog entry of a segment holding <paramref name="events"/>, its bounds moved by the deltas to make it lie.</summary>
+    private static SegmentInfo Info(List<Ev> events, int eventsDelta = 0, long minDelta = 0, long maxDelta = 0) => new()
     {
         Id = new SegmentId(1), NodeId = new NodeId(1), FilePath = "x.seg",
-        MinTimestampTicks = 0, MaxTimestampTicks = 0, EventCount = events,
+        MinTimestampTicks = events.Min(e => e.Ticks) + minDelta,
+        MaxTimestampTicks = events.Max(e => e.Ticks) + maxDelta,
+        EventCount = (uint)(events.Count + eventsDelta),
         MinLevel = LogLevel.Verbose, CompressedBytes = 0, UncompressedBytes = 0,
     };
 
@@ -547,6 +626,54 @@ public sealed class SegmentCountsEngineTests : IDisposable
     }
 
     /// <summary>
+    /// A grid no summary can answer — the aggregate road's one-second axis, a service-filtered
+    /// alert's own window, a short custom window's 60 s step — never reads one, so it must not pay
+    /// for building one either: on top of its scan that was a hash and a probe per event and a
+    /// builder per segment, thrown away (review of #157, S1).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(60)]
+    [InlineData(1_000)]
+    public async Task A_grid_that_is_not_whole_slots_builds_no_summary(int bucket)
+    {
+        await CountAsync(Base.AddHours(-12), Base.AddDays(3), bucket, null);
+        await CountAsync(Base.AddHours(-12), Base.AddDays(3), bucket, "billing");
+
+        Assert.Equal(0, _engine.SummaryBuildsForTest);
+        Assert.Equal(0, _engine.BuiltSummariesForTest.CountForTest);
+        Assert.Equal(0, _engine.ReadSummariesForTest.CountForTest);
+    }
+
+    /// <summary>
+    /// Once the cache of built summaries cannot keep another, building one per pre-summary segment
+    /// per request is work thrown away: a scan on top of what main paid. The first refusal marks
+    /// the cache full and the builds stop (review of #157, S1).
+    /// </summary>
+    [Fact]
+    public async Task A_full_cache_of_built_summaries_stops_the_builds()
+    {
+        await using var legacy = Populate(carryCounts: false, sub: "full");
+        legacy.BuiltSummariesForTest = new SegmentCountsCache(maxBytes: 1);   // keeps nothing
+        int segments = legacy.ListSegments().Count;
+        int workers  = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+        var from = Base.AddHours(-12);
+        var to   = Base.AddDays(3);
+
+        var first = await CountAsync(legacy, from, to, 43_200, null);
+        int afterFirst = legacy.SummaryBuildsForTest;
+        Assert.InRange(afterFirst, 1, workers);   // the ones already under way when the first was refused
+
+        var second = await CountAsync(legacy, from, to, 43_200, null);
+        Assert.Equal(afterFirst, legacy.SummaryBuildsForTest);
+        Assert.True(segments > workers, "setup: more segments than workers, or the bound proves nothing");
+
+        var scanned = await ScanAsync(legacy, from, to, 43_200, null);
+        SegmentCountsSummaryTests.AssertSameCounts(scanned, first);
+        SegmentCountsSummaryTests.AssertSameCounts(scanned, second);
+    }
+
+    /// <summary>
     /// A store written before summaries existed — every segment on a stand the day this ships.
     /// The first wide window decodes them (it had to anyway) and keeps their summaries; the
     /// next one decodes nothing.
@@ -573,7 +700,7 @@ public sealed class SegmentCountsEngineTests : IDisposable
 
         SegmentCountsSummaryTests.AssertSameCounts(scanned, first);
         SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(legacy, from, to, 86_400, "checkout"), second);
-        Assert.Equal(segments.Count, legacy.CountsCacheForTest.CountForTest);
+        Assert.Equal(segments.Count, legacy.BuiltSummariesForTest.CountForTest);
     }
 
     [Fact]
@@ -645,5 +772,147 @@ public sealed class SegmentCountsEngineTests : IDisposable
         var to   = Base.AddHours(4);
         SegmentCountsSummaryTests.AssertSameCounts(
             await ScanAsync(engine, from, to, 900, null), await CountAsync(engine, from, to, 900, null));
+    }
+}
+
+/// <summary>
+/// The cache of summaries on its own (review of #157, S3 and S4): what an entry weighs, what a
+/// full cache does, how a stale entry makes room, and what counts as the same file.
+/// </summary>
+public sealed class SegmentCountsCacheTests
+{
+    private static readonly long T0 = new DateTimeOffset(2026, 3, 2, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
+    private static SegmentInfo Segment(ulong id, long compressedBytes = 1_000) => new()
+    {
+        Id = new SegmentId(id), NodeId = new NodeId(1), FilePath = $"{id}.seg",
+        MinTimestampTicks = T0, MaxTimestampTicks = T0, EventCount = 1,
+        MinLevel = LogLevel.Information, CompressedBytes = compressedBytes, UncompressedBytes = 0,
+    };
+
+    /// <summary>A one-event summary naming one service of <paramref name="nameBytes"/> bytes.</summary>
+    private static SegmentCountsSummary Summary(int nameBytes = 8)
+    {
+        var b = new SegmentCountsBuilder();
+        byte[] name = new byte[nameBytes];
+        Array.Fill(name, (byte)'s');
+        b.Add(T0, 2, name);
+        return b.Build(1, T0, T0)!;
+    }
+
+    /// <summary>
+    /// Names of about 60 KB in a summary of few cells: weighed by cells alone it was nearly free, so
+    /// a budget meant for ~6 MB of cells could hold hundreds of megabytes of names.
+    /// </summary>
+    [Fact]
+    public void An_entry_weighs_its_service_names_not_only_its_cells()
+    {
+        var heavy = HeavySummary();
+        Assert.True(heavy.MemoryBytes > 60_000, $"setup: {heavy.MemoryBytes} B");
+        var cache = new SegmentCountsCache(maxBytes: heavy.MemoryBytes + heavy.MemoryBytes / 2);
+        static bool live(SegmentInfo _) => true;
+
+        cache.Add(Segment(1), heavy, live);
+        cache.Add(Segment(2), heavy, live);
+
+        Assert.Equal(1, cache.CountForTest);
+        Assert.Equal(heavy.MemoryBytes, cache.BytesForTest);
+    }
+
+    private static SegmentCountsSummary HeavySummary()
+    {
+        var b = new SegmentCountsBuilder();
+        const int names = 60;
+        for (int i = 0; i < names; i++)
+        {
+            byte[] name = new byte[1_000];
+            Array.Fill(name, (byte)'n');
+            System.Text.Encoding.ASCII.GetBytes(i.ToString("D3")).CopyTo(name, 0);
+            b.Add(T0, 2, name);
+        }
+        return b.Build(names, T0, T0)!;
+    }
+
+    [Fact]
+    public void A_full_cache_refuses_stays_within_its_budget_and_says_it_is_full()
+    {
+        var s = Summary();
+        var cache = new SegmentCountsCache(maxBytes: 2 * s.MemoryBytes);
+        static bool live(SegmentInfo _) => true;
+
+        cache.Add(Segment(1), s, live);
+        cache.Add(Segment(2), s, live);
+        Assert.False(cache.IsFull(live));
+
+        cache.Add(Segment(3), s, live);
+
+        Assert.Equal(2, cache.CountForTest);
+        Assert.Equal(2 * s.MemoryBytes, cache.BytesForTest);
+        Assert.True(cache.IsFull(live));
+        Assert.False(cache.TryGet(Segment(3), out _));
+    }
+
+    [Fact]
+    public void A_stale_entry_makes_room_and_takes_its_weight_with_it()
+    {
+        var small = Summary();
+        var big   = Summary(nameBytes: 900);
+        var cache = new SegmentCountsCache(maxBytes: big.MemoryBytes + small.MemoryBytes / 2);
+        var gone  = Segment(1);
+
+        cache.Add(gone, big, static _ => true);
+        cache.Add(Segment(2), big, info => !ReferenceEquals(info, gone));   // the first has left the catalog
+
+        Assert.Equal(1, cache.CountForTest);
+        Assert.Equal(big.MemoryBytes, cache.BytesForTest);
+        Assert.False(cache.TryGet(gone, out _));
+        Assert.True(cache.TryGet(Segment(2), out _));
+    }
+
+    [Fact]
+    public void A_full_cache_stops_being_full_once_something_leaves()
+    {
+        var s = Summary();
+        var cache = new SegmentCountsCache(maxBytes: s.MemoryBytes);
+        var first = Segment(1);
+        bool firstLive = true;
+        bool live(SegmentInfo info) => !ReferenceEquals(info, first) || firstLive;
+
+        cache.Add(first, s, live);
+        cache.Add(Segment(2), s, live);
+        Assert.True(cache.IsFull(live));
+
+        firstLive = false;
+        Thread.Sleep(1_100);   // past the prune throttle
+        Assert.False(cache.IsFull(live));
+        Assert.Equal(0, cache.CountForTest);
+        Assert.Equal(0, cache.BytesForTest);
+    }
+
+    [Fact]
+    public void Adding_a_key_again_replaces_the_entry_and_its_weight()
+    {
+        var small = Summary();
+        var big   = Summary(nameBytes: 500);
+        var cache = new SegmentCountsCache(maxBytes: 1_000_000);
+        static bool live(SegmentInfo _) => true;
+
+        cache.Add(Segment(1), small, live);
+        cache.Add(Segment(1), big, live);
+
+        Assert.Equal(1, cache.CountForTest);
+        Assert.Equal(big.MemoryBytes, cache.BytesForTest);
+        Assert.True(cache.TryGet(Segment(1), out var got));
+        Assert.Same(big, got);
+    }
+
+    [Fact]
+    public void Another_file_under_the_same_key_is_a_miss()
+    {
+        var cache = new SegmentCountsCache(maxBytes: 1_000_000);
+        cache.Add(Segment(1, compressedBytes: 1_000), Summary(), static _ => true);
+
+        Assert.True (cache.TryGet(Segment(1, compressedBytes: 1_000), out _));   // read off the same file again
+        Assert.False(cache.TryGet(Segment(1, compressedBytes: 2_000), out _));   // a different file
     }
 }
