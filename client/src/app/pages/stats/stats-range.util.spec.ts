@@ -155,6 +155,16 @@ describe('the axis', () => {
     expect(labels).toEqual(gap ? ['03:00', '04:00', '06:00', '08:00', '10:00'] : ['02:00', '04:00', '06:00', '08:00', '10:00']);
   });
 
+  it('gives the place a spring-forward gap moves a mark onto to one mark only', () => {
+    // 8 Mar 2026 01:00 → 05:00, hourly marks: where 02:00 does not exist, JS puts that mark on 03:00, the
+    // next mark's own place, and the band's @for tracks marks by pct — so the two must collapse into one.
+    // Elsewhere the window is four plain hours.
+    const gap = local(2026, 3, 8, 2).getHours() !== 2;
+    const ticks = axisTicks(local(2026, 3, 8, 1).getTime(), local(2026, 3, 8, 5).getTime(), NOW);
+    expect(new Set(ticks.map(t => t.pct)).size).toBe(ticks.length);
+    expect(ticks.map(t => t.label)).toEqual(gap ? ['03:00', '04:00'] : ['02:00', '03:00', '04:00']);
+  });
+
   it('keeps a quarter to about eight labels', () => {
     const quarter = resolveWindow('3m', '', '', NOW)!;
     const ticks = axisTicks(quarter.gridFromMs, quarter.gridEndMs, NOW);

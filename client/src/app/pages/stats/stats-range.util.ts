@@ -157,9 +157,12 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
   // Mark k from the local midnight before the start, so the marks fall on 00:00, 04:00, 08:00 …
   const day = startOfDay(new Date(gridFromMs));
   const ticks: AxisTick[] = [];
+  let last = NaN;
   for (let k = 0; ; k++) {
     const t = tickOfDay(day, k, step);
     if (t.getTime() >= gridEndMs) break;
+    if (t.getTime() === last) continue;   // a spring-forward gap moved mark k onto mark k + 1
+    last = t.getTime();
     const pct = ((t.getTime() - gridFromMs) / span) * 100;
     if (pct < 1.5 || pct > 98.5) continue;
     const midnight = t.getHours() === 0 && t.getMinutes() === 0;
@@ -174,7 +177,9 @@ export function axisTicks(gridFromMs: number, gridEndMs: number, now = new Date(
  * absolute hours would read 03:00 or 05:00 from then on. Each mark is placed from the day, not
  * from the mark before it: a mark that falls into a spring-forward gap (02:00 on a day that has no
  * 02:00) is moved on to 03:00 by the Date constructor, and the marks after it still fall on 04:00,
- * 06:00 … instead of carrying the lost hour along.
+ * 06:00 … instead of carrying the lost hour along. With hourly marks the moved mark lands on the
+ * next mark's own instant (02:00 and 03:00 are both 07:00Z in New York), which the caller's loop
+ * then drops, so no two marks share a place.
  */
 function tickOfDay(day: Date, k: number, step: number): Date {
   return step < DAY
