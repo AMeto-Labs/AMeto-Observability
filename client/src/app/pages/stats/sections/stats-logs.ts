@@ -38,11 +38,14 @@ interface LogsResult {
 /**
  * The Logs band: ingest volume over the window bucketed by service (`GET /api/events/counts`) and
  * the log store's counters (`GET /api/stats`). The counts are the one request of the page that is
- * not a catalogue read: a header scan of every event in the window (every block LZ4-decoded for its
- * headers), cached 20 s by bucket grid, and past seven days run as a search — a slot and a budget —
- * so a quarter over a busy store may come back refused (503) or out of budget (504) with the
- * server's sentence. That, or the store closed (#95), is the band's unavailable state; the store
- * counters failing alone only dashes the store's tiles.
+ * not a catalogue read: segments wholly inside the window are counted from their per-segment
+ * summaries (every preset's bucket is a whole number of 15-minute slots), and only the segments the
+ * window's edges cut are header-scanned. It is cached 20 s by bucket grid, and past seven days runs
+ * as a search — a slot and a budget — so on a busy server it may still come back refused (503) or
+ * out of budget (504) with the server's sentence, most likely on the first wide window after a
+ * restart, while segments written before the summaries existed are scanned once. That, or the store
+ * closed (#95), is the band's unavailable state; the store counters failing alone only dashes the
+ * store's tiles.
  */
 @Component({
   selector: 'app-stats-logs',
