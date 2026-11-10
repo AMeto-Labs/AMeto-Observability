@@ -859,7 +859,6 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         _retentionStore = retentionStore;
         _logger         = logger;
         _budgets        = budgets;
-        _countsStore    = SegmentCountsStore.Open(_options.DataDirectory, logger);
         // ── Flush RAM budgets ────────────────────────────────────────────────────
         // A flush costs memory in two separate places, and each needs its own bound:
         //
@@ -1050,6 +1049,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // The spill volume's free space, measured off every lock (SpillVolumeFreeBytes): the first
         // measurement now, so the floor check has one by the time a spill is wanted.
         StartSpillFreeMeasure();
+        // Last: a constructor that throws before here leaves no counts.db handle behind (review of
+        // #158, N4). Nothing above reads the store; Open itself never throws.
+        _countsStore = SegmentCountsStore.Open(_options.DataDirectory, logger);
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
@@ -1479,6 +1481,11 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // Other grids (the aggregate road's one-second axis, an alert's own window) never
                 // read a summary, so they never pay for building one.
                 bool summaryGrid = _countSummaries && SegmentCountsSummary.Answers(bucketSeconds);
+                // A summary is BUILT only for a store that can keep it. Without one — none opened,
+                // or one whose last write failed — a file's section is still added straight from
+                // its bytes, and a segment without one is scanned plainly: building and dropping
+                // a summary per segment per request is work nothing keeps.
+                bool canStore = summaryGrid && _countsStore is { Writable: true };
                 SegmentCountsStore.Lookup[]? stored = null;
                 if (summaryGrid && !wholeSegments && _countsStore is { } store)
                 {
@@ -1528,7 +1535,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                             // Entirely inside, with no row in the store: the file's own section,
                             // three small reads, and the row written for next time.
                             bool summarise = inside && summaryGrid && found != SegmentCountsStore.Lookup.Unsummarisable;
-                            if (summarise && TryCountFromFileSection(info, local, bucketSeconds))
+                            if (summarise && TryCountFromFileSection(info, local, bucketSeconds, canStore))
                                 return local;
 
                             try
@@ -1537,7 +1544,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                                 using var reader = OpenForHeaderScan(info);
                                 // Here an inside segment on a slot grid has no summary anywhere: one
                                 // written before summaries existed. Its scan yields one, stored.
-                                if (summarise)
+                                if (summarise && canStore)
                                     AggregateAndSummarise(reader, info, local, fromTicks, toTicks);
                                 else
                                     reader.AggregateHeaders(local, fromTicks, toTicks);
@@ -1585,6 +1592,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>Test seam: called for each segment a backfill pass is about to summarise.</summary>
     internal Action<SegmentInfo>? _beforeBackfillSegment;
 
+    /// <summary>Test seam: backfill passes begun in this process.</summary>
+    internal int BackfillPassesForTest => Volatile.Read(ref _backfillPasses);
+    private int _backfillPasses;
+
     /// <summary>Test seam: summaries built by scans of a counting request so far.</summary>
     internal int SummaryBuildsForTest => Volatile.Read(ref _summaryBuilds);
     private int _summaryBuilds;
@@ -1595,19 +1606,26 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// Adds a segment that lies wholly inside the window, and has no row in the store, from its
-    /// file's own 15-minute section, and stores the row for next time. False when the file carries
-    /// none (written before summaries, or its writer gave up) or could not be read: the caller then
-    /// scans it, and the scan's handling of a missing or damaged file is the one that decides what
-    /// that means.
+    /// file's own 15-minute section; with <paramref name="store"/> it builds the summary and stores
+    /// the row for next time, without it it adds straight from the section's bytes and builds
+    /// nothing. False when the file carries none (written before summaries, or its writer gave up)
+    /// or could not be read: the caller then scans it, and the scan's handling of a missing or
+    /// damaged file is the one that decides what that means.
     /// </summary>
-    private bool TryCountFromFileSection(SegmentInfo info, LogVolumeAggregator local, int bucketSeconds)
+    private bool TryCountFromFileSection(SegmentInfo info, LogVolumeAggregator local, int bucketSeconds, bool store)
     {
+        if (!store)
+        {
+            try { return SegmentCountsSummary.TryAddFromFile(info.FilePath, info, local, bucketSeconds); }
+            catch (Exception) { return false; }
+        }
+
         SegmentCountsSummary? summary;
         try { summary = SegmentCountsSummary.Read(info.FilePath, info); }
         catch (Exception) { return false; }
         if (summary is null) return false;
         summary.AddTo(local, bucketSeconds);
-        _countsStore?.TryUpsert(info, summary);
+        TryStore(info, summary);
         return true;
     }
 
@@ -1624,7 +1642,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         Interlocked.Increment(ref _summaryBuilds);
         var counts = new SegmentCountsBuilder();
         reader.AggregateAndSummariseHeaders(local, counts, fromTicks, toTicks);
-        _countsStore?.TryUpsert(info, counts.Build(info.EventCount, info.MinTimestampTicks, info.MaxTimestampTicks));
+        TryStore(info, counts);
+    }
+
+    /// <summary>
+    /// Stores a summary, or a builder's, outside the scan's own failure handling: every event was
+    /// added already, so a failure here — only an allocation can fail before the store's own catch —
+    /// costs the row, never the segment's place in the answer.
+    /// </summary>
+    private void TryStore(SegmentInfo info, SegmentCountsBuilder counts)
+    {
+        try { _countsStore?.TryUpsert(info, counts.Build(info.EventCount, info.MinTimestampTicks, info.MaxTimestampTicks)); }
+        catch (Exception) { /* the row is lost; the count is not */ }
+    }
+
+    private void TryStore(SegmentInfo info, SegmentCountsSummary summary)
+    {
+        try { _countsStore?.TryUpsert(info, summary); }
+        catch (Exception) { /* the row is lost; the count is not */ }
     }
 
     /// <summary>
@@ -1632,21 +1667,32 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <c>counts.db</c> — from its file's section if it carries one, else from one header scan —
     /// newest first, since recent windows are the ones looked at; then the rows of segments that
     /// have left the catalog are cleared. A segment with a matching row costs nothing, so a pass
-    /// over a store that is up to date is one query and a comparison.
+    /// over a store that is up to date is one read of the fingerprints and a comparison.
     ///
     /// <para>It runs at <paramref name="dutyCycle"/> of one thread: after each segment it rests for
     /// the time that segment took, scaled, so a 512 MB two-core host keeps serving while a month of
     /// older segments is summarised. Progress is the store itself: a pass stopped half way (a
     /// shutdown, a deploy) resumes where it stopped.</para>
+    ///
+    /// <para>Two things stop it short. A store it cannot read or write gives it nothing to do but
+    /// decode for nothing, so the pass ends there and the next one tries again. And the sweep, which
+    /// deletes the row of every key the catalog does not hold, runs only over a catalog that has
+    /// finished loading with nothing left unread: during the boot scan the catalog is a partial
+    /// view, and every row it has not reached yet would look stale (review of #158, M1).</para>
     /// </summary>
     internal async Task<CountsBackfillResult> BackfillCountsOnceAsync(CancellationToken ct, double dutyCycle = 0.25)
     {
+        Interlocked.Increment(ref _backfillPasses);
         var store = _countsStore;
         if (store is null) return default;
 
+        // Read BEFORE the snapshot: a catalog that has finished loading by now is whole for the
+        // snapshot taken after it.
+        bool catalogWhole = _catalogLoad.IsCompletedSuccessfully && Volatile.Read(ref _catalogScanShort) == 0;
         var segments = new List<SegmentInfo>(_segments.Values);
         segments.Sort(static (a, b) => b.MaxTimestampTicks.CompareTo(a.MaxTimestampTicks));
-        var rows = store.ReadFingerprints();
+        if (!store.TryReadFingerprints(out var rows))
+            return new CountsBackfillResult(segments.Count, 0, 0, 0, 0, 0, 0, StoppedOnStoreFailure: true);
 
         int already = 0, fromFiles = 0, scanned = 0, none = 0, failed = 0;
         foreach (var info in segments)
@@ -1679,8 +1725,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 }
             }
 
-            if (!store.TryUpsert(info, summary)) failed++;
-            else if (summary is null) none++;
+            // A store that will not take this row will not take the next: stop decoding for nothing.
+            if (!store.TryUpsert(info, summary))
+                return new CountsBackfillResult(segments.Count, already, fromFiles, scanned, none, failed + 1, 0, StoppedOnStoreFailure: true);
+            if (summary is null) none++;
             else if (read) fromFiles++;
             else scanned++;
 
@@ -1691,9 +1739,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             }
         }
 
-        int swept = store.DeleteStale(key => _segments.TryGetValue(key, out var current) ? current : null);
-        int summarised = already + fromFiles + scanned + none;
-        Volatile.Write(ref _countsProgress, new CountsSummaryProgress(segments.Count, summarised, DateTimeOffset.UtcNow));
+        int swept = 0;
+        if (catalogWhole)
+        {
+            swept = store.DeleteStale(rows, key => _segments.TryGetValue(key, out var current) ? current : null);
+            int summarised = already + fromFiles + scanned + none;
+            Volatile.Write(ref _countsProgress, new CountsSummaryProgress(segments.Count, summarised, DateTimeOffset.UtcNow));
+        }
         return new CountsBackfillResult(segments.Count, already, fromFiles, scanned, none, failed, swept);
     }
 

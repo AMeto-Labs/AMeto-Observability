@@ -653,7 +653,7 @@ public sealed class SegmentCountsEngineTests : IDisposable
 
         var scanned = await ScanAsync(_engine, from, to, bucket, service);
         var first   = await CountAsync(from, to, bucket, service);   // summaries read off the files
-        var again   = await CountAsync(from, to, bucket, service);   // and from memory
+        var again   = await CountAsync(from, to, bucket, service);   // and from counts.db
 
         SegmentCountsSummaryTests.AssertSameCounts(scanned, first);
         SegmentCountsSummaryTests.AssertSameCounts(scanned, again);
@@ -929,21 +929,217 @@ public sealed class SegmentCountsEngineTests : IDisposable
     {
         await _engine.FlushHotTierAsync();
         await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        var segments = _engine.ListSegments();
+        foreach (var (f, t) in new[] { (-12.0, 72.0), (5.25, 30.0), (24.0, 48.5) })
+            foreach (string? service in new[] { null, "checkout", "Zahlung-ü", "absent" })
+            {
+                var from = Base.AddHours(f);
+                var to   = Base.AddHours(t);
+                // Exactly the segments the window's edges cut are decoded; every one wholly inside
+                // is answered from its row.
+                int edges = segments.Count(s => s.MaxTimestampTicks >= from.UtcTicks && s.MinTimestampTicks <= to.UtcTicks
+                                              && (s.MinTimestampTicks < from.UtcTicks || s.MaxTimestampTicks > to.UtcTicks));
+                int opens = 0;
+                _engine._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+                LogVolumeCounts counts;
+                try     { counts = await CountAsync(from, to, bucket, service); }
+                finally { _engine._beforeHeaderSegmentOpen = null; }
+
+                Assert.Equal(edges, opens);
+                SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(_engine, from, to, bucket, service), counts);
+            }
+    }
+
+    // ── Review of #158, round 1 ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// M1. During the boot scan the catalog is a partial view; a sweep against it deleted the row of
+    /// every segment it had not reached, so every restart of a big store threw away the summaries
+    /// of every older segment and decoded them again. A pass over a loading catalog now deletes
+    /// nothing, and once the catalog is whole a wide window decodes nothing.
+    /// </summary>
+    [Fact]
+    public async Task A_pass_over_a_catalog_still_loading_deletes_no_row()
+    {
+        string sub = "boot";
+        int n;
+        await using (var legacy = Populate(carryCounts: false, sub: sub))
+        {
+            await legacy.FlushHotTierAsync();
+            n = legacy.ListSegments().Count;
+            await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        }
+
+        var held = new TaskCompletionSource();
+        var opts = new ServerOptions { DataDirectory = Path.Combine(_dir.Path, sub) };
+        await using var booting = new StorageEngine(
+            Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance, maintenanceStartDelay: TimeSpan.FromHours(1), bootScanHeldUntil: held.Task);
+        booting.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
+
+        var pass = await booting.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.Equal(0, pass.Swept);
+        Assert.Equal(n, booting.CountsStoreForTest!.ReadFingerprints().Count);
+        Assert.Equal(CountsSummaryProgress.NotYet, booting.CountsSummaries);   // a partial catalog reports nothing
+
+        held.SetResult();
+        await booting.CatalogLoaded;
+        int opens = 0;
+        booting._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+        var counts = await CountAsync(booting, Base.AddHours(-12), Base.AddDays(3), 43_200, null);
+        Assert.Equal(0, opens);
+        Assert.Equal(Events, counts.Total);
+    }
+
+    /// <summary>
+    /// S2. With no store — none could be opened — a summary built is a summary dropped, so none is
+    /// built: older segments are scanned plainly and new ones added from their sections' bytes.
+    /// Here a directory sits where counts.db would go, so the store cannot open.
+    /// </summary>
+    [Fact]
+    public async Task Without_a_store_no_summary_is_built_and_the_answers_stand()
+    {
+        string sub = "nostore";
+        Directory.CreateDirectory(Path.Combine(_dir.Path, sub, SegmentCountsStore.FileName));
+        await using var legacy = Populate(carryCounts: false, sub: sub);
+        Assert.Null(legacy.CountsStoreForTest);
+
+        var from = Base.AddHours(-12);
+        var to   = Base.AddDays(3);
+        var first  = await CountAsync(legacy, from, to, 43_200, null);
+        var second = await CountAsync(legacy, from, to, 86_400, "checkout");
+
+        Assert.Equal(0, legacy.SummaryBuildsForTest);
+        SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(legacy, from, to, 43_200, null), first);
+        SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(legacy, from, to, 86_400, "checkout"), second);
+    }
+
+    /// <summary>
+    /// S2 and S3. A store that cannot write — a full disk — ends a backfill pass at its first failed
+    /// write instead of decoding the whole store for nothing, and while it cannot write no request
+    /// builds a summary either. The next pass tries again, and once a write succeeds the store is
+    /// written to as before.
+    /// </summary>
+    [Fact]
+    public async Task A_store_that_cannot_write_stops_the_pass_and_the_builds_until_it_can()
+    {
+        await using var legacy = Populate(carryCounts: false, sub: "readonly");
+        await legacy.FlushHotTierAsync();
+        int n = legacy.ListSegments().Count;
+        var store = legacy.CountsStoreForTest!;
+        store.FailWritesForTest = true;
+        int attempted = 0;
+        legacy._beforeBackfillSegment = _ => Interlocked.Increment(ref attempted);
+
+        var pass = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.True(pass.StoppedOnStoreFailure);
+        Assert.Equal(1, attempted);
+        Assert.False(store.Writable);
+
+        await CountAsync(legacy, Base.AddHours(-12), Base.AddDays(3), 43_200, null);
+        Assert.Equal(0, legacy.SummaryBuildsForTest);
+
+        store.FailWritesForTest = false;
+        var next = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.False(next.StoppedOnStoreFailure);
+        Assert.Equal(n, next.Scanned);
+        Assert.True(store.Writable);
+    }
+
+    /// <summary>S3. A store that cannot be read gives the pass nothing to compare against: it stops before decoding anything.</summary>
+    [Fact]
+    public async Task A_store_that_cannot_be_read_stops_the_pass_before_it_decodes_anything()
+    {
+        await using var legacy = Populate(carryCounts: false, sub: "unreadable");
+        await legacy.FlushHotTierAsync();
+        legacy.CountsStoreForTest!.Dispose();
+        int attempted = 0;
+        legacy._beforeBackfillSegment = _ => Interlocked.Increment(ref attempted);
+
+        var pass = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+
+        Assert.True(pass.StoppedOnStoreFailure);
+        Assert.Equal(0, attempted);
+    }
+
+    /// <summary>
+    /// S5. A row whose bytes do not check out — here a blob overwritten behind the store's back — is
+    /// a miss: the segment is counted from its file's section, exactly, and its row written again.
+    /// </summary>
+    [Fact]
+    public async Task A_damaged_row_is_ignored_and_written_again()
+    {
+        await _engine.FlushHotTierAsync();
+        await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        var victim = _engine.ListSegments()[0];
+        string db = Path.Combine(_dir.Path, SegmentCountsStore.FileName);
+        using (var conn = new SqliteConnection($"Data Source={db};Pooling=False"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE segment_counts SET h1 = X'52444353020000' WHERE node = $n AND id = $i;";
+            cmd.Parameters.AddWithValue("$n", (long)victim.NodeId.Value);
+            cmd.Parameters.AddWithValue("$i", unchecked((long)victim.Id.Value));
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+        }
+
+        var from = Base.AddHours(-12);
+        var to   = Base.AddDays(3);
         int opens = 0;
         _engine._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+        var counts = await CountAsync(from, to, 3_600, null);
+        _engine._beforeHeaderSegmentOpen = null;
+
+        Assert.Equal(0, opens);   // its section answered
+        SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(_engine, from, to, 3_600, null), counts);
+        var agg = new LogVolumeAggregator(long.MinValue, long.MaxValue, 0, 3_600, 1, null, _engine.TemplatePool);
+        Assert.Equal(SegmentCountsStore.Lookup.Added, _engine.CountsStoreForTest!.TryAddTo(victim, 3_600, agg, 3_600));
+    }
+
+    /// <summary>
+    /// The service itself: it waits for the boot scan before its first pass, runs passes on its
+    /// clock, and a pass that throws costs that pass, not the service.
+    /// </summary>
+    [Fact]
+    public async Task The_backfill_service_waits_for_the_catalog_and_survives_a_failed_pass()
+    {
+        string sub = "service";
+        int n;
+        await using (var legacy = Populate(carryCounts: false, sub: sub))
+        {
+            await legacy.FlushHotTierAsync();
+            n = legacy.ListSegments().Count;
+        }
+
+        var held = new TaskCompletionSource();
+        var opts = new ServerOptions { DataDirectory = Path.Combine(_dir.Path, sub) };
+        await using var engine = new StorageEngine(
+            Options.Create(opts), new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance, maintenanceStartDelay: TimeSpan.FromHours(1), bootScanHeldUntil: held.Task);
+        engine.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
+        int calls = 0;
+        engine._beforeBackfillSegment = _ =>
+        {
+            if (Interlocked.Increment(ref calls) == 1) throw new InvalidOperationException("a pass that fails (test)");
+        };
+
+        var service = new CountsSummaryBackfillService(engine, NullLogger<CountsSummaryBackfillService>.Instance,
+                                                       firstPassDelay: TimeSpan.Zero, interval: TimeSpan.FromMilliseconds(50));
+        await service.StartAsync(CancellationToken.None);
         try
         {
-            foreach (var (f, t) in new[] { (-12.0, 72.0), (5.25, 30.0), (24.0, 48.5) })
-                foreach (string? service in new[] { null, "checkout", "Zahlung-ü", "absent" })
-                {
-                    var from = Base.AddHours(f);
-                    var to   = Base.AddHours(t);
-                    var counts = await CountAsync(from, to, bucket, service);
-                    SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(_engine, from, to, bucket, service), counts);
-                }
+            await Task.Delay(300);
+            Assert.Equal(0, engine.BackfillPassesForTest);   // still waiting for the boot scan
+
+            held.SetResult();
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (engine.CountsStoreForTest!.ReadFingerprints().Count < n && DateTime.UtcNow < deadline)
+                await Task.Delay(50);
+
+            Assert.Equal(n, engine.CountsStoreForTest!.ReadFingerprints().Count);
+            Assert.True(Volatile.Read(ref calls) > n, "the first pass failed and a later one did the work");
         }
-        finally { _engine._beforeHeaderSegmentOpen = null; }
-        Assert.True(opens < _engine.ListSegments().Count * 12, "only boundary segments were decoded");
+        finally { await service.StopAsync(CancellationToken.None); }
     }
 
     private StorageEngine Reopen(string sub)
@@ -1117,7 +1313,7 @@ public sealed class SegmentCountsStoreTests : IDisposable
         using var store = OpenStore();
         foreach (var info in new[] { gone, kept, replaced }) store.TryUpsert(info, summary);
 
-        int cleared = store.DeleteStale(key =>
+        int cleared = store.DeleteStale(store.ReadFingerprints(), key =>
             key.Id.Value == 2 ? kept
           : key.Id.Value == 3 ? Info(events, id: 3, bytes: 1)   // same key, another file
           : null);
@@ -1153,5 +1349,67 @@ public sealed class SegmentCountsStoreTests : IDisposable
         Assert.Equal(SegmentCountsStore.Lookup.Missing, store.TryAddTo(Info(events), 900, agg, 900));
         Assert.False(store.TryUpsert(Info(events), SegmentCountsSummaryTests.BuildFrom(events)));
         Assert.Empty(store.ReadFingerprints());
+    }
+
+    /// <summary>
+    /// S1. A rowid table, blobs ordered day, hour, quarter: a <c>WITHOUT ROWID</c> table keyed on
+    /// rows of hundreds of kilobytes compares whole rows on every lookup (~0.9 ms against ~8 µs).
+    /// The layout is named by <c>user_version</c>, and a file with another layout is rebuilt.
+    /// </summary>
+    [Fact]
+    public void The_table_is_a_rowid_table_with_the_small_blobs_first_and_another_layout_is_rebuilt()
+    {
+        string path = Path.Combine(_dir.Path, SegmentCountsStore.FileName);
+        using (var old = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            old.Open();
+            using var cmd = old.CreateCommand();
+            cmd.CommandText = "CREATE TABLE segment_counts (node INTEGER NOT NULL, id INTEGER NOT NULL, q15 BLOB NOT NULL, PRIMARY KEY (node, id)) WITHOUT ROWID;";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var store = OpenStore())
+        {
+            var events = SegmentCountsSummaryTests.Corpus();
+            Assert.True(store.TryUpsert(Info(events), SegmentCountsSummaryTests.BuildFrom(events)));
+        }
+
+        using var conn = new SqliteConnection($"Data Source={path};Pooling=False");
+        conn.Open();
+        using var q = conn.CreateCommand();
+        q.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'segment_counts';";
+        string sql = (string)q.ExecuteScalar()!;
+        q.CommandText = "PRAGMA user_version;";
+        long version = (long)q.ExecuteScalar()!;
+
+        Assert.DoesNotContain("WITHOUT ROWID", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.True(sql.IndexOf("d1", StringComparison.Ordinal) < sql.IndexOf("h1", StringComparison.Ordinal)
+                 && sql.IndexOf("h1", StringComparison.Ordinal) < sql.IndexOf("q15", StringComparison.Ordinal), sql);
+        Assert.Equal(SegmentCountsStore.SchemaVersion, version);
+    }
+
+    /// <summary>
+    /// S4. A lookup reads the blob where SQLite holds it and adds from there: nothing is copied and
+    /// nothing allocated, on the path CLAUDE.md lists as allocation-free. Before, each lookup built a
+    /// reader, a record, a stream and a copy of the blob (and walked the table's metadata twice).
+    /// </summary>
+    [Fact]
+    public void A_lookup_allocates_nothing()
+    {
+        var events = SegmentCountsSummaryTests.Corpus();
+        var info   = Info(events);
+        using var store = OpenStore();
+        Assert.True(store.TryUpsert(info, SegmentCountsSummaryTests.BuildFrom(events)));
+        var agg = new LogVolumeAggregator(long.MinValue, long.MaxValue, 0, 3_600, 1, null, NoPool);
+
+        // Warm: the aggregator meets its services, the statement its first step.
+        Assert.Equal(SegmentCountsStore.Lookup.Added, store.TryAddTo(info, 3_600, agg, 3_600));
+        Assert.Equal(SegmentCountsStore.Lookup.Added, store.TryAddTo(info, 3_600, agg, 3_600));
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 10; i++) store.TryAddTo(info, 3_600, agg, 3_600);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 1_024, $"ten lookups allocated {allocated} bytes");
     }
 }

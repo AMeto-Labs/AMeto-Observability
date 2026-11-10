@@ -24,6 +24,7 @@ public static class EndpointMapper
             if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             var  segs = storage.GetSegments(null, null);
+            var  counts = storage.CountsSummaries;   // once, so its three numbers belong to one pass
             long events = 0, compressed = 0, uncompressed = 0, oldest = long.MaxValue, newest = long.MinValue;
             for (int i = 0; i < segs.Count; i++)
             {
@@ -43,13 +44,12 @@ public static class EndpointMapper
                 // The earliest and latest event any segment holds — null with no segments.
                 oldestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(oldest, TimeSpan.Zero).ToString("O"),
                 newestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(newest, TimeSpan.Zero).ToString("O"),
-                // The counts backfill (counts.db) as of its last pass: until summarised equals
-                // segments, wide /api/events/counts windows still decode the rest.
+                // The counts backfill (counts.db) as of its last pass over a whole catalog.
                 countsSummaries   = new
                 {
-                    segments   = storage.CountsSummaries.Segments,
-                    summarised = storage.CountsSummaries.Summarised,
-                    asOf       = storage.CountsSummaries.AsOf?.ToString("O"),
+                    segments   = counts.Segments,
+                    summarised = counts.Summarised,
+                    asOf       = counts.AsOf?.ToString("O"),
                 },
             });
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewStats);

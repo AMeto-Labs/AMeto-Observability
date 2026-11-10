@@ -71,31 +71,47 @@ public sealed class RetentionBackgroundService : BackgroundService
 }
 
 /// <summary>
-/// Keeps <c>counts.db</c> whole: a minute after startup, then every ten minutes, one backfill pass
-/// gives every cold segment its counts summary — once per segment, ever, since the store is on
-/// disk — and clears the rows of segments that have gone. A pass over a store that is up to date is
-/// one query; the first pass after an upgrade summarises the older segments at a quarter of a core.
+/// Keeps <c>counts.db</c> whole: once the boot catalog scan has finished, after a minute's
+/// settling, then every ten minutes, one backfill pass gives every cold segment its counts
+/// summary — once per segment, ever, since the store is on disk — and clears the rows of segments
+/// that have gone. A pass over a store that is up to date is one read of the fingerprints; the
+/// first pass after an upgrade summarises the older segments at a quarter of one thread.
+///
+/// <para>It waits for the catalog for the reason the engine's maintenance loop does: until the
+/// boot scan ends the catalog is a partial view, and a pass over it would leave most segments for
+/// the next one (the engine also refuses to sweep against it). A scan that faults counts as ended,
+/// as there it does.</para>
 ///
 /// <para>Guarded like the engine's own loops (#137): a failed pass, or a log line that throws, costs
 /// that pass, never the service, and never stops the host.</para>
 /// </summary>
 public sealed class CountsSummaryBackfillService : BackgroundService
 {
-    private static readonly TimeSpan FirstPassDelay = TimeSpan.FromMinutes(1);
-    private static readonly TimeSpan Interval       = TimeSpan.FromMinutes(10);
-
     private readonly StorageEngine                         _storage;
     private readonly ILogger<CountsSummaryBackfillService> _logger;
+    private readonly TimeSpan                              _firstPassDelay;
+    private readonly TimeSpan                              _interval;
 
     public CountsSummaryBackfillService(StorageEngine storage, ILogger<CountsSummaryBackfillService> logger)
+        : this(storage, logger, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(10)) { }
+
+    /// <summary>For tests: the same service on a shorter clock.</summary>
+    internal CountsSummaryBackfillService(StorageEngine storage, ILogger<CountsSummaryBackfillService> logger,
+                                          TimeSpan firstPassDelay, TimeSpan interval)
     {
-        _storage = storage;
-        _logger  = logger;
+        _storage        = storage;
+        _logger         = logger;
+        _firstPassDelay = firstPassDelay;
+        _interval       = interval;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        try { await Task.Delay(FirstPassDelay, stoppingToken); }
+        try { await _storage.CatalogLoaded.WaitAsync(stoppingToken); }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+        catch (Exception) { /* a faulted scan has ended; the engine says why, and sweeps nothing after it */ }
+
+        try { await Task.Delay(_firstPassDelay, stoppingToken); }
         catch (OperationCanceledException) { return; }
 
         while (!stoppingToken.IsCancellationRequested)
@@ -103,10 +119,16 @@ public sealed class CountsSummaryBackfillService : BackgroundService
             try
             {
                 var r = await _storage.BackfillCountsOnceAsync(stoppingToken);
-                if (r.Written > 0 || r.Swept > 0 || r.Failed > 0)
-                    Say(Microsoft.Extensions.Logging.LogLevel.Information,
-                        "Counts summaries: {Written} segment(s) summarised ({FromFiles} from their files, {Scanned} by a scan, {None} with none possible), {Swept} stale row(s) cleared, {Failed} not readable now; {Stored} of {Segments} segments have theirs",
+                // Every pass copies the sections of the segments flushed and merged since the last
+                // one, so that alone is Debug; a scan, a failure or a stopped pass is worth reading.
+                var level = r.Scanned > 0 || r.Failed > 0 || r.StoppedOnStoreFailure
+                    ? Microsoft.Extensions.Logging.LogLevel.Information
+                    : Microsoft.Extensions.Logging.LogLevel.Debug;
+                if (r.Written > 0 || r.Swept > 0 || r.Failed > 0 || r.StoppedOnStoreFailure)
+                    Say(level,
+                        "Counts summaries: {Written} segment(s) summarised ({FromFiles} from their files, {Scanned} by a scan, {None} with none possible), {Swept} stale row(s) cleared, {Failed} not readable now{Stopped}; {Stored} of {Segments} segments have theirs",
                         r.Written, r.FromFileSections, r.Scanned, r.Unsummarisable, r.Swept, r.Failed,
+                        r.StoppedOnStoreFailure ? ", pass stopped: the store cannot be read or written" : "",
                         r.AlreadyStored + r.Written, r.Segments);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
@@ -116,7 +138,7 @@ public sealed class CountsSummaryBackfillService : BackgroundService
                 catch (Exception) { /* the line is lost; the service is not */ }
             }
 
-            try { await Task.Delay(Interval, stoppingToken); }
+            try { await Task.Delay(_interval, stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
     }
