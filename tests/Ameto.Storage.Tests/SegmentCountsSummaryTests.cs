@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using MessagePack;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
@@ -238,6 +239,92 @@ public sealed class SegmentCountsSummaryTests
         Assert.True(b.Abandoned);
     }
 
+    // ── Coarser resolutions and the store's form ───────────────────────────────────
+
+    /// <summary>
+    /// An hour's or a day's summary is the 15-minute one divided down: the same truncating nesting,
+    /// so it answers every grid of whole hours or days exactly as the events do — before 1970 too.
+    /// </summary>
+    [Theory]
+    [InlineData(3_600, 3_600)]
+    [InlineData(3_600, 43_200)]
+    [InlineData(86_400, 86_400)]
+    [InlineData(86_400, 604_800)]
+    public void A_coarse_summary_adds_up_exactly_as_its_events_do(int resolution, int bucketSeconds)
+    {
+        var events  = Corpus();
+        var coarse  = BuildFrom(events).Coarsen(resolution);
+        Assert.Equal(resolution, coarse.ResolutionSeconds);
+        long min = events.Min(e => e.Ticks);
+
+        foreach (string? filter in new[] { null, "checkout", "(unknown)" })
+        {
+            long minBucket = UnixSeconds(min) / bucketSeconds + 1;
+            var perEvent = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucketSeconds, 9, filter, NoPool);
+            var fromSum  = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucketSeconds, 9, filter, NoPool);
+            foreach (var e in events) perEvent.AddByServiceUtf8(e.Ticks, (LogLevel)e.Level, e.Service);
+            coarse.AddTo(fromSum, bucketSeconds);
+            AssertSameCounts(perEvent.Build(), fromSum.Build());
+        }
+    }
+
+    [Theory]
+    [InlineData(900)]
+    [InlineData(3_600)]
+    [InlineData(86_400)]
+    public void A_store_section_reads_back_and_adds_from_its_bytes_as_the_summary_does(int resolution)
+    {
+        var events  = Corpus();
+        var summary = BuildFrom(events).Coarsen(resolution);
+        var info    = Info(events);
+        byte[] bytes = summary.ToStoreBytes();
+        Assert.Equal(SegmentCountsSummary.StoreVersion, BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(4)));
+
+        var back = SegmentCountsSummary.Parse(bytes, info);
+        Assert.NotNull(back);
+        Assert.Equal(resolution, back!.ResolutionSeconds);
+        Assert.Equal(summary.Cells.ToArray(), back.Cells.ToArray());
+
+        int bucket = resolution * 4;
+        long minBucket = UnixSeconds(events.Min(e => e.Ticks)) / bucket + 1;
+        var a = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucket, 9, null, NoPool);
+        var b = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucket, 9, null, NoPool);
+        summary.AddTo(a, bucket);
+        Assert.True(SegmentCountsSummary.TryAddFrom(bytes, info, b, bucket));
+        AssertSameCounts(a.Build(), b.Build());
+
+        // A grid that is not a whole number of its slots adds nothing.
+        if (resolution > 900)
+        {
+            var c = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, 900, 9, null, NoPool);
+            Assert.False(SegmentCountsSummary.TryAddFrom(bytes, info, c, 900));
+            Assert.Equal(0, c.Build().Scanned);
+        }
+    }
+
+    [Fact]
+    public void A_file_section_stays_v1_so_the_build_before_the_store_still_reads_it()
+    {
+        var summary = BuildFrom(Corpus());
+        byte[] file = Section(summary);
+        Assert.Equal(SegmentCountsSummary.FileVersion, BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(4)));
+        Assert.Equal(900, BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(6)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(file.AsSpan(24)));
+        Assert.Throws<InvalidOperationException>(() => Section(summary.Coarsen(3_600)));
+    }
+
+    /// <summary>A section that checks out byte for byte but names a resolution nothing writes is no summary.</summary>
+    [Fact]
+    public void A_store_section_of_an_unknown_resolution_is_no_summary()
+    {
+        var events = Corpus();
+        byte[] bytes = BuildFrom(events).Coarsen(3_600).ToStoreBytes();
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(24), 1_800);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(bytes.Length - 4), Crc32c.Append(0, bytes.AsSpan(0, bytes.Length - 4)));
+
+        Assert.Null(SegmentCountsSummary.Parse(bytes, Info(events)));
+    }
+
     // ── The writer ──────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -372,7 +459,7 @@ public sealed class SegmentCountsSummaryTests
         return list;
     }
 
-    private static SegmentCountsSummary BuildFrom(List<Ev> events)
+    internal static SegmentCountsSummary BuildFrom(List<Ev> events)
     {
         var b = new SegmentCountsBuilder();
         foreach (var e in events) b.Add(e.Ticks, e.Level, e.Service);
@@ -629,7 +716,7 @@ public sealed class SegmentCountsEngineTests : IDisposable
     /// A grid no summary can answer — the aggregate road's one-second axis, a service-filtered
     /// alert's own window, a short custom window's 60 s step — never reads one, so it must not pay
     /// for building one either: on top of its scan that was a hash and a probe per event and a
-    /// builder per segment, thrown away (review of #157, S1).
+    /// builder per segment, thrown away (review of #157, S1). Nor does it write to the store.
     /// </summary>
     [Theory]
     [InlineData(1)]
@@ -641,66 +728,234 @@ public sealed class SegmentCountsEngineTests : IDisposable
         await CountAsync(Base.AddHours(-12), Base.AddDays(3), bucket, "billing");
 
         Assert.Equal(0, _engine.SummaryBuildsForTest);
-        Assert.Equal(0, _engine.BuiltSummariesForTest.CountForTest);
-        Assert.Equal(0, _engine.ReadSummariesForTest.CountForTest);
+        Assert.Empty(_engine.CountsStoreForTest!.ReadFingerprints());
     }
 
     /// <summary>
-    /// Once the cache of built summaries cannot keep another, building one per pre-summary segment
-    /// per request is work thrown away: a scan on top of what main paid. The first refusal marks
-    /// the cache full and the builds stop (review of #157, S1).
+    /// THE POINT OF counts.db. A store written before summaries existed — every segment on a stand
+    /// the day this ships. The first wide window decodes them (it had to anyway) and writes their
+    /// summaries to disk; the next window decodes nothing, and neither does the first window of the
+    /// NEXT process. Kept in memory (#157), the summaries died with every restart, and every deploy
+    /// began with a month decoded again.
     /// </summary>
     [Fact]
-    public async Task A_full_cache_of_built_summaries_stops_the_builds()
+    public async Task Segments_written_before_summaries_are_decoded_once_ever_not_once_per_restart()
     {
-        await using var legacy = Populate(carryCounts: false, sub: "full");
-        legacy.BuiltSummariesForTest = new SegmentCountsCache(maxBytes: 1);   // keeps nothing
-        int segments = legacy.ListSegments().Count;
-        int workers  = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
         var from = Base.AddHours(-12);
         var to   = Base.AddDays(3);
+        LogVolumeCounts scanned, first, second;
+        int segmentCount;
 
-        var first = await CountAsync(legacy, from, to, 43_200, null);
-        int afterFirst = legacy.SummaryBuildsForTest;
-        Assert.InRange(afterFirst, 1, workers);   // the ones already under way when the first was refused
+        await using (var legacy = Populate(carryCounts: false, sub: "legacy"))
+        {
+            var segments = legacy.ListSegments();
+            segmentCount = segments.Count;
+            Assert.All(segments, s => Assert.Equal(0, SegmentCountsSummaryTests.FooterSlot(s.FilePath, 1)));
+            await legacy.FlushHotTierAsync();   // everything cold, so the restart below sees it all
+            segmentCount = legacy.ListSegments().Count;
+            scanned = await ScanAsync(legacy, from, to, 43_200, null);
 
-        var second = await CountAsync(legacy, from, to, 43_200, null);
-        Assert.Equal(afterFirst, legacy.SummaryBuildsForTest);
-        Assert.True(segments > workers, "setup: more segments than workers, or the bound proves nothing");
+            int opens = 0;
+            legacy._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+            first = await CountAsync(legacy, from, to, 43_200, null);
+            Assert.Equal(segmentCount, opens);
+            Assert.Equal(segmentCount, legacy.CountsStoreForTest!.ReadFingerprints().Count);
+        }
 
-        var scanned = await ScanAsync(legacy, from, to, 43_200, null);
+        await using var restarted = Reopen("legacy");
+        int reopened = 0;
+        restarted._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref reopened);
+        second = await CountAsync(restarted, from, to, 43_200, null);
+
+        Assert.Equal(0, reopened);
+        Assert.Equal(segmentCount, restarted.ListSegments().Count);
         SegmentCountsSummaryTests.AssertSameCounts(scanned, first);
         SegmentCountsSummaryTests.AssertSameCounts(scanned, second);
     }
 
     /// <summary>
-    /// A store written before summaries existed — every segment on a stand the day this ships.
-    /// The first wide window decodes them (it had to anyway) and keeps their summaries; the
-    /// next one decodes nothing.
+    /// The background pass does it before anyone asks: after one pass over a pre-summary store,
+    /// no window decodes a whole segment — in this process or the next — and a second pass finds
+    /// nothing to do.
     /// </summary>
     [Fact]
-    public async Task Segments_written_before_summaries_are_decoded_once_then_answered_from_memory()
+    public async Task One_backfill_pass_summarises_every_older_segment_and_the_next_pass_has_nothing_to_do()
     {
-        await using var legacy = Populate(carryCounts: false, sub: "legacy");
-        var segments = legacy.ListSegments();
-        Assert.All(segments, s => Assert.Equal(0, SegmentCountsSummaryTests.FooterSlot(s.FilePath, 1)));
-
         var from = Base.AddHours(-12);
         var to   = Base.AddDays(3);
-        var scanned = await ScanAsync(legacy, from, to, 43_200, null);
+        await using (var legacy = Populate(carryCounts: false, sub: "backfill"))
+        {
+            await legacy.FlushHotTierAsync();
+            int n = legacy.ListSegments().Count;
 
+            var pass = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+            Assert.Equal(n, pass.Segments);
+            Assert.Equal(n, pass.Scanned);
+            Assert.Equal(0, pass.FromFileSections + pass.Failed + pass.AlreadyStored);
+            Assert.Equal(new CountsSummaryProgress(n, n, legacy.CountsSummaries.AsOf), legacy.CountsSummaries);
+
+            var again = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+            Assert.Equal(n, again.AlreadyStored);
+            Assert.Equal(0, again.Written);
+        }
+
+        await using var restarted = Reopen("backfill");
+        int[] buckets = [900, 3_600, 43_200, 86_400];
+        var answers = new LogVolumeCounts[buckets.Length];
         int opens = 0;
-        legacy._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
-        var first = await CountAsync(legacy, from, to, 43_200, null);
-        Assert.Equal(segments.Count, opens);
+        restarted._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+        for (int i = 0; i < buckets.Length; i++) answers[i] = await CountAsync(restarted, from, to, buckets[i], null);
+        restarted._beforeHeaderSegmentOpen = null;
 
-        opens = 0;
-        var second = await CountAsync(legacy, from, to, 86_400, "checkout");
         Assert.Equal(0, opens);
+        for (int i = 0; i < buckets.Length; i++)
+            SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(restarted, from, to, buckets[i], null), answers[i]);
+    }
 
-        SegmentCountsSummaryTests.AssertSameCounts(scanned, first);
-        SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(legacy, from, to, 86_400, "checkout"), second);
-        Assert.Equal(segments.Count, legacy.BuiltSummariesForTest.CountForTest);
+    /// <summary>
+    /// A segment no summary can be built for — here more service-name bytes than a summary keeps —
+    /// is remembered as such: the backfill stores "none", and a counting request then scans it
+    /// plainly instead of building, and dropping, a summary on every request.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_with_no_possible_summary_is_scanned_without_building_one_again()
+    {
+        string dir = Path.Combine(_dir.Path, "wide-names");
+        Directory.CreateDirectory(dir);
+        var opts = new ServerOptions { DataDirectory = dir };
+        await using var engine = new StorageEngine(
+            Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        engine.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
+        int names = SegmentCountsBuilder.MaxServiceBytesTotal / 1_000 + 2;
+        var buf = new ArrayBufferWriter<byte>(64);
+        for (int i = 0; i < names; i++)
+        {
+            buf.Clear();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(1); w.Write("n"); w.Write((long)i); w.Flush();
+            Assert.True(engine.TryWrite(new LogEventHeader
+            {
+                TimestampUtcTicks        = Base.UtcTicks + i * TimeSpan.TicksPerSecond,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = engine.TemplatePool.Intern("evt {n}"),
+                ServiceNamePoolIndex     = engine.TemplatePool.Intern(i.ToString("D4") + new string('s', 996)),
+            }, buf.WrittenSpan.ToArray()));
+        }
+        await engine.FlushHotTierAsync();
+        var segment = Assert.Single(engine.ListSegments());
+        Assert.Equal(0, SegmentCountsSummaryTests.FooterSlot(segment.FilePath, 1));   // the writer gave up too
+
+        var pass = await engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.Equal(1, pass.Unsummarisable);
+
+        var from = Base.AddHours(-1);
+        var to   = Base.AddHours(1);
+        var counts = await CountAsync(engine, from, to, 900, null);
+        await CountAsync(engine, from, to, 3_600, null);
+
+        Assert.Equal(0, engine.SummaryBuildsForTest);
+        Assert.Equal(names, counts.Total);
+    }
+
+    /// <summary>New segments carry their section, so the backfill copies it into the store without a scan.</summary>
+    [Fact]
+    public async Task The_backfill_copies_new_segments_sections_without_scanning_them()
+    {
+        await _engine.FlushHotTierAsync();
+        int n = _engine.ListSegments().Count;
+
+        var pass = await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+
+        Assert.Equal(n, pass.FromFileSections);
+        Assert.Equal(0, pass.Scanned);
+        Assert.Equal(n, _engine.CountsStoreForTest!.ReadFingerprints().Count);
+    }
+
+    /// <summary>
+    /// A pass stopped half way — a shutdown, a deploy — keeps every row it wrote, and the next pass
+    /// starts from there. A pass stops between segments: the one under way when the stop came is
+    /// finished and kept.
+    /// </summary>
+    [Fact]
+    public async Task A_stopped_pass_keeps_what_it_wrote_and_the_next_one_resumes()
+    {
+        await using var legacy = Populate(carryCounts: false, sub: "resume");
+        await legacy.FlushHotTierAsync();
+        int n = legacy.ListSegments().Count;
+        using var cts = new CancellationTokenSource();
+        int seen = 0;
+        legacy._beforeBackfillSegment = _ => { if (++seen == 4) cts.Cancel(); };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => legacy.BackfillCountsOnceAsync(cts.Token, dutyCycle: 1));
+        Assert.Equal(4, legacy.CountsStoreForTest!.ReadFingerprints().Count);
+
+        legacy._beforeBackfillSegment = null;
+        var rest = await legacy.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.Equal(4, rest.AlreadyStored);
+        Assert.Equal(n - 4, rest.Scanned);
+    }
+
+    /// <summary>
+    /// Rows outlive nothing: a segment that leaves the catalog — deleted by retention, merged away —
+    /// stops matching, is never used, and the next pass clears its row.
+    /// </summary>
+    [Fact]
+    public async Task A_row_whose_segment_left_the_catalog_is_cleared_by_the_next_pass()
+    {
+        await _engine.FlushHotTierAsync();
+        await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        var victim = _engine.ListSegments()[0];
+
+        await _engine.DeleteSegmentAsync(SegmentKey.Of(victim));
+        var pass = await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+
+        Assert.Equal(1, pass.Swept);
+        Assert.False(_engine.CountsStoreForTest!.ReadFingerprints().ContainsKey(SegmentKey.Of(victim)));
+    }
+
+    /// <summary>
+    /// The store's rows, at every resolution a grid can take, against the scan — with the store
+    /// filled by a backfill pass, so every wholly-inside segment is answered from counts.db.
+    /// </summary>
+    [Theory]
+    [InlineData(900)]
+    [InlineData(3_600)]
+    [InlineData(7_200)]
+    [InlineData(43_200)]
+    [InlineData(86_400)]
+    public async Task The_store_answers_every_resolution_exactly_as_the_scan(int bucket)
+    {
+        await _engine.FlushHotTierAsync();
+        await _engine.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        int opens = 0;
+        _engine._beforeHeaderSegmentOpen = _ => Interlocked.Increment(ref opens);
+        try
+        {
+            foreach (var (f, t) in new[] { (-12.0, 72.0), (5.25, 30.0), (24.0, 48.5) })
+                foreach (string? service in new[] { null, "checkout", "Zahlung-ü", "absent" })
+                {
+                    var from = Base.AddHours(f);
+                    var to   = Base.AddHours(t);
+                    var counts = await CountAsync(from, to, bucket, service);
+                    SegmentCountsSummaryTests.AssertSameCounts(await ScanAsync(_engine, from, to, bucket, service), counts);
+                }
+        }
+        finally { _engine._beforeHeaderSegmentOpen = null; }
+        Assert.True(opens < _engine.ListSegments().Count * 12, "only boundary segments were decoded");
+    }
+
+    private StorageEngine Reopen(string sub)
+    {
+        var opts = new ServerOptions { DataDirectory = Path.Combine(_dir.Path, sub) };
+        var engine = new StorageEngine(
+            Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        engine.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
+        engine.CatalogLoaded.GetAwaiter().GetResult();
+        return engine;
     }
 
     [Fact]
@@ -776,143 +1031,127 @@ public sealed class SegmentCountsEngineTests : IDisposable
 }
 
 /// <summary>
-/// The cache of summaries on its own (review of #157, S3 and S4): what an entry weighs, what a
-/// full cache does, how a stale entry makes room, and what counts as the same file.
+/// counts.db on its own: a row answers as its summary does at every resolution, only for the file
+/// it was written for; a segment with no possible summary is remembered as such; rows of segments
+/// that have gone are cleared; the store outlives its process; and a file that is not a store is
+/// set aside rather than stopping the server.
 /// </summary>
-public sealed class SegmentCountsCacheTests
+public sealed class SegmentCountsStoreTests : IDisposable
 {
-    private static readonly long T0 = new DateTimeOffset(2026, 3, 2, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+    private static readonly StringInternPool NoPool = new();
+    private readonly SegmentCountsSummaryTests.TempDir _dir = new();
 
-    private static SegmentInfo Segment(ulong id, long compressedBytes = 1_000) => new()
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        _dir.Dispose();
+    }
+
+    private SegmentCountsStore OpenStore() => SegmentCountsStore.Open(_dir.Path, NullLogger.Instance)!;
+
+    private static SegmentInfo Info(List<SegmentCountsSummaryTests.Ev> events, ulong id = 7, long bytes = 12_345) => new()
     {
         Id = new SegmentId(id), NodeId = new NodeId(1), FilePath = $"{id}.seg",
-        MinTimestampTicks = T0, MaxTimestampTicks = T0, EventCount = 1,
-        MinLevel = LogLevel.Information, CompressedBytes = compressedBytes, UncompressedBytes = 0,
+        MinTimestampTicks = events.Min(e => e.Ticks), MaxTimestampTicks = events.Max(e => e.Ticks),
+        EventCount = (uint)events.Count, MinLevel = LogLevel.Verbose,
+        CompressedBytes = bytes, UncompressedBytes = 0,
     };
 
-    /// <summary>A one-event summary naming one service of <paramref name="nameBytes"/> bytes.</summary>
-    private static SegmentCountsSummary Summary(int nameBytes = 8)
+    [Theory]
+    [InlineData(900, 900)]
+    [InlineData(900, 7_200)]
+    [InlineData(3_600, 3_600)]
+    [InlineData(3_600, 43_200)]
+    [InlineData(86_400, 86_400)]
+    public void A_row_adds_exactly_what_its_events_add(int resolution, int bucketSeconds)
     {
-        var b = new SegmentCountsBuilder();
-        byte[] name = new byte[nameBytes];
-        Array.Fill(name, (byte)'s');
-        b.Add(T0, 2, name);
-        return b.Build(1, T0, T0)!;
-    }
+        var events = SegmentCountsSummaryTests.Corpus();
+        var info   = Info(events);
+        using (var store = OpenStore())
+            Assert.True(store.TryUpsert(info, SegmentCountsSummaryTests.BuildFrom(events)));
 
-    /// <summary>
-    /// Names of about 60 KB in a summary of few cells: weighed by cells alone it was nearly free, so
-    /// a budget meant for ~6 MB of cells could hold hundreds of megabytes of names.
-    /// </summary>
-    [Fact]
-    public void An_entry_weighs_its_service_names_not_only_its_cells()
-    {
-        var heavy = HeavySummary();
-        Assert.True(heavy.MemoryBytes > 60_000, $"setup: {heavy.MemoryBytes} B");
-        var cache = new SegmentCountsCache(maxBytes: heavy.MemoryBytes + heavy.MemoryBytes / 2);
-        static bool live(SegmentInfo _) => true;
-
-        cache.Add(Segment(1), heavy, live);
-        cache.Add(Segment(2), heavy, live);
-
-        Assert.Equal(1, cache.CountForTest);
-        Assert.Equal(heavy.MemoryBytes, cache.BytesForTest);
-    }
-
-    private static SegmentCountsSummary HeavySummary()
-    {
-        var b = new SegmentCountsBuilder();
-        const int names = 60;
-        for (int i = 0; i < names; i++)
+        using var reopened = OpenStore();   // and it is still there in the next process
+        long minBucket = (events.Min(e => e.Ticks) - DateTimeOffset.UnixEpoch.UtcTicks) / TimeSpan.TicksPerSecond / bucketSeconds + 1;
+        foreach (string? filter in new[] { null, "checkout", "absent" })
         {
-            byte[] name = new byte[1_000];
-            Array.Fill(name, (byte)'n');
-            System.Text.Encoding.ASCII.GetBytes(i.ToString("D3")).CopyTo(name, 0);
-            b.Add(T0, 2, name);
+            var perEvent = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucketSeconds, 9, filter, NoPool);
+            var fromRow  = new LogVolumeAggregator(long.MinValue, long.MaxValue, minBucket, bucketSeconds, 9, filter, NoPool);
+            foreach (var e in events) perEvent.AddByServiceUtf8(e.Ticks, (LogLevel)e.Level, e.Service);
+
+            Assert.Equal(SegmentCountsStore.Lookup.Added, reopened.TryAddTo(info, resolution, fromRow, bucketSeconds));
+            SegmentCountsSummaryTests.AssertSameCounts(perEvent.Build(), fromRow.Build());
         }
-        return b.Build(names, T0, T0)!;
     }
 
     [Fact]
-    public void A_full_cache_refuses_stays_within_its_budget_and_says_it_is_full()
+    public void A_row_answers_only_for_the_file_it_was_written_for()
     {
-        var s = Summary();
-        var cache = new SegmentCountsCache(maxBytes: 2 * s.MemoryBytes);
-        static bool live(SegmentInfo _) => true;
+        var events = SegmentCountsSummaryTests.Corpus();
+        using var store = OpenStore();
+        store.TryUpsert(Info(events, bytes: 12_345), SegmentCountsSummaryTests.BuildFrom(events));
 
-        cache.Add(Segment(1), s, live);
-        cache.Add(Segment(2), s, live);
-        Assert.False(cache.IsFull(live));
-
-        cache.Add(Segment(3), s, live);
-
-        Assert.Equal(2, cache.CountForTest);
-        Assert.Equal(2 * s.MemoryBytes, cache.BytesForTest);
-        Assert.True(cache.IsFull(live));
-        Assert.False(cache.TryGet(Segment(3), out _));
+        var agg = new LogVolumeAggregator(long.MinValue, long.MaxValue, 0, 900, 1, null, NoPool);
+        Assert.Equal(SegmentCountsStore.Lookup.Missing, store.TryAddTo(Info(events, bytes: 99_999), 900, agg, 900));
+        Assert.Equal(SegmentCountsStore.Lookup.Missing, store.TryAddTo(Info(events, id: 8), 900, agg, 900));
+        Assert.Equal(0, agg.Build().Scanned);
     }
 
     [Fact]
-    public void A_stale_entry_makes_room_and_takes_its_weight_with_it()
+    public void A_segment_with_no_possible_summary_is_remembered_as_such()
     {
-        var small = Summary();
-        var big   = Summary(nameBytes: 900);
-        var cache = new SegmentCountsCache(maxBytes: big.MemoryBytes + small.MemoryBytes / 2);
-        var gone  = Segment(1);
+        var events = SegmentCountsSummaryTests.Corpus();
+        using var store = OpenStore();
+        Assert.True(store.TryUpsert(Info(events), summary: null));
 
-        cache.Add(gone, big, static _ => true);
-        cache.Add(Segment(2), big, info => !ReferenceEquals(info, gone));   // the first has left the catalog
-
-        Assert.Equal(1, cache.CountForTest);
-        Assert.Equal(big.MemoryBytes, cache.BytesForTest);
-        Assert.False(cache.TryGet(gone, out _));
-        Assert.True(cache.TryGet(Segment(2), out _));
+        var agg = new LogVolumeAggregator(long.MinValue, long.MaxValue, 0, 3_600, 1, null, NoPool);
+        Assert.Equal(SegmentCountsStore.Lookup.Unsummarisable, store.TryAddTo(Info(events), 3_600, agg, 3_600));
+        Assert.True(store.ReadFingerprints()[SegmentKey.Of(Info(events))].Matches(Info(events)));
     }
 
     [Fact]
-    public void A_full_cache_stops_being_full_once_something_leaves()
+    public void Rows_of_segments_the_catalog_no_longer_serves_as_that_file_are_cleared()
     {
-        var s = Summary();
-        var cache = new SegmentCountsCache(maxBytes: s.MemoryBytes);
-        var first = Segment(1);
-        bool firstLive = true;
-        bool live(SegmentInfo info) => !ReferenceEquals(info, first) || firstLive;
+        var events = SegmentCountsSummaryTests.Corpus();
+        var summary = SegmentCountsSummaryTests.BuildFrom(events);
+        var gone = Info(events, id: 1); var kept = Info(events, id: 2); var replaced = Info(events, id: 3);
+        using var store = OpenStore();
+        foreach (var info in new[] { gone, kept, replaced }) store.TryUpsert(info, summary);
 
-        cache.Add(first, s, live);
-        cache.Add(Segment(2), s, live);
-        Assert.True(cache.IsFull(live));
+        int cleared = store.DeleteStale(key =>
+            key.Id.Value == 2 ? kept
+          : key.Id.Value == 3 ? Info(events, id: 3, bytes: 1)   // same key, another file
+          : null);
 
-        firstLive = false;
-        Thread.Sleep(1_100);   // past the prune throttle
-        Assert.False(cache.IsFull(live));
-        Assert.Equal(0, cache.CountForTest);
-        Assert.Equal(0, cache.BytesForTest);
+        Assert.Equal(2, cleared);
+        Assert.Equal([SegmentKey.Of(kept)], store.ReadFingerprints().Keys);
     }
 
     [Fact]
-    public void Adding_a_key_again_replaces_the_entry_and_its_weight()
+    public void A_file_that_is_not_a_store_is_set_aside_and_a_new_one_started()
     {
-        var small = Summary();
-        var big   = Summary(nameBytes: 500);
-        var cache = new SegmentCountsCache(maxBytes: 1_000_000);
-        static bool live(SegmentInfo _) => true;
+        string path = Path.Combine(_dir.Path, SegmentCountsStore.FileName);
+        File.WriteAllText(path, "this is not a database, and never was one");
 
-        cache.Add(Segment(1), small, live);
-        cache.Add(Segment(1), big, live);
+        using var store = SegmentCountsStore.Open(_dir.Path, NullLogger.Instance);
 
-        Assert.Equal(1, cache.CountForTest);
-        Assert.Equal(big.MemoryBytes, cache.BytesForTest);
-        Assert.True(cache.TryGet(Segment(1), out var got));
-        Assert.Same(big, got);
+        Assert.NotNull(store);
+        Assert.True(File.Exists(path + ".corrupt"));
+        Assert.Empty(store!.ReadFingerprints());
+        var events = SegmentCountsSummaryTests.Corpus();
+        Assert.True(store.TryUpsert(Info(events), SegmentCountsSummaryTests.BuildFrom(events)));
     }
 
     [Fact]
-    public void Another_file_under_the_same_key_is_a_miss()
+    public void A_disposed_store_has_no_rows_and_takes_none()
     {
-        var cache = new SegmentCountsCache(maxBytes: 1_000_000);
-        cache.Add(Segment(1, compressedBytes: 1_000), Summary(), static _ => true);
+        var events = SegmentCountsSummaryTests.Corpus();
+        var store = OpenStore();
+        store.TryUpsert(Info(events), SegmentCountsSummaryTests.BuildFrom(events));
+        store.Dispose();
 
-        Assert.True (cache.TryGet(Segment(1, compressedBytes: 1_000), out _));   // read off the same file again
-        Assert.False(cache.TryGet(Segment(1, compressedBytes: 2_000), out _));   // a different file
+        var agg = new LogVolumeAggregator(long.MinValue, long.MaxValue, 0, 900, 1, null, NoPool);
+        Assert.Equal(SegmentCountsStore.Lookup.Missing, store.TryAddTo(Info(events), 900, agg, 900));
+        Assert.False(store.TryUpsert(Info(events), SegmentCountsSummaryTests.BuildFrom(events)));
+        Assert.Empty(store.ReadFingerprints());
     }
 }
