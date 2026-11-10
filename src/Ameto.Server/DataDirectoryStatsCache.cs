@@ -157,8 +157,11 @@ public sealed class DataDirectoryStatsCache
             foreach (var f in root.EnumerateFiles("*", SearchOption.TopDirectoryOnly))
             {
                 long len = Length(f);
-                if (f.Name.StartsWith("Ameto.db", StringComparison.OrdinalIgnoreCase)) s.DatabaseBytes += len;
-                else                                                                   s.OtherBytes    += len;
+                // Ameto.db (auth, retention) and counts.db (the log counts summaries), with their
+                // -wal, -shm and set-aside .corrupt files: both are SQLite databases.
+                if (f.Name.StartsWith("Ameto.db", StringComparison.OrdinalIgnoreCase)
+                    || f.Name.StartsWith("counts.db", StringComparison.OrdinalIgnoreCase)) s.DatabaseBytes += len;
+                else                                                                    s.OtherBytes    += len;
             }
 
             foreach (var d in root.EnumerateDirectories())

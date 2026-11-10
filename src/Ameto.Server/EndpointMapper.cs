@@ -24,6 +24,7 @@ public static class EndpointMapper
             if (LogStoreGate.IsClosed(storage)) return LogStoreGate.Closed;
 
             var  segs = storage.GetSegments(null, null);
+            var  counts = storage.CountsSummaries;   // once, so its three numbers belong to one pass
             long events = 0, compressed = 0, uncompressed = 0, oldest = long.MaxValue, newest = long.MinValue;
             for (int i = 0; i < segs.Count; i++)
             {
@@ -43,6 +44,13 @@ public static class EndpointMapper
                 // The earliest and latest event any segment holds — null with no segments.
                 oldestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(oldest, TimeSpan.Zero).ToString("O"),
                 newestTimestamp   = segs.Count == 0 ? null : new DateTimeOffset(newest, TimeSpan.Zero).ToString("O"),
+                // The counts backfill (counts.db) as of its last pass over a whole catalog.
+                countsSummaries   = new
+                {
+                    segments   = counts.Segments,
+                    summarised = counts.Summarised,
+                    asOf       = counts.AsOf?.ToString("O"),
+                },
             });
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewStats);
 
@@ -424,14 +432,14 @@ public static class EndpointMapper
         //             enough to always cover the full window, so it no longer bounds it.
         //   service — restrict to a single service (case-insensitive)
         //
-        // Cheap is relative. A segment wholly inside the window is counted from its summary when
-        // the bucket is a whole number of 15-minute slots (every Statistics preset's is; see
-        // SegmentCountsSummary), so a wide window decodes only the segments its edges cut and
-        // walks the hot tier. But a scan LZ4-decodes every block it reads, and it still reads
-        // everything for a grid that is not whole slots, once per process for a segment written
-        // before summaries existed (the first wide window after an upgrade or a restart; every
-        // time once the in-memory budget for those is full), and every time for a segment whose
-        // summary its writer gave up on. That can be a search's worth over a busy store, so a
+        // Cheap is relative. A segment wholly inside the window is counted from its summary in
+        // counts.db when the bucket is a whole number of 15-minute slots (every Statistics
+        // preset's is; see SegmentCountsSummary and SegmentCountsStore), so a wide window decodes
+        // only the segments its edges cut and walks the hot tier. But a scan LZ4-decodes every
+        // block it reads, and it still reads everything for a grid that is not whole slots, once
+        // EVER for a segment written before summaries existed that the backfill has not reached
+        // yet (the first wide windows after the upgrade), and every time for a segment whose
+        // summary could not be built. That can be a search's worth over a busy store, so a
         // window wider than WideCountsWindow takes a search slot and runs
         // under the search budget, exactly as /api/events/aggregate does — 503 when the guard is
         // full, 504 when the budget runs out. A window of seven days or less keeps the unguarded
@@ -1170,10 +1178,10 @@ public static class EndpointMapper
 
     /// <summary>
     /// The widest <c>/api/events/counts</c> window that runs unguarded. Segments wholly inside a
-    /// window on a grid of whole 15-minute slots are counted from their summaries, but the header
-    /// scan still decodes every block it reads — every segment for any other grid, every segment
-    /// written before the summaries existed once per process (every time once the in-memory budget
-    /// for those is full), and every segment whose summary its writer gave up on — so its worst case is the
+    /// window on a grid of whole 15-minute slots are counted from their summaries in counts.db, but
+    /// the header scan still decodes every block it reads — every segment for any other grid, once
+    /// ever every segment written before the summaries existed that the backfill has not reached,
+    /// and every segment whose summary could not be built — so its worst case is the
     /// window's events: a day or three is a poll's worth of work and stays a poll; a month or a
     /// quarter can be a search's worth on a busy store and is treated as one — a
     /// <see cref="QueryGuard"/> slot and the search budget,

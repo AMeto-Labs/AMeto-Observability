@@ -561,6 +561,23 @@ public sealed class SegmentReader : ISegmentReader
     }
 
     /// <summary>
+    /// Reads EVERY event header of the segment into <paramref name="counts"/> and nothing else: the
+    /// counts backfill's road for a segment written before summaries existed.
+    /// </summary>
+    internal void SummariseHeaders(SegmentCountsBuilder counts)
+    {
+        var sink = new SummariseSink(counts);
+        for (int i = 0; i < _blocks.Length; i++)
+            AggregateBlockHeaders(_blocks[i].FileOffset, ref sink, long.MinValue, long.MaxValue);
+    }
+
+    private readonly struct SummariseSink(SegmentCountsBuilder counts) : IHeaderSink
+    {
+        public void Add(long timestampTicks, LogLevel level, ReadOnlySpan<byte> serviceUtf8) =>
+            counts.Add(timestampTicks, (byte)level, serviceUtf8);
+    }
+
+    /// <summary>
     /// Where a header scan delivers each event. The scan is generic over it so the JIT
     /// specialises it per sink and the per-event call stays a direct, inlinable one.
     /// </summary>

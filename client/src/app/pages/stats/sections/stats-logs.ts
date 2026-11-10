@@ -39,12 +39,12 @@ interface LogsResult {
  * The Logs band: ingest volume over the window bucketed by service (`GET /api/events/counts`) and
  * the log store's counters (`GET /api/stats`). The counts are the one request of the page that is
  * not a catalogue read: segments wholly inside the window are counted from their per-segment
- * summaries (every preset's bucket is a whole number of 15-minute slots), and only the segments the
- * window's edges cut are header-scanned. It is cached 20 s by bucket grid, and past seven days runs
- * as a search — a slot and a budget — so on a busy server it may still come back refused (503) or
- * out of budget (504) with the server's sentence, most likely on the first wide window after a
- * restart, while segments written before the summaries existed are scanned (once each, while the
- * server's in-memory budget for their summaries holds them). That, or the store
+ * summaries on the server's disk (`counts.db`; every preset's bucket is a whole number of 15-minute
+ * slots), and only the segments the window's edges cut are header-scanned. It is cached 20 s by
+ * bucket grid, and past seven days runs as a search — a slot and a budget — so on a busy server it
+ * may still come back refused (503) or out of budget (504) with the server's sentence, most likely
+ * right after the upgrade that added the summaries, while segments written before it are scanned
+ * (once each, ever; a background pass does the rest). That, or the store
  * closed (#95), is the band's unavailable state; the store counters failing alone only dashes the
  * store's tiles.
  */

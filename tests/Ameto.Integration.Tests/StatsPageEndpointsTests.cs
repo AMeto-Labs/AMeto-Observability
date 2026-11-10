@@ -77,6 +77,35 @@ public sealed class StatsPageEndpointsTests
         Assert.True((reportedNewest - newest).Duration() < TimeSpan.FromSeconds(1), $"{reportedNewest} vs {newest}");
     }
 
+    /// <summary>
+    /// How far the counts backfill has got (counts.db): nothing until a pass over the loaded
+    /// catalogue has finished — the service waits a minute after the boot scan — and then the
+    /// segments it found and how many have their row.
+    /// </summary>
+    [Fact]
+    public async Task Stats_report_how_far_the_counts_backfill_has_got()
+    {
+        using var factory = new AmetoWebAppFactory();
+        var client  = factory.CreateClient();
+        var storage = factory.Services.GetRequiredService<StorageEngine>();
+        await storage.CatalogLoaded.WaitAsync(Patience);
+
+        var before = (await client.GetFromJsonAsync<JsonElement>("/api/stats")).GetProperty("countsSummaries");
+        Assert.Equal(0, before.GetProperty("segments").GetInt32());
+        Assert.Equal(JsonValueKind.Null, before.GetProperty("asOf").ValueKind);
+
+        await TestHelpers.IngestAsync(client, TestHelpers.MakeEvent("one"), TestHelpers.MakeEvent("two"));
+        await TestHelpers.WaitForEventsAsync(client, 2);
+        await storage.FlushHotTierAsync();
+        var pass = await storage.BackfillCountsOnceAsync(CancellationToken.None, dutyCycle: 1);
+        Assert.True(pass.Segments >= 1, "setup: the flush wrote a segment");
+
+        var after = (await client.GetFromJsonAsync<JsonElement>("/api/stats")).GetProperty("countsSummaries");
+        Assert.Equal(pass.Segments, after.GetProperty("segments").GetInt32());
+        Assert.Equal(pass.Segments, after.GetProperty("summarised").GetInt32());
+        Assert.Equal(JsonValueKind.String, after.GetProperty("asOf").ValueKind);
+    }
+
     /// <summary>The store's sentence once it has closed (#95), as every other read of the log store gives it.</summary>
     [Fact]
     public async Task Stats_answer_503_once_the_log_store_has_closed()

@@ -1,7 +1,5 @@
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
@@ -10,46 +8,60 @@ using Ameto.Core;
 namespace Ameto.Storage;
 
 /// <summary>
-/// How many events one cold segment holds per <c>(15-minute slot, service, level)</c> — everything
+/// How many events one cold segment holds per <c>(slot, service, level)</c> — everything
 /// <c>GET /api/events/counts</c> needs from a segment that lies wholly inside its window.
 ///
 /// <para>Without it the endpoint LZ4-decodes every block of every segment in the window on every
 /// request, so a month-wide Statistics band costs a month of decompression and, on a host whose
 /// page cache cannot hold that month, a month of disk reads (2026-11-09: the 1m band on the 512 MB
-/// production stand). With it, a segment wholly inside the window costs one small read, or nothing
-/// once cached, and only the two boundary segments and the hot tier are still decoded.</para>
+/// production stand). With it, a segment wholly inside the window costs a small read, and only the
+/// two boundary segments and the hot tier are still decoded.</para>
 ///
-/// <para><b>Exactness.</b> A summary answers only a grid whose bucket is a whole number of slots
-/// (every Statistics preset, 15 min to a day, is), and only for a segment wholly inside the
-/// window, where every event counts. Each slot then falls into exactly one bucket: the scan puts an
-/// event in <c>unixSeconds / bucketSeconds</c>, the summary puts its slot in
-/// <c>(unixSeconds / 900) / (bucketSeconds / 900)</c>, and nested truncating division equals the
-/// single one. The service bytes are the column's own, resolved by the aggregator's own UTF-8 road,
-/// so case folding, the filter and "(unknown)" behave exactly as in the scan.</para>
+/// <para><b>Resolutions.</b> A summary is built at <see cref="SlotSeconds"/> (15 minutes) and can be
+/// coarsened to an hour or a day (<see cref="Coarsen"/>): a month-wide window asks for 12-hour
+/// buckets and a quarter for days, so the coarse summaries hold 4 and 96 times fewer cells for the
+/// same answer. <see cref="ResolutionSeconds"/> says which one an instance is.</para>
 ///
-/// <para><b>Where it lives.</b> New segments carry it in their own file (see
+/// <para><b>Exactness.</b> A summary answers only a grid whose bucket is a whole number of its
+/// slots, and only for a segment wholly inside the window, where every event counts. Each slot then
+/// falls into exactly one bucket: the scan puts an event in <c>unixSeconds / bucketSeconds</c>, the
+/// summary puts its slot in <c>(unixSeconds / resolution) / (bucketSeconds / resolution)</c>, and
+/// nested truncating division equals the single one, whatever the sign; coarsening is the same
+/// nesting once more. The service bytes are the column's own, resolved by the aggregator's own UTF-8
+/// road, so case folding, the filter and "(unknown)" behave exactly as in the scan.</para>
+///
+/// <para><b>Where it lives.</b> New segments carry the 15-minute summary in their own file (see
 /// <see cref="SegmentWriter"/>: a section referenced from footer slot 1, which v7 readers have
-/// always ignored), so it is written and deleted with the segment and needs no lifecycle of its
-/// own. Segments written before it existed are summarised the first time a scan reads them whole
-/// and kept in memory (<see cref="SegmentCountsCache"/>).</para>
+/// always ignored). Every segment, old or new, also has a row in <see cref="SegmentCountsStore"/>
+/// (<c>counts.db</c>) with all three resolutions: segments written before summaries get theirs from
+/// one header scan, by the background backfill or by the first counting request that has to scan
+/// them, and keep it across restarts.</para>
 /// </summary>
 internal sealed class SegmentCountsSummary
 {
-    /// <summary>Slot width. Every bucket the summary answers is a whole number of these.</summary>
+    /// <summary>The finest slot, the one every summary is built at. Every bucket a summary answers is a whole number of these.</summary>
     public const int SlotSeconds = 900;
 
-    // ── Section format v1 (little-endian) ─────────────────────────────────────────
-    //   uint32 magic "RDCS"     uint16 version (1)     uint16 slotSeconds (900)
+    /// <summary>The coarser resolutions the store keeps beside the 15-minute one.</summary>
+    public const int HourSeconds = 3_600, DaySeconds = 86_400;
+
+    // ── Section format (little-endian) ────────────────────────────────────────────
+    //   uint32 magic "RDCS"     uint16 version          uint16 v1: slotSeconds (900); v2: 0
     //   uint32 eventCount       (= the segment header's EventCount)
-    //   uint32 serviceCount     uint32 cellCount       uint32 payloadBytes    uint32 reserved (0)
+    //   uint32 serviceCount     uint32 cellCount       uint32 payloadBytes
+    //   uint32 v1: reserved (0); v2: resolutionSeconds (900, 3 600 or 86 400)
     //   payload: { uint16 byteLen; bytes[byteLen] } × serviceCount   — the @svc column's own bytes
     //            { int32 slot; uint16 service; uint8 level; uint32 count } × cellCount
     //                                                    — sorted by (slot, service, level), unique
     //   uint32 crc32c over the header and the payload
-    internal const uint   SectionMagic   = 0x52_44_43_53;   // "RDCS"
-    internal const ushort SectionVersion = 1;
+    //
+    // v1 is what segment files carry (15 minutes only, the field a 16-bit one); v2 moves the
+    // resolution into the reserved 32-bit field so a day fits, and is what the store keeps.
+    internal const uint   SectionMagic       = 0x52_44_43_53;   // "RDCS"
+    internal const ushort FileVersion        = 1;
+    internal const ushort StoreVersion       = 2;
     internal const int    SectionHeaderBytes = 28;
-    internal const int    CellBytes      = 11;
+    internal const int    CellBytes          = 11;
 
     // Mirrors SegmentReader/SegmentWriter: header magic and the fixed footer every version ends with.
     private const uint MagicHeader     = 0x52_44_4C_47;   // "RDLG"
@@ -69,43 +81,47 @@ internal sealed class SegmentCountsSummary
     private readonly byte[][] _services;
     private readonly Cell[]   _cells;
 
-    internal SegmentCountsSummary(byte[][] services, Cell[] cells, uint eventCount)
+    internal SegmentCountsSummary(byte[][] services, Cell[] cells, uint eventCount, int resolutionSeconds = SlotSeconds)
     {
-        _services  = services;
-        _cells     = cells;
-        EventCount = eventCount;
-
-        // What holding it costs: the cell array, every service name with its array header, and
-        // the outer arrays and this object. The cache is budgeted in these bytes, so a summary of
-        // a few cells and many long names weighs what it holds.
-        long bytes = 96 + (long)cells.Length * Unsafe.SizeOf<Cell>() + (long)services.Length * 8;
-        foreach (var s in services) bytes += 32 + s.Length;
-        MemoryBytes = bytes;
+        _services         = services;
+        _cells            = cells;
+        EventCount        = eventCount;
+        ResolutionSeconds = resolutionSeconds;
     }
 
     /// <summary>Events the summary accounts for; equal to the segment header's count.</summary>
     public uint EventCount { get; }
 
+    /// <summary>The width of this summary's slots: 900, 3 600 or 86 400 seconds.</summary>
+    public int ResolutionSeconds { get; }
+
     /// <summary>Distinct <c>(slot, service, level)</c> cells.</summary>
     public int CellCount => _cells.Length;
-
-    /// <summary>Approximate managed bytes the summary holds — its weight in <see cref="SegmentCountsCache"/>.</summary>
-    public long MemoryBytes { get; }
 
     internal ReadOnlySpan<Cell> Cells => _cells;
     internal IReadOnlyList<byte[]> Services => _services;
 
-    /// <summary>True when a grid of <paramref name="bucketSeconds"/> can be answered from slots.</summary>
+    /// <summary>True when a grid of <paramref name="bucketSeconds"/> can be answered from 15-minute slots at all.</summary>
     public static bool Answers(int bucketSeconds) => bucketSeconds > 0 && bucketSeconds % SlotSeconds == 0;
+
+    /// <summary>The coarsest stored resolution a grid of <paramref name="bucketSeconds"/> can be answered from.</summary>
+    public static int ResolutionFor(int bucketSeconds) =>
+        bucketSeconds % DaySeconds == 0 ? DaySeconds
+        : bucketSeconds % HourSeconds == 0 ? HourSeconds
+        : SlotSeconds;
+
+    private static bool IsResolution(uint seconds) =>
+        seconds is SlotSeconds or HourSeconds or DaySeconds;
 
     /// <summary>
     /// Adds every event of the segment to <paramref name="agg"/>, exactly as a header scan of the
     /// whole segment would. The caller has checked that the segment lies wholly inside the
-    /// aggregator's window and that <see cref="Answers"/> holds for its grid.
+    /// aggregator's window and that <paramref name="bucketSeconds"/> is a whole number of this
+    /// summary's slots.
     /// </summary>
     public void AddTo(LogVolumeAggregator agg, int bucketSeconds)
     {
-        int slotsPerBucket = bucketSeconds / SlotSeconds;
+        int slotsPerBucket = bucketSeconds / ResolutionSeconds;
         int n = _services.Length;
         int[] ids = ArrayPool<int>.Shared.Rent(Math.Max(n, 1));
         try
@@ -116,6 +132,36 @@ internal sealed class SegmentCountsSummary
                 agg.AddSummaryCount((long)c.Slot / slotsPerBucket, c.Level, ids[c.Service], c.Count);
         }
         finally { ArrayPool<int>.Shared.Return(ids); }
+    }
+
+    /// <summary>
+    /// The same counts at a coarser resolution: every slot divided down (the same truncating
+    /// nesting), equal cells merged, services as they are.
+    /// </summary>
+    public SegmentCountsSummary Coarsen(int resolutionSeconds)
+    {
+        if (resolutionSeconds == ResolutionSeconds) return this;
+        if (resolutionSeconds < ResolutionSeconds || resolutionSeconds % ResolutionSeconds != 0)
+            throw new ArgumentOutOfRangeException(nameof(resolutionSeconds));
+        int factor = resolutionSeconds / ResolutionSeconds;
+
+        var cells = new Cell[_cells.Length];
+        for (int i = 0; i < cells.Length; i++)
+        {
+            ref readonly var c = ref _cells[i];
+            cells[i] = new Cell(c.Slot / factor, c.Service, c.Level, c.Count);
+        }
+        cells.AsSpan().Sort(static (a, b) => SortKey(a.Slot, a.Service, a.Level).CompareTo(SortKey(b.Slot, b.Service, b.Level)));
+        int w = 0;
+        for (int r = 0; r < cells.Length; r++)
+        {
+            if (w > 0 && cells[w - 1].Slot == cells[r].Slot && cells[w - 1].Service == cells[r].Service
+                      && cells[w - 1].Level == cells[r].Level)
+                cells[w - 1] = new Cell(cells[r].Slot, cells[r].Service, cells[r].Level, cells[w - 1].Count + cells[r].Count);
+            else
+                cells[w++] = cells[r];
+        }
+        return new SegmentCountsSummary(_services, cells.AsSpan(0, w).ToArray(), EventCount, resolutionSeconds);
     }
 
     // ── Writing ───────────────────────────────────────────────────────────────────
@@ -131,44 +177,57 @@ internal sealed class SegmentCountsSummary
         }
     }
 
-    /// <summary>Writes the section at the stream's position.</summary>
+    /// <summary>Writes the file section (v1) at the stream's position. Only a 15-minute summary goes in a file.</summary>
     public void WriteSection(Stream stream)
     {
+        if (ResolutionSeconds != SlotSeconds) throw new InvalidOperationException("A segment file carries the 15-minute summary only.");
         int total = SectionBytes;
         byte[] buf = ArrayPool<byte>.Shared.Rent(total);
         try
         {
-            var span = buf.AsSpan(0, total);
-            int payload = total - SectionHeaderBytes - 4;
-            BinaryPrimitives.WriteUInt32LittleEndian(span,        SectionMagic);
-            BinaryPrimitives.WriteUInt16LittleEndian(span[4..],   SectionVersion);
-            BinaryPrimitives.WriteUInt16LittleEndian(span[6..],   SlotSeconds);
-            BinaryPrimitives.WriteUInt32LittleEndian(span[8..],   EventCount);
-            BinaryPrimitives.WriteUInt32LittleEndian(span[12..],  (uint)_services.Length);
-            BinaryPrimitives.WriteUInt32LittleEndian(span[16..],  (uint)_cells.Length);
-            BinaryPrimitives.WriteUInt32LittleEndian(span[20..],  (uint)payload);
-            BinaryPrimitives.WriteUInt32LittleEndian(span[24..],  0);
-
-            int pos = SectionHeaderBytes;
-            foreach (var s in _services)
-            {
-                BinaryPrimitives.WriteUInt16LittleEndian(span[pos..], (ushort)s.Length); pos += 2;
-                s.CopyTo(span[pos..]);                                                pos += s.Length;
-            }
-            foreach (ref readonly var c in _cells.AsSpan())
-            {
-                BinaryPrimitives.WriteInt32LittleEndian (span[pos..], c.Slot);    pos += 4;
-                BinaryPrimitives.WriteUInt16LittleEndian(span[pos..], c.Service); pos += 2;
-                span[pos] = c.Level;                                              pos += 1;
-                BinaryPrimitives.WriteUInt32LittleEndian(span[pos..], c.Count);   pos += 4;
-            }
-            BinaryPrimitives.WriteUInt32LittleEndian(span[pos..], Crc32c.Append(0, span[..pos]));
-            stream.Write(span);
+            Write(buf.AsSpan(0, total), FileVersion);
+            stream.Write(buf, 0, total);
         }
         finally { ArrayPool<byte>.Shared.Return(buf); }
     }
 
-    // ── Reading ───────────────────────────────────────────────────────────────────
+    /// <summary>The store's form of the summary (v2, any resolution).</summary>
+    public byte[] ToStoreBytes()
+    {
+        var bytes = new byte[SectionBytes];
+        Write(bytes, StoreVersion);
+        return bytes;
+    }
+
+    private void Write(Span<byte> span, ushort version)
+    {
+        int payload = span.Length - SectionHeaderBytes - 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(span,        SectionMagic);
+        BinaryPrimitives.WriteUInt16LittleEndian(span[4..],   version);
+        BinaryPrimitives.WriteUInt16LittleEndian(span[6..],   version == FileVersion ? (ushort)SlotSeconds : (ushort)0);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[8..],   EventCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[12..],  (uint)_services.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[16..],  (uint)_cells.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[20..],  (uint)payload);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[24..],  version == FileVersion ? 0u : (uint)ResolutionSeconds);
+
+        int pos = SectionHeaderBytes;
+        foreach (var s in _services)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(span[pos..], (ushort)s.Length); pos += 2;
+            s.CopyTo(span[pos..]);                                                pos += s.Length;
+        }
+        foreach (ref readonly var c in _cells.AsSpan())
+        {
+            BinaryPrimitives.WriteInt32LittleEndian (span[pos..], c.Slot);    pos += 4;
+            BinaryPrimitives.WriteUInt16LittleEndian(span[pos..], c.Service); pos += 2;
+            span[pos] = c.Level;                                              pos += 1;
+            BinaryPrimitives.WriteUInt32LittleEndian(span[pos..], c.Count);   pos += 4;
+        }
+        BinaryPrimitives.WriteUInt32LittleEndian(span[pos..], Crc32c.Append(0, span[..pos]));
+    }
+
+    // ── Reading a segment file's section ──────────────────────────────────────────
 
     /// <summary>
     /// Reads the summary a segment file carries, or null when it carries none — a file written
@@ -182,12 +241,34 @@ internal sealed class SegmentCountsSummary
     /// </summary>
     public static SegmentCountsSummary? Read(string filePath, SegmentInfo info)
     {
+        byte[]? rented = ReadFileSection(filePath, info, out int length);
+        if (rented is null) return null;
+        try { return Parse(rented.AsSpan(0, length), info); }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
+    }
+
+    /// <summary>
+    /// <see cref="Read"/> and <see cref="AddTo"/> in one, without building the summary: the section
+    /// is checked whole and then added straight from its bytes. False when the file carries none.
+    /// </summary>
+    public static bool TryAddFromFile(string filePath, SegmentInfo info, LogVolumeAggregator agg, int bucketSeconds)
+    {
+        byte[]? rented = ReadFileSection(filePath, info, out int length);
+        if (rented is null) return false;
+        try { return TryAddFrom(rented.AsSpan(0, length), info, agg, bucketSeconds); }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
+    }
+
+    /// <summary>The file's v1 section in a buffer rented from the shared pool (the caller returns it), or null.</summary>
+    private static byte[]? ReadFileSection(string filePath, SegmentInfo info, out int length)
+    {
+        length = 0;
         FileRefusal.ThrowIfRefused(filePath, FileRefusal.Access.Open);
         using SafeFileHandle handle = File.OpenHandle(
             filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
 
-        long length = RandomAccess.GetLength(handle);
-        if (length < FileHeaderSize + FooterSize) return null;
+        long fileLength = RandomAccess.GetLength(handle);
+        if (fileLength < FileHeaderSize + FooterSize) return null;
 
         Span<byte> head = stackalloc byte[6];
         if (!ReadExactly(handle, head, 0)) return null;
@@ -197,31 +278,30 @@ internal sealed class SegmentCountsSummary
         if (version != FirstVersionWithSection) return null;
 
         Span<byte> footer = stackalloc byte[FooterSize];
-        if (!ReadExactly(handle, footer, length - FooterSize)) return null;
+        if (!ReadExactly(handle, footer, fileLength - FooterSize)) return null;
         if (BinaryPrimitives.ReadUInt32LittleEndian(footer[40..]) != MagicFooter) return null;
         long offset = BinaryPrimitives.ReadInt64LittleEndian(footer[8..]);
         if (offset == 0) return null;   // written before summaries, or the writer gave one up
-        long sectionEnd = length - FooterSize;
+        long sectionEnd = fileLength - FooterSize;
         if (offset < FileHeaderSize || offset > sectionEnd - SectionHeaderBytes - 4) return null;
 
         Span<byte> sh = stackalloc byte[SectionHeaderBytes];
         if (!ReadExactly(handle, sh, offset)) return null;
-        if (BinaryPrimitives.ReadUInt32LittleEndian(sh)       != SectionMagic)   return null;
-        if (BinaryPrimitives.ReadUInt16LittleEndian(sh[4..])  != SectionVersion) return null;
-        if (BinaryPrimitives.ReadUInt16LittleEndian(sh[6..])  != SlotSeconds)    return null;
-        if (BinaryPrimitives.ReadUInt32LittleEndian(sh[8..])  != info.EventCount) return null;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(sh)      != SectionMagic) return null;
+        if (BinaryPrimitives.ReadUInt16LittleEndian(sh[4..]) != FileVersion)  return null;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(sh[8..]) != info.EventCount) return null;
         long payload = BinaryPrimitives.ReadUInt32LittleEndian(sh[20..]);
         if (payload > MaxPayloadBytes || offset + SectionHeaderBytes + payload + 4 > sectionEnd) return null;
 
         int total = (int)(SectionHeaderBytes + payload + 4);
         byte[] buf = ArrayPool<byte>.Shared.Rent(total);
-        try
+        if (!ReadExactly(handle, buf.AsSpan(0, total), offset))
         {
-            var span = buf.AsSpan(0, total);
-            if (!ReadExactly(handle, span, offset)) return null;
-            return Parse(span, info);
+            ArrayPool<byte>.Shared.Return(buf);
+            return null;
         }
-        finally { ArrayPool<byte>.Shared.Return(buf); }
+        length = total;
+        return buf;
     }
 
     /// <summary>The largest payload the builder's limits allow; anything above is not a summary it wrote.</summary>
@@ -241,68 +321,138 @@ internal sealed class SegmentCountsSummary
         return true;
     }
 
-    /// <summary>
-    /// Parses and checks a whole section — CRC, bounds, order, references and the total against
-    /// the segment's own header — before anything is built, so a summary that comes back is one
-    /// that can be added without a further check.
-    /// </summary>
-    internal static SegmentCountsSummary? Parse(ReadOnlySpan<byte> section, SegmentInfo info)
-    {
-        if (section.Length < SectionHeaderBytes + 4) return null;
-        int crcAt = section.Length - 4;
-        if (Crc32c.Append(0, section[..crcAt]) != BinaryPrimitives.ReadUInt32LittleEndian(section[crcAt..])) return null;
+    // ── Checking and using a section's bytes ──────────────────────────────────────
 
-        if (BinaryPrimitives.ReadUInt32LittleEndian(section)      != SectionMagic)   return null;
-        if (BinaryPrimitives.ReadUInt16LittleEndian(section[4..]) != SectionVersion) return null;
-        if (BinaryPrimitives.ReadUInt16LittleEndian(section[6..]) != SlotSeconds)    return null;
+    /// <summary>Where a checked section's parts lie.</summary>
+    private readonly record struct Layout(int Resolution, uint EventCount, int ServiceCount, int CellCount,
+                                          int ServicesAt, int CellsAt);
+
+    /// <summary>
+    /// Checks a whole section — CRC, version, bounds, order, references, slots within the
+    /// segment's own first and last event, and the total against its header — without allocating,
+    /// so a section that passes can be used without a further check.
+    /// </summary>
+    private static bool TryCheck(ReadOnlySpan<byte> section, SegmentInfo info, out Layout layout)
+    {
+        layout = default;
+        if (section.Length < SectionHeaderBytes + 4) return false;
+        int crcAt = section.Length - 4;
+        if (Crc32c.Append(0, section[..crcAt]) != BinaryPrimitives.ReadUInt32LittleEndian(section[crcAt..])) return false;
+
+        if (BinaryPrimitives.ReadUInt32LittleEndian(section) != SectionMagic) return false;
+        ushort version  = BinaryPrimitives.ReadUInt16LittleEndian(section[4..]);
+        ushort field6   = BinaryPrimitives.ReadUInt16LittleEndian(section[6..]);
+        uint   field24  = BinaryPrimitives.ReadUInt32LittleEndian(section[24..]);
+        uint resolution;
+        if (version == FileVersion)       { if (field6 != SlotSeconds || field24 != 0) return false; resolution = SlotSeconds; }
+        else if (version == StoreVersion) { if (field6 != 0 || !IsResolution(field24)) return false; resolution = field24; }
+        else return false;
+
         uint eventCount   = BinaryPrimitives.ReadUInt32LittleEndian(section[8..]);
         uint serviceCount = BinaryPrimitives.ReadUInt32LittleEndian(section[12..]);
         uint cellCount    = BinaryPrimitives.ReadUInt32LittleEndian(section[16..]);
         uint payloadBytes = BinaryPrimitives.ReadUInt32LittleEndian(section[20..]);
-        if (eventCount != info.EventCount) return null;
-        if (payloadBytes != (uint)(crcAt - SectionHeaderBytes)) return null;
-        if (serviceCount > SegmentCountsBuilder.MaxServices || cellCount > SegmentCountsBuilder.MaxCells) return null;
+        if (eventCount != info.EventCount) return false;
+        if (payloadBytes != (uint)(crcAt - SectionHeaderBytes)) return false;
+        if (serviceCount > SegmentCountsBuilder.MaxServices || cellCount > SegmentCountsBuilder.MaxCells) return false;
 
         var payload = section[SectionHeaderBytes..crcAt];
         int pos = 0;
         long serviceBytes = 0;
-        var services = new byte[serviceCount][];
-        for (int i = 0; i < services.Length; i++)
+        for (uint i = 0; i < serviceCount; i++)
         {
-            if (payload.Length - pos < 2) return null;
+            if (payload.Length - pos < 2) return false;
             int len = BinaryPrimitives.ReadUInt16LittleEndian(payload[pos..]); pos += 2;
-            if (len > SegmentCountsBuilder.MaxServiceBytes || payload.Length - pos < len) return null;
+            if (len > SegmentCountsBuilder.MaxServiceBytes || payload.Length - pos < len) return false;
             serviceBytes += len;
-            if (serviceBytes > SegmentCountsBuilder.MaxServiceBytesTotal) return null;
-            services[i] = payload.Slice(pos, len).ToArray();                    pos += len;
+            if (serviceBytes > SegmentCountsBuilder.MaxServiceBytesTotal) return false;
+            pos += len;
         }
-        if ((long)(payload.Length - pos) != (long)cellCount * CellBytes) return null;
+        int cellsAt = pos;
+        if ((long)(payload.Length - pos) != (long)cellCount * CellBytes) return false;
 
         // Every cell's slot lies within the slots of the segment's own first and last event: the
-        // writer counted those very rows. Only a section some other writer produced, with a CRC
-        // that still checks out, could say otherwise, and it would put events in buckets the
-        // segment never reaches.
-        long minSlot = SlotOf(info.MinTimestampTicks);
-        long maxSlot = SlotOf(info.MaxTimestampTicks);
-
-        var  cells = new Cell[cellCount];
-        long sum   = 0;
-        long prev  = long.MinValue;
-        for (int i = 0; i < cells.Length; i++)
+        // writer counted those very rows. Only bytes some other writer produced, with a CRC that
+        // still checks out, could say otherwise, and they would put events in buckets the segment
+        // never reaches.
+        long minSlot = SlotOf(info.MinTimestampTicks, (int)resolution);
+        long maxSlot = SlotOf(info.MaxTimestampTicks, (int)resolution);
+        long sum  = 0;
+        long prev = long.MinValue;
+        for (uint i = 0; i < cellCount; i++)
         {
-            int    slot    = BinaryPrimitives.ReadInt32LittleEndian (payload[pos..]); pos += 4;
-            ushort service = BinaryPrimitives.ReadUInt16LittleEndian(payload[pos..]); pos += 2;
-            byte   level   = payload[pos];                                           pos += 1;
-            uint   count   = BinaryPrimitives.ReadUInt32LittleEndian(payload[pos..]); pos += 4;
-            if (service >= serviceCount || count == 0) return null;
-            if (slot < minSlot || slot > maxSlot) return null;
+            int    slot    = BinaryPrimitives.ReadInt32LittleEndian (payload[pos..]);
+            ushort service = BinaryPrimitives.ReadUInt16LittleEndian(payload[(pos + 4)..]);
+            byte   level   = payload[pos + 6];
+            uint   count   = BinaryPrimitives.ReadUInt32LittleEndian(payload[(pos + 7)..]);
+            pos += CellBytes;
+            if (service >= serviceCount || count == 0) return false;
+            if (slot < minSlot || slot > maxSlot) return false;
             long key = SortKey(slot, service, level);
-            if (key <= prev) return null;   // sorted and unique, as the writer leaves them
+            if (key <= prev) return false;   // sorted and unique, as the writer leaves them
             prev = key;
             sum += count;
-            cells[i] = new Cell(slot, service, level, count);
         }
-        return sum == eventCount ? new SegmentCountsSummary(services, cells, eventCount) : null;
+        if (sum != eventCount) return false;
+
+        layout = new Layout((int)resolution, eventCount, (int)serviceCount, (int)cellCount,
+                            SectionHeaderBytes, SectionHeaderBytes + cellsAt);
+        return true;
+    }
+
+    /// <summary>Checks a section and builds the summary it holds, or returns null.</summary>
+    internal static SegmentCountsSummary? Parse(ReadOnlySpan<byte> section, SegmentInfo info)
+    {
+        if (!TryCheck(section, info, out var l)) return null;
+        var services = new byte[l.ServiceCount][];
+        int pos = l.ServicesAt;
+        for (int i = 0; i < services.Length; i++)
+        {
+            int len = BinaryPrimitives.ReadUInt16LittleEndian(section[pos..]); pos += 2;
+            services[i] = section.Slice(pos, len).ToArray();                    pos += len;
+        }
+        var cells = new Cell[l.CellCount];
+        pos = l.CellsAt;
+        for (int i = 0; i < cells.Length; i++, pos += CellBytes)
+            cells[i] = new Cell(BinaryPrimitives.ReadInt32LittleEndian(section[pos..]),
+                                BinaryPrimitives.ReadUInt16LittleEndian(section[(pos + 4)..]),
+                                section[pos + 6],
+                                BinaryPrimitives.ReadUInt32LittleEndian(section[(pos + 7)..]));
+        return new SegmentCountsSummary(services, cells, l.EventCount, l.Resolution);
+    }
+
+    /// <summary>
+    /// Checks a section and adds it to <paramref name="agg"/> straight from its bytes — no summary
+    /// is built, nothing is allocated but what the aggregator allocates for a service it has not
+    /// seen. False, having added nothing, when the section does not check out or the grid is not
+    /// a whole number of its slots.
+    /// </summary>
+    internal static bool TryAddFrom(ReadOnlySpan<byte> section, SegmentInfo info, LogVolumeAggregator agg, int bucketSeconds)
+    {
+        if (!TryCheck(section, info, out var l)) return false;
+        if (bucketSeconds <= 0 || bucketSeconds % l.Resolution != 0) return false;
+        int slotsPerBucket = bucketSeconds / l.Resolution;
+
+        int[] ids = ArrayPool<int>.Shared.Rent(Math.Max(l.ServiceCount, 1));
+        try
+        {
+            int pos = l.ServicesAt;
+            for (int i = 0; i < l.ServiceCount; i++)
+            {
+                int len = BinaryPrimitives.ReadUInt16LittleEndian(section[pos..]); pos += 2;
+                ids[i] = agg.ResolveSummaryService(section.Slice(pos, len));        pos += len;
+            }
+            pos = l.CellsAt;
+            for (int i = 0; i < l.CellCount; i++, pos += CellBytes)
+            {
+                int    slot    = BinaryPrimitives.ReadInt32LittleEndian (section[pos..]);
+                ushort service = BinaryPrimitives.ReadUInt16LittleEndian(section[(pos + 4)..]);
+                agg.AddSummaryCount((long)slot / slotsPerBucket, section[pos + 6], ids[service],
+                                    BinaryPrimitives.ReadUInt32LittleEndian(section[(pos + 7)..]));
+            }
+        }
+        finally { ArrayPool<int>.Shared.Return(ids); }
+        return true;
     }
 
     /// <summary>One number that orders cells by (slot, service, level).</summary>
@@ -316,8 +466,8 @@ internal sealed class SegmentCountsSummary
     /// The slot of a timestamp: the aggregator's own arithmetic (LogVolumeAggregator.BucketOffset),
     /// then one more truncating division, which is why a slot's events share every bucket.
     /// </summary>
-    internal static long SlotOf(long timestampTicks) =>
-        (timestampTicks - UnixEpochTicks) / TicksPerSecond / SlotSeconds;
+    internal static long SlotOf(long timestampTicks, int resolutionSeconds = SlotSeconds) =>
+        (timestampTicks - UnixEpochTicks) / TicksPerSecond / resolutionSeconds;
 }
 
 /// <summary>
@@ -594,135 +744,4 @@ internal sealed class ByteSpanComparer : IEqualityComparer<byte[]>, IAlternateEq
         h.AddBytes(bytes);
         return h.ToHashCode();
     }
-}
-
-/// <summary>
-/// Summaries already read or built, by segment, so a segment is summarised once per process and
-/// a repeated wide window touches no file for it.
-///
-/// <para>Budgeted in bytes (<see cref="SegmentCountsSummary.MemoryBytes"/>): cells and service
-/// names both count, so a summary of a few cells and many long names weighs what it holds. When
-/// an entry does not fit, entries whose segment has left the catalog — merged, deleted, replaced —
-/// are dropped first; when the live ones alone fill the budget the entry is refused, and the cache
-/// reports itself <see cref="IsFull"/> until something leaves, so the caller can stop building
-/// summaries it could not keep. A segment that is not kept is read or scanned again next time,
-/// which is what every segment cost before summaries.</para>
-/// </summary>
-internal sealed class SegmentCountsCache
-{
-    /// <summary>
-    /// Summaries built by scanning segments written before summaries existed: each is a whole
-    /// segment's decode to rebuild. A 90-day store at ~100 service/level pairs per slot is ~10 MB.
-    /// </summary>
-    internal const long BuiltBudgetBytes = 12L * 1024 * 1024;
-
-    /// <summary>Summaries read off segment files: three small reads to get back, so a smaller budget.</summary>
-    internal const long ReadBudgetBytes = 4L * 1024 * 1024;
-
-    /// <summary>
-    /// How often a full cache may walk itself for stale entries. When the live segments alone fill
-    /// it, every further add or fullness check would walk it for nothing; once a second is enough
-    /// to notice the merges and deletes that free room.
-    /// </summary>
-    private const long PruneIntervalMs = 1_000;
-
-    private sealed class Item(SegmentInfo info, SegmentCountsSummary summary)
-    {
-        public readonly SegmentInfo          Info    = info;
-        public readonly SegmentCountsSummary Summary = summary;
-        public long Weight => Summary.MemoryBytes;
-    }
-
-    private readonly ConcurrentDictionary<SegmentKey, Item> _map = new();
-    private readonly Lock _pruneLock = new();
-    private readonly long _maxBytes;
-    private long _bytes;
-    private long _lastPruneTicks = -PruneIntervalMs;   // the first prune is never throttled
-    private volatile bool _full;
-
-    public SegmentCountsCache(long maxBytes) => _maxBytes = maxBytes;
-
-    /// <summary>Bytes held now; for tests.</summary>
-    internal long BytesForTest => Interlocked.Read(ref _bytes);
-    internal int  CountForTest => _map.Count;
-
-    public bool TryGet(SegmentInfo info, [NotNullWhen(true)] out SegmentCountsSummary? summary)
-    {
-        if (_map.TryGetValue(SegmentKey.Of(info), out var item) && SameFile(item.Info, info))
-        {
-            summary = item.Summary;
-            return true;
-        }
-        summary = null;
-        return false;
-    }
-
-    /// <summary>
-    /// True when the last summary offered was refused and nothing has left since — checked before
-    /// building one, so a full cache does not cost a build per segment per request. A full cache
-    /// first drops what is stale (at most once a second), which is how it stops being full.
-    /// </summary>
-    /// <param name="isLive">Whether a cached segment is still the one the catalog serves.</param>
-    public bool IsFull(Func<SegmentInfo, bool> isLive)
-    {
-        if (!_full) return false;
-        Prune(isLive);
-        return _full;
-    }
-
-    /// <param name="isLive">Whether a cached segment is still the one the catalog serves.</param>
-    public void Add(SegmentInfo info, SegmentCountsSummary summary, Func<SegmentInfo, bool> isLive)
-    {
-        var item = new Item(info, summary);
-        long weight = item.Weight;
-        if (Interlocked.Add(ref _bytes, weight) > _maxBytes)
-        {
-            Interlocked.Add(ref _bytes, -weight);
-            Prune(isLive);
-            if (Interlocked.Add(ref _bytes, weight) > _maxBytes)
-            {
-                Interlocked.Add(ref _bytes, -weight);
-                _full = true;
-                return;
-            }
-        }
-
-        var key = SegmentKey.Of(info);
-        while (true)
-        {
-            if (_map.TryGetValue(key, out var old))
-            {
-                if (_map.TryUpdate(key, item, old)) { Interlocked.Add(ref _bytes, -old.Weight); break; }
-            }
-            else if (_map.TryAdd(key, item)) break;
-        }
-        _full = false;
-    }
-
-    private void Prune(Func<SegmentInfo, bool> isLive)
-    {
-        lock (_pruneLock)
-        {
-            long now = Environment.TickCount64;
-            if (now - Interlocked.Read(ref _lastPruneTicks) < PruneIntervalMs) return;
-            Interlocked.Exchange(ref _lastPruneTicks, now);
-            bool freed = false;
-            foreach (var kv in _map)
-                if (!isLive(kv.Value.Info) && _map.TryRemove(kv))
-                {
-                    Interlocked.Add(ref _bytes, -kv.Value.Weight);
-                    freed = true;
-                }
-            if (freed) _full = false;
-        }
-    }
-
-    /// <summary>The same file: the object the catalog holds, or one read off the same file again.</summary>
-    internal static bool SameFile(SegmentInfo a, SegmentInfo b) =>
-        ReferenceEquals(a, b)
-        || (a.EventCount        == b.EventCount
-            && a.MinTimestampTicks == b.MinTimestampTicks
-            && a.MaxTimestampTicks == b.MaxTimestampTicks
-            && a.CompressedBytes   == b.CompressedBytes
-            && string.Equals(a.FilePath, b.FilePath, StringComparison.Ordinal));
 }

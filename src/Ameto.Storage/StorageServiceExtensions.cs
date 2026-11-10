@@ -71,6 +71,86 @@ public sealed class RetentionBackgroundService : BackgroundService
 }
 
 /// <summary>
+/// Keeps <c>counts.db</c> whole: once the boot catalog scan has finished, after a minute's
+/// settling, then every ten minutes, one backfill pass gives every cold segment its counts
+/// summary — once per segment, ever, since the store is on disk — and clears the rows of segments
+/// that have gone. A pass over a store that is up to date is one read of the fingerprints; the
+/// first pass after an upgrade summarises the older segments at a quarter of one thread.
+///
+/// <para>It waits for the catalog for the reason the engine's maintenance loop does: until the
+/// boot scan ends the catalog is a partial view, and a pass over it would leave most segments for
+/// the next one (the engine also refuses to sweep against it). A scan that faults counts as ended,
+/// as there it does.</para>
+///
+/// <para>Guarded like the engine's own loops (#137): a failed pass, or a log line that throws, costs
+/// that pass, never the service, and never stops the host.</para>
+/// </summary>
+public sealed class CountsSummaryBackfillService : BackgroundService
+{
+    private readonly StorageEngine                         _storage;
+    private readonly ILogger<CountsSummaryBackfillService> _logger;
+    private readonly TimeSpan                              _firstPassDelay;
+    private readonly TimeSpan                              _interval;
+
+    public CountsSummaryBackfillService(StorageEngine storage, ILogger<CountsSummaryBackfillService> logger)
+        : this(storage, logger, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(10)) { }
+
+    /// <summary>For tests: the same service on a shorter clock.</summary>
+    internal CountsSummaryBackfillService(StorageEngine storage, ILogger<CountsSummaryBackfillService> logger,
+                                          TimeSpan firstPassDelay, TimeSpan interval)
+    {
+        _storage        = storage;
+        _logger         = logger;
+        _firstPassDelay = firstPassDelay;
+        _interval       = interval;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try { await _storage.CatalogLoaded.WaitAsync(stoppingToken); }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+        catch (Exception) { /* a faulted scan has ended; the engine says why, and sweeps nothing after it */ }
+
+        try { await Task.Delay(_firstPassDelay, stoppingToken); }
+        catch (OperationCanceledException) { return; }
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var r = await _storage.BackfillCountsOnceAsync(stoppingToken);
+                // Every pass copies the sections of the segments flushed and merged since the last
+                // one, so that alone is Debug; a scan, a failure or a stopped pass is worth reading.
+                var level = r.Scanned > 0 || r.Failed > 0 || r.StoppedOnStoreFailure
+                    ? Microsoft.Extensions.Logging.LogLevel.Information
+                    : Microsoft.Extensions.Logging.LogLevel.Debug;
+                if (r.Written > 0 || r.Swept > 0 || r.Failed > 0 || r.StoppedOnStoreFailure)
+                    Say(level,
+                        "Counts summaries: {Written} segment(s) summarised ({FromFiles} from their files, {Scanned} by a scan, {None} with none possible), {Swept} stale row(s) cleared, {Failed} not readable now{Stopped}; {Stored} of {Segments} segments have theirs",
+                        r.Written, r.FromFileSections, r.Scanned, r.Unsummarisable, r.Swept, r.Failed,
+                        r.StoppedOnStoreFailure ? ", pass stopped: the store cannot be read or written" : "",
+                        r.AlreadyStored + r.Written, r.Segments);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                try { _logger.LogError(ex, "Counts summaries backfill pass failed"); }
+                catch (Exception) { /* the line is lost; the service is not */ }
+            }
+
+            try { await Task.Delay(_interval, stoppingToken); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private void Say(Microsoft.Extensions.Logging.LogLevel level, string message, params object[] args)
+    {
+        try { _logger.Log(level, message, args); }
+        catch (Exception) { /* the line is lost; the service is not */ }
+    }
+}
+
+/// <summary>
 /// DI extension for registering storage services.
 /// </summary>
 public static class StorageServiceExtensions
@@ -94,6 +174,7 @@ public static class StorageServiceExtensions
         // Expose the engine's shared intern pool so Ingestion can inject it directly
         services.AddSingleton(sp => sp.GetRequiredService<StorageEngine>().TemplatePool);
         services.AddHostedService<RetentionBackgroundService>();
+        services.AddHostedService<CountsSummaryBackfillService>();
         // Shared so the 30 s attribution line and /api/diagnostics measure the same interval
         // — a CPU percentage only exists between two reads of the process total.
         services.AddSingleton<ProcessCpuSampler>();
