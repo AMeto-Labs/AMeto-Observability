@@ -17,7 +17,7 @@ Ameto__DataDirectory=/mnt/logs Ameto__HttpPort=5342 ./Ameto.Server
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `NodeId` | uint | `0` | Node identifier. Must be unique per node in a multi-node setup. |
-| `DataDirectory` | string | `"data"` | Root directory for WAL files, cold segments, and the auth/retention SQLite database (`Ameto.db`). |
+| `DataDirectory` | string | `"data"` | Root directory for WAL files, cold segments, the auth/retention SQLite database (`Ameto.db`), and the log counts summaries (`counts.db`, derived from the segments and rebuilt by a background pass if deleted). |
 | `HttpPort` | int | `5341` | Kestrel listen port (serves the API, SSE, OTLP, and the SPA). |
 | `BasePath` | string | `""` | URL prefix the whole server is served under, e.g. `"/ameto"`, for hosting behind a reverse proxy at `https://host/ameto`. Empty = served at `/`. Applied at runtime, so one build works under any prefix — see [Serving under a URL prefix](#serving-under-a-url-prefix). |
 | `SslCertPath` | string | `""` | Path to a `.pfx` TLS certificate. Empty = plain HTTP. |
