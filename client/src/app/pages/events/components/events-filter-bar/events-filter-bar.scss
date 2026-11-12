@@ -5,7 +5,7 @@
   min-height: 32px;  /* the design's filter-bar row — a one-off, like the footer's 26px */
   /* One-off the design names for this bar (and the footer): every trigger, chip and the page-size
      select inherit it, so the bar reads at one size. The chips' counts sit at --fs-2xs below. */
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
@@ -47,7 +47,7 @@
   background: var(--surface-up);
   border: 1px solid var(--border);
   color: var(--txt-muted);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   white-space: nowrap;
   transition: all .12s;
   cursor: pointer;
@@ -86,9 +86,9 @@
   background: none;
   border: 1px solid transparent;
   color: var(--txt-dim);
-  font-weight: 500;
-  font-family: var(--ui);
-  letter-spacing: .3px;
+  font-weight: var(--fw-medium);
+  font-family: var(--font-ui);
+  letter-spacing: var(--ls-badge);
   cursor: pointer;
   transition: all .12s;
   white-space: nowrap;
@@ -124,7 +124,7 @@
   color: var(--txt-dim);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   cursor: pointer;
   outline: none;
   flex-shrink: 0;

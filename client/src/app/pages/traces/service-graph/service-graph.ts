@@ -256,9 +256,9 @@ const ZOOM_MAX = 3;
     @keyframes sgspin { to { transform: rotate(360deg); } }
 
     .sg-node { cursor: grab; user-select: none; }
-    .sg-node-label { font-size: 11px; font-weight: 600; pointer-events: none; }
-    .sg-node-sub   { font-size: 9px; fill: #64748b; pointer-events: none; }
-    .sg-edge-label { font-size: 9px; pointer-events: none; }
+    .sg-node-label { font-size: var(--fs-xs); font-weight: var(--fw-semibold); pointer-events: none; }
+    .sg-node-sub   { font-size: var(--fs-3xs); fill: #64748b; pointer-events: none; }
+    .sg-edge-label { font-size: var(--fs-3xs); pointer-events: none; }
 
     .sg-sheet {
       position: absolute;
@@ -316,15 +316,15 @@ const ZOOM_MAX = 3;
     }
     .sg-kpi-k {
       font-size: var(--fs-3xs);
-      font-weight: 600;
-      letter-spacing: .05em;
+      font-weight: var(--fw-semibold);
+      letter-spacing: var(--ls-caps);
       text-transform: uppercase;
       color: var(--text-muted);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .sg-kpi-v { font-size: var(--fs-md); font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+    .sg-kpi-v { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text-primary); white-space: nowrap; }
     .sg-red { color: var(--error); }
 
     /* Phone: the node card is a sheet over the bottom nav, and the zoom buttons grow to fingers. */

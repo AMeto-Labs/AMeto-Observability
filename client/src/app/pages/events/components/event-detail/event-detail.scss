@@ -4,7 +4,7 @@
   height: 100%;
   min-height: 0;
   overflow: hidden;
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-size: var(--log-font-size);
   line-height: var(--log-line-height);
   letter-spacing: var(--log-letter-spacing);
@@ -101,12 +101,12 @@
 }
 .d-fact-val.d-svc-name {
   color: var(--txt);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
 }
 
 /* ── Full-message modal ──────────────────────────────────────────── */
 .d-modal-msg {
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-size: var(--log-font-size);
   line-height: var(--lh-body);
   color: var(--msg-tmpl);
@@ -121,7 +121,7 @@
 }
 .d-modal-value {
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-size: var(--log-font-size);
   line-height: var(--lh-body);
   color: var(--txt);
@@ -227,8 +227,8 @@
   font-size: var(--fs-sm);
   word-break: break-all;
 }
-.d-fact-val.d-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.d-fact-val.d-id   { color: var(--info, #60A5FA); font-size: var(--fs-xs); letter-spacing: .02em; }
+.d-fact-val.d-mono { font-family: var(--font-log); font-variant-numeric: tabular-nums; }
+.d-fact-val.d-id   { color: var(--info, #60A5FA); font-family: var(--font-code); font-size: var(--fs-dense); letter-spacing: var(--ls-0); }
 
 /* Leading ⋮ button — opens a row's context menu (replaces the old right-side buttons).
    20px, not --icon-btn: it fills the first grid column of .d-fact / .d-props exactly. */
@@ -257,10 +257,10 @@
   align-items: center;
   gap: 6px;
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   font-family: var(--font-ui);
   text-transform: uppercase;
-  letter-spacing: .07em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-muted);
   margin: 12px 0 6px;
 }
@@ -271,8 +271,8 @@
   border: 1px solid var(--border-sub);
   border-radius: 999px;
   padding: 0 6px;
-  font-weight: 600;
-  letter-spacing: 0;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-0);
 }
 
 /* ── Properties list ─────────────────────────────────────────────── */
@@ -310,6 +310,11 @@
 .d-prop-v {
   min-width: 0;
   color: var(--txt);
+  /* A value reads like the log line it came from — the log font, a half-step under the
+     drawer text; the raw event (JSON tab) is the one place it turns into code. */
+  font-family: var(--font-log);
+  font-size: var(--fs-dense);
+  line-height: var(--lh-base);
   word-break: break-all;
   padding-top: 1px; /* likewise for the 12px value's first line */
   /* Expanded structured values (arrays/objects of long JSON) render a tree wider
@@ -332,8 +337,8 @@
   border-radius: 999px;
   padding: 1px 6px;
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  letter-spacing: .03em;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-badge);
   border: 1px solid transparent;
   flex-shrink: 0;
 }
@@ -355,10 +360,10 @@
 /* ── Exception ───────────────────────────────────────────────────── */
 .ev-exception { font-size: var(--fs-xs); }
 .exc-frame { margin-top: 4px; }
-.exc-head { color: var(--lvl-e); font-weight: 600; }
+.exc-head { color: var(--lvl-e); font-weight: var(--fw-semibold); }
 .exc-type { color: var(--lvl-e); }
-.exc-msg { color: var(--txt); font-weight: 400; }
-.exc-stack { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-xs); color: var(--txt-muted); margin: 4px 0; padding: 6px 10px; background: var(--bg); border-radius: 4px; border-left: 2px solid var(--border); }
+.exc-msg { color: var(--txt); font-weight: var(--fw-regular); }
+.exc-stack { white-space: pre-wrap; word-break: break-word; font-family: var(--font-code); font-size: var(--fs-dense); color: var(--txt-muted); margin: 4px 0; padding: 6px 10px; background: var(--bg); border-radius: 4px; border-left: 2px solid var(--border); }
 .exc-inner-label { color: var(--txt-muted); font-style: italic; margin-top: 4px; }
 
 /* ── JSON tab ────────────────────────────────────────────────────── */
@@ -384,7 +389,7 @@
   outline: none;
   color: var(--txt);
   font-size: var(--fs-sm);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   caret-color: var(--accent);
   min-width: 0;
 }
@@ -405,6 +410,10 @@
 .ev-json-body {
   padding: 10px 12px;
   overflow: auto;
+  /* The raw event is code: IBM Plex Mono at 12px matches Inter at 11.5 by x-height. */
+  font-family: var(--font-code);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
 }
 
 /* ── Trace waterfall ─────────────────────────────────────────────── */
@@ -414,9 +423,9 @@
   color: var(--txt-muted);
   font-style: italic;
   margin-left: 6px;
-  font-weight: 400;
+  font-weight: var(--fw-regular);
   text-transform: none;
-  letter-spacing: 0;
+  letter-spacing: var(--ls-0);
 }
 .tr-wf-skeletons {
   display: flex;
@@ -450,7 +459,7 @@
   font-size: var(--fs-2xs);
   color: var(--txt-muted);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
 }
 /* The phone's "this event" mark, the waterfall's count and its "Open in Traces" exist only in
    the phone layer (event-detail.html renders them there); the label row is a flex line so the
@@ -462,7 +471,7 @@
   gap: 8px;
 }
 .ev-json-hits {
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -595,9 +604,9 @@
 }
 .tr-block-label {
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .07em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-muted);
   margin-bottom: 8px;
 }
@@ -609,8 +618,8 @@
   padding: 2px 7px;
   border-radius: 5px;
   font-size: var(--fs-xs);
-  font-weight: 600;
-  letter-spacing: .02em;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-badge);
   border: 1px solid rgba(255,255,255,.08);
   background: rgba(255,255,255,.06);
   color: var(--txt-muted);
@@ -624,17 +633,17 @@
 .tr-id-row--tp { margin-top: 4px; padding-top: 7px; border-top: 1px solid var(--border-sub); }
 .tr-id-key { font-size: var(--fs-xs); color: var(--txt-muted); width: 76px; flex-shrink: 0; }
 .tr-id-val {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
+  font-family: var(--font-code);
+  font-size: var(--fs-dense);
   color: var(--info, #60A5FA);
-  letter-spacing: .02em;
+  letter-spacing: var(--ls-0);
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .tr-id-val--muted { color: var(--txt-dim); }
-.tr-id-val--tp { color: var(--txt-muted); font-size: 10.5px; letter-spacing: 0; }
+.tr-id-val--tp { color: var(--txt-muted); font-size: var(--fs-meta); letter-spacing: var(--ls-0); }
 .tr-copy-btn {
   flex-shrink: 0;
   display: inline-flex;
@@ -668,7 +677,7 @@
   margin-bottom: 5px;
   font-variant-numeric: tabular-nums;
 }
-.tr-tl-dur-label { font-weight: 600; color: var(--accent); }
+.tr-tl-dur-label { font-weight: var(--fw-semibold); color: var(--accent); }
 .tr-tl-track {
   height: 24px;
   background: var(--bg, #0d1929);
@@ -687,7 +696,7 @@
   justify-content: center;
   opacity: .85;
 }
-.tr-tl-bar-text { font-size: var(--fs-2xs); font-weight: 700; color: #fff; letter-spacing: .02em; }
+.tr-tl-bar-text { font-size: var(--fs-2xs); font-weight: var(--fw-semibold); color: #fff; letter-spacing: var(--ls-badge); }
 .tr-attrs-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .tr-attr-row {
   &:hover td { background: var(--surface-hover); }
@@ -748,7 +757,7 @@
   font-size: var(--fs-xs);
   color: var(--txt-muted);
   margin-bottom: 10px;
-  letter-spacing: .01em;
+  letter-spacing: var(--ls-small);
 
   &--muted { color: var(--txt-dim); font-style: italic; }
 }
@@ -772,7 +781,7 @@
   flex-wrap: wrap;
 }
 .ev-met-name {
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: var(--fs-xs);
   color: var(--txt);
   flex: 1;
@@ -783,9 +792,9 @@
 }
 .ev-met-kind {
   font-size: var(--fs-3xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
   border: 1px solid var(--border-sub);
   border-radius: 3px;
@@ -795,9 +804,9 @@
 .ev-met-unit { font-size: var(--fs-2xs); color: var(--txt-muted); flex-shrink: 0; }
 .ev-met-props-label {
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .07em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
   margin-bottom: 6px;
 }
@@ -811,5 +820,5 @@
   overflow: hidden;
   font-size: var(--fs-xs);
 }
-.ev-met-chip-k { padding: 2px 6px; color: var(--txt-muted); border-right: 1px solid var(--border-sub); font-family: var(--font-mono); }
-.ev-met-chip-v { padding: 2px 7px; color: var(--accent); font-family: var(--font-mono); font-weight: 600; }
+.ev-met-chip-k { padding: 2px 6px; color: var(--txt-muted); border-right: 1px solid var(--border-sub); font-family: var(--font-code); }
+.ev-met-chip-v { padding: 2px 7px; color: var(--accent); font-family: var(--font-code); font-weight: var(--fw-semibold); }

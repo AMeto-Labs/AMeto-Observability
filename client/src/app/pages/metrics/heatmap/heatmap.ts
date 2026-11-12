@@ -3,7 +3,7 @@ import {
   ChangeDetectionStrategy, OnDestroy,
 } from '@angular/core';
 import type { Chart as ChartJs } from 'chart.js';
-import { loadChart } from '../../../shared/utils/chart-lazy';
+import { loadChart, rootPx, rootToken } from '../../../shared/utils/chart-lazy';
 import { format } from 'date-fns';
 import { HeatmapDto } from '../../../core/models/metric.model';
 
@@ -81,8 +81,9 @@ export class HeatmapComponent implements OnDestroy {
     const xMin = cols[0].ts;
     const xMax = cols[cols.length - 1].ts;
 
-
     const ChartCtor = await loadChart();
+    // The axes are canvas text: their size and colour come from the same tokens as the page.
+    const tick = rootToken('--text-muted', '#64748b');
     if (seq !== this.renderSeq) return; // superseded by a newer render while loading
     this.chart = new ChartCtor(canvas, {
       type: 'matrix',
@@ -118,7 +119,7 @@ export class HeatmapComponent implements OnDestroy {
             type: 'linear',
             min: xMin, max: xMax,
             offset: false,
-            ticks: { color: '#64748b', maxTicksLimit: 6, font: { size: 10 },
+            ticks: { color: tick, maxTicksLimit: 6, font: { size: rootPx('--fs-2xs', 10) },
                      callback: (v: any) => format(new Date(Number(v)), 'HH:mm') },
             grid: { display: false }, border: { display: false },
           },
@@ -126,7 +127,7 @@ export class HeatmapComponent implements OnDestroy {
             type: 'linear',
             min: -0.5, max: nBuckets - 0.5,
             offset: false,
-            ticks: { color: '#64748b', font: { size: 9 }, stepSize: 1,
+            ticks: { color: tick, font: { size: rootPx('--fs-3xs', 9) }, stepSize: 1,
                      callback: (v: any) => boundLabel(d.bounds, Math.round(Number(v)), scale) },
             grid: { display: false }, border: { display: false },
           },

@@ -75,12 +75,12 @@ interface HistogramBar { heightPct: number; color: string; title: string; }
     .lat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
     .lat-figures { display: flex; gap: 14px; margin-bottom: 8px; }
     .lat-fig { display: flex; flex-direction: column; }
-    .lat-k { font-size: var(--fs-2xs); color: var(--txt-dim); text-transform: uppercase; letter-spacing: .05em; }
-    .lat-v { font-size: var(--fs-md); font-weight: 600; color: var(--txt); }
+    .lat-k { font-size: var(--fs-2xs); color: var(--txt-dim); text-transform: uppercase; letter-spacing: var(--ls-caps); }
+    .lat-v { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--txt); }
     .lat-bars { display: flex; align-items: flex-end; gap: 2px; flex: 1; min-height: 90px; }
     .lat-col { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
     .lat-fill { width: 100%; min-height: 1px; border-radius: 2px 2px 0 0; opacity: .9; }
-    .lat-ax { position: relative; height: 16px; margin-top: 6px; border-top: 1px solid var(--border); font-size: 9.5px; color: var(--txt-dim); flex-shrink: 0; }
+    .lat-ax { position: relative; height: 16px; margin-top: 6px; border-top: 1px solid var(--border); font-size: var(--fs-3xs); color: var(--txt-dim); flex-shrink: 0; }
     .lat-ax span { position: absolute; top: 3px; transform: translateX(-50%); white-space: nowrap; }
     .tn { font-variant-numeric: tabular-nums; }
   `,

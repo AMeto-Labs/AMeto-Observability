@@ -19,7 +19,7 @@
 .bs-title {
   margin: 0;
   font-size: var(--fs-lg);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   color: var(--txt);
 }
 .bs-note {
@@ -46,14 +46,14 @@
   gap: 8px;
   margin-bottom: 6px;
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .06em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
 }
 .bs-label-note {
-  font-weight: 500;
-  letter-spacing: 0;
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--ls-0);
   text-transform: none;
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
@@ -64,17 +64,17 @@
   background: none;
   font: inherit;
   font-size: var(--fs-xs);
-  font-weight: 500;
-  letter-spacing: 0;
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--ls-0);
   text-transform: none;
   color: var(--accent);
   cursor: pointer;
 }
 .bs-key {
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
 }
 .bs-value {
@@ -140,7 +140,7 @@
   color: var(--txt);
 }
 .bs-act-b {
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -199,7 +199,7 @@
   border: 0;
   background: var(--accent);
   color: var(--text-on-accent);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 .bs-foot-apply:disabled { opacity: .45; cursor: default; }
 
@@ -220,8 +220,8 @@
   background: var(--bg-elevated);
   color: var(--txt-muted);
   font: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
+  font-size: var(--fs-dense);
+  font-weight: var(--fw-medium);
   white-space: nowrap;
   cursor: pointer;
 }
@@ -235,14 +235,14 @@
   border-color: var(--accent);
   background: var(--accent);
   color: var(--text-on-accent);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
-.bs-chip[data-level="verbose"].active     { color: var(--lvl-v); border-color: var(--lvl-v); background: var(--lvl-v-bg); font-weight: 500; }
-.bs-chip[data-level="debug"].active       { color: var(--lvl-d); border-color: var(--lvl-d); background: var(--lvl-d-bg); font-weight: 500; }
-.bs-chip[data-level="information"].active { color: var(--lvl-i); border-color: var(--lvl-i); background: var(--lvl-i-bg); font-weight: 500; }
-.bs-chip[data-level="warning"].active     { color: var(--lvl-w); border-color: var(--lvl-w); background: var(--lvl-w-bg); font-weight: 500; }
-.bs-chip[data-level="error"].active       { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); font-weight: 500; }
-.bs-chip[data-level="fatal"].active       { color: var(--lvl-f); border-color: var(--lvl-f); background: var(--lvl-f-bg); font-weight: 500; }
+.bs-chip[data-level="verbose"].active     { color: var(--lvl-v); border-color: var(--lvl-v); background: var(--lvl-v-bg); font-weight: var(--fw-medium); }
+.bs-chip[data-level="debug"].active       { color: var(--lvl-d); border-color: var(--lvl-d); background: var(--lvl-d-bg); font-weight: var(--fw-medium); }
+.bs-chip[data-level="information"].active { color: var(--lvl-i); border-color: var(--lvl-i); background: var(--lvl-i-bg); font-weight: var(--fw-medium); }
+.bs-chip[data-level="warning"].active     { color: var(--lvl-w); border-color: var(--lvl-w); background: var(--lvl-w-bg); font-weight: var(--fw-medium); }
+.bs-chip[data-level="error"].active       { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); font-weight: var(--fw-medium); }
+.bs-chip[data-level="fatal"].active       { color: var(--lvl-f); border-color: var(--lvl-f); background: var(--lvl-f-bg); font-weight: var(--fw-medium); }
 
 .bs-field {
   display: flex;
@@ -253,7 +253,7 @@
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: 8px;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--txt);
   min-width: 0;
   box-sizing: border-box;
@@ -264,7 +264,7 @@
   font-size: var(--fs-2xs);
   color: var(--txt-dim);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   flex-shrink: 0;
 }
 .bs-field-in {
@@ -302,13 +302,13 @@
   background: none;
   color: var(--txt-dim);
   font: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-dense);
   cursor: pointer;
 }
 .bs-seg button.active {
   color: var(--txt);
   background: var(--surface-up);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 .bs-switch-label {
   display: flex;

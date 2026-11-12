@@ -74,10 +74,10 @@
 .nav-item--more { display: none; }
 
 .nav-label {
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-size: var(--fs-2xs);
-  font-weight: 500;
-  letter-spacing: .15px;
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--ls-small);
   white-space: nowrap;
   /* Backstop for a label longer than the rail: nowrap text in a centred column
      overflows BOTH sides of the item, escaping the --active background. The rail
@@ -106,12 +106,12 @@
   padding: 4px 8px 2px;
 }
 .env-eyebrow {
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-size: var(--fs-3xs);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   color: var(--txt-dim);
   text-transform: uppercase;
-  letter-spacing: .6px;
+  letter-spacing: var(--ls-caps);
 }
 .env-row {
   display: flex;
@@ -127,9 +127,9 @@
   box-shadow: 0 0 5px var(--lvl-i);
 }
 .env-name {
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-size: var(--fs-xs);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   color: var(--txt-muted);
   flex: 1;
   white-space: nowrap;

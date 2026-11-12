@@ -1,8 +1,7 @@
 :host { display: contents; }
 
-/* The design's named one-off for menus and lists: between --fs-xs and --fs-sm, deliberately
-   outside the scale. With --lh-ui and 4px of padding a row is the 24px the design draws. */
-$fs-menu: 11.5px;
+/* Rows are --fs-dense, the scale's half-step for menus and lists: with --lh-ui and 4px of
+   padding a row is the 24px the design draws. */
 
 .prop-menu {
   min-width: 220px;
@@ -11,7 +10,7 @@ $fs-menu: 11.5px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 6px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  font-size: $fs-menu;
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
   // A menu taller than the window scrolls rather than running off it.
   max-height: calc(100vh - 16px);
@@ -63,8 +62,8 @@ $fs-menu: 11.5px;
 .pm-section {
   padding: 3px 8px 2px;
   font-size: var(--fs-2xs);
-  font-weight: 600;
-  letter-spacing: 0.05em;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-caps);
   text-transform: uppercase;
   color: var(--text-muted);
 }

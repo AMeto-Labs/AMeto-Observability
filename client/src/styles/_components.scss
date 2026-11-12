@@ -12,10 +12,6 @@
   :root { --bottom-nav-h: calc(56px + env(safe-area-inset-bottom, 0px)); }
 }
 
-/* The design's named one-off for dense tables (also lists and menus, see _overlay.scss):
-   between --fs-xs and --fs-sm, deliberately outside the scale. */
-$fs-table: 11.5px;
-
 .page {
   padding: var(--page-pad);
   display: flex;
@@ -27,7 +23,7 @@ $fs-table: 11.5px;
 
 .page-title {
   font-size: var(--fs-lg);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: var(--lh-tight);
   color: var(--text-primary);
   display: flex;
@@ -49,9 +45,9 @@ $fs-table: 11.5px;
 /* Section captions are the scale's 10px small caps; a little tracking keeps them legible. */
 .section-title {
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   color: var(--text-secondary);
-  letter-spacing: .04em;
+  letter-spacing: var(--ls-caps);
   text-transform: uppercase;
 }
 
@@ -162,21 +158,21 @@ $fs-table: 11.5px;
 
 .field-input.mono,
 .mono {
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: var(--fs-xs);
 }
 
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: $fs-table;
+  font-size: var(--fs-dense);
 }
 
 .data-table th {
   text-align: left;
   padding: 4px 8px;
   color: var(--text-secondary);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   border-bottom: 1px solid var(--border);
 }
 

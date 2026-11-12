@@ -22,7 +22,7 @@
   gap: var(--gap); flex-shrink: 0; flex-wrap: wrap;
 }
 .mx-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
-  h1 { margin: 0; font-size: var(--fs-lg); font-weight: 600; line-height: var(--lh-tight); color: var(--text-primary); }
+  h1 { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-semibold); line-height: var(--lh-tight); color: var(--text-primary); }
 }
 .mx-sub { font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-ui); }
 
@@ -39,7 +39,7 @@
   font-size: var(--fs-xs); padding: 0 8px; border-radius: var(--radius-sm); cursor: pointer;
   transition: background .15s, color .15s;
   &:hover  { background: var(--bg-card); color: var(--text-primary); }
-  &.active { background: var(--accent); color: #000; font-weight: 600; }
+  &.active { background: var(--accent); color: #000; font-weight: var(--fw-semibold); }
 }
 
 .custom-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -93,7 +93,7 @@
 .cat-type {
   flex-shrink: 0; min-width: 16px; height: 16px; padding: 0 5px; border-radius: 4px;
   display: inline-flex; align-items: center; justify-content: center;
-  font-size: var(--fs-2xs); font-weight: 700; line-height: 1;
+  font-size: var(--fs-2xs); font-weight: var(--fw-semibold); line-height: 1;
 }
 .cat-name {
   flex: 1; font-size: var(--fs-sm); color: var(--text-primary); font-family: var(--font-ui);
@@ -112,7 +112,7 @@
   .cat-type { height: 18px; padding: 0 7px; }
 }
 .b-name {
-  font-size: var(--fs-md); font-weight: 600; color: var(--text-primary); font-family: var(--font-ui);
+  font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text-primary); font-family: var(--font-ui);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .b-unit { font-size: var(--fs-xs); color: var(--text-muted); flex-shrink: 0; }
@@ -120,7 +120,7 @@
 .b-controls { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
 .b-field { display: flex; flex-direction: column; gap: 3px;
   &.grow { flex: 1; min-width: 180px; }
-  span { font-size: var(--fs-2xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  span { font-size: var(--fs-2xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: var(--ls-caps); }
   select, .b-input {
     height: var(--ctl-h); padding: 0 8px; box-sizing: border-box;
     background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius);
@@ -128,12 +128,13 @@
     &:focus { border-color: var(--accent); }
   }
   select { cursor: pointer; }
-  .b-input { font-family: var(--font-ui); width: 100%; }
+  // Filters, metric names and the scale are typed like code: the code font, as on Logs.
+  .b-input { font-family: var(--font-code); width: 100%; }
 }
 .b-run {
   display: inline-flex; align-items: center; gap: 5px; height: var(--ctl-h); padding: 0 12px;
   background: var(--accent); border: none; border-radius: var(--radius); color: #000;
-  font-size: var(--fs-xs); font-weight: 600; cursor: pointer;
+  font-size: var(--fs-xs); font-weight: var(--fw-semibold); cursor: pointer;
   &:hover { opacity: .85; }
 }
 // Icon buttons that sit in a row of controls take the control height, so the row lines up.
@@ -145,7 +146,7 @@
 }
 
 .b-groupby { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.gb-label { font-size: var(--fs-2xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+.gb-label { font-size: var(--fs-2xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: var(--ls-caps); }
 .gb-chip {
   display: inline-flex; align-items: center; height: var(--ctl-h-sm);
   background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -202,7 +203,7 @@
   display: flex; align-items: center; justify-content: space-between;
   height: var(--toolbar-h); padding: 0 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
-.hist-title { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); }
+.hist-title { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-muted); }
 .hist-close {
   display: flex; align-items: center; justify-content: center; width: var(--icon-btn); height: var(--icon-btn);
   background: none; border: none; border-radius: 4px; color: var(--text-muted); cursor: pointer;
@@ -221,7 +222,7 @@
     background: none; border: none; border-radius: var(--radius-sm); color: var(--text-muted);
     font-size: var(--fs-xs); padding: 0 8px; cursor: pointer; transition: background .15s, color .15s;
     &:hover { color: var(--text-primary); }
-    &.on { background: var(--bg-card); color: var(--text-primary); font-weight: 600; }
+    &.on { background: var(--bg-card); color: var(--text-primary); font-weight: var(--fw-semibold); }
   }
 }
 .ex-toggle {
@@ -256,7 +257,7 @@
   .b-input { width: 100%; }
 }
 .expr-hint { font-size: var(--fs-xs); color: var(--text-muted);
-  code { font-family: var(--font-ui); color: var(--info); }
+  code { font-family: var(--font-code); color: var(--info); }
 }
 
 // ── Correlation drawer (heatmap cell → traces) ───────────────────────────────
@@ -279,7 +280,7 @@
   padding: var(--gap) var(--section-pad); border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
 .corr-titles { display: flex; flex-direction: column; gap: 2px; }
-.corr-title { font-size: var(--fs-lg); font-weight: 600; line-height: var(--lh-tight); color: var(--text-primary); }
+.corr-title { font-size: var(--fs-lg); font-weight: var(--fw-semibold); line-height: var(--lh-tight); color: var(--text-primary); }
 .corr-sub   { font-size: var(--fs-xs); color: var(--text-muted); }
 .corr-close {
   width: var(--icon-btn); height: var(--icon-btn); padding: 0;
@@ -306,7 +307,7 @@
 .corr-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .corr-row-top  { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .corr-method {
-  font-size: var(--fs-2xs); font-weight: 700; padding: 1px 5px; border-radius: 3px; flex-shrink: 0;
+  font-size: var(--fs-2xs); font-weight: var(--fw-semibold); padding: 1px 5px; border-radius: 3px; flex-shrink: 0;
   background: color-mix(in srgb, var(--info) 15%, transparent); color: var(--info);
 }
 .corr-path {

@@ -41,9 +41,9 @@
   border-bottom: 1px solid var(--border);
   padding: 4px 14px;
   font-size: var(--fs-2xs);
-  font-weight: 700;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   color: var(--text-muted);
   min-width: fit-content;
 }

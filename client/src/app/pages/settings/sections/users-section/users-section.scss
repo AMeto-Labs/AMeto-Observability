@@ -5,7 +5,7 @@
 
 .mono-sm {
   font-size: var(--fs-xs);
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
 }
 
 .action-cell {
@@ -40,7 +40,7 @@
   border: 1px solid var(--error);
   color: var(--error);
   text-transform: uppercase;
-  letter-spacing: .4px;
+  letter-spacing: var(--ls-badge);
 }
 
 .domain-table {
@@ -71,7 +71,7 @@
   border: 1px solid var(--border);
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: .4px;
+  letter-spacing: var(--ls-badge);
 
   &[data-provider='google']    { border-color: #4285F4; color: #4285F4; }
   &[data-provider='microsoft'] { border-color: #0078D4; color: #0078D4; }

@@ -5,8 +5,8 @@
 // The template at the message's size, its holes in their property colours (clef-renderer),
 // two lines at most.
 .ms-template {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-family: var(--font-log);
+  font-size: var(--fs-md);
   line-height: var(--lh-body);
   color: var(--msg-tmpl);
   display: -webkit-box;

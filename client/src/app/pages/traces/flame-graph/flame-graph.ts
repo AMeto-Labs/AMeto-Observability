@@ -261,7 +261,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
     }
     .fg-tt-svc  { color: var(--text-muted); }
     .fg-tt-dur  { color: var(--info); font-family: var(--font-ui); white-space: nowrap; }
-    .fg-tt-pct  { color: var(--accent); font-weight: 700; }
+    .fg-tt-pct  { color: var(--accent); font-weight: var(--fw-semibold); }
     .fg-tt-cut  { color: var(--warning); }
 
     .fg-cut-note {
@@ -316,7 +316,7 @@ export const CUT_NOTE = 'cut here — its deeper spans are not drawn';
       line-height: 1;
       margin-top: 4px;
       pointer-events: none;
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
     }
 
     .fg-legend {

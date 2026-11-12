@@ -43,9 +43,9 @@ import { ChangeDetectionStrategy, Component, input, output } from '@angular/core
       box-shadow: var(--shadow);
       padding: 4px 0;
       z-index: 1000;
-      font-size: 11.5px;
+      font-size: var(--fs-dense);
       line-height: var(--lh-ui);
-      font-family: var(--font-mono);
+      font-family: var(--font-code);
     }
     .suggest-item {
       padding: 4px 10px;

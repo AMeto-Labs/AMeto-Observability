@@ -40,7 +40,7 @@
   position: relative;
   min-width: 0;
   display: block;
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: var(--log-font-size);
   line-height: var(--log-line-height);
   letter-spacing: var(--log-letter-spacing);
@@ -112,7 +112,7 @@
   margin: 0;
   padding: 4px 0;
   z-index: 50;
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: var(--fs-sm);
 }
 .suggest-item {
@@ -144,8 +144,8 @@
   border-radius: 4px;
   padding: 1px 5px;
   margin-top: 0; /* was 2px for the 28px field; this centres it on the first line of the 26px one */
-  letter-spacing: 0;
-  font-family: var(--ui);
+  letter-spacing: var(--ls-0);
+  font-family: var(--font-ui);
   white-space: nowrap;
   pointer-events: none;
 }
@@ -177,7 +177,7 @@
   border: 1px solid var(--border);
   color: var(--txt-muted);
   font-size: var(--fs-xs);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   transition: all .12s;
 }
 .tb-live-btn:hover { color: var(--txt); border-color: var(--txt-muted); }

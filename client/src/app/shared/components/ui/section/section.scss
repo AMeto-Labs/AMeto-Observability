@@ -23,8 +23,8 @@
 .section__title {
   color: var(--text-secondary);
   font-size: var(--fs-2xs);
-  font-weight: 600;
-  letter-spacing: .04em;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-caps);
   margin: 0;
   text-transform: uppercase;
 }

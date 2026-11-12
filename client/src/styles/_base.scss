@@ -12,7 +12,28 @@ body {
   color: var(--text-primary);
   font-family: var(--font-ui);
   font-size: var(--fs-sm);
-  line-height: 1.45;
+  line-height: var(--lh-base);
+  /* Inter's figures are proportional by default — a "1" is a third narrower than a "0", so
+     every column of times, durations and counts wobbled wherever a page forgot to ask for
+     tabular ones. The whole app is data: ask once, here. Running text opts out with .prose. */
+  font-variant-numeric: tabular-nums;
+}
+
+.prose {
+  font-variant-numeric: normal;
+}
+
+/* The browser's own bold is 700, which no rule in the app asks for (see --fw-semibold). */
+b,
+strong,
+th,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: var(--fw-semibold);
 }
 
 a {
@@ -20,12 +41,15 @@ a {
   text-decoration: none;
 }
 
+/* Form controls take their font from the user agent's own shorthand, which resets the
+   figures to proportional: inherit them with the rest. */
 button,
 input,
 textarea,
 select {
   font-family: inherit;
   font-size: inherit;
+  font-variant-numeric: inherit;
 }
 
 button {
@@ -72,30 +96,30 @@ lucide-icon {
    --lvl-w exactly). */
 .msg-prop {
   color: var(--prop);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
 }
 
 /* JSON keys: the only highlighted part of an embedded JSON blob — property colour +
    italic. Values are dimmed below the template text so the keys stay the landmarks. */
 .msg-key {
   color: var(--prop);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-style: italic;
 }
 
 .msg-val {
   color: var(--msg-val);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
 }
 
 .msg-punct {
   color: var(--msg-punct);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
 }
 
 .msg-null {
   color: var(--msg-null);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-style: italic;
 }
 
@@ -106,7 +130,7 @@ lucide-icon {
 .ex-trace {
   color: var(--error);
   white-space: pre-wrap;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-top: 8px;
 }
 
@@ -135,8 +159,8 @@ lucide-icon {
   border: none;
   color: var(--text-primary);
   white-space: nowrap;
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
 }
 
 .ctx-menu button lucide-icon {
@@ -161,7 +185,7 @@ lucide-icon {
 .ctx-label {
   padding: 3px 14px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   max-width: 360px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -170,8 +194,8 @@ lucide-icon {
 
 /* Filter-expression preview inside context-menu items. */
 .ctx-menu code {
-  font-family: var(--font-mono);
-  font-size: 11px;
+  font-family: var(--font-code);
+  font-size: var(--fs-dense);
   color: var(--accent, #F59E0B);
   max-width: 300px;
   overflow: hidden;

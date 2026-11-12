@@ -10,7 +10,7 @@
   overflow: hidden;
   border-bottom: 1px solid rgba(255, 255, 255, .03);
   --lc: var(--lvl-i);
-  font-family: var(--font-mono);
+  font-family: var(--font-log);
   font-size: var(--log-font-size);
   line-height: var(--log-line-height);
   letter-spacing: var(--log-letter-spacing);
@@ -139,8 +139,8 @@
 }
 .ev-lvl-badge {
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  letter-spacing: .3px;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-badge);
   padding: 1px 6px;
   border-radius: 999px;
   background: var(--lc-bg, rgba(255, 255, 255, .06));
@@ -277,7 +277,7 @@
   padding: 0;
 }
 :host.ev-phone .ev-lvl-badge {
-  letter-spacing: .04em;
+  letter-spacing: var(--ls-badge);
   line-height: 14px;
 }
 :host.ev-phone .ev-ts {

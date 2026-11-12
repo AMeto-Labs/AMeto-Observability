@@ -443,7 +443,7 @@
                     <div class="trace-row-body">
                       <div class="trace-ts-line">
                         <span class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</span>
-                        <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
+                        <span class="trace-dur">{{ fmtDurNs(trace.durationNanos) }}</span>
                         @if (trace.spanCount > 1) {
                           <span class="span-count">{{ trace.spanCount }} spans</span>
                         }
@@ -503,7 +503,7 @@
             </button>
             <div class="detail-title">
               <span class="detail-trace-label">Trace</span>
-              <span class="detail-trace-id mono">{{ selectedTraceId() }}</span>
+              <span class="detail-trace-id">{{ selectedTraceId() }}</span>
               <lucide-icon class="copy-icon"
                            [name]="traceIdCopied() ? 'check' : 'copy'" [size]="12"
                            (click)="copyTraceId()" title="Copy trace ID" />
@@ -570,7 +570,7 @@
                       </div>
                     </div>
 
-                    <div class="wf-dur-col mono">{{ fmtDurNs(span.durationNanos) }}</div>
+                    <div class="wf-dur-col">{{ fmtDurNs(span.durationNanos) }}</div>
                   </div>
                 }
               </div>
@@ -637,7 +637,7 @@
                       </button>
                       Span ID
                     </span>
-                    <span class="sd-val mono small">{{ span.spanId }}</span>
+                    <span class="sd-val code small">{{ span.spanId }}</span>
                   </div>
                   <div class="sd-field sd-field--parent">
                     <span class="sd-key">
@@ -646,7 +646,7 @@
                       </button>
                       Parent
                     </span>
-                    <span class="sd-val mono small">{{ span.parentSpanId || '—' }}</span>
+                    <span class="sd-val code small">{{ span.parentSpanId || '—' }}</span>
                   </div>
                   <div class="sd-field sd-field--start">
                     <span class="sd-key">
@@ -655,7 +655,7 @@
                       </button>
                       Start
                     </span>
-                    <span class="sd-val mono small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
+                    <span class="sd-val small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
                   </div>
                   <div class="sd-field sd-field--dur">
                     <span class="sd-key">
@@ -664,7 +664,7 @@
                       </button>
                       Duration
                     </span>
-                    <span class="sd-val mono">{{ fmtDurNs(span.durationNanos) }}</span>
+                    <span class="sd-val">{{ fmtDurNs(span.durationNanos) }}</span>
                   </div>
                 </div>
 
@@ -693,7 +693,7 @@
                           <tbody>
                             @for (tag of selectedSpanTags(); track tag.key) {
                               <tr>
-                                <td class="tag-key mono">
+                                <td class="tag-key">
                                   <button class="tag-menu-btn"
                                           [class.open]="attrMenu()?.key === tag.key"
                                           (click)="openAttrMenu($event, tag.key, tag.value)"
@@ -761,7 +761,7 @@
             <div class="detail-info-tab">
               <div class="di-row">
                 <span class="di-k">Trace ID</span>
-                <span class="di-v mono small">{{ selectedTraceId() }}</span>
+                <span class="di-v code small">{{ selectedTraceId() }}</span>
               </div>
               <div class="di-row">
                 <span class="di-k">Spans</span>

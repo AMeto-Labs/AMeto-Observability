@@ -59,7 +59,7 @@
 .fs-svc-pct {
   min-width: 40px;
   text-align: right;
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
   font-variant-numeric: tabular-nums;
 }
@@ -70,7 +70,7 @@
   background: none;
   color: var(--accent);
   font: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-dense);
   cursor: pointer;
 }
 .fs-svc-empty {
@@ -96,6 +96,6 @@
   align-items: center;
   gap: 6px;
   min-height: 32px;
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
 }

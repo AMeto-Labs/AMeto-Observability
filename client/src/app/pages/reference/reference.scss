@@ -10,7 +10,7 @@
   display: flex;
   height: 100%;
   color: var(--txt);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
 }
 
 /* ── Section rail ──────────────────────────────────────────────────────────── */
@@ -26,7 +26,7 @@
 .ref-rail-title {
   font-size: var(--fs-2xs);
   text-transform: uppercase;
-  letter-spacing: .08em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
   padding: 0 8px 8px;
 }
@@ -68,20 +68,20 @@
 
 /* Running text is 13px / 1.6 (the scale's --fs-md); the h1 is the one large size the
    client has besides the login title. */
-h1 { font-size: var(--fs-2xl); font-weight: 650; line-height: var(--lh-tight); margin: 0 0 8px; }
+h1 { font-size: var(--fs-2xl); font-weight: var(--fw-semibold); line-height: var(--lh-tight); margin: 0 0 8px; }
 h2 {
   display: flex;
   align-items: center;
   gap: 9px;
   font-size: var(--fs-xl);
-  font-weight: 620;
+  font-weight: var(--fw-semibold);
   line-height: var(--lh-tight);
   margin: 0 0 var(--gap);
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-sub);
   lucide-icon { color: var(--accent); }
 }
-h3 { font-size: var(--fs-lg); font-weight: 600; color: var(--txt); margin: 20px 0 8px; }
+h3 { font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--txt); margin: 20px 0 8px; }
 
 p { font-size: var(--fs-md); line-height: 1.6; color: var(--txt-muted); margin: 0 0 var(--gap); }
 p.lead { font-size: var(--fs-lg); color: var(--txt); }
@@ -92,10 +92,10 @@ p.note {
   border-radius: var(--radius-card);
   padding: 10px 12px;
 }
-b { color: var(--txt); font-weight: 600; }
+b { color: var(--txt); font-weight: var(--fw-semibold); }
 
 code {
-  font-family: var(--mono);
+  font-family: var(--font-code);
   font-size: var(--fs-sm);
   background: var(--surface-up);
   border: 1px solid var(--border-sub);
@@ -139,7 +139,7 @@ code.ex.block {
 .levels { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
 .levels-label { font-size: var(--fs-sm); color: var(--txt-muted); margin-right: 4px; }
 .lvl-chip {
-  font-family: var(--mono);
+  font-family: var(--font-code);
   font-size: var(--fs-xs);
   padding: 2px 9px;
   border-radius: 999px;
@@ -172,9 +172,9 @@ code.ex.block {
   text-align: left;
   font-size: var(--fs-xs);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   padding: 7px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border-sub);

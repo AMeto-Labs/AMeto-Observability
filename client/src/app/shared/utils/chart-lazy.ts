@@ -25,8 +25,23 @@ export function loadChart(): Promise<ChartCtor> {
       import('chartjs-chart-matrix'),
     ]);
     Chart.register(...registerables, zoom.default, matrix.MatrixController, matrix.MatrixElement);
+    // A chart draws on a canvas, which does not inherit the page's font: without this every axis
+    // and legend was set in Chart.js's own default (Helvetica, so Arial on Windows).
+    Chart.defaults.font.family = rootToken('--font-ui', 'sans-serif');
+    Chart.defaults.font.size = rootPx('--fs-2xs', 10);
     _chart = Chart;
     return Chart;
   })();
   return _loading;
+}
+
+/** A custom property's value on :root, or the fallback where no stylesheet defines it (a test host). */
+export function rootToken(name: string, fallback: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+}
+
+/** A px size token (--fs-*) as a number, for the canvas-drawn text that cannot read CSS itself. */
+export function rootPx(name: string, fallback: number): number {
+  const px = parseFloat(rootToken(name, ''));
+  return Number.isFinite(px) && px > 0 ? px : fallback;
 }
