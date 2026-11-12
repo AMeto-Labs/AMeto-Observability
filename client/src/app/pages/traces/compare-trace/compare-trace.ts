@@ -202,8 +202,8 @@ interface AlignedRow {
       border: 1px solid var(--border);
       border-radius: var(--radius);
       color: var(--text-primary);
-      font-size: var(--fs-sm);
-      font-family: var(--font-ui);
+      font-size: var(--fs-dense);
+      font-family: var(--font-code); /* a trace ID */
       outline: none;
       box-sizing: border-box;
 
@@ -277,7 +277,7 @@ interface AlignedRow {
       white-space: nowrap;
     }
 
-    /* 15px/600 (design canvas) — between --fs-md and --fs-xl, so a literal. */
+    /* The summary numbers: --fs-lg (the canvas drew 15px; the scale's step is 14). */
     .cmp-sum-val {
       font-size: var(--fs-lg);
       font-weight: var(--fw-semibold);

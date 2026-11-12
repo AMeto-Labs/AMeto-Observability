@@ -257,7 +257,7 @@ const ZOOM_MAX = 3;
 
     .sg-node { cursor: grab; user-select: none; }
     .sg-node-label { font-size: var(--fs-xs); font-weight: var(--fw-semibold); pointer-events: none; }
-    .sg-node-sub   { font-size: var(--fs-3xs); fill: #64748b; pointer-events: none; }
+    .sg-node-sub   { font-size: var(--fs-3xs); fill: var(--text-muted); pointer-events: none; }
     .sg-edge-label { font-size: var(--fs-3xs); pointer-events: none; }
 
     .sg-sheet {

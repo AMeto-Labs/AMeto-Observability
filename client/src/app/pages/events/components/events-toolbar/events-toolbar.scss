@@ -71,9 +71,9 @@
 .filter-hl ::ng-deep .fh-num   { color: var(--lvl-w);       }
 .filter-hl ::ng-deep .fh-paren { color: var(--txt-muted);   }
 /* No font-weight here: the highlight div and the transparent textarea must stay
-   glyph-for-glyph identical, and --font-mono resolves to Inter, whose weights differ
-   in advance width — a heavier identifier run widens the visible layer and parks the
-   caret on top of the glyphs. Identifiers are set apart by colour alone. */
+   glyph-for-glyph identical. The expression is set in --font-code (IBM Plex Mono), whose
+   advance does not change with weight, but only its 400 ships, so a heavier run would be
+   a synthesized bold. Identifiers are set apart by colour alone. */
 .filter-hl ::ng-deep .fh-ident { color: var(--txt); }
 
 .filter-input {

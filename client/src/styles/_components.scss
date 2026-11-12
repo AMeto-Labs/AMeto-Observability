@@ -159,7 +159,7 @@
 .field-input.mono,
 .mono {
   font-family: var(--font-code);
-  font-size: var(--fs-xs);
+  font-size: var(--fs-dense); /* mono half a step up matches Inter at --fs-xs by x-height */
 }
 
 .data-table {

@@ -453,12 +453,12 @@
   border-radius: var(--radius);
   color: var(--text-primary);
   font-size: var(--fs-sm);
-  font-family: var(--font-ui);
+  font-family: var(--font-code); /* a TraceQL query is code, like the filter on Logs */
   outline: none;
   box-sizing: border-box;
   transition: border-color 0.15s;
 
-  &::placeholder { color: var(--text-muted); font-family: var(--font-ui); }
+  &::placeholder { color: var(--text-muted); }
   &:focus { border-color: var(--info); }
 }
 
@@ -504,8 +504,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--info);
-  font-size: var(--fs-xs);
-  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  font-family: var(--font-code); /* example queries */
   padding: 0 8px;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
@@ -536,8 +536,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text-secondary);
-  font-size: var(--fs-sm);
-  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  font-family: var(--font-code); /* a trace ID */
   outline: none;
   box-sizing: border-box;
 

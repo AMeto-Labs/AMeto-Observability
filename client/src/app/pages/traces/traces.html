@@ -37,7 +37,7 @@
     <div class="phone-search-field">
       <lucide-icon name="search" [size]="13" class="fi-icon" />
       @if (traceqlMode()) {
-        <input class="fi-input" [(ngModel)]="traceqlInput"
+        <input class="fi-input code" [(ngModel)]="traceqlInput"
                placeholder="TraceQL query" spellcheck="false" autocomplete="off"
                (keyup.enter)="runTraceQLUser()" />
       } @else {

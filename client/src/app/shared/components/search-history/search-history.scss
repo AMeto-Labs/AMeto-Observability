@@ -37,7 +37,7 @@
   flex: 1;
   min-width: 0;
   font-family: var(--font-code);
-  font-size: var(--fs-dense);   /* the design's one-off for list rows, between --fs-xs and --fs-sm */
+  font-size: var(--fs-dense);   /* the scale's half-step for list rows */
   line-height: var(--lh-ui);
   color: var(--txt);
   white-space: nowrap;

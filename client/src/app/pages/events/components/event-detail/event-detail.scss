@@ -316,7 +316,7 @@
   font-size: var(--fs-dense);
   line-height: var(--lh-base);
   word-break: break-all;
-  padding-top: 1px; /* likewise for the 12px value's first line */
+  padding-top: 1px; /* likewise for the 11.5px value's first line */
   /* Expanded structured values (arrays/objects of long JSON) render a tree wider
      than this fixed column; each row truncates itself with an ellipsis (see
      json-viewer one-line mode), so clip here without a scrollbar — the tree never
@@ -820,5 +820,5 @@
   overflow: hidden;
   font-size: var(--fs-xs);
 }
-.ev-met-chip-k { padding: 2px 6px; color: var(--txt-muted); border-right: 1px solid var(--border-sub); font-family: var(--font-code); }
-.ev-met-chip-v { padding: 2px 7px; color: var(--accent); font-family: var(--font-code); font-weight: var(--fw-semibold); }
+.ev-met-chip-k { padding: 2px 6px; color: var(--txt-muted); border-right: 1px solid var(--border-sub); font-family: var(--font-log); }
+.ev-met-chip-v { padding: 2px 7px; color: var(--accent); font-family: var(--font-log); font-weight: var(--fw-semibold); }

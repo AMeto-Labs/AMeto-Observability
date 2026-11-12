@@ -26,9 +26,12 @@ export function loadChart(): Promise<ChartCtor> {
     ]);
     Chart.register(...registerables, zoom.default, matrix.MatrixController, matrix.MatrixElement);
     // A chart draws on a canvas, which does not inherit the page's font: without this every axis
-    // and legend was set in Chart.js's own default (Helvetica, so Arial on Windows).
+    // and legend was set in Chart.js's own default (Helvetica, so Arial on Windows). Only the
+    // family is global: ticks and legends name their size where they are built, and tooltips
+    // keep Chart.js's 12px. The tooltip title's 'bold' would be a true 700 in the variable Inter;
+    // nothing in the app is heavier than --fw-semibold.
     Chart.defaults.font.family = rootToken('--font-ui', 'sans-serif');
-    Chart.defaults.font.size = rootPx('--fs-2xs', 10);
+    Chart.defaults.plugins.tooltip.titleFont = { weight: Number(rootToken('--fw-semibold', '600')) || 600 };
     _chart = Chart;
     return Chart;
   })();

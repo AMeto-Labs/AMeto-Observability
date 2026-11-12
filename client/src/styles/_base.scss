@@ -19,8 +19,25 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.prose {
+/* Running text keeps proportional figures: the Reference page and the one-line hints and
+   descriptions under fields. */
+.prose,
+.sublabel,
+.hint,
+.perm-hint,
+.expr-hint,
+.maint-hint,
+.ch-secret-hint,
+.rs-hint {
   font-variant-numeric: normal;
+}
+
+/* An uppercase caption, the way column headers and section labels are set. */
+.caps {
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-caps);
+  text-transform: uppercase;
 }
 
 /* The browser's own bold is 700, which no rule in the app asks for (see --fw-semibold). */

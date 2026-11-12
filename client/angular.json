@@ -27,6 +27,16 @@
               {
                 "glob": "**/*",
                 "input": "public"
+              },
+              {
+                "glob": "LICENSE",
+                "input": "node_modules/@fontsource-variable/inter",
+                "output": "licenses/inter"
+              },
+              {
+                "glob": "LICENSE",
+                "input": "node_modules/@fontsource/ibm-plex-mono",
+                "output": "licenses/ibm-plex-mono"
               }
             ],
             "styles": [

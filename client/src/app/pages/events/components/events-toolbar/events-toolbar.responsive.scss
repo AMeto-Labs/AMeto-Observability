@@ -263,7 +263,7 @@
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-soft);
-  font-weight: var(--fw-semibold);
+  /* No weight: only Plex Mono 400 ships, so 600 would be a synthesized bold. */
 }
 .ph-sg-kw { color: var(--accent); }
 .ph-sg-nl {
