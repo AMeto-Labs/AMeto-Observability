@@ -40,8 +40,8 @@
   align-items: start;
 }
 .metric:last-child { border-bottom: none; }
-.metric-name  { font-size: var(--fs-md); font-weight: 600; color: var(--text-primary); padding-top: 1px; }
-.metric-value { font-size: var(--fs-lg); font-weight: 600; line-height: var(--lh-tight); color: var(--text-primary); }
+.metric-name  { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text-primary); padding-top: 1px; }
+.metric-value { font-size: var(--fs-lg); font-weight: var(--fw-semibold); line-height: var(--lh-tight); color: var(--text-primary); }
 .metric-value.accent { color: var(--primary); }
 .metric-desc  { font-size: var(--fs-xs); color: var(--text-secondary); margin-top: 3px; line-height: var(--lh-body); }
 

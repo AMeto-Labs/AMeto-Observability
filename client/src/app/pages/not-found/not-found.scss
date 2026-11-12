@@ -18,7 +18,7 @@
    next to the 48px icon would read as a caption. */
 h1 {
   font-size: 48px;
-  font-weight: 700;
+  font-weight: var(--fw-semibold);
   color: var(--text-primary);
   line-height: 1;
 }

@@ -25,9 +25,9 @@
   align-items: center;
   gap: 6px;
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   color: var(--txt-muted);
-  letter-spacing: 0;
+  letter-spacing: var(--ls-0);
 }
 
 .sig-header-actions { display: flex; gap: 2px; }
@@ -129,7 +129,7 @@
   gap: 2px;
 }
 .sig-name   { font-size: var(--fs-sm); color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sig-filter { font-size: var(--fs-xs); color: var(--txt-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sig-filter { font-family: var(--font-code); font-size: var(--fs-dense); color: var(--txt-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ── Section labels ─────────────────────────────────────────────────────── */
 .sig-section-label {
@@ -138,9 +138,9 @@
   gap: 6px;
   padding: 8px 10px 4px;
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .06em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
 }
 
@@ -200,10 +200,10 @@ app-search-history:not(:first-child) { margin-top: 4px; }
   .sig-item--firing .sig-dot { width: 8px; height: 8px; }
   .sig-dot[data-sev="Critical"] { box-shadow: 0 0 6px var(--lvl-e); }
   .sig-item--firing .sig-name {
-    font-size: 12.5px;
-    font-weight: 600;
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
   }
-  .sig-item--firing .sig-filter { font-size: 10.5px; }
+  .sig-item--firing .sig-filter { font-size: var(--fs-meta); }
 
   // The shared history section at the sheet's sizes: a 32px label, 44px rows under a rule with the
   // buttons always out, the query at 12px. Set from here, not in search-history.scss, because that

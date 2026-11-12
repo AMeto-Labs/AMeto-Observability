@@ -36,7 +36,7 @@
   border-radius: var(--radius-sm);
   color: var(--txt-muted);
   font-size: var(--fs-xs);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
   transition: background .12s, color .12s;
@@ -45,7 +45,7 @@
 .seg-btn.active {
   background: var(--surface-hover);
   color: var(--accent);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 /* Custom: the filter bar's trigger (`.fb-btn`), carrying the window once one is applied. */
@@ -59,7 +59,7 @@
   background: var(--surface-up);
   border: 1px solid var(--border);
   color: var(--txt-muted);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;

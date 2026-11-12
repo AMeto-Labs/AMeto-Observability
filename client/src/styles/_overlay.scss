@@ -4,10 +4,8 @@
    any component's view-encapsulation scope.
    ═══════════════════════════════════════════════════════════════════ */
 
-/* The design's named one-off for dense lists and menus (and tables, see _components.scss):
-   between --fs-xs and --fs-sm, deliberately outside the scale. A row at this size with
-   --lh-ui and 4px of padding is the 24px the design draws. */
-$fs-list: 11.5px;
+/* List and menu rows are --fs-dense, the scale's half-step: with --lh-ui and 4px of padding
+   a row is the 24px the design draws. */
 
 /* ── Panel box ──────────────────────────────────────────────────── */
 .dd-panel {
@@ -31,10 +29,10 @@ $fs-list: 11.5px;
 }
 .dd-panel-title {
   font-size: var(--fs-sm);
-  font-weight: 600;
-  font-family: var(--ui);
+  font-weight: var(--fw-semibold);
+  font-family: var(--font-ui);
   color: var(--txt);
-  letter-spacing: .3px;
+  letter-spacing: var(--ls-0);
 }
 .dd-close-btn {
   display: flex;
@@ -59,8 +57,8 @@ $fs-list: 11.5px;
   padding: 4px 12px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
-  font-family: var(--ui);
-  font-size: $fs-list;
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
   color: var(--txt-muted);
   transition: background .1s;
@@ -74,7 +72,7 @@ $fs-list: 11.5px;
   }
 }
 .dd-select-all-row:hover { background: var(--surface-hover); }
-.dd-select-all-lbl { flex: 1; color: var(--txt); font-weight: 500; }
+.dd-select-all-lbl { flex: 1; color: var(--txt); font-weight: var(--fw-medium); }
 .dd-total-count { color: var(--txt-dim); font-size: var(--fs-xs); }
 
 /* footer actions (Reset + Apply): the dropdown's buttons are 24px, between the chip and
@@ -96,7 +94,7 @@ $fs-list: 11.5px;
   border: 1px solid var(--border);
   color: var(--txt-muted);
   font-size: var(--fs-xs);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   cursor: pointer;
   transition: all .12s;
 }
@@ -110,8 +108,8 @@ $fs-list: 11.5px;
   border: none;
   color: #fff;
   font-size: var(--fs-xs);
-  font-family: var(--ui);
-  font-weight: 600;
+  font-family: var(--font-ui);
+  font-weight: var(--fw-semibold);
   cursor: pointer;
   transition: opacity .12s;
 }
@@ -126,7 +124,7 @@ $fs-list: 11.5px;
   border: 1px solid var(--border);
   color: var(--txt-muted);
   font-size: var(--fs-xs);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   cursor: pointer;
   transition: all .12s;
 }
@@ -151,9 +149,9 @@ $fs-list: 11.5px;
   gap: 8px;
   padding: 4px 12px;
   cursor: pointer;
-  font-size: $fs-list;
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   color: var(--txt-muted);
   transition: background .1s;
 
@@ -219,7 +217,7 @@ $fs-list: 11.5px;
   outline: none;
   color: var(--txt);
   font-size: var(--fs-sm);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   caret-color: var(--accent);
   min-width: 0;
 }
@@ -231,9 +229,9 @@ $fs-list: 11.5px;
   gap: 7px;
   padding: 4px 12px;
   cursor: pointer;
-  font-size: $fs-list;
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   color: var(--txt-muted);
   transition: background .1s;
   flex-shrink: 0;
@@ -277,9 +275,9 @@ $fs-list: 11.5px;
   border: none;
   border-top: 1px solid var(--border);
   color: var(--accent);
-  font-size: $fs-list;
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   cursor: pointer;
   transition: background .1s;
   flex-shrink: 0;
@@ -289,7 +287,7 @@ $fs-list: 11.5px;
   padding: 10px 12px;
   font-size: var(--fs-sm);
   color: var(--txt-dim);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   font-style: italic;
 }
 
@@ -299,7 +297,7 @@ $fs-list: 11.5px;
    Same specificity as the base rules, later in the cascade (styles.scss order). */
 .ctx-menu button {
   padding: 4px 12px;
-  font-size: $fs-list;
+  font-size: var(--fs-dense);
   line-height: var(--lh-ui);
 }
 .ctx-label {

@@ -142,7 +142,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
 
     .lat-title {
       font-size: var(--fs-md);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       color: var(--text-primary);
       flex: 1;
     }
@@ -211,9 +211,9 @@ import { serviceColor } from '../../../shared/utils/service-color';
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
       font-size: var(--fs-2xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: var(--ls-caps);
       color: var(--text-muted);
       padding: 4px 12px;
     }
@@ -253,7 +253,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
     .lat-svc-name {
       font-size: var(--fs-sm);
       color: var(--text-primary);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -261,7 +261,7 @@ import { serviceColor } from '../../../shared/utils/service-color';
 
     .lat-err-badge {
       font-size: var(--fs-2xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       padding: 1px 5px;
       border-radius: 3px;
       background: color-mix(in srgb, var(--error) 15%, transparent);
@@ -357,8 +357,8 @@ import { serviceColor } from '../../../shared/utils/service-color';
         &::before {
           content: attr(data-label);
           font-size: var(--fs-3xs);
-          font-weight: 600;
-          letter-spacing: .05em;
+          font-weight: var(--fw-semibold);
+          letter-spacing: var(--ls-caps);
           text-transform: uppercase;
           color: var(--text-muted);
         }

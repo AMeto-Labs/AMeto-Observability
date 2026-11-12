@@ -6,7 +6,7 @@ import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import type { Chart as ChartJs } from 'chart.js';
-import { loadChart } from '../../shared/utils/chart-lazy';
+import { loadChart, rootPx } from '../../shared/utils/chart-lazy';
 import { format, subHours, formatISO } from 'date-fns';
 import { forkJoin, of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
@@ -668,21 +668,22 @@ function lineOpts(showLegend: boolean): any {
   const legendC = cssVar('--text-secondary', '#94a3b8');
   const tipBg   = cssVar('--bg-elevated', '#0f172a');
   const tipText = cssVar('--text-primary', '#e2e8f0');
+  const tickPx  = rootPx('--fs-2xs', 10);
   return {
     responsive: true, maintainAspectRatio: false, animation: false,
     interaction: { mode: 'index', intersect: false },
     scales: {
       x: {
         type: 'linear',
-        ticks: { color: tick, maxTicksLimit: 7, font: { size: 10 },
+        ticks: { color: tick, maxTicksLimit: 7, font: { size: tickPx },
                  callback: (v: any) => format(new Date(Number(v)), 'HH:mm') },
         grid: { color: grid }, border: { display: false },
       },
-      y: { ticks: { color: tick, font: { size: 10 } }, grid: { color: grid }, border: { display: false } },
+      y: { ticks: { color: tick, font: { size: tickPx } }, grid: { color: grid }, border: { display: false } },
     },
     plugins: {
       legend: { display: showLegend, position: 'bottom',
-                labels: { color: legendC, font: { size: 10 }, boxWidth: 10, boxHeight: 10, usePointStyle: true } },
+                labels: { color: legendC, font: { size: tickPx }, boxWidth: 10, boxHeight: 10, usePointStyle: true } },
       tooltip: { backgroundColor: tipBg, borderColor: grid, borderWidth: 1,
                  titleColor: tipText, bodyColor: legendC, padding: 8,
                  callbacks: {

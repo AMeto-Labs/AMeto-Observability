@@ -22,12 +22,12 @@
 .sh-title {
   margin: 0;
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: var(--lh-tight);
   color: var(--txt);
 }
 .sh-sub {
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -35,8 +35,8 @@
 }
 .sh-tag {
   font-size: var(--fs-3xs);
-  font-weight: 700;
-  letter-spacing: .04em;
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-caps);
   text-transform: uppercase;
   color: var(--error);
   border: 1px solid var(--error);
@@ -74,9 +74,9 @@
 }
 .ct {
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .06em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -96,7 +96,7 @@
   font-size: var(--fs-2xs);
   color: var(--txt-dim);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   line-height: 1.2;
   white-space: nowrap;
   overflow: hidden;
@@ -104,7 +104,7 @@
 }
 .tv {
   font-size: var(--fs-xl);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: var(--lh-tight);
   font-variant-numeric: tabular-nums;
   color: var(--txt);
@@ -139,7 +139,7 @@
   min-width: 0;
 }
 .sub {
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   color: var(--txt-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -198,7 +198,7 @@ button.bar:hover .fill { filter: brightness(1.2); }
   height: 16px;
   margin-top: 6px;
   border-top: 1px solid var(--border);
-  font-size: 9.5px;
+  font-size: var(--fs-3xs);
   color: var(--txt-dim);
   flex-shrink: 0;
 }
@@ -219,14 +219,14 @@ button.bar:hover .fill { filter: brightness(1.2); }
   background: none;
   color: var(--txt-dim);
   font: inherit;
-  font-size: 10.5px;
+  font-size: var(--fs-meta);
   cursor: pointer;
 }
 .tab:hover { color: var(--txt); }
 .tab[aria-selected="true"] {
   color: var(--txt);
   background: var(--surface-2);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 /* ── Empty and unavailable: in the chart's place, and a line in the breakdown's ── */

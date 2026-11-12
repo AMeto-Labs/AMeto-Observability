@@ -83,19 +83,49 @@
   --panel-w: 248px;
   --toolbar-h: 40px;
 
+  /* ── Fonts (design canvas, page «Шрифты», variant B, 2026-11-12) ────────────────────────
+     Both families ship with the client (@fontsource, SIL OFL 1.1; see angular.json → styles)
+     and AMeto serves them itself: nothing is fetched from another host, so a closed network
+     renders exactly what the internet does. The OS stacks behind them only cover the moment
+     before a file arrives. Components name a ROLE below, never a family. */
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --font-ui:   var(--font-sans); /* chrome: navigation, buttons, labels, titles, tiles            */
+  --font-log:  var(--font-sans); /* log rows, the message, property values — dense, proportional */
+  --font-code: var(--font-mono); /* JSON, filter expressions, stack traces, IDs, keys, code      */
+
   /* ── Type scale: one for every page (design canvas "Шкала типографики", 2026-11) ──────────
-     Set at 100 % zoom. Secondary text recedes by weight and size, not by contrast. */
-  --fs-3xs: 9px;    /* axis ticks, kind tags, nav eyebrows — small caps only            */
-  --fs-2xs: 10px;   /* column headers, section captions, level and status badges       */
-  --fs-xs:  11px;   /* buttons, tabs, chips, metadata, property keys, row time, cells   */
-  --fs-sm:  12px;   /* the base: body, log rows and messages, inputs, values, JSON      */
-  --fs-md:  13px;   /* a row's lead text: trace path, alert rule name, modal section    */
-  --fs-lg:  14px;   /* page and modal titles — one size instead of two                 */
-  --fs-xl:  18px;   /* the number on a Stats / Traces tile, an alert rule's value       */
-  --fs-2xl: 22px;   /* the login title and Reference's h1 — the only large ones         */
+     Set at 100 % zoom. Secondary text recedes by weight and size, not by contrast. The two
+     half-steps are the dense UI's own: they used to be one-offs ($fs-table and friends). */
+  --fs-3xs:   9px;    /* axis ticks, kind tags, nav eyebrows — small caps only            */
+  --fs-2xs:   10px;   /* column headers, section captions, level and status badges       */
+  --fs-meta:  10.5px; /* chips, counters, footers, sub-captions, property keys           */
+  --fs-xs:    11px;   /* buttons, tabs, metadata, row time and service, cells            */
+  --fs-dense: 11.5px; /* tables, lists, menus, property values, IDs, stack traces        */
+  --fs-sm:    12px;   /* the base: body, log rows and messages, inputs, JSON and code    */
+  --fs-md:    13px;   /* a row's lead text: trace path, alert rule name; a phone message */
+  --fs-lg:    14px;   /* page and modal titles — one size instead of two                 */
+  --fs-xl:    18px;   /* the number on a Stats / Traces tile, an alert rule's value       */
+  --fs-2xl:   22px;   /* the login title and Reference's h1 — the only large ones         */
+
+  /* Three weights. Nothing is heavier than 600: Google used to serve Inter at 400–600 only,
+     so every 700 in the app already rendered as 600, and the self-hosted variable font would
+     make them bolder. _base.scss pins b / strong / th / h1–h6 for the same reason. */
+  --fw-regular:  400; /* text, values                                 */
+  --fw-medium:   500; /* buttons, navigation labels, the service name */
+  --fw-semibold: 600; /* titles, numbers, column headers, badges      */
+
   --lh-tight: 1.25; /* titles, badges, tile numbers   */
   --lh-ui:    1.4;  /* controls, tabs, filter text    */
+  --lh-base:  1.45; /* body default                   */
   --lh-body:  1.5;  /* log rows, running text, JSON   */
+
+  /* Letter-spacing: five values instead of sixteen. */
+  --ls-tight: -0.01em; /* 18–22 px: tile numbers, large titles            */
+  --ls-0:     0;       /* 11–14 px running text                           */
+  --ls-small: 0.01em;  /* 9–10.5 px lowercase: navigation labels, ticks   */
+  --ls-badge: 0.03em;  /* level and status badges, chips, pills           */
+  --ls-caps:  0.05em;  /* uppercase captions and column headers           */
 
   /* ── Heights and spacing ─────────────────────────────────────────────────────────────── */
   --ctl-h:    26px; /* inputs, selects, buttons (were 34 / 32 / 30 / 28) */
@@ -107,14 +137,10 @@
   --radius-card: 8px;
   --radius: 6px;
   --radius-sm: 4px;
-  --font-ui: Inter, "Segoe UI", sans-serif;
-  --font-mono: Inter, "Segoe UI", sans-serif;
-  --mono: var(--font-ui);
-  --ui: var(--font-ui);
   --log-font-size: var(--fs-sm);
   --log-line-height: var(--lh-body);
   --log-row-h: 24px;          /* one collapsed log row; the virtual list sizes rows by it (events.ts) */
-  --log-letter-spacing: 0;
+  --log-letter-spacing: var(--ls-0);
 
   --bg: var(--bg-main);
   --surface: var(--bg-secondary);

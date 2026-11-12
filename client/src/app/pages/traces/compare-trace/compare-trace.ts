@@ -113,17 +113,17 @@ interface AlignedRow {
                   </div>
                 </div>
 
-                <span class="cmp-col-a mono" data-label="A">
+                <span class="cmp-col-a" data-label="A">
                   {{ row.aSpan ? fmtMs(row.aSpan.durationNanos / 1_000_000) : '—' }}
                   @if (!row.aSpan) { <span class="badge-missing">missing</span> }
                 </span>
 
-                <span class="cmp-col-b mono" data-label="B">
+                <span class="cmp-col-b" data-label="B">
                   {{ row.bSpan ? fmtMs(row.bSpan.durationNanos / 1_000_000) : '—' }}
                   @if (!row.bSpan) { <span class="badge-missing">missing</span> }
                 </span>
 
-                <span class="cmp-col-diff mono" data-label="Δ"
+                <span class="cmp-col-diff" data-label="Δ"
                       [class.faster]="(row.diffMs ?? 0) < 0"
                       [class.slower]="(row.diffMs ?? 0) > 0">
                   {{ row.diffMs !== null ? diffLabel(row.diffMs) : '—' }}
@@ -188,9 +188,9 @@ interface AlignedRow {
 
     .cmp-label {
       font-size: var(--fs-2xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: var(--ls-caps);
       color: var(--text-muted);
     }
 
@@ -202,8 +202,8 @@ interface AlignedRow {
       border: 1px solid var(--border);
       border-radius: var(--radius);
       color: var(--text-primary);
-      font-size: var(--fs-sm);
-      font-family: var(--font-ui);
+      font-size: var(--fs-dense);
+      font-family: var(--font-code); /* a trace ID */
       outline: none;
       box-sizing: border-box;
 
@@ -213,7 +213,7 @@ interface AlignedRow {
 
     .cmp-vs {
       font-size: var(--fs-sm);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       color: var(--text-muted);
       padding-bottom: 6px;
       flex-shrink: 0;
@@ -230,7 +230,7 @@ interface AlignedRow {
       border-radius: var(--radius);
       color: #000;
       font-size: var(--fs-sm);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       cursor: pointer;
       flex-shrink: 0;
       transition: opacity .15s;
@@ -270,17 +270,17 @@ interface AlignedRow {
 
     .cmp-sum-label {
       font-size: var(--fs-2xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: var(--ls-caps);
       color: var(--text-muted);
       white-space: nowrap;
     }
 
-    /* 15px/600 (design canvas) — between --fs-md and --fs-xl, so a literal. */
+    /* The summary numbers: --fs-lg (the canvas drew 15px; the scale's step is 14). */
     .cmp-sum-val {
-      font-size: 15px;
-      font-weight: 600;
+      font-size: var(--fs-lg);
+      font-weight: var(--fw-semibold);
       line-height: var(--lh-tight);
       color: var(--text-primary);
       font-family: var(--font-ui);
@@ -315,9 +315,9 @@ interface AlignedRow {
       background: var(--bg-elevated);
       border-bottom: 1px solid var(--border);
       font-size: var(--fs-2xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: var(--ls-caps);
       color: var(--text-muted);
       padding: 4px 12px;
       flex-shrink: 0;
@@ -367,7 +367,7 @@ interface AlignedRow {
 
     .cmp-op {
       font-size: var(--fs-sm);
-      line-height: 1.25;
+      line-height: var(--lh-tight);
       color: var(--text-primary);
       white-space: nowrap;
       overflow: hidden;
@@ -376,7 +376,7 @@ interface AlignedRow {
 
     .cmp-svc {
       font-size: var(--fs-2xs);
-      line-height: 1.25;
+      line-height: var(--lh-tight);
       color: var(--text-muted);
       white-space: nowrap;
     }
@@ -391,7 +391,7 @@ interface AlignedRow {
 
     .cmp-col-diff {
       font-size: var(--fs-sm);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       text-align: right;
       padding-right: 12px;
       white-space: nowrap;
@@ -419,7 +419,7 @@ interface AlignedRow {
 
     .badge-missing {
       font-size: var(--fs-3xs);
-      font-weight: 700;
+      font-weight: var(--fw-semibold);
       padding: 1px 4px;
       border-radius: 3px;
       background: color-mix(in srgb, var(--text-muted) 15%, transparent);
@@ -428,7 +428,6 @@ interface AlignedRow {
       font-style: normal;
     }
 
-    .mono { font-family: var(--font-ui); }
 
     @keyframes spin { to { transform: rotate(360deg); } }
     .spin { animation: spin 1s linear infinite; }
@@ -474,8 +473,8 @@ interface AlignedRow {
         &::before {
           content: attr(data-label);
           font-size: var(--fs-3xs);
-          font-weight: 600;
-          letter-spacing: .05em;
+          font-weight: var(--fw-semibold);
+          letter-spacing: var(--ls-caps);
           text-transform: uppercase;
           color: var(--text-muted);
         }

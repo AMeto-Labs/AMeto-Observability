@@ -40,22 +40,22 @@
 
 .logo-name {
   font-size: var(--fs-2xl);
-  font-weight: 700;
+  font-weight: var(--fw-semibold);
   line-height: var(--lh-tight);
   color: var(--txt);
-  font-family: var(--ui);
-  letter-spacing: -.4px;
+  font-family: var(--font-ui);
+  letter-spacing: var(--ls-tight);
 }
 
 .logo-slogan {
   text-align: center;
   font-size: var(--fs-sm);
   color: var(--txt-dim);
-  font-family: var(--ui);
+  font-family: var(--font-ui);
   line-height: var(--lh-body);
   max-width: 260px;
   margin: 0;
-  letter-spacing: .1px;
+  letter-spacing: var(--ls-0);
 }
 
 .field {
@@ -67,7 +67,7 @@
 .field-label {
   font-size: var(--fs-sm);
   color: var(--text-secondary);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
 }
 
 /* The sign-in form keeps its roomier fields: the global .field-input is the dense 26px
@@ -103,7 +103,7 @@
   color: var(--text-on-primary);
   font: inherit;
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   transition: opacity .15s, background .15s;
 }
 
@@ -144,7 +144,7 @@
   color: var(--txt);
   font: inherit;
   font-size: var(--fs-md);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   transition: background .15s, border-color .15s;
   cursor: pointer;
   width: 100%;

@@ -23,7 +23,7 @@
   font-size: var(--fs-xs);
   color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: .3px;
+  letter-spacing: var(--ls-caps);
 }
 
 .info-value {
@@ -31,7 +31,7 @@
   color: var(--text-primary);
 }
 
-.mono-sm { font-size: var(--fs-xs); font-family: var(--font-mono); }
+.mono-sm { font-size: var(--fs-xs); font-family: var(--font-code); }
 
 .muted { color: var(--text-secondary); }
 
@@ -103,7 +103,7 @@
   border: 1px solid var(--border);
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: .4px;
+  letter-spacing: var(--ls-badge);
 
   &[data-provider='google']    { border-color: #4285F4; color: #4285F4; }
   &[data-provider='microsoft'] { border-color: #0078D4; color: #0078D4; }
@@ -128,7 +128,7 @@
   border-radius: 99px;
   border: 1px solid var(--border);
   text-transform: uppercase;
-  letter-spacing: .4px;
+  letter-spacing: var(--ls-badge);
 
   &.active  { border-color: var(--success, #22C55E); color: var(--success, #22C55E); }
   &.blocked { border-color: var(--error); color: var(--error); }

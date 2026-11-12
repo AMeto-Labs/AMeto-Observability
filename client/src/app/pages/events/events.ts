@@ -187,14 +187,14 @@ export class EventsComponent implements OnInit {
   private measureCtx?: CanvasRenderingContext2D | null;
   private readonly fontsReady = signal(false);
 
-  /** A service name's width in the row's font: --fs-xs (11px) in --font-mono, what .ev-svc-name renders at. */
+  /** A service name's width in the row's font: --fs-xs (11px) in --font-log, what .ev-svc-name renders at. */
   private textWidth(name: string): number {
     let w = this.nameWidths.get(name);
     if (w !== undefined) return w;
     if (this.measureCtx === undefined) {
       this.measureCtx = document.createElement('canvas').getContext('2d');
       const root = getComputedStyle(document.documentElement);
-      const family = root.getPropertyValue('--font-mono').trim();
+      const family = root.getPropertyValue('--font-log').trim();
       // Read from the same token the row's name is set in, so a change to the scale cannot leave
       // the measured column and the rendered name at different sizes. No stylesheet (a test
       // host): the token's value.

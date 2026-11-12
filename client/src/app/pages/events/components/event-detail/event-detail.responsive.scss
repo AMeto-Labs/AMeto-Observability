@@ -36,7 +36,7 @@
   border: 0;
   border-radius: 0;
   box-shadow: none;
-  font-family: var(--ui);
+  font-family: var(--font-ui);
 }
 .as-sheet--ctx .ctx-menu button {
   min-height: 48px;
@@ -56,9 +56,9 @@
   padding: 8px 16px 4px;
   max-width: none;
   font-size: var(--fs-2xs);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: var(--ls-caps);
   color: var(--txt-dim);
 }
 .as-sheet--ctx .ctx-label + .ctx-label { padding-top: 0; }
@@ -79,7 +79,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--surface);
     flex-shrink: 0;
-    font-family: var(--ui);
+    font-family: var(--font-ui);
   }
   .ph-back {
     display: inline-flex;
@@ -108,17 +108,17 @@
     gap: 6px;
     min-width: 0;
   }
-  .ph-dbadge { line-height: 14px; letter-spacing: .04em; }
+  .ph-dbadge { line-height: 14px; letter-spacing: var(--ls-badge); }
   .ph-dsvc {
-    font-size: 12.5px;
-    font-weight: 600;
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
     color: var(--txt);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .ph-dmeta {
-    font-size: 10.5px;
+    font-size: var(--fs-meta);
     color: var(--txt-dim);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -151,7 +151,7 @@
     border-left: 3px solid var(--sev, var(--accent));
     border-radius: 6px;
   }
-  .d-message-text { font-size: 12.5px; }
+  .d-message-text { font-size: var(--fs-md); }
   .d-message-text.d-clamp {
     display: block;
     -webkit-line-clamp: unset;
@@ -195,14 +195,14 @@
     width: 86px;
     flex-shrink: 0;
     font-size: var(--fs-2xs);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     text-transform: uppercase;
-    letter-spacing: .05em;
+    letter-spacing: var(--ls-caps);
     color: var(--txt-dim);
   }
   .d-fact-v { flex: 1; min-width: 0; flex-wrap: nowrap; }
   .d-fact-val { font-size: var(--fs-sm); }
-  .d-fact-val.d-id { font-size: 11.5px; }
+  .d-fact-val.d-id { font-size: var(--fs-dense); }
   .d-svc-dot { width: 7px; height: 7px; }
   .d-facts .ev-log-badge { padding: 1px 7px; line-height: 14px; }
   .d-menu-btn,
@@ -254,7 +254,7 @@
   .d-prop-k {
     grid-area: k;
     padding: 0;
-    font-size: 10.5px;
+    font-size: var(--fs-meta);
     color: var(--txt-dim);
   }
   .d-prop-v {
@@ -358,7 +358,7 @@
     align-items: center;
     height: 20px;
     margin-bottom: 4px;
-    letter-spacing: .06em;
+    letter-spacing: var(--ls-caps);
   }
   .tr-block-label--wf {
     height: 28px;
@@ -376,8 +376,8 @@
     background: var(--accent-soft);
     color: var(--accent);
     font-size: var(--fs-xs);
-    font-weight: 600;
-    letter-spacing: 0;
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-0);
     text-transform: none;
     text-decoration: none;
     white-space: nowrap;
@@ -395,7 +395,7 @@
   .ev-wf-axis .ev-wf-bar-col { height: 20px; }
   .ev-wf-tick {
     top: 4px;
-    font-size: 9.5px;
+    font-size: var(--fs-3xs);
     color: var(--txt-dim);
   }
   .ev-wf-row {
@@ -434,24 +434,24 @@
   .ev-wf-svc {
     flex-shrink: 0;
     max-width: 92px;
-    font-size: 9.5px;
+    font-size: var(--fs-2xs);
   }
   .ev-wf-op {
     flex: 1;
-    font-size: 11.5px;
+    font-size: var(--fs-dense);
     color: var(--txt);
   }
   .ev-wf-me {
     flex-shrink: 0;
-    font-size: 9.5px;
-    font-weight: 700;
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-semibold);
     color: var(--accent);
     font-variant-numeric: tabular-nums;
   }
   .ev-wf-dur-col {
     grid-area: dur;
     flex: none;
-    font-size: 10.5px;
+    font-size: var(--fs-meta);
     padding-left: 6px;
   }
   .ev-wf-bar-col {
@@ -477,10 +477,10 @@
   .tr-tags { gap: 6px; margin-bottom: 4px; }
   .tr-badge {
     padding: 0 5px;
-    font-size: 9.5px;
-    font-weight: 700;
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-semibold);
     line-height: 15px;
-    letter-spacing: .03em;
+    letter-spacing: var(--ls-badge);
     border-radius: 3px;
   }
   .tr-ids { gap: 0; }
@@ -492,7 +492,7 @@
   }
   .tr-id-row--tp { margin: 0; padding: 0; border-top: 0; }
   .tr-id-key { width: 84px; font-size: var(--fs-xs); }
-  .tr-id-val { font-size: 11.5px; }
+  .tr-id-val { font-size: var(--fs-dense); }
   .tr-id-val--tp { color: var(--txt-muted); }
   .tr-copy-btn {
     width: 32px;

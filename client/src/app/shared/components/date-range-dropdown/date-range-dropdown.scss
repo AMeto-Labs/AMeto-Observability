@@ -16,8 +16,8 @@
   border-radius: 8px;
   box-shadow: var(--shadow);
   color: var(--txt);
-  font-family: var(--ui);
-  font-size: 12px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-sm);
 }
 
 .trp-head {
@@ -26,8 +26,8 @@
   justify-content: space-between;
   gap: 12px;
 }
-.trp-title { font-size: 12px; font-weight: 600; letter-spacing: .3px; }
-.trp-summary { font-size: 11px; color: var(--txt-dim); font-variant-numeric: tabular-nums; }
+.trp-title { font-size: var(--fs-sm); font-weight: var(--fw-semibold); letter-spacing: var(--ls-0); }
+.trp-summary { font-size: var(--fs-xs); color: var(--txt-dim); font-variant-numeric: tabular-nums; }
 
 /* Quick ranges */
 .trp-chips { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -38,8 +38,8 @@
   border: 1px solid var(--border);
   background: none;
   color: var(--txt-muted);
-  font-size: 11px;
-  font-family: var(--ui);
+  font-size: var(--fs-xs);
+  font-family: var(--font-ui);
   cursor: pointer;
   transition: border-color .12s, color .12s, background .12s;
 }
@@ -48,14 +48,14 @@
   border-color: var(--accent);
   background: var(--accent-dim);
   color: var(--accent);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 /* From – To */
 .trp-sides { display: flex; align-items: flex-start; gap: 8px; }
 .trp-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
-.trp-dash { margin-top: 24px; color: var(--txt-dim); font-size: 13px; }
-.trp-label { font-size: 11px; color: var(--txt-dim); }
+.trp-dash { margin-top: 24px; color: var(--txt-dim); font-size: var(--fs-md); }
+.trp-label { font-size: var(--fs-xs); color: var(--txt-dim); }
 .trp-anchor { position: relative; }
 
 .trp-field { display: flex; height: 30px; }
@@ -84,8 +84,8 @@
   outline: 0;
   background: none;
   color: var(--txt);
-  font-size: 12px;
-  font-family: var(--ui);
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
   font-variant-numeric: tabular-nums;
   caret-color: var(--accent);
 }
@@ -129,7 +129,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--txt-dim);
 }
 .trp-link {
@@ -137,14 +137,14 @@
   border: 0;
   background: none;
   color: var(--accent);
-  font-size: 11.5px;
-  font-weight: 600;
-  font-family: var(--ui);
+  font-size: var(--fs-dense);
+  font-weight: var(--fw-semibold);
+  font-family: var(--font-ui);
   cursor: pointer;
 }
 .trp-link:hover { text-decoration: underline; }
 // Set times / Whole days: a quiet toggle, the size of the note beside it.
-.trp-note .trp-link { font-size: 11px; font-weight: 500; }
+.trp-note .trp-link { font-size: var(--fs-xs); font-weight: var(--fw-medium); }
 .trp-set-times { display: inline-flex; align-items: center; gap: 3px; }
 
 .trp-actions { display: flex; align-items: center; justify-content: space-between; }
@@ -183,8 +183,8 @@
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
 }
-.trp-tp-name { font-size: 11px; color: var(--txt-dim); }
-.trp-tp-value { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.trp-tp-name { font-size: var(--fs-xs); color: var(--txt-dim); }
+.trp-tp-value { font-size: var(--fs-md); font-weight: var(--fw-semibold); font-variant-numeric: tabular-nums; }
 .trp-tp-cols {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -192,7 +192,7 @@
   padding: 6px 10px;
 }
 .trp-tp-col { display: flex; flex-direction: column; gap: 3px; }
-.trp-tp-unit { font-size: 10.5px; font-weight: 600; color: var(--txt-dim); text-align: center; }
+.trp-tp-unit { font-size: var(--fs-meta); font-weight: var(--fw-semibold); color: var(--txt-dim); text-align: center; }
 .trp-tp-list {
   position: relative;
   height: 168px;
@@ -210,13 +210,13 @@
   border-radius: var(--radius);
   background: none;
   color: var(--txt-muted);
-  font-size: 12px;
-  font-family: var(--ui);
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
 }
 .trp-tp-item:hover { background: var(--surface-hover); color: var(--txt); }
-.trp-tp-item.selected { background: var(--accent); color: var(--text-on-accent); font-weight: 700; }
+.trp-tp-item.selected { background: var(--accent); color: var(--text-on-accent); font-weight: var(--fw-semibold); }
 
 /* Date picker */
 .trp-cal { width: 232px; }
@@ -227,7 +227,7 @@
   padding: 6px 8px;
   border-bottom: 1px solid var(--border);
 }
-.trp-cal-month { font-size: 12px; font-weight: 600; }
+.trp-cal-month { font-size: var(--fs-sm); font-weight: var(--fw-semibold); }
 .trp-cal-nav {
   width: 24px;
   height: 24px;
@@ -253,8 +253,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10.5px;
-  font-weight: 600;
+  font-size: var(--fs-meta);
+  font-weight: var(--fw-semibold);
   color: var(--txt-dim);
 }
 .trp-cal-day {
@@ -264,8 +264,8 @@
   border-radius: var(--radius);
   background: none;
   color: var(--txt-muted);
-  font-size: 11.5px;
-  font-family: var(--ui);
+  font-size: var(--fs-dense);
+  font-family: var(--font-ui);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
 }
@@ -274,4 +274,4 @@
 .trp-cal-day.future { color: var(--txt-dim); }
 .trp-cal-day.in-range { background: var(--accent-dim); color: var(--txt); border-radius: 0; }
 .trp-cal-day.today { box-shadow: inset 0 0 0 1px var(--txt-dim); }
-.trp-cal-day.selected { background: var(--accent); color: var(--text-on-accent); font-weight: 700; border-radius: var(--radius); }
+.trp-cal-day.selected { background: var(--accent); color: var(--text-on-accent); font-weight: var(--fw-semibold); border-radius: var(--radius); }

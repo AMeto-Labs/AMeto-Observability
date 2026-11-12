@@ -141,7 +141,7 @@
     border-radius: var(--radius);
     color: var(--text-primary);
     font-size: var(--fs-sm);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     cursor: pointer;
   }
 
@@ -190,7 +190,7 @@
     &.active { border-color: var(--accent); color: var(--accent); }
   }
 
-  .filters-count { color: var(--accent); font-weight: 600; }
+  .filters-count { color: var(--accent); font-weight: var(--fw-semibold); }
 
   // ── The sheet ─────────────────────────────────────────────────────────────
   .hdr-sheet {
@@ -239,7 +239,7 @@
 
   .sheet-title {
     font-size: var(--fs-md);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     color: var(--text-primary);
   }
 
@@ -265,7 +265,7 @@
       height: 44px;
       border-radius: var(--radius);
       font-size: var(--fs-md);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       cursor: pointer;
     }
   }
@@ -314,8 +314,8 @@
   .custom-range::before {
     flex-basis: 100%;
     font-size: var(--fs-2xs);
-    font-weight: 600;
-    letter-spacing: .05em;
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-caps);
     text-transform: uppercase;
     color: var(--text-muted);
   }
@@ -588,7 +588,7 @@
   }
 
   .sd-key { width: auto; }
-  .sd-val { font-size: var(--fs-md); font-weight: 600; }
+  .sd-val { font-size: var(--fs-md); font-weight: var(--fw-semibold); }
 
   // The operation is the sheet's title, drawn first and across the row…
   .sd-field--op {
@@ -599,7 +599,7 @@
     border: none;
     border-radius: 0;
 
-    .sd-val { font-size: var(--fs-md); font-weight: 600; word-break: break-word; }
+    .sd-val { font-size: var(--fs-md); font-weight: var(--fw-semibold); word-break: break-word; }
   }
 
   // …the ids are a tap away in the Details tab, and Start stands in as the third KPI only
