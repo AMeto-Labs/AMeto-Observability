@@ -183,6 +183,7 @@ public sealed class LazyExceptionEvaluationTests
                      // guard that keeps that from happening again quietly.
                      "has(@x)", "isDefined(@x)", "not has(@x)",
                      "has(@x.type)", "has(@x.message)", "has(@x.inner.type)",
+                     "@x.exists = true", "@x.exists = false", "@x.exists != true",
                      "timeout", "gateway", "settle", "exception", "EXCEPTION",
                      "invalidoperation", "System.TimeoutException", "formatexception",
                      "nosuchterm", "order",                       // the last one hits the template
@@ -203,6 +204,31 @@ public sealed class LazyExceptionEvaluationTests
     }
 
     /// <summary>
+    /// <c>@x.exists</c> is <c>has(@x)</c> asked as a comparison, so over every payload shape and
+    /// on both roads the two must select the same events: <c>= true</c> where <c>has(@x)</c>
+    /// does, <c>= false</c> and <c>!= true</c> where <c>not has(@x)</c> does. The oracle above
+    /// cannot see a wrong answer both of its sides share, so the absolute one is pinned too —
+    /// present exactly where the payload decodes to an exception.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Payloads))]
+    public void ExistsSelectsExactlyWhatHasSelects(string which)
+    {
+        var  bytes   = PayloadBytes(which);
+        var  asObj   = ExceptionInfo.FromBytes(bytes.AsSpan());
+        bool present = asObj is not null;
+
+        foreach (var make in new Func<LogEvent>[] { () => WithObject(asObj), () => WithBytes(bytes) })
+        {
+            Assert.Equal(present,  Eval("has(@x)", make()));
+            Assert.Equal(present,  Eval("@x.exists = true", make()));
+            Assert.Equal(!present, Eval("not has(@x)", make()));
+            Assert.Equal(!present, Eval("@x.exists = false", make()));
+            Assert.Equal(!present, Eval("@x.exists != true", make()));
+        }
+    }
+
+    /// <summary>
     /// …and the point of all that: neither predicate decodes. This is what fails on a revert —
     /// the answers above are identical either way, the cost is not.
     /// </summary>
@@ -211,6 +237,9 @@ public sealed class LazyExceptionEvaluationTests
     [InlineData("isDefined(@x)")]           // IsDefinedNode → HasProperty
     [InlineData("not has(@x)")]             // negated, same reader
     [InlineData("has(@x.type)")]            // the alias @x resolves to
+    [InlineData("@x.exists = true")]        // CompareNode  → ReadBuiltin → HasException
+    [InlineData("@x.exists = false")]
+    [InlineData("@x.exists != true")]
     [InlineData("timeout")]                 // free text, matches the exception message
     [InlineData("gateway settle")]          // two terms, both in the message
     [InlineData("nosuchterm")]              // free text, matches nothing
