@@ -36,6 +36,10 @@ sum(Elapsed) > 5             # no such function
 'a' != 'b'                   # no property to test — this used to match everything
 ```
 
+Nesting is limited too: parentheses and `not` may go 100 levels deep, and a filter that goes
+deeper is a 400 whatever else it holds, free text included. A long `a and b and c …` is not
+nesting and is not limited.
+
 ## Aggregation
 
 A query that starts with `select` answers with a **table** instead of a list of events,

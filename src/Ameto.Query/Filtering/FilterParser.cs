@@ -60,8 +60,44 @@ namespace Ameto.Query.Filtering;
 /// </summary>
 public sealed class FilterParser
 {
+    /// <summary>
+    /// How deep a filter may nest. Every parenthesised group and every <c>not</c> is one level;
+    /// the level after this one is refused with a <see cref="FormatException"/>.
+    ///
+    /// <para>The parser descends by recursion, a level at a time, and a filter is text from
+    /// outside: the search box, a saved filter, an alert rule. Without a limit the text decides
+    /// how much stack is used, and a stack overflow cannot be caught — it ends the process.
+    /// Measured before this limit existed, on Windows, where a thread's stack is 1.5 MB:
+    /// 187 nested parentheses parsed in a Debug build and 188 ended the process. A Release
+    /// server went 270 deep when the filter was the first it parsed and 580 once the JIT had
+    /// optimised the parser — a filter of six hundred to twelve hundred characters, from
+    /// anyone who may search, where a request line holds eight thousand.</para>
+    ///
+    /// <para>A filter written by hand nests a handful deep. One grown by CLICKING nests once per
+    /// click: the events page adds a condition as <c>(current filter) and X</c>, so the hundredth
+    /// "exclude these" is a hundred parentheses. That is what 100 leaves room for — about what
+    /// fits in a request line anyway — and it is half of the lowest threshold measured. Since
+    /// <see cref="ParseAtom"/> was split from <see cref="ParsePredicate"/> a level also costs
+    /// some 500 bytes of stack rather than several kilobytes, so the limit is 50 KB at its
+    /// deepest, and the margin no longer depends on how many functions the language has.</para>
+    ///
+    /// <para>The limit bounds what RECURSES here. A long <c>a and b and c …</c> is read by a
+    /// loop and is not nesting; what keeps such a chain from being walked one stack frame per
+    /// clause afterwards is <see cref="ChainBalancer"/>.</para>
+    /// </summary>
+    public const int MaxNestingDepth = 100;
+
     private readonly List<Token> _tokens;
     private int _pos;
+
+    /// <summary>Groups and <c>not</c>s currently open around the cursor.</summary>
+    private int _depth;
+
+    /// <summary>
+    /// Set when the nesting limit refused the filter. <see cref="Parse"/> reads it so that this
+    /// one refusal is never mistaken for prose and handed to the free-text fallback.
+    /// </summary>
+    private bool _nestingRefused;
 
     private FilterParser(List<Token> tokens) => _tokens = tokens;
 
@@ -81,9 +117,9 @@ public sealed class FilterParser
         // search terms, exactly as before.
         bool structural = StructuralTokenPresent(tokens, filter!);
 
+        var parser = new FilterParser(tokens);
         try
         {
-            var parser = new FilterParser(tokens);
             var root   = parser.ParseExpr();
             if (parser.PeekKind() == TokenKind.Eof)
                 return root;
@@ -101,10 +137,16 @@ public sealed class FilterParser
                 $"Unexpected '{Describe(t)}' at pos {t.Pos} — the filter was already complete here. " +
                 "Join clauses with 'and' / 'or'.");
         }
-        catch (FormatException) when (!structural)
+        catch (FormatException) when (!structural && !parser._nestingRefused)
         {
             // Prose that happens to trip a grammar rule — a trailing `not`, a word the lexer
             // knows as a keyword. Still just words.
+            //
+            // The nesting limit is the one refusal that does not come here, structural or not.
+            // Parentheses alone are not "structural" (a stack frame is full of them), so ten
+            // thousand of them around a word would otherwise arrive as a text search for ten
+            // thousand parentheses: an answer to a question nobody asked, in place of the
+            // sentence that says what is wrong with the input.
             return AllTermsAsFreeText(tokens);
         }
     }
@@ -236,24 +278,64 @@ public sealed class FilterParser
     {
         if (PeekKind() == TokenKind.Not)
         {
+            EnterLevel(Peek());
             Consume(TokenKind.Not);
-            return new NotNode(ParseNot());
+            var operand = ParseNot();
+            _depth--;
+            return new NotNode(operand);
         }
         return ParseAtom();
     }
 
+    /// <summary>
+    /// A parenthesised group, or one predicate.
+    ///
+    /// <para>The group is the only place the grammar re-enters itself, and it is kept apart from
+    /// <see cref="ParsePredicate"/> on purpose. Every frame of this method sits on the stack once
+    /// per open parenthesis; while the group lived at the top of the method that reads the
+    /// predicates — forty-odd functions, each with its own locals — one level of nesting cost
+    /// 7.9 KB of stack in a Debug build, and in a Release one 5.5 KB until the JIT had
+    /// optimised the method and about 2.5 KB after.</para>
+    /// </summary>
     private FilterNode ParseAtom()
     {
         var t = Peek();
+        if (t.Kind != TokenKind.LParen)
+            return ParsePredicate();
 
         // Grouped: ( expr )
-        if (t.Kind == TokenKind.LParen)
-        {
-            Consume(TokenKind.LParen);
-            var inner = ParseExpr();
-            Consume(TokenKind.RParen);
-            return inner;
-        }
+        EnterLevel(t);
+        Consume(TokenKind.LParen);
+        var inner = ParseExpr();
+        Consume(TokenKind.RParen);
+        _depth--;
+        return inner;
+    }
+
+    /// <summary>
+    /// One more level of nesting — a group or a <c>not</c> — opening at <paramref name="at"/>,
+    /// or the refusal once there are more than <see cref="MaxNestingDepth"/>.
+    /// The matching <c>_depth--</c> sits after the level's last token; a parse that throws
+    /// never reaches it, and never needs to: nothing here backtracks.
+    /// </summary>
+    private void EnterLevel(Token at)
+    {
+        if (++_depth <= MaxNestingDepth) return;
+
+        _nestingRefused = true;
+        throw new FormatException(
+            $"The filter nests more than {MaxNestingDepth} levels deep at pos {at.Pos} — " +
+            "each '(' and each 'not' is a level. Simplify the grouping.");
+    }
+
+    /// <summary>
+    /// One predicate: a function call, a comparison, a set or pattern test, a bare level, or a
+    /// run of free text. Never re-enters the expression grammar — a function's arguments are
+    /// properties and literals — so however large this method grows, it is on the stack once.
+    /// </summary>
+    private FilterNode ParsePredicate()
+    {
+        var t = Peek();
 
         // Function calls: has(), isDefined(), startsWith(), contains(), ci_*
         if (t.Kind is TokenKind.Has or TokenKind.IsDefined)
