@@ -78,7 +78,12 @@ export interface McpProfileInput {
   maxEvents: number;
   maxWindowMinutes: number;
   callsPerMinute: number;
-  publishedTools: string[];
+  /**
+   * The saved tools the profile is granted, as one list. Left out, the server keeps the grants
+   * as they are — which is what a save that did not touch them wants: a tool's editor may have
+   * changed them since the card was filled.
+   */
+  publishedTools?: string[];
 }
 
 export type McpMaskAction = 'hash' | 'remove' | 'keepLast4' | 'keep';
@@ -213,6 +218,12 @@ export interface McpCall {
   filter: string | null;
   client: string | null;
   maskedBy: McpMaskedBy | null;
+  /**
+   * How many refusals the profile's minute has had so far, this one included. A profile over
+   * its calls-per-minute limit has only its 1st, 2nd, 4th, 8th… refusal of a minute recorded,
+   * and each such record carries the count. Absent or 0 for an ordinary call.
+   */
+  repeats?: number;
 }
 
 export interface McpActivityPage {

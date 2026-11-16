@@ -9,7 +9,9 @@ import {
   McpParameterType, McpPublishedTool, McpToolInput, McpToolParameter, McpToolTestResult,
 } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
-import { fmtCount, fmtWindow, parseWindow, placeholderNames, placeholderSegments, tokenSegments } from '../mcp-format';
+import {
+  asCount, fmtCount, fmtWindow, isCount, parseWindow, placeholderNames, placeholderSegments, tokenSegments,
+} from '../mcp-format';
 
 /** A parameter as its row holds it: the allowed values of an enum as one comma-separated text. */
 interface ParameterForm {
@@ -28,12 +30,45 @@ interface ToolForm {
   filter: string;
   fields: string[];
   window: string;
-  maxEvents: number;
+  /** Null while the number field is empty. */
+  maxEvents: number | null;
   order: 'newest' | 'oldest';
   profiles: string[];
 }
 
 const NEW = 'new';
+
+/** The ids of the two error lines, for the field an error is about to point at. */
+const ERROR_ID = 'mcp-tool-error';
+const TEST_ERROR_ID = 'mcp-tool-test-error';
+const PLACEHOLDERS_ID = 'mcp-tool-placeholders';
+
+/** The allowed values of an enum, from the text its row lists them in. */
+const enumValues = (text: string): string[] => text.split(',').map(v => v.trim()).filter(Boolean);
+
+/** A number as the server reads one (`double.TryParse`, invariant culture): `12`, `-0.5`, `1e3`. */
+const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+
+/**
+ * True when a parameter's default is one its type takes — the server's own test, so that what
+ * is cleared here is what would have been refused there. An enum's default is one of its
+ * values, and that is the only kind its row can show.
+ */
+function holdsDefault(p: ParameterForm): boolean {
+  const text = p.default.trim();
+  if (!text) return true;
+  switch (p.type) {
+    // To the letter: the row's list has the values as they are spelled, and nothing else.
+    case 'enum':    return enumValues(p.values).includes(p.default);
+    case 'number':  return NUMBER.test(text) && Number.isFinite(Number(text));
+    case 'boolean': return /^(?:true|false)$/i.test(text);
+    default:        return true;
+  }
+}
+
+/** The default that goes to the server: the one the parameter's row shows, or none. */
+const sentDefault = (p: ParameterForm): string | null =>
+  (p.type === 'enum' ? enumValues(p.values).find(v => v === p.default) : p.default.trim()) || null;
 
 const blank = (): ToolForm => ({
   name: '', description: '', parameters: [], filter: '', fields: [],
@@ -43,10 +78,18 @@ const blank = (): ToolForm => ({
 const toForm = (tool: McpPublishedTool | null): ToolForm => (tool ? {
   name: tool.name,
   description: tool.description,
-  parameters: tool.parameters.map(p => ({
-    name: p.name, type: p.type, required: p.required, description: p.description,
-    values: p.values.join(', '), default: p.default ?? '',
-  })),
+  parameters: tool.parameters.map(p => {
+    const values = p.values.join(', ');
+    const fallback = (p.default ?? '').trim();
+    return {
+      name: p.name, type: p.type, required: p.required, description: p.description, values,
+      // The server matches an enum's default without regard to case; the row offers the values
+      // as they are spelled, so the default is held in the spelling of the value it is.
+      default: p.type === 'enum'
+        ? enumValues(values).find(v => v.toLowerCase() === fallback.toLowerCase()) ?? ''
+        : p.default ?? '',
+    };
+  }),
   filter: tool.filter,
   fields: [...tool.fields],
   window: fmtWindow(tool.defaultWindowMinutes),
@@ -109,8 +152,29 @@ export class ToolEditorComponent {
   readonly fieldDraft = signal('');
 
   readonly types: readonly McpParameterType[] = ['string', 'number', 'boolean', 'enum'];
+  readonly asCount = asCount;
+  readonly errorId = ERROR_ID;
+  readonly testErrorId = TEST_ERROR_ID;
+  readonly placeholdersId = PLACEHOLDERS_ID;
 
   readonly windowMinutes = computed(() => parseWindow(this.form().window));
+
+  /** The parameters as their rows show them: an enum with the values its default is chosen from. */
+  readonly parameterRows = computed(() =>
+    this.form().parameters.map(p => ({ p, options: p.type === 'enum' ? enumValues(p.values) : [] })));
+
+  /** The fields that cannot be saved as they stand, or that the last refusal was about. */
+  readonly invalid = computed(() => {
+    const named = this.errorField();
+    return {
+      name: named === 'name',
+      description: named === 'description',
+      filter: named === 'filter' || this.placeholderProblems() !== '',
+      fields: named === 'fields',
+      window: this.windowMinutes() === null || named === 'defaultWindowMinutes',
+      maxEvents: !isCount(this.form().maxEvents) || named === 'maxEvents',
+    };
+  });
 
   /** The filter in runs of text and `{parameter}` placeholders, for the layer drawn under the textarea. */
   readonly filterSegments = computed(() => placeholderSegments(this.form().filter));
@@ -147,9 +211,14 @@ export class ToolEditorComponent {
     this.form.update(f => ({ ...f, ...change }));
   }
 
-  asCount(value: unknown): number {
-    const n = Math.floor(Number(value));
-    return Number.isFinite(n) && n > 0 ? n : 0;
+  /**
+   * `aria-describedby` of a field: the error lines on screen while they are about that field —
+   * the save's, the test run's, or both — else nothing.
+   */
+  describes(field: string, also: string | null = null): string | null {
+    const about = this.errorField() === field;
+    const ids = [about && this.error() !== null ? ERROR_ID : null, about && this.testError() !== null ? TEST_ERROR_ID : null, also];
+    return ids.filter(Boolean).join(' ') || null;
   }
 
   addParameter(): void {
@@ -158,8 +227,20 @@ export class ToolEditorComponent {
     });
   }
 
+  /**
+   * Changes one parameter. A default belongs to a type and, for an enum, to its values: when
+   * either changes so that the default is no longer one the parameter takes, the default goes.
+   * Kept, it would be sent with the tool — out of an enum's row, which cannot even show it.
+   */
   patchParameter(index: number, change: Partial<ParameterForm>): void {
-    this.patch({ parameters: this.form().parameters.map((p, i) => (i === index ? { ...p, ...change } : p)) });
+    const retyped = change.type !== undefined || change.values !== undefined;
+    this.patch({
+      parameters: this.form().parameters.map((p, i) => {
+        if (i !== index) return p;
+        const next = { ...p, ...change };
+        return retyped && !holdsDefault(next) ? { ...next, default: '' } : next;
+      }),
+    });
   }
 
   removeParameter(index: number): void {
@@ -204,7 +285,7 @@ export class ToolEditorComponent {
       this.fail('Write the default window with a unit: 15m, 1h, 1d.', 'defaultWindowMinutes');
       return null;
     }
-    if (!f.maxEvents) {
+    if (!isCount(f.maxEvents)) {
       this.fail('Events per call is a whole number above zero.', 'maxEvents');
       return null;
     }
@@ -213,8 +294,8 @@ export class ToolEditorComponent {
       type: p.type,
       required: p.required,
       description: p.description.trim(),
-      values: p.type === 'enum' ? p.values.split(',').map(v => v.trim()).filter(Boolean) : [],
-      default: p.default.trim() || null,
+      values: p.type === 'enum' ? enumValues(p.values) : [],
+      default: sentDefault(p),
     }));
     return {
       name: f.name.trim(), description: f.description.trim(), parameters, filter: f.filter.trim(), fields: f.fields,
@@ -269,7 +350,7 @@ export class ToolEditorComponent {
   readonly testParameters = computed(() => this.form().parameters.filter(p => p.name.trim()).map(p => ({
     name: p.name.trim(),
     type: p.type,
-    options: p.type === 'enum' ? p.values.split(',').map(v => v.trim()).filter(Boolean) : p.type === 'boolean' ? ['true', 'false'] : [],
+    options: p.type === 'enum' ? enumValues(p.values) : p.type === 'boolean' ? ['true', 'false'] : [],
     placeholder: p.default.trim() || (p.required ? 'required' : 'optional'),
   })));
 

@@ -88,6 +88,8 @@
           <span class="m-mut">Response budget</span>
           <span class="limit-ctl">
             <input class="field-input" type="number" min="1000" max="24000" step="500" aria-label="Response budget, tokens"
+                   [class.invalid]="invalid().responseBudgetTokens"
+                   [attr.aria-invalid]="invalid().responseBudgetTokens || null" [attr.aria-describedby]="describes('responseBudgetTokens')"
                    [ngModel]="form().responseBudgetTokens" (ngModelChange)="setLimit('responseBudgetTokens', asCount($event))" />
             <span class="m-hint unit">tokens</span>
           </span>
@@ -96,7 +98,8 @@
           <span class="m-mut">Widest time window</span>
           <span class="limit-ctl">
             <input class="field-input" type="text" aria-label="Widest time window" placeholder="7d"
-                   [class.invalid]="windowMinutes() === null"
+                   [class.invalid]="invalid().window"
+                   [attr.aria-invalid]="invalid().window || null" [attr.aria-describedby]="describes('window')"
                    [ngModel]="form().window" (ngModelChange)="setLimit('window', $event)" />
             <span class="m-hint unit">m · h · d</span>
           </span>
@@ -105,6 +108,8 @@
           <span class="m-mut">Events per call</span>
           <span class="limit-ctl">
             <input class="field-input" type="number" min="10" max="5000" aria-label="Events per call"
+                   [class.invalid]="invalid().maxEvents"
+                   [attr.aria-invalid]="invalid().maxEvents || null" [attr.aria-describedby]="describes('maxEvents')"
                    [ngModel]="form().maxEvents" (ngModelChange)="setLimit('maxEvents', asCount($event))" />
             <span class="m-hint unit">events</span>
           </span>
@@ -113,6 +118,8 @@
           <span class="m-mut">Calls per key</span>
           <span class="limit-ctl">
             <input class="field-input" type="number" min="1" max="6000" aria-label="Calls per key, per minute"
+                   [class.invalid]="invalid().callsPerMinute"
+                   [attr.aria-invalid]="invalid().callsPerMinute || null" [attr.aria-describedby]="describes('callsPerMinute')"
                    [ngModel]="form().callsPerMinute" (ngModelChange)="setLimit('callsPerMinute', asCount($event))" />
             <span class="m-hint unit">/ min</span>
           </span>
@@ -121,13 +128,15 @@
           <span class="m-mut">AI searches at once</span>
           <span class="limit-ctl">
             <input class="field-input" type="number" min="1" max="16" aria-label="AI searches at once"
+                   [class.invalid]="invalid().maxConcurrent"
+                   [attr.aria-invalid]="invalid().maxConcurrent || null" [attr.aria-describedby]="describes('maxConcurrent')"
                    [ngModel]="form().maxConcurrent" (ngModelChange)="setLimit('maxConcurrent', asCount($event))" />
             <span class="m-hint unit">at once</span>
           </span>
         </label>
       </div>
       @if (limitsError(); as error) {
-        <span class="m-err" role="alert">{{ error }}</span>
+        <span class="m-err" role="alert" id="mcp-limits-error">{{ error }}</span>
       }
       @if (limitsDirty()) {
         <div class="m-actions">

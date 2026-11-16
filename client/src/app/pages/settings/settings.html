@@ -29,9 +29,16 @@
       <app-api-keys-section [hidden]="activeTab() !== 'api-keys'" />
       @if (authService.isAdmin()) {
         <!-- Loaded — code and data — the first time its tab is opened, and kept mounted from
-             then on like the sections around it. -->
+             then on like the sections around it. Until its code is here the tab says so, and
+             when the code cannot be fetched (the network, a deploy that replaced the file)
+             it says that: an empty panel would say nothing. Both lines belong to the tab,
+             so both hide with it. -->
         @defer (when activeTab() === 'ai-mcp') {
           <app-mcp-section [hidden]="activeTab() !== 'ai-mcp'" />
+        } @loading {
+          <span class="loading-text" [hidden]="activeTab() !== 'ai-mcp'">Loading…</span>
+        } @error {
+          <span class="section-load-error" role="alert" [hidden]="activeTab() !== 'ai-mcp'">The AI / MCP section could not be loaded: reload the page to try again.</span>
         }
         <app-updates-section [hidden]="activeTab() !== 'updates'" />
       }

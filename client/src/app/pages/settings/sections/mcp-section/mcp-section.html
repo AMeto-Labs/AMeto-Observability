@@ -18,6 +18,15 @@
 } @else if (!store.loaded()) {
   <span class="loading-text">Loading…</span>
 } @else {
+  @if (store.stale()) {
+    <!-- A change went through, and the read that follows every change did not. The change is
+         shown; what else moved on the server meanwhile (a rotated key's preview, another
+         administrator's edit) may not be. -->
+    <div class="m-stale" role="status">
+      <span>The change was saved, but the profiles and tools could not be read again after it: what is shown may be behind the server.</span>
+      <button type="button" class="btn" (click)="store.refreshLists()">Read again</button>
+    </div>
+  }
   <!-- A tab is created the first time it is opened and kept from then on, so what was typed
        into one survives a look at another. -->
   @if (visited().has('connection')) {

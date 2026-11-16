@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  cellText, clientSnippets, fmtCount, fmtWindow, hasToken, hiddenSpan, lastCall, maskedLines, maskedSentence,
-  parseWindow, placeholderNames, placeholderSegments, prettyJson, signatureOf, statusTone, tokenSegments,
+  KEY_VARIABLE, asCount, cellText, clientSnippets, fmtCount, fmtWindow, hasToken, hiddenSpan, isCount, lastCall, maskedLines,
+  maskedSentence, parseWindow, placeholderNames, placeholderSegments, prettyJson, signatureOf, statusTone, tokenSegments,
 } from './mcp-format';
 
 describe('AI / MCP — numbers and windows', () => {
@@ -14,34 +14,77 @@ describe('AI / MCP — numbers and windows', () => {
     expect(fmtCount(undefined)).toBe('—');
   });
 
-  it('writes a window the way a person does, a single day in hours', () => {
+  it('writes a window as one number and one unit, a single day in hours', () => {
     expect(fmtWindow(15)).toBe('15 min');
     expect(fmtWindow(60)).toBe('1 h');
     expect(fmtWindow(1440)).toBe('24 h');
     expect(fmtWindow(10080)).toBe('7 d');
-    expect(fmtWindow(90)).toBe('1 h 30 min');
+    // No whole number of hours: minutes, not "1 h 30 min" — the form that shows it has to save it.
+    expect(fmtWindow(90)).toBe('90 min');
+    expect(fmtWindow(1441)).toBe('1441 min');
     expect(fmtWindow(0)).toBe('—');
   });
 
   it('reads back every window it writes', () => {
-    for (const minutes of [1, 15, 60, 90, 1440, 4320, 10080]) {
-      // "1 h 30 min" is the one spelling the parser does not take: such a value is typed as 90m.
+    // Every value a window can hold: one minute to the server's ceiling of 366 days. A form is
+    // filled with fmtWindow and saved through parseWindow, so one value that does not come back
+    // is a form that cannot be saved until its window is typed again.
+    const lost: string[] = [];
+    for (let minutes = 1; minutes <= 366 * 1440; minutes++) {
       const text = fmtWindow(minutes);
-      if (!text.includes(' h ')) expect(parseWindow(text)).toBe(minutes);
+      if (parseWindow(text) !== minutes) lost.push(`${minutes} → "${text}" → ${parseWindow(text)}`);
     }
+    expect(lost).toEqual([]);
+  });
+
+  it('reads the spellings a person types', () => {
     expect(parseWindow('90m')).toBe(90);
     expect(parseWindow('24h')).toBe(1440);
     expect(parseWindow(' 7 days ')).toBe(10080);
     expect(parseWindow('1w')).toBe(10080);
     expect(parseWindow('1.5h')).toBe(90);
+    expect(parseWindow('1,5 h')).toBe(90);
+    expect(parseWindow('45 MIN')).toBe(45);
+  });
+
+  it('reads the compound form too: units from the largest down, each once', () => {
+    expect(parseWindow('1 h 30 min')).toBe(90);
+    expect(parseWindow('1h30m')).toBe(90);
+    expect(parseWindow('1 hour 30 minutes')).toBe(90);
+    expect(parseWindow('1d 12h')).toBe(2160);
+    expect(parseWindow('1w 2d 3h 4m')).toBe(10080 + 2880 + 180 + 4);
+    // Not a window: the units out of order, one of them twice, a part without its unit.
+    expect(parseWindow('30m 1h')).toBeNull();
+    expect(parseWindow('1h 1h')).toBeNull();
+    expect(parseWindow('1h 30')).toBeNull();
+    expect(parseWindow('1h, 30m')).toBeNull();
   });
 
   it('refuses a bare number rather than guess its unit', () => {
     // "48" after "24 h" means hours to the person typing and minutes to the API.
     expect(parseWindow('48')).toBeNull();
     expect(parseWindow('')).toBeNull();
+    expect(parseWindow('   ')).toBeNull();
     expect(parseWindow('soon')).toBeNull();
     expect(parseWindow('0h')).toBeNull();
+    expect(parseWindow('5 months')).toBeNull();
+  });
+
+  it('keeps an emptied number field empty, and says apart whether a count will do', () => {
+    // The field's value accessor answers null for an empty field: that is not a zero.
+    expect(asCount(null)).toBeNull();
+    expect(asCount('')).toBeNull();
+    expect(asCount(undefined)).toBeNull();
+    expect(asCount('abc')).toBeNull();
+    expect(asCount(300)).toBe(300);
+    expect(asCount('300')).toBe(300);
+    expect(asCount(12.7)).toBe(12);
+    // What was typed stays as typed; whether it will do is asked on save.
+    expect(asCount(0)).toBe(0);
+    expect(asCount(-5)).toBe(-5);
+
+    expect(isCount(300)).toBe(true);
+    for (const value of [null, undefined, 0, -5, 1.5, Number.NaN]) expect(isCount(value)).toBe(false);
   });
 
   it('says when a profile last called: the gap, then the clock, then the day', () => {
@@ -116,6 +159,14 @@ describe('AI / MCP — tokens and placeholders', () => {
     expect(placeholderNames('A = {} and B = {1x} and C = {not closed')).toEqual([]);
     expect(placeholderNames('')).toEqual([]);
   });
+
+  it('takes for a placeholder exactly what the server binds: a letter first, 32 characters at most', () => {
+    // FilterTemplate.IsIdentifier on the server: ^[A-Za-z][A-Za-z0-9_]{0,31}$. A name coloured
+    // here and passed over there would look bound and be sent to the engine as text.
+    const longest = 'a' + '0'.repeat(31);
+    expect(placeholderNames(`A = {x} and B = {merchant_Id2} and C = {${longest}}`)).toEqual(['x', 'merchant_Id2', longest]);
+    expect(placeholderNames(`A = {_x} and B = {${longest}0} and C = {a-b} and D = {a b}`)).toEqual([]);
+  });
 });
 
 describe('AI / MCP — a stored value next to what an answer carries', () => {
@@ -125,6 +176,28 @@ describe('AI / MCP — a stored value next to what an answer carries', () => {
     expect(cellText(true)).toBe('true');
     expect(cellText(null)).toBe('null');
     expect(cellText({ Iin: '900101300126', Tier: 'gold' })).toBe('{"Iin":"900101300126","Tier":"gold"}');
+  });
+
+  it('takes the cell\'s own spelling for a number JSON.parse could not hold', () => {
+    // A 64-bit id as the server writes it, and as the browser has it after JSON.parse.
+    const exact = '9007199254740993';
+    const stored: unknown = JSON.parse(exact);
+    expect(String(stored)).toBe('9007199254740992');
+    // The cell is the same number: nothing was hidden, and the cell has the digits right.
+    expect(cellText(stored, exact)).toBe(exact);
+    expect(hiddenSpan(cellText(stored, exact), exact)).toBeNull();
+    // The same inside an object.
+    const order: unknown = JSON.parse(`{"Id":${exact},"Tier":"gold"}`);
+    expect(cellText(order, `{"Id":${exact},"Tier":"gold"}`)).toBe(`{"Id":${exact},"Tier":"gold"}`);
+
+    // A cell that is not the stored value stays what was hidden: a token, a kept tail, another number.
+    expect(cellText(stored, 'h:91c0e2aa5d17')).toBe('9007199254740992');
+    expect(cellText(4111111111111111, '****1111')).toBe('4111111111111111');
+    expect(cellText(12500, '12501')).toBe('12500');
+    expect(cellText(0, '')).toBe('0');
+    expect(cellText(order, '{"Id":"h:91c0e2aa5d17","Tier":"gold"}')).toBe('{"Id":9007199254740992,"Tier":"gold"}');
+    // A stored string is its own text, whatever the cell says.
+    expect(cellText('12500', '12500.0')).toBe('12500');
   });
 
   it('finds the part that differs, with what stands around it', () => {
@@ -171,13 +244,23 @@ describe('AI / MCP — what was hidden', () => {
 describe('AI / MCP — connecting a client', () => {
   const url = 'https://ameto.example.com/ameto/mcp';
 
-  it('never puts a key into a snippet: each reads it from the environment or asks for it', () => {
+  it('points every snippet at the endpoint, and its bearer at where the key is kept', () => {
+    // What follows "Bearer" in a snippet is a reference, never a value: the variable in the
+    // shell's or the editor's own syntax, VS Code's prompt, or — where there is no file to put
+    // a reference in — a placeholder to be replaced by hand.
+    const references = [`$${KEY_VARIABLE}`, `\${${KEY_VARIABLE}}`, `\${env:${KEY_VARIABLE}}`, '${input:ameto-mcp-key}', '<profile key>'];
+    let bearers = 0;
     for (const kind of ['claude-code', 'cursor', 'vscode', 'other'] as const) {
       for (const snippet of clientSnippets(kind, url)) {
         expect(snippet.code).toContain(url);
-        expect(snippet.code).not.toMatch(/mcp_[0-9a-f]{8}/);
+        for (const [, bearer] of snippet.code.matchAll(/Bearer ([^"\n]+)/g)) {
+          expect(references).toContain(bearer);
+          bearers++;
+        }
       }
     }
+    // Every snippet carries the header: six of them over the four kinds of client.
+    expect(bearers).toBe(6);
   });
 
   it('writes the command and the shared file for Claude Code', () => {

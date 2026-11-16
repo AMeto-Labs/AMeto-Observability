@@ -39,6 +39,17 @@
   flex-shrink: 0;
 }
 
+/* An enum's row is two lines tall: its last cell holds the values and, under them, the default
+   chosen from them. The other cells stay level with the first of the two lines. */
+.param.two-lines {
+  align-items: start;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+/* Three classes, to stand above the row's own rule for its type select. */
+.param .m-select.default { width: 100%; }
+
 /* ── The filter: a textarea over a coloured copy of its own text ── */
 .filter {
   position: relative;

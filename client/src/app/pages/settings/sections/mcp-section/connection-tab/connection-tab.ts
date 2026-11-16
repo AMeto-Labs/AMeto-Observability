@@ -8,15 +8,18 @@ import { copyToClipboard } from '../../../../../shared/utils/clipboard';
 import { mcpError } from '../../../../../core/services/mcp-api.service';
 import { McpLimits, McpSummary } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
-import { KEY_VARIABLE, McpClientKind, clientSnippets, fmtCount, fmtWindow, parseWindow } from '../mcp-format';
+import { KEY_VARIABLE, McpClientKind, asCount, clientSnippets, fmtCount, fmtWindow, isCount, parseWindow } from '../mcp-format';
 
-/** The limits as the form holds them: the window as the text a person types. */
+/**
+ * The limits as the form holds them: the window as the text a person types, a count as its
+ * number field holds it — null while the field is empty.
+ */
 interface LimitsForm {
-  responseBudgetTokens: number;
+  responseBudgetTokens: number | null;
   window: string;
-  maxEvents: number;
-  callsPerMinute: number;
-  maxConcurrent: number;
+  maxEvents: number | null;
+  callsPerMinute: number | null;
+  maxConcurrent: number | null;
 }
 
 interface Tile {
@@ -26,11 +29,11 @@ interface Tile {
 }
 
 const toForm = (limits: McpLimits | undefined): LimitsForm => ({
-  responseBudgetTokens: limits?.responseBudgetTokens ?? 0,
+  responseBudgetTokens: limits?.responseBudgetTokens ?? null,
   window: limits ? fmtWindow(limits.maxWindowMinutes) : '',
-  maxEvents: limits?.maxEvents ?? 0,
-  callsPerMinute: limits?.callsPerMinute ?? 0,
-  maxConcurrent: limits?.maxConcurrent ?? 0,
+  maxEvents: limits?.maxEvents ?? null,
+  callsPerMinute: limits?.callsPerMinute ?? null,
+  maxConcurrent: limits?.maxConcurrent ?? null,
 });
 
 const sameLimits = (a: McpLimits | undefined, b: McpLimits | undefined): boolean =>
@@ -128,6 +131,19 @@ export class ConnectionTabComponent {
   });
 
   readonly windowMinutes = computed(() => parseWindow(this.form().window));
+  readonly asCount = asCount;
+
+  /** The limits that cannot be saved as they stand: an empty field, a window without a unit. */
+  readonly invalid = computed(() => {
+    const f = this.form();
+    return {
+      responseBudgetTokens: !isCount(f.responseBudgetTokens),
+      window: this.windowMinutes() === null,
+      maxEvents: !isCount(f.maxEvents),
+      callsPerMinute: !isCount(f.callsPerMinute),
+      maxConcurrent: !isCount(f.maxConcurrent),
+    };
+  });
 
   readonly limitsDirty = computed(() => {
     const saved = toForm(this.store.overview()?.limits);
@@ -139,6 +155,8 @@ export class ConnectionTabComponent {
 
   readonly savingLimits = signal(false);
   readonly limitsError = signal<string | null>(null);
+  /** What the error line is about, when it is about fields of the form rather than about the save. */
+  private readonly limitsErrorAbout = signal<'window' | 'counts' | null>(null);
 
   constructor() {
     effect(() => this.store.setDirty('limits', this.limitsDirty()));
@@ -148,29 +166,34 @@ export class ConnectionTabComponent {
     this.form.update(f => ({ ...f, [key]: value }));
   }
 
-  /** A number field's text as a whole number; nonsense becomes 0, which the save refuses. */
-  asCount(value: unknown): number {
-    const n = Math.floor(Number(value));
-    return Number.isFinite(n) && n > 0 ? n : 0;
+  /**
+   * `aria-describedby` of a limit's field: the error line while the field is one it is about —
+   * the window for the sentence about the window, the counts that will not do for the other.
+   */
+  describes(field: keyof LimitsForm): string | null {
+    const about = this.limitsErrorAbout();
+    const named = about === 'window' ? field === 'window' : about === 'counts' && field !== 'window' && this.invalid()[field];
+    return named ? 'mcp-limits-error' : null;
+  }
+
+  private failLimits(message: string | null, about: 'window' | 'counts' | null = null): void {
+    this.limitsError.set(message);
+    this.limitsErrorAbout.set(about);
   }
 
   resetLimits(): void {
     this.form.set(toForm(this.store.overview()?.limits));
-    this.limitsError.set(null);
+    this.failLimits(null);
   }
 
   async saveLimits(): Promise<void> {
     const f = this.form();
     const window = this.windowMinutes();
-    if (window === null) {
-      this.limitsError.set('Write the widest window with a unit: 30m, 24h, 7d.');
-      return;
+    if (window === null) return this.failLimits('Write the widest window with a unit: 30m, 24h, 7d.', 'window');
+    if (!isCount(f.responseBudgetTokens) || !isCount(f.maxEvents) || !isCount(f.callsPerMinute) || !isCount(f.maxConcurrent)) {
+      return this.failLimits('Every limit is a whole number above zero.', 'counts');
     }
-    if (!f.responseBudgetTokens || !f.maxEvents || !f.callsPerMinute || !f.maxConcurrent) {
-      this.limitsError.set('Every limit is a whole number above zero.');
-      return;
-    }
-    this.limitsError.set(null);
+    this.failLimits(null);
     this.savingLimits.set(true);
     try {
       // The server holds each limit to its own floor and ceiling and answers with what it kept.
@@ -180,7 +203,7 @@ export class ConnectionTabComponent {
       });
       this.form.set(toForm(this.store.overview()?.limits));
     } catch (e) {
-      this.limitsError.set(mcpError(e, 'The limits could not be saved.').error);
+      this.failLimits(mcpError(e, 'The limits could not be saved.').error);
     } finally {
       this.savingLimits.set(false);
     }

@@ -38,21 +38,23 @@
         </div>
 
         @if (error(); as message) {
-          <span class="m-err" role="alert">{{ message }}</span>
+          <span class="m-err" role="alert" [id]="errorId">{{ message }}</span>
         }
 
         <div class="head">
           <label class="m-fld">
             <span class="m-lbl">Name</span>
             <input class="field-input mono" placeholder="payment_declines" maxlength="64" spellcheck="false"
-                   [class.invalid]="errorField() === 'name'"
+                   [class.invalid]="invalid().name"
+                   [attr.aria-invalid]="invalid().name || null" [attr.aria-describedby]="describes('name')"
                    [ngModel]="form().name" (ngModelChange)="patch({ name: $event })" />
             <span class="m-hint">What the AI calls. Lowercase, digits, underscores.</span>
           </label>
           <label class="m-fld">
             <span class="m-lbl">Description for the AI</span>
             <textarea class="m-textarea" rows="3" placeholder="What the tool returns and when to use it. The assistant chooses a tool by this text."
-                      [class.invalid]="errorField() === 'description'"
+                      [class.invalid]="invalid().description"
+                      [attr.aria-invalid]="invalid().description || null" [attr.aria-describedby]="describes('description')"
                       [ngModel]="form().description" (ngModelChange)="patch({ description: $event })"></textarea>
           </label>
         </div>
@@ -65,19 +67,22 @@
               Add parameter
             </button>
           </div>
-          <div class="m-table" role="table" aria-label="Parameters">
+          <div class="m-table" role="table" aria-label="Parameters" [attr.aria-describedby]="describes('parameters')">
             <div class="m-hr param-cols" role="row">
               <span role="columnheader">Name</span>
               <span role="columnheader">Type</span>
               <span role="columnheader">Description</span>
-              <span role="columnheader">Allowed or default</span>
-              <span></span>
+              <span role="columnheader">Allowed, default</span>
+              <span role="columnheader" aria-label="Remove"></span>
             </div>
-            @for (p of form().parameters; track $index; let i = $index) {
-              <div class="m-tr param-cols param" role="row">
-                <input class="field-input mono m-par" placeholder="merchantId" spellcheck="false" aria-label="Parameter name"
-                       [ngModel]="p.name" (ngModelChange)="patchParameter(i, { name: $event })" />
-                <span class="m-row tight">
+            @for (r of parameterRows(); track $index; let i = $index) {
+              @let p = r.p;
+              <div class="m-tr param-cols param" role="row" [class.two-lines]="p.type === 'enum'">
+                <span class="m-cell" role="cell">
+                  <input class="field-input mono m-par" placeholder="merchantId" spellcheck="false" aria-label="Parameter name"
+                         [ngModel]="p.name" (ngModelChange)="patchParameter(i, { name: $event })" />
+                </span>
+                <span class="m-row tight" role="cell">
                   <select class="m-select" aria-label="Type" [ngModel]="p.type" (ngModelChange)="patchParameter(i, { type: $event })">
                     @for (t of types; track t) { <option [value]="t">{{ t }}</option> }
                   </select>
@@ -86,18 +91,30 @@
                     required
                   </label>
                 </span>
-                <input class="field-input" placeholder="What the assistant should pass" aria-label="Parameter description"
-                       [ngModel]="p.description" (ngModelChange)="patchParameter(i, { description: $event })" />
-                @if (p.type === 'enum') {
-                  <input class="field-input mono" placeholder="value_a, value_b" aria-label="Allowed values" spellcheck="false"
-                         [ngModel]="p.values" (ngModelChange)="patchParameter(i, { values: $event })" />
-                } @else {
-                  <input class="field-input mono" placeholder="default, if any" aria-label="Default value" spellcheck="false"
-                         [ngModel]="p.default" (ngModelChange)="patchParameter(i, { default: $event })" />
-                }
-                <button type="button" class="btn-icon danger" title="Remove parameter" aria-label="Remove parameter" (click)="removeParameter(i)">
-                  <lucide-icon name="x" [size]="12" />
-                </button>
+                <span class="m-cell" role="cell">
+                  <input class="field-input" placeholder="What the assistant should pass" aria-label="Parameter description"
+                         [ngModel]="p.description" (ngModelChange)="patchParameter(i, { description: $event })" />
+                </span>
+                <!-- An enum has both: the values it may take, and a default that is one of them.
+                     A default is never held out of sight — whatever is sent is in this cell. -->
+                <span class="m-fld" role="cell">
+                  @if (p.type === 'enum') {
+                    <input class="field-input mono" placeholder="value_a, value_b" aria-label="Allowed values" spellcheck="false"
+                           [ngModel]="p.values" (ngModelChange)="patchParameter(i, { values: $event })" />
+                    <select class="m-select default" aria-label="Default value" [ngModel]="p.default" (ngModelChange)="patchParameter(i, { default: $event })">
+                      <option value="">no default</option>
+                      @for (v of r.options; track $index) { <option [value]="v">default: {{ v }}</option> }
+                    </select>
+                  } @else {
+                    <input class="field-input mono" placeholder="default, if any" aria-label="Default value" spellcheck="false"
+                           [ngModel]="p.default" (ngModelChange)="patchParameter(i, { default: $event })" />
+                  }
+                </span>
+                <span class="m-cell" role="cell">
+                  <button type="button" class="btn-icon danger" title="Remove parameter" aria-label="Remove parameter" (click)="removeParameter(i)">
+                    <lucide-icon name="x" [size]="12" />
+                  </button>
+                </span>
               </div>
             } @empty {
               <div class="m-empty">No parameters: the tool runs its filter as it is written.</div>
@@ -113,11 +130,13 @@
             <pre class="filter-layer" aria-hidden="true">@for (s of filterSegments(); track $index) {<span [class.m-par]="s.kind === 'param'">{{ s.text }}</span>}<br></pre>
             <textarea id="mcp-tool-filter" class="filter-input" spellcheck="false" autocapitalize="off" autocomplete="off"
                       placeholder="@service = 'payments-api' and MerchantId = {merchantId}"
+                      [attr.aria-invalid]="invalid().filter || null"
+                      [attr.aria-describedby]="describes('filter', placeholderProblems() ? placeholdersId : null)"
                       [ngModel]="form().filter" (ngModelChange)="patch({ filter: $event })"></textarea>
           </div>
           <span class="m-hint">A parameter is inserted as a value. A clause whose optional parameter was not given is dropped.</span>
           @if (placeholderProblems(); as problems) {
-            <span class="m-err">{{ problems }}</span>
+            <span class="m-err" [id]="placeholdersId">{{ problems }}</span>
           }
         </div>
 
@@ -135,6 +154,8 @@
               <span class="m-chip">All properties</span>
             }
             <input class="field-input mono small-input" placeholder="PaymentId" aria-label="Add a returned field" spellcheck="false"
+                   [class.invalid]="invalid().fields"
+                   [attr.aria-invalid]="invalid().fields || null" [attr.aria-describedby]="describes('fields')"
                    [ngModel]="fieldDraft()" (ngModelChange)="fieldDraft.set($event)"
                    (keydown.enter)="addField(); $event.preventDefault()" />
             <button type="button" class="btn sm" [disabled]="!fieldDraft().trim()" (click)="addField()">
@@ -149,12 +170,15 @@
           <label class="m-fld">
             <span class="m-lbl">Default window</span>
             <input class="field-input" placeholder="1h"
-                   [class.invalid]="windowMinutes() === null"
+                   [class.invalid]="invalid().window"
+                   [attr.aria-invalid]="invalid().window || null" [attr.aria-describedby]="describes('defaultWindowMinutes')"
                    [ngModel]="form().window" (ngModelChange)="patch({ window: $event })" />
           </label>
           <label class="m-fld">
             <span class="m-lbl">Events per call</span>
             <input class="field-input" type="number" min="1" max="5000"
+                   [class.invalid]="invalid().maxEvents"
+                   [attr.aria-invalid]="invalid().maxEvents || null" [attr.aria-describedby]="describes('maxEvents')"
                    [ngModel]="form().maxEvents" (ngModelChange)="patch({ maxEvents: asCount($event) })" />
           </label>
           <label class="m-fld">
@@ -235,7 +259,7 @@
         </div>
 
         @if (testError(); as message) {
-          <span class="m-err" role="alert">{{ message }}</span>
+          <span class="m-err" role="alert" [id]="testErrorId">{{ message }}</span>
         }
 
         @if (result(); as r) {

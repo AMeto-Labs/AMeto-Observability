@@ -36,10 +36,12 @@ export class ToolsTabComponent {
     return (this.store.overview()?.tools ?? []).map(t => ({ tool: t, calls: fmtCount(usage[t.name] ?? 0) }));
   });
 
+  /** The tool whose switch is on its way to the server; every switch of the table waits for it. */
   readonly switching = signal<string | null>(null);
   readonly switchError = signal<string | null>(null);
 
   async toggleBuiltIn(name: string, enabled: boolean): Promise<void> {
+    if (this.switching() !== null) return;
     this.switching.set(name);
     this.switchError.set(null);
     try {

@@ -14,27 +14,62 @@ export function fmtCount(n: number | null | undefined): string {
   return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 }
 
-/** A window in minutes as a person writes it: `15 min`, `24 h`, `7 d`. A single day is said in hours. */
+/**
+ * A window in minutes as a person writes it: `15 min`, `90 min`, `24 h`, `7 d`. A single day is
+ * said in hours, and a window that is no whole number of hours in minutes: one number and one
+ * unit, always. A form is filled with this and saved through {@link parseWindow}, so whatever
+ * is printed here has to read back there as the same number.
+ */
 export function fmtWindow(minutes: number): string {
   if (!Number.isFinite(minutes) || minutes <= 0) return '—';
   if (minutes % 1440 === 0 && minutes >= 2880) return `${minutes / 1440} d`;
   if (minutes % 60 === 0) return `${minutes / 60} h`;
-  if (minutes < 60) return `${minutes} min`;
-  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  return `${minutes} min`;
+}
+
+/** Minutes in a unit of a window, by the unit's first letter. */
+const WINDOW_UNITS: Readonly<Record<string, number>> = { w: 10_080, d: 1_440, h: 60, m: 1 };
+
+/**
+ * The same, read back: `15m`, `90 min`, `24h`, `7 d`, `1w` → minutes — and the compound form a
+ * person also writes, `1 h 30 min` or `1h30m`: units from the largest down, each at most once.
+ * A bare number is refused rather than guessed at — `48` after `24 h` means hours to the person
+ * typing and minutes to the API.
+ */
+export function parseWindow(text: string): number | null {
+  const source = text ?? '';
+  // Sticky: each part has to start exactly where the one before it ended.
+  const part = /\s*(\d+(?:[.,]\d+)?)\s*(weeks?|w|days?|d|hours?|h|minutes?|mins?|m)(?![a-z])\s*/iy;
+  let minutes = 0;
+  let smallest = Infinity;
+  let at = 0;
+  while (at < source.length) {
+    part.lastIndex = at;
+    const m = part.exec(source);
+    if (!m) return null;
+    const unit = WINDOW_UNITS[m[2][0].toLowerCase()];
+    if (unit >= smallest) return null;
+    smallest = unit;
+    minutes += parseFloat(m[1].replace(',', '.')) * unit;
+    at = part.lastIndex;
+  }
+  return Number.isFinite(minutes) && minutes >= 1 ? Math.round(minutes) : null;
 }
 
 /**
- * The same, read back: `15m`, `90 min`, `24h`, `7 d`, `1w` → minutes. A bare number is refused
- * rather than guessed at — `48` after `24 h` means hours to the person typing and minutes to
- * the API.
+ * What a number field holds, as a count: a whole number, or null while the field is empty or
+ * holds no number. Empty is not turned into zero — a field cleared to be retyped would show a
+ * `0` nobody typed. Whether the count will do is asked when the form is saved ({@link isCount}).
  */
-export function parseWindow(text: string): number | null {
-  const m = /^\s*(\d+(?:[.,]\d+)?)\s*(m|min|mins|minutes?|h|hours?|d|days?|w|weeks?)\s*$/i.exec(text ?? '');
-  if (!m) return null;
-  const n = parseFloat(m[1].replace(',', '.'));
-  const unit = m[2].toLowerCase()[0];
-  const minutes = unit === 'w' ? n * 10_080 : unit === 'd' ? n * 1_440 : unit === 'h' ? n * 60 : n;
-  return Number.isFinite(minutes) && minutes >= 1 ? Math.round(minutes) : null;
+export function asCount(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** True for a count a limit can be: a whole number above zero. */
+export function isCount(value: number | null | undefined): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
 }
 
 const pad = (n: number): string => String(n).padStart(2, '0');
@@ -144,6 +179,12 @@ export function hasToken(text: string | null | undefined): boolean {
 }
 
 /**
+ * A placeholder's name, by the server's rule (`FilterTemplate.IsIdentifier`): a letter, then
+ * letters, digits or underscores — 32 characters at most. Braces around anything else are text.
+ */
+const PLACEHOLDER_NAME = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
+
+/**
  * Splits a filter template at its `{parameter}` placeholders. A brace inside a quoted string
  * is text — `@mt = 'Order {OrderId} shipped'` has no placeholder — which is the server's rule
  * too, so what is highlighted here is what will be bound there.
@@ -166,7 +207,7 @@ export function placeholderSegments(filter: string | null | undefined): Segment[
     if (ch === '{') {
       const close = filter.indexOf('}', i + 1);
       const name = close > i ? filter.slice(i + 1, close) : '';
-      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      if (PLACEHOLDER_NAME.test(name)) {
         flush();
         out.push({ text: `{${name}}`, kind: 'param' });
         i = close;
@@ -189,11 +230,29 @@ export function placeholderNames(filter: string | null | undefined): string[] {
   return names;
 }
 
-/** A stored value as an answer's cell would spell it, so the two can be compared. */
-export function cellText(value: unknown): string {
+/**
+ * A stored value as an answer's cell would spell it, so the two can be compared.
+ *
+ * `sent` is the cell it is compared with. The stored value has been through `JSON.parse`, which
+ * keeps some sixteen digits of a number, while the cell is the server's exact text: a 64-bit id
+ * comes back as `9007199254740992` beside a cell that says `…993`. Where the cell, read the
+ * same way, is the very value held here, nothing was hidden and the cell's spelling is the
+ * exact one — so that is the answer.
+ */
+export function cellText(value: unknown, sent?: string): string {
   if (typeof value === 'string') return value;
   if (value === undefined) return '';
-  return JSON.stringify(value);
+  return sent !== undefined && readsAs(sent, value) ? sent : JSON.stringify(value);
+}
+
+/** True when a cell's text, read as the stored value was read, is that value. */
+function readsAs(sent: string, stored: unknown): boolean {
+  if (typeof stored === 'number') return sent.trim() !== '' && Number(sent) === stored;
+  // A number inside an object or a list loses its digits the same way.
+  if (stored !== null && typeof stored === 'object') {
+    try { return JSON.stringify(JSON.parse(sent)) === JSON.stringify(stored); } catch { return false; }
+  }
+  return false;
 }
 
 /**

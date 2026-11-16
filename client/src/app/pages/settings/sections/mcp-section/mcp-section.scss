@@ -49,6 +49,15 @@
   font-size: var(--fs-sm);
 }
 
+/* Not an error — the change it speaks of went through — so it is said in the warning's colour. */
+.m-stale {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  color: var(--warning);
+  font-size: var(--fs-xs);
+}
+
 /* ── The vocabulary every tab of the section is written in ───────────────────────
    One copy, here, reaching the tab components below this host — rather than the same forty
    rules compiled into each of the six. Everything is prefixed m- and scoped to this host. */
@@ -369,6 +378,19 @@
   .m-tr.pick:hover { background: var(--bg-hover); }
   .m-tr.sel,
   .m-tr.sel:hover { background: var(--accent-soft); }
+
+  /* A list of picked rows is one stop for the Tab key; the ring shows which row holds it. */
+  .m-tr.pick:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: -2px;
+  }
+
+  /* A cell that holds a control — a switch, a field, a button — rather than text. */
+  .m-cell {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+  }
 
   .m-empty {
     padding: 14px 8px;

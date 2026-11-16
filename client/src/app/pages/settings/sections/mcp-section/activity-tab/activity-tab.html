@@ -18,7 +18,7 @@
           <select class="m-select" aria-label="Time range" [ngModel]="hours()" (ngModelChange)="hours.set(+$event)">
             @for (r of ranges; track r.hours) { <option [value]="r.hours">{{ r.label }}</option> }
           </select>
-          <button type="button" class="btn-icon" title="Read again" aria-label="Read the list again" [disabled]="loading()" (click)="load()">
+          <button type="button" class="btn-icon" title="Read again" aria-label="Read the list again" [disabled]="loading()" (click)="reload()">
             <lucide-icon [name]="loading() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
           </button>
         </span>
@@ -43,15 +43,16 @@
           <span class="m-num" role="columnheader">ms</span>
           <span role="columnheader">Status</span>
         </div>
-        @for (r of rows(); track r.call.id) {
+        <!-- One stop for the Tab key; the arrows walk the rows, and the row walked to is picked. -->
+        @for (r of rows(); track r.call.id; let i = $index) {
           <div
             class="m-tr cols pick"
             role="row"
-            tabindex="0"
+            [attr.tabindex]="r.call.id === selected()?.id ? 0 : -1"
             [class.sel]="r.call.id === selected()?.id"
             [attr.aria-selected]="r.call.id === selected()?.id"
             (click)="pick(r.call.id)"
-            (keydown.enter)="pick(r.call.id)"
+            (keydown)="onRowKey($event, i)"
           >
             <span class="m-mut" role="cell" [attr.title]="r.day + ' ' + r.time">{{ r.time }}</span>
             <span class="m-el" role="cell">{{ r.call.profile }}</span>
@@ -60,22 +61,32 @@
             <span class="m-mut m-num" role="cell">{{ r.masked }}</span>
             <span class="m-mut m-num" role="cell">{{ r.tokens }}</span>
             <span class="m-mut m-num" role="cell">{{ r.ms }}</span>
-            <span role="cell"><span class="m-pill" [class]="r.tone">{{ r.call.status }}</span></span>
+            <span class="m-row tight" role="cell">
+              <span class="m-pill" [class]="r.tone">{{ r.call.status }}</span>
+              @if (r.repeats) {
+                <span class="m-hint" [attr.title]="'Refused ' + r.repeats + ' times this minute so far'">×{{ r.repeats }}</span>
+              }
+            </span>
           </div>
         } @empty {
-          <div class="m-empty">{{ loading() ? 'Reading the calls…' : 'No calls in this window.' }}</div>
+          <!-- A read that failed has said so above; "no calls" under it would be a second, wrong answer. -->
+          @if (!error()) {
+            <div class="m-empty">{{ loading() ? 'Reading the calls…' : 'No calls in this window.' }}</div>
+          }
         }
       </div>
 
-      <div class="m-row between">
-        <span class="m-hint">{{ footer() }}</span>
-        @if (more()) {
-          <button type="button" class="btn" [disabled]="loadingMore()" (click)="loadMore()">
-            @if (loadingMore()) { <lucide-icon name="loader-circle" [size]="13" /> }
-            Load more
-          </button>
-        }
-      </div>
+      @if (rows().length || !error()) {
+        <div class="m-row between">
+          <span class="m-hint">{{ footer() }}</span>
+          @if (more()) {
+            <button type="button" class="btn" [disabled]="loadingMore() || loading()" (click)="loadMore()">
+              @if (loadingMore()) { <lucide-icon name="loader-circle" [size]="13" /> }
+              Load more
+            </button>
+          }
+        </div>
+      }
     </app-section>
   </div>
 
@@ -94,6 +105,10 @@
           <span class="m-dim">Result</span><span>{{ d.result }}</span>
         </div>
 
+        @if (d.repeats) {
+          <span class="m-hint">{{ d.repeats }}</span>
+        }
+
         @if (d.call.refusal; as refusal) {
           <div class="m-fld">
             <span class="m-lbl">What the AI was told</span>
@@ -108,7 +123,7 @@
 
         @if (d.filter.length) {
           <div class="m-fld">
-            <span class="m-lbl">Filter that ran</span>
+            <span class="m-lbl">Filter as written</span>
             <pre class="m-code">@for (s of d.filter; track $index) {<span [class.m-tok]="s.kind === 'token'">{{ s.text }}</span>}</pre>
             @if (d.filterHasToken) {
               <span class="m-hint">The token was resolved to the stored value on the server. The value itself is not recorded.</span>

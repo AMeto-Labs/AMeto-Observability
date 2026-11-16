@@ -1,6 +1,7 @@
 .side { width: 400px; }
 
-.cols { grid-template-columns: 62px 124px minmax(0, 1fr) 52px 56px 52px 52px 82px; }
+/* The last column holds the status and, beside it, the ×N of a refusal recorded for many. */
+.cols { grid-template-columns: 62px 124px minmax(0, 1fr) 52px 56px 52px 52px 104px; }
 
 .facts {
   display: grid;

@@ -3,16 +3,20 @@
     <app-section title="Built-in tools">
       <div class="m-table" role="table" aria-label="Built-in tools">
         <div class="m-hr builtin-cols" role="row">
-          <span></span>
+          <span role="columnheader" aria-label="Switched on"></span>
           <span role="columnheader">Tool</span>
           <span role="columnheader">What it gives the AI</span>
           <span class="m-num" role="columnheader">Calls 7 d</span>
         </div>
         @for (r of builtIn(); track r.tool.name) {
           <div class="m-tr builtin-cols row" role="row">
-            <button type="button" class="m-sw" role="switch"
-                    [attr.aria-checked]="r.tool.enabled" [attr.aria-label]="r.tool.name + ' for every profile'"
-                    [disabled]="switching() === r.tool.name" (click)="toggleBuiltIn(r.tool.name, !r.tool.enabled)"></button>
+            <!-- Every switch waits while one is on its way: the change is sent as the whole
+                 list of names, and two lists in flight would each undo the other's switch. -->
+            <span class="m-cell" role="cell">
+              <button type="button" class="m-sw" role="switch"
+                      [attr.aria-checked]="r.tool.enabled" [attr.aria-label]="r.tool.name + ' for every profile'"
+                      [disabled]="switching() !== null" (click)="toggleBuiltIn(r.tool.name, !r.tool.enabled)"></button>
+            </span>
             <span class="m-cd" role="cell" [class.m-dim]="!r.tool.enabled">{{ r.tool.name }}</span>
             <span class="m-mut m-el" role="cell" [attr.title]="r.tool.description">{{ r.tool.description }}</span>
             <span class="m-mut m-num" role="cell">{{ r.calls }}</span>
@@ -41,7 +45,7 @@
           <span role="columnheader">Profiles</span>
           <span role="columnheader">Status</span>
           <span class="m-num" role="columnheader">Calls 7 d</span>
-          <span></span>
+          <span role="columnheader" aria-label="Actions"></span>
         </div>
         @for (r of published(); track r.tool.id) {
           <div class="m-tr published-cols tall" role="row">

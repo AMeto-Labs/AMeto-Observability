@@ -17,15 +17,16 @@
           <span role="columnheader">Masking</span>
           <span role="columnheader">Last call</span>
         </div>
-        @for (r of rows(); track r.profile.id) {
+        <!-- One stop for the Tab key; the arrows walk the rows, and the row walked to is picked. -->
+        @for (r of rows(); track r.profile.id; let i = $index) {
           <div
             class="m-tr cols tall pick"
             role="row"
-            tabindex="0"
+            [attr.tabindex]="r.profile.id === tabStop() ? 0 : -1"
             [class.sel]="r.profile.id === selectedId()"
             [attr.aria-selected]="r.profile.id === selectedId()"
             (click)="pick(r.profile.id)"
-            (keydown.enter)="pick(r.profile.id)"
+            (keydown)="onRowKey($event, i)"
           >
             <span class="m-two-lines" role="cell">
               <span class="m-el m-strong">{{ r.profile.name }}</span>
@@ -54,7 +55,8 @@
         <label class="m-fld">
           <span class="m-lbl">Name</span>
           <input class="field-input" placeholder="Payments team" maxlength="100"
-                 [class.invalid]="errorField() === 'name'"
+                 [class.invalid]="invalid().name"
+                 [attr.aria-invalid]="invalid().name || null" [attr.aria-describedby]="describes('name')"
                  [ngModel]="form().name" (ngModelChange)="patch({ name: $event })" />
         </label>
 
@@ -156,24 +158,28 @@
           <label class="m-fld">
             <span class="m-lbl">Events per call</span>
             <input class="field-input" type="number" min="1" max="5000"
-                   [class.invalid]="errorField() === 'maxEvents'"
+                   [class.invalid]="invalid().maxEvents"
+                   [attr.aria-invalid]="invalid().maxEvents || null" [attr.aria-describedby]="describes('maxEvents')"
                    [ngModel]="form().maxEvents" (ngModelChange)="patch({ maxEvents: asCount($event) })" />
           </label>
           <label class="m-fld">
             <span class="m-lbl">Time window</span>
             <input class="field-input" placeholder="24h"
-                   [class.invalid]="windowMinutes() === null"
+                   [class.invalid]="invalid().window"
+                   [attr.aria-invalid]="invalid().window || null" [attr.aria-describedby]="describes('maxWindowMinutes')"
                    [ngModel]="form().window" (ngModelChange)="patch({ window: $event })" />
           </label>
           <label class="m-fld">
             <span class="m-lbl">Calls per minute</span>
             <input class="field-input" type="number" min="1" max="6000"
+                   [class.invalid]="invalid().callsPerMinute"
+                   [attr.aria-invalid]="invalid().callsPerMinute || null" [attr.aria-describedby]="describes('callsPerMinute')"
                    [ngModel]="form().callsPerMinute" (ngModelChange)="patch({ callsPerMinute: asCount($event) })" />
           </label>
         </div>
 
         @if (error(); as message) {
-          <span class="m-err" role="alert">{{ message }}</span>
+          <span class="m-err" role="alert" [id]="errorId">{{ message }}</span>
         }
 
         <div class="m-row between">

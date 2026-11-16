@@ -1,6 +1,9 @@
-import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy, Component, DestroyRef, ElementRef, computed, effect, inject, signal, viewChild,
+} from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
+import { Subscription } from 'rxjs';
 
 import { ModalComponent, SectionComponent } from '../../../../../shared/components/ui';
 import { McpApiService, mcpError } from '../../../../../core/services/mcp-api.service';
@@ -82,9 +85,30 @@ export class MaskingTabComponent {
   readonly draft = signal<RuleDraft | null>(null);
   readonly draftService = signal('');
   readonly draftError = signal<string | null>(null);
+  /** The field of the dialog the error is about, where it is about one. */
+  readonly draftErrorField = signal<string | null>(null);
   readonly savingRule = signal(false);
   readonly draftAction = computed(() => ACTIONS.find(a => a.id === this.draft()?.action) ?? ACTIONS[0]);
   readonly serviceOptions = computed(() => this.store.services().filter(s => !(this.draft()?.services ?? []).includes(s)));
+
+  /** True between "Delete rule" and the answer to "really?": the dialog's second step. */
+  readonly confirmingDelete = signal(false);
+  private readonly keepRule = viewChild<ElementRef<HTMLButtonElement>>('keepRule');
+  private readonly askDelete = viewChild<ElementRef<HTMLButtonElement>>('askDelete');
+  private backToAskDelete = false;
+
+  /**
+   * What deleting the rule in the dialog does to an answer, said of the rule as it is saved —
+   * not of what the dialog has been edited to. Taking a rule away is the one click here that
+   * can put a hidden value into the next answer, so it is spelled out before it happens.
+   */
+  readonly deleteNote = computed(() => {
+    const rule = this.store.rules().find(r => r.id === this.draft()?.id);
+    if (!rule) return '';
+    return rule.action === 'keep'
+      ? `Without it “${rule.field}” is off the allow-list: Strict mode hides it.`
+      : `Without it Standard mode sends “${rule.field}” as it is stored, unless another rule or a detector hides it.`;
+  });
 
   addRule(): void {
     this.openDraft({ id: null, field: '', services: [], action: 'hash' });
@@ -98,6 +122,8 @@ export class MaskingTabComponent {
     this.draft.set(draft);
     this.draftService.set('');
     this.draftError.set(null);
+    this.draftErrorField.set(null);
+    this.confirmingDelete.set(false);
   }
 
   closeDraft(): void {
@@ -125,26 +151,44 @@ export class MaskingTabComponent {
   async saveRule(): Promise<void> {
     const d = this.draft();
     if (!d) return;
-    if (!d.field.trim()) { this.draftError.set('Field is required.'); return; }
+    if (!d.field.trim()) {
+      this.draftError.set('Field is required.');
+      this.draftErrorField.set('field');
+      return;
+    }
     await this.changeRules(() => this.store.saveRule(d.id, { field: d.field.trim(), services: d.services, action: d.action }),
       'The rule could not be saved.');
   }
 
+  /** Back from the question to the dialog as it was. */
+  keepRuleAfterAll(): void {
+    this.backToAskDelete = true;
+    this.confirmingDelete.set(false);
+  }
+
+  /** The second step of "Delete rule": the first one only asks. */
   async deleteRule(): Promise<void> {
     const id = this.draft()?.id;
-    if (id) await this.changeRules(() => this.store.deleteRule(id), 'The rule could not be deleted.');
+    if (!id) return;
+    await this.changeRules(() => this.store.deleteRule(id), 'The rule could not be deleted.');
+    // Refused: the dialog is still open, with the reason in it.
+    if (this.draft()) this.keepRuleAfterAll();
+    else this.confirmingDelete.set(false);
   }
 
   /** A change to the rules, after which the preview on the right is no longer what an answer would be. */
   private async changeRules(change: () => Promise<void>, fallback: string): Promise<void> {
     this.draftError.set(null);
+    this.draftErrorField.set(null);
     this.savingRule.set(true);
     try {
       await change();
       this.draft.set(null);
-      if (this.preview()) void this.runPreview();
+      this.retakePreview();
     } catch (e) {
-      this.draftError.set(mcpError(e, fallback).error);
+      const problem = mcpError(e, fallback);
+      this.draftError.set(problem.error);
+      this.draftErrorField.set(problem.field ?? null);
     } finally {
       this.savingRule.set(false);
     }
@@ -163,15 +207,17 @@ export class MaskingTabComponent {
     }));
   });
 
+  /** The detector whose switch is on its way to the server; every detector's switch waits for it. */
   readonly switchingDetector = signal<string | null>(null);
   readonly detectorError = signal<string | null>(null);
 
   async toggleDetector(id: string, on: boolean): Promise<void> {
+    if (this.switchingDetector() !== null) return;
     this.switchingDetector.set(id);
     this.detectorError.set(null);
     try {
       await this.store.setDetector(id, on);
-      if (this.preview()) void this.runPreview();
+      this.retakePreview();
     } catch (e) {
       this.detectorError.set(mcpError(e, 'The detector could not be switched.').error);
     } finally {
@@ -192,7 +238,7 @@ export class MaskingTabComponent {
     try {
       await this.store.rotateSecret();
       this.confirmingRotate.set(false);
-      if (this.preview()) void this.runPreview();
+      this.retakePreview();
     } catch (e) {
       this.rotateError.set(mcpError(e, 'The secret could not be rotated.').error);
     } finally {
@@ -206,10 +252,24 @@ export class MaskingTabComponent {
   readonly preview = signal<McpPreview | null>(null);
   readonly previewing = signal(false);
   readonly previewError = signal<string | null>(null);
+  /** `filter` when the preview was refused for the filter that picks the event. */
+  readonly previewErrorField = signal<string | null>(null);
+  private previewRequest: Subscription | null = null;
 
   constructor() {
+    inject(DestroyRef).onDestroy(() => this.previewRequest?.unsubscribe());
+    // The question about deleting a rule stands where the button that asked it stood, so the
+    // focus would fall out of the dialog: it goes to the answer that changes nothing, and back
+    // to the button once that answer is given.
+    effect(() => this.keepRule()?.nativeElement.focus());
+    effect(() => {
+      const button = this.askDelete()?.nativeElement;
+      if (!button || !this.backToAskDelete) return;
+      this.backToAskDelete = false;
+      button.focus();
+    });
     // The panel opens on the most recent event rather than on nothing.
-    void this.runPreview();
+    this.runPreview();
   }
 
   /** The preview's "as" control: a mode, or a profile (whose mode it then is). */
@@ -218,7 +278,7 @@ export class MaskingTabComponent {
   setMode(mode: McpMaskingMode): void {
     this.mode.set(mode);
     this.previewProfile.set('');
-    if (this.preview()) void this.runPreview();
+    this.retakePreview();
   }
 
   setPreviewAs(value: string): void {
@@ -231,25 +291,42 @@ export class MaskingTabComponent {
       this.previewProfile.set(profile.id);
       this.mode.set(profile.maskingMode);
     }
-    if (this.preview()) void this.runPreview();
+    this.retakePreview();
   }
 
-  runPreview(): Promise<void> {
+  /**
+   * The preview again, after something it depends on changed — where there is one to take
+   * again: one shown, or one on its way (whose answer would be of how things were).
+   */
+  private retakePreview(): void {
+    if (this.preview() || this.previewing()) this.runPreview();
+  }
+
+  /**
+   * Takes the preview. A request still on its way is abandoned first: it was asked under a
+   * mode, a profile or a filter that may no longer be the one chosen, and answers do not come
+   * back in the order they were asked for — a slow one must not land on top of this one's.
+   */
+  runPreview(): void {
+    this.previewRequest?.unsubscribe();
     this.previewing.set(true);
     this.previewError.set(null);
+    this.previewErrorField.set(null);
     const profileId = this.previewProfile();
-    return new Promise<void>(resolve => {
-      this.api.preview({
-        filter: this.probe().trim() || undefined,
-        ...(profileId ? { profileId } : { mode: this.mode() }),
-      }).subscribe({
-        next: preview => { this.preview.set(preview); this.previewing.set(false); resolve(); },
-        error: e => {
-          this.previewError.set(mcpError(e, 'The preview could not be taken.').error);
-          this.previewing.set(false);
-          resolve();
-        },
-      });
+    this.previewRequest = this.api.preview({
+      filter: this.probe().trim() || undefined,
+      ...(profileId ? { profileId } : { mode: this.mode() }),
+    }).subscribe({
+      next: preview => {
+        this.preview.set(preview);
+        this.previewing.set(false);
+      },
+      error: e => {
+        const problem = mcpError(e, 'The preview could not be taken.');
+        this.previewError.set(problem.error);
+        this.previewErrorField.set(problem.field ?? null);
+        this.previewing.set(false);
+      },
     });
   }
 
@@ -288,19 +365,25 @@ export class MaskingTabComponent {
     plain('@service', stored['@service']);
     pair('@mt', stored['@mt'] ?? '', sent.template);
 
-    const answered = new Map(sent.properties.map(prop => [prop.name, prop.value]));
-    for (const [key, value] of Object.entries(stored.props ?? {})) {
-      const was = cellText(value);
-      const now = answered.get(key);
+    // A value an answer may leave out altogether: marked on the stored side, named as gone on the other.
+    const held = (key: string, was: string, now: string | undefined) => {
       if (now !== undefined) pair(key, was, now);
       else if (side === 'stored') out.push({ key, parts: [{ text: was, kind: 'raw' }] });
       else out.push({ key, parts: [{ text: 'removed', kind: '' }], removed: true });
+    };
+
+    const answered = new Map(sent.properties.map(prop => [prop.name, prop.value]));
+    for (const [key, value] of Object.entries(stored.props ?? {})) {
+      const now = answered.get(key);
+      // Spelled the cell's way where the cell is this very value (a 64-bit id, say): see cellText.
+      held(key, cellText(value, now), now);
     }
 
     const x = stored['@x'];
     if (x) {
       plain('@x.type', x.type);
-      if (x.message !== undefined) pair('@x.message', x.message, sent.exception?.message ?? '');
+      if (x.message !== undefined) held('@x.message', x.message, sent.exception?.message);
+      if (x.stack !== undefined) held('@x.stack', x.stack, sent.exception?.stack);
     }
     return out;
   }

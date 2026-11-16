@@ -1,6 +1,6 @@
 import { ChangeDetectionStrategy, Component, computed, effect, inject, signal, untracked } from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, ParamMap, Router } from '@angular/router';
 
 import { SettingsDirtyService } from '../../settings-dirty.service';
 import { MCP_TABS, McpSectionStore, McpTabId } from './mcp.store';
@@ -12,6 +12,20 @@ import { ToolEditorComponent } from './tool-editor/tool-editor';
 import { ActivityTabComponent } from './activity-tab/activity-tab';
 
 const isTab = (value: string | null): value is McpTabId => MCP_TABS.some(t => t.id === value);
+
+/** A place in the section: a tab, and on the Tools tab the tool in the editor — its id, `new`, or null for the list. */
+interface Place {
+  tab: McpTabId;
+  tool: string | null;
+}
+
+const placeOf = (params: ParamMap): Place => {
+  const requested = params.get('mcp');
+  const tab = isTab(requested) ? requested : 'connection';
+  return { tab, tool: tab === 'tools' ? params.get('tool') || null : null };
+};
+
+const samePlace = (a: Place, b: Place): boolean => a.tab === b.tab && a.tool === b.tool;
 
 /**
  * Settings → AI / MCP: the Model Context Protocol endpoint for AI assistants — where it is and
@@ -43,14 +57,21 @@ export class McpSectionComponent {
 
   private readonly params = toSignal(this.route.queryParamMap, { initialValue: this.route.snapshot.queryParamMap });
 
-  readonly activeTab = computed<McpTabId>(() => {
-    const requested = this.params().get('mcp');
-    return isTab(requested) ? requested : 'connection';
-  });
+  /** Where the URL points. */
+  private readonly requested = computed(() => placeOf(this.params()), { equal: samePlace });
+
+  /**
+   * Where the section is. It goes where the URL points — with one exception: out of an editor
+   * that holds unsaved input it goes only after the question. The editor is drawn from this,
+   * not from the URL, because the URL has already changed by the time anyone can be asked: the
+   * browser's Back and Forward do not wait for an answer.
+   */
+  private readonly place = signal<Place>(placeOf(this.route.snapshot.queryParamMap));
+
+  readonly activeTab = computed<McpTabId>(() => this.place().tab);
 
   /** The tool open in the editor: its id, `new`, or null while the list is shown. */
-  readonly editing = computed<string | null>(() =>
-    this.activeTab() === 'tools' ? this.params().get('tool') || null : null);
+  readonly editing = computed<string | null>(() => this.place().tool);
 
   /** The tabs opened so far; each is created on its first visit. */
   readonly visited = signal<ReadonlySet<McpTabId>>(new Set<McpTabId>());
@@ -60,6 +81,10 @@ export class McpSectionComponent {
 
   constructor() {
     effect(() => this.dirtyService.mark('ai-mcp', this.store.anyDirty()));
+    effect(() => {
+      const requested = this.requested();
+      untracked(() => this.follow(requested));
+    });
     effect(() => {
       const tab = this.activeTab();
       untracked(() => this.visited.update(seen => (seen.has(tab) ? seen : new Set(seen).add(tab))));
@@ -96,7 +121,26 @@ export class McpSectionComponent {
     return true;
   }
 
-  private go(queryParams: Record<string, string | null>): void {
-    void this.router.navigate([], { relativeTo: this.route, queryParams, queryParamsHandling: 'merge' });
+  /**
+   * Goes where the URL now points. A move made inside the section has asked its question
+   * before it touched the URL, and cleared the flag; what arrives here with the flag still up
+   * is Back, Forward or an address typed by hand — out of an editor with unsaved input. "No"
+   * keeps the editor and puts its address back in place of the one that was just entered.
+   */
+  private follow(requested: Place): void {
+    const here = this.place();
+    if (samePlace(requested, here)) return;
+    if (here.tool !== null && this.store.dirty().tool) {
+      if (!confirm('This tool has unsaved changes. Discard them?')) {
+        this.go({ mcp: here.tab, tool: here.tool }, true);
+        return;
+      }
+      this.store.setDirty('tool', false);
+    }
+    this.place.set(requested);
+  }
+
+  private go(queryParams: Record<string, string | null>, replaceUrl = false): void {
+    void this.router.navigate([], { relativeTo: this.route, queryParams, queryParamsHandling: 'merge', replaceUrl });
   }
 }

@@ -5,24 +5,11 @@ import { LucideAngularModule } from 'lucide-angular';
 import { ModalComponent, SectionComponent } from '../../../../../shared/components/ui';
 import { copyToClipboard } from '../../../../../shared/utils/clipboard';
 import { mcpError } from '../../../../../core/services/mcp-api.service';
-import { McpMaskingMode, McpProfile, McpProfileInput, McpToolsMode } from '../../../../../core/models/mcp.model';
+import { McpProfile, McpProfileInput, McpPublishedTool } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
-import { dayOf, fmtWindow, lastCall, parseWindow } from '../mcp-format';
-
-/** A profile as its card holds it: the window as typed, the grants as tool ids. */
-interface ProfileForm {
-  name: string;
-  description: string;
-  toolsMode: McpToolsMode;
-  builtIn: string[];
-  published: string[];
-  services: string[];
-  maskingMode: McpMaskingMode;
-  freeFilters: boolean;
-  maxEvents: number;
-  window: string;
-  callsPerMinute: number;
-}
+import { asCount, dayOf, isCount, lastCall, parseWindow } from '../mcp-format';
+import { focusRow, rowKeyTarget } from '../pick-rows';
+import { ProfileForm, blankForm, rebaseForm, sameForm, sameMembers, toForm } from './profile-form';
 
 /** One switch of the card's tool grid. */
 interface ToolSwitch {
@@ -36,6 +23,9 @@ interface ToolSwitch {
 }
 
 const NEW = 'new';
+
+/** The id of the card's error line, for the field it is about to point at. */
+const ERROR_ID = 'mcp-profile-error';
 
 /**
  * Profiles: a key and what that key may do. The list on the left, the card of the picked
@@ -54,6 +44,9 @@ export class ProfilesTabComponent {
   /** Goes up by one each time another tab asks for a blank profile to be opened here. */
   readonly createRequest = input(0);
 
+  readonly errorId = ERROR_ID;
+  readonly asCount = asCount;
+
   /** The profile in the card: an id, `new`, or null while there is none to show. */
   readonly selectedId = signal<string | null>(null);
   readonly isNew = computed(() => this.selectedId() === NEW);
@@ -61,9 +54,9 @@ export class ProfilesTabComponent {
     this.store.profiles().find(p => p.id === this.selectedId()) ?? null);
 
   readonly form = signal<ProfileForm>(this.blank());
-  /** The form as it was loaded or last saved: what "unsaved" is measured against. */
-  private readonly baseline = signal<string>('');
-  readonly dirty = computed(() => this.selectedId() !== null && JSON.stringify(this.form()) !== this.baseline());
+  /** The profile as the card was filled with it or last saved it: what "unsaved" is measured against. */
+  private readonly baseline = signal<ProfileForm>(this.form());
+  readonly dirty = computed(() => this.selectedId() !== null && !sameForm(this.form(), this.baseline()));
 
   readonly saving = signal(false);
   readonly error = signal<string | null>(null);
@@ -77,6 +70,18 @@ export class ProfilesTabComponent {
   readonly working = signal(false);
 
   readonly windowMinutes = computed(() => parseWindow(this.form().window));
+
+  /** The fields that cannot be saved as they stand, or that the last refusal was about. */
+  readonly invalid = computed(() => {
+    const f = this.form();
+    const named = this.errorField();
+    return {
+      name: named === 'name',
+      maxEvents: !isCount(f.maxEvents) || named === 'maxEvents',
+      window: this.windowMinutes() === null || named === 'maxWindowMinutes',
+      callsPerMinute: !isCount(f.callsPerMinute) || named === 'callsPerMinute',
+    };
+  });
 
   // ── The list ────────────────────────────────────────────────────────────────
 
@@ -98,6 +103,9 @@ export class ProfilesTabComponent {
       };
     });
   });
+
+  /** The row the Tab key stops at: the picked one — or the first, while a new profile is in the card. */
+  readonly tabStop = computed(() => this.selected()?.id ?? this.store.profiles()[0]?.id ?? null);
 
   // ── The card ────────────────────────────────────────────────────────────────
 
@@ -135,12 +143,12 @@ export class ProfilesTabComponent {
   readonly serviceOptions = computed(() => this.store.services().filter(s => !this.form().services.includes(s)));
 
   constructor() {
-    // Start on the first profile once the list is there, and move off a profile that is gone.
+    // The card follows the store: this tab stays mounted while another is shown, and a tool's
+    // editor over there grants and withdraws the very tools this card has switches for.
     effect(() => {
       const profiles = this.store.profiles();
-      const id = untracked(this.selectedId);
-      if (id === NEW) return;
-      if (id === null || !profiles.some(p => p.id === id)) untracked(() => this.open(profiles[0]?.id ?? null));
+      const tools = this.store.tools();
+      untracked(() => this.follow(profiles, tools));
     });
     effect(() => {
       if (this.createRequest() > 0) untracked(() => this.startNew());
@@ -149,30 +157,42 @@ export class ProfilesTabComponent {
   }
 
   private blank(): ProfileForm {
-    return {
-      name: '', description: '', toolsMode: 'builtInAndPublished',
-      builtIn: (this.store.overview()?.tools ?? []).map(t => t.name),
-      published: [], services: [], maskingMode: 'standard', freeFilters: true,
-      maxEvents: 200, window: '24 h', callsPerMinute: 30,
-    };
+    return blankForm((this.store.overview()?.tools ?? []).map(t => t.name));
   }
 
-  private toForm(p: McpProfile): ProfileForm {
-    return {
-      name: p.name, description: p.description, toolsMode: p.toolsMode,
-      builtIn: [...p.tools], published: [...p.publishedTools], services: [...p.services],
-      maskingMode: p.maskingMode, freeFilters: p.freeFilters,
-      maxEvents: p.maxEvents, window: fmtWindow(p.maxWindowMinutes), callsPerMinute: p.callsPerMinute,
-    };
+  /** A form without the grants of tools that are gone: the server refuses an id that is no tool's. */
+  private known(form: ProfileForm, tools: readonly McpPublishedTool[] = this.store.tools()): ProfileForm {
+    const published = form.published.filter(id => tools.some(t => t.id === id));
+    return published.length === form.published.length ? form : { ...form, published };
+  }
+
+  /**
+   * Brings the card up to date with the store: starts on the first profile once the list is
+   * there, moves off a profile that is gone, and otherwise lays what the user has changed over
+   * the profile as it is now — with nothing unsaved that is the profile itself.
+   */
+  private follow(profiles: readonly McpProfile[], tools: readonly McpPublishedTool[]): void {
+    const id = this.selectedId();
+    const profile = id === null || id === NEW ? null : profiles.find(p => p.id === id) ?? null;
+    if (id !== NEW && !profile) {
+      this.open(profiles[0]?.id ?? null);
+      return;
+    }
+    const base = this.baseline();
+    // A new profile has nothing in the store to follow; only a tool deleted meanwhile leaves it.
+    const saved = this.known(profile ? toForm(profile) : base, tools);
+    const form = this.known(rebaseForm(this.form(), base, saved), tools);
+    if (!sameForm(saved, base)) this.baseline.set(saved);
+    if (!sameForm(form, this.form())) this.form.set(form);
   }
 
   /** Puts a profile (or a blank one) into the card, with nothing unsaved. */
   private open(id: string | null): void {
     const profile = id === null || id === NEW ? null : this.store.profiles().find(p => p.id === id) ?? null;
-    const form = profile ? this.toForm(profile) : this.blank();
+    const form = this.known(profile ? toForm(profile) : this.blank());
     this.selectedId.set(id);
     this.form.set(form);
-    this.baseline.set(JSON.stringify(form));
+    this.baseline.set(form);
     this.error.set(null);
     this.errorField.set(null);
     this.serviceDraft.set('');
@@ -182,9 +202,20 @@ export class ProfilesTabComponent {
     return !this.dirty() || confirm('This profile has unsaved changes. Discard them?');
   }
 
-  pick(id: string): void {
-    if (id === this.selectedId() || !this.mayDiscard()) return;
+  /** Puts a profile into the card; false when the card keeps what it has (unsaved input, and the answer was no). */
+  pick(id: string): boolean {
+    if (id === this.selectedId()) return true;
+    if (!this.mayDiscard()) return false;
     this.open(id);
+    return true;
+  }
+
+  onRowKey(event: KeyboardEvent, index: number): void {
+    const rows = this.rows();
+    const target = rowKeyTarget(event, index, rows.length);
+    if (target === null) return;
+    event.preventDefault();
+    if (this.pick(rows[target].profile.id)) focusRow(event, target - index);
   }
 
   startNew(): void {
@@ -201,9 +232,9 @@ export class ProfilesTabComponent {
     this.form.update(f => ({ ...f, ...change }));
   }
 
-  asCount(value: unknown): number {
-    const n = Math.floor(Number(value));
-    return Number.isFinite(n) && n > 0 ? n : 0;
+  /** `aria-describedby` of a field: the error line while it is about that field, else nothing. */
+  describes(field: string): string | null {
+    return this.error() !== null && this.errorField() === field ? ERROR_ID : null;
   }
 
   toggleTool(t: ToolSwitch): void {
@@ -229,14 +260,19 @@ export class ProfilesTabComponent {
     const f = this.form();
     const window = this.windowMinutes();
     if (!f.name.trim()) return this.fail('Name is required.', 'name');
+    if (!isCount(f.maxEvents)) return this.fail('Events per call is a whole number above zero.', 'maxEvents');
     if (window === null) return this.fail('Write the time window with a unit: 30m, 24h, 7d.', 'maxWindowMinutes');
-    if (!f.maxEvents || !f.callsPerMinute) return this.fail('The limits are whole numbers above zero.', 'maxEvents');
+    if (!isCount(f.callsPerMinute)) return this.fail('Calls per minute is a whole number above zero.', 'callsPerMinute');
 
     const input: McpProfileInput = {
       name: f.name.trim(), description: f.description.trim(), toolsMode: f.toolsMode, tools: f.builtIn,
       services: f.services, maskingMode: f.maskingMode, freeFilters: f.freeFilters,
-      maxEvents: f.maxEvents, maxWindowMinutes: window, callsPerMinute: f.callsPerMinute, publishedTools: f.published,
+      maxEvents: f.maxEvents, maxWindowMinutes: window, callsPerMinute: f.callsPerMinute,
     };
+    // The grants go along only when they were changed here. Left out, the server keeps them as
+    // they are — so a save that is about the name cannot undo what a tool's editor just did.
+    if (!sameMembers(f.published, this.baseline().published)) input.publishedTools = f.published;
+
     this.error.set(null);
     this.errorField.set(null);
     this.saving.set(true);
@@ -273,7 +309,7 @@ export class ProfilesTabComponent {
       this.revealedKey.set(await this.store.rotateKey(id));
       this.confirming.set(null);
     } catch (e) {
-      this.error.set(mcpError(e, 'The key could not be rotated.').error);
+      this.fail(mcpError(e, 'The key could not be rotated.').error, null);
       this.confirming.set(null);
     } finally {
       this.working.set(false);
@@ -285,12 +321,12 @@ export class ProfilesTabComponent {
     if (!id || id === NEW) return;
     this.working.set(true);
     try {
-      // The effect above moves the card to the first profile left once this one is gone.
-      this.baseline.set(JSON.stringify(this.form()));
+      // Once the profile is gone from the store the card moves to the first one left, whatever
+      // it held. Until then — and when the server refuses — what was typed stays unsaved input.
       await this.store.deleteProfile(id);
       this.confirming.set(null);
     } catch (e) {
-      this.error.set(mcpError(e, 'The profile could not be deleted.').error);
+      this.fail(mcpError(e, 'The profile could not be deleted.').error, null);
       this.confirming.set(null);
     } finally {
       this.working.set(false);
