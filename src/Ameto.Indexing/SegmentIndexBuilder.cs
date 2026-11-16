@@ -802,11 +802,12 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     public long BuildRetainedBytes => _inverted.BuildRetainedBytes + _trigram.BuildRetainedBytes;
 
     /// <summary>
-    /// Exception payloads this group could not read as an exception map (merge path only; the
-    /// flush path holds decoded objects). Each is a row written without its exception type,
-    /// inner type and message terms — though one whose payload opens as a map or a non-empty
-    /// string is still filed under the <c>@x.exists</c> marker. The
-    /// process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
+    /// Exception payloads this group could not read as an exception map. Each is a row written
+    /// without its exception type, inner type and message terms. One whose payload opens as a
+    /// map or a non-empty string is still filed under the <c>@x.exists</c> marker, because a
+    /// scan counts it as having an exception (<see cref="ExceptionInfo.IsPresent"/>); one cut
+    /// off before that is counted here and marked nowhere, because a scan does not count it
+    /// either. The process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
     ///
     /// <para>ENCOUNTERS, not distinct rows. The merged segment keeps the raw payload, so the same
     /// row is met and counted again at every later merge level, and a merge that fails after this

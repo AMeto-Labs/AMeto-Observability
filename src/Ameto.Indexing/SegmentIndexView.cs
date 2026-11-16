@@ -173,6 +173,13 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
         return _index.LookupIntersect(predicates, this);
     }
 
+    /// <inheritdoc/>
+    public int? CountAtMost(string propertyName, object? value)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _index.CountAtMost(propertyName, value, this);
+    }
+
     // ── Sections, rented on first need ────────────────────────────────────────
 
     ReadOnlySpan<byte> IIndexSectionSource.InvertedSection()

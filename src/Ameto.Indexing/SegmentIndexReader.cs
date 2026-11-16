@@ -80,6 +80,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private SegmentTrigramIndex.PackedHeader?    _trigramHeader;
     private Dictionary<long, Kept<int[]?>>?      _trigrams;       // null value: the section has no such trigram
     private Dictionary<BucketKey, Kept<int[]?>>? _buckets;        // null value: the property has no such value
+    private Dictionary<BucketKey, int>?          _counts;         // a bucket counted and not (yet) decoded
     private Dictionary<string, Kept<bool>>?      _bloomVerdicts;
 
     // The bound on answers that grow with the QUESTIONS rather than the data: bloom verdicts and
@@ -200,6 +201,9 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) =>
         LookupIntersect(predicates, Own);
 
+    /// <inheritdoc/>
+    public int? CountAtMost(string propertyName, object? value) => CountAtMost(propertyName, value, Own);
+
     private IIndexSectionSource Own => _bloom is not null ? this : throw Unbound();
 
     private static InvalidOperationException Unbound() =>
@@ -280,7 +284,13 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     internal bool MightContain(string propertyName, object? value, IIndexSectionSource src)
     {
         // Bloom filter gives a cheap first gate; inverted index is the definitive check.
-        if (!MightContainValue(value, src)) return false;
+        //
+        // Not for the exception marker. The bloom is handed that bucket's NAME and never the
+        // value filed in it, so it would say "no" about a group whose marker lists rows — and
+        // this would then disagree with the decoded reader, which has no bloom to ask. Nothing
+        // in the query path sends the marker here today; the day something does, a vouched
+        // group must not be dropped for it.
+        if (!SegmentInvertedIndex.IsExceptionMarker(propertyName) && !MightContainValue(value, src)) return false;
         var offsets = PostingsForKey(propertyName, value, src, out bool known);
         return !known || offsets is not null;    // property not indexed → no information
     }
@@ -319,64 +329,128 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     }
 
     /// <summary>
-    /// Every bucket a hint key could name — the key itself, its dotted spelling when it has one
-    /// (<see cref="SegmentInvertedIndex.TryFlatSpelling"/>), and the name an older builder filed it
-    /// under (<see cref="SegmentInvertedIndex.LegacyBucket"/>) — unioned over every encoding of the
-    /// value (<see cref="IndexValueForms.Serialised"/>). <paramref name="known"/> is false when no
-    /// candidate property exists; the return is null when they exist and none holds the value.
-    /// The same rules, in the same order, as the decoded index's <c>PostingsForKey</c>.
+    /// <see cref="ISegmentIndex.CountAtMost"/>: <see cref="LookupIntersect"/>'s three answers for
+    /// the one predicate with a number in place of the list, and NOTHING DECODED to produce it —
+    /// each posting list opens with its own count, so a bucket's size is read off the section,
+    /// or off the memo once it has been.
+    ///
+    /// <para>The caller it exists for is the narrowing that has to choose between naming a
+    /// group's rows and saying "every row". A list that names nearly all of a group is the one
+    /// case where decoding it buys nothing, and the one case where it is largest: a
+    /// level-split Error group asked for the rows that carry an exception. Counted first, that
+    /// list is never decoded, never copied and never kept — where it used to be all three, per
+    /// group, for a page of fifty rows.</para>
+    ///
+    /// <para>An upper bound: the number sums the predicate's buckets and the value's encodings
+    /// where the list would union them, so a row filed under two of them is counted twice. That
+    /// errs towards "more rows", which is the direction a caller deciding whether to narrow can
+    /// afford.</para>
     /// </summary>
-    private int[]? PostingsForKey(string property, object? value, IIndexSectionSource src, out bool known)
+    internal int? CountAtMost(string propertyName, object? value, IIndexSectionSource src)
     {
-        known = false;
-        var catalog = Catalog(src);
-        if (catalog.Properties.Count == 0) return null;
+        int count = CountForKey(propertyName, value, src, out bool known);
+        return known ? count : null;                        // unknown property → no information
+    }
+
+    /// <summary>
+    /// Every bucket a hint key could name in this group — the key itself, its dotted spelling
+    /// when it has one (<see cref="SegmentInvertedIndex.TryFlatSpelling"/>), and the name an older
+    /// builder filed it under (<see cref="SegmentInvertedIndex.LegacyBucket"/>) — and whether the
+    /// key is KNOWN here at all. The same rules, in the same order, as the decoded index's
+    /// <c>PostingsForKey</c>, and the one place this reader applies them: the list
+    /// (<see cref="PostingsForKey"/>) and the count (<see cref="CountForKey"/>) both ask here, so
+    /// they cannot come to answer for different buckets.
+    /// </summary>
+    private static bool BucketsFor(
+        SegmentInvertedIndex.PackedCatalog catalog, string property,
+        out SegmentInvertedIndex.PackedProperty? own,
+        out SegmentInvertedIndex.PackedProperty? flat,
+        out SegmentInvertedIndex.PackedProperty? legacy)
+    {
+        own = flat = legacy = null;
+        if (catalog.Properties.Count == 0) return false;
 
         // The exception marker answers only where its builder vouched for it, and there it is
         // known even when no row was filed under it (SegmentInvertedIndex.IsExceptionMarker).
         // Read off the catalog, so a group with no exception is dropped without its section
         // being read again.
+        bool known = false;
         if (SegmentInvertedIndex.IsExceptionMarker(property))
         {
-            if (!catalog.VouchesForExceptionMarker) return null;
+            if (!catalog.VouchesForExceptionMarker) return false;
             known = true;
         }
 
-        IndexValueForms.Buffer buf = default;
-        Span<string?> forms = buf;
-        int n = -1;
-        int[]? acc = null;
+        if (catalog.Properties.TryGetValue(property, out own)) known = true;
 
-        if (catalog.Properties.TryGetValue(property, out var prop))
-        {
+        Span<char> spelling = stackalloc char[SegmentInvertedIndex.MaxFlatKeyChars];
+        if (SegmentInvertedIndex.TryFlatSpelling(property, spelling) &&
+            catalog.BySpan.TryGetValue(spelling[..property.Length], out flat))
             known = true;
-            n   = IndexValueForms.Serialised(value, forms);
-            acc = PostingsFor(prop, forms[..n], catalog.Codec, src);
-        }
-
-        Span<char> flat = stackalloc char[SegmentInvertedIndex.MaxFlatKeyChars];
-        if (SegmentInvertedIndex.TryFlatSpelling(property, flat) &&
-            catalog.BySpan.TryGetValue(flat[..property.Length], out var flatProp))
-        {
-            known = true;
-            if (n < 0) n = IndexValueForms.Serialised(value, forms);
-            if (PostingsFor(flatProp, forms[..n], catalog.Codec, src) is { } flatOffsets)
-                acc = acc is null ? flatOffsets : SegmentInvertedIndex.UnionAscending(acc, flatOffsets);
-        }
 
         // The bucket's pre-rename name (SegmentInvertedIndex.LegacyBucket): `@service` hints also
         // read an old group's `service.name`. Memo entries are keyed by the catalog's own name, so
         // the two buckets' answers are remembered apart.
-        if (SegmentInvertedIndex.LegacyBucket(property) is { } legacy &&
-            catalog.Properties.TryGetValue(legacy, out var legacyProp))
-        {
+        if (SegmentInvertedIndex.LegacyBucket(property) is { } renamedFrom &&
+            catalog.Properties.TryGetValue(renamedFrom, out legacy))
             known = true;
-            if (n < 0) n = IndexValueForms.Serialised(value, forms);
-            if (PostingsFor(legacyProp, forms[..n], catalog.Codec, src) is { } legacyOffsets)
-                acc = acc is null ? legacyOffsets : SegmentInvertedIndex.UnionAscending(acc, legacyOffsets);
-        }
 
+        return known;
+    }
+
+    /// <summary>
+    /// The postings of every bucket <see cref="BucketsFor"/> names, unioned over every encoding of
+    /// the value (<see cref="IndexValueForms.Serialised"/>). <paramref name="known"/> is false when
+    /// no candidate property exists; the return is null when they exist and none holds the value.
+    /// </summary>
+    private int[]? PostingsForKey(string property, object? value, IIndexSectionSource src, out bool known)
+    {
+        var catalog = Catalog(src);
+        known = BucketsFor(catalog, property, out var own, out var flat, out var legacy);
+        if (own is null && flat is null && legacy is null) return null;
+
+        IndexValueForms.Buffer buf = default;
+        Span<string?> forms = buf;
+        forms = forms[..IndexValueForms.Serialised(value, forms)];
+
+        int[]? acc = null;
+        if (own is not null) acc = PostingsFor(own, forms, catalog.Codec, src);
+        if (flat is not null && PostingsFor(flat, forms, catalog.Codec, src) is { } flatOffsets)
+            acc = acc is null ? flatOffsets : SegmentInvertedIndex.UnionAscending(acc, flatOffsets);
+        if (legacy is not null && PostingsFor(legacy, forms, catalog.Codec, src) is { } legacyOffsets)
+            acc = acc is null ? legacyOffsets : SegmentInvertedIndex.UnionAscending(acc, legacyOffsets);
         return acc;
+    }
+
+    /// <summary>
+    /// <see cref="PostingsForKey"/> as a count: the postings its buckets hold for the value's
+    /// encodings, summed rather than unioned — an upper bound on the list's length, and exact
+    /// when one bucket holds one encoding, which is the ordinary case. 0 is what a null list is.
+    /// </summary>
+    private int CountForKey(string property, object? value, IIndexSectionSource src, out bool known)
+    {
+        var catalog = Catalog(src);
+        known = BucketsFor(catalog, property, out var own, out var flat, out var legacy);
+        if (own is null && flat is null && legacy is null) return 0;
+
+        IndexValueForms.Buffer buf = default;
+        Span<string?> forms = buf;
+        forms = forms[..IndexValueForms.Serialised(value, forms)];
+
+        long total = 0;
+        if (own    is not null) total += CountFor(own,    forms, catalog.Codec, src);
+        if (flat   is not null) total += CountFor(flat,   forms, catalog.Codec, src);
+        if (legacy is not null) total += CountFor(legacy, forms, catalog.Codec, src);
+        return (int)Math.Min(total, int.MaxValue);
+    }
+
+    private long CountFor(SegmentInvertedIndex.PackedProperty prop, ReadOnlySpan<string?> forms,
+                          bool codec, IIndexSectionSource src)
+    {
+        long total = 0;
+        for (int i = 0; i < forms.Length; i++)
+            total += BucketCount(prop, forms[i]!, codec, src);
+        return total;
     }
 
     private int[]? PostingsFor(SegmentInvertedIndex.PackedProperty prop, ReadOnlySpan<string?> forms,
@@ -410,22 +484,90 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         BeforeRemember?.Invoke();
         lock (_gate)
         {
+            if (_buckets is not null && _buckets.TryGetValue(key, out var raced)) return raced.Value;   // a racing query got there first
+            if (found is null)
+            {
+                RememberAbsentLocked(key);
+                return null;
+            }
+
             if (_buckets is null)
             {
                 _buckets = [];
                 Interlocked.Add(ref _memoBytes, ShellBytes);
             }
-            if (_buckets.TryGetValue(key, out var raced)) return raced.Value;   // a racing query got there first
-            int slot = -1;
-            if (found is null)
-            {
-                slot = TakeSlotLocked();
-                _ring[slot] = new Slot { Kind = SlotKind.AbsentBucket, Bucket = key };
-            }
-            _buckets.Add(key, new Kept<int[]?>(found, slot));
-            Interlocked.Add(ref _memoBytes, BucketEntryBytes(key) + (found is null ? 0 : ArrayBytes + 4L * found.Length));
+            _buckets.Add(key, new Kept<int[]?>(found, -1));
+            Interlocked.Add(ref _memoBytes, BucketEntryBytes(key) + ArrayBytes + 4L * found.Length);
+
+            // The list says everything its count did.
+            if (_counts is not null && _counts.Remove(key))
+                Interlocked.Add(ref _memoBytes, -BucketEntryBytes(key));
         }
         return found;
+    }
+
+    /// <summary>
+    /// One (property, encoded value) bucket's posting COUNT, without its postings: from the memo —
+    /// a list already decoded, a count already read, an absence already found — or off the
+    /// section, where each matching list's count is its first varint
+    /// (<see cref="SegmentInvertedIndex.CountBucket"/>). "No such value here" counts 0 and is
+    /// remembered the way <see cref="Bucket"/> remembers it, so the two share one answer about
+    /// absence — and only about absence: a value that is there with an empty list also counts 0,
+    /// and is remembered as a count, so that <see cref="Bucket"/> still finds its (empty) list.
+    ///
+    /// <para>A count is kept only until its list is decoded (see <see cref="Bucket"/>), so what
+    /// stays remembered as a bare number is the bucket nobody went on to read — the dense one
+    /// the count was asked about in order NOT to read. Like the postings it stands for, it
+    /// grows with what the group holds and not with the questions asked, so it is outside the
+    /// ring that bounds verdicts and absences.</para>
+    /// </summary>
+    private int BucketCount(SegmentInvertedIndex.PackedProperty prop, string form, bool codec, IIndexSectionSource src)
+    {
+        var key = new BucketKey(prop.Name, form);
+        lock (_gate)
+        {
+            if (_buckets is not null && _buckets.TryGetValue(key, out var known))
+            {
+                if (known.Slot >= 0) _ring[known.Slot].Referenced = true;
+                return known.Value?.Length ?? 0;
+            }
+            if (_counts is not null && _counts.TryGetValue(key, out int counted)) return counted;
+        }
+
+        int found = SegmentInvertedIndex.CountBucket(src.InvertedSection(), codec, prop.Runs, form);
+        BeforeRemember?.Invoke();
+        lock (_gate)
+        {
+            if (_buckets is not null && _buckets.TryGetValue(key, out var raced)) return raced.Value?.Length ?? 0;
+            if (found < 0)
+            {
+                RememberAbsentLocked(key);
+                return 0;
+            }
+
+            if (_counts is null)
+            {
+                _counts = [];
+                Interlocked.Add(ref _memoBytes, ShellBytes);
+            }
+            if (_counts.TryAdd(key, found))
+                Interlocked.Add(ref _memoBytes, BucketEntryBytes(key));
+        }
+        return found;
+    }
+
+    /// <summary>Remembers that a bucket holds no such value — one of the answers the ring bounds.</summary>
+    private void RememberAbsentLocked(BucketKey key)
+    {
+        if (_buckets is null)
+        {
+            _buckets = [];
+            Interlocked.Add(ref _memoBytes, ShellBytes);
+        }
+        int slot = TakeSlotLocked();
+        _ring[slot] = new Slot { Kind = SlotKind.AbsentBucket, Bucket = key };
+        _buckets.Add(key, new Kept<int[]?>(null, slot));
+        Interlocked.Add(ref _memoBytes, BucketEntryBytes(key));
     }
 
     private SegmentInvertedIndex.PackedCatalog Catalog(IIndexSectionSource src)

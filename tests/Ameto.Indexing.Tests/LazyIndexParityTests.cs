@@ -242,6 +242,242 @@ public sealed class LazyIndexParityTests
             $"the reader retains {lazy.ApproxManagedBytes} B for a {section.Length} B section");
     }
 
+    // ── Counted before it is named ────────────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="ISegmentIndex.CountAtMost"/> is <see cref="ISegmentIndex.LookupIntersect"/>
+    /// asked about one predicate, with a number in place of the list — and the narrowing decides
+    /// by it whether the list is built at all. So the two must never disagree about which of the
+    /// three answers a question has: a count of "no information" over a list of "nothing matches"
+    /// would scan a group the index had proved empty, and the reverse would DROP one it knew
+    /// nothing about.
+    ///
+    /// <para>Every row of the rich section is filed once, so here the number is also exact — for
+    /// the decoded reader, for a packed reader asked only to count (which reads each list's
+    /// leading count, or decodes a legacy bitmap that has none), and for one that had already
+    /// decoded the list. Both passes: the second is answered from the memo.</para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void EveryCount_IsTheAnswerTheListGives_FromTheSectionAndFromTheMemo(string layout)
+    {
+        byte[] section = Serialise(BuildRich(), layout);
+        var oracle = SegmentInvertedIndex.Deserialise(section);
+        using var counting = SegmentIndexReader.Load(section, [], []);   // asked to count, never to list
+        using var listing  = SegmentIndexReader.Load(section, [], []);   // asked to list, then to count
+
+        for (int pass = 0; pass < 2; pass++)
+        foreach (var (p, v) in RichQuestions)
+        {
+            string what = $"pass {pass}, {Show(p)} = {Show(v)}";
+            uint[]? list = oracle.LookupIntersect([(p, v)]);
+            int?    rows = list?.Length;
+
+            Assert.True(rows == oracle.CountAtMost(p, v),   $"decoded: {what}");
+            Assert.True(rows == counting.CountAtMost(p, v), $"counted off the section: {what}");
+            Assert.True(Same(list, listing.LookupIntersect([(p, v)])), $"list: {what}");
+            Assert.True(rows == listing.CountAtMost(p, v),  $"counted off the decoded list: {what}");
+        }
+
+        // A reader that was only ever asked to count still has every list to give.
+        foreach (var (p, v) in RichQuestions)
+        {
+            Assert.True(Same(oracle.LookupIntersect([(p, v)]), counting.LookupIntersect([(p, v)])), $"list after count: {Show(p)} = {Show(v)}");
+            Assert.True(oracle.MightContain(p, v) == counting.MightContain(p, v), $"MightContain after count: {Show(p)} = {Show(v)}");
+        }
+    }
+
+    /// <summary>
+    /// The same, where the bound is NOT exact: random sections file one row under several
+    /// spellings of a property and several casings of a value, which the list unions and the
+    /// packed count sums. What must hold is the contract, whichever was asked first.
+    /// </summary>
+    [Fact]
+    public void RandomSections_CountNoFewerRowsThanTheyList_AndGiveTheSameKindOfAnswer()
+    {
+        var rng = new Random(161);
+        string[] props  = ["A", "b", "B", "c.d", "c\u0001d", "Ω", "e"];
+        string[] values = ["x", "X", "xy", "XY", "Ωmega", "ΩMEGA", "1", "01", "true", "", "long-" + new string('q', 40)];
+        bool boundWasLoose = false;
+
+        for (int round = 0; round < 40; round++)
+        {
+            var b = new SegmentInvertedIndex();
+            int events = rng.Next(1, 300);
+            for (uint o = 0; o < events; o++)
+            {
+                int k = rng.Next(1, 4);
+                for (int j = 0; j < k; j++)
+                    b.Add(o, props[rng.Next(props.Length)], rng.Next(4) switch
+                    {
+                        0 => (long)rng.Next(3),
+                        1 => rng.Next(2) == 0,
+                        _ => values[rng.Next(values.Length)],
+                    });
+            }
+            byte[] section = rng.Next(4) == 0 ? b.SerialiseRoaringV1() : b.Serialise();
+            var oracle = SegmentInvertedIndex.Deserialise(section);
+            using var lazy = SegmentIndexReader.Load(section, [], []);
+
+            for (int q = 0; q < 60; q++)
+            {
+                string  p = props[rng.Next(props.Length)];
+                object? v = rng.Next(3) switch
+                {
+                    0 => (long)rng.Next(3),
+                    1 => rng.Next(2) == 0 ? "TRUE" : false,
+                    _ => values[rng.Next(values.Length)],
+                };
+                string what = $"round {round}, {Show(p)} = {Show(v)}";
+
+                // Either order: the count before its list is decoded, or after.
+                if (rng.Next(2) == 0) lazy.LookupIntersect([(p, v)]);
+                int?    counted = lazy.CountAtMost(p, v);
+                uint[]? list    = lazy.LookupIntersect([(p, v)]);
+
+                Assert.True(Same(oracle.LookupIntersect([(p, v)]), list), "list: " + what);
+                AssertCounts(list, counted, "packed: " + what);
+                Assert.True(list?.Length == oracle.CountAtMost(p, v), "decoded: " + what);   // exact: it has the union
+                if (list is not null && counted > list.Length) boundWasLoose = true;
+            }
+        }
+
+        // Without a loose bound somewhere, this proved no more than the rich section does.
+        Assert.True(boundWasLoose, "no question was counted above its list");
+    }
+
+    /// <summary>
+    /// What the count is FOR. The posting list worth not building is the big one — a value most
+    /// of a group carries — and it is told apart from the rest by its length, which the section
+    /// states in the list's first bytes. Reading that must cost nothing like the list: it used to
+    /// be decoded, copied and kept in order to learn that it should not have been.
+    /// </summary>
+    [Fact]
+    public void CountingABucket_DecodesNoPostingList_AndKeepsNone()
+    {
+        const int Rows = 20_000, Listed = Rows - (Rows + 2) / 3;
+        var b = new SegmentInvertedIndex();
+        for (uint o = 0; o < Rows; o++)
+        {
+            b.Add(o, "RequestId", $"req-{o:x8}");
+            b.Add(o, "Provider", o % 3 == 0 ? "UnionPay" : "Visa");
+        }
+        byte[] section = b.Serialise();
+
+        using var lazy = SegmentIndexReader.Load(section, [], []);
+        Assert.Null(lazy.CountAtMost("NoSuchProperty", "x"));        // the catalog is read here, once
+        long kept = lazy.ApproxManagedBytes;
+
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        int? counted = lazy.CountAtMost("Provider", "Visa");
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
+
+        Assert.Equal(Listed, counted);
+        // Decoded, the list is 4 bytes a row: 53 KB. The count is a memo entry — and, the first
+        // time, the tables it and the absent encodings of the value are remembered in.
+        Assert.True(allocated < 2048, $"counting a {Listed}-row bucket allocated {allocated} B");
+        Assert.True(lazy.ApproxManagedBytes - kept < 2048,
+            $"counting a {Listed}-row bucket left {lazy.ApproxManagedBytes - kept} B in the memo");
+
+        // Asked again it is the memo's, and the memo's answer is free.
+        a0 = GC.GetAllocatedBytesForCurrentThread();
+        counted = lazy.CountAtMost("Provider", "Visa");
+        allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
+        Assert.Equal(Listed, counted);
+        Assert.Equal(0, allocated);
+
+        // The list is still there for a caller who does want it, and from then on the count is
+        // the list's own length: the number kept in its place is dropped.
+        long counting = lazy.ApproxManagedBytes;
+        Assert.Equal(Listed, lazy.LookupIntersect([("Provider", "Visa")])!.Length);
+        Assert.True(lazy.ApproxManagedBytes - counting >= 4L * Listed - 512,
+            $"the decoded list added {lazy.ApproxManagedBytes - counting} B to the memo");
+        Assert.Equal(Listed, lazy.CountAtMost("Provider", "Visa"));
+    }
+
+    /// <summary>
+    /// A value that is in the section and lists no row is not an absent value: the decoded
+    /// reader holds an empty list for it and <c>MightContain</c> says so. Both count 0, and a
+    /// packed reader that counted first must not go on to remember the value as absent — its
+    /// answers would then depend on which question it was asked first.
+    /// </summary>
+    [Fact]
+    public void AValueFiledWithNoRow_IsStillAValue_WhicheverQuestionComesFirst()
+    {
+        var b = new SegmentInvertedIndex();
+        b.Add(3, "P", "hollow");
+        b.Add(7, "P", "one");
+        byte[] section = b.Serialise();
+
+        // No builder files a value without a row, so the list is emptied by hand: its leading
+        // count, which follows the value's text and the list's own byte length.
+        int count = section.AsSpan().IndexOf("hollow"u8) + "hollow".Length + sizeof(uint);
+        Assert.Equal(1, section[count]);
+        section[count] = 0;
+
+        var oracle = SegmentInvertedIndex.Deserialise(section);
+        (string, object?)[] hollow = [("P", "hollow")];
+        Assert.True(oracle.LookupIntersect(hollow) is { Length: 0 });
+        Assert.True(oracle.MightContain("P", "hollow"));
+        Assert.Equal(0, oracle.CountAtMost("P", "hollow"));
+
+        foreach (bool countFirst in (bool[])[true, false])
+        {
+            using var lazy = SegmentIndexReader.Load(section, [], []);
+            if (countFirst) Assert.Equal(0, lazy.CountAtMost("P", "hollow"));
+
+            Assert.True(lazy.LookupIntersect(hollow) is { Length: 0 }, $"list, count first: {countFirst}");
+            Assert.True(lazy.Lookup("P", "hollow") is { Length: 0 }, $"lookup, count first: {countFirst}");
+            Assert.True(lazy.MightContain("P", "hollow"), $"MightContain, count first: {countFirst}");
+            Assert.Equal(0, lazy.CountAtMost("P", "hollow"));
+
+            // And the value beside it is untouched by any of this.
+            Assert.Equal(1, lazy.CountAtMost("P", "one"));
+            Assert.Equal([7u], lazy.LookupIntersect([("P", "one")])!);
+        }
+    }
+
+    /// <summary>
+    /// An index that knows no cheaper way counts by building the list: the interface's default,
+    /// which is what any other implementation gets, has to give the same three answers.
+    /// </summary>
+    [Fact]
+    public void AnIndexWithNoCountOfItsOwn_CountsByItsList()
+    {
+        var b = new SegmentInvertedIndex();
+        b.Add(0, "P", "v");
+        b.Add(4, "P", "v");
+        ISegmentIndex index = new ListsOnly(SegmentInvertedIndex.Deserialise(b.Serialise()));
+
+        Assert.Equal(2, index.CountAtMost("P", "v"));
+        Assert.Equal(0, index.CountAtMost("P", "absent"));
+        Assert.Null(index.CountAtMost("NoSuchProperty", "v"));
+    }
+
+    /// <summary>The members <see cref="ISegmentIndex"/> requires, and none of the optional ones.</summary>
+    private sealed class ListsOnly(SegmentInvertedIndex inner) : ISegmentIndex
+    {
+        public uint[]? Lookup(string propertyName, object? value) => inner.Lookup(propertyName, value);
+        public bool MightContain(string propertyName, object? value) => inner.MightContain(propertyName, value);
+        public uint[]? LookupTrigram(ReadOnlySpan<char> text) => null;
+        public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) =>
+            inner.LookupIntersect(predicates);
+    }
+
+    /// <summary>
+    /// Null and 0 are different answers here too: "no information, scan" and "nothing matches,
+    /// drop the group". The count may exceed the list and may not fall short of it.
+    /// </summary>
+    private static void AssertCounts(uint[]? list, int? counted, string what)
+    {
+        if (list is null) { Assert.True(counted is null, $"a count of {counted} over no information: {what}"); return; }
+
+        Assert.True(counted is not null, $"no count over a list of {list.Length}: {what}");
+        Assert.True(counted >= list.Length, $"a count of {counted} under a list of {list.Length}: {what}");
+        // Zero is proof, and the only count an empty list has.
+        Assert.True((counted == 0) == (list.Length == 0), $"a count of {counted} over a list of {list.Length}: {what}");
+    }
+
     // ── Trigram ───────────────────────────────────────────────────────────────
 
     private static readonly string[] Texts =

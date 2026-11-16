@@ -16,6 +16,7 @@ public sealed class CompiledFilter : IPreparedFilter
     // Pre-computed at compile time so QueryExecutor pays zero allocation per query.
     private readonly IReadOnlyList<(string property, string text)>    _trigramHints;
     private readonly IReadOnlyList<(string property, object? value)>  _invertedHints;
+    private readonly IReadOnlyList<(string property, object? value)>  _invertedHintsBesideExceptionPresence;
 
     // The single bloom/MightContain hint, also resolved once at compile time — the
     // prefilter asks for it inside a per-segment parallel loop.
@@ -32,6 +33,7 @@ public sealed class CompiledFilter : IPreparedFilter
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
+        _invertedHintsBesideExceptionPresence = BesideExceptionPresence(_invertedHints);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
         _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
@@ -517,7 +519,59 @@ public sealed class CompiledFilter : IPreparedFilter
     /// (<c>SegmentInvertedIndex.IsExceptionMarker</c>): there the list is the answer and its
     /// absence drops the group; an older group says "no information" and is scanned.</para>
     /// </summary>
-    private static readonly (string, object?) ExceptionPresentHint = (ClefFields.ExceptionExists, "true");
+    internal static readonly (string Property, object? Value) ExceptionPresentHint = (ClefFields.ExceptionExists, "true");
+
+    /// <summary>
+    /// True when <see cref="ExceptionPresentHint"/> is among <see cref="GetInvertedHints"/>: the
+    /// filter cannot match an event that carries no exception.
+    ///
+    /// <para>The narrowing treats that one hint apart from the rest
+    /// (<c>QueryExecutor.TryNarrowWithIndex</c>): its posting list is counted before it is
+    /// built, and where it names nearly the whole of a group it is not built at all — the other
+    /// hints then narrow without it (<see cref="GetInvertedHintsBesideExceptionPresence"/>).
+    /// Both are resolved here, once per filter, because the narrowing asks once per group.</para>
+    /// </summary>
+    public bool HintsExceptionPresence => !ReferenceEquals(_invertedHintsBesideExceptionPresence, _invertedHints);
+
+    /// <summary>
+    /// <see cref="GetInvertedHints"/> without the exception marker's hint; the same list when
+    /// that hint is not in it.
+    /// </summary>
+    public IReadOnlyList<(string property, object? value)> GetInvertedHintsBesideExceptionPresence() =>
+        _invertedHintsBesideExceptionPresence;
+
+    private static IReadOnlyList<(string, object?)> BesideExceptionPresence(
+        IReadOnlyList<(string property, object? value)> hints)
+    {
+        List<(string, object?)>? rest = null;
+        for (int i = 0; i < hints.Count; i++)
+        {
+            if (IsExceptionPresentHint(hints[i]))
+            {
+                if (rest is null)
+                {
+                    rest = new List<(string, object?)>(hints.Count);
+                    for (int j = 0; j < i; j++) rest.Add(hints[j]);
+                }
+            }
+            else rest?.Add(hints[i]);
+        }
+        if (rest is null) return hints;
+        return rest.Count == 0 ? Array.Empty<(string, object?)>() : rest;
+    }
+
+    /// <summary>
+    /// The hint itself, key AND value — not merely a hint under the marker's name. Today no other
+    /// is ever filed there (the field of that name has no value bucket; see
+    /// <see cref="CollectInvertedHints"/>), but <see cref="HintsExceptionPresence"/> is what lets
+    /// the narrowing DROP a group whose marker lists no row, and that is only right for a filter
+    /// that cannot match without an exception. A hint for the marker's other answer, should one
+    /// ever be added, must not be taken for this one.
+    /// </summary>
+    private static bool IsExceptionPresentHint((string property, object? value) hint) =>
+        string.Equals(hint.property, ExceptionPresentHint.Property, StringComparison.Ordinal) &&
+        hint.value is string text &&
+        string.Equals(text, (string)ExceptionPresentHint.Value!, StringComparison.Ordinal);
 
     /// <summary>
     /// True when <paramref name="node"/> matches an event if and only if the event carries an

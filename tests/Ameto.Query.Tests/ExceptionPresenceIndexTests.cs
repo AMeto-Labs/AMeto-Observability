@@ -104,9 +104,239 @@ public sealed class ExceptionPresenceIndexTests : IAsyncLifetime
         await AssertAnswersAsync(store);
     }
 
+    // ── Through the index cache, which is how production asks ─────────────────
+
+    /// <summary>
+    /// Everything above runs an executor with no index cache, which answers each query from the
+    /// sections. Production has one: the first query teaches each group's memo, and the next is
+    /// answered from what it learned — the marker's count, its list where one was worth
+    /// building, the proof that a group holds none. The rows must be the same from either, and
+    /// the second asking must not go back to a section.
+    /// </summary>
+    [Fact]
+    public async Task ThroughTheIndexCache_TheRowsAreTheSame_FromTheSectionsAndThenFromTheMemos()
+    {
+        var store = await StoreAsync("cached", static (events, terms) => new SegmentIndexBuilder(events, 5, terms));
+        using var cache = new SegmentIndexCache(64L * 1024 * 1024);
+        var cached = store with { Query = WithCache(store.Engine, cache) };
+
+        await AssertAnswersAsync(cached);
+        Assert.True(cache.MissCount > 0, "setup: nothing was read through the cache");
+        long misses = cache.MissCount, hits = cache.HitCount;
+
+        await AssertAnswersAsync(cached);
+        Assert.Equal(misses, cache.MissCount);
+        Assert.True(cache.HitCount > hits);
+    }
+
+    // ── A group the marker nearly fills ───────────────────────────────────────
+
+    /// <summary>
+    /// The Error level of a level-split store: nearly every row carries an exception, so the
+    /// marker's list names nearly the whole group and narrows next to nothing. From fifteen rows
+    /// in sixteen up it is not built — the group is carried as "every row" — and that must
+    /// change what a query costs and nothing about what it returns: the rows the list would
+    /// have left out are still in the group, and the scan has to reject them.
+    ///
+    /// <para>200 rows a group, so the line is at 188: 94 in a hundred is on it, 93 is one row
+    /// past and named. A page is asked for as well as the whole window, newest first as the UI
+    /// does, and each executor twice — the cached one answers the second time from its memos.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(100, "every row")]
+    [InlineData(97,  "every row")]
+    [InlineData(94,  "every row")]
+    [InlineData(93,  "186 of 200")]
+    [InlineData(50,  "100 of 200")]
+    [InlineData(0,   "dropped")]
+    public async Task AGroupTheMarkerNearlyFills_IsCarriedWhole_AndReturnsOnlyTheRowsThatMatch(int percent, string verdict)
+    {
+        const int PerSegment = 200, Rows = QuerySegmentFixtures.ErrorSegments * PerSegment, Page = 50;
+
+        var (engine, uncached) = await QuerySegmentFixtures.ErrorSegmentsAsync(
+            Path.Combine(_dir, "dense-" + percent), PerSegment, percent);
+        _engines.Add(engine);
+        using var cache = new SegmentIndexCache(64L * 1024 * 1024);
+        var cached = WithCache(engine, cache);
+
+        Assert.All(GroupVerdicts(engine, "has(@x)"), v => Assert.Equal(verdict, v));
+        // Beside the level every row of the group has: that list is the whole group and is
+        // recognised as such once built, so the verdict is the marker's either way.
+        Assert.All(GroupVerdicts(engine, "@x.exists = true and @l = 'Error'"), v => Assert.Equal(verdict, v));
+
+        string[] with    = [.. Enumerable.Range(0, Rows).Where(row => row % 100 <  percent).Select(RowName)];
+        string[] without = [.. Enumerable.Range(0, Rows).Where(row => row % 100 >= percent).Select(RowName)];
+        string[] newest  = [.. with.Reverse().Take(Page)];
+
+        foreach (var query in (QueryExecutor[])[uncached, uncached, cached, cached])
+        {
+            foreach (string filter in (string[])["has(@x)", "@x.exists = true", "has(@x) and @l = 'Error'"])
+            {
+                Assert.Equal(with, await RowsAsync(query, filter));
+                Assert.Equal(newest, RowsOf(await QuerySegmentFixtures.RunAsync(query, filter, Page)));
+            }
+            Assert.Equal(without, await RowsAsync(query, "not has(@x)"));
+
+            // Beside a hint that does narrow, the marker's list is left out and the hint narrows alone.
+            string one = RowName(Rows / 2 + 7);
+            Assert.Equal(7 < percent ? [one] : [], await RowsAsync(query, $"has(@x) and Row = '{one}'"));
+        }
+
+        static string RowName(int row) => row.ToString("D7", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    // ── One segment, groups of every kind ─────────────────────────────────────
+
+    /// <summary>
+    /// The verdicts are per index GROUP, and a segment's candidate list is assembled from them:
+    /// a dropped group contributes nothing, a narrowed one its ordinals, and an "every row" group
+    /// a contiguous range that is generated only if the segment has to name rows at all — before
+    /// a narrowed group's ordinals, or after the last one. Every other test here has one group
+    /// to a segment and so exercises none of that.
+    ///
+    /// <para>One segment, cut into a group per block, whose rows run through six stretches: all
+    /// with an exception, none, every third, all but one in thirty-two, none, all. So "every
+    /// row" groups sit on both sides of narrowed ones with dropped ones between, and one kind of
+    /// "every row" group holds rows WITHOUT an exception that only the scan can reject. Read in
+    /// both directions, by the page from either end, through two time windows, with and without
+    /// the cache.</para>
+    /// </summary>
+    [Fact]
+    public async Task OneSegmentWhoseGroupsAnswerDifferently_ReturnsTheSameRows_InEitherDirection()
+    {
+        var (engine, uncached, hasException, baseTicks) = await ManyGroupsSegmentAsync();
+        using var cache = new SegmentIndexCache(64L * 1024 * 1024);
+        var cached = WithCache(engine, cache);
+
+        // The premise: the segment really does hold every kind of group, in an order that makes
+        // the assembly do each thing it can do.
+        var groups = GroupAnswers(engine, "has(@x)");
+        bool Whole(int g)    => groups[g].Verdict == "every row";
+        bool Narrowed(int g) => groups[g].Verdict.Contains(" of ", StringComparison.Ordinal);
+        bool HoldsARowWithout(int g) =>
+            Enumerable.Range((int)groups[g].First, (int)groups[g].Count).Any(row => !hasException[row]);
+        int[] all = [.. Enumerable.Range(0, groups.Count)];
+
+        Assert.True(groups.Count >= 12, $"setup: only {groups.Count} groups");
+        Assert.DoesNotContain(groups, static g => g.Verdict == "no information");
+        Assert.Contains(groups, static g => g.Verdict == "dropped");
+        Assert.Contains(all, g => Whole(g) && !HoldsARowWithout(g));
+        Assert.Contains(all, g => Whole(g) && HoldsARowWithout(g));
+        int firstNarrowed = Array.FindIndex(all, Narrowed), lastNarrowed = Array.FindLastIndex(all, Narrowed);
+        Assert.True(firstNarrowed >= 0, "setup: no group was narrowed");
+        Assert.Contains(all, g => Whole(g) && g < firstNarrowed);
+        Assert.Contains(all, g => Whole(g) && g > lastNarrowed);
+
+        int      rows    = hasException.Length;
+        string[] with    = [.. Enumerable.Range(0, rows).Where(row => hasException[row]).Select(RowName)];
+        string[] without = [.. Enumerable.Range(0, rows).Where(row => !hasException[row]).Select(RowName)];
+
+        // A window that opens and closes inside a stretch with no exception, so every group
+        // between is asked whole; and one that opens half a second before a row deep in the last
+        // stretch, where every group it reaches says "every row" and none is narrowed.
+        int opens = Stretches[0] + Stretches[1] / 2, closes = rows - Stretches[5] - Stretches[4] / 2;
+        int late  = rows - Stretches[5] / 2;
+        DateTimeOffset At(int row, long nudge = 0) => new(baseTicks + row * TimeSpan.TicksPerSecond + nudge, TimeSpan.Zero);
+        string[] between = [.. Enumerable.Range(opens, closes - opens + 1).Where(row => hasException[row]).Select(RowName)];
+        string[] tail    = [.. Enumerable.Range(late, rows - late).Select(RowName)];
+        Assert.All(Enumerable.Range(late, rows - late), row => Assert.True(hasException[row]));
+
+        foreach (var query in (QueryExecutor[])[uncached, cached, cached])
+        {
+            foreach (string filter in (string[])["has(@x)", "@x.exists = true"])
+            {
+                Assert.Equal(with, RowsOf(await QuerySegmentFixtures.RunAsync(query, filter, int.MaxValue, forward: true)));
+                Assert.Equal(with.Reverse(), RowsOf(await QuerySegmentFixtures.RunAsync(query, filter, int.MaxValue)));
+                Assert.Equal(with.Take(40), RowsOf(await QuerySegmentFixtures.RunAsync(query, filter, 40, forward: true)));
+                Assert.Equal(with.Reverse().Take(40), RowsOf(await QuerySegmentFixtures.RunAsync(query, filter, 40)));
+
+                Assert.Equal(between, RowsOf(await QuerySegmentFixtures.RunAsync(
+                    query, filter, int.MaxValue, At(opens), At(closes), forward: true)));
+                Assert.Equal(between.Reverse(), RowsOf(await QuerySegmentFixtures.RunAsync(
+                    query, filter, int.MaxValue, At(opens), At(closes))));
+                Assert.Equal(tail, RowsOf(await QuerySegmentFixtures.RunAsync(
+                    query, filter, int.MaxValue, At(late, -TimeSpan.TicksPerSecond / 2), At(rows + 60), forward: true)));
+            }
+            Assert.Equal(without, RowsOf(await QuerySegmentFixtures.RunAsync(query, "not has(@x)", int.MaxValue, forward: true)));
+        }
+
+        static string RowName(int row) => row.ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Rows in each stretch of <see cref="ManyGroupsSegmentAsync"/>, in the order written.</summary>
+    private static readonly int[] Stretches = [700, 3_000, 1_500, 1_000, 3_000, 700];
+
+    /// <summary>Whether row <paramref name="i"/> of stretch <paramref name="stretch"/> carries an exception.</summary>
+    private static bool StretchHasException(int stretch, int i) => stretch switch
+    {
+        0 or 5 => true,
+        1 or 4 => false,
+        2      => i % 3 == 0,
+        _      => i % 32 != 5,          // one row in thirty-two without: inside the one in sixteen
+    };
+
+    /// <summary>
+    /// One Warning segment whose index is cut into a group per block (a group owns whole blocks,
+    /// and a budget of one byte fills it with the first), written through the production index
+    /// wiring. Returns, per file ordinal, whether that row carries an exception.
+    /// </summary>
+    private async Task<(StorageEngine Engine, QueryExecutor Query, bool[] HasException, long BaseTicks)> ManyGroupsSegmentAsync()
+    {
+        string dir = Path.Combine(_dir, "many-groups");
+        Directory.CreateDirectory(dir);
+        var options = new ServerOptions { DataDirectory = dir };
+        var engine  = new StorageEngine(
+            Options.Create(options),
+            new RetentionStore(options, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        _engines.Add(engine);
+        engine._groupPayloadBudgetBytes = 1;
+        engine.IndexSinkFactory = static (events, terms) => new SegmentIndexBuilder(events, 5, terms);
+        var query = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+
+        long baseTicks = new DateTimeOffset(2026, 8, 30, 9, 0, 0, TimeSpan.Zero).UtcTicks;
+        int  template  = engine.TemplatePool.Intern("settle {Row}");
+        int  service   = engine.TemplatePool.Intern("Billing.API");
+        var  buf       = new ArrayBufferWriter<byte>(64);
+        var  has       = new List<bool>(Stretches.Sum());
+
+        for (int stretch = 0; stretch < Stretches.Length; stretch++)
+        for (int i = 0; i < Stretches[stretch]; i++)
+        {
+            int row = has.Count;
+            has.Add(StretchHasException(stretch, i));
+
+            buf.ResetWrittenCount();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(1);
+            w.Write("Row"); w.Write(row.ToString("D5", System.Globalization.CultureInfo.InvariantCulture));
+            w.Flush();
+
+            Assert.True(engine.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)row).RawValue,
+                TimestampUtcTicks        = baseTicks + row * TimeSpan.TicksPerSecond,
+                Level                    = LogLevel.Warning,
+                MessageTemplatePoolIndex = template,
+                ServiceNamePoolIndex     = service,
+            }, buf.WrittenSpan, "settle {Row}", has[row] ? Readable : default));
+        }
+        await engine.FlushHotTierAsync();
+
+        Assert.Single(engine.ListSegments());
+        return (engine, query, [.. has], baseTicks);
+    }
+
     // ── Assertions ────────────────────────────────────────────────────────────
 
     private sealed record Store(StorageEngine Engine, QueryExecutor Query, string[] WithAnException, string[] Without);
+
+    /// <summary>An executor over <paramref name="engine"/> with the index cache production runs with.</summary>
+    private static QueryExecutor WithCache(StorageEngine engine, SegmentIndexCache cache) =>
+        new(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
+
+    private static string[] RowsOf(List<LogEvent> events) =>
+        [.. events.Select(static ev => (string)ev.Properties!["Row"]!)];
 
     private static async Task AssertAnswersAsync(Store store)
     {
@@ -141,8 +371,19 @@ public sealed class ExceptionPresenceIndexTests : IAsyncLifetime
     /// </summary>
     private static string[] GroupVerdicts(StorageEngine engine, string filter)
     {
+        var verdicts = GroupAnswers(engine, filter).ConvertAll(static g => g.Verdict);
+        verdicts.Sort(StringComparer.Ordinal);
+        return [.. verdicts];
+    }
+
+    /// <summary>
+    /// The same verdicts in file order, each with the ordinals its group covers — for a test
+    /// that needs to know which group said what.
+    /// </summary>
+    private static List<(string Verdict, uint First, uint Count)> GroupAnswers(StorageEngine engine, string filter)
+    {
         var compiled = CompiledFilter.Compile(filter);
-        var verdicts = new List<string>();
+        var answers  = new List<(string, uint, uint)>();
         foreach (var segment in engine.ListSegments())
         {
             using var reader = SegmentReader.Open(segment.FilePath);
@@ -154,16 +395,15 @@ public sealed class ExceptionPresenceIndexTests : IAsyncLifetime
                 using var index    = SegmentIndexReader.Load(inverted.Span, trigram.Span, bloom.Span);
                 uint rows = reader.Groups[g].EventCount;
 
-                if (!QueryExecutor.TryNarrowWithIndex(compiled, index, null, rows, out uint[]? candidates, out bool everyRow))
-                    verdicts.Add("dropped");
-                else if (everyRow)
-                    verdicts.Add("every row");
-                else
-                    verdicts.Add(candidates is null ? "no information" : $"{candidates.Length} of {rows}");
+                string verdict =
+                    !QueryExecutor.TryNarrowWithIndex(compiled, index, null, rows, out uint[]? candidates, out bool everyRow) ? "dropped"
+                    : everyRow           ? "every row"
+                    : candidates is null ? "no information"
+                    : $"{candidates.Length} of {rows}";
+                answers.Add((verdict, reader.Groups[g].FirstOrdinal, rows));
             }
         }
-        verdicts.Sort(StringComparer.Ordinal);
-        return [.. verdicts];
+        return answers;
     }
 
     // ── Fixture ───────────────────────────────────────────────────────────────

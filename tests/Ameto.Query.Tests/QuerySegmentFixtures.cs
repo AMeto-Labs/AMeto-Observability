@@ -208,6 +208,79 @@ internal static class QuerySegmentFixtures
         return (engine, query);
     }
 
+    // ── Error segments, some of whose rows carry an exception ─────────────────
+
+    /// <summary>Segments in <see cref="ErrorSegmentsAsync"/>.</summary>
+    public const int ErrorSegments = 8;
+
+    /// <summary>
+    /// What a level-split store's Error level looks like to a search for exceptions: eight
+    /// one-group segments of <paramref name="rowsPerSegment"/> Error events each, written through
+    /// the production index wiring, in which <paramref name="percentWithException"/> rows of
+    /// every hundred carry an exception of ordinary size (a ~1.3 KB stack trace) and the rest
+    /// carry none. Eight because that is one prefilter batch
+    /// (<c>QueryExecutor.PrefilterParallelism</c> at its cap), which is what a first page pays
+    /// for before it returns a row.
+    ///
+    /// <para><c>Row</c> is unique and ascending, so a result can be checked for which rows it
+    /// holds and in what order. <paramref name="cache"/> is the index cache production runs with;
+    /// null answers every query from the sections.</para>
+    /// </summary>
+    public static async Task<(StorageEngine Engine, QueryExecutor Query)> ErrorSegmentsAsync(
+        string dir, int rowsPerSegment, int percentWithException, SegmentIndexCache? cache = null)
+    {
+        Directory.CreateDirectory(dir);
+        var options = new ServerOptions
+        {
+            DataDirectory = dir,
+            HotTier       = new HotTierOptions { MaxSizeBytes = 256L * 1024 * 1024 },
+        };
+        var engine = new StorageEngine(
+            Options.Create(options),
+            new RetentionStore(options, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        engine.IndexSinkFactory = static (estimatedEventCount, termsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
+        var query = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
+
+        byte[] exception = new ExceptionInfo
+        {
+            Type       = "System.InvalidOperationException",
+            Message    = "gateway timeout on settle",
+            StackTrace = string.Join('\n', Enumerable.Repeat("   at Billing.Api.Orders.SettleAsync(OrderId id) in /src/Orders.cs:line 118", 16)),
+        }.ToBytes();
+
+        long baseTicks = new DateTimeOffset(2026, 7, 30, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+        int  tmplIdx   = engine.TemplatePool.Intern("settle {Row} failed");
+        int  svcIdx    = engine.TemplatePool.Intern("Billing.API");
+        var  buf       = new ArrayBufferWriter<byte>(64);
+
+        int row = 0;
+        for (int s = 0; s < ErrorSegments; s++)
+        {
+            for (int i = 0; i < rowsPerSegment; i++, row++)
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(1);
+                w.Write("Row"); w.Write(row.ToString("D7", System.Globalization.CultureInfo.InvariantCulture));
+                w.Flush();
+
+                Assert.True(engine.TryWrite(new LogEventHeader
+                {
+                    Id                       = new EventId(0u, (uint)row).RawValue,
+                    TimestampUtcTicks        = baseTicks + row * TimeSpan.TicksPerSecond,
+                    Level                    = LogLevel.Error,
+                    MessageTemplatePoolIndex = tmplIdx,
+                    ServiceNamePoolIndex     = svcIdx,
+                }, buf.WrittenSpan, "settle {Row} failed", i % 100 < percentWithException ? exception : default));
+            }
+            await engine.FlushHotTierAsync();
+        }
+        Assert.Equal(ErrorSegments, engine.ListSegments().Count);
+        return (engine, query);
+    }
+
     // ── Shared query helper ───────────────────────────────────────────────────
 
     /// <summary>Drains a query, stopping at <paramref name="count"/>.</summary>

@@ -230,4 +230,18 @@ public interface ISegmentIndex
     /// Returns null if not supported; empty array if no events match all predicates.
     /// </summary>
     uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) => null;
+
+    /// <summary>
+    /// How many rows an equality predicate would name AT MOST, without naming any — for a caller
+    /// that has to decide whether a posting list is worth building before it builds one.
+    ///
+    /// <para>The three answers of <see cref="LookupIntersect"/> asked about this one predicate,
+    /// with a number in place of the list: null is "no information" (the index has no bucket for
+    /// the property), 0 is proof that no row matches (the bucket is there and the value is not),
+    /// and anything else is an UPPER bound on the list's length — exact unless one row was filed
+    /// under two spellings of the value. An index that can read a posting list's count without
+    /// decoding the list overrides this; the default counts by building it.</para>
+    /// </summary>
+    int? CountAtMost(string propertyName, object? value) =>
+        LookupIntersect([(propertyName, value)])?.Length;
 }

@@ -249,9 +249,10 @@ public static class DiagnosticsEndpointMapper
                 // ── Index build ────────────────────────────────────────────────
                 // Merge rows whose exception column is not a readable exception map: written,
                 // but without their exception type and message terms, so @x.type filters and
-                // free-text search over merged segments miss them (has(@x) still finds them).
-                // Non-zero means a producer writes maps the index
-                // cannot read; it was previously counted nowhere an operator could see.
+                // free-text search over merged segments miss them. has(@x) still finds the ones
+                // whose payload opens as a map or a non-empty string; one cut off before that
+                // is no exception to a scan either. Non-zero means a producer writes maps the
+                // index cannot read; it was previously counted nowhere an operator could see.
                 indexMalformedExceptionPayloads = indexing.Hints.MalformedExceptionPayloads,
                 // Bytes parked in the index build pools — transient after a gen2 trim, but
                 // counted in no memory budget.

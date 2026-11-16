@@ -455,6 +455,185 @@ public sealed class ExceptionExistsFieldTests
         Assert.Equal(new uint[] { 0, 1, 2, 3 }, named);
     }
 
+    /// <summary>
+    /// Where the line is: the marker's list stands for its group when it leaves out at most one
+    /// row in sixteen. The count it is judged by is an upper bound, so it may exceed the group;
+    /// a group whose size is unknown is never "nearly all"; and one of fewer than sixteen rows
+    /// only when the list is the whole of it.
+    /// </summary>
+    [Theory]
+    [InlineData(16u,            16,           true)]
+    [InlineData(16u,            15,           true)]
+    [InlineData(16u,            14,           false)]
+    [InlineData(32u,            30,           true)]
+    [InlineData(32u,            29,           false)]
+    [InlineData(15u,            15,           true)]
+    [InlineData(15u,            14,           false)]
+    [InlineData(1u,             1,            true)]
+    [InlineData(1u,             0,            false)]
+    [InlineData(10_000u,        9_375,        true)]
+    [InlineData(10_000u,        9_374,        false)]
+    [InlineData(16u,            40,           true)]
+    [InlineData(0u,             0,            false)]
+    [InlineData(0u,             5,            false)]
+    [InlineData(4_000_000_000u, int.MaxValue, false)]   // compared as wide as the wider of the two
+    public void A_list_stands_for_its_group_when_it_leaves_out_at_most_one_row_in_sixteen(uint group, int rows, bool whole) =>
+        Assert.Equal(whole, QueryExecutor.NamesNearlyAllOf(group, rows));
+
+    /// <summary>
+    /// A marker that names nearly all of its group is not built and then discarded — it is never
+    /// ASKED for. The narrowing asks the index how many rows the marker lists, which costs one
+    /// read of the list's leading count, and stops there: alone, the group is carried as "every
+    /// row"; beside a hint that does narrow, that hint narrows by itself. The rows the list
+    /// would have left out arrive with the rest and are the scan's to reject.
+    ///
+    /// <para>What it replaced decoded the list, copied it and kept it, in every group of every
+    /// segment a first page touched, to find that it named the group.</para>
+    /// </summary>
+    [Fact]
+    public void A_marker_that_names_nearly_all_of_its_group_is_counted_and_never_listed()
+    {
+        const int Rows = 32;
+
+        // One row in thirty-two has no exception: inside the one in sixteen a list may leave out.
+        using var dense = Sharded(Rows, static row => row != 9);
+        var asked = new RecordingIndex(dense);
+
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x)"), asked, null, Rows, out uint[]? candidates, out bool whole));
+        Assert.True(whole);
+        Assert.Null(candidates);
+        Assert.Equal([ClefFields.ExceptionExists], asked.Counted);
+        Assert.Empty(asked.Listed);
+
+        asked = new RecordingIndex(dense);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x) and Shard = 'a'"), asked, null, Rows, out candidates, out whole));
+        Assert.False(whole);
+        Assert.NotNull(candidates);
+        Assert.Equal(new uint[] { 8, 9, 10, 11 }, candidates);      // row 9 has none: the scan rejects it
+        Assert.Equal([ClefFields.ExceptionExists], asked.Counted);
+        Assert.Equal(["Shard"], asked.Listed);
+
+        // Four rows in thirty-two without one is past the line: the list is worth having, and is
+        // asked for with the rest, as it always was.
+        using var sparser = Sharded(Rows, static row => row % 8 != 1);
+        asked = new RecordingIndex(sparser);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x)"), asked, null, Rows, out candidates, out whole));
+        Assert.False(whole);
+        Assert.NotNull(candidates);
+        Assert.Equal(28, candidates.Length);
+        Assert.Equal([ClefFields.ExceptionExists], asked.Listed);
+
+        asked = new RecordingIndex(sparser);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x) and Shard = 'a'"), asked, null, Rows, out candidates, out whole));
+        Assert.NotNull(candidates);
+        Assert.Equal(new uint[] { 8, 10, 11 }, candidates);         // row 9 has none, and the list says so
+        Assert.Equal([ClefFields.ExceptionExists + " + Shard"], asked.Listed);
+
+        // A filter that does not ask for an exception counts nothing: the question is the marker's alone.
+        asked = new RecordingIndex(dense);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("Shard = 'a'"), asked, null, Rows, out candidates, out _));
+        Assert.Equal(new uint[] { 8, 9, 10, 11 }, candidates!);
+        Assert.Empty(asked.Counted);
+
+        // Any other key has to be listed to be recognised — and once it is, a list as long as
+        // the group is the group, here every row being an Error: carried whole all the same.
+        asked = new RecordingIndex(dense);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("@l = 'Error'"), asked, null, Rows, out candidates, out whole));
+        Assert.True(whole);
+        Assert.Null(candidates);
+        Assert.Empty(asked.Counted);
+        Assert.Equal([ClefFields.Level], asked.Listed);
+
+        // Both at once: the marker counted and left out, the level listed and recognised.
+        asked = new RecordingIndex(dense);
+        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x) and @l = 'Error'"), asked, null, Rows, out candidates, out whole));
+        Assert.True(whole);
+        Assert.Null(candidates);
+        Assert.Equal([ClefFields.ExceptionExists], asked.Counted);
+        Assert.Equal([ClefFields.Level], asked.Listed);
+    }
+
+    /// <summary>
+    /// What the narrowing is told about a filter, once, when it is compiled: whether the marker's
+    /// hint is among its inverted hints — only then may a group whose marker lists no row be
+    /// dropped — and which hints stand beside it, in their order, to narrow alone where the
+    /// marker's list is not worth building.
+    /// </summary>
+    [Theory]
+    [InlineData("has(@x)",                                  true,  "")]
+    [InlineData("@x.exists = true",                         true,  "")]
+    [InlineData("has(@x) and @x.exists != false",           true,  "")]
+    [InlineData("has(@x) and Shard = 'a'",                  true,  "Shard")]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", true,  "Shard,@l")]
+    [InlineData("Shard = 'a'",                              false, "Shard")]
+    [InlineData("@x.exists = false and Shard = 'a'",        false, "Shard")]
+    [InlineData("not has(@x)",                              false, "")]
+    [InlineData("has(@x) or Shard = 'a'",                   false, "")]
+    public void The_filter_says_whether_it_asks_for_an_exception_and_what_it_hints_beside(
+        string expression, bool asks, string beside)
+    {
+        var filter = CompiledFilter.Compile(expression);
+        var rest   = filter.GetInvertedHintsBesideExceptionPresence();
+
+        Assert.Equal(asks, filter.HintsExceptionPresence);
+        Assert.Equal(asks, filter.GetInvertedHints().Contains(CompiledFilter.ExceptionPresentHint));
+        Assert.Equal(beside, string.Join(",", rest.Select(static hint => hint.property)));
+        Assert.DoesNotContain(CompiledFilter.ExceptionPresentHint, rest);
+        if (!asks) Assert.Same(filter.GetInvertedHints(), rest);     // nothing to leave out, nothing copied
+    }
+
+    /// <summary>
+    /// One index group of <paramref name="rows"/> Error rows, as a query reads it: rows 8 to 11
+    /// carry <c>Shard = 'a'</c> and the rest <c>'b'</c>, and a row carries an exception where
+    /// <paramref name="hasException"/> says so.
+    /// </summary>
+    private static SegmentIndexReader Sharded(int rows, Func<int, bool> hasException)
+    {
+        byte[] a = Pack(static (ref MessagePackWriter w) => { w.WriteMapHeader(1); w.Write("Shard"); w.Write("a"); });
+        byte[] b = Pack(static (ref MessagePackWriter w) => { w.WriteMapHeader(1); w.Write("Shard"); w.Write("b"); });
+        byte[] boom = Boom.ToBytes();
+        long ticks = new DateTimeOffset(2026, 11, 16, 9, 0, 0, TimeSpan.Zero).UtcTicks;
+
+        using var builder = new SegmentIndexBuilder(rows);
+        for (int i = 0; i < rows; i++)
+        {
+            var ev = new SegmentEventRef(new EventId(0u, (uint)i).RawValue, ticks + i, LogLevel.Error,
+                                         0, 0, 0, "settle {OrderId}", "Billing.API",
+                                         i is >= 8 and < 12 ? a : b, hasException(i) ? boom : []);
+            builder.Add((uint)i, in ev);
+        }
+        return Index(builder);
+    }
+
+    /// <summary>An index that notes which keys it was asked to count and which to list.</summary>
+    private sealed class RecordingIndex(ISegmentIndex inner) : ISegmentIndex
+    {
+        public List<string> Counted { get; } = [];
+        public List<string> Listed  { get; } = [];
+
+        public uint[]? Lookup(string propertyName, object? value)
+        {
+            Listed.Add(propertyName);
+            return inner.Lookup(propertyName, value);
+        }
+
+        public bool MightContain(string propertyName, object? value) => inner.MightContain(propertyName, value);
+
+        public uint[]? LookupTrigram(ReadOnlySpan<char> text) => inner.LookupTrigram(text);
+
+        public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates)
+        {
+            Listed.Add(string.Join(" + ", predicates.Select(static p => p.property)));
+            return inner.LookupIntersect(predicates);
+        }
+
+        public int? CountAtMost(string propertyName, object? value)
+        {
+            Counted.Add(propertyName);
+            return inner.CountAtMost(propertyName, value);
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>The ordinals of the events a filter matches — the scan, which is the answer owed.</summary>

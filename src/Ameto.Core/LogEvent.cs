@@ -370,6 +370,12 @@ public static class ClefFields
     /// bucket is also something only a builder can write: a property enters the index with its
     /// first value, so neither an older group nor a user property that happens to have this
     /// name can pass for one — a property of this name with a value in it vouches for nothing.</para>
+    ///
+    /// <para>The word is given for <c>ExceptionInfo.IsPresent</c> AS IT STOOD when the group was
+    /// built, and every group that carries it holds that method's answers. So the name is also
+    /// a version: should <c>IsPresent</c> ever come to accept a payload it rejects today, the
+    /// builder has to vouch under a NEW name, or the groups already written would be trusted
+    /// about rows their lists leave out. See the note on that method.</para>
     /// </summary>
     public const string ExceptionExistsComplete = "@x.exists.complete";
 }
