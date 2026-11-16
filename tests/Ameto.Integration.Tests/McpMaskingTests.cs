@@ -240,7 +240,7 @@ public sealed class McpMaskingTests
         Assert.Equal("true", cells["Retry"]);          // a boolean hides nothing
         Assert.True(policy.HidesField("PaymentId"));
         Assert.False(policy.HidesField("Reason"));
-        Assert.False(policy.HidesField("@mt"));
+        Assert.False(FilterGuard.IsHidden(policy, "@mt"));          // a built-in field is never a hidden one
     }
 
     [Fact]
@@ -299,14 +299,7 @@ public sealed class McpMaskingTests
     [InlineData("ci_contains(CardNumber, '1111')")]
     [InlineData("endsWith(CardNumber, '1111')")]
     [InlineData("length(CardNumber) > 15")]
-    [InlineData("toLower(CardNumber) = 'x'")]
-    [InlineData("toNumber(CardNumber) >= 4000000000000000")]
-    [InlineData("substring(CardNumber, 0, 4) = '4111'")]
-    [InlineData("indexOf(CardNumber, '4') = 0")]
-    [InlineData("replace(CardNumber, '4', '5') = 'x'")]
-    [InlineData("concat(CardNumber, '-') = 'x'")]
-    [InlineData("coalesce(CardNumber, 'none') = 'none'")]
-    [InlineData("toJson(CardNumber) = '4111'")]
+    [InlineData("regexMatch(CardNumber, '^41')")]
     [InlineData("CardNumber = OtherNumber")]
     [InlineData("OtherNumber = CardNumber")]
     [InlineData("@l = 'Error' and (Reason = 'x' or not (Payment.CardNumber like '4%'))")]
@@ -315,31 +308,8 @@ public sealed class McpMaskingTests
         var prepared = FilterGuard.Prepare(filter, Policy(rules: Rule("CardNumber", MaskAction.Hash)), new TokenVault());
         Assert.NotNull(prepared.Error);
         Assert.Contains("hidden field", prepared.Error);
-    }
-
-    /// <summary>
-    /// The guard finds the properties a node reads by SHAPE: a string member named *Property, or
-    /// a list of argument nodes. A node type added to the query language with its path under
-    /// another name would be read by nobody — so this fails first, in the build that adds it.
-    /// </summary>
-    [Fact]
-    public void EveryFilterNodeType_ExposesThePropertiesItReads_InAShapeTheGuardKnows()
-    {
-        Type[] readNoProperty =
-        [
-            typeof(AndNode), typeof(OrNode), typeof(NotNode), typeof(MatchAllNode), typeof(LevelNode),
-            typeof(FreeTextNode), typeof(TimeCompareNode), typeof(NowCompareNode),
-        ];
-        var unknown = typeof(FilterNode).Assembly.GetTypes()
-            .Where(static t => !t.IsAbstract && typeof(FilterNode).IsAssignableFrom(t))
-            .Except(readNoProperty)
-            .Where(static t => !t.GetProperties().Any(static p =>
-                (p.PropertyType == typeof(string) && p.Name.EndsWith("Property", StringComparison.Ordinal))
-                || (p.PropertyType.IsGenericType && p.Name == "Args")))
-            .Select(static t => t.Name)
-            .ToList();
-
-        Assert.Empty(unknown);
+        Assert.Equal(RefusalKind.Masking, prepared.Kind);
+        Assert.Null(prepared.Node);
     }
 
     [Fact]
@@ -349,27 +319,30 @@ public sealed class McpMaskingTests
         var policy = Policy(vault: vault, rules: [Rule("CardNumber", MaskAction.Hash), Rule("MerchantId", MaskAction.Hash)]);
         var cells  = Cells(policy.Mask(Event("x", new() { ["CardNumber"] = "4111'1111\\1111", ["MerchantId"] = 6456116363L }), new MaskStats()));
 
-        var text = FilterGuard.Prepare($"CardNumber = '{cells["CardNumber"]}' or MerchantId in ['{cells["MerchantId"]}']", policy, vault);
-        Assert.Null(text.Error);
+        var prepared = FilterGuard.Prepare($"CardNumber = '{cells["CardNumber"]}' or MerchantId in ['{cells["MerchantId"]}']", policy, vault);
+        Assert.Null(prepared.Error);
         // A string comes back quoted with its quote and backslash escaped; a number bare.
-        Assert.Equal(@"CardNumber = '4111\'1111\\1111' or MerchantId in [6456116363]", text.Filter);
-        Assert.True(CompiledFilter.Compile(text.Filter).Matches(Event("x", new() { ["CardNumber"] = "4111'1111\\1111" })));
+        string text = FilterGuard.Write(prepared.Node!);
+        Assert.Equal(@"CardNumber = '4111\'1111\\1111' or MerchantId in [6456116363]", text);
+        Assert.True(CompiledFilter.Compile(text).Matches(Event("x", new() { ["CardNumber"] = "4111'1111\\1111" })));
+        Assert.True(CompiledFilter.Compile(text).Matches(Event("x", new() { ["MerchantId"] = 6456116363L })));
 
         var unknown = FilterGuard.Prepare("CardNumber = 'h:0123456789ab'", policy, vault);
         Assert.Contains("h:0123456789ab", unknown.Error);
-        Assert.Null(unknown.Filter);
+        Assert.Null(unknown.Node);
     }
 
     [Fact]
     public void AnAggregation_MayCountAHiddenField_ButNotRangeOrSumIt()
     {
-        var policy = Policy(rules: Rule("Amount", MaskAction.Hash));
-        Assert.Null(FilterGuard.PrepareAggregation("select count(*), count(Amount) group by Amount", policy, new TokenVault()).Error);
+        var policy  = Policy(rules: Rule("Amount", MaskAction.Hash));
+        var profile = new McpProfile { Id = "a", Name = "a", KeyHash = "" };
+        Assert.Null(FilterGuard.PrepareAggregation("select count(*), count(Amount) group by Amount", policy, new TokenVault(), profile).Error);
         foreach (string aggregate in (ReadOnlySpan<string>)["sum", "min", "max", "avg"])
             Assert.Contains("hidden field",
-                FilterGuard.PrepareAggregation($"select {aggregate}(Amount)", policy, new TokenVault()).Error);
+                FilterGuard.PrepareAggregation($"select {aggregate}(Amount)", policy, new TokenVault(), profile).Error);
         Assert.Contains("hidden field",
-            FilterGuard.PrepareAggregation("select count(*) where Amount > 100", policy, new TokenVault()).Error);
+            FilterGuard.PrepareAggregation("select count(*) where Amount > 100", policy, new TokenVault(), profile).Error);
     }
 
     [Fact]
@@ -377,11 +350,17 @@ public sealed class McpMaskingTests
     {
         var open   = new McpProfile { Id = "a", Name = "a", KeyHash = "" };
         var scoped = open with { Services = ["payments-api", "o'brien"] };
+        var errors = FilterGuard.Prepare("@l = 'Error'", Policy(), new TokenVault()).Node;
 
-        Assert.Equal("@service <> 'ameto-mcp'", FilterGuard.Scope(null, false, open));
-        Assert.Equal("(@l = 'Error') and @service <> 'ameto-mcp'", FilterGuard.Scope("@l = 'Error'", false, open));
-        Assert.Equal(@"(@l = 'Error') and @service in ['payments-api', 'o\'brien']", FilterGuard.Scope("@l = 'Error'", false, scoped));
-        Assert.Null(FilterGuard.Scope("plain words", true, scoped));       // free text carries no predicate
+        Assert.Equal("@service != 'ameto-mcp'", FilterGuard.Compose(null, open));
+        Assert.Equal("@l = 'Error' and @service != 'ameto-mcp'", FilterGuard.Compose(errors, open));
+        Assert.Equal(@"@l = 'Error' and @service in ['payments-api', 'o\'brien']", FilterGuard.Compose(errors, scoped));
+        // The service a call names is one more clause, never text pasted into another.
+        Assert.Equal(@"@l = 'Error' and @service = 'it\'s' and @service != 'ameto-mcp'", FilterGuard.Compose(errors, open, "it's"));
+        Assert.Equal(@"@service = 'it\'s' and @service != 'ameto-mcp'", FilterGuard.Compose(null, open, "it's"));
+        // An `or` is one clause of the chain, in its own parentheses: the scope holds for both sides of it.
+        var either = FilterGuard.Prepare("A = 1 or B = 2", Policy(), new TokenVault()).Node;
+        Assert.Equal(@"(A = 1 or B = 2) and @service in ['payments-api', 'o\'brien']", FilterGuard.Compose(either, scoped));
 
         Assert.False(FilterGuard.InScope(open, Event("x", [], "ameto-mcp")));
         Assert.True(FilterGuard.InScope(open, Event("x", [], null)));

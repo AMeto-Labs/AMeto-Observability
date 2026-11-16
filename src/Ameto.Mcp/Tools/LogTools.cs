@@ -155,8 +155,6 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
         /// <summary>The filter before tokens became values and the profile's scope was joined: what the audit keeps.</summary>
         public string?             AsWritten   { get; init; }
-        public bool                FreeText    { get; init; }
-        public string?             OnlyService { get; init; }
         public HashSet<LogLevel>?  Levels      { get; init; }
         public HashSet<string>?    Fields      { get; init; }
         public int                 Limit       { get; init; }
@@ -198,13 +196,8 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
         return await RunSearchAsync(new SearchSpec
         {
-            // Free text cannot be joined to a predicate, so its rows are narrowed after the fact.
-            Filter      = prepared.FreeText ? prepared.Filter
-                        : FilterGuard.Scope(FilterGuard.And(prepared.Filter, service is null ? null : "@service = " + FilterGuard.Quote(service)),
-                                            freeText: false, call.Profile),
+            Filter      = FilterGuard.Compose(prepared.Node, call.Profile, service),
             AsWritten   = call.Str("filter"),
-            FreeText    = prepared.FreeText,
-            OnlyService = prepared.FreeText ? service : null,
             Levels      = levels,
             Fields      = call.Strings("fields") is { } f ? new HashSet<string>(f, StringComparer.OrdinalIgnoreCase) : null,
             Limit       = Math.Clamp(call.Int("limit") ?? 50, 1, call.MaxEvents),
@@ -228,18 +221,26 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                 TimeSpan.FromMinutes(tool.DefaultWindowMinutes), out var from, out var to, out string? windowNote, out string? error))
             return ToolResult.Refused(RefusalKind.Input, error!);
 
-        var (bound, bindError) = PublishedToolBinder.Bind(tool, call.Args);
+        var (bound, reference, bindError) = PublishedToolBinder.Bind(tool, call.Args);
         if (bindError is not null) return ToolResult.Refused(RefusalKind.Input, bindError);
 
         var prepared = FilterGuard.Prepare(bound, call.Policy, store.Vault);
         if (prepared.Error is not null) return ToolResult.Refused(prepared.Kind, prepared.Error, bound);
 
+        // An argument is a value, bound in as a quoted literal — and this is where that is
+        // checked rather than trusted: the filter with the arguments in it has to be the filter
+        // the tool's author wrote, shape for shape. If quoting ever let a value through as more
+        // than a value, the two would differ, and the call would stop here.
+        var written = FilterGuard.Prepare(reference, call.Policy, store.Vault);
+        if (written.Error is not null || !string.Equals(FilterGuard.Shape(written.Node), FilterGuard.Shape(prepared.Node), StringComparison.Ordinal))
+            return ToolResult.Refused(RefusalKind.Input,
+                $"These arguments would change the filter of {tool.Name} itself, not only the values in it. The call was not run.", bound);
+
         if (!TryCursor(call, out long? afterTicks, out EventId? afterId, out var badCursor)) return badCursor!;
 
         return await RunSearchAsync(new SearchSpec
         {
-            Filter      = prepared.FreeText ? prepared.Filter : FilterGuard.Scope(prepared.Filter, freeText: false, call.Profile),
-            FreeText    = prepared.FreeText,
+            Filter      = FilterGuard.Compose(prepared.Node, call.Profile),
             AsWritten   = bound,
             Fields      = tool.Fields.Count == 0 ? null : new HashSet<string>(tool.Fields, StringComparer.OrdinalIgnoreCase),
             Limit       = Math.Clamp(tool.MaxEvents, 1, call.MaxEvents),
@@ -273,7 +274,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         var policy = call.Policy;
         var page = await FetchAsync(spec.Filter, spec.From, spec.To, spec.Levels,
                                     spec.OldestFirst ? QueryDirection.Forward : QueryDirection.Backward,
-                                    spec.AfterTicks, spec.AfterId, call.Profile, spec.OnlyService, spec.Limit, ct);
+                                    spec.AfterTicks, spec.AfterId, call.Profile, spec.Limit, ct);
 
         // Events go into the answer in the order the query returned them, until the budget is
         // spent. Each is masked as it is taken, so nothing is counted that was not sent.
@@ -345,11 +346,11 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
             return ToolResult.Refused(RefusalKind.Input, error!);
 
         var policy = call.Policy;
-        var (query, refusal, kind) = FilterGuard.PrepareAggregation(call.Str("query"), policy, store.Vault);
-        if (query is null) return ToolResult.Refused(kind, refusal!);
+        string? asWritten = call.Str("query");
+        var (query, refusal, kind) = FilterGuard.PrepareAggregation(asWritten, policy, store.Vault, call.Profile);
+        if (query is null) return ToolResult.Refused(kind, refusal!, asWritten);
 
-        var (result, scopeError) = await RunAggregationAsync(query, call.Profile, from, to, ct);
-        if (result is null) return ToolResult.Refused(RefusalKind.Input, scopeError!);
+        var result = await RunAggregationAsync(query, from, to, ct);
 
         var stats  = new MaskStats();
         var header = new List<string>(result.KeyColumns.Count + result.ValueColumns.Count);
@@ -361,9 +362,9 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             var cells = new string?[header.Count];
             for (int k = 0; k < row.Key.Length; k++)
-                cells[k] = policy.MaskGroupKey(KeyPath(query.Keys[k].Property), row.Key[k], stats) is { } key ? EventTable.Cell(key) : null;
+                cells[k] = GroupKey(query.Keys[k].Property, row.Key[k], policy, stats) is { } key ? EventTable.Cell(key) : null;
             for (int v = 0; v < row.Values.Length; v++)
-                cells[row.Key.Length + v] = Number(row.Values[v]);
+                cells[row.Key.Length + v] = Cell(query.Aggregates[v], row.Values[v], policy, stats);
             rows.Add(cells);
         }
 
@@ -379,39 +380,49 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         sb.Append('\n');
         EventTable.WriteGrid(sb, header, rows);
 
-        return new ToolResult { Text = sb.ToString(), Events = 0, Stats = stats };
-    }
-
-    /// <summary>Runs an aggregation narrowed to what the profile may see.</summary>
-    private async Task<(AggregationResult? Result, string? Error)> RunAggregationAsync(
-        AggregationQuery query, McpProfile profile, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
-    {
-        if (!string.IsNullOrWhiteSpace(query.FilterText) && FilterParser.Parse(query.FilterText) is FreeTextNode)
-            return (null, "The where-clause is plain words. In an aggregation write it as an expression, for example ci_contains(@mt, 'timeout').");
-
-        var scoped = new AggregationQuery
+        return new ToolResult
         {
-            Aggregates = query.Aggregates,
-            Keys       = query.Keys,
-            FilterText = FilterGuard.Scope(query.FilterText, freeText: false, profile),
-            Limit      = Math.Clamp(query.Limit, 1, 200),
-        };
-        var result = await new AggregationExecutor(executor, headerScan: storage).ExecuteAsync(scoped, from, to, ct);
-        return (result, null);
-    }
-
-    /// <summary>The path a group key is judged by: a property path as a rule spells it, or a built-in's name.</summary>
-    private static string KeyPath(string encoded)
-    {
-        if (!BuiltinFields.TryResolve(encoded, out var field))
-            return PropertyPath.ToDisplay(PropertyPath.StripIndexSegments(encoded));
-        return field switch
-        {
-            BuiltinField.MessageTemplate => "@mt",
-            BuiltinField.ExceptionMessage or BuiltinField.ExceptionStack or BuiltinField.InnerExceptionMessage => "@x.message",
-            _ => "@built-in",
+            Text   = sb.ToString(),
+            // A table whose scan stopped early is a part of the answer, and is recorded as one:
+            // as out of time when that is what stopped it, as cut short otherwise.
+            Status = call.TimedOut() ? ToolResult.TimedOut : result.Partial ? ToolResult.Trimmed : ToolResult.Ok,
+            Stats  = stats,
+            Filter = asWritten,
         };
     }
+
+    /// <summary>
+    /// One number of a table. A count is a count; any other aggregate is made of the values
+    /// themselves — a maximum is one of them — so it goes past the detectors like a value does.
+    /// </summary>
+    private static string? Cell(AggregateSpec aggregate, double? value, MaskingPolicy policy, MaskStats stats) =>
+        value is not { } number ? null
+        : aggregate.Kind == AggregateKind.Count || aggregate.Property is null ? Number(number)
+        : policy.MaskNumber(RulePath(aggregate.Property), number, stats);
+
+    /// <summary>Runs an aggregation whose where-clause already carries the profile's scope (see <see cref="FilterGuard"/>).</summary>
+    private async Task<AggregationResult> RunAggregationAsync(
+        AggregationQuery query, DateTimeOffset from, DateTimeOffset to, CancellationToken ct) =>
+        await new AggregationExecutor(executor, headerScan: storage).ExecuteAsync(query, from, to, ct);
+
+    /// <summary>
+    /// A group key as a cell. A built-in field — one the ENGINE reads as built-in, by its own
+    /// table — is never a hidden one; but three of them are text a service wrote (the template,
+    /// an exception's message, its stack) and go past the detectors as they do in a search.
+    /// Everything else is a property, whatever its name begins with, and the rules judge it.
+    /// </summary>
+    private static string? GroupKey(string encoded, string? value, MaskingPolicy policy, MaskStats stats)
+    {
+        if (value is null) return null;
+        if (!BuiltinFields.TryResolve(encoded, out var field)) return policy.MaskGroupKey(RulePath(encoded), value, stats);
+        return field is BuiltinField.MessageTemplate or BuiltinField.ExceptionMessage
+                     or BuiltinField.ExceptionStack or BuiltinField.InnerExceptionMessage
+            ? policy.MaskText(value, stats)
+            : value;
+    }
+
+    /// <summary>A path as a rule spells it: names joined by dots, a list's positions left out.</summary>
+    private static string RulePath(string encoded) => PropertyPath.ToDisplay(PropertyPath.StripIndexSegments(encoded));
 
     private static string? Number(double? value) => value is not { } v ? null
         : v == Math.Floor(v) && Math.Abs(v) < 1e15 ? ((long)v).ToString(CultureInfo.InvariantCulture)
@@ -429,29 +440,36 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         if (service is not null && !FilterGuard.MaySee(call.Profile, service))
             return ToolResult.Refused(RefusalKind.Scope, $"This profile does not see the service '{service}'.");
 
-        string where   = service is null ? "" : " where @service = " + FilterGuard.Quote(service);
-        string andSvc  = service is null ? "" : " and @service = " + FilterGuard.Quote(service);
         var policy     = call.Policy;
         var stats      = new MaskStats();
         var notes      = new List<string>();
         if (windowNote is not null) notes.Add(windowNote);
 
-        async Task<AggregationResult?> Ask(string text)
+        // The columns are fixed text. The where-clause is a tree, written out with the profile's
+        // scope like every other filter here — a service's name is never pasted into a query.
+        async Task<AggregationResult?> Ask(string columns, FilterNode? where = null)
         {
             if (ct.IsCancellationRequested) return null;
             try
             {
-                var (result, _) = await RunAggregationAsync(AggregationParser.Parse(text), call.Profile, from, to, ct);
-                if (result is { Partial: true } && notes.TrueForAll(static n => !n.StartsWith("PARTIAL", StringComparison.Ordinal)))
+                var shape  = AggregationParser.Parse(columns);
+                var result = await RunAggregationAsync(new AggregationQuery
+                {
+                    Aggregates = shape.Aggregates,
+                    Keys       = shape.Keys,
+                    FilterText = FilterGuard.Compose(where, call.Profile, service),
+                    Limit      = shape.Limit,
+                }, from, to, ct);
+                if (result.Partial && notes.TrueForAll(static n => !n.StartsWith("PARTIAL", StringComparison.Ordinal)))
                     notes.Add($"PARTIAL — {result.PartialReason ?? "a scan stopped early"}. The numbers are floors, not totals.");
                 return result;
             }
             catch (OperationCanceledException) { return null; }
         }
 
-        var byServiceLevel = await Ask($"select count(*){where} group by @service, @l limit 200");
-        var templates      = await Ask($"select count(*){where} group by @mt, @l limit 12");
-        var exceptions     = await Ask($"select count(*) where has(@x){andSvc} group by @x.type limit 10");
+        var byServiceLevel = await Ask("select count(*) group by @service, @l limit 200");
+        var templates      = await Ask("select count(*) group by @mt, @l limit 12");
+        var exceptions     = await Ask("select count(*) group by @x.type limit 10", FilterGuard.HasException());
 
         var sb = new StringBuilder();
         long total = 0;
@@ -501,7 +519,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             var rows = new List<string?[]>(templates.Rows.Count);
             foreach (var row in templates.Rows)
-                rows.Add([Number(row.Values[0]), row.Key[1], policy.MaskGroupKey("@mt", row.Key[0], stats) is { } t ? Truncate(t, 200) : null]);
+                rows.Add([Number(row.Values[0]), row.Key[1], row.Key[0] is { } t ? Truncate(policy.MaskText(t, stats), 200) : null]);
             sb.Append("\nmost frequent message templates\n");
             EventTable.WriteGrid(sb, ["count", "level", "template"], rows);
         }
@@ -555,7 +573,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
         var stats = new MaskStats();
         var sb    = new StringBuilder(2_048);
-        EventTable.WriteDetail(sb, policy.Mask(target, stats), maxStackChars: Math.Max(2_000, call.BudgetChars / 3));
+        EventTable.WriteDetail(sb, policy.Mask(target, stats), maxStackChars: Math.Max(2_000, call.BudgetChars / 3), maxChars: call.BudgetChars);
         int events = 1;
 
         int before = Math.Clamp(call.Int("before") ?? 5, 0, 50);
@@ -563,13 +581,12 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         long ticks = target.Timestamp.UtcTicks;
         if (before + after > 0)
         {
-            string? sameService = FilterGuard.Scope(
-                target.ServiceName is { } s ? "@service = " + FilterGuard.Quote(s) : null, freeText: false, profile);
+            string sameService = FilterGuard.Compose(null, profile, target.ServiceName);
             var hour  = TimeSpan.FromHours(1);
             var older = before == 0 ? null : await FetchAsync(sameService, target.Timestamp - hour, target.Timestamp, null,
-                QueryDirection.Backward, ticks, target.Id, profile, null, before, ct);
+                QueryDirection.Backward, ticks, target.Id, profile, before, ct);
             var newer = after == 0 ? null : await FetchAsync(sameService, target.Timestamp, target.Timestamp + hour, null,
-                QueryDirection.Forward, ticks, target.Id, profile, null, after, ct);
+                QueryDirection.Forward, ticks, target.Id, profile, after, ct);
 
             var timeline = new List<MaskedEvent>(before + after + 1);
             if (older is not null)
@@ -580,20 +597,20 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
             sb.Append("\nbefore and after in ").Append(target.ServiceName ?? "the events this profile sees")
               .Append(" (oldest first; > marks this event)\n");
-            EventTable.WriteTimeline(sb, timeline, id, withService: target.ServiceName is null);
+            EventTable.WriteTimeline(sb, timeline, id, withService: target.ServiceName is null, maxChars: call.BudgetChars - sb.Length);
             events = timeline.Count;
         }
 
         if ((call.Bool("trace") ?? true) && TraceIdHelper.FormatTraceId(target.TraceIdHi, target.TraceIdLo) is { } traceId)
         {
             var half  = TimeSpan.FromMinutes(30);
-            var trace = await FetchAsync(FilterGuard.Scope($"@tr = '{traceId}'", freeText: false, profile),
-                target.Timestamp - half, target.Timestamp + half, null, QueryDirection.Forward, null, null, profile, null, 60, ct);
+            var trace = await FetchAsync(FilterGuard.Compose(FilterGuard.InTrace(traceId), profile),
+                target.Timestamp - half, target.Timestamp + half, null, QueryDirection.Forward, null, null, profile, 60, ct);
             if (trace.Events.Count > 1)
             {
                 var masked = trace.Events.ConvertAll(ev => policy.Mask(ev, ev.Id.RawValue == id ? new MaskStats() : stats));
                 sb.Append("\nsame trace ").Append(traceId).Append(" (oldest first)\n");
-                EventTable.WriteTimeline(sb, masked, id, withService: true);
+                EventTable.WriteTimeline(sb, masked, id, withService: true, maxChars: call.BudgetChars - sb.Length);
                 if (trace.More) sb.Append("… the trace has more events\n");
                 events += masked.Count - 1;
             }
@@ -613,6 +630,8 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
     private sealed class FieldInfo
     {
+        /// <summary>The name the property is stored under: what the rules judge it by.</summary>
+        public required string Stored { get; init; }
         public int Count;
         public readonly SortedSet<string> Types = new(StringComparer.Ordinal);
         public readonly List<string> Examples = new(3);
@@ -629,9 +648,8 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
             return ToolResult.Refused(RefusalKind.Scope, $"This profile does not see the service '{service}'.");
 
         var policy = call.Policy;
-        var page = await FetchAsync(
-            FilterGuard.Scope(service is null ? null : "@service = " + FilterGuard.Quote(service), freeText: false, call.Profile),
-            from, to, null, QueryDirection.Backward, null, null, call.Profile, null, want: 1_000, ct);
+        var page = await FetchAsync(FilterGuard.Compose(null, call.Profile, service),
+            from, to, null, QueryDirection.Backward, null, null, call.Profile, want: 1_000, ct);
 
         var stats    = new MaskStats();
         var fields   = new Dictionary<string, FieldInfo>(StringComparer.Ordinal);
@@ -641,22 +659,27 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
             string svc = ev.ServiceName ?? "(no service)";
             services[svc] = services.GetValueOrDefault(svc) + 1;
 
-            var own    = new MaskStats();
-            var masked = policy.Mask(ev, own);
-            var raw    = ev.Properties;
-            bool gaveExample = false;
-            foreach (var (key, cell) in masked.Properties)
+            // The properties alone: this answer shows no template and no exception, so neither
+            // is read, and nothing in them is counted as hidden.
+            var (masked, storedNames) = policy.MaskProperties(ev, new MaskStats());
+            var raw = ev.Properties;
+            HashSet<string>? shown = null;
+            for (int i = 0; i < masked.Count; i++)
             {
-                if (!fields.TryGetValue(key, out var info)) fields[key] = info = new FieldInfo();
+                var (key, cell) = masked[i];
+                string stored   = storedNames[i];
+                if (!fields.TryGetValue(key, out var info)) fields[key] = info = new FieldInfo { Stored = stored };
                 info.Count++;
-                info.Types.Add(TypeName(raw is not null && raw.TryGetValue(key, out object? value) ? value : null));
+                info.Types.Add(TypeName(raw is not null && raw.TryGetValue(stored, out object? value) ? value : null));
                 if (info.Examples.Count >= 3) continue;
                 string example = Truncate(EventTable.Cell(cell), 36);
                 if (info.Examples.Contains(example)) continue;
                 info.Examples.Add(example);
-                gaveExample = true;
+                (shown ??= new HashSet<string>(StringComparer.Ordinal)).Add(stored);
             }
-            if (gaveExample) stats.Merge(own);
+            // What is counted as hidden is what this answer shows: the properties an example was
+            // taken from, and no others of the same event.
+            if (shown is not null) policy.MaskProperties(ev, stats, shown);
         }
 
         var sb = new StringBuilder();
@@ -677,7 +700,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                     name,
                     info.Count.ToString(CultureInfo.InvariantCulture),
                     string.Join('|', info.Types),
-                    policy.HidesField(name) ? "= only" : "",
+                    policy.HidesField(info.Stored) ? "= only" : "",
                     string.Join(", ", info.Examples),
                 ]);
             sb.Append('\n');
@@ -723,14 +746,14 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
     private sealed record Page(List<LogEvent> Events, bool More, (long Ticks, ulong Id)? Resume);
 
     /// <summary>
-    /// Reads up to <paramref name="want"/> events the profile may see. The executor is asked for
-    /// more than that, because some of what it returns may not be the profile's — its services
-    /// are joined to the filter where a filter can carry them, but free text cannot, and the
-    /// audit trail is dropped here in every case.
+    /// Reads up to <paramref name="want"/> events the profile may see. The filter already carries
+    /// the profile's scope (<see cref="FilterGuard.Compose"/>); each event is checked against it
+    /// once more here, and an event that check stops is neither returned nor a place to resume
+    /// from — a cursor is a time and an id, and must not be those of an event of another service.
     /// </summary>
     private async Task<Page> FetchAsync(
         string? filter, DateTimeOffset from, DateTimeOffset to, HashSet<LogLevel>? levels, QueryDirection direction,
-        long? afterTicks, EventId? afterId, McpProfile profile, string? onlyService, int want, CancellationToken ct)
+        long? afterTicks, EventId? afterId, McpProfile profile, int want, CancellationToken ct)
     {
         int ask = (int)Math.Min(10_000, (long)want * 2 + 64);
         var request = new QueryRequest
@@ -755,9 +778,8 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
             {
                 if (events.Count == want) { more = true; break; }   // one past what was wanted
                 read++;
-                last = ev;
                 if (!FilterGuard.InScope(profile, ev)) continue;
-                if (onlyService is not null && !string.Equals(ev.ServiceName, onlyService, StringComparison.OrdinalIgnoreCase)) continue;
+                last = ev;
                 events.Add(ev);
             }
         }

@@ -54,6 +54,15 @@ public sealed class AggregationQuery
     /// <summary>Rows to return after ordering. Groups beyond it are counted, not sent.</summary>
     public int Limit { get; init; } = DefaultLimit;
 
+    /// <summary>
+    /// When set, <c>sum</c>, <c>min</c>, <c>max</c> and <c>avg</c> take a value only where it is
+    /// STORED as a number. Off, a string that reads as a number counts as one — which is what a
+    /// person at the Logs page wants of <c>"200"</c>, and what turns <c>max(Phone)</c> over
+    /// <c>"+77015550123"</c> into the phone number with its formatting gone. A caller that must
+    /// not hand an identifier back as a measurement sets this; <c>count</c> is unaffected.
+    /// </summary>
+    public bool NumbersOnly { get; init; }
+
     /// <summary>True when there is no <c>group by</c> — a single row over the whole window.</summary>
     public bool IsScalar => Keys.Count == 0;
 }

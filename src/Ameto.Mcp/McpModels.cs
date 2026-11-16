@@ -92,16 +92,27 @@ public sealed record McpProfile
         Services.Count == 0 || (service is not null && Services.Contains(service, StringComparer.OrdinalIgnoreCase));
 }
 
-/// <summary>What an admin sets on a profile; everything else on it is the server's.</summary>
+/// <summary>
+/// What an admin sets on a profile; everything else on it is the server's.
+///
+/// <para><b>A member left null is left as it is.</b> For a new profile that is its default; for
+/// an existing one it is the value it has. An update that names only the name changes only the
+/// name — it used to reset the services to "all of them" and the masking to Standard, which is
+/// the wrong direction for a mistake to go in.</para>
+/// </summary>
 public sealed record McpProfileInput
 {
-    public string                 Name             { get; init; } = "";
+    public string?                Name             { get; init; }
     public string?                Description      { get; init; }
-    public McpToolsMode           ToolsMode        { get; init; }
+    public McpToolsMode?          ToolsMode        { get; init; }
+
+    /// <summary>The built-in tools switched on. Null on a new profile means all of them.</summary>
     public IReadOnlyList<string>? Tools            { get; init; }
+
+    /// <summary>The services the profile sees; the empty list is every service.</summary>
     public IReadOnlyList<string>? Services         { get; init; }
-    public McpMaskingMode         MaskingMode      { get; init; }
-    public bool                   FreeFilters      { get; init; } = true;
+    public McpMaskingMode?        MaskingMode      { get; init; }
+    public bool?                  FreeFilters      { get; init; }
     public int?                   MaxEvents        { get; init; }
     public int?                   MaxWindowMinutes { get; init; }
     public int?                   CallsPerMinute   { get; init; }

@@ -23,19 +23,38 @@ internal static class TimeWindow
         string? from, string? to, DateTimeOffset now, TimeSpan max, TimeSpan defaultSpan,
         out DateTimeOffset fromUtc, out DateTimeOffset toUtc, out string? note, out string? error)
     {
+        try
+        {
+            return Resolve(from, to, now, max, defaultSpan, out fromUtc, out toUtc, out note, out error);
+        }
+        catch (Exception e) when (e is ArgumentOutOfRangeException or OverflowException)
+        {
+            // Every road to this is closed where the times are read; if one is ever opened, the
+            // caller gets a sentence about its arguments and not a failure of the server.
+            fromUtc = toUtc = default;
+            note    = null;
+            error   = "'from' and 'to' are outside the range of time a log can hold.";
+            return false;
+        }
+    }
+
+    private static bool Resolve(
+        string? from, string? to, DateTimeOffset now, TimeSpan max, TimeSpan defaultSpan,
+        out DateTimeOffset fromUtc, out DateTimeOffset toUtc, out string? note, out string? error)
+    {
         fromUtc = toUtc = default;
         note = error = null;
 
         if (!TryParseInstant(to, now, out var parsedTo))
         {
-            error = $"'to' is not a time: '{to}'. Use an ISO-8601 timestamp, 'now', or a relative time such as -15m, -2h, -1d.";
+            error = $"'to' is not a time: '{Clip(to)}'. Use an ISO-8601 timestamp, 'now', or a relative time such as -15m, -2h, -1d.";
             return false;
         }
         toUtc = parsedTo ?? now;
 
         if (!TryParseInstant(from, now, out var parsedFrom))
         {
-            error = $"'from' is not a time: '{from}'. Use an ISO-8601 timestamp or a relative time such as -15m, -2h, -1d.";
+            error = $"'from' is not a time: '{Clip(from)}'. Use an ISO-8601 timestamp or a relative time such as -15m, -2h, -1d.";
             return false;
         }
         fromUtc = parsedFrom ?? toUtc - (defaultSpan < max ? defaultSpan : max);
@@ -64,29 +83,44 @@ internal static class TimeWindow
 
         if (text[0] == '-' && text.Length >= 3)
         {
-            char unit = char.ToLowerInvariant(text[^1]);
-            if (!double.TryParse(text[1..^1], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out double amount) || amount < 0)
+            // Digits and at most one point, and nothing else: double.TryParse also reads "NaN"
+            // and "Infinity", and a number of twenty digits, none of which is a length of time.
+            ReadOnlySpan<char> digits = text[1..^1];
+            if (digits.Length > 12 || digits.ContainsAnyExcept("0123456789.")
+                || !double.TryParse(digits, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out double amount)
+                || !double.IsFinite(amount) || amount < 0)
                 return false;
-            TimeSpan? span = unit switch
+            double seconds = char.ToLowerInvariant(text[^1]) switch
             {
-                's' => TimeSpan.FromSeconds(amount),
-                'm' => TimeSpan.FromMinutes(amount),
-                'h' => TimeSpan.FromHours(amount),
-                'd' => TimeSpan.FromDays(amount),
-                'w' => TimeSpan.FromDays(amount * 7),
-                _   => null,
+                's' => amount,
+                'm' => amount * 60,
+                'h' => amount * 3_600,
+                'd' => amount * 86_400,
+                'w' => amount * 604_800,
+                _   => double.NaN,
             };
-            if (span is not { } back || back > TimeSpan.FromDays(3660)) return false;
-            value = now - back;
+            // The comparison is false for NaN too, so an unknown unit stops here.
+            if (!(seconds <= MaxRelative.TotalSeconds)) return false;
+            value = now - TimeSpan.FromSeconds(seconds);
             return true;
         }
 
         if (!DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
                 DateTimeStyles.RoundtripKind | DateTimeStyles.AssumeUniversal, out var parsed))
             return false;
+        // A year the log cannot hold is not a time to search at, and would take the arithmetic
+        // on the window past what a timestamp can be.
+        if (parsed.Year is < 1971 or > 9000) return false;
         value = parsed.ToUniversalTime();
         return true;
     }
+
+    /// <summary>An argument as a refusal quotes it: its beginning, when it is long.</summary>
+    private static string Clip(string? raw) =>
+        raw is null ? "" : raw.Length <= 40 ? raw : string.Concat(raw.AsSpan(0, 40), "…");
+
+    /// <summary>The furthest back a relative time may reach: ten years.</summary>
+    private static readonly TimeSpan MaxRelative = TimeSpan.FromDays(3660);
 
     public static string Describe(TimeSpan span) =>
         span.TotalDays >= 1 && span.TotalDays == Math.Floor(span.TotalDays)   ? $"{span.TotalDays:0} d"

@@ -145,7 +145,7 @@ public sealed class AggregationExecutor(
                 acc = new Accumulator(keyBuilder.TakeParts(), aggs.Count);
                 groups.Add(new string(keyBuilder.Composite), acc);
             }
-            acc.Add(ev, aggs);
+            acc.Add(ev, aggs, query.NumbersOnly);
         }
         }
         catch (OperationCanceledException) { /* reported as partial below, like every other stop */ }
@@ -481,7 +481,7 @@ public sealed class AggregationExecutor(
             return a;
         }
 
-        public void Add(LogEvent ev, IReadOnlyList<AggregateSpec> aggs)
+        public void Add(LogEvent ev, IReadOnlyList<AggregateSpec> aggs, bool numbersOnly)
         {
             for (int i = 0; i < aggs.Count; i++)
             {
@@ -492,7 +492,7 @@ public sealed class AggregationExecutor(
                 if (raw is null) continue;                               // absent: contributes nothing
 
                 if (spec.Kind == AggregateKind.Count) { _counts[i]++; continue; }
-                if (!TryNumber(raw, out double d)) continue;             // sum('abc') is not an error, just no data
+                if (!TryNumber(raw, numbersOnly, out double d)) continue; // sum('abc') is not an error, just no data
 
                 _counts[i]++;
                 _sums[i] += d;
@@ -526,7 +526,7 @@ public sealed class AggregationExecutor(
             return values;
         }
 
-        private static bool TryNumber(object v, out double d)
+        private static bool TryNumber(object v, bool numbersOnly, out double d)
         {
             switch (v)
             {
@@ -541,7 +541,8 @@ public sealed class AggregationExecutor(
                 case bool b:    d = b ? 1 : 0; break;
                 // TryParse accepts "NaN", "Infinity" and "-Infinity" — the likelier route in,
                 // since a CLEF producer writes whatever its serialiser will emit.
-                case string s:  if (!double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out d)) return false;
+                // See AggregationQuery.NumbersOnly: a caller may ask that text never counts.
+                case string s:  if (numbersOnly || !double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out d)) { d = 0; return false; }
                                 break;
                 default:        d = 0; return false;
             }

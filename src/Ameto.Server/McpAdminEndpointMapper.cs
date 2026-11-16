@@ -157,15 +157,17 @@ internal static class McpAdminEndpointMapper
 
         write.MapPost("/profiles", (HttpContext ctx, McpProfileRequest body, McpStore store) =>
         {
-            if (ToInput(body, store.Current, out var input) is { } invalid) return invalid;
+            if (ToInput(body, store.Current, creating: true, out var input) is { } invalid) return invalid;
             var (profile, key) = store.CreateProfile(input!, ctx.User.FindFirstValue(ClaimTypes.Name) ?? "unknown");
             // The key is in this answer and nowhere else, ever: only its hash is stored.
             return Results.Ok(new { profile = ProfileDto(profile, store.Current), key });
         });
 
+        // A member the body leaves out keeps its value, as for PUT /settings: an update that
+        // names only the name must not also open the profile to every service.
         write.MapPut("/profiles/{id}", (string id, McpProfileRequest body, McpStore store) =>
         {
-            if (ToInput(body, store.Current, out var input) is { } invalid) return invalid;
+            if (ToInput(body, store.Current, creating: false, out var input) is { } invalid) return invalid;
             return store.UpdateProfile(id, input!) is { } profile ? Results.Ok(ProfileDto(profile, store.Current)) : Results.NotFound();
         });
 
@@ -449,6 +451,9 @@ internal static class McpAdminEndpointMapper
                         arguments = Text(p, McpAudit.Fields.Arguments),
                         refusal   = Text(p, McpAudit.Fields.Refusal),
                         refusalKind = Text(p, McpAudit.Fields.RefusalKind),
+                        // For a call refused over the minute's limit: which refusal of that
+                        // minute this is. Only the 1st, 2nd, 4th, 8th… are recorded.
+                        repeats   = Number(p, McpAudit.Fields.Repeats),
                         filter    = Text(p, McpAudit.Fields.Filter),
                         client    = Text(p, McpAudit.Fields.Client),
                         maskedBy  = p is not null && p.TryGetValue(McpAudit.Fields.MaskedBy, out object? by) ? by : null,
@@ -566,8 +571,9 @@ internal static class McpAdminEndpointMapper
 
         // With sample values in place of the parameters: the question is about the filter's
         // shape, which no argument can change.
-        var (sample, _) = PublishedToolBinder.Bind(tool, PublishedToolBinder.SampleArguments(tool));
-        return FilterGuard.Prepare(sample, snapshot.Standard, new TokenVault()).Error is { } refusal
+        var sample = PublishedToolBinder.Bind(tool, PublishedToolBinder.SampleArguments(tool));
+        if (sample.Error is { } unbound) return Invalid(unbound, "filter");
+        return FilterGuard.Prepare(sample.Filter, snapshot.Standard, new TokenVault()).Error is { } refusal
             ? Invalid(refusal, "filter")
             : null;
     }
@@ -693,19 +699,32 @@ internal static class McpAdminEndpointMapper
         action   = Camel(r.Action.ToString()),
     };
 
-    /// <summary>The validated input, or the 400 that says which field is wrong.</summary>
-    private static IResult? ToInput(McpProfileRequest body, McpSnapshot snapshot, out McpProfileInput? input)
+    /// <summary>
+    /// The validated input, or the 400 that says which field is wrong. A member the body leaves
+    /// out stays null in the input, and the store leaves it as it is; only a new profile has to
+    /// be given a name.
+    /// </summary>
+    private static IResult? ToInput(McpProfileRequest body, McpSnapshot snapshot, bool creating, out McpProfileInput? input)
     {
         input = null;
-        if (string.IsNullOrWhiteSpace(body.Name)) return Invalid("Name is required.", "name");
-        if (body.Name.Length > 100)               return Invalid("Name is at most 100 characters.", "name");
+        if (creating || body.Name is not null)
+        {
+            if (string.IsNullOrWhiteSpace(body.Name)) return Invalid("Name is required.", "name");
+            if (body.Name.Length > 100)               return Invalid("Name is at most 100 characters.", "name");
+        }
 
-        var toolsMode = McpToolsMode.BuiltInAndPublished;
-        if (body.ToolsMode is not null && !Enum.TryParse(body.ToolsMode, ignoreCase: true, out toolsMode))
-            return Invalid("toolsMode is builtInAndPublished or publishedOnly.", "toolsMode");
-        var maskingMode = McpMaskingMode.Standard;
-        if (body.MaskingMode is not null && !Enum.TryParse(body.MaskingMode, ignoreCase: true, out maskingMode))
-            return Invalid("maskingMode is standard or strict.", "maskingMode");
+        McpToolsMode? toolsMode = null;
+        if (body.ToolsMode is not null)
+        {
+            if (!TryName(body.ToolsMode, out McpToolsMode named)) return Invalid("toolsMode is builtInAndPublished or publishedOnly.", "toolsMode");
+            toolsMode = named;
+        }
+        McpMaskingMode? maskingMode = null;
+        if (body.MaskingMode is not null)
+        {
+            if (!TryName(body.MaskingMode, out McpMaskingMode named)) return Invalid("maskingMode is standard or strict.", "maskingMode");
+            maskingMode = named;
+        }
 
         if (body.Tools is not null)
             foreach (string tool in body.Tools)
@@ -723,7 +742,7 @@ internal static class McpAdminEndpointMapper
             Tools            = body.Tools,
             Services         = body.Services,
             MaskingMode      = maskingMode,
-            FreeFilters      = body.FreeFilters ?? true,
+            FreeFilters      = body.FreeFilters,
             MaxEvents        = body.MaxEvents,
             MaxWindowMinutes = body.MaxWindowMinutes,
             CallsPerMinute   = body.CallsPerMinute,
@@ -737,9 +756,27 @@ internal static class McpAdminEndpointMapper
         action = MaskAction.Hash;
         if (string.IsNullOrWhiteSpace(body.Field)) return Invalid("Field is required.", "field");
         if (body.Field.Length > 200)               return Invalid("Field is at most 200 characters.", "field");
-        if (body.Action is not null && (!Enum.TryParse(body.Action, ignoreCase: true, out action) || !Enum.IsDefined(action)))
+        if (body.Action is not null && !TryName(body.Action, out action))
             return Invalid("action is hash, remove, keepLast4 or keep.", "action");
         return null;
+    }
+
+    /// <summary>
+    /// An enum value by its NAME, whatever its case. <c>Enum.TryParse</c> also reads a number —
+    /// "2" is a value of every enum as far as it is concerned, defined or not — and a masking
+    /// mode that silently became another one is not a typo to pass over.
+    /// </summary>
+    private static bool TryName<T>(string text, out T value) where T : struct, Enum
+    {
+        text = text.Trim();
+        foreach (string name in Enum.GetNames<T>())
+            if (name.Equals(text, StringComparison.OrdinalIgnoreCase))
+            {
+                value = Enum.Parse<T>(name);
+                return true;
+            }
+        value = default;
+        return false;
     }
 
     private static IResult Invalid(string error, string field) => Results.BadRequest(new { error, field });

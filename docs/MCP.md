@@ -105,7 +105,7 @@ A profile is a key and what that key may do.
 | Free-form filters | on | Off withdraws `logs_search` and `logs_aggregate`, the two tools that take a filter the assistant writes. |
 | Events per call | 200 | The most events one answer returns. |
 | Time window | 24 h | The widest window one call may ask for. A wider one is narrowed to its most recent part, and the answer says so. |
-| Calls per minute | 30 | Counted per calendar minute. A call past it is refused with the seconds left. |
+| Calls per minute | 30 | Counted per calendar minute; every call counts, one that is refused included. A call past it is refused with the seconds left. |
 
 The server-wide limits (Settings → AI / MCP → Connection) are ceilings: a profile can only be
 stricter.
@@ -134,8 +134,22 @@ profile's own list says: not in a tool list, and refused when called by name.
 **Time.** `from` and `to` take ISO-8601 timestamps or relative values: `-15m`, `-2h`, `-1d`, `-1w`,
 `now`. The default window is the last hour. Times are UTC.
 
-**Filters** are the [filter expressions](FILTER_EXPRESSIONS.md) of the Logs page, plain words
-included.
+**Filters** are the [filter expressions](FILTER_EXPRESSIONS.md) of the Logs page, with two
+differences. Both are there for the hidden values (see
+[What a filter may ask](#what-a-filter-may-ask-about-a-hidden-field)).
+
+- **Plain words search the message template and the exception** — its type and its message — and
+  not the property values. On the Logs page they search everything; here that would let any
+  hidden value be asked for one substring at a time. To search a property, name it:
+  `ci_contains(Note, 'refund')`.
+- **A filter is built from a short list**: `=`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `like`,
+  `has()`, `isDefined()`, `startsWith()`, `contains()`, `endsWith()` and their `ci_` forms,
+  `length()`, `regexMatch()`, joined with `and`, `or`, `not` and parentheses. The other functions
+  of the language (`toJson()`, `elementAt()`, `substring()`, …) are refused by name: several of
+  them read a value by a road a field rule does not name.
+
+A filter or a query is at most 4 000 characters, with parentheses nested at most 32 deep, and a
+search takes at most 24 plain words.
 
 ### What an answer looks like
 
@@ -165,10 +179,12 @@ more: call again with cursor=4uuudmgf6pne.2w3khozgukn4
 
 `logs_overview` runs three aggregations (events by service and level, the 12 most frequent
 templates, the 10 most frequent exception types). `logs_aggregate` returns at most 200 rows and
-marks an answer `PARTIAL` when the scan stopped early — the numbers are then floors.
+marks an answer `PARTIAL` when the scan stopped early — the numbers are then floors. Its `sum`,
+`min`, `max` and `avg` are taken over values stored as numbers (see [Aggregates](#aggregates)).
 `logs_context` looks one hour either side of the event for its neighbours and 30 minutes either
-side for its trace. `logs_fields` reads up to the 1 000 most recent events of the window and lists
-the 60 most frequent properties.
+side for its trace, and keeps to the answer budget like every tool: of an event with more
+properties than fit, it says how many were left out. `logs_fields` reads up to the 1 000 most
+recent events of the window and lists the 60 most frequent properties.
 
 ## Published tools
 
@@ -203,7 +219,7 @@ tool exists from the moment it is saved.
 | `name` | 3–64 characters: lowercase letters, digits, underscores. Unique, and not a built-in tool's name. |
 | `description` | What the tool answers, written for the assistant: it chooses a tool by this text. |
 | `parameters` | Up to 16. A type is `string`, `number`, `boolean` or `enum` (with `values`). An optional parameter may have a `default`. |
-| `filter` | A [filter expression](FILTER_EXPRESSIONS.md) with `{name}` where a parameter's value goes. |
+| `filter` | A [filter expression](FILTER_EXPRESSIONS.md) with `{name}` where a parameter's value goes. At most 2 000 characters. |
 | `fields` | The properties an answer carries. Empty: all of them. |
 | `defaultWindowMinutes`, `maxEvents`, `order` | The window a call gets when it names none; the most events of one answer (the profile's own limit still applies); `newest` or `oldest` first. |
 | `published` | `false` keeps a draft: saved and editable, offered to nobody. |
@@ -215,7 +231,10 @@ the same form.
 **A parameter is a value, whatever it contains.** The server puts it into the filter as a literal
 — quoted and escaped for a string, checked for a number, matched against the list for an enum —
 so a value cannot add a condition, close a parenthesis or name another field.
-`x' or @l = 'Error` is searched for as that text.
+`x' or @l = 'Error` is searched for as that text. This is checked on every call, not only relied
+on: the filter with the arguments in it has to have the shape of the definition with plain values
+in their place — the same conditions, on the same fields, joined the same way — or the call is
+not run.
 
 **Placeholders are read outside quotes only.** A message template is full of braces, and
 `@mt = 'Payment {PaymentId} declined'` is an ordinary filter: a brace inside quotes is text. So a
@@ -225,7 +244,10 @@ parameter stands where a whole value stands — `MerchantId = {merchantId}`,
 **An optional parameter that is not given takes its clause with it.** The filter above, called
 without `reason`, runs as `@service = 'payments-api' and MerchantId = …`. That works per top-level
 `and` clause, so a filter with an `or` at its top level cannot have an optional parameter without
-a default: put the alternatives in parentheses.
+a default: put the alternatives in parentheses. The clause goes whole — `(Owner = {owner} or
+@l = 'Error')` without `owner` is no condition at all, not "errors only" — so a filter has to keep
+one condition that is always there. A definition whose every clause is optional is refused, and a
+call that would leave a tool with no condition is refused too.
 
 **The rules for hidden values hold.** A tool's filter is checked like any filter the assistant
 could write — it may not read a hidden field with anything but `=`, `!=`, `in` or `has()`, and a
@@ -262,8 +284,15 @@ A rule names a property and what happens to its value.
   characters, compared without regard to case.
 - A pattern without a dot is also tried against the last segment of a path: `CardNumber` hides
   `CardNumber` and `Payment.CardNumber`. A pattern with a dot matches whole paths only.
-- A rule on a property that holds an object or a list hides the whole value under one token.
-- A rule may be limited to some services.
+- A rule on a property that holds an object or a list hides the whole value under one token,
+  and everything under it: with a rule on `Buyer`, a filter or a `group by` on `Buyer.Name` is
+  one on a hidden field.
+- The elements of a list are named by the list's own path: `Items.Sku` is the `Sku` of every
+  item, whichever way a filter spells the position (`Items[0].Sku`, `Items.0.Sku`).
+- A rule may be limited to some services. An event of another service is then answered as if the
+  rule were not there. A filter or a table is not about one service, so there a field counts as
+  hidden when a rule hides it in *any* service — and a `keep` counts only when it holds for
+  every service.
 - When several rules match, the most protective wins: remove, then hash, then keepLast4, then keep.
 
 A new installation starts with three `remove` rules: `*Password*`, `*Secret*`, `Authorization`.
@@ -283,49 +312,93 @@ exception's message and stack trace.
 | Bearer and JWT tokens | a JWT, or the credential after `Bearer` | yes |
 | IBAN | passes the modulo-97 check | no |
 
-An integer property that is a card number or an IIN is hidden as well. A detector does not know
-what a name, an address or an internal identifier looks like: name those fields in a rule, or use
-Strict mode.
+A number that is a card number or an IIN is hidden as well, whether it is stored as an integer or
+as a floating-point number. So is a property's *name* when it holds a value — a map keyed by email
+address or by card number. A detector does not know what a name, an address or an internal
+identifier looks like: name those fields in a rule, or use Strict mode.
+
+**Detectors work on answers, not on questions.** They do not make a field a hidden one. A filter
+may still order, pattern-match and aggregate a field no rule names, and so learn about a value a
+detector would have hidden in the answer. What must not be asked about needs a rule — or Strict
+mode, where every field is hidden unless a `keep` names it.
 
 ### Modes
 
 - **Standard** — hide what the rules name and what the detectors find.
 - **Strict** — hide every string and number, except the properties a `keep` rule names. Booleans
-  and nulls pass. The message template and exception texts still go through the detectors.
+  and nulls pass. The message template, exception texts and property names still go through the
+  detectors.
 
 ### Tokens
 
 A token is `h:` and twelve hex digits: the first six bytes of HMAC-SHA256 over the value, with a
 secret the server generates on first start and keeps encrypted in its database.
 
-- **One value, one token**, in every answer and for every profile. The assistant can tell that two
-  events concern the same customer, and can count and group by the token.
-- **A number and its text are one token**; so are a card number with and without spaces, and an
-  email address in either case.
+- **A value hidden the same way has the same token**, in every answer and for every profile. The
+  assistant can tell that two events concern the same customer, and can count and group by the
+  token.
+- **A number and its text are one token.** A value a *detector* found is hashed in a normal form
+  — a card number without its spaces, an email address in lower case — so two spellings of it are
+  one token. A value a *rule* hides is hashed as it is stored: `4111 1111 1111 1111` under a
+  `hash` rule and the same card found by the detector in another property's text are two tokens.
+  Where tokens have to match across fields, store the value in one spelling.
 - **A token cannot be turned back into its value** without the secret. Rotating the secret
   (Settings → Masking, or `POST /api/mcp/secret/rotate`) changes every token.
 
-**Searching by a token.** `CardNumber = 'h:92f7e6d86459'` in a filter is replaced by the value on
-the server, so the search uses the index as any other. For this the server remembers, in memory
-only, the values of the tokens it handed out recently — up to 40 000 of them, none longer than 256
-characters. A token it no longer remembers (an old one, or any after a restart) is refused with a
-sentence telling the assistant to run the search again.
+**Searching by a token.** In `CardNumber = 'h:92f7e6d86459'` the server puts the value in the
+token's place, so the search uses the index as any other. It does that in the parsed filter, where
+the token is the value of `=`, `!=` or `in`, and nowhere else: a token in a column heading, in a
+property name or inside a longer string stays the text it is, and a token under anything but
+equality — `Elapsed > 'h:…'`, `startsWith(Path, 'h:…')`, a plain word — is refused, because it
+would order or match a visible value against the hidden one. The filter that runs is written out
+from the checked tree and read back before it is run; it is never the caller's text with pieces
+replaced.
+
+For this the server remembers, in memory only, the values of the tokens it handed out recently —
+up to 40 000 of them, none longer than 256 characters. A token it no longer remembers (an old one,
+or any after a restart) is refused with a sentence telling the assistant to run the search again.
 
 ### What a filter may ask about a hidden field
 
 A filter is a question, and `CardNumber like '4400%'` tells, by whether anything comes back, that
 a card number starts with 4400. So a hidden field may be tested with `=`, `!=`, `in` and `has()`
 only — against a token, or against a value the person already has. Anything else (`like`,
-`contains`, `startsWith`, `<`, `length()`, `substring()`, …) is refused, and so is an aggregate
-other than a count: `min(CardNumber)` is a card number.
+`contains`, `startsWith`, `<`, `length()`, `regexMatch()`, a comparison with another field) is
+refused, and so is an aggregate other than a count: `min(CardNumber)` is a card number.
+
+A field is hidden by every road to it: under a rule on its parent, in any service a rule names,
+through a list position however it is spelled. And nothing reads a hidden value through its
+parent — the functions that could (`toJson()`, `elementAt()`, `keys()`, `values()`,
+`fromJson()`) are not among those a filter here is built from.
+
+### Aggregates
+
+- **A hidden field can be counted and grouped by, nothing else.** `count(CardNumber)` and
+  `group by CardNumber` work; the group keys come back as tokens.
+- **`sum`, `min`, `max` and `avg` are taken over values stored as numbers.** A string that
+  reads as a number is, more often than not, an identifier — a phone number, an IIN with its
+  leading zeros — and would come back as a measurement, its spelling gone and with it everything
+  a detector knows it by. It is not counted. (`count` counts it, as a value.)
+- **The number an aggregate comes to goes past the detectors**, as a number does in a search: a
+  maximum that is a card number or an IIN comes back as its token — the one a search gives the
+  same value. A whole number too long for the arithmetic to hold exactly is not shown at all:
+  its leading digits would be right, and most of an identifier.
 
 ### What this does not do
 
-- **Plain-word search is not restricted.** Words are matched against the text of events, hidden
-  property values included, so a search can confirm that a word occurs. A profile that must not
-  have even that gets free-form filters switched off.
-- **Equality can be guessed at.** `CardNumber = '4111…'` with a guessed value answers yes or no.
-  The calls-per-minute limit and the record of every call are what stand against it.
+- **Detectors do not restrict questions**, only answers — see [Detectors](#detectors).
+- **Equality can be guessed at.** `CardNumber = '4111…'` with a guessed value answers yes or no,
+  and `in` asks about several values at once. A field with few possible values — a status, a
+  small number, a yes or no — is found out this way whatever hides it. The calls-per-minute limit
+  and the record of every call are what stand against it.
+- **The text of events is searched as it is.** Plain words, `like` and `contains` work on the
+  message template and the exception: they are what an investigation reads. A value a service
+  wrote into its template by string interpolation can therefore be searched for piece by piece,
+  even though the detectors hide it in the answer. Log values as properties.
+- **A rule hides a field, not a value.** A value hidden in one field and logged in the clear in
+  another is found by its token: `Note = 'h:…'` matches the events whose `Note` is that value,
+  and shows it. Hide every field the value is logged in — a pattern without a dot covers a name
+  at any depth.
 - **Built-in fields are never hidden**: the timestamp, level, service, trace and span ids, event
   references.
 
@@ -336,8 +409,13 @@ other than a count: `min(CardNumber)` is a card number.
 | Response budget | 8 000 tokens | Per answer. |
 | Widest time window | 7 days | |
 | Events per call | 500 | |
-| Calls per key | 60 / min | |
+| Calls per key | 60 / min | Every call counts, one that is refused included. |
 | AI searches at once | 2 | A third call waits up to 10 s for a place, then is refused. |
+| Filter or query | 4 000 characters | Fixed. Parentheses nest at most 32 deep. |
+| Arguments of one call | 6 000 characters of JSON | Fixed. |
+
+The last two are what the record of calls keeps of a call, whole. A call is refused rather than
+run with more than its record holds, so there is no part of a filter past the record's reach.
 
 An AI call also takes one of the server's search slots and runs under the search time budget
 (`Ameto:Query`), like a search from the Logs page. A call that runs out of time returns what it
@@ -351,18 +429,23 @@ Every call is written to the log store as an event of the service `ameto-mcp`, w
 | Property | |
 |----------|---|
 | `Tool`, `Profile`, `ProfileId` | |
-| `Status` | `OK`, `Trimmed` (cut to the budget), `Refused`, `Timed out`, `Failed` |
+| `Status` | `OK`, `Trimmed` (cut to the budget, or a table whose scan stopped early), `Refused`, `Timed out`, `Failed` |
 | `Events`, `Masked`, `Tokens`, `ElapsedMs` | Events returned, values hidden, estimated size, time taken. |
 | `MaskedBy` | Values hidden, by what hid them: `rules` (a field rule) and `strict` (Strict mode) count by field path, `detectors` by detector id — `cardNumber`, `email`, `phone`, `iin`, `secret`, `iban`, plus `unscannable` and `tooDeep` for a text or a value hidden whole because it could not be looked through. `ruleIds` counts the same values as `rules`, by the id of the rule that decided. |
-| `Arguments` | As the assistant sent them: a token stays a token. |
-| `Filter` | The filter a search asked with. For a published tool, its template with the call's arguments in place — what the arguments alone do not show. As written: a token in it is still a token, and the filter with the value in the token's place is not kept anywhere. Absent when the call had no filter. |
+| `Arguments` | As the assistant sent them, whole: a token stays a token. |
+| `Filter` | The filter a search asked with. For a published tool, its template with the call's arguments in place — what the arguments alone do not show. As written and whole: a token in it is still a token, and the filter with the value in the token's place is not kept anywhere. Absent when the call had no filter. |
 | `Refusal` | Why a refused call was refused. |
 | `RefusalKind` | The same in one word: `input` (the arguments: a filter that does not parse, an unknown parameter, a bad cursor or time), `limit` (calls per minute, AI searches at once, the server's search slots), `masking` (a hidden field asked about in a way that would spell it out, or a token nobody was given), `scope` (a tool, a service or an event the profile does not reach), `unavailable` (the log store has shut down). An alert rule on `RefusalKind = 'masking'` watches for an assistant probing hidden values. |
+| `Repeats` | On a call refused because the profile's minute was spent: which such refusal of that minute it is. Only the 1st, 2nd, 4th, 8th… are written down, so a client that keeps asking fills no store, and the last record of a minute says about how many calls there were. Absent otherwise. |
 | `Client` | The client's name and version, when it gives them, and the protocol revision it spoke: `my-agent 1.4 · MCP 2026-07-28`. |
 
 They are ordinary events: `@service = 'ameto-mcp'` finds them on the Logs page, retention applies,
 and an alert rule can watch them. The arguments and the filter are what the person or the
 assistant typed, and may contain a value typed in full.
+
+**The name `ameto-mcp` is the server's own.** An event that arrives over ingestion — CLEF or OTLP
+— claiming that service is filed under `ingested:ameto-mcp` instead, so an ingest key cannot
+write the record of a call that was never made. Nothing is dropped; the name says how it came.
 
 ## Settings API
 
@@ -376,14 +459,14 @@ Under `/api/mcp`. Reading needs the `manager` role, every change `admin`.
 | `POST /api/mcp/secret/rotate` | A new token secret. |
 | `GET /api/mcp/profiles` | Profiles, each with an 8-character preview of its key's hash and the ids of the published tools it is granted (`publishedTools`). |
 | `POST /api/mcp/profiles` | Create: `name`, `description`, `toolsMode`, `tools`, `services`, `maskingMode`, `freeFilters`, `maxEvents`, `maxWindowMinutes`, `callsPerMinute`, `publishedTools`. Answers `{ profile, key }` — the only time the key is returned. |
-| `PUT /api/mcp/profiles/{id}` | Replace the profile's settings. `publishedTools` is the whole list of granted tools — a tool left out of it is withdrawn; without the field the grants stay as they are. |
+| `PUT /api/mcp/profiles/{id}` | Change the profile's settings. A field left out keeps its value, as for `PUT /api/mcp/settings`: `{ "name": "…" }` renames the profile and changes nothing else. A list that is given is the whole list — `services: []` is every service, and a tool left out of `publishedTools` is withdrawn. `maskingMode` and `toolsMode` are names; a number is refused. |
 | `GET /api/mcp/profiles/{id}/tools` | The tools the profile's key is offered, as `tools/list` answers it: `name`, `description`, `builtIn`, `inputSchema`. |
 | `POST /api/mcp/profiles/{id}/rotate-key` | A new key; the old one stops working. |
 | `DELETE /api/mcp/profiles/{id}` | |
-| `GET /api/mcp/rules`, `POST /api/mcp/rules`, `PUT /api/mcp/rules/{id}`, `DELETE /api/mcp/rules/{id}` | Field rules: `field`, `services`, `action`. |
+| `GET /api/mcp/rules`, `POST /api/mcp/rules`, `PUT /api/mcp/rules/{id}`, `DELETE /api/mcp/rules/{id}` | Field rules: `field`, `services`, `action` (`hash`, `remove`, `keepLast4` or `keep`, by name). |
 | `GET /api/mcp/tools` | `{ builtIn, published }`: the built-in tools, and the published ones with their definitions and input schemas. |
 | `POST /api/mcp/tools`, `PUT /api/mcp/tools/{id}`, `DELETE /api/mcp/tools/{id}` | A [published tool](#published-tools). A definition that cannot work is a `400` with `error` and the `field` it is about. |
 | `POST /api/mcp/tools/test` | `{ tool, profileId, arguments, id? }` → `{ text, isError, status, filter, events, masked, maskedBy, tokens, elapsedMs, definition }`, `maskedBy` in the three groups of the record of calls. Saves nothing. |
 | `GET /api/mcp/tools/usage` | Calls by tool over the last `days` (7 by default), from the record of calls. |
 | `POST /api/mcp/preview` | The most recent event matching `filter`, as stored (`stored`) and as an answer would carry it (`sent`) under `mode` (or a profile's), with what was hidden (`masked`: `total`, `rules`, `strict`, `detectors`). Admin only: it returns the stored event. |
-| `GET /api/mcp/activity` | The record of calls, newest first: `profile`, `tool`, `status`, `from`, `to`, `count`, and `afterTs` / `afterId` to continue. |
+| `GET /api/mcp/activity` | The record of calls, newest first: `profile`, `tool`, `status`, `from`, `to`, `count`, and `afterTs` / `afterId` to continue. Each call carries the properties of [the record](#the-record-of-calls), `repeats` among them. |

@@ -31,6 +31,22 @@ internal sealed class McpToolHost(
     /// <summary>How long a call waits for one of the AI places before it is refused.</summary>
     private static readonly TimeSpan PlaceWait = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// The length of the arguments as JSON, near enough, without writing them out: a call far
+    /// past the limit is measured and refused, not copied first.
+    /// </summary>
+    private static long ArgumentsLength(Dictionary<string, JsonElement> arguments)
+    {
+        long length = 2;
+        foreach (var (name, value) in arguments)
+            length += name.Length + 4 + System.Runtime.InteropServices.JsonMarshal.GetRawUtf8Value(value).Length;
+        return length;
+    }
+
+    /// <summary>A tool's name as an answer and the record may carry it: a name is at most 64 characters.</summary>
+    private static string Shown(string name) =>
+        name.Length <= McpAudit.MaxNameChars ? name : string.Concat(name.AsSpan(0, McpAudit.MaxNameChars), "…");
+
     /// <summary>The arguments as the client sent them, for the audit record.</summary>
     private static string ArgumentsJson(Dictionary<string, JsonElement> arguments)
     {
@@ -121,18 +137,32 @@ internal sealed class McpToolHost(
             ? OffersBuiltIn(profile, builtIn, snapshot.Settings)
             : published?.OfferedTo(profile) == true;
 
+        // EVERY call counts against the profile's minute, the ones that will be refused
+        // included: a call that asks for a tool nobody has is still a call, and each call is a
+        // line in the record. Only what comes after the minute is spent is not counted — and
+        // that is thinned on its way into the record (see McpAudit.Keeps).
+        long argumentsLength = ArgumentsLength(arguments);
         ToolResult result;
-        if (!offered)
-            result = ToolResult.Refused(RefusalKind.Scope, $"The tool '{name}' is not offered to this profile.");
-        else if (!limiter.TryCount(profile.Id, Math.Min(profile.CallsPerMinute, snapshot.Settings.CallsPerMinute),
-                                   now.ToUnixTimeMilliseconds(), out int retryAfter))
+        int repeats = 0;
+        if (!limiter.TryCount(profile.Id, Math.Min(profile.CallsPerMinute, snapshot.Settings.CallsPerMinute),
+                              now.ToUnixTimeMilliseconds(), out int retryAfter, out repeats))
             result = ToolResult.Refused(RefusalKind.Limit, $"This profile has made its calls for this minute. Try again in {retryAfter} s.");
+        else if (!offered)
+            result = ToolResult.Refused(RefusalKind.Scope, $"The tool '{Shown(name)}' is not offered to this profile.");
+        else if (argumentsLength > McpAudit.MaxArgumentChars)
+            // What a call may carry is what the record keeps of it, whole: there is no part of
+            // an argument past the record's reach to put the real question in.
+            result = ToolResult.Refused(RefusalKind.Input,
+                $"The arguments are {argumentsLength} characters of JSON; one call may carry at most {McpAudit.MaxArgumentChars}.");
         else if (storage.Availability == QueryAvailability.Closed)
             result = ToolResult.Refused(RefusalKind.Unavailable, "The log store has shut down. Logs are available again once the server has restarted.");
         else
             result = await RunAsync(name, published, profile, snapshot, arguments, now, ct).ConfigureAwait(false);
 
-        audit.Record(profile, name, ArgumentsJson(arguments), result, Stopwatch.GetElapsedTime(started), ClientOf(request.Server));
+        if (McpAudit.Keeps(repeats))
+            audit.Record(profile, Shown(name),
+                argumentsLength > McpAudit.MaxArgumentChars ? $"(not kept: {argumentsLength} characters)" : ArgumentsJson(arguments),
+                result, Stopwatch.GetElapsedTime(started), ClientOf(request.Server), repeats);
         store.Touch(profile.Id, now);
 
         return new CallToolResult

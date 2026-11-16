@@ -216,22 +216,89 @@ public sealed class MaskingPolicy
     }
 
     /// <summary>
-    /// True when a property's value never leaves as stored — hashed, cut or removed by a rule in
-    /// any service, or, in <see cref="McpMaskingMode.Strict"/>, simply not on the allow-list. A
-    /// filter may test such a field for equality only, and an aggregation may only count it.
+    /// True when a property's value never leaves as stored in SOME event the question could be
+    /// about — hashed, cut or removed by a rule, or, in <see cref="McpMaskingMode.Strict"/>,
+    /// simply not on the allow-list. A filter may test such a field for equality only, and an
+    /// aggregation may only count it.
+    ///
+    /// <para>A filter is not tied to one service or to one spelling of a path, so this is the
+    /// widest reading of the rules, not the reading an event of one service gets:</para>
+    /// <list type="bullet">
+    /// <item>A rule on a path hides everything under it. <c>Buyer</c> → hash sends the whole
+    /// object as one token, so <c>Buyer.Name</c> is as hidden as <c>Buyer</c> is.</item>
+    /// <item>A rule for one service counts for every service: the field is hidden somewhere.</item>
+    /// <item>A <c>keep</c> for one service counts for none: the field is still hidden in the
+    /// others, and a question about it is a question about those too.</item>
+    /// </list>
+    /// The path is a property path as a filter spells it; a built-in field (<c>@mt</c>) is the
+    /// caller's to tell apart — none of them is ever hidden.
     /// </summary>
-    public bool HidesField(string path)
+    public bool HidesField(string path) => HiddenAnywhere(path, out _, out _) != Decision.None;
+
+    /// <summary>
+    /// What is done, somewhere, to the value at a path: the most protective decision any rule of
+    /// any service takes on the path or on anything above it — or, in Strict with no such rule,
+    /// a hash unless a <c>keep</c> that holds in every service covers it.
+    /// </summary>
+    private Decision HiddenAnywhere(ReadOnlySpan<char> path, out string? ruleId, out bool keptEverywhere)
     {
-        if (IsBuiltIn(path)) return false;
-        return Decide(path, service: null, anyService: true) switch
+        Decision best = OnPathOrAbove(path, out ruleId, out keptEverywhere);
+
+        // `Items.0.Sku` is `Items[0].Sku` to the engine wherever Items is a list, and the rules
+        // name a list's elements by the list's own path — `Items.Sku`. A path with a number in
+        // it is therefore judged both ways, and has to pass both.
+        if (WithoutNumbers(path) is { } elements)
         {
-            Decision.None => Mode == McpMaskingMode.Strict,
-            Decision.Keep => false,
-            _             => true,
-        };
+            Decision other = OnPathOrAbove(elements, out string? otherRule, out bool otherKept);
+            keptEverywhere &= otherKept;
+            if (other > best) { best = other; ruleId = otherRule; }
+        }
+
+        if (best != Decision.None) return best;
+        return Mode == McpMaskingMode.Strict && !keptEverywhere ? Decision.Hash : Decision.None;
     }
 
-    private static bool IsBuiltIn(string path) => path.Length > 0 && path[0] == '@';
+    /// <summary>The most protective rule on a path or on any path above it — Buyer.Name, then Buyer.</summary>
+    private Decision OnPathOrAbove(ReadOnlySpan<char> path, out string? ruleId, out bool keptEverywhere)
+    {
+        Decision best = Decision.None;
+        keptEverywhere = false;
+        ruleId = null;
+        for (ReadOnlySpan<char> at = path; ; )
+        {
+            int lastDot = at.LastIndexOf('.');
+            ReadOnlySpan<char> leaf = lastDot < 0 ? default : at[(lastDot + 1)..];
+            foreach (var rule in _rules)
+            {
+                if (!Glob(rule.Pattern, at) && !(rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf))) continue;
+                if (rule.Decision == Decision.Keep) keptEverywhere |= rule.Services.Length == 0;
+                else if (rule.Decision > best) { best = rule.Decision; ruleId = rule.Id; }
+            }
+            if (lastDot < 0) return best;
+            at = at[..lastDot];
+        }
+    }
+
+    /// <summary>
+    /// The path with every all-digit segment after the first taken out, or null when it has none:
+    /// <c>Items.0.Sku</c> → <c>Items.Sku</c>.
+    /// </summary>
+    private static string? WithoutNumbers(ReadOnlySpan<char> path)
+    {
+        StringBuilder? sb = null;
+        int start = 0, kept = 0;
+        for (int i = 0; i <= path.Length; i++)
+        {
+            if (i < path.Length && path[i] != '.') continue;
+            ReadOnlySpan<char> segment = path[start..i];
+            bool number = start > 0 && !segment.IsEmpty && !segment.ContainsAnyExceptInRange('0', '9');
+            if (number) sb ??= new StringBuilder(path.Length).Append(path[..(start - 1)]);
+            else if (sb is not null) { if (kept > 0) sb.Append('.'); sb.Append(segment); }
+            if (!number) kept++;
+            start = i + 1;
+        }
+        return sb?.ToString();
+    }
 
     private static bool InScope(string[] services, string? service)
     {
@@ -329,22 +396,62 @@ public sealed class MaskingPolicy
 
     /// <summary>
     /// A group key of an aggregation, which is a property value like any other: <c>group by
-    /// CardNumber</c> must not hand out the card numbers one row at a time.
+    /// CardNumber</c> must not hand out the card numbers one row at a time. The path is a
+    /// PROPERTY's — whatever its name begins with. Which keys are built-in fields is the
+    /// caller's to know, from the engine's own table; guessing it from an at sign here would
+    /// send a property called <c>@anything</c> past every rule.
     /// </summary>
     public string? MaskGroupKey(string path, string? value, MaskStats stats)
     {
         if (value is null) return null;
-        if (IsBuiltIn(path)) return path is "@mt" or "@m" || path.StartsWith("@x", StringComparison.Ordinal) ? MaskText(value, stats) : value;
 
-        switch (Decide(path, service: null, anyService: true, out string? rule))
+        // A row of a table is not an event of one service, so the key is judged as a filter's
+        // field is: by what is done to it anywhere, under any path above it.
+        Decision decision = HiddenAnywhere(path, out string? rule, out bool kept);
+        MaskReason reason = rule is null ? MaskReason.Strict : MaskReason.Rule;
+        switch (decision)
         {
-            case Decision.Keep:      return value;
-            case Decision.Remove:    stats.Add(MaskReason.Rule, path, rule); return "(hidden)";
-            case Decision.KeepLast4: stats.Add(MaskReason.Rule, path, rule); return LastFour(value);
-            case Decision.Hash:      stats.Add(MaskReason.Rule, path, rule); return TokenOfText(value, isNumber: false);
+            case Decision.Remove:    stats.Add(reason, path, rule); return "(hidden)";
+            case Decision.KeepLast4: stats.Add(reason, path, rule); return LastFour(value);
+            case Decision.Hash:      stats.Add(reason, path, rule); return TokenOfText(value, isNumber: false);
         }
-        if (Mode == McpMaskingMode.Strict) { stats.Add(MaskReason.Strict, path); return TokenOfText(value, isNumber: false); }
-        return MaskText(value, stats);
+        return kept ? value : MaskText(value, stats);
+    }
+
+    /// <summary>The largest whole number a double holds exactly: past it, digits are not the value's own.</summary>
+    private const double ExactIntegers = 9_007_199_254_740_992d;
+
+    /// <summary>
+    /// A number an aggregate came to — a minimum, a maximum, a sum, an average — as the cell of
+    /// a table. <c>max(ClientIin)</c> is somebody's IIN and <c>min(Pan)</c> a card number, and a
+    /// sum or an average over a group of one event is that event's value: so the number goes
+    /// past the same detectors a value does in a search, as a number and as the digits it is
+    /// written with. A field that a rule keeps in every service is sent as it is.
+    /// </summary>
+    public string MaskNumber(string path, double value, MaskStats stats)
+    {
+        if (value != Math.Floor(value) || double.IsInfinity(value))
+            return value.ToString("0.###", CultureInfo.InvariantCulture);
+
+        if (Math.Abs(value) > ExactIntegers)
+        {
+            // Its leading digits are right and its last ones are not: most of a long identifier,
+            // shown as if it were a measurement. Not shown at all.
+            stats.Add(MaskReason.Detector, MaskStats.Unscannable);
+            return "(hidden: too long to show exactly)";
+        }
+
+        long whole  = (long)value;
+        string text = whole.ToString(CultureInfo.InvariantCulture);
+        HiddenAnywhere(path, out _, out bool kept);
+        if (kept) return text;
+
+        if (SensitiveValueDetectors.IsSensitiveNumber(whole, _detectors, out var kind))
+        {
+            stats.Add(MaskReason.Detector, SensitiveValueDetectors.IdOf(kind));
+            return TokenOfText(text, isNumber: true);
+        }
+        return MaskText(text, stats);
     }
 
     // ── Events ────────────────────────────────────────────────────────────────
@@ -359,24 +466,7 @@ public sealed class MaskingPolicy
     public MaskedEvent Mask(LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields = null)
     {
         var props = new List<KeyValuePair<string, string>>();
-        ReadOnlyMemory<byte> raw = ev.RawProperties;
-        if (raw.IsEmpty && ev.Properties is { Count: > 0 } map) raw = PropertyBytes.From(map);
-
-        if (!raw.IsEmpty)
-        {
-            var reader = new MessagePackReader(raw);
-            if (reader.NextMessagePackType == MessagePackType.Map)
-            {
-                var ctx = new Ctx(raw, ev.ServiceName, stats);
-                int count = reader.ReadMapHeader();
-                for (int i = 0; i < count; i++)
-                {
-                    string key = ReadKey(ref reader);
-                    if (onlyFields is not null && !onlyFields.Contains(key)) { reader.Skip(); continue; }
-                    if (Cell(ref reader, key, in ctx) is { } cell) props.Add(new(key, cell));
-                }
-            }
-        }
+        Properties(ev, stats, onlyFields, props, stored: null);
 
         MaskedException? exception = null;
         if (ev.HasException)
@@ -397,6 +487,43 @@ public sealed class MaskingPolicy
             Properties = props,
             Exception  = exception,
         };
+    }
+
+    /// <summary>
+    /// The properties of <paramref name="ev"/> alone, as the AI gets them — no template, no
+    /// exception — and beside each the name it is stored under, which is the name
+    /// <paramref name="onlyFields"/> speaks of and can differ from the name that is sent
+    /// (see <see cref="Name"/>). For an answer that shows properties and nothing else of an event.
+    /// </summary>
+    public (List<KeyValuePair<string, string>> Properties, List<string> StoredNames) MaskProperties(
+        LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields = null)
+    {
+        var props  = new List<KeyValuePair<string, string>>();
+        var stored = new List<string>();
+        Properties(ev, stats, onlyFields, props, stored);
+        return (props, stored);
+    }
+
+    private void Properties(
+        LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields, List<KeyValuePair<string, string>> props, List<string>? stored)
+    {
+        ReadOnlyMemory<byte> raw = ev.RawProperties;
+        if (raw.IsEmpty && ev.Properties is { Count: > 0 } map) raw = PropertyBytes.From(map);
+        if (raw.IsEmpty) return;
+
+        var reader = new MessagePackReader(raw);
+        if (reader.NextMessagePackType != MessagePackType.Map) return;
+
+        var ctx = new Ctx(raw, ev.ServiceName, stats);
+        int count = reader.ReadMapHeader();
+        for (int i = 0; i < count; i++)
+        {
+            string key = ReadKey(ref reader);
+            if (onlyFields is not null && !onlyFields.Contains(key)) { reader.Skip(); continue; }
+            if (Cell(ref reader, key, in ctx) is not { } cell) continue;
+            props.Add(new(Name(key, stats), cell));
+            stored?.Add(key);
+        }
     }
 
     private MaskedException MaskException(ExceptionInfo x, MaskStats stats, int depth) => new(
@@ -467,7 +594,7 @@ public sealed class MaskingPolicy
                     Decision d   = Decide(child, c.Service, anyService: false, out string? rule);
                     if (d == Decision.Remove) { r.Skip(); c.Stats.Add(MaskReason.Rule, child, rule); continue; }
 
-                    w.WritePropertyName(key);
+                    w.WritePropertyName(Name(key, c.Stats));
                     if (r.TryReadNil())            w.WriteNullValue();
                     else if (d == Decision.Hash)   w.WriteStringValue(Hashed(ref r, child, in c, MaskReason.Rule, rule));
                     else if (d == Decision.KeepLast4) w.WriteStringValue(Cut(ref r, child, in c, rule));
@@ -602,11 +729,44 @@ public sealed class MaskingPolicy
     private static string LastFour(string value) =>
         value.Length <= 4 ? "****" : string.Concat("****", value.AsSpan(value.Length - 4));
 
+    /// <summary>
+    /// A property's name as it is sent. A name is a name nearly always — but a dictionary keyed
+    /// by an address or a card number has its values where its names should be, so a name that
+    /// could hold one goes past the detectors like any other text. The rules still judge the
+    /// name as stored.
+    /// </summary>
+    private string Name(string name, MaskStats stats) => CouldHoldAValue(name) ? MaskText(name, stats) : name;
+
+    /// <summary>
+    /// The cheap question before the detectors: an at sign, the start of a JWT, or six digits.
+    /// Nearly every name fails all three, and is sent without a pattern being run over it.
+    /// </summary>
+    private static bool CouldHoldAValue(string name)
+    {
+        if (name.Length < 6) return false;
+        if (name.AsSpan(1).Contains('@') || name.Contains("eyJ", StringComparison.Ordinal)) return true;
+        int digits = 0;
+        foreach (char c in name)
+            if (char.IsAsciiDigit(c) && ++digits == 6) return true;
+        return false;
+    }
+
     private static string ReadNumber(ref MessagePackReader r, out long? integer)
     {
         integer = null;
         if (r.NextMessagePackType == MessagePackType.Float)
-            return r.ReadDouble().ToString("R", CultureInfo.InvariantCulture);
+        {
+            // A whole number that happens to be stored as a double is the number it is: the same
+            // digits, the same token, and a card number all the same. Only up to where a double
+            // still holds every digit.
+            double d = r.ReadDouble();
+            if (d == Math.Floor(d) && Math.Abs(d) <= ExactIntegers)
+            {
+                integer = (long)d;
+                return integer.Value.ToString(CultureInfo.InvariantCulture);
+            }
+            return d.ToString("R", CultureInfo.InvariantCulture);
+        }
 
         if (r.NextCode == MessagePackCode.UInt64)
         {

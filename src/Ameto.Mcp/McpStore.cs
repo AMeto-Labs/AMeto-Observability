@@ -119,19 +119,30 @@ public sealed class McpStore
             Id        = Guid.NewGuid().ToString("N"),
             Name      = "",
             KeyHash   = HashKey(key),
+            // A profile created without a list is given the built-in tools: the common case,
+            // and the one the UI starts from. An explicit list, the empty one included, is
+            // taken as it is.
+            Tools     = [.. Tools.BuiltInTools.All.Select(static t => t.Name)],
             CreatedBy = createdBy,
             CreatedAt = DateTimeOffset.UtcNow,
         }, input);
 
         lock (_gate)
         {
-            WriteProfile(profile);
-            WriteGrants(profile.Id, input.PublishedTools);
+            Atomically(() =>
+            {
+                WriteProfile(profile);
+                WriteGrants(profile.Id, input.PublishedTools);
+            });
             _snapshot = Load();
         }
         return (profile, key);
     }
 
+    /// <summary>
+    /// Changes the members <paramref name="input"/> names and leaves the others as they are
+    /// (see <see cref="McpProfileInput"/>). Null when there is no such profile.
+    /// </summary>
     public McpProfile? UpdateProfile(string id, McpProfileInput input)
     {
         McpProfile updated;
@@ -139,8 +150,11 @@ public sealed class McpStore
         {
             if (_snapshot.FindProfile(id) is not { } existing) return null;
             updated = Apply(existing, input);
-            WriteProfile(updated);
-            WriteGrants(id, input.PublishedTools);
+            Atomically(() =>
+            {
+                WriteProfile(updated);
+                WriteGrants(id, input.PublishedTools);
+            });
             _snapshot = Load();
         }
         ToolListsChanged?.Invoke();
@@ -185,11 +199,16 @@ public sealed class McpStore
     {
         lock (_gate)
         {
-            bool removed = Execute("DELETE FROM mcp_profiles WHERE id = @id", ("@id", id)) > 0;
+            bool removed = false;
+            Atomically(() =>
+            {
+                removed = Execute("DELETE FROM mcp_profiles WHERE id = @id", ("@id", id)) > 0;
+                if (!removed) return;
+                foreach (var tool in _snapshot.Tools)
+                    if (tool.Profiles.Contains(id, StringComparer.Ordinal))
+                        WriteTool(tool with { Profiles = [.. tool.Profiles.Where(p => p != id)] });
+            });
             if (!removed) return false;
-            foreach (var tool in _snapshot.Tools)
-                if (tool.Profiles.Contains(id, StringComparer.Ordinal))
-                    WriteTool(tool with { Profiles = [.. tool.Profiles.Where(p => p != id)] });
             _snapshot = Load();
         }
         ToolListsChanged?.Invoke();
@@ -218,20 +237,25 @@ public sealed class McpStore
         }
     }
 
+    /// <summary>
+    /// <paramref name="profile"/> with what <paramref name="input"/> names set on it. A member
+    /// the input leaves null keeps the value the profile has — which for a new profile is the
+    /// record's own default, and for an existing one is what was stored.
+    /// </summary>
     private static McpProfile Apply(McpProfile profile, McpProfileInput input) => profile with
     {
-        Name             = input.Name.Trim(),
-        Description      = input.Description?.Trim() ?? "",
-        ToolsMode        = input.ToolsMode == McpToolsMode.PublishedOnly ? McpToolsMode.PublishedOnly : McpToolsMode.BuiltInAndPublished,
-        // A profile created without a list is given the built-in tools: the common case, and
-        // the one the UI starts from. An explicit list, the empty one included, is taken as it is.
-        Tools            = input.Tools is null ? [.. Tools.BuiltInTools.All.Select(static t => t.Name)] : Distinct(input.Tools),
-        Services         = Distinct(input.Services),
-        MaskingMode      = input.MaskingMode == McpMaskingMode.Strict ? McpMaskingMode.Strict : McpMaskingMode.Standard,
-        FreeFilters      = input.FreeFilters,
-        MaxEvents        = Math.Clamp(input.MaxEvents ?? 200, 1, 5_000),
-        MaxWindowMinutes = Math.Clamp(input.MaxWindowMinutes ?? 24 * 60, 1, 366 * 24 * 60),
-        CallsPerMinute   = Math.Clamp(input.CallsPerMinute ?? 30, 1, 6_000),
+        Name             = input.Name?.Trim() ?? profile.Name,
+        Description      = input.Description?.Trim() ?? profile.Description,
+        ToolsMode        = (input.ToolsMode ?? profile.ToolsMode) == McpToolsMode.PublishedOnly
+                               ? McpToolsMode.PublishedOnly : McpToolsMode.BuiltInAndPublished,
+        Tools            = input.Tools is { } tools ? Distinct(tools) : profile.Tools,
+        Services         = input.Services is { } services ? Distinct(services) : profile.Services,
+        MaskingMode      = (input.MaskingMode ?? profile.MaskingMode) == McpMaskingMode.Strict
+                               ? McpMaskingMode.Strict : McpMaskingMode.Standard,
+        FreeFilters      = input.FreeFilters ?? profile.FreeFilters,
+        MaxEvents        = Math.Clamp(input.MaxEvents ?? profile.MaxEvents, 1, 5_000),
+        MaxWindowMinutes = Math.Clamp(input.MaxWindowMinutes ?? profile.MaxWindowMinutes, 1, 366 * 24 * 60),
+        CallsPerMinute   = Math.Clamp(input.CallsPerMinute ?? profile.CallsPerMinute, 1, 6_000),
     };
 
     private static string[] Distinct(IReadOnlyList<string>? values) => values is null
@@ -309,14 +333,17 @@ public sealed class McpStore
         lock (_gate)
         {
             toolsChanged = !_snapshot.Settings.DisabledTools.SequenceEqual(settings.DisabledTools, StringComparer.Ordinal);
-            WriteSetting("enabled",                settings.Enabled ? "1" : "0");
-            WriteSetting("detectors",              ((int)settings.Detectors).ToString(CultureInfo.InvariantCulture));
-            WriteSetting("response_budget_tokens", settings.ResponseBudgetTokens.ToString(CultureInfo.InvariantCulture));
-            WriteSetting("max_window_minutes",     settings.MaxWindowMinutes.ToString(CultureInfo.InvariantCulture));
-            WriteSetting("max_events",             settings.MaxEvents.ToString(CultureInfo.InvariantCulture));
-            WriteSetting("calls_per_minute",       settings.CallsPerMinute.ToString(CultureInfo.InvariantCulture));
-            WriteSetting("max_concurrent",         settings.MaxConcurrent.ToString(CultureInfo.InvariantCulture));
-            WriteSetting("disabled_tools",         ListJson(settings.DisabledTools));
+            Atomically(() =>
+            {
+                WriteSetting("enabled",                settings.Enabled ? "1" : "0");
+                WriteSetting("detectors",              ((int)settings.Detectors).ToString(CultureInfo.InvariantCulture));
+                WriteSetting("response_budget_tokens", settings.ResponseBudgetTokens.ToString(CultureInfo.InvariantCulture));
+                WriteSetting("max_window_minutes",     settings.MaxWindowMinutes.ToString(CultureInfo.InvariantCulture));
+                WriteSetting("max_events",             settings.MaxEvents.ToString(CultureInfo.InvariantCulture));
+                WriteSetting("calls_per_minute",       settings.CallsPerMinute.ToString(CultureInfo.InvariantCulture));
+                WriteSetting("max_concurrent",         settings.MaxConcurrent.ToString(CultureInfo.InvariantCulture));
+                WriteSetting("disabled_tools",         ListJson(settings.DisabledTools));
+            });
             _snapshot = Load();
         }
         // A built-in tool switched off or on changes what every profile is offered.
@@ -332,12 +359,17 @@ public sealed class McpStore
     {
         lock (_gate)
         {
-            _secret          = RandomNumberGenerator.GetBytes(32);
-            _secretCreatedAt = DateTimeOffset.UtcNow;
-            WriteSecret(_secret, _secretCreatedAt);
+            // Stored before it is put to use: if the write fails, the secret in force is still
+            // the one on disk, and the tokens handed out now are the tokens after a restart.
+            byte[] secret = RandomNumberGenerator.GetBytes(32);
+            var createdAt = DateTimeOffset.UtcNow;
+            Atomically(() => WriteSecret(secret, createdAt));
+
+            _secret          = secret;
+            _secretCreatedAt = createdAt;
             Vault.Clear();
             _snapshot = Load();
-            return _secretCreatedAt;
+            return createdAt;
         }
     }
 
@@ -640,8 +672,41 @@ public sealed class McpStore
         return cmd.ExecuteScalar() as string;
     }
 
+    /// <summary>The connection and transaction the writes of one change share; see <see cref="Atomically"/>.</summary>
+    private (SqliteConnection Connection, SqliteTransaction Transaction)? _batch;
+
+    /// <summary>
+    /// Runs several writes as one change: all of them are stored, or none is. A profile and its
+    /// grants, the eight rows of the settings — half of either is a state nobody chose. Called
+    /// under the gate, which is what makes the one field safe to share.
+    /// </summary>
+    private void Atomically(Action writes)
+    {
+        using var conn = Open();
+        using var transaction = conn.BeginTransaction();
+        _batch = (conn, transaction);
+        try
+        {
+            writes();
+            transaction.Commit();
+        }
+        finally
+        {
+            _batch = null;
+        }
+    }
+
     private int Execute(string sql, params ReadOnlySpan<(string Name, object Value)> parameters)
     {
+        if (_batch is { } batch)
+        {
+            using var inBatch = batch.Connection.CreateCommand();
+            inBatch.Transaction = batch.Transaction;
+            inBatch.CommandText = sql;
+            foreach (var (name, value) in parameters) inBatch.Parameters.AddWithValue(name, value);
+            return inBatch.ExecuteNonQuery();
+        }
+
         using var conn = Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = sql;

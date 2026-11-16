@@ -46,7 +46,7 @@ public static class BuiltInTools
             "The answer is cut to a budget: when it says 'more', call again with the cursor it gives.",
             Schema($$"""
                 { "type": "object", "properties": {
-                    "filter": { "type": "string", "description": "Seq filter expression, e.g. @l = 'Error' and StatusCode >= 500, or plain words to search event text. Empty: every event." },
+                    "filter": { "type": "string", "description": "Filter expression, e.g. @l = 'Error' and StatusCode >= 500, or plain words: they are looked for in the message template and the exception, not in property values. Empty: every event." },
                     {{TimeProperties}},
                     "service": { "type": "string", "description": "Only this service." },
                     "levels": { "type": "array", "items": { "type": "string", "enum": ["Verbose", "Debug", "Information", "Warning", "Error", "Fatal"] }, "description": "Only these levels." },
@@ -61,6 +61,7 @@ public static class BuiltInTools
         new(Aggregate, "Count and group log events",
             "Answers with a table instead of events: select count(*) where @l = 'Error' group by @service. " +
             "Aggregates: count(*), count(P), sum(P), min(P), max(P), avg(P). Clauses: where <filter>, group by <property>[, …], limit <n>. " +
+            "sum, min, max and avg take values stored as numbers; a number kept as text is not counted, and a hidden property can only be counted. " +
             "Rows come largest first. A partial answer says so: its numbers are then floors, not totals.",
             Schema($$"""
                 { "type": "object", "required": ["query"], "properties": {
@@ -102,9 +103,9 @@ public static class BuiltInTools
 
         Time: 'from' and 'to' take ISO-8601 or relative values (-15m, -2h, -1d, now). The default window is the last hour. All times are UTC.
 
-        Filters use Seq syntax: @l = 'Error', StatusCode >= 500, @service in ['a', 'b'], has(UserId), @mt like '%timeout%', ci_contains(@x.message, 'refused'), Request.Path = '/pay', combined with and / or / not and parentheses. Plain words search the text of events.
+        Filters use Seq syntax: @l = 'Error', StatusCode >= 500, @service in ['a', 'b'], has(UserId), @mt like '%timeout%', ci_contains(@x.message, 'refused'), Request.Path = '/pay', combined with and / or / not and parentheses. Plain words are looked for in the message template and in the exception, not in property values: to search a property, name it.
 
-        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value always has the same token, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
+        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value has the same token wherever it is hidden the same way, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A token may only stand as the value in =, != or in; a hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
 
         Answers are cut to a budget. When one ends with 'more', call again with the cursor it gives.
         """;
@@ -120,7 +121,9 @@ public static class BuiltInTools
           nested       Request.User.Id = 42   Headers['X-Forwarded-For'] = '10.0.0.1'
           logic        and  or  not  ( )
           built-in     @t  @l  @mt  @service  @tr  @sp  @x.type  @x.message  @x.stack
-          free text    plain words match the text of events; every word must appear
+          functions    has() isDefined() startsWith() contains() endsWith() and their ci_ forms, length(), regexMatch(); no others here
+          free text    plain words are looked for in the message template and the exception, not in property values; every word must appear
+          hidden       a property marked "= only" takes =, !=, in and has(); a token (h:…) stands only as the value in =, != or in
           aggregation  select count(*) where @l = 'Error' group by @service limit 20   (logs_aggregate)
           strings are in single quotes; a quote inside one is doubled: 'can''t'
         """;

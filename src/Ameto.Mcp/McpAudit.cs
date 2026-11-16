@@ -23,7 +23,24 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
 {
     public const string Template = "AI call {Tool} by {Profile}: {Status}";
 
-    private const int MaxArgumentChars = 2_000;
+    /// <summary>
+    /// The most JSON one call's arguments may be — and what the record keeps of them, which is
+    /// the same number on purpose: a call is refused before it is longer than its record.
+    /// A filter has its own, shorter limit (<see cref="FilterGuard.MaxFilterChars"/>).
+    /// </summary>
+    public const int MaxArgumentChars = 6_000;
+
+    /// <summary>The longest tool name, and the longest client name, the record keeps.</summary>
+    public const int MaxNameChars = 64, MaxClientChars = 200;
+
+    /// <summary>
+    /// Whether the <paramref name="repeat"/>-th refusal of a spent minute is written down: the
+    /// 1st, 2nd, 4th, 8th… — each carrying its number, so the record says how many there were
+    /// without holding a line for each. A profile over its limit can ask as fast as the network
+    /// carries it; the store is not what should absorb that. Zero is a call that was not such a
+    /// refusal, and is always kept.
+    /// </summary>
+    public static bool Keeps(int repeat) => repeat <= 1 || System.Numerics.BitOperations.IsPow2(repeat);
 
     /// <summary>Property names of an audit event; the Activity endpoint filters and reads by them.</summary>
     public static class Fields
@@ -31,7 +48,7 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
         public const string Tool = "Tool", Profile = "Profile", ProfileId = "ProfileId", Status = "Status",
                             Events = "Events", Masked = "Masked", MaskedBy = "MaskedBy", Tokens = "Tokens",
                             ElapsedMs = "ElapsedMs", Arguments = "Arguments", Refusal = "Refusal", Client = "Client",
-                            Filter = "Filter", RefusalKind = "RefusalKind";
+                            Filter = "Filter", RefusalKind = "RefusalKind", Repeats = "Repeats";
 
         /// <summary>
         /// The groups inside <see cref="MaskedBy"/>: what hid the values. The first three count
@@ -67,7 +84,11 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
         }
     }
 
-    public void Record(McpProfile profile, string tool, string argumentsJson, ToolResult result, TimeSpan elapsed, string? client)
+    /// <summary>
+    /// Writes one call down. <paramref name="repeats"/> is, for a refusal over the minute's
+    /// limit, which one of that minute it is (see <see cref="Keeps"/>); zero otherwise.
+    /// </summary>
+    public void Record(McpProfile profile, string tool, string argumentsJson, ToolResult result, TimeSpan elapsed, string? client, int repeats = 0)
     {
         try
         {
@@ -89,14 +110,17 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
             // A refusal is a sentence about the call as it was written, so it is safe to keep.
             if (result.IsError) properties[Fields.Refusal] = result.Text.Length <= 600 ? result.Text : result.Text[..600];
             if (result.Refusal != RefusalKind.None) properties[Fields.RefusalKind] = NameOf(result.Refusal);
-            if (!string.IsNullOrEmpty(client)) properties[Fields.Client] = client;
+            if (repeats > 1) properties[Fields.Repeats] = repeats;
+            if (!string.IsNullOrEmpty(client))
+                properties[Fields.Client] = client.Length <= MaxClientChars ? client : string.Concat(client.AsSpan(0, MaxClientChars), "…");
             // The filter the call asked with; for a published tool, its template with this call's
             // arguments in place — which the arguments alone do not show. As written: a token
-            // among them is still a token.
+            // among them is still a token. A filter that ran is never longer than this keeps;
+            // one that is longer was refused for it, and its beginning is enough.
             if (!string.IsNullOrEmpty(result.Filter))
-                properties[Fields.Filter] = result.Filter.Length <= MaxArgumentChars
+                properties[Fields.Filter] = result.Filter.Length <= FilterGuard.MaxFilterChars
                                                 ? result.Filter
-                                                : string.Concat(result.Filter.AsSpan(0, MaxArgumentChars), "…");
+                                                : string.Concat(result.Filter.AsSpan(0, FilterGuard.MaxFilterChars), "…");
 
             byte[] payload = PropertyBytes.From(properties);
             int templateIndex = storage.TemplatePool.Intern(Template);
@@ -140,13 +164,18 @@ internal sealed class McpCallLimiter
     {
         public long Start;
         public int  Calls;
+        public int  Refused;
     }
 
     private readonly ConcurrentDictionary<string, Minute> _minutes = new(StringComparer.Ordinal);
     private int _running;
 
-    /// <summary>Counts one call against the profile's minute; false when the minute is spent.</summary>
-    public bool TryCount(string profileId, int perMinute, long nowMs, out int retryAfterSeconds)
+    /// <summary>
+    /// Counts one call against the profile's minute; false when the minute is spent, and then
+    /// <paramref name="refused"/> says how many calls of this minute have been turned away so
+    /// far, this one included.
+    /// </summary>
+    public bool TryCount(string profileId, int perMinute, long nowMs, out int retryAfterSeconds, out int refused)
     {
         var minute = _minutes.GetOrAdd(profileId, static _ => new Minute());
         lock (minute)
@@ -154,11 +183,18 @@ internal sealed class McpCallLimiter
             long start = nowMs - nowMs % 60_000;
             if (minute.Start != start)
             {
-                minute.Start = start;
-                minute.Calls = 0;
+                minute.Start   = start;
+                minute.Calls   = 0;
+                minute.Refused = 0;
             }
             retryAfterSeconds = (int)((start + 60_000 - nowMs) / 1000) + 1;
-            if (minute.Calls >= perMinute) return false;
+            refused = 0;
+            if (minute.Calls >= perMinute)
+            {
+                if (minute.Refused < int.MaxValue) minute.Refused++;
+                refused = minute.Refused;
+                return false;
+            }
             minute.Calls++;
             return true;
         }

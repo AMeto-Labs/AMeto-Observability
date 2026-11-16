@@ -165,7 +165,7 @@ internal static class EventTable
     }
 
     /// <summary>One event in full: every property on its own line, the whole exception.</summary>
-    public static void WriteDetail(StringBuilder sb, MaskedEvent ev, int maxStackChars)
+    public static void WriteDetail(StringBuilder sb, MaskedEvent ev, int maxStackChars, int maxChars = int.MaxValue)
     {
         var e = ev.Source;
         sb.Append("ref       ").Append(EventRef.Format(e)).Append('\n');
@@ -176,8 +176,18 @@ internal static class EventTable
         if (e.SpanId != 0) sb.Append("@sp       ").Append(TraceIdHelper.FormatSpanId(e.SpanId)).Append('\n');
         sb.Append("@mt       ").Append(ev.Template).Append('\n');
 
+        // An event can carry any number of properties of any size; the answer has a size.
+        int start = sb.Length, written = 0;
         foreach (var (key, value) in ev.Properties)
+        {
+            if (sb.Length - start > maxChars)
+            {
+                sb.Append("… ").Append(ev.Properties.Count - written).Append(" more properties left out: the answer reached its size budget\n");
+                break;
+            }
             sb.Append(key).Append(" = ").Append(value.Length > 4_000 ? string.Concat(value.AsSpan(0, 4_000), "…") : value).Append('\n');
+            written++;
+        }
 
         int depth = 0;
         for (var x = ev.Exception; x is not null; x = x.Inner, depth++)
@@ -199,10 +209,17 @@ internal static class EventTable
     /// Events one per line in the order given — for what happened around an event, where the
     /// order is the point and grouping by template would lose it.
     /// </summary>
-    public static void WriteTimeline(StringBuilder sb, IReadOnlyList<MaskedEvent> events, ulong markId, bool withService)
+    public static void WriteTimeline(StringBuilder sb, IReadOnlyList<MaskedEvent> events, ulong markId, bool withService, int maxChars = int.MaxValue)
     {
+        int begin = sb.Length, lines = 0;
         foreach (var ev in events)
         {
+            if (sb.Length - begin > Math.Max(maxChars, 0) && lines > 0)
+            {
+                sb.Append("… ").Append(events.Count - lines).Append(" more events left out: the answer reached its size budget\n");
+                break;
+            }
+            lines++;
             int start = sb.Length;
             var e = ev.Source;
             sb.Append(e.Id.RawValue == markId ? "> " : "  ");

@@ -253,6 +253,10 @@ internal static partial class PublishedToolBinder
         }
 
         if (string.IsNullOrWhiteSpace(tool.Filter)) return ("The filter is empty.", "filter");
+        if (tool.Filter.Length > MaxTemplateChars)
+            return ($"The filter is at most {MaxTemplateChars} characters.", "filter");
+        if (FilterGuard.TooDeep(tool.Filter))
+            return ($"The filter nests parentheses more than {FilterGuard.MaxNesting} deep.", "filter");
         var template = new FilterTemplate(tool.Filter);
         foreach (string name in template.Placeholders)
             if (!seen.Contains(name)) return ($"The filter uses {{{name}}}, which is not a declared parameter.", "filter");
@@ -262,7 +266,7 @@ internal static partial class PublishedToolBinder
                 return ($"The parameter '{p.Name}' is not used in the filter. A parameter is written as {{{p.Name}}}, outside quotes.", "filter");
             if (template.HasTopLevelOr && !p.Required && p.Default is null)
                 return ($"'{p.Name}' is optional, and the filter has an 'or' at its top level: leaving the parameter out would drop the whole filter. " +
-                        "Make it required, give it a default, or put the alternatives in parentheses.", "filter");
+                        "Make it required, give it a default, or put the alternatives in parentheses beside a condition that is always there.", "filter");
         }
 
         // The filter has to be one the engine accepts, both with every parameter given and with
@@ -274,7 +278,12 @@ internal static partial class PublishedToolBinder
                 var p = tool.Parameters.First(q => q.Name == name);
                 return everything || p.Required || p.Default is not null ? Literal(p, Sample(p)) : null;
             });
-            if (bound is null) continue;
+            // An optional parameter takes its whole clause with it — the alternatives beside it
+            // in a parenthesis included. A filter that is nothing but such clauses is, called
+            // without arguments, no filter: every event the profile sees.
+            if (bound is null)
+                return ("With its optional parameters left out the filter has no condition left, and the tool would return every event its profile sees. " +
+                        "Keep one condition that is always there, or make a parameter required.", "filter");
             try
             {
                 if (AggregationParser.TryParse(bound, out _)) return ("A tool's filter selects events; it cannot be a 'select …' aggregation.", "filter");
@@ -290,17 +299,32 @@ internal static partial class PublishedToolBinder
         return null;
     }
 
+    /// <summary>The longest filter a definition may have: what leaves room for its arguments in a call's own limit.</summary>
+    public const int MaxTemplateChars = 2_000;
+
+    /// <summary>
+    /// A tool's filter for one call.
+    /// <para><see cref="Filter"/> is the template with the call's arguments in it.
+    /// <see cref="Reference"/> is the same template with a plain value of the right type in the
+    /// place of each of those arguments, and the same clauses left out: what the filter looks
+    /// like whatever the arguments are. The two must come to trees of one shape
+    /// (<see cref="FilterGuard.Shape"/>) — an argument is a value, and a value changes no shape.</para>
+    /// </summary>
+    internal readonly record struct Binding(string? Filter, string? Reference, string? Error);
+
     /// <summary>
     /// The tool's filter for one call, or the sentence that tells the AI which argument is wrong.
     /// </summary>
-    public static (string? Filter, string? Error) Bind(McpPublishedTool tool, IReadOnlyDictionary<string, JsonElement> arguments)
+    public static Binding Bind(McpPublishedTool tool, IReadOnlyDictionary<string, JsonElement> arguments)
     {
         foreach (string given in arguments.Keys)
             if (!Reserved.Contains(given, StringComparer.Ordinal) && !tool.Parameters.Any(p => p.Name == given))
-                return (null, $"'{given}' is not a parameter of {tool.Name}. Its parameters: {Signature(tool)}.");
+                return new(null, null, $"'{given}' is not a parameter of {tool.Name}. Its parameters: {Signature(tool)}.");
 
         string? error = null;
-        string? filter = new FilterTemplate(tool.Filter).Bind(name =>
+        var template  = new FilterTemplate(tool.Filter);
+        var present   = new HashSet<string>(StringComparer.Ordinal);
+        string? filter = template.Bind(name =>
         {
             var p = tool.Parameters.First(q => q.Name == name);
             string? raw = arguments.TryGetValue(name, out var value) ? Text(value) : null;
@@ -310,13 +334,26 @@ internal static partial class PublishedToolBinder
                 if (p.Required) error ??= $"'{name}' is required. Parameters of {tool.Name}: {Signature(tool)}.";
                 return null;
             }
-            if (Literal(p, raw) is { } literal) return literal;
+            if (Literal(p, raw) is { } literal)
+            {
+                present.Add(name);
+                return literal;
+            }
             error ??= p.Type == McpToolParameter.Enum
                 ? $"'{raw}' is not a value of '{name}'. Its values: {string.Join(", ", p.Values)}."
                 : $"'{name}' takes a {p.Type}; '{raw}' is not one.";
             return null;
         });
-        return error is null ? (filter, null) : (null, error);
+        if (error is not null) return new(null, null, error);
+
+        // An optional parameter takes its clause with it; when that leaves nothing, the call
+        // would be a search for everything, which is not what any tool was published to be.
+        if (filter is null)
+            return new(null, null, $"{tool.Name} needs at least one of its parameters: {Signature(tool)}.");
+
+        string? reference = template.Bind(name =>
+            present.Contains(name) && tool.Parameters.First(q => q.Name == name) is { } p ? Literal(p, Sample(p)) : null);
+        return new(filter, reference, null);
     }
 
     /// <summary>
@@ -397,9 +434,9 @@ internal static partial class PublishedToolBinder
         switch (p.Type)
         {
             case McpToolParameter.Number:
-                return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double n) && double.IsFinite(n)
-                    ? n.ToString("R", CultureInfo.InvariantCulture)
-                    : null;
+                // Digits and a point, never an exponent: 0.00001 as "1E-05" is not a number the
+                // filter language reads.
+                return FilterGuard.NumberLiteral(raw);
             case McpToolParameter.Boolean:
                 return bool.TryParse(raw, out bool b) ? (b ? "true" : "false") : null;
             case McpToolParameter.Enum:
