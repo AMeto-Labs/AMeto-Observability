@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Ameto.Query.Filtering;
+using Ameto.Storage;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Ameto.Integration.Tests;
 
@@ -9,10 +11,10 @@ namespace Ameto.Integration.Tests;
 /// A filter that nests too deeply is a 400, on every endpoint that takes one.
 ///
 /// <para>It used to be the end of the process. The parser reads a filter by recursion and
-/// nothing counted the levels, so a few hundred opening parentheses — a filter of four hundred
-/// to twelve hundred characters depending on the build, typed by any signed-in user into the
-/// search box — overflowed the stack of the request thread. A stack overflow is not an
-/// exception; nothing catches it, and the server was gone for everybody.</para>
+/// nothing counted the levels, so a few hundred opening parentheses — a filter of two to six
+/// hundred characters depending on the build, typed by any signed-in user into the search
+/// box — overflowed the stack of the request thread. A stack overflow is not an exception;
+/// nothing catches it, and the server was gone for everybody.</para>
 ///
 /// <para>The limit lives in the parser and surfaces as its ordinary <see cref="FormatException"/>,
 /// which each of these endpoints already turned into a 400 carrying the message. Nothing in the
@@ -25,9 +27,14 @@ namespace Ameto.Integration.Tests;
 /// </summary>
 public sealed class FilterNestingEndpointTests : IClassFixture<AmetoWebAppFactory>
 {
+    private readonly AmetoWebAppFactory _factory;
     private readonly HttpClient _client;
 
-    public FilterNestingEndpointTests(AmetoWebAppFactory factory) => _client = factory.CreateClient();
+    public FilterNestingEndpointTests(AmetoWebAppFactory factory)
+    {
+        _factory = factory;
+        _client  = factory.CreateClient();
+    }
 
     private static readonly string TooDeep = $"more than {FilterParser.MaxNestingDepth} levels deep";
 
@@ -48,8 +55,8 @@ public sealed class FilterNestingEndpointTests : IClassFixture<AmetoWebAppFactor
     // ── Search, live tail, validation ─────────────────────────────────────────
 
     [Theory]
-    // 250 levels is the realistic one: 505 characters, well inside a request line, and past
-    // the point where a Debug build's stack ran out. 10 000 is the one nobody could miss.
+    // 250 levels is the realistic one: about 500 characters, well inside a request line, and
+    // past the point where a Debug build's stack ran out. 10 000 is the one nobody could miss.
     [InlineData("/api/events", 250)]
     [InlineData("/api/events", 10_000)]
     [InlineData("/api/events/live", 250)]
@@ -180,26 +187,42 @@ public sealed class FilterNestingEndpointTests : IClassFixture<AmetoWebAppFactor
 
     // ── A long chain is not nesting ───────────────────────────────────────────
 
-    [Fact]
-    public async Task The_longest_chain_a_request_line_can_carry_is_searched_not_refused()
+    /// <summary>
+    /// <paramref name="target"/> followed by the longest <c>-or-or-…</c> chain that still makes a
+    /// request line Kestrel would accept: 8 192 bytes for <c>GET target HTTP/1.1</c> and its line
+    /// end. A lone <c>-</c> is the shortest clause the language has — a word to search for — so
+    /// this is the most clauses one GET can carry, about 2 700, and it needs no escaping.
+    /// </summary>
+    private static string WithTheLongestChainThatFits(string target)
     {
-        // `''or''or''…`: four characters a clause, 2 040 of them in the 8 192 bytes Kestrel
-        // allows a request line. Nothing about it is nested, so it is not refused — and the
-        // tree it compiles to is balanced, so it does not cost a stack frame per clause either.
-        string filter = string.Join("or", Enumerable.Repeat("''", 2_040));
+        int room    = 8_192 - "GET ".Length - target.Length - " HTTP/1.1\r\n".Length;
+        int clauses = (room + 2) / 3;                       // n clauses are 3n − 2 characters
+        return target + string.Join("or", Enumerable.Repeat("-", clauses));
+    }
 
-        using var validate = await _client.GetAsync($"/api/events/validate?filter={Uri.EscapeDataString(filter)}");
-        Assert.Equal(HttpStatusCode.OK, validate.StatusCode);
+    [Theory]
+    [InlineData("/api/events/validate?filter=")]
+    [InlineData("/api/events?count=1&filter=")]
+    public async Task The_longest_chain_a_request_line_can_carry_is_searched_not_refused(string target)
+    {
+        // Nothing about it is nested, so it is not refused. Left-deep, a chain this long was
+        // more than a Debug build's stack could follow — one GET, and the process was gone.
+        // Compiled balanced, it is twelve levels.
+        string url = WithTheLongestChainThatFits(target);
+        Assert.InRange(url.Length, 8_170, 8_177);
 
-        using var search = await _client.GetAsync($"/api/events?count=1&filter={Uri.EscapeDataString(filter)}");
-        Assert.Equal(HttpStatusCode.OK, search.StatusCode);
+        using var resp = await _client.GetAsync(url);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
     }
 
     [Fact]
     public async Task An_alert_rule_whose_filter_is_a_chain_of_fifty_thousand_clauses_previews()
     {
         // Half a megabyte of filter in a body: more clauses than any stack could follow one
-        // frame at a time. The preview compiles it and runs it against the store.
+        // frame at a time. The preview compiles it and runs it against the store — which has
+        // to have finished loading first, or the answer is a 503 that says so.
+        await _factory.Services.GetRequiredService<StorageEngine>().CatalogLoaded.WaitAsync(TimeSpan.FromSeconds(60));
         string filter = string.Join(" or ", Enumerable.Range(0, 50_000).Select(i => $"Code = {i}"));
 
         using var resp = await _client.PostAsJsonAsync("/api/alerts/preview", Rule(filter));

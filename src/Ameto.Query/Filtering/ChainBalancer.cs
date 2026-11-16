@@ -34,10 +34,12 @@ internal static class ChainBalancer
     /// The deepest tree a compiled filter may hold, counted in levels below the root.
     ///
     /// <para>Not a limit anyone meets by writing a filter: a chain of ten thousand clauses is
-    /// fourteen levels deep once balanced. Reaching it takes some twenty groups one inside the
-    /// other, the operators alternating on the way down, each group holding a chain of both and
-    /// each OPENING with the next group. The costliest walker measured takes about 650 bytes
-    /// of stack per level in a Debug build, so this is some 170 KB at the very worst.</para>
+    /// fourteen levels deep once balanced, and a hundred groups each joined to the next by one
+    /// operator are a hundred. Reaching it takes a dozen or more groups one inside another, the
+    /// operators alternating on the way down, with a chain of both at every level: nineteen
+    /// groups if the chains are the longest left unbalanced and each opens with the next group,
+    /// fewer if they are long enough to be balanced. The costliest walker measured takes about
+    /// 650 bytes of stack per level in a Debug build, so this is some 170 KB at the very worst.</para>
     /// </summary>
     internal const int MaxDepth = 256;
 
@@ -57,10 +59,12 @@ internal static class ChainBalancer
     {
         // Checked on the way DOWN, so this walk is bounded by the limit it enforces: it gives
         // up at the first node past it rather than after having followed the tree to the bottom.
+        // No position in the sentence: a node does not carry one, and the levels counted are
+        // those of the tree as it will be walked, which is not something to point at in the text.
         if (level > MaxDepth)
             throw new FormatException(
-                $"The filter is nested too deeply — its 'and' / 'or' / 'not' clauses stack more than {MaxDepth} levels deep. " +
-                "Simplify the grouping.");
+                $"The filter is nested too deeply — its groups, with the 'and' / 'or' chains inside them, " +
+                $"stack more than {MaxDepth} levels deep. Use fewer groups inside one another.");
 
         switch (node)
         {

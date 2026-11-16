@@ -14,9 +14,9 @@ namespace Ameto.Query.Tests;
 /// is a <see cref="FormatException"/> like every other thing the parser refuses, which the
 /// endpoints already answer with a 400.</para>
 ///
-/// <para>Every test below that goes past the limit used to end the test host rather than fail.
-/// If one of them takes the whole run down with "Stack overflow", that is this limit not
-/// being applied somewhere the parser recurses.</para>
+/// <para>The tests below that go far past the limit — ten thousand levels — used to end the
+/// test host rather than fail. If one of them takes the whole run down with "Stack overflow",
+/// that is this limit not being applied somewhere the parser recurses.</para>
 /// </summary>
 public sealed class FilterNestingLimitTests
 {
@@ -144,7 +144,7 @@ public sealed class FilterNestingLimitTests
     public void A_closed_group_gives_its_level_back()
     {
         // Three hundred groups, none inside another: the depth is one throughout. A counter
-        // that only ever went up would refuse the sixty-fifth.
+        // that only ever went up would refuse the hundred-and-first.
         string filter = string.Join(" and ", Enumerable.Repeat("(A = 1)", 300));
         Assert.True(CompiledFilter.Compile(filter).Matches(Event(("A", 1L))));
 
@@ -258,7 +258,25 @@ public sealed class FilterNestingLimitTests
     [InlineData("(unbalanced (on purpose")]
     [InlineData("not found (yet)")]
     public void Ordinary_prose_with_parentheses_is_still_searched_for(string text)
-        => Assert.False(CompiledFilter.Compile(text).IsMatchAll);
+        => Assert.IsType<FreeTextNode>(FilterParser.Parse(text));
+
+    [Theory]
+    // What is counted is what the parser DESCENDS into. A parenthesis after a word is a call to
+    // a function there is no such name for, and the parser stops there — at the first one,
+    // having opened no group. With no comparison in sight that is prose, as it was before the
+    // limit existed, however many parentheses follow; there is no stack in it to protect.
+    [InlineData("timeout ")]
+    [InlineData("f(x) ")]
+    [InlineData(") ")]
+    public void Parentheses_the_parser_never_opens_are_not_levels(string before)
+    {
+        string text = before + Open(4_000) + Close(4_000);
+
+        // Every parenthesis is a search term, the ones `before` brings included.
+        var terms = Assert.IsType<FreeTextNode>(FilterParser.Parse(text)).Terms;
+        Assert.Equal(text.Count(c => c == '('), terms.Count(t => t == "("));
+        Assert.False(CompiledFilter.Compile(text).IsMatchAll);
+    }
 
     [Fact]
     public void Prose_nested_right_up_to_the_limit_is_still_a_search()

@@ -70,16 +70,18 @@ public sealed class FilterParser
     /// Measured before this limit existed, on Windows, where a thread's stack is 1.5 MB:
     /// 187 nested parentheses parsed in a Debug build and 188 ended the process. A Release
     /// server went 270 deep when the filter was the first it parsed and 580 once the JIT had
-    /// optimised the parser — a filter of six hundred to twelve hundred characters, from
-    /// anyone who may search, where a request line holds eight thousand.</para>
+    /// optimised the parser. They need not even be closed, so that is a filter of two to six
+    /// hundred characters, from anyone who may search, where a request line holds eight
+    /// thousand.</para>
     ///
     /// <para>A filter written by hand nests a handful deep. One grown by CLICKING nests once per
     /// click: the events page adds a condition as <c>(current filter) and X</c>, so the hundredth
-    /// "exclude these" is a hundred parentheses. That is what 100 leaves room for — about what
-    /// fits in a request line anyway — and it is half of the lowest threshold measured. Since
-    /// <see cref="ParseAtom"/> was split from <see cref="ParsePredicate"/> a level also costs
-    /// some 500 bytes of stack rather than several kilobytes, so the limit is 50 KB at its
-    /// deepest, and the margin no longer depends on how many functions the language has.</para>
+    /// "exclude these" is a hundred parentheses. 100 leaves room for that, and is what a
+    /// request line holds of such clicks when each excludes a message template of ordinary
+    /// length. What it costs is small: since <see cref="ParseAtom"/> was split from
+    /// <see cref="ParsePredicate"/> a level takes some 500 bytes of stack rather than several
+    /// kilobytes, so the deepest filter allowed uses about 50 KB of it, and that no longer
+    /// grows with the number of functions the language has.</para>
     ///
     /// <para>The limit bounds what RECURSES here. A long <c>a and b and c …</c> is read by a
     /// loop and is not nesting; what keeps such a chain from being walked one stack frame per
@@ -143,10 +145,13 @@ public sealed class FilterParser
             // knows as a keyword. Still just words.
             //
             // The nesting limit is the one refusal that does not come here, structural or not.
-            // Parentheses alone are not "structural" (a stack frame is full of them), so ten
-            // thousand of them around a word would otherwise arrive as a text search for ten
-            // thousand parentheses: an answer to a question nobody asked, in place of the
-            // sentence that says what is wrong with the input.
+            // Parentheses alone are not "structural" (a stack frame is full of them), so a
+            // filter the parser had followed a hundred groups down would otherwise come back
+            // as a text search for its own parentheses, with no word about why.
+            //
+            // It is a refusal of what the parser DESCENDED into, not of parentheses as such:
+            // `timeout ((((…` stops at "unknown function 'timeout'" before any group opens,
+            // is prose by the rule above, and is searched for as it always was.
             return AllTermsAsFreeText(tokens);
         }
     }
@@ -290,7 +295,8 @@ public sealed class FilterParser
     /// <summary>
     /// A parenthesised group, or one predicate.
     ///
-    /// <para>The group is the only place the grammar re-enters itself, and it is kept apart from
+    /// <para>The group is where the grammar re-enters itself from the top (the other recursion,
+    /// <c>not</c>, is <see cref="ParseNot"/> calling itself), and it is kept apart from
     /// <see cref="ParsePredicate"/> on purpose. Every frame of this method sits on the stack once
     /// per open parenthesis; while the group lived at the top of the method that reads the
     /// predicates — forty-odd functions, each with its own locals — one level of nesting cost
@@ -332,7 +338,10 @@ public sealed class FilterParser
     /// One predicate: a function call, a comparison, a set or pattern test, a bare level, or a
     /// run of free text. Never re-enters the expression grammar — a function's arguments are
     /// properties and literals — so however large this method grows, it is on the stack once.
+    /// Never inlined, by its size alone; the attribute says that it must not be, because
+    /// folded back into <see cref="ParseAtom"/> its locals are on the stack once per level again.
     /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private FilterNode ParsePredicate()
     {
         var t = Peek();

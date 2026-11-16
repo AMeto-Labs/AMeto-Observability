@@ -11,7 +11,8 @@ namespace Ameto.Query.Tests;
 /// the header predicate, the evaluator on every event. Measured before
 /// <see cref="ChainBalancer"/>: about 650 bytes of stack per clause in a Debug build and 490
 /// in a Release one before the JIT has optimised the walkers, so a chain of 2 315 clauses
-/// (3 063 in Release) overflowed a 1.5 MB stack — and a request line alone carries 2 040.
+/// (3 063 in Release) overflowed a 1.5 MB stack — and a request line carries 2 720 of the
+/// densest, which a Debug process did not survive.
 ///
 /// <para>A compiled filter now holds a long chain balanced. These pin the two halves of that:
 /// a chain of any length compiles and evaluates, and the balanced tree is the same filter in
@@ -77,15 +78,21 @@ public sealed class ChainBalancerTests
     public void The_longest_chain_a_request_line_can_carry_compiles_and_evaluates()
     {
         // Kestrel refuses a request line over 8 192 bytes, so that is what the search and tail
-        // endpoints can be handed. The densest chain that fits is an empty string per clause,
-        // four characters each: `''or''or''…`. Left-deep, 2 439 of those ended a Debug process.
-        const int clauses = 2_040;
-        string filter = string.Join("or", Enumerable.Repeat("''", clauses));
-        Assert.True(filter.Length <= 8_192 - "GET /api/events?filter= HTTP/1.1\r\n".Length);
+        // endpoints can be handed. The densest chain that fits is a lone `-` per clause — the
+        // lexer reads it as a number, the parser as a word to search for — three characters
+        // each: `-or-or-…`, 2 720 of them. Left-deep, a Debug process followed about 2 450 and
+        // then ended; a Release one about 3 400. Without the balancer this test does not fail,
+        // it takes the test host with it.
+        const int clauses = 2_720;
+        string filter = string.Join("or", Enumerable.Repeat("-", clauses));
+        Assert.Equal(8_192 - "GET /api/events?filter= HTTP/1.1\r\n".Length, filter.Length);
+
+        Assert.Equal(12, Depth(ChainBalancer.Balance(FilterParser.Parse(filter))));     // ⌈log₂ 2 720⌉
 
         var f = CompiledFilter.Compile(filter);
 
-        Assert.True(f.Matches(Event(LogLevel.Error)));      // every event contains the empty string
+        Assert.True(f.Matches(Event(LogLevel.Error, ("Id", "a-b"))));
+        Assert.False(f.Matches(Event(LogLevel.Error, ("Id", "ab"))));
         Assert.False(f.TryGetHeaderOnlyShape(out _, out _));
         Assert.Null(f.DerivedLevels);
     }
@@ -96,8 +103,8 @@ public sealed class ChainBalancerTests
     public void A_chain_far_longer_than_any_stack_could_follow_compiles_and_evaluates(string op)
     {
         // A hundred thousand clauses, a megabyte of filter: what the body of an alert rule may
-        // carry, since nothing bounds its length. Left-deep this is a hundred thousand frames
-        // in every walker; balanced it is seventeen.
+        // carry, since nothing bounds its length short of the 30 MB a request body may be.
+        // Left-deep this is a hundred thousand frames in every walker; balanced it is seventeen.
         const int n = 100_000;
         string filter = Chain(op, n, i => $"P{i % 7} = {i % 7}");
 
@@ -121,11 +128,42 @@ public sealed class ChainBalancerTests
         string inner  = Chain("or", 5_000, i => $"A = {i}");
         string filter = $"@l = 'Error' and not ({inner}) and B = 1";
 
+        // Two levels of `and`, the `not`, and ⌈log₂ 5 000⌉ = 13 under it — where the parser's
+        // tree has 4 999. Asserted on the tree, because on a stack large enough to follow the
+        // unbalanced chain the matches below would come out right either way.
+        Assert.Equal(2 + 1 + 13, Depth(ChainBalancer.Balance(FilterParser.Parse(filter))));
+
         var f = CompiledFilter.Compile(filter);
 
         Assert.True(f.Matches(Event(LogLevel.Error, ("A", 5_000L), ("B", 1L))));
         Assert.False(f.Matches(Event(LogLevel.Error, ("A", 4_999L), ("B", 1L))));
         Assert.False(f.Matches(Event(LogLevel.Debug, ("A", 5_000L), ("B", 1L))));
+    }
+
+    [Fact]
+    public void A_long_chain_that_ends_in_a_group_of_the_same_operator_keeps_every_clause_in_order()
+    {
+        // `p and p and … and (q and q and …)`: the group on the right is one clause of the outer
+        // chain and a long chain of its own. Both are balanced, and the reading order — which
+        // is the order of the hints, and of evaluation — is the order they were written in.
+        string filter = Chain("and", 12, i => $"P{i} = 'p{i}'") + " and (" + Chain("and", 12, i => $"Q{i} = 'q{i}'") + ")";
+
+        var parsed   = FilterParser.Parse(filter);
+        var balanced = ChainBalancer.Balance(parsed);
+
+        var before = Leaves(parsed);
+        var after  = Leaves(balanced);
+        Assert.Equal(24, after.Count);
+        for (int i = 0; i < 24; i++) Assert.Same(before[i], after[i]);
+        Assert.Equal(3 + 4, Depth(balanced));       // the group is the last of 13 clauses, three levels down; four more inside
+
+        var hints = CompiledFilter.Compile(filter).GetInvertedHints();
+        Assert.Equal(24, hints.Count);
+        for (int i = 0; i < 12; i++)
+        {
+            Assert.Equal(($"P{i}", (object?)$"p{i}"), hints[i]);
+            Assert.Equal(($"Q{i}", (object?)$"q{i}"), hints[12 + i]);
+        }
     }
 
     // ── The balanced tree is the same filter ──────────────────────────────────
@@ -355,6 +393,39 @@ public sealed class ChainBalancerTests
     }
 
     [Fact]
+    public void A_negated_long_chain_of_services_is_still_pushed_down_to_the_header_clause_by_clause()
+    {
+        // not (s0 or s1 or … s19) is twenty conjuncts by De Morgan, and the header predicate
+        // collects each one from under the `or` — whatever shape the `or` has.
+        var f = CompiledFilter.Compile("not (" + Chain("or", 20, i => $"@service = 'svc-{i}'") + ")");
+
+        var header = f.HeaderPredicate;
+        Assert.NotNull(header);
+        Assert.True(header!.HasServicePredicate);
+
+        static LogEvent From(string? service) => new()
+        {
+            Id              = new EventId(0u, 1u),
+            Timestamp       = new DateTimeOffset(2026, 8, 23, 12, 0, 0, TimeSpan.Zero),
+            Level           = LogLevel.Error,
+            MessageTemplate = "something happened",
+            ServiceName     = service,
+        };
+
+        for (int i = 0; i < 20; i++)
+        {
+            Assert.False(header.ServiceMayMatch($"svc-{i}"), $"svc-{i} is excluded by the filter");
+            Assert.False(f.Matches(From($"svc-{i}")));
+        }
+        foreach (string? other in new[] { "svc-20", "payments", null })
+        {
+            // The header predicate may only say "cannot match"; where the evaluator matches, it must not.
+            Assert.True(f.Matches(From(other)));
+            Assert.True(header.ServiceMayMatch(other));
+        }
+    }
+
+    [Fact]
     public void A_long_chain_of_time_bounds_still_narrows_the_window()
     {
         // Thirty lower bounds and thirty upper ones; the tightest of each wins.
@@ -438,8 +509,8 @@ public sealed class ChainBalancerTests
 
         var ex = Assert.Throws<FormatException>(() => CompiledFilter.Compile(filter));
         Assert.Contains("nested too deeply", ex.Message, StringComparison.Ordinal);
-        Assert.Contains($"more than {ChainBalancer.MaxDepth} levels", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("Simplify the grouping", ex.Message, StringComparison.Ordinal);
+        Assert.Contains($"more than {ChainBalancer.MaxDepth} levels deep", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Use fewer groups inside one another", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -470,5 +541,24 @@ public sealed class ChainBalancerTests
         var f = CompiledFilter.Compile(Staircase(16, ands: 100, ors: 100));
         Assert.True(f.Matches(Event(LogLevel.Error, ("A", 1L), ("B", 2L))));
         Assert.False(f.Matches(Event(LogLevel.Error, ("A", 2L), ("B", 2L))));
+    }
+
+    [Fact]
+    public void A_balanced_chain_counts_for_the_levels_it_has_once_balanced_and_the_limit_is_exact_there_too()
+    {
+        // Eighteen groups of two hundred-clause chains: 18 × (7 + 7) = 252 levels, every one
+        // of them a level of a BALANCED chain. Four negations in front make it 256, which is
+        // the limit; a fifth is one too many. (Each group opens with the next, and the first
+        // clause of a balanced chain sits at its full depth, so the count is not a ceiling here.)
+        string staircase = Staircase(18, ands: 100, ors: 100);
+
+        string atTheLimit = "not not not not " + staircase;
+        Assert.Equal(ChainBalancer.MaxDepth, Depth(ChainBalancer.Balance(FilterParser.Parse(atTheLimit))));
+        var f = CompiledFilter.Compile(atTheLimit);
+        Assert.True(f.Matches(Event(LogLevel.Error, ("A", 1L), ("B", 2L))));    // four negations cancel
+        Assert.False(f.Matches(Event(LogLevel.Error, ("A", 2L), ("B", 2L))));
+
+        var ex = Assert.Throws<FormatException>(() => CompiledFilter.Compile("not " + atTheLimit));
+        Assert.Contains("nested too deeply", ex.Message, StringComparison.Ordinal);
     }
 }
