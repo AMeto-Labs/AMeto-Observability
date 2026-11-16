@@ -106,6 +106,14 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
     /// section — where each property's entries lie, how long the list is and where — and with
     /// nothing to carry that, the second would walk it all again to decode one list. Ignored when
     /// a cache is in use: the cache's memo is the one that learned it.</para>
+    ///
+    /// <para>A carried memo must be THIS group's — of this file, over these bytes — and anything
+    /// else is refused with an <see cref="ArgumentException"/>. Everything a memo knows is about
+    /// the group it learned: its lists are that group's ordinals and the places it noted lists at
+    /// are offsets into that group's section, so the memo of another group would answer here for
+    /// bytes it never read, losing rows or decoding a list from wherever the offsets land. An
+    /// uncached memo is stamped with what it learns when it is made, and checked against it here,
+    /// as the cache checks the fingerprint of the memos it keeps.</para>
     /// </summary>
     public static SegmentIndexView Open(
         SegmentIndexCache? cache, string path, int group, SegmentReader segment, SegmentIndexReader? carried = null)
@@ -115,9 +123,15 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
             var lease = cache.AcquireOrAdd(path, group, IndexGroupFingerprint.Of(segment, group));
             return new SegmentIndexView(lease.Index, lease, leased: true, segment, group);
         }
-        if (carried is { OwnsSections: true })
-            throw new ArgumentException("A carried index must be a memo: a reader that owns its sections answers by itself.", nameof(carried));
-        return new SegmentIndexView(carried ?? SegmentIndexReader.CreateMemo(), default, leased: false, segment, group);
+
+        var learning = new SegmentIndexReader.LearnedFrom(path, group, IndexGroupFingerprint.Of(segment, group));
+        if (carried is null)
+            return new SegmentIndexView(SegmentIndexReader.CreateMemo(learning), default, leased: false, segment, group);
+        if (!carried.Learns(learning))
+            throw new ArgumentException(
+                $"A carried memo must be the UncachedMemo of a view of this same group ({group}) of this same file ({path}).",
+                nameof(carried));
+        return new SegmentIndexView(carried, default, leased: false, segment, group);
     }
 
     /// <summary>A view over sections already in hand — for tests, which need no segment file to
@@ -142,9 +156,9 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
 
     /// <summary>
     /// The memo this view answers through when NO CACHE keeps it, for a caller that will open
-    /// the same group again before its query ends (see <see cref="Open"/>); null when the cache
-    /// holds the memo, which then needs no carrying. The memo outlives the view: it owns nothing
-    /// that <see cref="Dispose"/> returns.
+    /// the same group again before its query ends (see <see cref="Open"/>, which takes it back
+    /// for that group alone); null when the cache holds the memo, which then needs no carrying.
+    /// The memo outlives the view: it owns nothing that <see cref="Dispose"/> returns.
     /// </summary>
     public SegmentIndexReader? UncachedMemo => _leased ? null : _index;
 

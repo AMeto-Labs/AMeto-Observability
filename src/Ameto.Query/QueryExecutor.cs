@@ -859,8 +859,9 @@ public sealed class QueryExecutor : IQueryExecutor
 
     /// <summary>
     /// Index groups whose rows the prefilter left to be named by the scan
-    /// (<see cref="SegmentPlan.NameLater"/>), process-wide, with the caveats of
-    /// <see cref="Pins"/>: a test that reads it needs the assembly's parallelisation off.
+    /// (<see cref="SegmentPlan.NameLater"/>), counted for the plans a scan reads — not for one
+    /// the prefilter then dropped, whose groups are read whole — process-wide, with the caveats
+    /// of <see cref="Pins"/>: a test that reads it needs the assembly's parallelisation off.
     /// </summary>
     internal static long GroupsLeftForLater;
 
@@ -1039,6 +1040,8 @@ public sealed class QueryExecutor : IQueryExecutor
                         // True once some group is NOT simply read whole: dropped, named, or left
                         // to be named. Until then the segment's answer is "every row".
                         bool narrowed = false;
+                        // Groups the plan leaves for the scan to name (GroupsLeftForLater).
+                        int leftForLater = 0;
 
                         var groups = reader.Groups;
                         for (int g = 0; g < groups.Length; g++)
@@ -1129,7 +1132,7 @@ public sealed class QueryExecutor : IQueryExecutor
                                 // carries it to that second asking.
                                 case GroupVerdict.Deferred:
                                     plan.NameLater(g, index.UncachedMemo);
-                                    Interlocked.Increment(ref GroupsLeftForLater);
+                                    leftForLater++;
                                     narrowed = true;
                                     break;
 
@@ -1158,8 +1161,13 @@ public sealed class QueryExecutor : IQueryExecutor
                         // the groups ARE the file (SegmentReader.GroupsCoverBlocks). Every file
                         // this build writes is such a file; for one that is not, nothing is
                         // assumed, and every row of it is read.
-                        results[i] = new PrefilterResult(
-                            info, narrowed && reader.GroupsCoverBlocks ? plan : null, reader, seg.Pin);
+                        var scanPlan = narrowed && reader.GroupsCoverBlocks ? plan : null;
+                        // Groups left for later are counted once the plan that leaves them is
+                        // the one the scan will read: a plan dropped here, or by a failure below,
+                        // has its groups read whole, never named.
+                        if (scanPlan is not null && leftForLater > 0)
+                            Interlocked.Add(ref GroupsLeftForLater, leftForLater);
+                        results[i] = new PrefilterResult(info, scanPlan, reader, seg.Pin);
                         keep = true;
                     }
                     catch (Exception ex)
@@ -1388,10 +1396,13 @@ public sealed class QueryExecutor : IQueryExecutor
     /// </param>
     /// <param name="candidates">
     /// The rows named, for <see cref="GroupVerdict.Named"/>; empty for every other verdict.
-    /// READ-ONLY, and not for the look of it: for a single equality it is the posting list as
-    /// the index keeps it, shared with every query that asks the same
-    /// (<see cref="ISegmentIndex.TryLookupIntersect"/>) — the copy that used to stand between
-    /// them was four bytes for every row named, in every group a query named rows in.
+    /// READ-ONLY, and not for the look of it: for a single equality whose value the group files
+    /// once — one bucket, one encoding, the usual case — it is the posting list as the index
+    /// keeps it, shared with every query that asks the same
+    /// (<see cref="ISegmentIndex.TryLookupIntersect"/>); the copy that used to stand between
+    /// them was four bytes for every row named, in every group a query named rows in. A value
+    /// filed several ways (a property and its alias, several encodings of a literal) is their
+    /// union, made for the call.
     /// </param>
     internal static GroupVerdict Narrow(
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,

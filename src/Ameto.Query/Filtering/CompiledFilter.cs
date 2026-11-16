@@ -18,8 +18,10 @@ public sealed class CompiledFilter : IPreparedFilter
     private readonly IReadOnlyList<(string property, object? value)>  _invertedHints;
 
     // The inverted hints with some of them left out, by which: worked out the first time a
-    // narrowing asks for that subset and kept, because it asks once per index group.
-    private System.Collections.Concurrent.ConcurrentDictionary<ulong, IReadOnlyList<(string property, object? value)>>? _hintsWithout;
+    // narrowing asks for that subset and kept, because it asks once per index group. A small
+    // copy-on-write array, read without a lock and replaced whole when a subset is added — a
+    // filter meets one or two subsets, and is often compiled for a single query.
+    private (ulong Skip, IReadOnlyList<(string property, object? value)> Hints)[]? _hintsWithout;
 
     // The single bloom/MightContain hint, also resolved once at compile time — the
     // prefilter asks for it inside a per-segment parallel loop.
@@ -464,8 +466,9 @@ public sealed class CompiledFilter : IPreparedFilter
 
     /// <summary>
     /// <see cref="GetInvertedHints"/> without the hints whose positions are set in
-    /// <paramref name="skip"/> — bit <c>i</c> for the hint at index <c>i</c> — in their order; the
-    /// same list when none is.
+    /// <paramref name="skip"/> — bit <c>i</c> for the hint at index <c>i</c> — in their order. A
+    /// mask that leaves nothing out (zero, or only positions the filter does not have) gets the
+    /// filter's own list, uncopied.
     ///
     /// <para>For the narrowing, which counts every hint's posting list before it builds one and
     /// leaves out the hints whose lists would name nearly the whole of the group in hand
@@ -474,27 +477,42 @@ public sealed class CompiledFilter : IPreparedFilter
     /// <c>@l = 'Error'</c>, and no row of a Warning one does — so the subset cannot be decided
     /// when the filter is compiled, and is asked for per group, on the path where a list built
     /// per call would be garbage per group. Each subset is therefore built once and kept: a
-    /// filter meets a handful of them, however many groups it is asked about.</para>
+    /// filter meets a handful of them, however many groups it is asked about. They are kept in a
+    /// small array that is read without a lock and replaced whole when one is added, so a filter
+    /// compiled for one query pays for the subsets it meets — a list and a short array each —
+    /// and for nothing per group.</para>
     ///
     /// <para>Positions past the sixty-fourth cannot be named in the mask and are always kept —
     /// their lists are then built and intersected, which is correct and merely not spared.</para>
     /// </summary>
     public IReadOnlyList<(string property, object? value)> GetInvertedHintsWithout(ulong skip)
     {
+        // A mask is about this filter's hints: a position it does not have leaves nothing out.
+        int count = _invertedHints.Count;
+        if (count < 64) skip &= (1UL << count) - 1;
         if (skip == 0) return _invertedHints;
 
-        var kept = _hintsWithout;
-        if (kept is null)
+        var kept = Volatile.Read(ref _hintsWithout);
+        IReadOnlyList<(string, object?)>? rest = null;
+        while (true)
         {
-            Interlocked.CompareExchange(ref _hintsWithout, new(), null);
-            kept = _hintsWithout!;
-        }
-        if (kept.TryGetValue(skip, out var known)) return known;
+            if (kept is not null)
+                foreach (var (mask, hints) in kept)
+                    if (mask == skip) return hints;
 
-        // A filter of k hints has at most 2^k subsets and meets few of them; the bound is for
-        // the filter with dozens of conjuncts over groups that each leave out a different set.
-        var rest = Without(_invertedHints, skip);
-        return kept.Count < MaxKeptHintSubsets ? kept.GetOrAdd(skip, rest) : rest;
+            // A filter of k hints has at most 2^k subsets and meets few of them; the bound is for
+            // the filter with dozens of conjuncts over groups that each leave out a different set.
+            rest ??= Without(_invertedHints, skip);
+            if (kept is { Length: >= MaxKeptHintSubsets }) return rest;
+
+            var grown = new (ulong, IReadOnlyList<(string, object?)>)[(kept?.Length ?? 0) + 1];
+            kept?.CopyTo(grown, 0);
+            grown[^1] = (skip, rest);
+
+            var seen = Interlocked.CompareExchange(ref _hintsWithout, grown, kept);
+            if (ReferenceEquals(seen, kept)) return rest;
+            kept = seen;    // another narrowing added a subset meanwhile — perhaps this one
+        }
     }
 
     /// <summary>Subsets of the inverted hints one filter keeps (<see cref="GetInvertedHintsWithout"/>).</summary>

@@ -30,9 +30,10 @@ namespace Ameto.Query.Tests;
 /// hundred rows a group is a list short enough to name at once), and each case says so by the
 /// counters before it trusts its rows. COUNTS, off
 /// <see cref="QueryExecutor.GroupsLeftForLater"/>, <see cref="QueryExecutor.GroupsNamedLate"/>,
-/// <see cref="SegmentReader.PooledSliceRents"/> and <see cref="SegmentReader.BlocksDecoded"/>: a
-/// page names the rows of the groups it reads and of no other, and a group the index ruled out
-/// is not read. Process-wide counters, so this depends on the assembly's
+/// <see cref="SegmentReader.PooledSliceRents"/>, <see cref="SegmentReader.BlocksDecoded"/> and
+/// <see cref="SegmentReader.RowsMaterialised"/>: a page names the rows of the groups it reads and
+/// of no other, a group named is read by its names, and a group the index ruled out is not read.
+/// Process-wide counters, so this depends on the assembly's
 /// <c>DisableTestParallelization</c> (see AssemblyInfo.cs).</para>
 /// </summary>
 public sealed class LateNamingTests : IAsyncLifetime
@@ -192,7 +193,9 @@ public sealed class LateNamingTests : IAsyncLifetime
     /// prefilter batch held; read the other way it names the oldest one's. Before, every group
     /// of the batch had its list built to be thrown away.
     ///
-    /// <para>What is left for later is the whole first batch, whatever the page then reads of it.</para>
+    /// <para>What is left for later is the whole first batch, whatever the page then reads of it.
+    /// And the group the page reads is read BY the rows its list names: those, and no others, are
+    /// made into events.</para>
     /// </summary>
     [Theory]
     [InlineData("has(@x)")]
@@ -200,17 +203,104 @@ public sealed class LateNamingTests : IAsyncLifetime
     [InlineData("has(@x) and Lane = 'even'")]
     public async Task APageNamesTheRowsOfTheGroupItReads_AndOfNoOther(string filter)
     {
-        var c = new Case(filter, filter, null, static _ => true, true);
+        var c       = CaseOf(filter);
+        var byBlock = RowsByBlock();
 
         using var cache = new SegmentIndexCache(64L * 1024 * 1024);
         foreach (var query in (QueryExecutor[])[_uncached, WithCache(cache)])
         foreach (bool forward in (bool[])[false, true])
         {
+            long made = SegmentReader.RowsMaterialised, decoded = SegmentReader.BlocksDecoded;
             var (left, named, _, page) = await CountAsync(query, c, 50, forward);
             Assert.Equal(50, page.Count);
             Assert.Equal(FirstBatch, left);
             Assert.Equal(1, named);
+
+            // The blocks read are the oldest going forward and the newest going back — those, in
+            // that order, holding a row the list names (a block that holds none is skipped), as
+            // many as the page needed. Of their rows the list names the ones that match, and those
+            // are what is made: blocks read whole would make every row they hold, the scan
+            // rejecting the rest and returning the same page.
+            int blocks = (int)(SegmentReader.BlocksDecoded - decoded);
+            var read   = (forward ? byBlock : Enumerable.Reverse(byBlock)).Where(block => block.Any(c.Matches)).Take(blocks);
+            Assert.Equal(read.Sum(block => block.Count(c.Matches)), SegmentReader.RowsMaterialised - made);
         }
+    }
+
+    /// <summary>
+    /// A group whose rows the index NAMES is read by those names, whoever named them: the
+    /// prefilter, for a short list, or the scan, when it got to a group whose long list it was
+    /// left. The rows cannot show it — a group read whole returns the same one row, the scan
+    /// rejecting the rest — so what is counted is the rows made into events: one.
+    /// </summary>
+    [Theory]
+    [InlineData("Row = '0004321'")]                       // one row: named by the prefilter
+    [InlineData("Lane = 'odd' and Row = '0000321'")]      // a long list beside it: named by the scan, going forward
+    public async Task ANamedGroupIsReadByItsNames_NotWhole(string filter)
+    {
+        var c   = CaseOf(filter);
+        int row = Enumerable.Range(0, Rows).Single(c.Matches);
+
+        using var cache = new SegmentIndexCache(64L * 1024 * 1024);
+        var cached = WithCache(cache);
+        foreach (var query in (QueryExecutor[])[_uncached, cached, cached])
+        foreach (bool forward in (bool[])[true, false])
+        {
+            long made = SegmentReader.RowsMaterialised;
+            var (_, named, _, page) = await CountAsync(query, c, int.MaxValue, forward);
+            Assert.Equal(new[] { row }, page.Select(RowOf));
+            // The premise: who named it. (Going back, the row's segment is past the first
+            // batch, and every batch after it names its rows itself.)
+            if (forward) Assert.Equal(c.LeftForLater, named > 0);
+            Assert.Equal(1, SegmentReader.RowsMaterialised - made);
+        }
+    }
+
+    /// <summary>
+    /// What a query without a cache carries to a group's second asking is the memo of THAT
+    /// group's first view, and a view takes no other. A memo's lists are ordinals of the group it
+    /// learned and the places it noted lists at are offsets into that group's section: carried to
+    /// another group, or to the same group of another file, it would answer for bytes it never
+    /// read — rows lost, or a list decoded from wherever the offsets land.
+    /// </summary>
+    [Fact]
+    public async Task AMemoCarriedToASecondAsking_IsThatGroupsOrNone()
+    {
+        string[] files = [.. _engine.ListSegments().Select(static s => s.FilePath).Take(2)];
+        using var a = SegmentReader.Open(files[0]);
+        using var b = SegmentReader.Open(files[1]);
+        (string, object?)[] even = [("Lane", QuerySegmentFixtures.EvenLane)];
+
+        SegmentIndexReader memo;
+        using (var first = SegmentIndexView.Open(null, files[0], 0, a))
+        {
+            Assert.Equal(RowsPerSegment / 2, first.CountAtMost("Lane", QuerySegmentFixtures.EvenLane));
+            memo = first.UncachedMemo!;
+        }
+
+        // Its own group takes it, and uses what it learned: the long list it counted is read by itself.
+        long slices = SegmentReader.PooledSliceRents;
+        using (var second = SegmentIndexView.Open(null, files[0], 0, a, memo))
+        {
+            Assert.True(second.TryLookupIntersect(even, out var rows));
+            Assert.Equal(RowsPerSegment / 2, rows.Length);
+        }
+        Assert.Equal(1, SegmentReader.PooledSliceRents - slices);
+
+        // The same group of another file: refused.
+        Assert.Throws<ArgumentException>(() => SegmentIndexView.Open(null, files[1], 0, b, memo));
+
+        // Another group of the same file: refused.
+        var (many, _, _, _) = await ManyGroupsSegmentAsync();
+        using var m = SegmentReader.Open(Assert.Single(many.ListSegments()).FilePath);
+        SegmentIndexReader groupZero;
+        using (var g0 = SegmentIndexView.Open(null, m.Info.FilePath, 0, m)) groupZero = g0.UncachedMemo!;
+        Assert.Throws<ArgumentException>(() => SegmentIndexView.Open(null, m.Info.FilePath, 1, m, groupZero));
+
+        // A memo the cache keeps is not one to carry: the cache is what keeps it.
+        using var cache = new SegmentIndexCache(1 << 20);
+        using (var cached = SegmentIndexView.Open(cache, files[0], 0, a))
+            Assert.Null(cached.UncachedMemo);
     }
 
     /// <summary>
@@ -471,6 +561,33 @@ public sealed class LateNamingTests : IAsyncLifetime
 
     private QueryExecutor WithCache(SegmentIndexCache cache) =>
         new(_engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
+
+    /// <summary>The case of <see cref="Cases"/> that is <paramref name="filter"/> alone, with no level set.</summary>
+    private static Case CaseOf(string filter) => Cases.First(c => c.Filter == filter && c.Levels is null);
+
+    /// <summary>
+    /// The store's rows, by row number, block by block, oldest block first: what each block of
+    /// each segment holds — so that a test can say which rows a read of so many blocks had to
+    /// choose from.
+    /// </summary>
+    private List<int[]> RowsByBlock()
+    {
+        var segments = new List<(int FirstRow, int[][] Blocks)>();
+        foreach (var info in _engine.ListSegments())
+        {
+            using var reader = SegmentReader.Open(info.FilePath);
+            int firstRow = (int)((reader.Groups[0].MinTs - _baseTicks) / TimeSpan.TicksPerSecond);
+            var blocks   = new int[reader.BlockCount][];
+            for (int b = 0; b < blocks.Length; b++)
+            {
+                int from = (int)reader.FirstOrdinalOfBlock(b);
+                int to   = b + 1 < blocks.Length ? (int)reader.FirstOrdinalOfBlock(b + 1) : (int)reader.Info.EventCount;
+                blocks[b] = [.. Enumerable.Range(firstRow + from, to - from)];
+            }
+            segments.Add((firstRow, blocks));
+        }
+        return [.. segments.OrderBy(static s => s.FirstRow).SelectMany(static s => s.Blocks)];
+    }
 
     private DateTimeOffset At(int row) => new(_baseTicks + row * TimeSpan.TicksPerSecond, TimeSpan.Zero);
 

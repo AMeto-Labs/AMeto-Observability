@@ -903,9 +903,11 @@ public sealed class SegmentReader : ISegmentReader
                 int decoded = LZ4Codec.Decode(src, rentedUncomp.AsSpan(0, uncompressedSize));
                 if (decoded != uncompressedSize) return null;
 
-                return cands is { } named
+                var events = cands is { } named
                     ? DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup, named: true, named.Span, firstOrdinal)
                     : DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup);
+                Interlocked.Add(ref RowsMaterialised, events.Count);
+                return events;
             }
             finally { if (basePtr is not null) handle.ReleasePointer(); }
         }
@@ -1096,6 +1098,13 @@ public sealed class SegmentReader : ISegmentReader
 
     /// <summary>Blocks in the file, in (ts, id) order — the unit a merge reads one at a time.</summary>
     internal int BlockCount => _blocks.Length;
+
+    /// <summary>
+    /// The file ordinal of block <paramref name="block"/>'s first row (v5 and later), for a test
+    /// that has to know which rows the blocks a read decoded hold.
+    /// </summary>
+    internal uint FirstOrdinalOfBlock(int block) =>
+        _blockOrdinals is { } ordinals ? ordinals[block] : throw new NotSupportedException("A v4 file has no block ordinals.");
 
     /// <summary>
     /// The stored block sizes are STRUCTURE and are validated as such, before either is
@@ -1374,6 +1383,16 @@ public sealed class SegmentReader : ISegmentReader
     /// rows cannot tell an index that prunes from one that merely agrees.
     /// </summary>
     internal static long BlocksDecoded;
+
+    /// <summary>
+    /// Rows an event read made into <see cref="LogEvent"/>s, by any reader in this process: every
+    /// row of a block read whole, only the candidate rows of a block read by its names. The same
+    /// kind of DIAGNOSTIC as <see cref="BlocksDecoded"/>, for the claim it cannot state where a
+    /// group is one block: that a group whose rows the index NAMED was read by those names and
+    /// not whole. Both reads return the same rows — the scan rejects what the names left out —
+    /// so nothing but this count tells them apart.
+    /// </summary>
+    internal static long RowsMaterialised;
 
     /// <summary>
     /// Process-wide count of successful <see cref="Open"/> calls, in the same spirit and with

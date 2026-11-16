@@ -490,7 +490,7 @@ public sealed class ExceptionExistsFieldTests
     /// <para>What it replaced decoded the list, copied it and kept it, in every group of every
     /// segment a first page touched, to find that it named the group. The marker was the first
     /// hint to be counted this way; every equality is now, the level beside it included
-    /// (<c>FirstPageNarrowingTests</c> pins the rule for the rest).</para>
+    /// (<c>NarrowByCountTests</c> pins the rule for the rest).</para>
     /// </summary>
     [Fact]
     public void A_marker_that_names_nearly_all_of_its_group_is_counted_and_never_listed()
@@ -545,12 +545,14 @@ public sealed class ExceptionExistsFieldTests
     /// What the narrowing asks a compiled filter for, per index group: its inverted hints without
     /// the ones whose lists that group makes not worth building, by position, in their order.
     /// Asked once per group, so each subset is built the first time and the same list handed
-    /// back after that — and with nothing left out, the filter's own list, uncopied.
+    /// back after that — and with nothing left out, the filter's own list, uncopied. A position
+    /// the filter does not have leaves nothing out.
     /// </summary>
     [Theory]
     [InlineData("has(@x)",                                  0b001ul, "")]
     [InlineData("has(@x) and Shard = 'a'",                  0b001ul, "Shard")]
     [InlineData("has(@x) and Shard = 'a'",                  0b010ul, "@x.exists")]
+    [InlineData("has(@x) and Shard = 'a'",                  0b101ul, "Shard")]    // and a position it does not have
     [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b010ul, "Shard,@l")]
     [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b110ul, "Shard")]
     [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b111ul, "")]
@@ -565,7 +567,14 @@ public sealed class ExceptionExistsFieldTests
 
         Assert.Equal(rest, string.Join(",", first.Select(static hint => hint.property)));
         Assert.Same(first, filter.GetInvertedHintsWithout(skip));
-        if (skip == 0) Assert.Same(filter.GetInvertedHints(), first);    // nothing to leave out, nothing copied
+
+        // Nothing left out — no mask, or only positions the filter does not have — nothing copied.
+        var all = filter.GetInvertedHints();
+        if (first.Count == all.Count) Assert.Same(all, first);
+
+        // The same subset, however the mask spells it, is one list.
+        int count = all.Count;
+        if (count < 64) Assert.Same(first, filter.GetInvertedHintsWithout(skip | (1UL << count)));
     }
 
     /// <summary>

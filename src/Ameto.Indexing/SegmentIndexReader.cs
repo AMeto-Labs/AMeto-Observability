@@ -102,6 +102,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private int                                  _ringUsed, _hand;
     private long                                 _memoBytes;
 
+    // What an UNCACHED memo was made to learn (SegmentIndexView.Open), so that a memo carried to
+    // a second view of a group is known to be that group's. Null for a cached memo — the cache
+    // keys and fingerprints its memos itself — and for a reader that owns its sections.
+    private LearnedFrom? _learnedFrom;
+
     /// <summary>
     /// A test seam: runs after a question has been answered from a section and before the answer
     /// is remembered — the window in which two queries that missed the same bucket race. Null in
@@ -142,6 +147,26 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// <summary>An empty memo for one (file, group): no section, nothing native, a few hundred
     /// bytes until a query teaches it something.</summary>
     internal static SegmentIndexReader CreateMemo() => new(null, null, null);
+
+    /// <summary>
+    /// The one group an uncached memo learns: the file and group a view opened it for, and the
+    /// fingerprint of the bytes behind them (<see cref="IndexGroupFingerprint"/>). Everything a
+    /// memo remembers is about those bytes — its lists are ordinals of that group, its absences
+    /// are about that section, the places it noted lists at are offsets into it — so this is what
+    /// a memo carried to a second view has to match (<see cref="SegmentIndexView.Open"/>).
+    /// </summary>
+    internal readonly record struct LearnedFrom(string Path, int Group, IndexGroupFingerprint Fingerprint);
+
+    /// <summary>An empty memo for an uncached view of the group <paramref name="learning"/> names.</summary>
+    internal static SegmentIndexReader CreateMemo(in LearnedFrom learning)
+    {
+        var memo = CreateMemo();
+        memo._learnedFrom = learning;
+        return memo;
+    }
+
+    /// <summary>True for the memo of an uncached view of exactly the group <paramref name="group"/> names.</summary>
+    internal bool Learns(in LearnedFrom group) => _learnedFrom is { } own && own == group;
 
     /// <summary>True for a reader made by <see cref="Load"/>; false for a memo.</summary>
     internal bool OwnsSections => _bloom is not null;
@@ -335,11 +360,14 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// with offsets is "these and no others" — as read-only memory over the array the answer was
     /// worked out in.
     ///
-    /// <para>For ONE predicate that array is the bucket's posting list as the memo keeps it. It
-    /// is not copied: a memo's arrays are never written once published, the caller cannot write
-    /// through read-only memory, and the copy this replaces cost a query four bytes for every
-    /// row the list names, per group asked, to protect the list from a caller that only ever read
-    /// it. For several predicates it is the intersection, already an array of its own.</para>
+    /// <para>For ONE predicate whose value the group files once — one bucket, one encoding, the
+    /// usual case — that array is the bucket's posting list as the memo keeps it. It is not
+    /// copied: a memo's arrays are never written once published, the caller cannot write through
+    /// read-only memory, and the copy this replaces cost a query four bytes for every row the
+    /// list names, per group asked, to protect the list from a caller that only ever read it. A
+    /// value filed several ways (a property and its alias, several encodings of a literal) is
+    /// their union, made for the call. For several predicates it is the intersection: an array
+    /// of its own, or — when one of the lists is empty — that empty list.</para>
     /// </summary>
     internal bool TryLookupIntersect(
         IReadOnlyList<(string property, object? value)> predicates, IIndexSectionSource src,
@@ -555,7 +583,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// named up front is exactly what the count already decoded, and naming it reads nothing
     /// more.</para>
     ///
-    /// <para>What a list this short costs to have: at most a kilobyte in the memo, per group
+    /// <para>What a list this short costs to have: at most a kilobyte in the memo, per bucket
     /// asked — a fraction of what opening the group's segment costs (4 KB at 10 000 rows, 11 KB
     /// at 40 000, measured by <c>FirstPageIndexCostProbe</c>), and so not worth a second visit
     /// to the group to avoid. A longer list is: the lists of one prefilter batch of eight groups

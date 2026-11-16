@@ -1176,7 +1176,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// (<see cref="DecodeAt"/>).</para>
     ///
     /// <para><see cref="ScanBucket"/> and <see cref="CountBucket"/> are this walk at its two
-    /// ends, so which entries count as "this value" is decided in a single place.</para>
+    /// ends, so which entries count as "this value" is decided in a single place. A value filed
+    /// under several entries (spellings that differ only in case) is walked once like any other:
+    /// their lists are decoded and unioned as the walk meets them, for as long as the count
+    /// allows.</para>
     ///
     /// <para>A LEGACY section's bitmaps carry no leading count: each is decoded to be counted,
     /// and what was decoded is handed back whatever the limit — there is nothing left to
@@ -1193,8 +1196,15 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         Span<char> scratch = rented ?? stackalloc char[256];
         try
         {
-            // First pass: which entries match, and what their lists say they hold.
-            int[]?   legacy  = null;
+            // int.MaxValue is "whatever it holds" (ScanBucket), not a number to compare a sum with.
+            bool decodeAll = decodeAtMost == int.MaxValue;
+
+            // The union so far, decoded AS THE WALK GOES for as long as the count stays within the
+            // limit — so a bucket of several entries is still one walk. The entry that takes the
+            // count past the limit stops the decoding, and what was decoded before it (at most
+            // the limit's worth) is dropped: past the limit the answer is the count alone.
+            int[]?   acc     = null;
+            bool     over    = false;
             long     counted = 0;
             int      matches = 0;
             ListSpan first   = default;
@@ -1212,14 +1222,25 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                     if (!ValueEquals(value, form, formAscii, scratch)) continue;
 
                     if (++matches == 1) first = new ListSpan(pos - bmLen, bmLen);
-                    if (codec)
+                    if (!codec)
                     {
-                        counted += SegmentBitmapCodec.Count(bm);
+                        // No leading count: decoded to be counted, and kept whatever the limit.
+                        var legacy = DecodeRoaring(bm);
+                        acc = acc is null ? legacy : UnionAscending(acc, legacy);
+                        continue;
+                    }
+
+                    counted += SegmentBitmapCodec.Count(bm);
+                    if (over) continue;
+                    if (decodeAll || counted <= decodeAtMost)
+                    {
+                        var decoded = DecodeCodec(bm);
+                        acc = acc is null ? decoded : UnionAscending(acc, decoded);
                     }
                     else
                     {
-                        var decoded = DecodeRoaring(bm);
-                        legacy = legacy is null ? decoded : UnionAscending(legacy, decoded);
+                        over = true;
+                        acc  = null;
                     }
                 }
             }
@@ -1228,58 +1249,19 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             where    = default;
             if (matches == 0) return -1;
 
-            if (!codec)
+            if (!over)
             {
-                postings = legacy;
-                return legacy!.Length;
+                postings = acc!;
+                return acc!.Length;
             }
 
-            // int.MaxValue is "whatever it holds" (ScanBucket), not a number to compare a sum with.
-            if (decodeAtMost != int.MaxValue && counted > decodeAtMost)
-            {
-                // Several entries (spellings of the value that differ only in case) are a union,
-                // which has no single place to be decoded from: the caller walks again for it.
-                if (matches == 1) where = first;
-                return (int)Math.Min(counted, int.MaxValue);
-            }
-
-            postings = matches == 1
-                ? DecodeCodec(data.Slice(first.Offset, first.Length))
-                : UnionOfMatches(data, runs, form, formAscii, scratch);
-            return postings.Length;
+            // Counted, not decoded. One entry is one list, which a caller decodes later from its
+            // own bytes; several (spellings of the value that differ only in case) are a union,
+            // which has no single place to be decoded from: the caller walks again for it.
+            if (matches == 1) where = first;
+            return (int)Math.Min(counted, int.MaxValue);
         }
         finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
-    }
-
-    /// <summary>
-    /// The second pass of <see cref="ProbeBucket"/> for the rare bucket that is several entries:
-    /// their lists decoded and unioned, in section order.
-    /// </summary>
-    private static int[] UnionOfMatches(ReadOnlySpan<byte> data, PropertyRun[] runs, string form,
-                                        bool formAscii, Span<char> scratch)
-    {
-        int  minLen = form.Length;
-        long maxLen = 3L * form.Length;
-
-        int[]? acc = null;
-        for (int r = 0; r < runs.Length; r++)
-        {
-            int pos = runs[r].Offset;
-            for (int v = 0; v < runs[r].ValueCount; v++)
-            {
-                int valLen = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]); pos += 2;
-                var value  = data.Slice(pos, valLen);                              pos += valLen;
-                int bmLen  = (int)BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-                var bm     = data.Slice(pos, bmLen);                               pos += bmLen;
-
-                if (valLen < minLen || valLen > maxLen) continue;
-                if (!ValueEquals(value, form, formAscii, scratch)) continue;
-
-                var decoded = DecodeCodec(bm);
-                acc = acc is null ? decoded : UnionAscending(acc, decoded);
-            }
-        }
-        return acc ?? [];
     }
 
     /// <summary>
