@@ -421,6 +421,7 @@ public static class FilterEvaluator
         BuiltinField.ExceptionStack        => ExceptionField(ev, ExceptionInfo.Field.StackTrace),
         BuiltinField.InnerExceptionType    => ExceptionField(ev, ExceptionInfo.Field.InnerType),
         BuiltinField.InnerExceptionMessage => ExceptionField(ev, ExceptionInfo.Field.InnerMessage),
+        BuiltinField.ExceptionExists       => ev.HasException ? BoxedTrue : BoxedFalse,
         BuiltinField.Timestamp             => ev.Timestamp.ToString("O"),
         BuiltinField.TraceId               => TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
         BuiltinField.SpanId                => TraceIdHelper.FormatSpanId(ev.SpanId),
@@ -428,6 +429,15 @@ public static class FilterEvaluator
         BuiltinField.ServiceName           => ev.ServiceName,
         _                                  => null,
     };
+
+    /// <summary>
+    /// The two values of <c>@x.exists</c>, boxed once for the process. The field is read per
+    /// candidate event and this road hands values back as <c>object?</c>, so boxing the answer
+    /// where it is read would allocate on every row a <c>@x.exists = true</c> scan touches.
+    /// The answer itself is <see cref="LogEvent.HasException"/>: the payload's lead byte, with
+    /// nothing decoded, and the same reading <c>has(@x)</c> takes in <see cref="HasProperty"/>.
+    /// </summary>
+    private static readonly object BoxedTrue = true, BoxedFalse = false;
 
     /// <summary>
     /// One field of the event's exception — read out of the bytes wherever the event carries them

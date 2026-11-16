@@ -120,6 +120,33 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void ServiceNameDotted()         => AssertIndexPath("service.name = 'Auth.API'", 9002);
     [Fact] public void ServiceNamePascal()         => AssertIndexPath("ServiceName = 'Auth.API'", 9002);
 
+    // ── Marker axis: a bucket that exists and still must not be asked ─────────
+    // The builder files `@x.exists` = "true" for an event with an exception and nothing for
+    // one without, so the bucket has no entry `@x.exists = false` could find: hinted, that
+    // predicate meets "known bucket, no such value" and the segment — which holds 9002 — is
+    // dropped. The field is therefore not hinted at any spelling, and both answers below come
+    // from the scan. (9001 and 9003 carry an exception; ExceptionExistsFieldTests has the rows
+    // the bucket gets wrong for `= true` as well.)
+
+    [Fact] public void ExceptionExistsTrue()       => AssertIndexPath("@x.exists = true", 9001, 9003);
+    [Fact] public void ExceptionExistsFalse()      => AssertIndexPath("@x.exists = false", 9002);
+    [Fact] public void ExceptionExistsNotTrue()    => AssertIndexPath("@x.exists != true", 9002);
+    [Fact] public void ExceptionExistsQuoted()     => AssertIndexPath("@x.exists = 'true'", 9001, 9003);
+    [Fact] public void ExceptionExistsInFalse()    => AssertIndexPath("@x.exists in [false]", 9002);
+    [Fact] public void ExceptionExistsBracketed()  => AssertIndexPath("['@x.exists'] = false", 9002);
+    [Fact] public void ExceptionExistsPascal()     => AssertIndexPath("Exception.Exists = false", 9002);
+    [Fact] public void HasExceptionCall()          => AssertIndexPath("has(@x)", 9001, 9003);
+    [Fact] public void NotHasExceptionCall()       => AssertIndexPath("not has(@x)", 9002);
+
+    /// <summary>The example in docs/FILTER_EXPRESSIONS.md: the other conjunct still narrows.</summary>
+    [Fact]
+    public void ExceptionExistsBesideAnIndexedConjunct() =>
+        AssertIndexPath($"@x.exists = true and @x.inner.type = '{SocketType}'", 9001);
+
+    [Fact]
+    public void ExceptionExistsFalseBesideAnIndexedConjunct() =>
+        AssertIndexPath("@x.exists = false and Region = 'ae-auh'", 9002);
+
     // ── Coverage axis: fields no inverted bucket holds ────────────────────────
     // The hint must be suppressed entirely. A hint here is unanswerable, and the index
     // answered "no matching events", which dropped the segment.
