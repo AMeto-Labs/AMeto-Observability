@@ -90,8 +90,11 @@ public sealed class SegmentIndexReaderFactory
     /// <summary>
     /// One query's view of one group: the cached memo when <paramref name="cache"/> is enabled,
     /// answering through <paramref name="segment"/>, which the query keeps open. See
-    /// <see cref="SegmentIndexView"/>.
+    /// <see cref="SegmentIndexView"/>, and <see cref="SegmentIndexView.Open"/> for
+    /// <paramref name="carried"/> — what a query without a cache brings back to its second view
+    /// of a group.
     /// </summary>
-    public SegmentIndexView OpenGroup(SegmentIndexCache? cache, string path, int group, SegmentReader segment)
-        => SegmentIndexView.Open(cache, path, group, segment);
+    public SegmentIndexView OpenGroup(
+        SegmentIndexCache? cache, string path, int group, SegmentReader segment, SegmentIndexReader? carried = null)
+        => SegmentIndexView.Open(cache, path, group, segment, carried);
 }

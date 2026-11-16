@@ -364,6 +364,14 @@ public sealed class LazyIndexParityTests
         }
         byte[] section = b.Serialise();
 
+        // Asked of another reader first: the measured call must not also be the one that
+        // compiles the path. A first call takes milliseconds, long enough for the rest of the
+        // process to be felt in the window — when counting a LONG list was first done inside
+        // it, one run in twelve had 6-8 KB charged to this thread that the count never asked
+        // for (at whichever step it happened to be on, with no collection in between).
+        using (var warm = SegmentIndexReader.Load(section, [], []))
+            Assert.Equal(Listed, warm.CountAtMost("Provider", "Visa"));
+
         using var lazy = SegmentIndexReader.Load(section, [], []);
         Assert.Null(lazy.CountAtMost("NoSuchProperty", "x"));        // the catalog is read here, once
         long kept = lazy.ApproxManagedBytes;

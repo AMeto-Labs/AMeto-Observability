@@ -33,25 +33,29 @@ namespace Ameto.Perf;
 /// <code>
 ///   rows with an  |  page of 50                        |  full read of all 80 000
 ///   exception     |  plain scan   has(@x)    cached    |  plain scan   has(@x), cached
-///      100 %      |     134         186        170     |   120 256       120 214
-///       94 %      |      89         146        124     |   115 121       114 769
-///       93 %      |     149        1368       1055     |   112 795       112 669
-///       50 %      |     147         793        621     |    67 518        61 138
+///      100 %      |     106         161        144     |   120 594       120 601
+///       94 %      |     104         157        140     |   114 388       114 390
+///       93 %      |      93         180        127     |   113 352       112 306
+///       50 %      |     163         205        168     |    67 822        60 330
 /// </code>
-/// <para>With the list always built, the page at 95 rows in a hundred cost 1.0 MB with the cache
-/// and 1.3 MB without. The full read is indifferent at the line — 93 and 94 differ from the plain
-/// scan by less than the runs differ from each other — and by one row in two the list is worth
-/// a tenth of the read. A full read's uncached column is left out of this table, though the
-/// probe prints it: an executor with no cache reads each group's inverted section again for
-/// every query (186 KB a group here, into a 256 KB buffer: up to 2 MB a query), whatever the
-/// marker then says, and on a full read that shows as a difference from the plain scan that
-/// is not the list's.</para>
+/// <para>The two rows BELOW the line are what changed since the line was drawn. There the list
+/// is worth having and is built — and it used to be built in every group of the page's batch:
+/// 1368 KB and 1055 KB at 93 rows in a hundred, 793 and 621 at one in two. A list is now built
+/// for the group the scan reaches and for no other (<c>FirstPageIndexCostProbe</c> is where
+/// that is measured and bounded, for every kind of equality), so a page below the line costs
+/// what a page above it does and the line no longer decides anything a page can feel.</para>
+///
+/// <para>What it still decides is a full read, and by little: just under the line the list
+/// saves the read the rows it leaves out, under one per cent of it (93 %: 112 306 against
+/// 113 352 scanned); just over, the read costs what the plain scan costs. By one row in two
+/// the list is worth a tenth of the read. A full read's uncached column is left out of this
+/// table, though the probe prints it: an executor with no cache reads each group's inverted
+/// section again for every query (195 KB a group here, into a 256 KB buffer: up to 2 MB a
+/// query), whatever the marker then says, and on a full read that shows as a difference from
+/// the plain scan that is not the list's.</para>
 ///
 /// <para>WHAT IS ASSERTED: that a page over groups above the line pays for no list, with or
-/// without the index cache. Time is printed, never asserted. What is NOT claimed: below the line
-/// the list is built, and a first page pays for it in every group of the batch, exactly as a
-/// page of any other indexed equality does — the 93 % and 50 % rows are printed to show that
-/// cost, not to bound it.</para>
+/// without the index cache. Time is printed, never asserted.</para>
 /// </summary>
 public sealed class ExceptionPresencePageProbe(ITestOutputHelper output) : IAsyncLifetime
 {
@@ -64,10 +68,11 @@ public sealed class ExceptionPresencePageProbe(ITestOutputHelper output) : IAsyn
     private const string Scanned        = "not not has(@x)";
 
     /// <summary>
-    /// What naming every row of the store costs a query at its cheapest: twelve bytes a row —
-    /// the copy the index hands out, the list the groups are gathered in and the array the
-    /// reader walks, four bytes each. A reader without the cache decodes the list first, which
-    /// makes it sixteen.
+    /// What naming every row of the store cost a query at its cheapest when the marker's list
+    /// was built in every group of a batch: twelve bytes a row — the copy the index handed out,
+    /// the list the groups were gathered in and the array the reader walked, four bytes each; a
+    /// reader without the cache decoded the list first, which made it sixteen. The yardstick
+    /// the assertion below is cut from, kept at what it measured.
     /// </summary>
     private const long CheapestListBytes = (long)Rows * 12;
 

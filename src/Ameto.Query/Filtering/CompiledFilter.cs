@@ -16,7 +16,10 @@ public sealed class CompiledFilter : IPreparedFilter
     // Pre-computed at compile time so QueryExecutor pays zero allocation per query.
     private readonly IReadOnlyList<(string property, string text)>    _trigramHints;
     private readonly IReadOnlyList<(string property, object? value)>  _invertedHints;
-    private readonly IReadOnlyList<(string property, object? value)>  _invertedHintsBesideExceptionPresence;
+
+    // The inverted hints with some of them left out, by which: worked out the first time a
+    // narrowing asks for that subset and kept, because it asks once per index group.
+    private System.Collections.Concurrent.ConcurrentDictionary<ulong, IReadOnlyList<(string property, object? value)>>? _hintsWithout;
 
     // The single bloom/MightContain hint, also resolved once at compile time — the
     // prefilter asks for it inside a per-segment parallel loop.
@@ -33,7 +36,6 @@ public sealed class CompiledFilter : IPreparedFilter
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
-        _invertedHintsBesideExceptionPresence = BesideExceptionPresence(_invertedHints);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
         _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
@@ -460,6 +462,53 @@ public sealed class CompiledFilter : IPreparedFilter
     /// </summary>
     public IReadOnlyList<(string property, object? value)> GetInvertedHints() => _invertedHints;
 
+    /// <summary>
+    /// <see cref="GetInvertedHints"/> without the hints whose positions are set in
+    /// <paramref name="skip"/> — bit <c>i</c> for the hint at index <c>i</c> — in their order; the
+    /// same list when none is.
+    ///
+    /// <para>For the narrowing, which counts every hint's posting list before it builds one and
+    /// leaves out the hints whose lists would name nearly the whole of the group in hand
+    /// (<c>QueryExecutor.Narrow</c>): the rest then narrow without them. Which hints those are
+    /// differs from one index group to the next — every row of an Error segment satisfies
+    /// <c>@l = 'Error'</c>, and no row of a Warning one does — so the subset cannot be decided
+    /// when the filter is compiled, and is asked for per group, on the path where a list built
+    /// per call would be garbage per group. Each subset is therefore built once and kept: a
+    /// filter meets a handful of them, however many groups it is asked about.</para>
+    ///
+    /// <para>Positions past the sixty-fourth cannot be named in the mask and are always kept —
+    /// their lists are then built and intersected, which is correct and merely not spared.</para>
+    /// </summary>
+    public IReadOnlyList<(string property, object? value)> GetInvertedHintsWithout(ulong skip)
+    {
+        if (skip == 0) return _invertedHints;
+
+        var kept = _hintsWithout;
+        if (kept is null)
+        {
+            Interlocked.CompareExchange(ref _hintsWithout, new(), null);
+            kept = _hintsWithout!;
+        }
+        if (kept.TryGetValue(skip, out var known)) return known;
+
+        // A filter of k hints has at most 2^k subsets and meets few of them; the bound is for
+        // the filter with dozens of conjuncts over groups that each leave out a different set.
+        var rest = Without(_invertedHints, skip);
+        return kept.Count < MaxKeptHintSubsets ? kept.GetOrAdd(skip, rest) : rest;
+    }
+
+    /// <summary>Subsets of the inverted hints one filter keeps (<see cref="GetInvertedHintsWithout"/>).</summary>
+    private const int MaxKeptHintSubsets = 64;
+
+    private static IReadOnlyList<(string, object?)> Without(
+        IReadOnlyList<(string property, object? value)> hints, ulong skip)
+    {
+        var rest = new List<(string, object?)>(hints.Count);
+        for (int i = 0; i < hints.Count; i++)
+            if (i >= 64 || (skip & (1UL << i)) == 0) rest.Add(hints[i]);
+        return rest.Count == 0 ? Array.Empty<(string, object?)>() : rest;
+    }
+
     private static IReadOnlyList<(string, object?)> BuildInvertedHints(FilterNode root)
     {
         var list = new List<(string, object?)>(4);
@@ -520,58 +569,6 @@ public sealed class CompiledFilter : IPreparedFilter
     /// absence drops the group; an older group says "no information" and is scanned.</para>
     /// </summary>
     internal static readonly (string Property, object? Value) ExceptionPresentHint = (ClefFields.ExceptionExists, "true");
-
-    /// <summary>
-    /// True when <see cref="ExceptionPresentHint"/> is among <see cref="GetInvertedHints"/>: the
-    /// filter cannot match an event that carries no exception.
-    ///
-    /// <para>The narrowing treats that one hint apart from the rest
-    /// (<c>QueryExecutor.TryNarrowWithIndex</c>): its posting list is counted before it is
-    /// built, and where it names nearly the whole of a group it is not built at all — the other
-    /// hints then narrow without it (<see cref="GetInvertedHintsBesideExceptionPresence"/>).
-    /// Both are resolved here, once per filter, because the narrowing asks once per group.</para>
-    /// </summary>
-    public bool HintsExceptionPresence => !ReferenceEquals(_invertedHintsBesideExceptionPresence, _invertedHints);
-
-    /// <summary>
-    /// <see cref="GetInvertedHints"/> without the exception marker's hint; the same list when
-    /// that hint is not in it.
-    /// </summary>
-    public IReadOnlyList<(string property, object? value)> GetInvertedHintsBesideExceptionPresence() =>
-        _invertedHintsBesideExceptionPresence;
-
-    private static IReadOnlyList<(string, object?)> BesideExceptionPresence(
-        IReadOnlyList<(string property, object? value)> hints)
-    {
-        List<(string, object?)>? rest = null;
-        for (int i = 0; i < hints.Count; i++)
-        {
-            if (IsExceptionPresentHint(hints[i]))
-            {
-                if (rest is null)
-                {
-                    rest = new List<(string, object?)>(hints.Count);
-                    for (int j = 0; j < i; j++) rest.Add(hints[j]);
-                }
-            }
-            else rest?.Add(hints[i]);
-        }
-        if (rest is null) return hints;
-        return rest.Count == 0 ? Array.Empty<(string, object?)>() : rest;
-    }
-
-    /// <summary>
-    /// The hint itself, key AND value — not merely a hint under the marker's name. Today no other
-    /// is ever filed there (the field of that name has no value bucket; see
-    /// <see cref="CollectInvertedHints"/>), but <see cref="HintsExceptionPresence"/> is what lets
-    /// the narrowing DROP a group whose marker lists no row, and that is only right for a filter
-    /// that cannot match without an exception. A hint for the marker's other answer, should one
-    /// ever be added, must not be taken for this one.
-    /// </summary>
-    private static bool IsExceptionPresentHint((string property, object? value) hint) =>
-        string.Equals(hint.property, ExceptionPresentHint.Property, StringComparison.Ordinal) &&
-        hint.value is string text &&
-        string.Equals(text, (string)ExceptionPresentHint.Value!, StringComparison.Ordinal);
 
     /// <summary>
     /// True when <paramref name="node"/> matches an event if and only if the event carries an

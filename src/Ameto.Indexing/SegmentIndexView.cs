@@ -61,7 +61,7 @@ public readonly record struct IndexGroupFingerprint(
 /// </summary>
 public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisposable
 {
-    private const int InvertedRead = 1, TrigramRead = 2, BloomRead = 4;
+    private const int InvertedRead = 1, TrigramRead = 2, BloomRead = 4, SliceRead = 8;
 
     private readonly SegmentIndexReader      _index;
     private readonly SegmentIndexCache.Lease _lease;
@@ -72,7 +72,7 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
     private readonly int                  _group;
     private readonly ReadOnlyMemory<byte> _heldInverted, _heldTrigram, _heldBloom;
 
-    private PooledSection       _inverted, _trigram;
+    private PooledSection       _inverted, _trigram, _slice;
     private SegmentBloomFilter? _bloom;
     private int                 _read;
     private bool                _disposed;
@@ -97,16 +97,27 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
     /// section it needs from <paramref name="segment"/> (which the caller keeps open for longer
     /// than this view). With an enabled cache the memo is the cached one — created empty if the
     /// group has none — and every query that opens the group shares what it learns; without one,
-    /// the memo lives and dies with this view.
+    /// the memo lives and dies with this view, unless the caller carries it.
+    ///
+    /// <para><paramref name="carried"/> is what a caller WITHOUT a cache hands back when it opens
+    /// the same group a second time in one query: the memo of its first view
+    /// (<see cref="UncachedMemo"/>). A query asks a group twice when it leaves a long posting
+    /// list unbuilt until its read reaches the group; the first asking has already walked the
+    /// section — where each property's entries lie, how long the list is and where — and with
+    /// nothing to carry that, the second would walk it all again to decode one list. Ignored when
+    /// a cache is in use: the cache's memo is the one that learned it.</para>
     /// </summary>
-    public static SegmentIndexView Open(SegmentIndexCache? cache, string path, int group, SegmentReader segment)
+    public static SegmentIndexView Open(
+        SegmentIndexCache? cache, string path, int group, SegmentReader segment, SegmentIndexReader? carried = null)
     {
         if (cache is { Enabled: true })
         {
             var lease = cache.AcquireOrAdd(path, group, IndexGroupFingerprint.Of(segment, group));
             return new SegmentIndexView(lease.Index, lease, leased: true, segment, group);
         }
-        return new SegmentIndexView(SegmentIndexReader.CreateMemo(), default, leased: false, segment, group);
+        if (carried is { OwnsSections: true })
+            throw new ArgumentException("A carried index must be a memo: a reader that owns its sections answers by itself.", nameof(carried));
+        return new SegmentIndexView(carried ?? SegmentIndexReader.CreateMemo(), default, leased: false, segment, group);
     }
 
     /// <summary>A view over sections already in hand — for tests, which need no segment file to
@@ -128,6 +139,14 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
 
     /// <summary>The memo this view answers through.</summary>
     internal SegmentIndexReader Index => _index;
+
+    /// <summary>
+    /// The memo this view answers through when NO CACHE keeps it, for a caller that will open
+    /// the same group again before its query ends (see <see cref="Open"/>); null when the cache
+    /// holds the memo, which then needs no carrying. The memo outlives the view: it owns nothing
+    /// that <see cref="Dispose"/> returns.
+    /// </summary>
+    public SegmentIndexReader? UncachedMemo => _leased ? null : _index;
 
     /// <summary>True once this view has had to read any of the group's sections: a miss.</summary>
     public bool ReadSections => _read != 0;
@@ -174,6 +193,15 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
     }
 
     /// <inheritdoc/>
+    /// <remarks>The memory is the memo's, not the view's: it outlives <see cref="Dispose"/>.</remarks>
+    public bool TryLookupIntersect(
+        IReadOnlyList<(string property, object? value)> predicates, out ReadOnlyMemory<uint> offsets)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _index.TryLookupIntersect(predicates, this, out offsets);
+    }
+
+    /// <inheritdoc/>
     public int? CountAtMost(string propertyName, object? value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -191,6 +219,26 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
             _read    |= InvertedRead;
         }
         return _inverted.Span;
+    }
+
+    /// <summary>
+    /// One posting list's bytes, read by themselves when the view has not already read the whole
+    /// section for a question of its own. A read of the file either way: the group was a miss.
+    /// </summary>
+    ReadOnlySpan<byte> IIndexSectionSource.InvertedSlice(int offset, int length)
+    {
+        if (_segment is null) { _read |= InvertedRead; return _heldInverted.Span.Slice(offset, length); }
+        if ((_read & InvertedRead) != 0) return _inverted.Span.Slice(offset, length);
+
+        // One list at a time: the last one was decoded before this one was asked for. Emptied
+        // before it is returned, so a rent that throws cannot leave a buffer to be returned twice.
+        var last = _slice;
+        _slice   = default;
+        last.Dispose();
+
+        _slice = _segment.RentInvertedIndexBytes(_group, offset, length);
+        _read |= SliceRead;
+        return _slice.Span;
     }
 
     ReadOnlySpan<byte> IIndexSectionSource.TrigramSection()
@@ -232,6 +280,7 @@ public sealed class SegmentIndexView : ISegmentIndex, IIndexSectionSource, IDisp
         {
             if ((_read & InvertedRead) != 0) _inverted.Dispose();
             if ((_read & TrigramRead)  != 0) _trigram.Dispose();
+            if ((_read & SliceRead)    != 0) _slice.Dispose();
         }
         if (_leased) _lease.Complete(readSections: _read != 0);
     }

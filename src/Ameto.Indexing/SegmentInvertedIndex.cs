@@ -477,7 +477,14 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// (merging against the running result), into a fresh array. The lists themselves are never
     /// written — a reader's memo hands out the arrays it keeps.
     /// </summary>
-    internal static uint[] IntersectLists(int[][] lists, int used)
+    internal static uint[] IntersectLists(int[][] lists, int used) => ToUInt(IntersectAscending(lists, used));
+
+    /// <summary>
+    /// <see cref="IntersectLists"/> before its copy: the intersection as ascending ordinals. One
+    /// of the lists themselves when there is only one, or when the shortest is empty — so the
+    /// result may be an array the caller's memo keeps, and is read-only like them.
+    /// </summary>
+    internal static int[] IntersectAscending(int[][] lists, int used)
     {
         if (used < lists.Length) Array.Resize(ref lists, used);
 
@@ -486,8 +493,21 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         for (int i = 1; i < lists.Length && acc.Length > 0; i++)
             acc = IntersectSorted(acc, lists[i]);
 
-        return ToUInt(acc);
+        return acc;
     }
+
+    /// <summary>
+    /// Ascending ordinals as the unsigned offsets a reader walks, WITHOUT the copy
+    /// <see cref="ToUInt"/> makes: the same array, read as <c>uint[]</c>. The runtime lets an
+    /// <c>int[]</c> be cast to a <c>uint[]</c> (the two differ only in how a value is read, and
+    /// an ordinal is never negative), and read-only memory over the result is exactly that array.
+    ///
+    /// <para>Read-only is what makes it safe to hand out an array a memo keeps: the list is
+    /// shared by every query that asks for it, and four bytes a row were being spent on a
+    /// private copy for each of them only so that none could write to it. A type that cannot be
+    /// written through says the same thing for nothing.</para>
+    /// </summary>
+    internal static ReadOnlyMemory<uint> AsOffsets(int[] ordinals) => (uint[])(object)ordinals;
 
     /// <summary>
     /// Approximate managed bytes this DESERIALISED index retains: postings expanded to
@@ -1104,7 +1124,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// </summary>
     internal static int[]? ScanBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form)
     {
-        WalkBucket(data, codec, runs, form, decode: true, out int[]? postings);
+        ProbeBucket(data, codec, runs, form, decodeAtMost: int.MaxValue, out int[]? postings, out _);
         return postings;
     }
 
@@ -1122,16 +1142,48 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// writes is not.</para>
     /// </summary>
     internal static int CountBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form) =>
-        WalkBucket(data, codec, runs, form, decode: false, out _);
+        ProbeBucket(data, codec, runs, form, decodeAtMost: -1, out _, out _);
 
     /// <summary>
-    /// The one walk behind <see cref="ScanBucket"/> and <see cref="CountBucket"/>, so that which
-    /// entries count as "this value" is decided in a single place. Returns the postings counted —
-    /// the union's length when <paramref name="decode"/> is set, the sum of the matching lists'
-    /// counts when it is not — or −1 when no entry matched.
+    /// Where one posting list lies in its section: the bytes a decode needs and no others. The
+    /// default value is "no single list" — nothing matched, the list is already decoded, or
+    /// several entries matched — which no real list can be taken for: a list is never empty of
+    /// bytes, it opens with its count.
     /// </summary>
-    private static int WalkBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form,
-                                  bool decode, out int[]? postings)
+    internal readonly struct ListSpan(int offset, int length)
+    {
+        public readonly int Offset = offset;
+        public readonly int Length = length;
+
+        public bool IsOne => Length > 0;
+    }
+
+    /// <summary>
+    /// ONE WALK of a property's entries that answers both questions a narrowing has about a
+    /// bucket: how many postings it holds, and — when that is at most
+    /// <paramref name="decodeAtMost"/> — what they are. Returns the count (the union's length
+    /// when the list was decoded, the sum of the matching lists' leading counts when it was not)
+    /// or −1 when no entry matches; <paramref name="postings"/> is the decoded union or null.
+    ///
+    /// <para><b>Why one walk and not a count followed by a scan.</b> The entries of a property
+    /// are found by walking them, and a high-cardinality property — a request id — has one per
+    /// row. A narrowing that counted every bucket before listing it would walk such a property
+    /// twice for every lookup of one id, on the path that is all walk. So the walk that finds
+    /// the entry decodes it there and then when it is short, which a selective lookup always is;
+    /// and when it is long, the list is the one a caller counts in order NOT to build, and what
+    /// it gets is the count and <paramref name="where"/> — the list's own bytes, so that the
+    /// caller who does want it later decodes it without walking again
+    /// (<see cref="DecodeAt"/>).</para>
+    ///
+    /// <para><see cref="ScanBucket"/> and <see cref="CountBucket"/> are this walk at its two
+    /// ends, so which entries count as "this value" is decided in a single place.</para>
+    ///
+    /// <para>A LEGACY section's bitmaps carry no leading count: each is decoded to be counted,
+    /// and what was decoded is handed back whatever the limit — there is nothing left to
+    /// save.</para>
+    /// </summary>
+    internal static int ProbeBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form,
+                                    int decodeAtMost, out int[]? postings, out ListSpan where)
     {
         int  minLen    = form.Length;
         long maxLen    = 3L * form.Length;
@@ -1141,9 +1193,11 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         Span<char> scratch = rented ?? stackalloc char[256];
         try
         {
-            int[]? acc     = null;
-            long   counted = 0;
-            bool   matched = false;
+            // First pass: which entries match, and what their lists say they hold.
+            int[]?   legacy  = null;
+            long     counted = 0;
+            int      matches = 0;
+            ListSpan first   = default;
             for (int r = 0; r < runs.Length; r++)
             {
                 int pos = runs[r].Offset;
@@ -1157,23 +1211,83 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                     if (valLen < minLen || valLen > maxLen) continue;
                     if (!ValueEquals(value, form, formAscii, scratch)) continue;
 
-                    matched = true;
-                    if (!decode)
+                    if (++matches == 1) first = new ListSpan(pos - bmLen, bmLen);
+                    if (codec)
                     {
-                        counted += codec ? SegmentBitmapCodec.Count(bm) : DecodeRoaring(bm).Length;
-                        continue;
+                        counted += SegmentBitmapCodec.Count(bm);
                     }
-
-                    var decoded = codec ? DecodeCodec(bm) : DecodeRoaring(bm);
-                    acc = acc is null ? decoded : UnionAscending(acc, decoded);
+                    else
+                    {
+                        var decoded = DecodeRoaring(bm);
+                        legacy = legacy is null ? decoded : UnionAscending(legacy, decoded);
+                    }
                 }
             }
-            postings = acc;
-            if (!matched) return -1;
-            return decode ? acc!.Length : (int)Math.Min(counted, int.MaxValue);
+
+            postings = null;
+            where    = default;
+            if (matches == 0) return -1;
+
+            if (!codec)
+            {
+                postings = legacy;
+                return legacy!.Length;
+            }
+
+            // int.MaxValue is "whatever it holds" (ScanBucket), not a number to compare a sum with.
+            if (decodeAtMost != int.MaxValue && counted > decodeAtMost)
+            {
+                // Several entries (spellings of the value that differ only in case) are a union,
+                // which has no single place to be decoded from: the caller walks again for it.
+                if (matches == 1) where = first;
+                return (int)Math.Min(counted, int.MaxValue);
+            }
+
+            postings = matches == 1
+                ? DecodeCodec(data.Slice(first.Offset, first.Length))
+                : UnionOfMatches(data, runs, form, formAscii, scratch);
+            return postings.Length;
         }
         finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
     }
+
+    /// <summary>
+    /// The second pass of <see cref="ProbeBucket"/> for the rare bucket that is several entries:
+    /// their lists decoded and unioned, in section order.
+    /// </summary>
+    private static int[] UnionOfMatches(ReadOnlySpan<byte> data, PropertyRun[] runs, string form,
+                                        bool formAscii, Span<char> scratch)
+    {
+        int  minLen = form.Length;
+        long maxLen = 3L * form.Length;
+
+        int[]? acc = null;
+        for (int r = 0; r < runs.Length; r++)
+        {
+            int pos = runs[r].Offset;
+            for (int v = 0; v < runs[r].ValueCount; v++)
+            {
+                int valLen = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]); pos += 2;
+                var value  = data.Slice(pos, valLen);                              pos += valLen;
+                int bmLen  = (int)BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
+                var bm     = data.Slice(pos, bmLen);                               pos += bmLen;
+
+                if (valLen < minLen || valLen > maxLen) continue;
+                if (!ValueEquals(value, form, formAscii, scratch)) continue;
+
+                var decoded = DecodeCodec(bm);
+                acc = acc is null ? decoded : UnionAscending(acc, decoded);
+            }
+        }
+        return acc ?? [];
+    }
+
+    /// <summary>
+    /// The posting list <see cref="ProbeBucket"/> located and did not decode, from its own bytes
+    /// (<see cref="ListSpan"/>) — the current layout only, which is the only one a list is ever
+    /// located in.
+    /// </summary>
+    internal static int[] DecodeAt(ReadOnlySpan<byte> list) => DecodeCodec(list);
 
     /// <summary><c>Encoding.UTF8.GetString(utf8)</c> equals <paramref name="form"/>
     /// OrdinalIgnoreCase, without the string.</summary>

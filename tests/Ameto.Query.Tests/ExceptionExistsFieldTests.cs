@@ -488,7 +488,9 @@ public sealed class ExceptionExistsFieldTests
     /// would have left out arrive with the rest and are the scan's to reject.
     ///
     /// <para>What it replaced decoded the list, copied it and kept it, in every group of every
-    /// segment a first page touched, to find that it named the group.</para>
+    /// segment a first page touched, to find that it named the group. The marker was the first
+    /// hint to be counted this way; every equality is now, the level beside it included
+    /// (<c>FirstPageNarrowingTests</c> pins the rule for the rest).</para>
     /// </summary>
     [Fact]
     public void A_marker_that_names_nearly_all_of_its_group_is_counted_and_never_listed()
@@ -510,7 +512,7 @@ public sealed class ExceptionExistsFieldTests
         Assert.False(whole);
         Assert.NotNull(candidates);
         Assert.Equal(new uint[] { 8, 9, 10, 11 }, candidates);      // row 9 has none: the scan rejects it
-        Assert.Equal([ClefFields.ExceptionExists], asked.Counted);
+        Assert.Equal([ClefFields.ExceptionExists, "Shard"], asked.Counted);
         Assert.Equal(["Shard"], asked.Listed);
 
         // Four rows in thirty-two without one is past the line: the list is worth having, and is
@@ -529,58 +531,59 @@ public sealed class ExceptionExistsFieldTests
         Assert.Equal(new uint[] { 8, 10, 11 }, candidates);         // row 9 has none, and the list says so
         Assert.Equal([ClefFields.ExceptionExists + " + Shard"], asked.Listed);
 
-        // A filter that does not ask for an exception counts nothing: the question is the marker's alone.
-        asked = new RecordingIndex(dense);
-        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("Shard = 'a'"), asked, null, Rows, out candidates, out _));
-        Assert.Equal(new uint[] { 8, 9, 10, 11 }, candidates!);
-        Assert.Empty(asked.Counted);
-
-        // Any other key has to be listed to be recognised — and once it is, a list as long as
-        // the group is the group, here every row being an Error: carried whole all the same.
-        asked = new RecordingIndex(dense);
-        Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("@l = 'Error'"), asked, null, Rows, out candidates, out whole));
-        Assert.True(whole);
-        Assert.Null(candidates);
-        Assert.Empty(asked.Counted);
-        Assert.Equal([ClefFields.Level], asked.Listed);
-
-        // Both at once: the marker counted and left out, the level listed and recognised.
+        // The level every row of the group has, beside it: counted like the marker, and like the
+        // marker never listed. It used to be listed in order to be recognised as the group.
         asked = new RecordingIndex(dense);
         Assert.True(QueryExecutor.TryNarrowWithIndex(CompiledFilter.Compile("has(@x) and @l = 'Error'"), asked, null, Rows, out candidates, out whole));
         Assert.True(whole);
         Assert.Null(candidates);
-        Assert.Equal([ClefFields.ExceptionExists], asked.Counted);
-        Assert.Equal([ClefFields.Level], asked.Listed);
+        Assert.Equal([ClefFields.ExceptionExists, ClefFields.Level], asked.Counted);
+        Assert.Empty(asked.Listed);
     }
 
     /// <summary>
-    /// What the narrowing is told about a filter, once, when it is compiled: whether the marker's
-    /// hint is among its inverted hints — only then may a group whose marker lists no row be
-    /// dropped — and which hints stand beside it, in their order, to narrow alone where the
-    /// marker's list is not worth building.
+    /// What the narrowing asks a compiled filter for, per index group: its inverted hints without
+    /// the ones whose lists that group makes not worth building, by position, in their order.
+    /// Asked once per group, so each subset is built the first time and the same list handed
+    /// back after that — and with nothing left out, the filter's own list, uncopied.
     /// </summary>
     [Theory]
-    [InlineData("has(@x)",                                  true,  "")]
-    [InlineData("@x.exists = true",                         true,  "")]
-    [InlineData("has(@x) and @x.exists != false",           true,  "")]
-    [InlineData("has(@x) and Shard = 'a'",                  true,  "Shard")]
-    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", true,  "Shard,@l")]
-    [InlineData("Shard = 'a'",                              false, "Shard")]
-    [InlineData("@x.exists = false and Shard = 'a'",        false, "Shard")]
-    [InlineData("not has(@x)",                              false, "")]
-    [InlineData("has(@x) or Shard = 'a'",                   false, "")]
-    public void The_filter_says_whether_it_asks_for_an_exception_and_what_it_hints_beside(
-        string expression, bool asks, string beside)
+    [InlineData("has(@x)",                                  0b001ul, "")]
+    [InlineData("has(@x) and Shard = 'a'",                  0b001ul, "Shard")]
+    [InlineData("has(@x) and Shard = 'a'",                  0b010ul, "@x.exists")]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b010ul, "Shard,@l")]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b110ul, "Shard")]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b111ul, "")]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", 0b000ul, "Shard,@x.exists,@l")]
+    [InlineData("Shard = 'a'",                              0b110ul, "Shard")]    // positions it does not have
+    [InlineData("not has(@x)",                              0b001ul, "")]
+    public void The_filter_hands_out_its_hints_without_the_ones_a_group_makes_worthless(
+        string expression, ulong skip, string rest)
     {
         var filter = CompiledFilter.Compile(expression);
-        var rest   = filter.GetInvertedHintsBesideExceptionPresence();
+        var first  = filter.GetInvertedHintsWithout(skip);
 
-        Assert.Equal(asks, filter.HintsExceptionPresence);
-        Assert.Equal(asks, filter.GetInvertedHints().Contains(CompiledFilter.ExceptionPresentHint));
-        Assert.Equal(beside, string.Join(",", rest.Select(static hint => hint.property)));
-        Assert.DoesNotContain(CompiledFilter.ExceptionPresentHint, rest);
-        if (!asks) Assert.Same(filter.GetInvertedHints(), rest);     // nothing to leave out, nothing copied
+        Assert.Equal(rest, string.Join(",", first.Select(static hint => hint.property)));
+        Assert.Same(first, filter.GetInvertedHintsWithout(skip));
+        if (skip == 0) Assert.Same(filter.GetInvertedHints(), first);    // nothing to leave out, nothing copied
     }
+
+    /// <summary>
+    /// Which filters carry the marker's hint at all: the ones that cannot match a row without an
+    /// exception. Only for those may a group whose marker lists no row be dropped.
+    /// </summary>
+    [Theory]
+    [InlineData("has(@x)",                                  true)]
+    [InlineData("@x.exists = true",                         true)]
+    [InlineData("has(@x) and @x.exists != false",           true)]
+    [InlineData("has(@x) and Shard = 'a'",                  true)]
+    [InlineData("Shard = 'a' and has(@x) and @l = 'Error'", true)]
+    [InlineData("Shard = 'a'",                              false)]
+    [InlineData("@x.exists = false and Shard = 'a'",        false)]
+    [InlineData("not has(@x)",                              false)]
+    [InlineData("has(@x) or Shard = 'a'",                   false)]
+    public void The_filter_says_whether_it_asks_for_an_exception(string expression, bool asks) =>
+        Assert.Equal(asks, CompiledFilter.Compile(expression).GetInvertedHints().Contains(CompiledFilter.ExceptionPresentHint));
 
     /// <summary>
     /// One index group of <paramref name="rows"/> Error rows, as a query reads it: rows 8 to 11

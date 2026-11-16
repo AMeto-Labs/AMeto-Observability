@@ -302,6 +302,7 @@ public sealed class SegmentReader : ISegmentReader
             // the footer slots v7 repurposes. Everything above the reader then sees a single
             // uniform shape and no version branch survives past this constructor.
             : [new SegmentIndexGroup(0, blockCount, 0, evCount, minTs, maxTs, slot0, slot1, slot2)];
+        GroupsCoverBlocks = CoverBlocks(_groups, blockCount);
 
         // Honest uncompressed size: every block frame starts with a uint32
         // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
@@ -392,6 +393,33 @@ public sealed class SegmentReader : ISegmentReader
     /// </summary>
     public ReadOnlySpan<SegmentIndexGroup> Groups => _groups;
 
+    /// <summary>
+    /// True when the group directory accounts for every block exactly once, in order: group 0
+    /// starts at block 0, each group starts where the one before it ended, and the last ends at
+    /// the last block. Every file this build's writer produces is laid out that way (a group owns
+    /// whole blocks and the next begins on the boundary), and so is the one implicit group of a
+    /// v4-v6 file.
+    ///
+    /// <para>It is what <see cref="ReadGroupsAsync"/> rests on: a read that walks the file group
+    /// by group returns every row only if the groups are the file. A directory that says
+    /// otherwise is not something the writer makes, so nothing is assumed about it — the caller
+    /// reads such a file by its blocks, through <see cref="ReadEventsAsync"/>, as before.</para>
+    /// </summary>
+    public bool GroupsCoverBlocks { get; }
+
+    /// <summary>The rule behind <see cref="GroupsCoverBlocks"/>, apart from any file, so a test can put a directory no writer makes to it.</summary>
+    internal static bool CoverBlocks(ReadOnlySpan<SegmentIndexGroup> groups, int blockCount)
+    {
+        long next = 0;
+        for (int g = 0; g < groups.Length; g++)
+        {
+            // A count read off the file as a uint and held as an int: negative is a torn word.
+            if (groups[g].FirstBlock != next || groups[g].BlockCount < 0) return false;
+            next += groups[g].BlockCount;
+        }
+        return next == blockCount;
+    }
+
     public async IAsyncEnumerable<LogEvent> ReadEventsAsync(
         uint[]? candidateOffsets,
         DateTimeOffset? from,
@@ -402,30 +430,7 @@ public sealed class SegmentReader : ISegmentReader
         long fromTicks = from?.UtcTicks ?? long.MinValue;
         long toTicks   = to?.UtcTicks   ?? long.MaxValue;
 
-        // v5 + index candidates: posting-list offsets are file ordinals, so we can skip
-        // whole blocks with no candidate and, inside a touched block, materialise ONLY the
-        // candidate rows — the dominant query-path saving (no Dictionary/string per
-        // rejected event). Candidates may arrive unsorted (trigram set → array).
-        //
-        // ASCENDING CANDIDATES ARE REQUIRED, not merely tidy. Everything downstream — the
-        // LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
-        // assumes them, so one out-of-order pair makes the cursor step past a candidate and
-        // drop a row the caller's index proved matches. The caller still makes no ordering
-        // promise, so the check stays; what is gone is paying a clone and an O(n log n) sort
-        // to learn what a single pass can prove. QueryExecutor's narrowing now merges sorted
-        // posting lists rather than draining a HashSet, so the ordered case is the norm and
-        // costs one scan; anything else is copied and sorted exactly as before, because the
-        // array belongs to the caller and must not be mutated.
-        uint[]? cands = null;
-        if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
-        {
-            cands = candidateOffsets;
-            if (!IsNonDescending(cands))
-            {
-                cands = (uint[])candidateOffsets.Clone();
-                Array.Sort(cands);
-            }
-        }
+        ReadOnlyMemory<uint>? cands = candidateOffsets is { Length: > 0 } ? InWalkOrder(candidateOffsets) : null;
 
         // One vocabulary table for the whole read — blocks of one segment share their
         // templates and service names, so the table is what makes string allocation
@@ -438,21 +443,7 @@ public sealed class SegmentReader : ISegmentReader
             int idx = reversed ? blockCount - 1 - bi : bi;
             ct.ThrowIfCancellationRequested();
 
-            if (SkipByWindow(idx, fromTicks, toTicks)) continue;
-
-            int candStart = 0, candEnd = 0;
-            if (cands is not null)
-            {
-                uint first = _blockOrdinals![idx];
-                uint next  = idx + 1 < blockCount ? _blockOrdinals[idx + 1] : Info.EventCount;
-                candStart  = LowerBound(cands, first);
-                candEnd    = LowerBound(cands, next);
-                if (candStart == candEnd) continue;   // no candidate rows in this block
-            }
-
-            var events = cands is null
-                ? ReadBlock(_blocks[idx].FileOffset, reversed, dedup)
-                : ReadBlock(_blocks[idx].FileOffset, reversed, dedup, cands, candStart, candEnd, _blockOrdinals![idx]);
+            if (BlockEvents(idx, cands, fromTicks, toTicks, reversed, dedup) is not { } events) continue;
             foreach (var evt in events)
             {
                 long ts = evt.Timestamp.UtcTicks;
@@ -461,6 +452,141 @@ public sealed class SegmentReader : ISegmentReader
             }
         }
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reads the segment ONE INDEX GROUP AT A TIME, asking <paramref name="plan"/> about each
+    /// group when the read gets to it and not before: skip it, read all of it, or read the rows
+    /// it names. Groups come in file order, or in reverse when <paramref name="reversed"/>, and
+    /// the events in the same global (timestamp, id) order <see cref="ReadEventsAsync"/> gives —
+    /// a group is a run of consecutive blocks, so walking groups is walking blocks.
+    ///
+    /// <para><b>Why the plan is asked late.</b> The caller's answer for a group can cost as much
+    /// as a posting list per row of it, and a reader that stops early — a page of fifty rows off
+    /// the newest end of the file — never reaches most groups. Asked up front, the answer for
+    /// every one of them is built to be thrown away; asked here, a group the read does not reach
+    /// costs its plan nothing. The same holds between files: nothing is asked of a segment whose
+    /// read never starts.</para>
+    ///
+    /// <para><b>Why per group and not one list for the file.</b> The index is per group, so its
+    /// answers are: "none of this group", "all of it", "these rows". One candidate list for the
+    /// whole file can carry only the third, so the other two had to be spelled in it — a whole
+    /// group as every ordinal it holds, four bytes a row to say "all" — and one group the index
+    /// knew nothing about sent the entire file to a full scan, its narrowed groups included.</para>
+    ///
+    /// <para>Requires <see cref="GroupsCoverBlocks"/>, without which walking the groups is not
+    /// walking the file. Each group's candidates are ordinals of THAT group, ascending (checked,
+    /// and sorted into a copy when they are not — see <see cref="InWalkOrder"/>); a v4 file,
+    /// which has no ordinals to resolve them by, reads a named group whole, and the caller's own
+    /// per-row checks decide, as they always do.</para>
+    /// </summary>
+    public async IAsyncEnumerable<LogEvent> ReadGroupsAsync(
+        ISegmentGroupPlan plan,
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        bool reversed = false,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        if (!GroupsCoverBlocks)
+            throw new InvalidOperationException(
+                $"The index groups of {Info.FilePath} do not cover its blocks; read it with ReadEventsAsync.");
+
+        long fromTicks = from?.UtcTicks ?? long.MinValue;
+        long toTicks   = to?.UtcTicks   ?? long.MaxValue;
+
+        // One table for the whole read, as in ReadEventsAsync: the groups of a file share a vocabulary.
+        var dedup = new BlockStringDedup();
+
+        int groupCount = _groups.Length;
+        for (int gi = 0; gi < groupCount; gi++)
+        {
+            int g = reversed ? groupCount - 1 - gi : gi;
+            ct.ThrowIfCancellationRequested();
+
+            var read = plan.Read(g);
+            if (read.IsSkip) continue;
+
+            ReadOnlyMemory<uint>? cands = null;
+            if (read.IsNamed)
+            {
+                // A group whose rows are named and that names none has nothing to read. Unlike the
+                // file-wide overload, where an empty list is read as "no list".
+                if (read.Candidates.IsEmpty) continue;
+                cands = InWalkOrder(read.Candidates);
+            }
+
+            int firstBlock = _groups[g].FirstBlock, blocks = _groups[g].BlockCount;
+            for (int bi = 0; bi < blocks; bi++)
+            {
+                int idx = reversed ? firstBlock + blocks - 1 - bi : firstBlock + bi;
+                ct.ThrowIfCancellationRequested();
+
+                if (BlockEvents(idx, cands, fromTicks, toTicks, reversed, dedup) is not { } events) continue;
+                foreach (var evt in events)
+                {
+                    long ts = evt.Timestamp.UtcTicks;
+                    if (ts < fromTicks || ts > toTicks) continue;
+                    yield return evt;
+                }
+            }
+        }
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The candidate list as the block walk needs it, or null when this file cannot use one.
+    ///
+    /// <para>v5 + index candidates: posting-list offsets are file ordinals, so we can skip
+    /// whole blocks with no candidate and, inside a touched block, materialise ONLY the
+    /// candidate rows — the dominant query-path saving (no Dictionary/string per
+    /// rejected event). Candidates may arrive unsorted (trigram set → array).</para>
+    ///
+    /// <para>ASCENDING CANDIDATES ARE REQUIRED, not merely tidy. Everything downstream — the
+    /// LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
+    /// assumes them, so one out-of-order pair makes the cursor step past a candidate and
+    /// drop a row the caller's index proved matches. The caller still makes no ordering
+    /// promise, so the check stays; what is gone is paying a clone and an O(n log n) sort
+    /// to learn what a single pass can prove. QueryExecutor's narrowing now merges sorted
+    /// posting lists rather than draining a HashSet, so the ordered case is the norm and
+    /// costs one scan; anything else is copied and sorted exactly as before, because the
+    /// list belongs to the caller and must not be mutated.</para>
+    ///
+    /// <para>READ-ONLY MEMORY from here to the row walk, and that is the point of the type: a
+    /// list handed to <see cref="ReadGroupsAsync"/> may be the very array an index cache keeps
+    /// for every later query of the same filter — handed over uncopied, so that a page does not
+    /// pay four bytes for each row its group lists. Nothing below can write to it.</para>
+    /// </summary>
+    private ReadOnlyMemory<uint>? InWalkOrder(ReadOnlyMemory<uint> candidateOffsets)
+    {
+        if (_blockOrdinals is null) return null;
+        if (IsNonDescending(candidateOffsets.Span)) return candidateOffsets;
+
+        uint[] sorted = candidateOffsets.ToArray();
+        Array.Sort(sorted);
+        return sorted;
+    }
+
+    /// <summary>
+    /// The events of block <paramref name="idx"/> a read wants — all of them, or the candidate
+    /// rows when <paramref name="cands"/> names any — or null when the zone map or the
+    /// candidates say the block holds none. The one place both reads decide that.
+    /// </summary>
+    private IEnumerable<LogEvent>? BlockEvents(
+        int idx, ReadOnlyMemory<uint>? cands, long fromTicks, long toTicks, bool reversed, BlockStringDedup dedup)
+    {
+        if (SkipByWindow(idx, fromTicks, toTicks)) return null;
+        if (cands is not { } named) return ReadBlock(_blocks[idx].FileOffset, reversed, dedup);
+
+        uint first    = _blockOrdinals![idx];
+        uint next     = idx + 1 < _blocks.Length ? _blockOrdinals[idx + 1] : Info.EventCount;
+        var  all      = named.Span;
+        int candStart = LowerBound(all, first);
+        int candEnd   = LowerBound(all, next);
+        if (candStart == candEnd) return null;   // no candidate rows in this block
+
+        // The block's own candidates, and none of the rest of the list.
+        return ReadBlock(_blocks[idx].FileOffset, reversed, dedup, named.Slice(candStart, candEnd - candStart), first);
     }
 
     /// <summary>
@@ -499,7 +625,7 @@ public sealed class SegmentReader : ISegmentReader
     /// cursor steps past both copies on the next row — and rejecting it would cost a sort for
     /// nothing.
     /// </summary>
-    private static bool IsNonDescending(uint[] a)
+    private static bool IsNonDescending(ReadOnlySpan<uint> a)
     {
         for (int i = 1; i < a.Length; i++)
             if (a[i] < a[i - 1]) return false;
@@ -507,7 +633,7 @@ public sealed class SegmentReader : ISegmentReader
     }
 
     /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>
-    private static int LowerBound(uint[] a, uint key)
+    private static int LowerBound(ReadOnlySpan<uint> a, uint key)
     {
         int lo = 0, hi = a.Length;
         while (lo < hi)
@@ -729,11 +855,11 @@ public sealed class SegmentReader : ISegmentReader
 
     private IEnumerable<LogEvent> ReadBlock(
         long blockOffset, bool reversed, BlockStringDedup? dedup,
-        uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
+        ReadOnlyMemory<uint>? cands = null, uint firstOrdinal = 0)
     {
         // The decode lives in its own method because it reads the compressed bytes straight
         // out of the mapping, and C# forbids unsafe code inside an iterator (CS1629).
-        var events = DecodeBlockAt(blockOffset, dedup, cands, candStart, candEnd, firstOrdinal);
+        var events = DecodeBlockAt(blockOffset, dedup, cands, firstOrdinal);
         if (events is null) yield break;
 
         if (reversed) events.Reverse();
@@ -756,12 +882,12 @@ public sealed class SegmentReader : ISegmentReader
     /// filtering and delivery.</para>
     /// </summary>
     private unsafe List<LogEvent>? DecodeBlockAt(
-        long blockOffset, BlockStringDedup? dedup,
-        uint[]? cands, int candStart, int candEnd, uint firstOrdinal)
+        long blockOffset, BlockStringDedup? dedup, ReadOnlyMemory<uint>? cands, uint firstOrdinal)
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
         ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
+        Interlocked.Increment(ref BlocksDecoded);
 
         byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
         try
@@ -777,8 +903,9 @@ public sealed class SegmentReader : ISegmentReader
                 int decoded = LZ4Codec.Decode(src, rentedUncomp.AsSpan(0, uncompressedSize));
                 if (decoded != uncompressedSize) return null;
 
-                return DecodeColumnarBlock(
-                    rentedUncomp.AsSpan(0, decoded), dedup, cands, candStart, candEnd, firstOrdinal);
+                return cands is { } named
+                    ? DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup, named: true, named.Span, firstOrdinal)
+                    : DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup);
             }
             finally { if (basePtr is not null) handle.ReleasePointer(); }
         }
@@ -786,14 +913,15 @@ public sealed class SegmentReader : ISegmentReader
     }
 
     /// <summary>
-    /// Decodes a columnar block into <see cref="LogEvent"/>s. When <paramref name="cands"/>
-    /// is non-null, only rows whose file ordinal (<paramref name="firstOrdinal"/> + row) is in
-    /// cands[candStart..candEnd) are materialised — rejected rows cost a couple of integer
-    /// comparisons, no Dictionary / string / ExceptionInfo allocation.
+    /// Decodes a columnar block into <see cref="LogEvent"/>s. When <paramref name="named"/>,
+    /// only rows whose file ordinal (<paramref name="firstOrdinal"/> + row) is in
+    /// <paramref name="cands"/> — the block's own candidates, ascending — are materialised:
+    /// rejected rows cost a couple of integer comparisons, no Dictionary / string /
+    /// ExceptionInfo allocation.
     /// </summary>
     private static List<LogEvent> DecodeColumnarBlock(
         ReadOnlySpan<byte> span, BlockStringDedup? dedup = null,
-        uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
+        bool named = false, ReadOnlySpan<uint> cands = default, uint firstOrdinal = 0)
     {
         int    pos        = 0;
         int    eventCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4));   pos += 4;
@@ -836,15 +964,15 @@ public sealed class SegmentReader : ISegmentReader
         var svcOffsets   = colSvc.Length >= offsetsBytes ? colSvc.Slice(0, offsetsBytes) : default;
         var svcPayload   = colSvc.Length >= offsetsBytes ? colSvc.Slice(offsetsBytes) : default;
 
-        var list = new List<LogEvent>(cands is null ? eventCount : candEnd - candStart);
-        int cp = candStart;   // two-pointer walk: rows ascend, cands sorted ascending
+        var list = new List<LogEvent>(named ? cands.Length : eventCount);
+        int cp = 0;           // two-pointer walk: rows ascend, cands sorted ascending
         for (int i = 0; i < eventCount; i++)
         {
-            if (cands is not null)
+            if (named)
             {
                 uint ord = firstOrdinal + (uint)i;
-                while (cp < candEnd && cands[cp] < ord) cp++;
-                if (cp >= candEnd) break;             // no candidates left in this block
+                while (cp < cands.Length && cands[cp] < ord) cp++;
+                if (cp >= cands.Length) break;        // no candidates left in this block
                 if (cands[cp] != ord) continue;       // this row is not a candidate
             }
 
@@ -1174,6 +1302,35 @@ public sealed class SegmentReader : ISegmentReader
     public PooledSection RentTrigramIndexBytes(int group = 0)  => RentSection(_groups[group].TrigramOffset);
     public PooledSection RentBloomFilterBytes(int group = 0)   => RentSection(_groups[group].BloomOffset);
 
+    /// <summary>
+    /// <paramref name="length"/> bytes of group <paramref name="group"/>'s inverted section,
+    /// starting <paramref name="offset"/> bytes into it: ONE posting list, for a caller that
+    /// already knows where it lies.
+    ///
+    /// <para>The whole-section rent above copies every posting list a group has out of the
+    /// mapping — megabytes for a prop-dense group — and a reader that is after one list it
+    /// located earlier (it walked the section once, to count the list) would pay that a second
+    /// time to decode a few kilobytes. This copies those kilobytes.</para>
+    ///
+    /// <para>The range is checked against the section's own length: it comes from a walk of
+    /// these bytes, remembered across queries, and a range the section cannot hold says the
+    /// bytes behind the path are not the ones that were walked.</para>
+    /// </summary>
+    public PooledSection RentInvertedIndexBytes(int group, int offset, int length)
+    {
+        long section = _groups[group].InvertedOffset;
+        uint held    = section > 0 ? (uint)ReadInt32At(section) : 0;
+        if (offset < 0 || length < 0 || (ulong)offset + (ulong)length > held)
+            throw new InvalidDataException(
+                $"Bytes [{offset}, {(long)offset + length}) are outside the {held}-byte inverted section of group {group} in {Info.FilePath}");
+        if (length == 0) return default;
+
+        var data = ArrayPool<byte>.Shared.Rent(length);
+        _view.ReadArray(section + 4 + offset, data, 0, length);
+        Interlocked.Increment(ref PooledSliceRents);
+        return new PooledSection(data, length);
+    }
+
     private byte[] ReadSection(long offset)
     {
         if (offset <= 0) return [];
@@ -1197,6 +1354,26 @@ public sealed class SegmentReader : ISegmentReader
     /// mapped view.</para>
     /// </summary>
     internal static long PooledSectionRents;
+
+    /// <summary>
+    /// Pieces of a section rented by any reader in this process
+    /// (<see cref="RentInvertedIndexBytes(int, int, int)"/>), counted apart from
+    /// <see cref="PooledSectionRents"/> so that "how many times was a section read" keeps meaning
+    /// whole sections — and so that a test can say a posting list was fetched by itself, which no
+    /// other instrument shows. The same caveats: process-wide, attributable only with the
+    /// assembly's parallelisation switched off.
+    /// </summary>
+    internal static long PooledSliceRents;
+
+    /// <summary>
+    /// Blocks decompressed and decoded for an event read (<see cref="ReadEventsAsync"/>,
+    /// <see cref="ReadGroupsAsync"/>) by any reader in this process — what a scan pays in. A
+    /// DIAGNOSTIC in the spirit of <see cref="PooledSectionRents"/>, with its caveats, and for a
+    /// claim no other instrument can state: that rows the index ruled out were NOT READ. A scan
+    /// that read them and rejected each returns the same rows, so a test that only compares
+    /// rows cannot tell an index that prunes from one that merely agrees.
+    /// </summary>
+    internal static long BlocksDecoded;
 
     /// <summary>
     /// Process-wide count of successful <see cref="Open"/> calls, in the same spirit and with
