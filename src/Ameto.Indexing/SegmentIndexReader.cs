@@ -332,6 +332,16 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         var catalog = Catalog(src);
         if (catalog.Properties.Count == 0) return null;
 
+        // The exception marker answers only where its builder vouched for it, and there it is
+        // known even when no row was filed under it (SegmentInvertedIndex.IsExceptionMarker).
+        // Read off the catalog, so a group with no exception is dropped without its section
+        // being read again.
+        if (SegmentInvertedIndex.IsExceptionMarker(property))
+        {
+            if (!catalog.VouchesForExceptionMarker) return null;
+            known = true;
+        }
+
         IndexValueForms.Buffer buf = default;
         Span<string?> forms = buf;
         int n = -1;

@@ -1157,9 +1157,10 @@ public sealed class QueryExecutor : IQueryExecutor
         => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount, out candidates, out _);
 
     /// <param name="groupEventCount">
-    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision: a level
-    /// union whose posting lists already account for every event in the group is the identity,
-    /// and intersecting with the identity is work with no result. See below.
+    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision, taken in
+    /// two places: posting lists that already account for every event in the group — the level
+    /// union, or the intersection of the inverted hints — are the identity, and intersecting
+    /// with the identity is work with no result. See below.
     /// </param>
     /// <param name="everyRow">
     /// True when the group contributes EVERY one of its rows — the third narrowing state,
@@ -1209,6 +1210,7 @@ public sealed class QueryExecutor : IQueryExecutor
         // Inverted-index event-level narrowing: AND posting lists for all equality
         // predicates. This gives exact event offsets within the segment — the reader will
         // only deserialise those events.
+        bool invertedNamesEveryRow = false;
         if (invertedHints.Count > 0)
         {
             var invOffsets = idx.LookupIntersect(invertedHints);
@@ -1216,8 +1218,24 @@ public sealed class QueryExecutor : IQueryExecutor
             {
                 if (invOffsets.Length == 0) return false;
 
-                candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
-                if (candidates.Length == 0) return false;
+                // A LIST AS LONG AS THE GROUP IS THE GROUP. Ordinals are distinct and a group's
+                // index names only its own rows, so an intersection of groupEventCount of them
+                // names every one — the same identity the level union below recognises, reached
+                // here by a predicate every row of the group satisfies. `has(@x)` over a
+                // level-split Error segment is that predicate as a matter of course: nearly
+                // every row there carries an exception. Intersecting with the identity removes
+                // nothing, and naming it would be the group-sized array the level road stopped
+                // building. So it is carried as a fact, and decided once the level set has had
+                // its say.
+                if (groupEventCount != 0 && invOffsets.Length == groupEventCount)
+                {
+                    invertedNamesEveryRow = true;
+                }
+                else
+                {
+                    candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
+                    if (candidates.Length == 0) return false;
+                }
             }
         }
 
@@ -1274,6 +1292,12 @@ public sealed class QueryExecutor : IQueryExecutor
                 }
             }
         }
+
+        // The inverted hints named every row and nothing else narrowed: the group contributes
+        // all of its rows, which is the third state and not "no information". Left as a null
+        // candidate list alone it would read as an unnarrowed group, and one of those sends the
+        // whole segment — the groups this query did narrow or reject included — to a full scan.
+        if (candidates is null && invertedNamesEveryRow) everyRow = true;
 
         return true;
     }

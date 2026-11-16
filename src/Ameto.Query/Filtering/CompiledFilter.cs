@@ -467,6 +467,15 @@ public sealed class CompiledFilter : IPreparedFilter
 
     private static void CollectInvertedHints(FilterNode node, List<(string, object?)> out_)
     {
+        // Asked first, because the node kinds it reads are ones the switch below gives no hint
+        // for (has / isDefined) or the wrong one (`@x.exists = …`, whose field has no value
+        // bucket to hint).
+        if (SelectsEventsWithAnException(node))
+        {
+            out_.Add(ExceptionPresentHint);
+            return;
+        }
+
         switch (node)
         {
             // `X = null` is deliberately not hinted: the evaluator treats a missing property
@@ -490,6 +499,61 @@ public sealed class CompiledFilter : IPreparedFilter
                 CollectInvertedHints(and.Right, out_);
                 break;
             // Deliberately skip OrNode — OR is too broad for intersection
+        }
+    }
+
+    // ── Exception presence: the one question the marker bucket can answer ─────
+
+    /// <summary>
+    /// "Which rows carry an exception", as an inverted hint: the bucket
+    /// <c>SegmentIndexBuilder</c> files every such row under, and the one value it files there.
+    ///
+    /// <para>This is NOT the field <c>@x.exists</c> being hinted by value — that field has no
+    /// value bucket (see its row in <see cref="BuiltinFields"/>): the marker holds "true" and
+    /// nothing else, so asking it for <c>false</c> would be answered "no such row" about a
+    /// group full of them. It is the single positive question, emitted only for a predicate
+    /// that <see cref="SelectsEventsWithAnException"/> proves is that question. And it is
+    /// honoured only by an index group whose builder vouched that the marker is complete
+    /// (<c>SegmentInvertedIndex.IsExceptionMarker</c>): there the list is the answer and its
+    /// absence drops the group; an older group says "no information" and is scanned.</para>
+    /// </summary>
+    private static readonly (string, object?) ExceptionPresentHint = (ClefFields.ExceptionExists, "true");
+
+    /// <summary>
+    /// True when <paramref name="node"/> matches an event if and only if the event carries an
+    /// exception — the predicates the scan answers from <c>LogEvent.HasException</c>, which is
+    /// exactly what the index's marker records.
+    ///
+    /// <para><c>has(@x)</c> and <c>isDefined(@x)</c> under every spelling
+    /// <c>FilterEvaluator.HasProperty</c> answers that way, and <c>@x.exists</c> compared with a
+    /// literal that leaves only the events WITH an exception: <c>= true</c>, <c>= 'TRUE'</c>,
+    /// <c>!= false</c>, <c>in [true]</c>. Which literals those are is not decided here. The
+    /// evaluator's own comparison is run on both values the field can take, so this cannot come
+    /// to disagree with the scan about what <c>=</c> means for a bool — the way
+    /// <see cref="Filtering.HeaderPredicate"/> computes a level mask. Anything that also admits
+    /// an event without an exception (<c>= false</c>, <c>!= true</c>, <c>!= null</c>) or admits
+    /// none is not this question and gets no hint.</para>
+    /// </summary>
+    private static bool SelectsEventsWithAnException(FilterNode node)
+    {
+        switch (node)
+        {
+            case HasNode has:
+                return IsBuiltin(has.Property, BuiltinField.ExceptionType);
+
+            case IsDefinedNode defined:
+                return IsBuiltin(defined.Property, BuiltinField.ExceptionType);
+
+            case CompareNode { RightProperty: null } cmp when IsBuiltin(cmp.Property, BuiltinField.ExceptionExists):
+                return FilterEvaluator.CompareValues(true, cmp.Value, cmp.Op)
+                   && !FilterEvaluator.CompareValues(false, cmp.Value, cmp.Op);
+
+            case InNode inNode when IsBuiltin(inNode.Property, BuiltinField.ExceptionExists):
+                return FilterEvaluator.InValues(true, inNode.Values)
+                   && !FilterEvaluator.InValues(false, inNode.Values);
+
+            default:
+                return false;
         }
     }
 

@@ -120,13 +120,14 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void ServiceNameDotted()         => AssertIndexPath("service.name = 'Auth.API'", 9002);
     [Fact] public void ServiceNamePascal()         => AssertIndexPath("ServiceName = 'Auth.API'", 9002);
 
-    // ── Marker axis: a bucket that exists and still must not be asked ─────────
+    // ── Marker axis: a bucket that may be asked one question only ─────────────
     // The builder files `@x.exists` = "true" for an event with an exception and nothing for
-    // one without, so the bucket has no entry `@x.exists = false` could find: hinted, that
-    // predicate meets "known bucket, no such value" and the segment — which holds 9002 — is
-    // dropped. The field is therefore not hinted at any spelling, and both answers below come
-    // from the scan. (9001 and 9003 carry an exception; ExceptionExistsFieldTests has the rows
-    // the bucket gets wrong for `= true` as well.)
+    // one without, so the bucket has no entry `@x.exists = false` could find: hinted by value,
+    // that predicate meets "known bucket, no such value" and the segment — which holds 9002 —
+    // is dropped. So the field is never hinted by value. What the marker is asked is the one
+    // positive question, "which rows carry an exception": `@x.exists = true` and `has(@x)`
+    // narrow to 9001 and 9003 through it, and everything else about the field is answered by
+    // the scan. (ExceptionExistsFieldTests has the groups whose marker may NOT answer.)
 
     [Fact] public void ExceptionExistsTrue()       => AssertIndexPath("@x.exists = true", 9001, 9003);
     [Fact] public void ExceptionExistsFalse()      => AssertIndexPath("@x.exists = false", 9002);
@@ -146,6 +147,33 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact]
     public void ExceptionExistsFalseBesideAnIndexedConjunct() =>
         AssertIndexPath("@x.exists = false and Region = 'ae-auh'", 9002);
+
+    /// <summary>
+    /// The positive question is answered BY the marker, not merely in spite of it: the
+    /// prefilter hands back the two rows that carry an exception, and the row without one is
+    /// never read.
+    /// </summary>
+    [Theory]
+    [InlineData("has(@x)")]
+    [InlineData("@x.exists = true")]
+    [InlineData("Exception.Exists = true")]
+    public void ExceptionPresence_NarrowsToTheMarkedRows(string expression)
+    {
+        Assert.True(Prefilter(CompiledFilter.Compile(expression), out uint[]? candidates));
+        Assert.NotNull(candidates);
+        Assert.Equal(new uint[] { 0, 2 }, candidates);
+    }
+
+    /// <summary>…and the predicates that are not that question leave the index alone.</summary>
+    [Theory]
+    [InlineData("not has(@x)")]
+    [InlineData("@x.exists = false")]
+    [InlineData("@x.exists != true")]
+    public void ExceptionAbsence_IsNotNarrowed(string expression)
+    {
+        Assert.True(Prefilter(CompiledFilter.Compile(expression), out uint[]? candidates));
+        Assert.Null(candidates);
+    }
 
     // ── Coverage axis: fields no inverted bucket holds ────────────────────────
     // The hint must be suppressed entirely. A hint here is unanswerable, and the index

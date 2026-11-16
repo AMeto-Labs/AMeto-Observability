@@ -102,9 +102,32 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// </summary>
     public void Add(uint fileOrdinal, in SegmentEventRef ev)
     {
+        if (!_vouchedForExceptionMarker) VouchForExceptionMarker();
         IndexHeaderFields(in ev, fileOrdinal);
         IndexPropertiesStreaming(ev.Properties, fileOrdinal);
     }
+
+    /// <summary>
+    /// Files <see cref="ClefFields.ExceptionExistsComplete"/> — a property with no value — once
+    /// per group, before its first event: this builder's word that the group's
+    /// <c>@x.exists</c> bucket names EVERY row <see cref="ExceptionInfo.IsPresent"/> accepts
+    /// (see <see cref="IndexException"/>, which files the marker before it reads the payload).
+    /// A reader lets the marker answer <c>has(@x)</c> only where it finds this, so a group
+    /// written before the marker was complete is scanned instead of trusted.
+    ///
+    /// <para>No value is ever filed under it, and that emptiness is the whole signal: a property
+    /// enters the index with its first value everywhere else, so nothing but this call writes
+    /// an empty one. Should a client send a property of this very name, its value lands in the
+    /// same bucket, the bucket is no longer empty, and the group vouches for nothing — the
+    /// reader scans, which is the safe way to be wrong. Not a bloom term: nothing probes for it.</para>
+    /// </summary>
+    private void VouchForExceptionMarker()
+    {
+        _vouchedForExceptionMarker = true;
+        _inverted.PropertyId("@x.exists.complete"u8, out _);
+    }
+
+    private bool _vouchedForExceptionMarker;
 
     /// <summary>
     /// Streaming (zero-alloc) build. Must be called while <paramref name="hot"/> is frozen.
@@ -155,6 +178,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;
+            if (!_vouchedForExceptionMarker) VouchForExceptionMarker();
             IndexHeaderFieldsReference(HotTierEventSource.EventAt(hot, pool, i), offset);
 
             var props = hot.ReadPropertiesPayload(i, pool);
@@ -261,6 +285,15 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             return;
         }
 
+        // THE MARKER FIRST, and on IsPresent's answer alone — before anything tries to read the
+        // payload. LogEvent.HasException is this same probe over these same bytes (the writer
+        // stores the column untouched), so the bucket names exactly the rows `has(@x)` is true
+        // for, the ones whose map cannot be read below included. That is what
+        // VouchForExceptionMarker promises a reader, and what lets the marker stand in for a
+        // scan. It used to be filed after the read, so an unreadable map was a row the scan
+        // counted and the bucket did not.
+        AddExists(offset);
+
         // The raw msgpack, on the flush path and the merge path alike (the hot tier keeps the bytes
         // the client sent, as a segment's column does). Read only the three fields the index wants,
         // in place — the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded.
@@ -272,8 +305,9 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             {
                 if (!ExceptionInfo.TryReadIndexFields(_exception.Memory, out var type, out var message, out var innerType))
                 {
-                    // The row is written whatever its exception column holds; what is lost is
-                    // the row's place in the @x.* buckets. The old full decode threw here and
+                    // The row is written whatever its exception column holds, and it keeps its
+                    // place in the marker above; what is lost is its place in the type, inner
+                    // type and message terms. The old full decode threw here and
                     // failed the merge, so this is counted rather than silent: a non-zero count
                     // is a producer writing exception maps this reader cannot read (a non-string
                     // type, a truncated map), which is worth knowing about and not worth losing a
@@ -283,7 +317,6 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                     NoteMalformedException(offset, ev.ExceptionPayload.Length);
                     return;
                 }
-                AddExists(offset);
                 if (!type.IsEmpty)
                 {
                     type = WellFormed(type);
@@ -770,7 +803,9 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
     /// <summary>
     /// Exception payloads this group could not read as an exception map (merge path only; the
-    /// flush path holds decoded objects). Each is a row written without its @x.* terms. The
+    /// flush path holds decoded objects). Each is a row written without its exception type,
+    /// inner type and message terms — though one whose payload opens as a map or a non-empty
+    /// string is still filed under the <c>@x.exists</c> marker. The
     /// process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
     ///
     /// <para>ENCOUNTERS, not distinct rows. The merged segment keeps the raw payload, so the same
@@ -830,7 +865,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         Microsoft.Extensions.Logging.LoggerMessage.Define<long, uint, int, long>(
             Microsoft.Extensions.Logging.LogLevel.Warning,
             new Microsoft.Extensions.Logging.EventId(0, "IndexMalformedExceptionPayloads"),
-            "Index build: {Count} exception payload(s) in this group are not readable exception maps (first at file ordinal {Ordinal}, {Bytes} B); the rows are written but their @x.* terms are not indexed, so @x.type filters and free-text search over the merged segment miss them. Process total: {Total}");
+            "Index build: {Count} exception payload(s) in this group are not readable exception maps (first at file ordinal {Ordinal}, {Bytes} B); the rows are written but their exception type and message are not indexed, so @x.type filters and free-text search over the merged segment miss them. Process total: {Total}");
 
     /// <summary>
     /// The production path — see <see cref="ISegmentIndexSink.WriteSections"/>. The inverted

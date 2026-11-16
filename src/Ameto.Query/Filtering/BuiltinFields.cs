@@ -40,8 +40,8 @@ public enum BuiltinField : byte
 /// <c>@id</c>. Emitting a hint for one of those asks the index a question it cannot answer,
 /// and the index's "no such bucket" answer used to be read as "no matching events", which
 /// silently dropped every cold segment. Null means "emit no hint, scan instead".
-/// <c>@x.exists</c> is null for a reason of its own, given at its row: it has a bucket, and
-/// that bucket cannot answer for it.</para>
+/// <c>@x.exists</c> is null for a reason of its own, given at its row: it has a bucket, but
+/// one that marks presence and holds no values to hint by.</para>
 ///
 /// <para>The same rule holds one index over: <c>SegmentTrigramIndex.Lookup</c> reads a
 /// missing trigram in a POPULATED index as proof of absence, so a
@@ -115,15 +115,19 @@ public static class BuiltinFields
 
         // Whether the event carries an exception at all: a bool on EVERY event, never null, so
         // `@x.exists = false` is `not has(@x)`. The builder does file an `@x.exists` bucket
-        // (ClefFields.ExceptionExists) and the field still gets NO hint, because that bucket is
-        // a presence marker, not a value bucket. It holds "true" and nothing else, so its
-        // silence about `false` is not proof: a hint for `@x.exists = false` would be answered
-        // "known bucket, no such value" and drop every group that holds an exception — the
-        // groups whose other rows are exactly what was asked for. Its "true" list is not the
-        // evaluator's either: a row whose exception map the builder could not read is left out
-        // of it, while LogEvent.HasException still counts a row whose payload opens as a map.
-        // And the bloom is handed the bucket's NAME, never a value. So the predicate scans, as
-        // `has(@x)` does, and the two answer alike in both tiers.
+        // (ClefFields.ExceptionExists) and the field still gets NO VALUE HINT from this table,
+        // because that bucket is a presence marker, not a value bucket. It holds "true" and
+        // nothing else, so its silence about `false` is not proof: a hint for
+        // `@x.exists = false` would be answered "known bucket, no such value" and drop every
+        // group that holds an exception — the groups whose other rows are exactly what was
+        // asked for. And the bloom is handed the bucket's NAME, never a value.
+        //
+        // What the marker CAN answer is the one positive question, "which rows carry an
+        // exception", and that hint is built apart from this table, for the predicates that
+        // are that question and nothing more — `has(@x)`, `@x.exists = true`
+        // (CompiledFilter.SelectsEventsWithAnException) — and honoured only by an index group
+        // whose builder vouched that its marker is complete
+        // (SegmentInvertedIndex.IsExceptionMarker). Everything else about the field scans.
         new(BuiltinField.ExceptionExists, null, BloomIndexed: false, TrigramIndexed: false,
             ["@x" + Sep + "exists", "Exception" + Sep + "Exists", ClefFields.ExceptionExists]),
 

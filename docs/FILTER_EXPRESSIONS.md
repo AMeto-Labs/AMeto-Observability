@@ -134,7 +134,7 @@ Inside the brackets, escape a literal single quote with `\'`.
 | `@x.stack` | | Exception stack trace (string). |
 | `@x.inner.type` | | Inner exception type. |
 | `@x.inner.message` | | Inner exception message. |
-| `@x.exists` | | `true` when the event has an exception, `false` when it has none — `@x.exists = true` selects what `has(@x)` does, `@x.exists = false` what `not has(@x)` does. Like `has(@x)` it scans; the index is not used for it. |
+| `@x.exists` | | `true` when the event has an exception, `false` when it has none — `@x.exists = true` selects what `has(@x)` does, `@x.exists = false` what `not has(@x)` does. `@x.exists = true` and `has(@x)` use the index: a segment that holds no exception is skipped unread. `@x.exists = false` and `not has(@x)` scan. |
 | `@t` | `Timestamp` | ISO-8601 timestamp string. |
 | `@service` | `ServiceName`, `service.name` | The service the event came from (OTLP resource attribute `service.name`, or CLEF `@service` / `service.name`). `=` and `in` use the index; `contains` / `like` on it scan. |
 

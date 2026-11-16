@@ -430,6 +430,16 @@ The certificate is hot-reloaded on every new TLS handshake — replace the `.pfx
 
 ## Upgrading and rolling back: on-disk formats
 
+### Log segment indexes (`*.seg`): a search for exceptions uses the index
+
+From this release `has(@x)`, `isDefined(@x)` and `@x.exists = true` are answered from a segment's index. An index group that holds no exception is skipped without being read, a group where every row carries one is read whole, and a mixed group is narrowed to the rows that do. Before, the predicate gave the index nothing to look up, so every row in the search window was read to answer it — the Information segments that hold no exception at all included.
+
+**The format versions do not change.** Each index group this release writes — at a flush and at every merge — files every row that carries an exception under the inverted bucket `@x.exists`, where it used to leave out a row whose exception map it could not read, and carries one more bucket, `@x.exists.complete`, with no value in it: the group's word that the first is complete. That is 24 bytes a group.
+
+**Upgrading needs nothing**, and the gain arrives with the data. A segment an older release wrote carries no such word, so a search for exceptions reads it row by row as before — after one look at the group's index to find that out, which the index cache then remembers — and it answers from the index once compaction has merged it. Nothing is rewritten for the purpose.
+
+**Rolling back is safe.** An older release reads these index sections as it reads its own: the extra bucket is a property it is never asked about. It goes back to answering `has(@x)` by reading every row.
+
 ### Log segments (`*.seg`) and write-ahead logs: the exception column holds the client's own bytes
 
 From this release a CLEF event's `@x` is kept exactly as its msgpack arrived — in the hot tier, in the write-ahead log entry and in the segment's exception column — and decoded only where a reader wants a field of it: the index reads the type, the message and the inner type; a filter on `@x.type`, `@x.message`, `@x.stack`, `@x.inner.type` or `@x.inner.message` reads that one field; the events API and the live stream write the JSON straight from the bytes. Before, the value was decoded at ingest into a tree of strings (type, message, stack trace, the inner chain), held in the hot tier that way for up to `HotTier.MaxAge` (about 3.5 KB of UTF-16 per exception against 1.5 KB of msgpack, all of it promoted to the old generation), serialised once into the WAL and once more into the segment, and decoded again for every row delivered. The JSON a client receives is unchanged byte for byte.

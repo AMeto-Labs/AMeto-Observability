@@ -14,12 +14,14 @@ namespace Ameto.Query.Tests;
 /// The evaluator therefore read <c>@x.exists</c> as a nested user property — <c>@x</c>, then
 /// <c>exists</c> — which no event has, and the predicate matched nothing in either tier.
 ///
-/// <para>Pinned here: the table row (every spelling, and deliberately NO index hint), the
-/// evaluator's answer (<see cref="LogEvent.HasException"/>, so the same one <c>has(@x)</c>
-/// gives and with nothing decoded), and why the index's own <c>@x.exists</c> bucket is not
-/// asked — shown over a real index rather than asserted. The spellings also run through the
-/// production prefilter in <c>IndexHintKeyTests</c>, and every payload shape through the
-/// object-against-bytes oracle in <c>LazyExceptionEvaluationTests</c>.</para>
+/// <para>Pinned here: the table row (every spelling, and no VALUE hint); the evaluator's answer
+/// (<see cref="LogEvent.HasException"/>, so the same one <c>has(@x)</c> gives and with nothing
+/// decoded); the one question the index IS asked — "which rows carry an exception", for the
+/// predicates that are exactly that question and for no other; and how far the index's marker
+/// may answer it, over indexes the builder really wrote. The spellings also run through the
+/// production prefilter in <c>IndexHintKeyTests</c>, every payload shape through the
+/// object-against-bytes oracle in <c>LazyExceptionEvaluationTests</c>, and whole stores through
+/// the executor in <c>ExceptionPresenceIndexTests</c>.</para>
 /// </summary>
 public sealed class ExceptionExistsFieldTests
 {
@@ -62,8 +64,13 @@ public sealed class ExceptionExistsFieldTests
     public void Near_misses_stay_user_properties(string name) =>
         Assert.False(BuiltinFields.TryResolve(name, out _));
 
+    /// <summary>
+    /// The row gives the field nothing a hint BY VALUE could use: the index's bucket of the same
+    /// name holds "true" and nothing else, so it cannot be asked about <c>false</c>, and the
+    /// bloom holds the bucket's name rather than a value.
+    /// </summary>
     [Fact]
-    public void The_row_names_no_index_structure_a_hint_could_use()
+    public void The_row_gives_the_field_no_value_hint()
     {
         Assert.Equal("@x.exists", ClefFields.ExceptionExists);
         Assert.Null(BuiltinFields.InvertedKey(BuiltinField.ExceptionExists));
@@ -71,21 +78,93 @@ public sealed class ExceptionExistsFieldTests
         Assert.False(BuiltinFields.IsTrigramIndexed(BuiltinField.ExceptionExists));
     }
 
+    // ── The one question the index is asked ───────────────────────────────────
+
+    /// <summary>
+    /// "Which rows carry an exception" is the one thing the index's marker records, so it is
+    /// asked for exactly the predicates that are that question — and each row here is first
+    /// shown to BE that question: it matches an event if and only if the event has an exception.
+    /// </summary>
     [Theory]
+    [InlineData("has(@x)")]
+    [InlineData("isDefined(@x)")]
+    [InlineData("has(Exception)")]
+    [InlineData("has(@x.type)")]              // the type defaults when absent: present exactly when the exception is
+    [InlineData("has(Exception.Type)")]
     [InlineData("@x.exists = true")]
-    [InlineData("@x.exists = false")]
-    [InlineData("@x.exists != true")]
     [InlineData("@x.exists = 'true'")]
-    [InlineData("['@x.exists'] = true")]
-    [InlineData("Exception.Exists = false")]
+    [InlineData("@x.exists = 'TRUE'")]
+    [InlineData("@x.exists != false")]
+    [InlineData("@x.exists <> false")]
+    [InlineData("@x.exists != 'no'")]         // a bool reads any text but "true" as false
     [InlineData("@x.exists in [true]")]
-    [InlineData("@x.exists in [false]")]
-    [InlineData("@x.exists like 'tru%'")]
-    [InlineData("contains(@x.exists, 'true')")]
-    [InlineData("startsWith(@x.exists, 'tru')")]
-    public void No_predicate_on_it_asks_the_index_anything(string expression)
+    [InlineData("@x.exists in ['true', 'TRUE']")]
+    [InlineData("true = @x.exists")]
+    [InlineData("['@x.exists'] = true")]
+    [InlineData("Exception.Exists = true")]
+    public void A_predicate_that_selects_the_events_with_an_exception_asks_the_marker(string expression)
     {
         var filter = CompiledFilter.Compile(expression);
+        Assert.All(Shapes(), ev => Assert.Equal(ev.HasException, filter.Matches(ev)));
+
+        var hint = Assert.Single(filter.GetInvertedHints());
+        Assert.Equal(ClefFields.ExceptionExists, hint.property);
+        Assert.Equal("true", hint.value);
+
+        // Nothing for the bloom gate — it holds the bucket's name, not a value — and no text.
+        Assert.False(filter.TryGetIndexHint(out _, out _));
+        Assert.Empty(filter.GetTrigramHints());
+    }
+
+    /// <summary>
+    /// Everything else about the field scans, and the first assertion is why: each of these
+    /// admits an event without an exception, or refuses one with — so a list of the rows that
+    /// carry one is not its answer.
+    /// </summary>
+    [Theory]
+    [InlineData("@x.exists = false")]
+    [InlineData("@x.exists != true")]
+    [InlineData("@x.exists <> true")]
+    [InlineData("@x.exists = 'false'")]
+    [InlineData("@x.exists = 'no'")]
+    [InlineData("@x.exists = 1")]
+    [InlineData("@x.exists in [false]")]
+    [InlineData("@x.exists in [true, false]")]
+    [InlineData("@x.exists = null")]
+    [InlineData("@x.exists != null")]
+    [InlineData("@x.exists > false")]           // ordering a bool matches nothing
+    [InlineData("contains(@x.exists, 'true')")] // case-sensitive against "True": matches nothing
+    [InlineData("has(@x.exists)")]              // true of every event
+    [InlineData("has(@x.message)")]             // a field of the exception, not its presence
+    [InlineData("has(@x.inner.type)")]
+    [InlineData("not has(@x)")]
+    [InlineData("not @x.exists = true")]
+    [InlineData("has(@x) or Region = 'ae-dxb'")]   // an OR branch is not a conjunct
+    public void Anything_else_about_it_asks_the_index_nothing(string expression)
+    {
+        var filter = CompiledFilter.Compile(expression);
+        Assert.Contains(Shapes(), ev => filter.Matches(ev) != ev.HasException);
+
+        Assert.Empty(filter.GetInvertedHints());
+        Assert.Empty(filter.GetTrigramHints());
+        Assert.False(filter.TryGetIndexHint(out _, out _));
+    }
+
+    /// <summary>
+    /// The hint is given to the shapes it recognises, not to everything that happens to select
+    /// the same events. These do select them — a double negation, a pattern only "True" fits —
+    /// and still ask the index nothing: an unrecognised spelling is scanned, which costs time
+    /// and never a row.
+    /// </summary>
+    [Theory]
+    [InlineData("not @x.exists = false")]
+    [InlineData("not not has(@x)")]
+    [InlineData("@x.exists like 'tru%'")]
+    public void A_spelling_the_hint_does_not_recognise_is_scanned(string expression)
+    {
+        var filter = CompiledFilter.Compile(expression);
+        Assert.All(Shapes(), ev => Assert.Equal(ev.HasException, filter.Matches(ev)));
+
         Assert.Empty(filter.GetInvertedHints());
         Assert.Empty(filter.GetTrigramHints());
         Assert.False(filter.TryGetIndexHint(out _, out _));
@@ -94,18 +173,34 @@ public sealed class ExceptionExistsFieldTests
     [Fact]
     public void A_conjunct_beside_it_keeps_its_own_hint()
     {
-        // The example in docs/FILTER_EXPRESSIONS.md. `@x.exists` gives the index nothing to
-        // answer and takes nothing away: the inner type still narrows the segment.
+        // The example in docs/FILTER_EXPRESSIONS.md: the marker and the inner type both narrow.
         var filter = CompiledFilter.Compile($"@x.exists = true and @x.inner.type = '{InnerType}'");
 
-        var hint = Assert.Single(filter.GetInvertedHints());
-        Assert.Equal(ClefFields.ExceptionInnerType, hint.property);
-        Assert.Equal(InnerType, hint.value);
+        var hints = filter.GetInvertedHints();
+        Assert.Equal(2, hints.Count);
+        Assert.Equal((ClefFields.ExceptionExists, (object?)"true"), hints[0]);
+        Assert.Equal((ClefFields.ExceptionInnerType, (object?)InnerType), hints[1]);
 
+        // The bloom gate is the inner type's alone.
         Assert.True(filter.TryGetIndexHint(out string key, out object? value));
         Assert.Equal(ClefFields.ExceptionInnerType, key);
         Assert.Equal(InnerType, value);
     }
+
+    /// <summary>
+    /// One event of every kind the theories above have to tell apart: an exception as a
+    /// decoded object and as raw bytes, one with nothing but a type, no exception at all, an
+    /// exception column holding nil, and an event the OR's other branch matches.
+    /// </summary>
+    private static LogEvent[] Shapes() =>
+    [
+        Event(exception: Boom),
+        Event(rawException: Boom.ToBytes()),
+        Event(rawException: new ExceptionInfo { Type = "System.TimeoutException" }.ToBytes()),
+        Event(),
+        Event(rawException: NilPayload),
+        Event(props: new() { ["Region"] = "ae-dxb" }),
+    ];
 
     // ── The evaluator ─────────────────────────────────────────────────────────
 
@@ -124,9 +219,9 @@ public sealed class ExceptionExistsFieldTests
 
     private static LogEvent Event(
         ExceptionInfo? exception = null, ReadOnlyMemory<byte> rawException = default,
-        Dictionary<string, object?>? props = null) => new()
+        Dictionary<string, object?>? props = null, uint id = 1) => new()
     {
-        Id              = new EventId(0u, 1u),
+        Id              = new EventId(0u, id),
         Timestamp       = new DateTimeOffset(2026, 11, 16, 9, 0, 0, TimeSpan.Zero),
         Level           = LogLevel.Error,
         MessageTemplate = "settle {OrderId}",
@@ -225,87 +320,173 @@ public sealed class ExceptionExistsFieldTests
         Assert.False(raw.ExceptionMaterialised, $"`{expression}` built the ExceptionInfo tree");
     }
 
-    // ── Why the index's own bucket is not asked ───────────────────────────────
+    // ── How far the index's marker may answer ─────────────────────────────────
+
+    /// <summary>Five rows, one of every kind the marker and the scan could come to disagree on.</summary>
+    private static readonly byte[][] Rows =
+    [
+        Boom.ToBytes(),                                                                    // 0: readable
+        [],                                                                                // 1: no exception
+        Pack(static (ref MessagePackWriter w) => w.Write("System.Exception: plain text")),  // 2: legacy @x, a plain string
+        // 3: a map whose `type` is not a string. LogEvent.HasException answers from the lead
+        //    byte and says yes; the index cannot read its fields.
+        Pack(static (ref MessagePackWriter w) => { w.WriteMapHeader(1); w.Write("type"); w.Write(7); }),
+        NilPayload,                                                                        // 4: a column holding nil
+    ];
+
+    private static readonly uint[] RowsWithAnException = [0, 2, 3];
+    private static readonly uint[] RowsWithout         = [1, 4];
 
     /// <summary>
-    /// <c>SegmentIndexBuilder</c> files an <c>@x.exists</c> bucket, and the row gives the field
-    /// no hint all the same. This is the reason, over an index the builder really wrote: the
-    /// bucket is a presence MARKER, not the field's values.
-    ///
-    /// <para>It holds "true" for the rows whose exception the builder could READ — so a hint
-    /// for <c>@x.exists = true</c> would lose the row whose map it could not read, which the
-    /// evaluator (and <c>has(@x)</c>) counts. And it holds nothing else — so a hint for
-    /// <c>@x.exists = false</c> would meet "known bucket, no such value", which the executor
-    /// takes as proof and drops the group on, where two rows match. Either hint costs the query
-    /// rows; scanning costs it only time, and no more than <c>has(@x)</c> has always cost.</para>
+    /// The marker's list IS the scan's answer to "which rows carry an exception" — the row
+    /// whose map the index could not read included — and that is the only thing it can be
+    /// asked. It holds "true" and nothing else, so asked for <c>false</c> it says "no such row"
+    /// about a group where two rows match: the reason the field gets no hint by value, and the
+    /// positive question a hint of its own.
     /// </summary>
     [Fact]
-    public void The_index_bucket_of_the_same_name_cannot_answer_for_the_field()
+    public void The_marker_lists_what_the_scan_matches_and_knows_nothing_about_false()
     {
-        const ulong WellFormed = 7001, NoException = 7002, LegacyString = 7003, UnreadableMap = 7004, Nil = 7005;
+        var events = Rows.Select(static (payload, i) => Event(rawException: payload, id: (uint)i)).ToArray();
+        Assert.Equal(RowsWithAnException, Scan(events, "@x.exists = true"));
+        Assert.Equal(RowsWithAnException, Scan(events, "has(@x)"));
+        Assert.Equal(RowsWithout,         Scan(events, "@x.exists = false"));
+        Assert.Equal(RowsWithout,         Scan(events, "@x.exists != true"));
+        Assert.Equal(RowsWithout,         Scan(events, "not has(@x)"));
 
-        using var hot  = new HotTierSegment(16, 64 * 1024);
-        var       pool = new StringInternPool();
+        using var builder = Filled(new SegmentIndexBuilder(Rows.Length), Rows);
+        using var index   = Index(builder);
+        Assert.Equal(1, builder.MalformedExceptionPayloads);     // row 3: counted, and still marked
 
-        Write(hot, pool, WellFormed,    Boom.ToBytes());
-        Write(hot, pool, NoException,   default);
-        // Legacy @x: a plain string. An exception to the evaluator and to the builder alike.
-        Write(hot, pool, LegacyString,  Pack(static (ref MessagePackWriter w) => w.Write("System.Exception: plain text")));
-        // A map whose `type` is not a string. LogEvent.HasException answers from the lead byte
-        // and says yes; the builder cannot read its index fields and files the row nowhere.
-        Write(hot, pool, UnreadableMap, Pack(static (ref MessagePackWriter w) => { w.WriteMapHeader(1); w.Write("type"); w.Write(7); }));
-        Write(hot, pool, Nil,           NilPayload);
-
-        hot.Freeze();
-        List<LogEvent> events = [.. hot.ReadAll(pool)];
-
-        var builder = new SegmentIndexBuilder(hot.Count);
-        builder.Build(hot, pool);
-        var index = SegmentIndexReader.Load(
-            builder.SerialisedInvertedIndex, builder.SerialisedTrigramIndex, builder.SerialisedBloomFilter);
-
-        // What the field answers, and that it is has(@x)'s answer.
-        ulong[] with    = [WellFormed, LegacyString, UnreadableMap];
-        ulong[] without = [NoException, Nil];
-        Assert.Equal(with,    Scan(events, "@x.exists = true"));
-        Assert.Equal(with,    Scan(events, "has(@x)"));
-        Assert.Equal(without, Scan(events, "@x.exists = false"));
-        Assert.Equal(without, Scan(events, "@x.exists != true"));
-        Assert.Equal(without, Scan(events, "not has(@x)"));
-
-        // What the bucket would have answered. Offsets are write order: 0..4.
-        Assert.Equal(1, builder.MalformedExceptionPayloads);
-
-        uint[]? forTrue = index.LookupIntersect([(ClefFields.ExceptionExists, (object?)true)]);
+        uint[]? forTrue = index.LookupIntersect([(ClefFields.ExceptionExists, (object?)"true")]);
         Assert.NotNull(forTrue);
-        Assert.Equal([0u, 2u], forTrue);              // offset 3, the unreadable map, is not there
+        Assert.Equal(RowsWithAnException, forTrue);
 
         uint[]? forFalse = index.LookupIntersect([(ClefFields.ExceptionExists, (object?)false)]);
         Assert.NotNull(forFalse);                     // not "no information": the bucket is known…
         Assert.Empty(forFalse);                       // …and proves no row matches, where two do
     }
 
-    private static ulong[] Scan(List<LogEvent> events, string expression)
+    /// <summary>
+    /// The production narrowing, over a group of each kind. Written by this build: the marker's
+    /// rows, and a group that holds no exception is dropped unread. Written before it — a marker
+    /// that leaves out the unreadable row, and no word that it is complete: no information, so
+    /// the group is scanned and the row is still found.
+    /// </summary>
+    [Theory]
+    [InlineData("has(@x)")]
+    [InlineData("isDefined(@x)")]
+    [InlineData("@x.exists = true")]
+    [InlineData("@x.exists != false")]
+    public void The_narrowing_follows_the_marker_only_as_far_as_its_builder_vouched(string expression)
     {
         var filter = CompiledFilter.Compile(expression);
-        var hits   = new List<ulong>();
+
+        byte[][] noException = [[], NilPayload];
+
+        using (var builder = Filled(new SegmentIndexBuilder(Rows.Length), Rows))
+        using (var vouched = Index(builder))
+        {
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, vouched, out uint[]? candidates));
+            Assert.NotNull(candidates);
+            Assert.Equal(RowsWithAnException, candidates);
+        }
+
+        using (var builder = Filled(new SegmentIndexBuilder(noException.Length), noException))
+        using (var none = Index(builder))
+            Assert.False(QueryExecutor.TryNarrowWithIndex(filter, none, out _), "a vouched group with no exception must be dropped");
+
+        using (var older = Filled(new PreVouchingIndexSink(Rows.Length, 0), Rows))
+        using (var index = Index(older))
+        {
+            // What narrowing by an older marker would have cost: read straight off the section,
+            // past the readers' rule, it lists rows 0 and 2 and not 3.
+            byte[] section = Sections(older).Inverted;
+            var    catalog = SegmentInvertedIndex.ReadCatalog(section);
+            Assert.False(catalog.VouchesForExceptionMarker);
+            int[]? listed = SegmentInvertedIndex.ScanBucket(
+                section, catalog.Codec, catalog.Properties[ClefFields.ExceptionExists].Runs, "true");
+            Assert.NotNull(listed);
+            Assert.Equal(new[] { 0, 2 }, listed);
+
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, out uint[]? candidates));
+            Assert.Null(candidates);
+        }
+
+        using (var older = Filled(new PreVouchingIndexSink(noException.Length, 0), noException))
+        using (var index = Index(older))
+        {
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, out uint[]? candidates),
+                "an older group without a marker proves nothing: it must be scanned, not dropped");
+            Assert.Null(candidates);
+        }
+    }
+
+    /// <summary>
+    /// Every row of a level-split Error group carries an exception, so the marker's list is the
+    /// whole group. That is the third narrowing state — every row, named by nothing — rather
+    /// than a group-sized array to select all of them, and rather than "no information", which
+    /// would send the rest of the segment to a full scan with it.
+    /// </summary>
+    [Fact]
+    public void A_group_where_every_row_has_an_exception_contributes_every_row_without_naming_them()
+    {
+        byte[][] everyRow = [Boom.ToBytes(), Rows[2], Rows[3], Boom.ToBytes()];
+        var filter = CompiledFilter.Compile("has(@x)");
+
+        using var builder = Filled(new SegmentIndexBuilder(everyRow.Length), everyRow);
+        using var index   = Index(builder);
+
+        Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, null, (uint)everyRow.Length, out uint[]? candidates, out bool whole));
+        Assert.Null(candidates);
+        Assert.True(whole);
+
+        // With the group's size unknown the same rows arrive named — the state is about how the
+        // answer is carried, not which rows it is.
+        Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, null, 0, out uint[]? named, out whole));
+        Assert.False(whole);
+        Assert.NotNull(named);
+        Assert.Equal(new uint[] { 0, 1, 2, 3 }, named);
+
+        // In a group one row larger the list is a genuine narrowing again.
+        Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, null, (uint)everyRow.Length + 1, out named, out whole));
+        Assert.False(whole);
+        Assert.NotNull(named);
+        Assert.Equal(new uint[] { 0, 1, 2, 3 }, named);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>The ordinals of the events a filter matches — the scan, which is the answer owed.</summary>
+    private static uint[] Scan(LogEvent[] events, string expression)
+    {
+        var filter = CompiledFilter.Compile(expression);
+        var hits   = new List<uint>();
         foreach (var ev in events)
-            if (filter.Matches(ev)) hits.Add(ev.Id.RawValue);
+            if (filter.Matches(ev)) hits.Add((uint)ev.Id.RawValue);
         return [.. hits];
     }
 
-    private static void Write(HotTierSegment hot, StringInternPool pool, ulong id, ReadOnlySpan<byte> exception)
+    /// <summary>One index group pushed into <paramref name="sink"/>: a row per exception payload, at Error level.</summary>
+    private static TSink Filled<TSink>(TSink sink, byte[][] exceptions) where TSink : ISegmentIndexSink
     {
-        const string Template = "settle {OrderId}";
-        var header = new LogEventHeader
+        long ticks = new DateTimeOffset(2026, 11, 16, 9, 0, 0, TimeSpan.Zero).UtcTicks;
+        for (int i = 0; i < exceptions.Length; i++)
         {
-            Id                       = id,
-            TimestampUtcTicks        = new DateTimeOffset(2026, 11, 16, 9, 0, (int)(id % 60), TimeSpan.Zero).UtcTicks,
-            MessageTemplatePoolIndex = pool.Intern(Template),
-            ServiceNamePoolIndex     = pool.Intern("Billing.API"),
-            Level                    = LogLevel.Error,
-        };
-        Assert.True(hot.TryWrite(header, EmptyProps, Template, exception));
+            var ev = new SegmentEventRef(new EventId(0u, (uint)i).RawValue, ticks + i, LogLevel.Error,
+                                         0, 0, 0, "settle {OrderId}", "Billing.API", EmptyProps, exceptions[i]);
+            sink.Add((uint)i, in ev);
+        }
+        return sink;
+    }
+
+    private static (byte[] Inverted, byte[] Trigram, byte[] Bloom) Sections(ISegmentIndexSink sink) => sink.Serialise();
+
+    /// <summary>The group's index as a query reads it: the packed reader over the sink's sections.</summary>
+    private static SegmentIndexReader Index(ISegmentIndexSink sink)
+    {
+        var (inverted, trigram, bloom) = Sections(sink);
+        return SegmentIndexReader.Load(inverted, trigram, bloom);
     }
 
     /// <summary>msgpack fixmap of zero entries — an event with no properties.</summary>
