@@ -12,6 +12,7 @@ A high-performance, self-hosted observability server — **logs, traces and metr
 - **Inverted index + Bloom filters** — fast segment-skip without decompressing blocks
 - **Alert rules** — threshold-based signals with webhook / SMTP dispatch
 - **Symmetric replication** — each node replicates its own flushed segments to all peers, no leader election
+- **AI access (MCP)** — a Model Context Protocol endpoint with read-only log tools for AI assistants; confidential values are replaced by tokens before an answer leaves the server, and every call is recorded; set up under Settings → AI / MCP ([docs/MCP.md](docs/MCP.md))
 - **Auth** — JWT + API keys, optional OAuth providers
 - **Angular SPA** — live tail, log search, trace explorer, metric charts, retention settings, diagnostics
 - **Single binary** per node, no external dependencies
@@ -160,6 +161,7 @@ Paths are relative to `Ameto:BasePath` when one is configured (default: none) �
 | Traces | `GET /api/traces`, `/api/traces/stats`, `/api/traces/{traceId}` |
 | Metrics | `GET /api/metrics`, `/api/metrics/names`, `/api/metrics/{name}` |
 | Auth | `POST /api/auth/login`, `/api/auth/refresh`, `/api/auth/keys`, OAuth via `/api/auth/oauth/{provider}` |
+| AI (MCP) | `POST /mcp` · settings under `/api/mcp` |
 | Ops | `GET /api/stats`, `/api/diagnostics`, `/api/retention`, `/api/replication/nodes`, `/health` |
 
 ## Architecture
@@ -180,6 +182,7 @@ Ameto.slnx
 │   ├── Ameto.Metrics/       — metric point storage and aggregation
 │   ├── Ameto.Otel/          — OTLP (protobuf) ingestion + trace/metric endpoints
 │   ├── Ameto.Alerts/        — threshold rules, webhook/SMTP dispatch
+│   ├── Ameto.Mcp/           — AI endpoint (Model Context Protocol): log tools, masking, profiles
 │   ├── Ameto.Replication/   — symmetric segment replication, peer probing
 │   ├── Ameto.Server/        — Kestrel host, REST/SSE endpoints, Angular SPA
 │   └── Serilog.Sinks.Ameto/ — Serilog sink (NuGet package)

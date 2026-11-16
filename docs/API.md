@@ -699,6 +699,19 @@ Rule writes are admin-only because a rule owns its channels, and a channel holds
 
 ---
 
+## AI access (MCP)
+
+`POST /mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for AI assistants: read-only log tools — five built in, and the saved queries you publish as tools — with confidential values replaced by tokens in every answer, and every call recorded. It is described in [MCP.md](MCP.md), together with its settings API under `/api/mcp`.
+
+**Auth:** `Authorization: Bearer <profile key>`. A profile key is created under Settings → AI / MCP and is accepted on `/mcp` only: it is not an API key and opens no other route. An API key or a user's token is not a profile key.
+
+**Response `401 Unauthorized`:** no profile key, or one that belongs to no profile.  
+**Response `503 Service Unavailable`:** the endpoint is switched off in Settings.
+
+Registered only when `Ameto:Mcp:Enabled` is `true` (the default).
+
+---
+
 ## Auth providers (OAuth)
 
 | Endpoint | Purpose |

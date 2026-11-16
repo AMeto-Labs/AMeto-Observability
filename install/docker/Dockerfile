@@ -47,6 +47,7 @@ COPY src/Ameto.Tracing/Ameto.Tracing.csproj       src/Ameto.Tracing/
 COPY src/Ameto.Otel/Ameto.Otel.csproj             src/Ameto.Otel/
 COPY src/Ameto.Alerts/Ameto.Alerts.csproj         src/Ameto.Alerts/
 COPY src/Ameto.Replication/Ameto.Replication.csproj src/Ameto.Replication/
+COPY src/Ameto.Mcp/Ameto.Mcp.csproj               src/Ameto.Mcp/
 COPY src/Ameto.Server/Ameto.Server.csproj         src/Ameto.Server/
 
 # Restore into the IMAGE LAYER, not a BuildKit cache mount. A cache mount is

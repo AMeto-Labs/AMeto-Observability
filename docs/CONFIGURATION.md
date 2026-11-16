@@ -322,6 +322,18 @@ Evaluating on a degraded store reads the window it failed to load as a quiet one
 
 ---
 
+## AI endpoint (`Ameto:Mcp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `Enabled` | bool | `true` | Maps the Model Context Protocol endpoint at `/mcp` and its settings API under `/api/mcp`. `false` maps neither. |
+
+The endpoint answers nobody until an admin creates an AI profile: every request without a profile key is a `401`. Everything else about it — profiles and their keys, the masking rules, the detectors, the limits, a switch that answers `503` without a restart — is set in **Settings → AI / MCP** and kept in `Ameto.db`, not in this file. See [MCP.md](MCP.md).
+
+The secret the masking tokens are made with is generated on first start and stored in `Ameto.db`, encrypted with the master key (`Ameto:MasterKey`). A server started with a different master key cannot read it and refuses to start, rather than minting a new secret and changing every token.
+
+---
+
 ## Resource attributes (env, deployment id, …)
 
 Attach shared attributes to everything a service sends by setting OTLP **resource attributes** on the sender — one env var, no code:
@@ -561,6 +573,9 @@ Ameto:
   Alerts:
     Enabled: true                 # needs Metrics and Tracing enabled as well
     EvaluateOnDegradedStore: false   # true = evaluate rules on a degraded store's partial data
+
+  Mcp:
+    Enabled: true                 # /mcp for AI assistants, and /api/mcp; the rest is set in Settings → AI / MCP
 
   Retention:
     VerboseDays: 90

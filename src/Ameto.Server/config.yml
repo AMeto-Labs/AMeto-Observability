@@ -274,6 +274,14 @@ Ameto:
     ErrorDays: 90
     FatalDays: 90
 
+  # ── AI endpoint (Model Context Protocol) ─────────────────────────────────────
+  # /mcp: read-only log tools for AI assistants, with confidential values replaced by
+  # tokens before an answer leaves the server. It answers nobody until an admin creates
+  # a profile in Settings → AI / MCP, where everything else about it is set as well.
+  # false maps neither /mcp nor its settings API. See docs/MCP.md.
+  Mcp:
+    Enabled: true
+
   # ── Software-update check (Settings → Updates, admin only) ───────────────────
   # One conditional request to the GitHub Releases API per interval; a 304
   # response costs nothing against the rate limit. Disable for air-gapped hosts.
