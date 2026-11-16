@@ -21,13 +21,18 @@ namespace Ameto.Query.Tests;
 /// marker gives the bloom is the bucket's name, never the value. So the client's <c>"true"</c>
 /// was never added, and the bloom gate dropped the group for a filter on it:
 /// <c>['@x.exists'][0] = 'true'</c> returned the row while it was hot and nothing once the tier
-/// was flushed. Only with an exception indexed first, which is how it hid: a row written before
-/// any exception made the value new, and it was added.</para>
+/// was flushed. It took three things at once, which is how it hid: the property as an ARRAY
+/// (no equality reaches a scalar of that name — the bare spelling is the built-in), an
+/// exception indexed before it (a row written before any exception made the value new, and it
+/// was added), and no other <c>true</c> in the group (a boolean under any property gives the
+/// bloom the same text).</para>
 ///
 /// <para>The other six buckets are asked the same question here and always answered it: their
 /// header fields give the bloom the very text they file, so a client's string finds it there
-/// whichever came first. They are pinned so that the next field filed marker-fashion — a
-/// posting whose bloom term is not its value — fails a test instead of a query.</para>
+/// whichever came first. They are pinned beside the marker, and the list of them is checked
+/// against what a header really files (<see cref="TheBucketsTriedAreEveryBucketAHeaderFiles_EachWithTheValueFiledThere"/>),
+/// so that the next field filed marker-fashion — a posting whose bloom term is not its value —
+/// has to take its turn here and fails a test instead of a query.</para>
 ///
 /// <para>Each test asks the hot tier, flushes (or merges), and asks again — through the real
 /// <see cref="StorageEngine"/> and <see cref="QueryExecutor"/>, without the index cache and
@@ -54,6 +59,10 @@ public sealed class ClientPropertyInAHeaderBucketTests : IAsyncLifetime
     /// <c>header</c> is the row whose HEADER files that value, <c>client</c> the row that carries
     /// it as a property of the bucket's name, and <c>both</c> one row that does both — its own
     /// header filed a moment before its own property, so it needs no other row to go missing.
+    ///
+    /// <para>For the level the four orders are one: every row here is a Warning, so each row's
+    /// own header files that value before its property is read, <c>client</c> rows included.
+    /// The orders tell the two filers apart only in the other six buckets.</para>
     /// </summary>
     public static TheoryData<string, string, string> BucketsAndOrders
     {
@@ -86,30 +95,78 @@ public sealed class ClientPropertyInAHeaderBucketTests : IAsyncLifetime
         await AssertFlushedAsync(store, AskForTheClientValue(bucket, value, expected[0]), expected, rows.Length);
     }
 
+    /// <summary>
+    /// What the theory stands on, read off the builder instead of trusted: the buckets tried are
+    /// EVERY bucket a header files a value in, and the value tried in each is the one this
+    /// fixture's <c>header</c> row files there — so the client's string really does meet the
+    /// header's term, and a case that passes is not passing for want of a meeting.
+    ///
+    /// <para>It is also what keeps the list from going stale. A field the builder starts to file
+    /// from the header turns up in this section, and has to be given its row in
+    /// <see cref="HeaderBuckets"/> — and so its turn in the theory — before this passes. A bucket
+    /// with no value in it is left out: it holds no term a client's value could share.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheBucketsTriedAreEveryBucketAHeaderFiles_EachWithTheValueFiledThere()
+    {
+        var store = Store("premise");
+        Write(store.Engine, 0, "header", Marker, "true");
+        await store.Engine.FlushHotTierAsync();
+
+        var segment = Assert.Single(store.Engine.ListSegments());
+        using var reader   = SegmentReader.Open(segment.FilePath);
+        using var inverted = reader.RentInvertedIndexBytes(0);
+        using var trigram  = reader.RentTrigramIndexBytes(0);
+        using var bloom    = reader.RentBloomFilterBytes(0);
+
+        // Every property of the group's inverted section that holds a value, but the row's own.
+        string[] filed =
+        [
+            .. SegmentInvertedIndex.ReadCatalog(inverted.Span).Properties.Values
+                .Where(static p => p.Name != "Row" && p.Runs.Sum(static run => run.ValueCount) > 0)
+                .Select(static p => p.Name)
+                .Order(StringComparer.Ordinal),
+        ];
+        string[] tried = [.. HeaderBuckets.Select(static b => b.Bucket).Order(StringComparer.Ordinal)];
+        Assert.True(tried.AsSpan().SequenceEqual(filed),
+            $"the header files [{string.Join(", ", filed)}]; the theory tries [{string.Join(", ", tried)}]");
+
+        using var index = SegmentIndexReader.Load(inverted.Span, trigram.Span, bloom.Span);
+        foreach (var (bucket, value) in HeaderBuckets)
+            Assert.True(index.Lookup(bucket, value) is [0u], $"the header row does not file ({bucket}, {value})");
+    }
+
     // ── The marker's bucket, the other ways in ────────────────────────────────
 
     /// <summary>
-    /// The built-in keeps answering from the header beside such a property, in both tiers. The
-    /// client's row IS filed in the marker's posting list — the two share the term — which makes
-    /// that list a superset of the rows with an exception; the scan decides, as it does for
-    /// every candidate, so the list costs a read and never an answer.
+    /// The built-in keeps answering from the header beside such a property, in both tiers: it
+    /// shadows a property of its name, array or not.
+    ///
+    /// <para>Whether these predicates are scanned or answered from the marker's posting list,
+    /// the answer has to be this one. The list names the client's row as well — the two share
+    /// the term — so wherever it is read it is a superset the scan has to trim. The client's
+    /// own filter reads it from the other side in the theory above, and must not return the
+    /// <c>header</c> row; these read it only where the index answers for the built-in.</para>
     /// </summary>
     [Fact]
     public async Task TheBuiltInFieldStillAnswersFromTheHeader_BesideAClientPropertyOfItsName()
     {
-        string[] filters = ["@x.exists = true", "['@x.exists'] = true", "@x.exists = 'true'", "has(@x)", "has(@x) and @l = 'Warning'"];
-        string[] rows    = ["header", "client", "plain"];
+        string[] withAnException = ["@x.exists = true", "['@x.exists'] = true", "@x.exists = 'true'", "has(@x)", "has(@x) and @l = 'Warning'"];
+        string[] withNone        = ["@x.exists = false", "['@x.exists'] = false", "not has(@x)"];
+        string[] rows            = ["header", "client", "plain"];
 
         var store = Store("builtin");
         for (int i = 0; i < rows.Length; i++)
             Write(store.Engine, i, rows[i], Marker, "true");
 
-        await AssertHotAsync(store, filters, ["header"]);
+        await AssertHotAsync(store, withAnException, ["header"]);
+        await AssertHotAsync(store, withNone, ["client", "plain"]);
+
         await store.Engine.FlushHotTierAsync();
         AssertOneGroupOf(store.Engine, rows.Length);
-        await AssertFlushedAsync(store, filters, ["header"], rows.Length);
 
-        await AssertFlushedAsync(store, ["@x.exists = false", "not has(@x)"], ["client", "plain"], rows.Length);
+        await AssertFlushedAsync(store, withAnException, ["header"], rows.Length);
+        await AssertFlushedAsync(store, withNone, ["client", "plain"], rows.Length);
     }
 
     /// <summary>
@@ -146,9 +203,10 @@ public sealed class ClientPropertyInAHeaderBucketTests : IAsyncLifetime
     private sealed record TestStore(StorageEngine Engine, QueryExecutor Query);
 
     /// <summary>
-    /// Filters on the client's value. The array form is the one spelling that reaches the
-    /// property at all: the bare name is the built-in field, which shadows a property of its
-    /// name in both tiers (see <c>ExceptionExistsFieldTests</c>).
+    /// Filters on the client's value. A subscript after the name — <c>[0]</c>, or <c>['0']</c>,
+    /// which reads an array the same way — is what reaches the property at all: the bare name is
+    /// the built-in field, which shadows a property of its name in both tiers (see
+    /// <c>ExceptionExistsFieldTests</c>).
     ///
     /// <para>The marker's value is asked for as a bool literal as well. A stored string compares
     /// with the literal's text, so the hot tier matches it — and the bloom gate then probes the
@@ -159,6 +217,7 @@ public sealed class ClientPropertyInAHeaderBucketTests : IAsyncLifetime
         string[] filters =
         [
             $"['{bucket}'][0] = '{value}'",
+            $"['{bucket}']['0'] = '{value}'",
             $"['{bucket}'][0] = '{value.ToUpperInvariant()}'",
             $"['{bucket}'][0] in ['{value}']",
             $"['{bucket}'][0] = '{value}' and @l = 'Warning'",

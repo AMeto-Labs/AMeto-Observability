@@ -12,6 +12,11 @@ namespace Ameto.Indexing.Tests;
 /// reference build still does that), and the count the writer sizes the next group from must
 /// still be the number of terms PRESENTED — repeats included — or every forecast after the
 /// first group would silently shrink.
+///
+/// <para>Byte-identical for the inputs tried here, that is. One input is known not to be, and
+/// no query can tell: the KEY of a client property named like a bucket the header files is
+/// never added once the header has made the bucket (see the note on first sight in
+/// <see cref="SegmentIndexBuilder"/>).</para>
 /// </summary>
 public sealed class BloomFirstSightTests
 {
@@ -109,8 +114,12 @@ public sealed class BloomFirstSightTests
     }
 
     /// <summary>
-    /// The fix adds the one term that was missing and nothing else: a group in which no client
-    /// ever files the marker's value gives the bloom the bucket's name, and never <c>"true"</c>.
+    /// The fix adds the one term that was missing and nothing else. In a group where no client
+    /// files the marker's value the bloom is given the bucket's name and never <c>"true"</c> —
+    /// which is what the reference build does, adding the name for every exception and the value
+    /// for none, so its bytes are the statement. (Giving the bloom the value in the marker's own
+    /// add would have closed the gap too, and let every group that holds an exception pass the
+    /// gate for <c>true</c>.)
     /// </summary>
     [Fact]
     public void WithoutAClientValue_TheMarkerStillGivesTheBloomItsNameAlone()
@@ -122,11 +131,12 @@ public sealed class BloomFirstSightTests
         streaming.Build(hot, pool);
         using var reference = new SegmentIndexBuilder(hot.Count);
         reference.BuildReference(hot, pool);
+
         Assert.Equal(reference.SerialisedBloomFilter, streaming.SerialisedBloomFilter);
+        Assert.Equal(reference.BloomTermsAdded,       streaming.BloomTermsAdded);
 
         using var bloom = SegmentBloomFilter.Deserialise(streaming.SerialisedBloomFilter);
         Assert.True(bloom.MightContain("@x.exists"));
-        Assert.False(bloom.MightContain("true"), "the marker gave the bloom its value (or these rows' terms happen to cover its bits)");
     }
 
     /// <summary>
