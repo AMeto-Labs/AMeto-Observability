@@ -1,0 +1,445 @@
+@use 'breakpoints' as bp;
+
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-pad);
+  min-width: 0;
+}
+
+/* The settings page hides a section with [hidden]; a display of our own would undo it. */
+:host([hidden]) { display: none; }
+
+/* ── The section's own tabs ─────────────────────────────────────────────────── */
+.m-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.m-tab {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 6px 12px;
+  margin-bottom: -1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
+}
+
+.m-tab:hover { color: var(--text-primary); }
+
+.m-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: var(--fw-medium);
+}
+
+.m-load-error {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  color: var(--error);
+  font-size: var(--fs-sm);
+}
+
+/* ── The vocabulary every tab of the section is written in ───────────────────────
+   One copy, here, reaching the tab components below this host — rather than the same forty
+   rules compiled into each of the six. Everything is prefixed m- and scoped to this host. */
+:host ::ng-deep {
+  .m-tabpanel { display: block; min-width: 0; }
+  .m-tabpanel[hidden] { display: none; }
+
+  .m-cols {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--section-pad);
+    min-width: 0;
+  }
+
+  .m-main,
+  .m-side {
+    display: flex;
+    flex-direction: column;
+    gap: var(--section-pad);
+    min-width: 0;
+  }
+
+  .m-main { flex: 1; }
+  .m-side { flex-shrink: 0; }
+
+  .m-sub  { font-size: var(--fs-xs); color: var(--text-secondary); }
+  .m-hint { font-size: var(--fs-xs); color: var(--text-muted); }
+  .m-lbl  { font-size: var(--fs-xs); font-weight: var(--fw-medium); color: var(--text-secondary); }
+  .m-err  { font-size: var(--fs-xs); color: var(--error); }
+  .m-mut  { color: var(--text-secondary); }
+  .m-dim  { color: var(--text-muted); }
+  .m-num  { text-align: right; }
+  .m-strong { font-weight: var(--fw-medium); }
+
+  .m-cd {
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+  }
+
+  .m-el {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .m-row {
+    display: flex;
+    align-items: center;
+    gap: var(--gap);
+    min-width: 0;
+  }
+
+  .m-row.between { justify-content: space-between; }
+  .m-row.wrap    { flex-wrap: wrap; }
+  .m-row.top     { align-items: flex-start; }
+  .m-row.tight   { gap: 6px; }
+  .m-grow        { flex: 1; min-width: 0; }
+  .m-fixed       { flex-shrink: 0; }
+
+  .m-fld {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .m-two-lines {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  /* ── Pills, chips, tokens ── */
+  .m-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: var(--fs-meta);
+    font-weight: var(--fw-medium);
+    white-space: nowrap;
+  }
+
+  .m-pill.ok   { color: var(--success); }
+  .m-pill.err  { color: var(--error); }
+  .m-pill.warn,
+  .m-pill.acc  { color: var(--accent); }
+
+  .m-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--ctl-h-sm);
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+
+  .m-chip-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    margin-right: -4px;
+    padding: 0;
+    border: 0;
+    border-radius: 3px;
+    background: none;
+    color: var(--text-muted);
+  }
+
+  .m-chip-x:hover { color: var(--error); background: var(--error-soft); }
+
+  .m-tok {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .m-raw {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--error-soft);
+    color: var(--error);
+  }
+
+  .m-par { color: var(--info); }
+
+  /* ── Code and read-only values ── */
+  .m-code {
+    min-width: 0;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+    line-height: 1.65;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .m-code.pre {
+    overflow-x: auto;
+    overflow-wrap: normal;
+    white-space: pre;
+  }
+
+  .m-code.tall { max-height: 420px; overflow-y: auto; }
+
+  .m-inp {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    min-height: var(--ctl-h);
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+  }
+
+  .m-select {
+    height: var(--ctl-h);
+    max-width: 100%;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    outline: none;
+  }
+
+  .m-select:focus { border-color: var(--primary); }
+
+  .m-textarea {
+    width: 100%;
+    min-height: 52px;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    line-height: var(--lh-base);
+    outline: none;
+    resize: vertical;
+  }
+
+  .m-textarea:focus { border-color: var(--primary); }
+
+  .m-textarea.mono {
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+    line-height: 1.65;
+  }
+
+  .field-input.invalid,
+  .m-textarea.invalid { border-color: var(--error); }
+
+  .btn.sm { height: var(--ctl-h-sm); }
+
+  /* ── Switch and segmented control ── */
+  .m-sw {
+    position: relative;
+    flex-shrink: 0;
+    width: 28px;
+    height: 16px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    transition: background .12s, border-color .12s;
+  }
+
+  .m-sw::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: left .12s, background .12s;
+  }
+
+  .m-sw[aria-checked='true'] {
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+
+  .m-sw[aria-checked='true']::after {
+    left: 14px;
+    background: var(--text-on-accent);
+  }
+
+  .m-sw:disabled {
+    cursor: default;
+    opacity: .5;
+  }
+
+  .m-sw:focus-visible,
+  .m-seg button:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+  }
+
+  .m-seg {
+    display: inline-flex;
+    flex-shrink: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .m-seg button {
+    height: 24px;
+    padding: 0 10px;
+    border: 0;
+    border-right: 1px solid var(--border);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+
+  .m-seg button:last-child { border-right: 0; }
+  .m-seg button:hover { color: var(--text-primary); }
+
+  .m-seg button[aria-pressed='true'] {
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: var(--fw-medium);
+  }
+
+  /* ── Tables: grid rows, so a cell can hold two lines and a row can be picked ── */
+  .m-table {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .m-hr,
+  .m-tr {
+    display: grid;
+    align-items: center;
+    column-gap: 12px;
+    min-height: 30px;
+    padding: 0 8px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .m-hr {
+    border-bottom-color: var(--border);
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-medium);
+  }
+
+  .m-tr { font-size: var(--fs-dense); }
+  .m-tr.flush { padding: 0; }
+  .m-tr.pick { cursor: pointer; }
+  .m-tr.pick:hover { background: var(--bg-hover); }
+  .m-tr.sel,
+  .m-tr.sel:hover { background: var(--accent-soft); }
+
+  .m-empty {
+    padding: 14px 8px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+  }
+
+  /* ── Tiles ── */
+  .m-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+  }
+
+  .m-tile b {
+    font-size: var(--fs-xl);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-tight);
+    line-height: 1.2;
+  }
+
+  /* ── Dialogs ── */
+  .m-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 4px;
+  }
+
+  .m-key-reveal {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+  }
+
+  .m-key-text {
+    flex: 1;
+    color: var(--accent);
+    font-family: var(--font-code);
+    font-size: var(--fs-sm);
+    word-break: break-all;
+  }
+
+  /* ── Below a wide desktop the side column goes under the main one ── */
+  @include bp.below(bp.$bp-lg) {
+    .m-cols {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .m-side { width: auto !important; }
+  }
+
+  /* On a tablet or a phone a table keeps its columns and scrolls sideways inside its section,
+     rather than widening the page. The layouts for those sizes are still to be designed; this
+     only keeps the desktop one from breaking there. */
+  @include bp.below(bp.$bp-md) {
+    .m-table { overflow-x: auto; }
+
+    .m-table > .m-hr,
+    .m-table > .m-tr:not(.flush) { min-width: 600px; }
+
+    .m-row.between { flex-wrap: wrap; }
+  }
+}

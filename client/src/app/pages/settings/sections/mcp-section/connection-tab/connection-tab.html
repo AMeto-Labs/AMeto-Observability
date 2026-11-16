@@ -1,0 +1,149 @@
+<div class="m-cols">
+  <div class="m-main">
+    <app-section title="MCP endpoint">
+      <div class="m-row between">
+        <span class="m-sub">AI clients connect to this address with a profile key. Answers are masked on the server before they leave it.</span>
+        <span class="m-row tight m-fixed">
+          <span class="state" [class.on]="enabled()">{{ enabled() ? 'Enabled' : 'Disabled' }}</span>
+          <button
+            type="button"
+            class="m-sw"
+            role="switch"
+            aria-label="MCP endpoint enabled"
+            [attr.aria-checked]="enabled()"
+            [disabled]="switching()"
+            (click)="toggleEnabled()"
+          ></button>
+        </span>
+      </div>
+      <div class="m-row">
+        <span class="m-inp m-cd m-grow">{{ url() }}</span>
+        <button type="button" class="btn" (click)="copy('url', url())">
+          <lucide-icon [name]="copied() === 'url' ? 'check' : 'copy'" [size]="13" />
+          Copy
+        </button>
+      </div>
+      <div class="m-row tight wrap">
+        <span class="m-pill">Streamable HTTP</span>
+        <span class="m-pill">MCP 2026-07-28</span>
+        <span class="m-pill">also serves 2025-11-25 and earlier</span>
+        <span class="m-pill">Bearer profile key</span>
+      </div>
+      @if (!enabled()) {
+        <span class="m-hint">Switched off, the address answers 503 to every client. Profiles, rules and tools are kept.</span>
+      }
+      @if (switchError(); as error) {
+        <span class="m-err" role="alert">{{ error }}</span>
+      }
+    </app-section>
+
+    <app-section title="Connect a client">
+      <div class="m-row between wrap">
+        <div class="m-seg" role="group" aria-label="Client">
+          @for (c of clients; track c.id) {
+            <button type="button" [attr.aria-pressed]="client() === c.id" (click)="client.set(c.id)">{{ c.label }}</button>
+          }
+        </div>
+        <button type="button" class="btn" (click)="createProfile.emit()">
+          <lucide-icon name="key" [size]="13" />
+          Create a profile key
+        </button>
+      </div>
+      @for (s of snippets(); track s.label; let i = $index) {
+        <div class="m-fld">
+          <span class="m-lbl">{{ s.label }}</span>
+          <div class="m-row top">
+            <pre class="m-code m-grow">{{ s.code }}</pre>
+            <button type="button" class="btn" (click)="copy('snippet-' + i, s.code)">
+              <lucide-icon [name]="copied() === 'snippet-' + i ? 'check' : 'copy'" [size]="13" />
+              Copy
+            </button>
+          </div>
+        </div>
+      }
+      <span class="m-hint">The key itself never goes into a file: each developer keeps it in {{ keyVariable }}.</span>
+    </app-section>
+  </div>
+
+  <div class="m-side side">
+    <app-section title="Last 24 hours">
+      <div class="tiles">
+        @for (t of tiles(); track t.label) {
+          <div class="m-tile">
+            <span class="m-hint">{{ t.label }}</span>
+            <b>{{ t.value }}</b>
+            <span class="m-hint m-el">{{ t.note }}</span>
+          </div>
+        }
+      </div>
+      @if (store.summary()?.partial) {
+        <span class="m-hint">There were more calls than one summary reads: these are the figures of the newest.</span>
+      }
+    </app-section>
+
+    <app-section title="Server limits">
+      <span class="m-sub">Ceilings for every profile. A profile can only lower them.</span>
+      <div class="limits">
+        <label class="limit">
+          <span class="m-mut">Response budget</span>
+          <span class="limit-ctl">
+            <input class="field-input" type="number" min="1000" max="24000" step="500" aria-label="Response budget, tokens"
+                   [ngModel]="form().responseBudgetTokens" (ngModelChange)="setLimit('responseBudgetTokens', asCount($event))" />
+            <span class="m-hint unit">tokens</span>
+          </span>
+        </label>
+        <label class="limit">
+          <span class="m-mut">Widest time window</span>
+          <span class="limit-ctl">
+            <input class="field-input" type="text" aria-label="Widest time window" placeholder="7d"
+                   [class.invalid]="windowMinutes() === null"
+                   [ngModel]="form().window" (ngModelChange)="setLimit('window', $event)" />
+            <span class="m-hint unit">m · h · d</span>
+          </span>
+        </label>
+        <label class="limit">
+          <span class="m-mut">Events per call</span>
+          <span class="limit-ctl">
+            <input class="field-input" type="number" min="10" max="5000" aria-label="Events per call"
+                   [ngModel]="form().maxEvents" (ngModelChange)="setLimit('maxEvents', asCount($event))" />
+            <span class="m-hint unit">events</span>
+          </span>
+        </label>
+        <label class="limit">
+          <span class="m-mut">Calls per key</span>
+          <span class="limit-ctl">
+            <input class="field-input" type="number" min="1" max="6000" aria-label="Calls per key, per minute"
+                   [ngModel]="form().callsPerMinute" (ngModelChange)="setLimit('callsPerMinute', asCount($event))" />
+            <span class="m-hint unit">/ min</span>
+          </span>
+        </label>
+        <label class="limit">
+          <span class="m-mut">AI searches at once</span>
+          <span class="limit-ctl">
+            <input class="field-input" type="number" min="1" max="16" aria-label="AI searches at once"
+                   [ngModel]="form().maxConcurrent" (ngModelChange)="setLimit('maxConcurrent', asCount($event))" />
+            <span class="m-hint unit">at once</span>
+          </span>
+        </label>
+      </div>
+      @if (limitsError(); as error) {
+        <span class="m-err" role="alert">{{ error }}</span>
+      }
+      @if (limitsDirty()) {
+        <div class="m-actions">
+          <button type="button" class="btn" [disabled]="savingLimits()" (click)="resetLimits()">Cancel</button>
+          <button type="button" class="btn primary" [disabled]="savingLimits()" (click)="saveLimits()">
+            <lucide-icon [name]="savingLimits() ? 'loader-circle' : 'save'" [size]="13" />
+            {{ savingLimits() ? 'Saving…' : 'Save limits' }}
+          </button>
+        </div>
+      }
+    </app-section>
+
+    <app-section title="How access works">
+      <span class="m-sub">A profile key is accepted on /mcp only. It cannot read /api/events, so it has no unmasked road.</span>
+      <span class="m-sub">AI searches share the search slots with people and take at most {{ savedConcurrent() }} of them at a time.</span>
+      <span class="m-sub">Every call is written to the log under the service ameto-mcp.</span>
+    </app-section>
+  </div>
+</div>

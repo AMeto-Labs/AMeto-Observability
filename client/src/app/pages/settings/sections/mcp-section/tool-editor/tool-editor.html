@@ -1,0 +1,265 @@
+@if (missing()) {
+  <section class="section">
+    <span class="m-sub">This tool no longer exists: it was deleted, or the link is out of date.</span>
+    <div>
+      <button type="button" class="btn" (click)="closed.emit()">
+        <lucide-icon name="arrow-left" [size]="13" />
+        Published tools
+      </button>
+    </div>
+  </section>
+} @else {
+  <div class="m-cols">
+    <div class="m-main">
+      <section class="section" aria-label="Tool definition">
+        <div class="m-row between wrap">
+          <span class="m-row tight m-grow">
+            <button type="button" class="crumb section-title" (click)="back()">Published tools</button>
+            <span class="m-dim">/</span>
+            <span class="m-cd m-strong m-el">{{ form().name || 'new tool' }}</span>
+            <span class="m-pill" [class.ok]="isPublished()">{{ isNew() ? 'New' : isPublished() ? 'Published' : 'Draft' }}</span>
+          </span>
+          <span class="m-row tight m-fixed">
+            <button type="button" class="btn" [disabled]="!dirty() || saving()" (click)="discard()">Discard changes</button>
+            @if (isPublished()) {
+              <button type="button" class="btn" [disabled]="saving()" (click)="save(false)">Unpublish</button>
+              <button type="button" class="btn primary" [disabled]="saving() || !dirty()" (click)="save(true)">
+                <lucide-icon [name]="saving() ? 'loader-circle' : 'save'" [size]="13" />
+                {{ saving() ? 'Saving…' : 'Save' }}
+              </button>
+            } @else {
+              <button type="button" class="btn" [disabled]="saving() || (!dirty() && !isNew())" (click)="save(false)">Save as draft</button>
+              <button type="button" class="btn primary" [disabled]="saving()" (click)="save(true)">
+                <lucide-icon [name]="saving() ? 'loader-circle' : 'send'" [size]="13" />
+                {{ saving() ? 'Saving…' : 'Save and publish' }}
+              </button>
+            }
+          </span>
+        </div>
+
+        @if (error(); as message) {
+          <span class="m-err" role="alert">{{ message }}</span>
+        }
+
+        <div class="head">
+          <label class="m-fld">
+            <span class="m-lbl">Name</span>
+            <input class="field-input mono" placeholder="payment_declines" maxlength="64" spellcheck="false"
+                   [class.invalid]="errorField() === 'name'"
+                   [ngModel]="form().name" (ngModelChange)="patch({ name: $event })" />
+            <span class="m-hint">What the AI calls. Lowercase, digits, underscores.</span>
+          </label>
+          <label class="m-fld">
+            <span class="m-lbl">Description for the AI</span>
+            <textarea class="m-textarea" rows="3" placeholder="What the tool returns and when to use it. The assistant chooses a tool by this text."
+                      [class.invalid]="errorField() === 'description'"
+                      [ngModel]="form().description" (ngModelChange)="patch({ description: $event })"></textarea>
+          </label>
+        </div>
+
+        <div class="m-fld">
+          <div class="m-row between">
+            <span class="m-lbl">Parameters</span>
+            <button type="button" class="btn sm" (click)="addParameter()">
+              <lucide-icon name="plus" [size]="12" />
+              Add parameter
+            </button>
+          </div>
+          <div class="m-table" role="table" aria-label="Parameters">
+            <div class="m-hr param-cols" role="row">
+              <span role="columnheader">Name</span>
+              <span role="columnheader">Type</span>
+              <span role="columnheader">Description</span>
+              <span role="columnheader">Allowed or default</span>
+              <span></span>
+            </div>
+            @for (p of form().parameters; track $index; let i = $index) {
+              <div class="m-tr param-cols param" role="row">
+                <input class="field-input mono m-par" placeholder="merchantId" spellcheck="false" aria-label="Parameter name"
+                       [ngModel]="p.name" (ngModelChange)="patchParameter(i, { name: $event })" />
+                <span class="m-row tight">
+                  <select class="m-select" aria-label="Type" [ngModel]="p.type" (ngModelChange)="patchParameter(i, { type: $event })">
+                    @for (t of types; track t) { <option [value]="t">{{ t }}</option> }
+                  </select>
+                  <label class="check m-mut">
+                    <input type="checkbox" [checked]="p.required" (change)="patchParameter(i, { required: $any($event.target).checked })" />
+                    required
+                  </label>
+                </span>
+                <input class="field-input" placeholder="What the assistant should pass" aria-label="Parameter description"
+                       [ngModel]="p.description" (ngModelChange)="patchParameter(i, { description: $event })" />
+                @if (p.type === 'enum') {
+                  <input class="field-input mono" placeholder="value_a, value_b" aria-label="Allowed values" spellcheck="false"
+                         [ngModel]="p.values" (ngModelChange)="patchParameter(i, { values: $event })" />
+                } @else {
+                  <input class="field-input mono" placeholder="default, if any" aria-label="Default value" spellcheck="false"
+                         [ngModel]="p.default" (ngModelChange)="patchParameter(i, { default: $event })" />
+                }
+                <button type="button" class="btn-icon danger" title="Remove parameter" aria-label="Remove parameter" (click)="removeParameter(i)">
+                  <lucide-icon name="x" [size]="12" />
+                </button>
+              </div>
+            } @empty {
+              <div class="m-empty">No parameters: the tool runs its filter as it is written.</div>
+            }
+          </div>
+        </div>
+
+        <div class="m-fld">
+          <label class="m-lbl" for="mcp-tool-filter">Filter</label>
+          <!-- The textarea is what is typed into; the layer under it is the same text with the
+               placeholders coloured. One box, one font, one wrap — so the two stay in step. -->
+          <div class="filter" [class.invalid]="errorField() === 'filter'">
+            <pre class="filter-layer" aria-hidden="true">@for (s of filterSegments(); track $index) {<span [class.m-par]="s.kind === 'param'">{{ s.text }}</span>}<br></pre>
+            <textarea id="mcp-tool-filter" class="filter-input" spellcheck="false" autocapitalize="off" autocomplete="off"
+                      placeholder="@service = 'payments-api' and MerchantId = {merchantId}"
+                      [ngModel]="form().filter" (ngModelChange)="patch({ filter: $event })"></textarea>
+          </div>
+          <span class="m-hint">A parameter is inserted as a value. A clause whose optional parameter was not given is dropped.</span>
+          @if (placeholderProblems(); as problems) {
+            <span class="m-err">{{ problems }}</span>
+          }
+        </div>
+
+        <div class="m-fld">
+          <span class="m-lbl">Returned fields</span>
+          <div class="m-row tight wrap">
+            @for (f of form().fields; track f) {
+              <span class="m-chip m-cd">
+                {{ f }}
+                <button type="button" class="m-chip-x" [attr.aria-label]="'Remove ' + f" (click)="removeField(f)">
+                  <lucide-icon name="x" [size]="11" />
+                </button>
+              </span>
+            } @empty {
+              <span class="m-chip">All properties</span>
+            }
+            <input class="field-input mono small-input" placeholder="PaymentId" aria-label="Add a returned field" spellcheck="false"
+                   [ngModel]="fieldDraft()" (ngModelChange)="fieldDraft.set($event)"
+                   (keydown.enter)="addField(); $event.preventDefault()" />
+            <button type="button" class="btn sm" [disabled]="!fieldDraft().trim()" (click)="addField()">
+              <lucide-icon name="plus" [size]="12" />
+              Add
+            </button>
+          </div>
+          <span class="m-hint">Only these properties are returned, with the template. Masking rules still apply to them.</span>
+        </div>
+
+        <div class="tail">
+          <label class="m-fld">
+            <span class="m-lbl">Default window</span>
+            <input class="field-input" placeholder="1h"
+                   [class.invalid]="windowMinutes() === null"
+                   [ngModel]="form().window" (ngModelChange)="patch({ window: $event })" />
+          </label>
+          <label class="m-fld">
+            <span class="m-lbl">Events per call</span>
+            <input class="field-input" type="number" min="1" max="5000"
+                   [ngModel]="form().maxEvents" (ngModelChange)="patch({ maxEvents: asCount($event) })" />
+          </label>
+          <label class="m-fld">
+            <span class="m-lbl">Order</span>
+            <select class="m-select" [ngModel]="form().order" (ngModelChange)="patch({ order: $event })">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+            </select>
+          </label>
+          <div class="m-fld">
+            <span class="m-lbl">Available to profiles</span>
+            <div class="m-row tight wrap profiles">
+              @for (p of grantedProfiles(); track p.id) {
+                <span class="m-chip">
+                  {{ p.name }}
+                  <button type="button" class="m-chip-x" [attr.aria-label]="'Withdraw from ' + p.name" (click)="removeProfile(p.id)">
+                    <lucide-icon name="x" [size]="11" />
+                  </button>
+                </span>
+              } @empty {
+                <span class="m-hint">No profile yet</span>
+              }
+              @if (availableProfiles().length) {
+                <select class="m-select add-profile" aria-label="Add a profile" [ngModel]="''" (ngModelChange)="addProfile($event)">
+                  <option value="">Add…</option>
+                  @for (p of availableProfiles(); track p.id) {
+                    <option [value]="p.id">{{ p.name }}</option>
+                  }
+                </select>
+              }
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="m-side side">
+      <section class="section" aria-label="Test run">
+        <div class="m-row between">
+          <span class="section-title">Test run</span>
+          @if (testProfile(); as profile) {
+            <select class="m-select" aria-label="Run as profile" [ngModel]="profile.id" (ngModelChange)="pickProfile($event)">
+              @for (p of store.profiles(); track p.id) {
+                <option [value]="p.id">as profile: {{ p.name }}</option>
+              }
+            </select>
+          }
+        </div>
+
+        <div class="args">
+          @for (p of testParameters(); track p.name) {
+            <label class="m-fld">
+              <span class="m-lbl m-cd m-par m-el">{{ p.name }}</span>
+              @if (p.options.length) {
+                <select class="m-select" [ngModel]="testValue(p.name)" (ngModelChange)="setTestValue(p.name, $event)">
+                  <option value="">—</option>
+                  @for (o of p.options; track o) { <option [value]="o">{{ o }}</option> }
+                </select>
+              } @else {
+                <input class="field-input mono" spellcheck="false" [placeholder]="p.placeholder"
+                       [ngModel]="testValue(p.name)" (ngModelChange)="setTestValue(p.name, $event)" />
+              }
+            </label>
+          }
+          <label class="m-fld">
+            <span class="m-lbl m-cd m-el">from</span>
+            <input class="field-input mono" spellcheck="false" [placeholder]="fromPlaceholder()"
+                   [ngModel]="testValue('from')" (ngModelChange)="setTestValue('from', $event)" />
+          </label>
+        </div>
+
+        <div class="m-row between">
+          <span class="m-hint">{{ resultLine() }}</span>
+          <button type="button" class="btn primary m-fixed" [disabled]="testing() || !testProfile()" (click)="run()">
+            <lucide-icon [name]="testing() ? 'loader-circle' : 'play'" [size]="13" />
+            {{ testing() ? 'Running…' : 'Run' }}
+          </button>
+        </div>
+
+        @if (testError(); as message) {
+          <span class="m-err" role="alert">{{ message }}</span>
+        }
+
+        @if (result(); as r) {
+          @if (r.filter) {
+            <div class="m-fld">
+              <span class="m-lbl">Filter with these arguments</span>
+              <pre class="m-code">@for (s of boundSegments(); track $index) {<span [class.m-tok]="s.kind === 'token'">{{ s.text }}</span>}</pre>
+            </div>
+          }
+          <div class="m-fld">
+            <span class="m-lbl">Answer, as the AI receives it</span>
+            <pre class="m-code pre tall" [class.refused]="r.isError">@for (s of answerSegments(); track $index) {<span [class.m-tok]="s.kind === 'token'">{{ s.text }}</span>}</pre>
+          </div>
+        }
+
+        <div class="m-fld">
+          <span class="m-lbl">Definition in the tool list of the AI</span>
+          @if (definition(); as json) {
+            <pre class="m-code pre tall">{{ json }}</pre>
+          } @else {
+            <span class="m-hint">Run the tool, or save it, to see the definition an assistant is shown.</span>
+          }
+        </div>
+      </section>
+    </div>
+  </div>
+}

@@ -1,0 +1,41 @@
+<nav class="m-tabs" aria-label="AI / MCP sections">
+  @for (tab of tabs; track tab.id) {
+    <button
+      type="button"
+      class="m-tab"
+      [class.active]="activeTab() === tab.id"
+      [attr.aria-current]="activeTab() === tab.id ? 'page' : null"
+      (click)="select(tab.id)"
+    >{{ tab.label }}</button>
+  }
+</nav>
+
+@if (store.loadError(); as error) {
+  <div class="m-load-error" role="alert">
+    <span>{{ error }}</span>
+    <button type="button" class="btn" (click)="store.load()">Try again</button>
+  </div>
+} @else if (!store.loaded()) {
+  <span class="loading-text">Loading…</span>
+} @else {
+  <!-- A tab is created the first time it is opened and kept from then on, so what was typed
+       into one survives a look at another. -->
+  @if (visited().has('connection')) {
+    <app-mcp-connection-tab class="m-tabpanel" [hidden]="activeTab() !== 'connection'" (createProfile)="newProfile()" />
+  }
+  @if (visited().has('profiles')) {
+    <app-mcp-profiles-tab class="m-tabpanel" [hidden]="activeTab() !== 'profiles'" [createRequest]="createRequest()" />
+  }
+  @if (visited().has('masking')) {
+    <app-mcp-masking-tab class="m-tabpanel" [hidden]="activeTab() !== 'masking'" />
+  }
+  @if (visited().has('tools')) {
+    <app-mcp-tools-tab class="m-tabpanel" [hidden]="activeTab() !== 'tools' || editing() !== null" (edit)="openTool($event)" />
+  }
+  @if (editing(); as toolId) {
+    <app-mcp-tool-editor class="m-tabpanel" [toolId]="toolId" (closed)="closeEditor()" (saved)="openTool($event, true)" />
+  }
+  @if (visited().has('activity')) {
+    <app-mcp-activity-tab class="m-tabpanel" [hidden]="activeTab() !== 'activity'" [active]="activeTab() === 'activity'" />
+  }
+}

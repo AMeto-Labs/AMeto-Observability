@@ -1,0 +1,62 @@
+.side { width: 480px; }
+
+.cols { grid-template-columns: minmax(0, 1fr) 120px 120px 90px 24px; }
+
+.detectors {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 20px;
+}
+
+.detector {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  min-width: 0;
+  min-height: 30px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-dense);
+}
+
+/* An event as name and value, a line each. */
+.kv {
+  display: flex;
+  flex-direction: column;
+  white-space: normal;
+}
+
+.kv-line {
+  display: flex;
+  gap: 10px;
+}
+
+.kv-key {
+  flex-shrink: 0;
+  width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kv-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* The input a service is typed into and its button: one item of the row, so they wrap together. */
+.adder {
+  display: inline-flex;
+  flex: 1 1 190px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.service-input {
+  flex: 1;
+  min-width: 0;
+  height: var(--ctl-h-sm);
+  font-size: var(--fs-xs);
+}

@@ -1,0 +1,122 @@
+<div class="m-cols">
+  <div class="m-main">
+    <app-section title="Built-in tools">
+      <div class="m-table" role="table" aria-label="Built-in tools">
+        <div class="m-hr builtin-cols" role="row">
+          <span></span>
+          <span role="columnheader">Tool</span>
+          <span role="columnheader">What it gives the AI</span>
+          <span class="m-num" role="columnheader">Calls 7 d</span>
+        </div>
+        @for (r of builtIn(); track r.tool.name) {
+          <div class="m-tr builtin-cols row" role="row">
+            <button type="button" class="m-sw" role="switch"
+                    [attr.aria-checked]="r.tool.enabled" [attr.aria-label]="r.tool.name + ' for every profile'"
+                    [disabled]="switching() === r.tool.name" (click)="toggleBuiltIn(r.tool.name, !r.tool.enabled)"></button>
+            <span class="m-cd" role="cell" [class.m-dim]="!r.tool.enabled">{{ r.tool.name }}</span>
+            <span class="m-mut m-el" role="cell" [attr.title]="r.tool.description">{{ r.tool.description }}</span>
+            <span class="m-mut m-num" role="cell">{{ r.calls }}</span>
+          </div>
+        }
+      </div>
+      <span class="m-hint">Switched off here, a tool is offered to no profile. A profile has its own switches for the ones left on.</span>
+      @if (switchError(); as error) {
+        <span class="m-err" role="alert">{{ error }}</span>
+      }
+    </app-section>
+
+    <app-section title="Published tools">
+      <div class="m-row between">
+        <span class="m-sub">A saved query the AI calls by name. Parameters are bound as values, so the AI cannot extend the filter.</span>
+        <button type="button" class="btn primary m-fixed" (click)="edit.emit('new')">
+          <lucide-icon name="plus" [size]="13" />
+          New tool
+        </button>
+      </div>
+
+      <div class="m-table" role="table" aria-label="Published tools">
+        <div class="m-hr published-cols" role="row">
+          <span role="columnheader">Tool</span>
+          <span role="columnheader">Parameters</span>
+          <span role="columnheader">Profiles</span>
+          <span role="columnheader">Status</span>
+          <span class="m-num" role="columnheader">Calls 7 d</span>
+          <span></span>
+        </div>
+        @for (r of published(); track r.tool.id) {
+          <div class="m-tr published-cols tall" role="row">
+            <span class="m-two-lines" role="cell">
+              <span class="m-cd m-el m-strong">{{ r.tool.name }}</span>
+              <span class="m-hint m-el" [attr.title]="r.tool.description">{{ r.tool.description }}</span>
+            </span>
+            <span class="m-cd m-dim m-el" role="cell" [attr.title]="r.signature">{{ r.signature }}</span>
+            <span class="m-mut" role="cell">{{ r.profiles }}</span>
+            <span role="cell">
+              <span class="m-pill" [class.ok]="r.tool.published">{{ r.tool.published ? 'Published' : 'Draft' }}</span>
+            </span>
+            <span class="m-mut m-num" role="cell">{{ r.calls }}</span>
+            <span class="row-actions" role="cell">
+              <button type="button" class="btn-icon" title="Edit tool" [attr.aria-label]="'Edit ' + r.tool.name" (click)="edit.emit(r.tool.id)">
+                <lucide-icon name="pencil" [size]="12" />
+              </button>
+              <button type="button" class="btn-icon danger" title="Delete tool" [attr.aria-label]="'Delete ' + r.tool.name" (click)="askDelete(r.tool)">
+                <lucide-icon name="trash-2" [size]="12" />
+              </button>
+            </span>
+          </div>
+        } @empty {
+          <div class="m-empty">No published tools yet. Save a query with parameters and an assistant can call it by name.</div>
+        }
+      </div>
+    </app-section>
+  </div>
+
+  <div class="m-side side">
+    <app-section title="Tool list by profile">
+      <span class="m-sub">Each key gets its own list. Clients re-read it within a minute of a change.</span>
+      @if (listProfile(); as p) {
+        <div class="m-row wrap">
+          <select class="m-select" aria-label="Profile" [ngModel]="p.id" (ngModelChange)="pickProfile($event)">
+            @for (option of store.profiles(); track option.id) {
+              <option [value]="option.id">{{ option.name }}</option>
+            }
+          </select>
+          <span class="m-hint">{{ listNote() }}</span>
+        </div>
+        @if (offered() === null) {
+          <span class="m-err" role="alert">The list could not be read.</span>
+        } @else {
+          <div class="m-table">
+            @for (r of offeredRows(); track r.tool.name) {
+              <div class="m-tr flush offered" [attr.title]="r.tool.description">
+                <span class="m-two-lines">
+                  <span class="m-cd">{{ r.tool.name }}</span>
+                  <span class="m-hint m-cd m-el">{{ r.signature }}</span>
+                </span>
+              </div>
+            } @empty {
+              <div class="m-empty">This profile is offered no tools.</div>
+            }
+          </div>
+          <span class="m-hint">{{ offeredNote() }}</span>
+        }
+      } @else {
+        <span class="m-hint">There are no profiles yet.</span>
+      }
+    </app-section>
+  </div>
+</div>
+
+<app-modal [open]="deleting() !== null" title="Delete the tool?" [dismissable]="!working()" (close)="deleting.set(null)">
+  <span class="m-sub">“{{ deleting()?.name }}” is withdrawn from every profile at once. An assistant that still has it in its tool list is refused when it calls it.</span>
+  @if (deleteError(); as error) {
+    <span class="m-err" role="alert">{{ error }}</span>
+  }
+  <div class="m-actions">
+    <button type="button" class="btn" [disabled]="working()" (click)="deleting.set(null)">Cancel</button>
+    <button type="button" class="btn danger" [disabled]="working()" (click)="remove()">
+      <lucide-icon [name]="working() ? 'loader-circle' : 'trash-2'" [size]="13" />
+      Delete tool
+    </button>
+  </div>
+</app-modal>

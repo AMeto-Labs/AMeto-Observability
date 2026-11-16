@@ -1,0 +1,123 @@
+.side { width: 480px; }
+
+.crumb {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.crumb:hover { color: var(--accent); }
+
+.head {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: var(--gap);
+}
+
+/* ── Parameters ── */
+.param-cols { grid-template-columns: 110px 146px minmax(0, 1fr) 150px 24px; }
+.m-hr.param-cols { min-height: 26px; }
+.param { min-height: 34px; }
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.check input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.param .m-select {
+  width: 74px;
+  flex-shrink: 0;
+}
+
+/* ── The filter: a textarea over a coloured copy of its own text ── */
+.filter {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-main);
+}
+
+.filter:focus-within { border-color: var(--primary); }
+.filter.invalid { border-color: var(--error); }
+
+.filter-layer,
+.filter-input {
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  font-family: var(--font-code);
+  font-size: var(--fs-dense);
+  font-variant-ligatures: none;
+  letter-spacing: 0;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  tab-size: 2;
+}
+
+/* The layer is in the flow and gives the box its height; two lines at least. */
+.filter-layer {
+  min-height: calc(2 * 1.65em + 16px);
+  color: var(--text-primary);
+  pointer-events: none;
+}
+
+/* The textarea lies exactly over it, with its own glyphs unpainted: the caret and the
+   selection are the textarea's, the colours are the layer's. */
+.filter-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text-primary);
+  outline: none;
+  resize: none;
+}
+
+.filter-input::placeholder { color: var(--text-muted); }
+
+.small-input {
+  width: 130px;
+  height: var(--ctl-h-sm);
+}
+
+.tail {
+  display: grid;
+  grid-template-columns: 110px 110px 150px minmax(0, 1fr);
+  gap: var(--gap);
+}
+
+.tail .m-select { width: 100%; }
+
+.profiles { min-height: var(--ctl-h); }
+
+/* Two classes, to stand above the grid's own rule for its selects. */
+.tail .add-profile {
+  width: auto;
+  height: var(--ctl-h-sm);
+  font-size: var(--fs-xs);
+}
+
+/* ── The test run ── */
+.args {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
+.args .m-select { width: 100%; }
+
+.refused { color: var(--error); }

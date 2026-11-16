@@ -28,6 +28,11 @@
       }
       <app-api-keys-section [hidden]="activeTab() !== 'api-keys'" />
       @if (authService.isAdmin()) {
+        <!-- Loaded — code and data — the first time its tab is opened, and kept mounted from
+             then on like the sections around it. -->
+        @defer (when activeTab() === 'ai-mcp') {
+          <app-mcp-section [hidden]="activeTab() !== 'ai-mcp'" />
+        }
         <app-updates-section [hidden]="activeTab() !== 'updates'" />
       }
     </div>
