@@ -232,6 +232,27 @@ public interface ISegmentIndex
     uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) => null;
 
     /// <summary>
+    /// <see cref="LookupIntersect"/> for a caller that only READS the answer, with the same three
+    /// answers: false is "no information" (null there), true with no offsets is "no event matches
+    /// all predicates", and true with offsets is "these and no others".
+    ///
+    /// <para>What differs is who owns the memory. <see cref="LookupIntersect"/> returns an array
+    /// that is the caller's, which for a single predicate means a copy of the posting list — four
+    /// bytes a row, made so that the caller cannot write to the list the index keeps. Read-only
+    /// memory needs no such copy: an index that keeps its lists may hand out the list ITSELF.
+    /// So the memory is valid for as long as it is referenced, shared with every other caller
+    /// that asked the same question, and not to be written through any back door. An index with
+    /// nothing to share answers from <see cref="LookupIntersect"/>, which is this default.</para>
+    /// </summary>
+    bool TryLookupIntersect(
+        IReadOnlyList<(string property, object? value)> predicates, out ReadOnlyMemory<uint> offsets)
+    {
+        uint[]? list = LookupIntersect(predicates);
+        offsets = list;
+        return list is not null;
+    }
+
+    /// <summary>
     /// How many rows an equality predicate would name AT MOST, without naming any — for a caller
     /// that has to decide whether a posting list is worth building before it builds one.
     ///

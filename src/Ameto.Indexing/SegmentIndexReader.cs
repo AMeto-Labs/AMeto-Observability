@@ -15,6 +15,14 @@ internal interface IIndexSectionSource
     /// <summary>The group's packed inverted section; empty when the group has none.</summary>
     ReadOnlySpan<byte> InvertedSection();
 
+    /// <summary>
+    /// <paramref name="length"/> bytes of the inverted section from <paramref name="offset"/>: one
+    /// posting list a walk located earlier, for a reader that needs it and nothing else of the
+    /// section. A source that can reads those bytes alone. The span is good until the source is
+    /// next asked for anything — decode it before asking again.
+    /// </summary>
+    ReadOnlySpan<byte> InvertedSlice(int offset, int length);
+
     /// <summary>The group's packed trigram section; empty when the group has none.</summary>
     ReadOnlySpan<byte> TrigramSection();
 
@@ -80,7 +88,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private SegmentTrigramIndex.PackedHeader?    _trigramHeader;
     private Dictionary<long, Kept<int[]?>>?      _trigrams;       // null value: the section has no such trigram
     private Dictionary<BucketKey, Kept<int[]?>>? _buckets;        // null value: the property has no such value
-    private Dictionary<BucketKey, int>?          _counts;         // a bucket counted and not (yet) decoded
+    private Dictionary<BucketKey, Counted>?      _counts;         // a bucket counted and not (yet) decoded
     private Dictionary<string, Kept<bool>>?      _bloomVerdicts;
 
     // The bound on answers that grow with the QUESTIONS rather than the data: bloom verdicts and
@@ -93,6 +101,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     private Slot[]                               _ring = [];
     private int                                  _ringUsed, _hand;
     private long                                 _memoBytes;
+
+    // What an UNCACHED memo was made to learn (SegmentIndexView.Open), so that a memo carried to
+    // a second view of a group is known to be that group's. Null for a cached memo — the cache
+    // keys and fingerprints its memos itself — and for a reader that owns its sections.
+    private LearnedFrom? _learnedFrom;
 
     /// <summary>
     /// A test seam: runs after a question has been answered from a section and before the answer
@@ -134,6 +147,26 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// <summary>An empty memo for one (file, group): no section, nothing native, a few hundred
     /// bytes until a query teaches it something.</summary>
     internal static SegmentIndexReader CreateMemo() => new(null, null, null);
+
+    /// <summary>
+    /// The one group an uncached memo learns: the file and group a view opened it for, and the
+    /// fingerprint of the bytes behind them (<see cref="IndexGroupFingerprint"/>). Everything a
+    /// memo remembers is about those bytes — its lists are ordinals of that group, its absences
+    /// are about that section, the places it noted lists at are offsets into it — so this is what
+    /// a memo carried to a second view has to match (<see cref="SegmentIndexView.Open"/>).
+    /// </summary>
+    internal readonly record struct LearnedFrom(string Path, int Group, IndexGroupFingerprint Fingerprint);
+
+    /// <summary>An empty memo for an uncached view of the group <paramref name="learning"/> names.</summary>
+    internal static SegmentIndexReader CreateMemo(in LearnedFrom learning)
+    {
+        var memo = CreateMemo();
+        memo._learnedFrom = learning;
+        return memo;
+    }
+
+    /// <summary>True for the memo of an uncached view of exactly the group <paramref name="group"/> names.</summary>
+    internal bool Learns(in LearnedFrom group) => _learnedFrom is { } own && own == group;
 
     /// <summary>True for a reader made by <see cref="Load"/>; false for a memo.</summary>
     internal bool OwnsSections => _bloom is not null;
@@ -202,6 +235,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         LookupIntersect(predicates, Own);
 
     /// <inheritdoc/>
+    public bool TryLookupIntersect(
+        IReadOnlyList<(string property, object? value)> predicates, out ReadOnlyMemory<uint> offsets) =>
+        TryLookupIntersect(predicates, Own, out offsets);
+
+    /// <inheritdoc/>
     public int? CountAtMost(string propertyName, object? value) => CountAtMost(propertyName, value, Own);
 
     private IIndexSectionSource Own => _bloom is not null ? this : throw Unbound();
@@ -210,6 +248,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         new("This index is a query-cache memo and owns no section: ask it through a SegmentIndexView.");
 
     ReadOnlySpan<byte> IIndexSectionSource.InvertedSection() => _inverted;
+    ReadOnlySpan<byte> IIndexSectionSource.InvertedSlice(int offset, int length) => _inverted.AsSpan(offset, length);
     ReadOnlySpan<byte> IIndexSectionSource.TrigramSection()  => _trigram;
     SegmentBloomFilter IIndexSectionSource.BloomFilter()     => _bloom ?? throw Unbound();
 
@@ -291,8 +330,13 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         // in the query path sends the marker here today; the day something does, a vouched
         // group must not be dropped for it.
         if (!SegmentInvertedIndex.IsExceptionMarker(propertyName) && !MightContainValue(value, src)) return false;
-        var offsets = PostingsForKey(propertyName, value, src, out bool known);
-        return !known || offsets is not null;    // property not indexed → no information
+
+        // Whether the value is THERE, which is not a question about its rows. This used to take
+        // the posting list and look at whether it was null — so a narrowing's first step, the
+        // check that the group holds the value at all, decoded and kept the whole list of a
+        // value most of the group carries, in every group it asked.
+        bool held = HoldsKey(propertyName, value, src, out bool known);
+        return !known || held;                   // property not indexed → no information
     }
 
     internal uint[]? Lookup(string propertyName, object? value, IIndexSectionSource src)
@@ -307,39 +351,70 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     /// array is "nothing here matches". A property the section never wrote is the first case; a
     /// property present without the value is the third.
     /// </summary>
-    internal uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates, IIndexSectionSource src)
-    {
-        if (predicates.Count == 0) return null;
+    internal uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates, IIndexSectionSource src) =>
+        TryLookupIntersect(predicates, src, out var offsets) ? offsets.ToArray() : null;
 
+    /// <summary>
+    /// <see cref="LookupIntersect"/> without its copy (<see cref="ISegmentIndex.TryLookupIntersect"/>):
+    /// false is "cannot narrow, scan", true with no offsets is "nothing here matches", and true
+    /// with offsets is "these and no others" — as read-only memory over the array the answer was
+    /// worked out in.
+    ///
+    /// <para>For ONE predicate whose value the group files once — one bucket, one encoding, the
+    /// usual case — that array is the bucket's posting list as the memo keeps it. It is not
+    /// copied: a memo's arrays are never written once published, the caller cannot write through
+    /// read-only memory, and the copy this replaces cost a query four bytes for every row the
+    /// list names, per group asked, to protect the list from a caller that only ever read it. A
+    /// value filed several ways (a property and its alias, several encodings of a literal) is
+    /// their union, made for the call. For several predicates it is the intersection: an array
+    /// of its own, or — when one of the lists is empty — that empty list.</para>
+    /// </summary>
+    internal bool TryLookupIntersect(
+        IReadOnlyList<(string property, object? value)> predicates, IIndexSectionSource src,
+        out ReadOnlyMemory<uint> offsets)
+    {
+        offsets = default;
+        if (predicates.Count == 0) return false;
+
+        int[]?   only  = null;      // the one list, while there is one
         int[][]? lists = null;
-        int used = 0;
+        int      used  = 0;
         for (int i = 0; i < predicates.Count; i++)
         {
-            int[]? offsets = PostingsForKey(predicates[i].property, predicates[i].value, src, out bool known);
+            int[]? postings = PostingsForKey(predicates[i].property, predicates[i].value, src, out bool known);
             if (!known) continue;                           // unknown property → no information
-            if (offsets is null)
-                return Array.Empty<uint>();                 // known bucket, absent value → proven empty
+            if (postings is null) return true;              // known bucket, absent value → proven empty
 
-            lists ??= new int[predicates.Count][];
-            lists[used++] = offsets;
+            if (used == 0) only = postings;
+            else
+            {
+                lists ??= new int[predicates.Count][];
+                if (used == 1) lists[0] = only!;
+                lists[used] = postings;
+            }
+            used++;
         }
 
-        if (used == 0) return null;                          // nothing usable → scan
-        return SegmentInvertedIndex.IntersectLists(lists!, used);
+        if (used == 0) return false;                         // nothing usable → scan
+        offsets = SegmentInvertedIndex.AsOffsets(used == 1 ? only! : SegmentInvertedIndex.IntersectAscending(lists!, used));
+        return true;
     }
 
     /// <summary>
     /// <see cref="ISegmentIndex.CountAtMost"/>: <see cref="LookupIntersect"/>'s three answers for
-    /// the one predicate with a number in place of the list, and NOTHING DECODED to produce it —
-    /// each posting list opens with its own count, so a bucket's size is read off the section,
-    /// or off the memo once it has been.
+    /// the one predicate with a number in place of the list, and NO LONG LIST DECODED to produce
+    /// it — each posting list opens with its own count, so a bucket's size is read off the
+    /// section, or off the memo once it has been. A SHORT list is decoded by the walk that
+    /// counts it (<see cref="ShortListPostings"/>), so that a selective lookup, which goes on to
+    /// ask for the list, walks its property's entries once and not twice.
     ///
-    /// <para>The caller it exists for is the narrowing that has to choose between naming a
-    /// group's rows and saying "every row". A list that names nearly all of a group is the one
-    /// case where decoding it buys nothing, and the one case where it is largest: a
-    /// level-split Error group asked for the rows that carry an exception. Counted first, that
-    /// list is never decoded, never copied and never kept — where it used to be all three, per
-    /// group, for a page of fifty rows.</para>
+    /// <para>The caller it exists for is the narrowing, which asks it of every equality before
+    /// it names a row. A list that names nearly all of a group is the one case where decoding it
+    /// buys nothing, and the one case where it is largest: a level-split Error group asked for
+    /// its Error rows, or for the rows that carry an exception. Counted first, that list is
+    /// never decoded, never copied and never kept — where it used to be all three, per group,
+    /// for a page of fifty rows. And a list that is merely long is one the narrowing leaves
+    /// until a read reaches its group, which a page mostly does not.</para>
     ///
     /// <para>An upper bound: the number sums the predicate's buckets and the value's encodings
     /// where the list would union them, so a row filed under two of them is counted twice. That
@@ -449,8 +524,37 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
     {
         long total = 0;
         for (int i = 0; i < forms.Length; i++)
-            total += BucketCount(prop, forms[i]!, codec, src);
+            total += Math.Max(0, Probe(prop, forms[i]!, codec, src));   // "no such value" counts no row
         return total;
+    }
+
+    /// <summary>
+    /// <see cref="PostingsForKey"/>'s "not null" without the postings: whether ANY bucket
+    /// <see cref="BucketsFor"/> names holds any encoding of the value. Stops at the first that
+    /// does. <paramref name="known"/> is false when no candidate property exists.
+    /// </summary>
+    private bool HoldsKey(string property, object? value, IIndexSectionSource src, out bool known)
+    {
+        var catalog = Catalog(src);
+        known = BucketsFor(catalog, property, out var own, out var flat, out var legacy);
+        if (own is null && flat is null && legacy is null) return false;
+
+        IndexValueForms.Buffer buf = default;
+        Span<string?> forms = buf;
+        forms = forms[..IndexValueForms.Serialised(value, forms)];
+
+        return Holds(own, forms, catalog.Codec, src)
+            || Holds(flat, forms, catalog.Codec, src)
+            || Holds(legacy, forms, catalog.Codec, src);
+    }
+
+    private bool Holds(SegmentInvertedIndex.PackedProperty? prop, ReadOnlySpan<string?> forms,
+                       bool codec, IIndexSectionSource src)
+    {
+        if (prop is null) return false;
+        for (int i = 0; i < forms.Length; i++)
+            if (Probe(prop, forms[i]!, codec, src) >= 0) return true;
+        return false;
     }
 
     private int[]? PostingsFor(SegmentInvertedIndex.PackedProperty prop, ReadOnlySpan<string?> forms,
@@ -466,11 +570,43 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         return acc;
     }
 
-    /// <summary>One (property, encoded value) bucket: from the memo, or by scanning the
-    /// property's entries in the section and remembering the answer — its absence included.</summary>
+    /// <summary>
+    /// The longest posting list the walk that COUNTS a bucket also decodes
+    /// (<see cref="Probe"/>): at most this many rows.
+    ///
+    /// <para>Two things hang on the one number. Here, it is what keeps a selective lookup at one
+    /// walk of its property's entries: its list is far below it, so the walk that finds the
+    /// entry hands the list over, and the request for it that follows is answered from the memo.
+    /// In the query's narrowing it is, for a query's first prefilter batch, the line between a
+    /// list that is named while the prefilter has the group open and one that waits for a read
+    /// to reach the group (<c>QueryExecutor.NameUpFront</c>) — the same line, so that what is
+    /// named up front is exactly what the count already decoded, and naming it reads nothing
+    /// more.</para>
+    ///
+    /// <para>What a list this short costs to have: at most a kilobyte in the memo, per bucket
+    /// asked — a fraction of what opening the group's segment costs (4 KB at 10 000 rows, 11 KB
+    /// at 40 000, measured by <c>FirstPageIndexCostProbe</c>), and so not worth a second visit
+    /// to the group to avoid. A longer list is: the lists of one prefilter batch of eight groups
+    /// cost a page of fifty rows 0.4-1.0 MB at 10 000 rows a group and 1.4-3.9 MB at 40 000,
+    /// when each was built — decoded, copied out and gathered — in every group of the batch.</para>
+    /// </summary>
+    public const int ShortListPostings = 256;
+
+    /// <summary>A bucket's posting count, and where its list lies when it is one list.</summary>
+    private readonly struct Counted(int count, SegmentInvertedIndex.ListSpan where)
+    {
+        public readonly int                           Count = count;
+        public readonly SegmentInvertedIndex.ListSpan Where = where;
+    }
+
+    /// <summary>One (property, encoded value) bucket: from the memo, or from the section and
+    /// remembered — its absence included. A list <see cref="Probe"/> counted and located is
+    /// decoded from its own bytes, which is all of the section that is read for it; anything
+    /// else is found by scanning the property's entries.</summary>
     private int[]? Bucket(SegmentInvertedIndex.PackedProperty prop, string form, bool codec, IIndexSectionSource src)
     {
-        var key = new BucketKey(prop.Name, form);
+        var key   = new BucketKey(prop.Name, form);
+        SegmentInvertedIndex.ListSpan where = default;
         lock (_gate)
         {
             if (_buckets is not null && _buckets.TryGetValue(key, out var known))
@@ -478,9 +614,12 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                 if (known.Slot >= 0) _ring[known.Slot].Referenced = true;
                 return known.Value;
             }
+            if (_counts is not null && _counts.TryGetValue(key, out var counted)) where = counted.Where;
         }
 
-        var found = SegmentInvertedIndex.ScanBucket(src.InvertedSection(), codec, prop.Runs, form);
+        int[]? found = where.IsOne
+            ? SegmentInvertedIndex.DecodeAt(src.InvertedSlice(where.Offset, where.Length))
+            : SegmentInvertedIndex.ScanBucket(src.InvertedSection(), codec, prop.Runs, form);
         BeforeRemember?.Invoke();
         lock (_gate)
         {
@@ -490,38 +629,29 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                 RememberAbsentLocked(key);
                 return null;
             }
-
-            if (_buckets is null)
-            {
-                _buckets = [];
-                Interlocked.Add(ref _memoBytes, ShellBytes);
-            }
-            _buckets.Add(key, new Kept<int[]?>(found, -1));
-            Interlocked.Add(ref _memoBytes, BucketEntryBytes(key) + ArrayBytes + 4L * found.Length);
-
-            // The list says everything its count did.
-            if (_counts is not null && _counts.Remove(key))
-                Interlocked.Add(ref _memoBytes, -BucketEntryBytes(key));
+            RememberListLocked(key, found);
         }
         return found;
     }
 
     /// <summary>
-    /// One (property, encoded value) bucket's posting COUNT, without its postings: from the memo —
-    /// a list already decoded, a count already read, an absence already found — or off the
-    /// section, where each matching list's count is its first varint
-    /// (<see cref="SegmentInvertedIndex.CountBucket"/>). "No such value here" counts 0 and is
-    /// remembered the way <see cref="Bucket"/> remembers it, so the two share one answer about
-    /// absence — and only about absence: a value that is there with an empty list also counts 0,
-    /// and is remembered as a count, so that <see cref="Bucket"/> still finds its (empty) list.
+    /// One (property, encoded value) bucket's posting COUNT, or −1 when the property holds no
+    /// such value: from the memo — a list already decoded, a count already read, an absence
+    /// already found — or by ONE walk of the property's entries
+    /// (<see cref="SegmentInvertedIndex.ProbeBucket"/>) that reads each matching list's leading
+    /// count and decodes the list only when it is short (<see cref="ShortListPostings"/>).
     ///
-    /// <para>A count is kept only until its list is decoded (see <see cref="Bucket"/>), so what
-    /// stays remembered as a bare number is the bucket nobody went on to read — the dense one
-    /// the count was asked about in order NOT to read. Like the postings it stands for, it
-    /// grows with what the group holds and not with the questions asked, so it is outside the
-    /// ring that bounds verdicts and absences.</para>
+    /// <para>Everything the walk learns is remembered. Absence, the way <see cref="Bucket"/>
+    /// remembers it, so the two share one answer about it — and only about absence: a value that
+    /// is there with an empty list counts 0, and its (empty) list is what is kept. A short list,
+    /// as the list. A long one, as its count and the place its bytes lie, kept only until the
+    /// list is decoded (see <see cref="Bucket"/>): so what stays remembered as a bare number is
+    /// the bucket nobody went on to read — the dense one the count was asked about in order NOT
+    /// to read. Like the postings it stands for, a count grows with what the group holds and not
+    /// with the questions asked, so it is outside the ring that bounds verdicts and
+    /// absences.</para>
     /// </summary>
-    private int BucketCount(SegmentInvertedIndex.PackedProperty prop, string form, bool codec, IIndexSectionSource src)
+    private int Probe(SegmentInvertedIndex.PackedProperty prop, string form, bool codec, IIndexSectionSource src)
     {
         var key = new BucketKey(prop.Name, form);
         lock (_gate)
@@ -529,20 +659,26 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             if (_buckets is not null && _buckets.TryGetValue(key, out var known))
             {
                 if (known.Slot >= 0) _ring[known.Slot].Referenced = true;
-                return known.Value?.Length ?? 0;
+                return known.Value?.Length ?? -1;
             }
-            if (_counts is not null && _counts.TryGetValue(key, out int counted)) return counted;
+            if (_counts is not null && _counts.TryGetValue(key, out var counted)) return counted.Count;
         }
 
-        int found = SegmentInvertedIndex.CountBucket(src.InvertedSection(), codec, prop.Runs, form);
+        int found = SegmentInvertedIndex.ProbeBucket(
+            src.InvertedSection(), codec, prop.Runs, form, ShortListPostings, out int[]? postings, out var where);
         BeforeRemember?.Invoke();
         lock (_gate)
         {
-            if (_buckets is not null && _buckets.TryGetValue(key, out var raced)) return raced.Value?.Length ?? 0;
+            if (_buckets is not null && _buckets.TryGetValue(key, out var raced)) return raced.Value?.Length ?? -1;
             if (found < 0)
             {
                 RememberAbsentLocked(key);
-                return 0;
+                return -1;
+            }
+            if (postings is not null)
+            {
+                RememberListLocked(key, postings);
+                return postings.Length;
             }
 
             if (_counts is null)
@@ -550,10 +686,26 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                 _counts = [];
                 Interlocked.Add(ref _memoBytes, ShellBytes);
             }
-            if (_counts.TryAdd(key, found))
+            if (_counts.TryAdd(key, new Counted(found, where)))
                 Interlocked.Add(ref _memoBytes, BucketEntryBytes(key));
         }
         return found;
+    }
+
+    /// <summary>Remembers a bucket's decoded postings, in place of the count kept for it until now.</summary>
+    private void RememberListLocked(BucketKey key, int[] postings)
+    {
+        if (_buckets is null)
+        {
+            _buckets = [];
+            Interlocked.Add(ref _memoBytes, ShellBytes);
+        }
+        _buckets.Add(key, new Kept<int[]?>(postings, -1));
+        Interlocked.Add(ref _memoBytes, BucketEntryBytes(key) + ArrayBytes + 4L * postings.Length);
+
+        // The list says everything its count did.
+        if (_counts is not null && _counts.Remove(key))
+            Interlocked.Add(ref _memoBytes, -BucketEntryBytes(key));
     }
 
     /// <summary>Remembers that a bucket holds no such value — one of the answers the ring bounds.</summary>

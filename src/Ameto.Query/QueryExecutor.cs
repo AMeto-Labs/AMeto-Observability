@@ -20,10 +20,14 @@ namespace Ameto.Query;
 ///      <see cref="SegmentIndexView"/> — the cached memo of what earlier queries worked out,
 ///      reading a section only for a new question — and call
 ///      <see cref="ISegmentIndex.MightContain"/>; skip groups where the index says no match.
-///   3. Candidate narrowing: trigram (<see cref="ISegmentIndex.LookupTrigram"/>) and
-///      inverted (<see cref="ISegmentIndex.LookupIntersect"/>) posting lists yield
-///      candidate event ordinals (file order, v5 segments) — the reader skips blocks
-///      without candidates and materialises only candidate rows.
+///   3. Candidate narrowing (<see cref="Narrow"/>), per index group and in two parts. What the
+///      posting lists' COUNTS decide is decided with step 2: a group that holds no match is
+///      dropped, one whose lists name nearly all of it contributes every row, and a short list
+///      is named there. A LONG list — trigram (<see cref="ISegmentIndex.LookupTrigram"/>) aside,
+///      which is still built with step 2 — is, for the first batch of a query, built only when
+///      the scan reaches its group (<see cref="SegmentPlan"/>): the candidate ordinals of that
+///      group, by which the reader skips blocks without candidates and materialises only
+///      candidate rows. Later batches build theirs as they go (<see cref="MergeSourcesAsync"/>).
 ///   4. Block decode: LZ4 decompress via <see cref="SegmentReader"/>.
 ///   5. Per-event AST evaluation via <see cref="FilterEvaluator"/>.
 ///
@@ -574,6 +578,9 @@ public sealed class QueryExecutor : IQueryExecutor
         // finally closes every one of them, primed or not. A filter with nothing to ask an index
         // has every segment survive without opening any, so it skips the prefilter outright.
         bool prefilter   = NeedsPrefilter(filter, levels);
+        // Once for the query: every prefilter batch asks with them, and so does a group whose
+        // rows are named only when the scan reaches it.
+        var  levelHints  = LevelHints(levels);
         var  survivors   = new List<PrefilterResult>(prefilter ? Math.Min(order.Length, PrefilterParallelism) : order.Length);
         int  checkedUpTo = 0;                    // order[..checkedUpTo] has been through the prefilter
         int  batch       = PrefilterParallelism; // the next prefilter batch; doubles each time
@@ -645,9 +652,26 @@ public sealed class QueryExecutor : IQueryExecutor
                         if (checkedUpTo == order.Length || !CouldBeat(order[checkedUpTo].Info)) return;
 
                         int take   = Math.Min(batch, order.Length - checkedUpTo);
+
+                        // THE FIRST BATCH LEAVES LONG POSTING LISTS FOR THE SCAN; THE REST DO NOT.
+                        // A page is usually filled out of the first batch — that is why it is one
+                        // wave of the prefilter's parallelism and no more — and for that batch a
+                        // list built up front is, for all but the group or two the page reads,
+                        // built to be thrown away (see SegmentPlan for what that cost).
+                        //
+                        // A page that comes back for a SECOND batch has said something about
+                        // itself: its rows are thin on the ground, or there are none, and the
+                        // prefilter is going to walk on through the window. From there the lists
+                        // are built as each batch is checked, eight segments at a time, as every
+                        // batch's used to be. Left to the scan they would be built one group at a
+                        // time on the consumer's thread — and what two lists prove only together,
+                        // an intersection that comes out empty, would be learned a segment at a
+                        // time, by a search whose whole cost is finding that out.
+                        int nameAtMost = checkedUpTo == 0 ? NameUpFront : int.MaxValue;
+
                         var passed = await PrefilterSegmentsAsync(
                             new ArraySegment<WindowSegment>(order, checkedUpTo, take),
-                            filter, levels, fromTicks, toTicks, ct);
+                            filter, levels, levelHints, nameAtMost, fromTicks, toTicks, ct);
                         // Survivors come back in input order and the input is the next slice
                         // of the priming order, so appending keeps the queue ordered.
                         survivors.AddRange(passed);
@@ -658,11 +682,11 @@ public sealed class QueryExecutor : IQueryExecutor
 
                     if (!CouldBeat(survivors[next].Info)) return;
 
-                    var (segInfo, candidateOffsets, segReader, segPin) = survivors[next++];
+                    var (segInfo, segPlan, segReader, segPin) = survivors[next++];
                     // The reader is BORROWED — the finally below owns every one of them,
                     // primed or not, so the scan must not dispose what it did not open. So is
                     // the pin, which the scan maps its own reader from when there is none.
-                    var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets, segReader, segPin,
+                    var stream = ScanSegmentAsync(segInfo, filter, levels, segPlan, segReader, segPin,
                                                   from, to, afterTs, afterId, !forward, pace, ct);
                     var newIt = stream.GetAsyncEnumerator(ct);
                     if (await newIt.MoveNextAsync())
@@ -727,9 +751,9 @@ public sealed class QueryExecutor : IQueryExecutor
     // ── Index fast-skip + trigram pre-filter (combined, parallel) ────────────
 
     /// <summary>
-    /// Result of the per-segment prefilter: the segment to scan, optional candidate block
-    /// offsets from the trigram index (null = scan all blocks), and the reader the prefilter
-    /// already opened.
+    /// Result of the per-segment prefilter: the segment to scan, what the index decided about
+    /// each of its groups (<paramref name="Plan"/>; null = read every row of the segment), and
+    /// the reader the prefilter already opened.
     ///
     /// <para>OWNERSHIP: <paramref name="Reader"/> belongs to <see cref="MergeSourcesAsync"/>,
     /// which disposes every one of them in its finally — including the segments that never
@@ -750,7 +774,136 @@ public sealed class QueryExecutor : IQueryExecutor
     /// (see <see cref="WindowSegment"/>).</para>
     /// </summary>
     private readonly record struct PrefilterResult(
-        SegmentInfo Info, uint[]? CandidateOffsets, SegmentReader? Reader, SafeFileHandle? Pin);
+        SegmentInfo Info, SegmentPlan? Plan, SegmentReader? Reader, SafeFileHandle? Pin);
+
+    /// <summary>
+    /// What the index decided about each group of ONE surviving segment, and what it has left
+    /// undecided: the plan the scan reads the segment by (<see cref="SegmentReader.ReadGroupsAsync"/>),
+    /// one group at a time, in the order it walks them.
+    ///
+    /// <para>A group is in one of four states. Three are answers the prefilter gave while it had
+    /// the group's index open: nothing of it is read (no match is possible, it lies outside the
+    /// window, or it is empty — the state a slot starts in), all of it is read, or the rows named
+    /// are. The fourth is a question put off, by a query's first prefilter batch only: the
+    /// group's rows have to be named, the posting lists that name them are long, and they are
+    /// not built until the scan asks for this group (<see cref="NameLate"/>).</para>
+    ///
+    /// <para><b>Why put it off.</b> The prefilter works a batch of segments before the first row
+    /// is returned, and a page is mostly filled by the newest one or two. Named up front, a list
+    /// cost twelve to sixteen bytes for every row it named — decoded, copied out of the index,
+    /// gathered into one list for the segment and copied out of that — in every group of every
+    /// segment of the batch: 0.4-1.0 MB for a page of fifty rows over eight groups of 10 000,
+    /// 1.4-3.9 MB over eight of 40 000 (<c>FirstPageIndexCostProbe</c>), and growing with the
+    /// group. Left to the scan, a list is built for the groups the page reads, and a segment
+    /// with many groups pays for the one the page ends in rather than for all of them.</para>
+    ///
+    /// <para><b>Why per group.</b> One candidate list for a whole segment can only name rows. A
+    /// group that contributes every row then has to be spelled as each of its ordinals, and a
+    /// group the index knows nothing about cannot be spelled at all — it used to send the whole
+    /// segment, narrowed groups included, to a full scan. Here each group keeps the answer its
+    /// own index gave.</para>
+    ///
+    /// <para>Filled by one prefilter worker, then read by the scan's thread, never both at once:
+    /// the prefilter batch has completed before any of its survivors is primed. Each slot is
+    /// read once and emptied, so a candidate list — or the memo a cacheless query carries to the
+    /// second asking — is not kept for the rest of the query by a group already read.</para>
+    /// </summary>
+    private sealed class SegmentPlan(
+        QueryExecutor owner, SegmentInfo info, SegmentReader reader,
+        CompiledFilter filter, (string, object?)[][]? levelHints) : ISegmentGroupPlan
+    {
+        private enum Part : byte { None, Whole, Named, Late }
+
+        private struct Slot
+        {
+            public Part                 Part;
+            public ReadOnlyMemory<uint> Candidates;   // Named
+            public SegmentIndexReader?  Memo;         // Late, and only without an index cache
+        }
+
+        private readonly Slot[] _groups = new Slot[reader.Groups.Length];
+
+        /// <summary>Every row of group <paramref name="group"/> is read: the index said so, or said nothing.</summary>
+        public void ReadWhole(int group) => _groups[group].Part = Part.Whole;
+
+        /// <summary>
+        /// Only the rows at <paramref name="candidates"/> are read. The list may be the index
+        /// cache's own (<see cref="ISegmentIndex.TryLookupIntersect"/>), which is why it is
+        /// read-only memory from here to the reader's row walk.
+        /// </summary>
+        public void ReadOnly(int group, ReadOnlyMemory<uint> candidates) =>
+            _groups[group] = new Slot { Part = Part.Named, Candidates = candidates };
+
+        /// <summary>
+        /// The group's rows are named when the scan reaches it. <paramref name="memo"/> is what
+        /// the prefilter's view of the group learned, when no cache is there to keep it
+        /// (<see cref="SegmentIndexView.UncachedMemo"/>).
+        /// </summary>
+        public void NameLater(int group, SegmentIndexReader? memo) =>
+            _groups[group] = new Slot { Part = Part.Late, Memo = memo };
+
+        GroupRead ISegmentGroupPlan.Read(int group)
+        {
+            var slot = _groups[group];
+            _groups[group] = default;
+
+            return slot.Part switch
+            {
+                Part.Whole => GroupRead.Whole,
+                Part.Named => GroupRead.Only(slot.Candidates),
+                Part.Late  => owner.NameLate(info, reader, group, filter, levelHints, slot.Memo),
+                _          => GroupRead.Skip,
+            };
+        }
+    }
+
+    /// <summary>
+    /// Index groups whose rows the prefilter left to be named by the scan
+    /// (<see cref="SegmentPlan.NameLater"/>), counted for the plans a scan reads — not for one
+    /// the prefilter then dropped, whose groups are read whole — process-wide, with the caveats
+    /// of <see cref="Pins"/>: a test that reads it needs the assembly's parallelisation off.
+    /// </summary>
+    internal static long GroupsLeftForLater;
+
+    /// <summary>
+    /// The other half of <see cref="GroupsLeftForLater"/>: groups a scan reached and named
+    /// (<see cref="NameLate"/>). The difference is what a query did not pay for — the lists of
+    /// the groups its page never got to — and is the number a test states that saving by.
+    /// </summary>
+    internal static long GroupsNamedLate;
+
+    /// <summary>
+    /// The second asking of a group the prefilter left for later: everything <see cref="Narrow"/>
+    /// has to say about it, with no limit on the lists it builds — the scan is here, and needs
+    /// them now. The answers already taken are taken again, off the memo this time: the group's
+    /// catalog, the lists' counts and where the lists lie, so that what is read of the file is
+    /// the lists themselves (<see cref="SegmentIndexReader"/>).
+    ///
+    /// <para>A failure is the prefilter's kind of failure and gets its answer: the group is read
+    /// whole. The index may cost a query its acceleration, never its rows.</para>
+    /// </summary>
+    private GroupRead NameLate(
+        SegmentInfo info, SegmentReader reader, int group,
+        CompiledFilter filter, (string, object?)[][]? levelHints, SegmentIndexReader? carried)
+    {
+        Interlocked.Increment(ref GroupsNamedLate);
+        try
+        {
+            using var index = _indexFactory.OpenGroup(_indexCache, info.FilePath, group, reader, carried);
+            return Narrow(filter, index, levelHints, reader.Groups[group].EventCount, int.MaxValue, out var candidates) switch
+            {
+                GroupVerdict.Dropped => GroupRead.Skip,
+                GroupVerdict.Named   => GroupRead.Only(candidates),
+                _                    => GroupRead.Whole,
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "Index narrowing failed for group {Group} of segment {Id}, reading the group whole", group, info.Id);
+            return GroupRead.Whole;
+        }
+    }
 
     /// <summary>
     /// A window segment and the handle pinning its file since the catalog snapshot (#114), or null
@@ -810,10 +963,21 @@ public sealed class QueryExecutor : IQueryExecutor
     /// never touches its multi-MB inverted/trigram sections. v4-v6 segments expose exactly
     /// one group, so they take the same path with the same result as before.</para>
     /// </summary>
+    /// <param name="levelHints">
+    /// The level set as index hints (<see cref="LevelHints"/>), or null when the query has none.
+    /// </param>
+    /// <param name="nameAtMost">
+    /// The longest posting list this batch builds for a group while it has the group open; a
+    /// group that needs a longer one is left for the scan to name (<see cref="SegmentPlan"/>).
+    /// <see cref="NameUpFront"/> for a query's first batch and no limit after it — see
+    /// <see cref="MergeSourcesAsync"/> for why the two differ.
+    /// </param>
     private async Task<List<PrefilterResult>> PrefilterSegmentsAsync(
         IReadOnlyList<WindowSegment>  segInfos,
         CompiledFilter                filter,
         HashSet<Ameto.Core.LogLevel>? levels,
+        (string, object?)[][]?        levelHints,
+        int                           nameAtMost,
         long                          fromTicks,
         long                          toTicks,
         CancellationToken             ct)
@@ -828,26 +992,7 @@ public sealed class QueryExecutor : IQueryExecutor
             return passthrough;
         }
 
-        // GetTrigramHints() returns a pre-computed list — no .ToList() allocation needed.
-        var trigramHints   = filter.GetTrigramHints();
-        var invertedHints  = filter.GetInvertedHints();
-        bool hasIndexHint  = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
-        bool hasInvHints   = invertedHints.Count > 0;
-
-        // The levels PARAMETER prunes through the same index the `@l = '...'` FILTER
-        // uses. It used to prune nothing: an errors-only dashboard query decoded every
-        // block of every surviving segment only for the per-event level check to reject
-        // nearly all of it. Per group, each level of the set either has a posting list,
-        // is provably absent, or answers "no information" (a pre-index segment) — the
-        // union across the set is definitive unless any level answers the latter.
-        (string, object?)[][]? levelHints = null;
-        if (levels is { Count: > 0 })
-        {
-            levelHints = new (string, object?)[levels.Count][];
-            int li = 0;
-            foreach (var l in levels)
-                levelHints[li++] = [(ClefFields.Level, l.ToSeqString())];
-        }
+        bool hasIndexHint = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
 
         var results = new PrefilterResult?[segInfos.Count];
 
@@ -879,78 +1024,24 @@ public sealed class QueryExecutor : IQueryExecutor
                         // has done to the path since (#114).
                         reader = OpenSegment(info, seg.Pin);
 
-                        // Accumulated across the surviving groups. Posting offsets are FILE
-                        // ordinals in every group (SegmentIndexBuilder.Build writes
-                        // firstOrdinal + pos), so the groups' candidate arrays simply
-                        // concatenate — no rebasing.
+                        // What the index says about each group of this segment, kept PER GROUP:
+                        // the plan the scan reads the segment by (see SegmentPlan). Made at the
+                        // first group that survives — so a null plan below is a segment with no
+                        // survivor — and dropped again if all it turns out to say is "read
+                        // everything".
                         //
-                        // The ORDER of what comes out is STILL not a promise this method makes.
-                        // Each group's array is ascending — TryNarrowWithIndex merges sorted
-                        // posting lists now, where it used to drain a HashSet whose enumeration
-                        // order is unspecified by contract — but groups are appended in file
-                        // order and a later group's ordinals are all above an earlier one's only
-                        // because SegmentIndexBuilder.Build writes firstOrdinal + pos. Nothing
-                        // downstream may assume more than "the reader will handle it".
-                        //
-                        // SegmentReader.ReadEventsAsync verifies the order before its two-pointer
-                        // walk and sorts a copy when it has to, and that check is the contract,
-                        // not a belt-and-braces extra: the walk advances a single cursor through
-                        // the candidates alongside ascending row ordinals, so one descending pair
-                        // makes it step past a candidate it will never come back to and the query
-                        // silently loses rows the index proved it should return. Do not delete it
-                        // on the strength of a comment here.
-                        List<uint>? candidates = null;
-                        bool anyGroupSurvived  = false;
-                        // A surviving group that could not narrow (its index sections are absent —
-                        // e.g. a WAL-recovery flush that ran before the builder was wired) is NO
-                        // information about its rows. Candidates would then silently exclude them,
-                        // so the whole segment falls back to a full scan.
-                        bool unnarrowedGroup   = false;
-                        // THE THIRD NARROWING STATE: groups that contribute EVERY one of their
-                        // rows (see TryNarrowWithIndex — the level union that IS the group). Their
-                        // ordinals are the contiguous range [FirstOrdinal, +EventCount), so they
-                        // are not materialised here at all; they are generated only if some OTHER
-                        // group genuinely narrows and the segment therefore has to name ordinals.
-                        List<(uint First, uint Count)>? everyRowGroups = null;
-                        // Groups this segment could contribute rows from, and groups that survived.
-                        // When they agree, every row of the segment is a candidate, and the honest
-                        // way to say so is to hand the scan no candidate list at all.
-                        int groupsConsidered = 0, groupsAccepted = 0;
-
-                        // Appends the pending whole-group ranges. Called before a narrowed group's
-                        // own ordinals go in, so the list stays ascending: groups are visited in
-                        // ordinal order and everything pending came from an earlier one.
-                        void FlushEveryRowGroups()
-                        {
-                            if (everyRowGroups is null || candidates is null) return;
-                            for (int r = 0; r < everyRowGroups.Count; r++)
-                            {
-                                var (first, count) = everyRowGroups[r];
-                                for (uint o = 0; o < count; o++) candidates.Add(first + o);
-                            }
-                            everyRowGroups.Clear();
-                        }
-
-                        void Accept(uint[]? groupCandidates, bool everyRow, uint firstOrdinal, uint eventCount)
-                        {
-                            anyGroupSurvived = true;
-                            groupsAccepted++;
-
-                            if (everyRow)
-                            {
-                                (everyRowGroups ??= new List<(uint, uint)>(4)).Add((firstOrdinal, eventCount));
-                            }
-                            else if (groupCandidates is null)
-                            {
-                                unnarrowedGroup = true;
-                            }
-                            else
-                            {
-                                candidates ??= new List<uint>(groupCandidates.Length);
-                                FlushEveryRowGroups();
-                                candidates.AddRange(groupCandidates);
-                            }
-                        }
+                        // It replaced one candidate list for the whole segment, gathered here from
+                        // the groups' posting lists: a List the groups were appended to and the
+                        // array copied out of it, eight bytes a named row on top of the lists
+                        // themselves, for every segment of the batch, before the first row was
+                        // returned — and a group that contributed every row had to be written
+                        // into it ordinal by ordinal once any other group named its own.
+                        SegmentPlan? plan = null;
+                        // True once some group is NOT simply read whole: dropped, named, or left
+                        // to be named. Until then the segment's answer is "every row".
+                        bool narrowed = false;
+                        // Groups the plan leaves for the scan to name (GroupsLeftForLater).
+                        int leftForLater = 0;
 
                         var groups = reader.Groups;
                         for (int g = 0; g < groups.Length; g++)
@@ -959,12 +1050,11 @@ public sealed class QueryExecutor : IQueryExecutor
                             if (grp.EventCount == 0) continue;
                             // Group time bounds are exact, so this drops a group's index sections
                             // without reading them. The reader's per-event window check remains
-                            // the correctness gate. NOT counted as a dropped group below: the
-                            // reader prunes by the same window itself, so leaving such a group out
-                            // of an explicit candidate list buys nothing.
+                            // the correctness gate. NOT counted as narrowing: the reader prunes by
+                            // the same window itself, so a plan made only to leave such a group
+                            // out would buy nothing. In a plan that exists for another reason the
+                            // group's slot stays empty and it is not read.
                             if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
-
-                            groupsConsidered++;
 
                             // The group's index as this query sees it: the cached memo for (file,
                             // group) when there is a cache — found, or created empty — else a
@@ -993,67 +1083,91 @@ public sealed class QueryExecutor : IQueryExecutor
                             // accept, and an inline copy of that decision is exactly what once let
                             // the index prune rows a scan would have matched.
                             if (hasIndexHint && !PassesBloomGate(filter, index))
+                            {
+                                narrowed = true;
                                 continue;
+                            }
                             // No level of the set can be present in this group (no false negatives
                             // in the bloom) — skip it before the inverted lookups.
                             if (levelHints is not null && !AnyLevelMaybePresent(levelHints, index))
+                            {
+                                narrowed = true;
                                 continue;
+                            }
 
-                            // Phase 2: trigram offsets and the inverted-index narrowing. The fast
-                            // path above already returned for a filter with no hint of any kind, so
-                            // every group reaching here has something to look up. A group that is
-                            // provably empty for this filter is skipped, not the whole segment —
+                            // Phase 2: what the group's posting lists say — by their counts first,
+                            // and by the lists themselves only as far as this batch may build them
+                            // (nameAtMost: short ones in a query's first batch, any after it).
+                            // The fast path above already returned for a filter with no hint of any
+                            // kind, so every group reaching here has something to ask. A group that
+                            // is provably empty for this filter is skipped, not the whole segment —
                             // the next group may still hold matches.
-                            if (!TryNarrowWithIndex(filter, index, levelHints, grp.EventCount,
-                                                    out var groupCandidates, out bool groupEveryRow))
+                            var verdict = Narrow(filter, index, levelHints, grp.EventCount, nameAtMost,
+                                                 out var groupCandidates);
+                            if (verdict == GroupVerdict.Dropped)
+                            {
+                                narrowed = true;
                                 continue;
+                            }
 
-                            Accept(groupCandidates, groupEveryRow, grp.FirstOrdinal, grp.EventCount);
+                            plan ??= new SegmentPlan(this, info, reader, filter, levelHints);
+                            switch (verdict)
+                            {
+                                // The group's own ordinals, ascending as Narrow merges them — which
+                                // is NOT a promise the reader takes on trust: it verifies the order
+                                // before its two-pointer walk and sorts a copy when it has to
+                                // (SegmentReader.InWalkOrder). That check is the contract. The walk
+                                // advances a single cursor through the candidates alongside
+                                // ascending row ordinals, so one descending pair makes it step past
+                                // a candidate it will never come back to, and the query silently
+                                // loses rows the index proved it should return.
+                                case GroupVerdict.Named:
+                                    plan.ReadOnly(g, groupCandidates);
+                                    narrowed = true;
+                                    break;
+
+                                // The rows have to be named and the lists are long: left for the
+                                // scan, which names them if it gets to this group. With no cache to
+                                // keep what this view has just learned of the group, the plan
+                                // carries it to that second asking.
+                                case GroupVerdict.Deferred:
+                                    plan.NameLater(g, index.UncachedMemo);
+                                    leftForLater++;
+                                    narrowed = true;
+                                    break;
+
+                                // Every row — or NO INFORMATION: a group whose index sections are
+                                // absent (a WAL-recovery flush that ran before the builder was
+                                // wired), or whose index does not know the property. Nothing was
+                                // proved about its rows, so all of them are read; and that is all
+                                // it means. It used to send the whole SEGMENT to a full scan,
+                                // because one list for the segment could not say "all of this
+                                // group" without naming every row of it.
+                                default:
+                                    plan.ReadWhole(g);
+                                    break;
+                            }
                         }
 
                         // Every group rejected ⇒ the segment holds nothing this query can match.
-                        if (!anyGroupSurvived) return ValueTask.CompletedTask;
+                        if (plan is null) return ValueTask.CompletedTask;
 
-                        uint[]? candidateOffsets;
-                        if (unnarrowedGroup)
-                        {
-                            // One group with no information sends the whole segment to a full scan,
-                            // its narrowed groups included — a candidate list would exclude rows
-                            // nothing proved absent.
-                            candidateOffsets = null;
-                        }
-                        else if (candidates is not null)
-                        {
-                            // Something genuinely narrowed, so this segment has to name its rows —
-                            // and a whole-group contributor names its contiguous range, generated
-                            // directly rather than unioned out of its posting lists.
-                            FlushEveryRowGroups();
-                            candidateOffsets = candidates.ToArray();
-                        }
-                        else if (everyRowGroups is null)
-                        {
-                            candidateOffsets = null;                      // nothing narrowed at all
-                        }
-                        else if (groupsAccepted == groupsConsidered)
-                        {
-                            // EVERY group of this segment contributes EVERY one of its rows: the
-                            // candidate list would be 0,1,2,…,n-1. Saying so by handing back no
-                            // list is the same scan over the same rows, and it is the difference
-                            // between a plain block walk and a group-sized uint[] built by a
-                            // posting-list union, copied into a List, copied out again, and then
-                            // resolved by a binary search per block and a cursor step per row —
-                            // to select all of them. This is the level-only filter's normal shape
-                            // against a level-split store.
-                            candidateOffsets = null;
-                        }
-                        else
-                        {
-                            // Some group WAS rejected, so the survivors' rows still have to be
-                            // named — but as their plain ranges, with no posting lists involved.
-                            candidateOffsets = ContiguousOrdinals(everyRowGroups);
-                        }
-
-                        results[i] = new PrefilterResult(info, candidateOffsets, reader, seg.Pin);
+                        // EVERY group that could contribute contributes EVERY one of its rows:
+                        // the plan would say "whole" for each. Saying so with no plan is the
+                        // same scan over the same rows — the plain block walk — and it is the
+                        // level-only filter's normal shape against a level-split store.
+                        //
+                        // And a plan is walked group by group, which reads every row only where
+                        // the groups ARE the file (SegmentReader.GroupsCoverBlocks). Every file
+                        // this build writes is such a file; for one that is not, nothing is
+                        // assumed, and every row of it is read.
+                        var scanPlan = narrowed && reader.GroupsCoverBlocks ? plan : null;
+                        // Groups left for later are counted once the plan that leaves them is
+                        // the one the scan will read: a plan dropped here, or by a failure below,
+                        // has its groups read whole, never named.
+                        if (scanPlan is not null && leftForLater > 0)
+                            Interlocked.Add(ref GroupsLeftForLater, leftForLater);
+                        results[i] = new PrefilterResult(info, scanPlan, reader, seg.Pin);
                         keep = true;
                     }
                     catch (Exception ex)
@@ -1127,17 +1241,6 @@ public sealed class QueryExecutor : IQueryExecutor
         return index.MightContainValue(hintVal);
     }
 
-    /// <summary>
-    /// Phase 2: the definitive <c>MightContain</c> gate, trigram offset lookup and inverted
-    /// posting-list narrowing, against an already-loaded index.
-    ///
-    /// <para>Returns false when the segment is provably empty for this filter — the caller
-    /// then never reads it. <paramref name="candidates"/> is null for "scan every block" and
-    /// otherwise the exact local offsets worth deserialising.</para>
-    /// </summary>
-    internal static bool TryNarrowWithIndex(CompiledFilter filter, ISegmentIndex idx, out uint[]? candidates)
-        => TryNarrowWithIndex(filter, idx, levelHints: null, out candidates);
-
     /// <summary>True when at least one level of the set might be present per the group's bloom.</summary>
     private static bool AnyLevelMaybePresent((string, object?)[][] levelHints, SegmentIndexView index)
     {
@@ -1146,6 +1249,81 @@ public sealed class QueryExecutor : IQueryExecutor
                 return true;
         return false;
     }
+
+    /// <summary>
+    /// The level set as index hints, one single-predicate list per level, or null when the query
+    /// names no level.
+    ///
+    /// <para>The levels PARAMETER prunes through the same index the <c>@l = '...'</c> FILTER
+    /// uses. It used to prune nothing: an errors-only dashboard query decoded every block of
+    /// every surviving segment only for the per-event level check to reject nearly all of it.
+    /// Per group, each level of the set either has a posting list, is provably absent, or
+    /// answers "no information" (a pre-index segment) — the union across the set is definitive
+    /// unless any level answers the latter.</para>
+    /// </summary>
+    private static (string, object?)[][]? LevelHints(HashSet<Ameto.Core.LogLevel>? levels)
+    {
+        if (levels is not { Count: > 0 }) return null;
+
+        var hints = new (string, object?)[levels.Count][];
+        int i = 0;
+        foreach (var level in levels)
+            hints[i++] = [(ClefFields.Level, level.ToSeqString())];
+        return hints;
+    }
+
+    /// <summary>What one index group's index says about a filter: the answer <see cref="Narrow"/> gives.</summary>
+    internal enum GroupVerdict : byte
+    {
+        /// <summary>No row of the group can match. It is not read.</summary>
+        Dropped,
+
+        /// <summary>
+        /// The group contributes EVERY one of its rows: its posting lists name all of it, or so
+        /// nearly all that naming the rows is not worth a list (<see cref="NamesNearlyAllOf"/>).
+        /// A state and not a list, because the answer is the contiguous range the group directory
+        /// already states; materialising it is what the state exists to avoid.
+        /// </summary>
+        EveryRow,
+
+        /// <summary>Exactly the rows named are candidates.</summary>
+        Named,
+
+        /// <summary>
+        /// The index has nothing to say about the group's rows — it predates the index, or does
+        /// not know the property. Read like <see cref="EveryRow"/>, and a different statement:
+        /// that one is a fact about the group, this one is the absence of any.
+        /// </summary>
+        NoInformation,
+
+        /// <summary>
+        /// The rows have to be named, and a list that names them is longer than the caller let
+        /// be built now. Nothing more is settled by it: asked again without the limit, the group
+        /// may turn out to be any of the others — an intersection of two long lists can be empty.
+        /// </summary>
+        Deferred,
+    }
+
+    /// <summary>
+    /// The longest posting list a query's FIRST prefilter batch builds while it has a group
+    /// open; a longer one waits for the scan to reach the group (<see cref="SegmentPlan"/>).
+    /// Later batches build whatever they need (see <see cref="MergeSourcesAsync"/>).
+    ///
+    /// <para>It is the index's own line between a list its counting walk decodes and one it only
+    /// counts, so that what is named up front is what the count has already decoded — see
+    /// <see cref="SegmentIndexReader.ShortListPostings"/>, which says what a list this short
+    /// costs and why that is not worth a second visit to the group.</para>
+    /// </summary>
+    internal const int NameUpFront = SegmentIndexReader.ShortListPostings;
+
+    /// <summary>
+    /// <see cref="Narrow"/> with no limit on the lists it builds, as the three answers it had
+    /// before there was one to set: false when the group is provably empty for this filter — the
+    /// caller then never reads it — and otherwise <paramref name="candidates"/>, null for "read
+    /// every row" and otherwise the exact local offsets worth deserialising.
+    /// </summary>
+    internal static bool TryNarrowWithIndex(CompiledFilter filter, ISegmentIndex idx, out uint[]? candidates)
+        => TryNarrowWithIndex(filter, idx, levelHints: null, out candidates);
 
     internal static bool TryNarrowWithIndex(
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints, out uint[]? candidates)
@@ -1156,37 +1334,163 @@ public sealed class QueryExecutor : IQueryExecutor
         uint groupEventCount, out uint[]? candidates)
         => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount, out candidates, out _);
 
-    /// <param name="groupEventCount">
-    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision, taken in
-    /// two places: posting lists that already account for the group — the level union or the
-    /// intersection of the inverted hints when it names every event, the exception marker's
-    /// list when it names nearly every one (<see cref="NamesNearlyAllOf"/>) — narrow nothing
-    /// worth the list, and the group is reported whole instead. See below.
-    /// </param>
     /// <param name="everyRow">
-    /// True when the group contributes EVERY one of its rows — the third narrowing state,
-    /// distinct from both "these ordinals" (<paramref name="candidates"/>) and "no information"
-    /// (a null <paramref name="candidates"/> with this false). <paramref name="candidates"/> is
-    /// left null, because the answer is the contiguous range the caller already knows from the
-    /// group directory; materialising it is what this state exists to avoid.
+    /// True for <see cref="GroupVerdict.EveryRow"/>, which a null <paramref name="candidates"/>
+    /// alone does not tell from <see cref="GroupVerdict.NoInformation"/>.
     /// </param>
     internal static bool TryNarrowWithIndex(
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,
         uint groupEventCount, out uint[]? candidates, out bool everyRow)
     {
-        candidates = null;
-        everyRow   = false;
+        var verdict = Narrow(filter, idx, levelHints, groupEventCount, int.MaxValue, out var rows);
+        candidates = verdict == GroupVerdict.Named ? rows.ToArray() : null;
+        everyRow   = verdict == GroupVerdict.EveryRow;
+        return verdict != GroupVerdict.Dropped;
+    }
+
+    /// <summary>
+    /// Phase 2 of the prefilter: what one group's index says about the filter — the definitive
+    /// <c>MightContain</c> gate, the posting lists' counts, and then, only where still needed and
+    /// allowed, the lists: trigram offsets, the inverted hints' intersection, the level union.
+    ///
+    /// <para><b>Counted before named.</b> Every equality hint and every level of the set is first
+    /// asked how many rows its list holds (<see cref="ISegmentIndex.CountAtMost"/>), which the
+    /// index answers without building the list. Three things are settled by the numbers alone:
+    /// a list that holds no row drops the group; a list that names nearly all of the group
+    /// (<see cref="NamesNearlyAllOf"/>) narrows nothing worth having and is left out, so that
+    /// the group either contributes every row or is narrowed by the other hints alone; and a list
+    /// longer than <paramref name="nameAtMost"/> is not built by this call at all
+    /// (<see cref="GroupVerdict.Deferred"/>).</para>
+    ///
+    /// <para>All three are about what a list COSTS when it buys little. Naming a row costs four
+    /// bytes to decode and four to hand over, and the lists that cost most are the ones that say
+    /// least: <c>@l = 'Error'</c> over the Error segments of a level-split store is every row of
+    /// every group, the rows that carry an exception are nearly every row of the same groups, and
+    /// both were decoded, copied and compared with the group's size to learn that. A full read
+    /// hides it, since the rows it returns dwarf the lists. A PAGE does not: the prefilter works
+    /// a batch of segments before the first row is returned, so fifty rows paid for the lists of
+    /// every group in the batch (<c>FirstPageIndexCostProbe</c>). Hence the limit — the
+    /// prefilter passes <see cref="NameUpFront"/> for a query's first batch, and the scan, when
+    /// it reaches a group left that way, asks again with none.</para>
+    ///
+    /// <para><b>One function, two callers.</b> The limit is the only difference between the two
+    /// askings, deliberately: what drops a group, what makes it whole and which rows it names are
+    /// decided by the same lines whichever asks, so the answer cannot depend on when it was
+    /// given. A filter with a SUBSTRING predicate is the exception to the limit and not to the
+    /// rest: its trigram lists have no count to ask for, and the group they prove empty must be
+    /// dropped here, in the batch, rather than one segment at a time by the scan — so such a
+    /// filter is narrowed whole in one go, as every filter used to be.</para>
+    ///
+    /// <para>SAFE in every direction it errs: "every row" and "no information" are supersets, a
+    /// deferred group is asked again, and the scan re-checks each row it is handed against the
+    /// whole filter. Only <see cref="GroupVerdict.Dropped"/> and <see cref="GroupVerdict.Named"/>
+    /// can cost a row, and both rest on what they always did — a posting list (or its count of
+    /// zero) from an index that knows the property.</para>
+    /// </summary>
+    /// <param name="groupEventCount">
+    /// Events in the group being narrowed, or 0 for "unknown" — in which case no list is ever
+    /// "nearly all" and every one is named.
+    /// </param>
+    /// <param name="nameAtMost">
+    /// The longest posting list this call may build; <see cref="int.MaxValue"/> for no limit.
+    /// </param>
+    /// <param name="candidates">
+    /// The rows named, for <see cref="GroupVerdict.Named"/>; empty for every other verdict.
+    /// READ-ONLY, and not for the look of it: for a single equality whose value the group files
+    /// once — one bucket, one encoding, the usual case — it is the posting list as the index
+    /// keeps it, shared with every query that asks the same
+    /// (<see cref="ISegmentIndex.TryLookupIntersect"/>); the copy that used to stand between
+    /// them was four bytes for every row named, in every group a query named rows in. A value
+    /// filed several ways (a property and its alias, several encodings of a literal) is their
+    /// union, made for the call.
+    /// </param>
+    internal static GroupVerdict Narrow(
+        CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,
+        uint groupEventCount, int nameAtMost, out ReadOnlyMemory<uint> candidates)
+    {
+        candidates = default;
 
         var trigramHints  = filter.GetTrigramHints();
         var invertedHints = filter.GetInvertedHints();
-        bool hasIndexHint = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
 
         // Definitive inverted-index check (bloom can have false positives)
-        if (hasIndexHint
+        if (!filter.IsMatchAll
             && filter.TryGetIndexHint(out string prop, out object? val)
             && !idx.MightContain(prop, val))
-            return false;
+            return GroupVerdict.Dropped;
 
+        // ── What the counts decide ───────────────────────────────────────────────
+        //
+        // The inverted hints are ANDed, so each one's list bounds the answer by itself: one that
+        // holds no row proves the group empty, and one that names nearly all of the group can be
+        // left out of the intersection, which without it is a superset the scan trims. A hint
+        // whose property the index does not know (null) has no bucket to count and none to
+        // intersect: LookupIntersect passes over it below, as it always has.
+        ulong nearlyAll = 0;       // by position in invertedHints: lists not worth building
+        bool  anyToName = false;   // some hint is left whose list has to be built
+        int   longest   = 0;       // the longest list that would be
+        for (int i = 0; i < invertedHints.Count; i++)
+        {
+            var (property, value) = invertedHints[i];
+            if (idx.CountAtMost(property, value) is not int listed) continue;
+            if (listed == 0) return GroupVerdict.Dropped;
+
+            // The mask has sixty-four positions; a hint past them is named like any other.
+            if (i < 64 && NamesNearlyAllOf(groupEventCount, listed))
+            {
+                nearlyAll |= 1UL << i;
+                continue;
+            }
+            anyToName = true;
+            longest   = Math.Max(longest, listed);
+        }
+
+        // The levels parameter, through the same posting lists a `@l = '...'` filter uses. An
+        // event matches ANY allowed level, so the set is a union — and only definitive when
+        // every level answered (null = the group predates the index or the bucket is unknown:
+        // no information, scan).
+        //
+        // LEVEL-PURE GROUP: an event has exactly one level, so a group's level posting lists
+        // are disjoint and their counts sum to the rows the union names. A sum that reaches the
+        // group — the normal case for a level-split Error segment, where `@l = Error` names all
+        // ~100k of its rows — means the union IS the group, and it is never built: intersecting
+        // with the identity removes nothing, and the union alone would be a group-sized array
+        // to select all of it. A sum of zero proves the group holds none of the allowed levels.
+        bool levelsNearlyAll = false, levelsToName = false;
+        if (levelHints is not null)
+        {
+            long total      = 0;
+            int  longestOne = 0;
+            bool definitive = true;
+            foreach (var hint in levelHints)
+            {
+                if (idx.CountAtMost(hint[0].Item1, hint[0].Item2) is not int listed)
+                {
+                    definitive = false;
+                    break;
+                }
+                total     += listed;
+                longestOne = Math.Max(longestOne, listed);
+            }
+            if (definitive)
+            {
+                if (total == 0) return GroupVerdict.Dropped;
+
+                levelsNearlyAll = NamesNearlyAllOf(groupEventCount, (int)Math.Min(total, int.MaxValue));
+                levelsToName    = !levelsNearlyAll;
+                if (levelsToName) longest = Math.Max(longest, longestOne);
+            }
+        }
+
+        // ── Not now ──────────────────────────────────────────────────────────────
+        //
+        // Everything above was answered from counts. What is left needs a list, and the caller
+        // has said how long a list it will have built at this point. Not for a filter with a
+        // substring predicate — see the summary.
+        if (trigramHints.Count == 0 && longest > nameAtMost) return GroupVerdict.Deferred;
+
+        // ── The lists ────────────────────────────────────────────────────────────
+        //
         // EVERY posting list below arrives ASCENDING and DISTINCT — SegmentBitmapCodec's
         // delta encoding cannot decode backwards, and both LookupTrigram and LookupIntersect
         // now hand back merged sorted arrays. So every combination here is a two-pointer merge.
@@ -1194,7 +1498,14 @@ public sealed class QueryExecutor : IQueryExecutor
         // one for the inverted result and one for the level union — and for a level-split Error
         // segment that last one is the WHOLE group, ~2 MB of buckets per group per query,
         // built to hash data that was already in order. The sorted-array result is also what
-        // lets SegmentReader.ReadEventsAsync replace its clone-and-sort with one scan.
+        // lets the segment reader replace its clone-and-sort with one scan.
+        //
+        // `rows` is the answer so far and `named` whether there is one: a list that names no
+        // row never gets this far (it drops the group), so the two cannot be told apart by the
+        // list being empty.
+        ReadOnlyMemory<uint> rows  = default;
+        bool                 named = false;
+
         if (trigramHints.Count > 0)
         {
             uint[]? acc = null;
@@ -1203,200 +1514,122 @@ public sealed class QueryExecutor : IQueryExecutor
                 var offsets = idx.LookupTrigram(text);
                 if (offsets is null) continue;              // no information from this hint
                 acc = acc is null ? offsets : IntersectSorted(acc, offsets);
-                if (acc.Length == 0) return false;
+                if (acc.Length == 0) return GroupVerdict.Dropped;
             }
-            candidates = acc;
+            if (acc is not null)
+            {
+                rows  = acc;
+                named = true;
+            }
         }
 
-        // Inverted-index event-level narrowing: AND posting lists for all equality
-        // predicates. This gives exact event offsets within the segment — the reader will
-        // only deserialise those events.
-        //
-        // THE EXCEPTION MARKER IS COUNTED BEFORE IT IS NAMED. Its list is the one a search for
-        // exceptions asks every group for, and over the Error level of a level-split store it
-        // names nearly the whole group: the largest list the group has, narrowing next to
-        // nothing. So the index is first asked how many rows the marker lists (CountAtMost
-        // reads the list's leading count and decodes nothing), and a list that names nearly all
-        // of its group (NamesNearlyAllOf) is not built. It is carried as a fact instead, decided
-        // below once the level set has had its say, and the other hints narrow without it.
-        //
-        // Building it first and measuring it afterwards is what this replaced, and it cost a
-        // PAGE far more than it cost a full read: the prefilter works a whole batch of segments
-        // before the first row is returned, so fifty rows paid for a decoded list, a copy of it
-        // and two more on the way to the reader — in every group of every segment in the batch.
-        //
-        // ONLY the marker is asked this way. Any equality can name a whole group — `@service`
-        // in a one-service store — and would be spared the same list. But the marker's bucket
-        // holds one value, so counting it is one read, where an ordinary property's bucket is
-        // one among thousands and has to be FOUND to be counted: a second walk of the property's
-        // entries, on the very path a selective lookup takes. Those are built as they always
-        // were, and recognised afterwards (below).
-        bool hintsNameTheGroup = false;
-        if (invertedHints.Count > 0)
+        // Inverted-index event-level narrowing: AND posting lists for the equality predicates
+        // whose lists are worth having. This gives exact event offsets within the group — the
+        // reader will only deserialise those events.
+        if (anyToName)
         {
-            var toName = invertedHints;
-            if (filter.HintsExceptionPresence)
+            var toName = nearlyAll == 0 ? invertedHints : filter.GetInvertedHintsWithout(nearlyAll);
+            if (idx.TryLookupIntersect(toName, out var invOffsets))
             {
-                var (marker, present) = CompiledFilter.ExceptionPresentHint;
-                int? atMost = idx.CountAtMost(marker, present);
-                if (atMost is 0) return false;              // vouched for, and no row carries one
+                if (invOffsets.IsEmpty) return GroupVerdict.Dropped;
 
-                if (atMost is int rows && NamesNearlyAllOf(groupEventCount, rows))
+                if (named)
                 {
-                    hintsNameTheGroup = true;
-                    toName = filter.GetInvertedHintsBesideExceptionPresence();
-                }
-                // Otherwise it is named with the rest: a list worth having, or — null — a group
-                // whose builder did not vouch for its marker, which LookupIntersect passes over.
-            }
-
-            var invOffsets = toName.Count > 0 ? idx.LookupIntersect(toName) : null;
-            if (invOffsets is not null)
-            {
-                if (invOffsets.Length == 0) return false;
-
-                // A LIST AS LONG AS THE GROUP IS THE GROUP. Ordinals are distinct and a group's
-                // index names only its own rows, so an intersection of groupEventCount of them
-                // names every one — the same identity the level union below recognises, reached
-                // here by an equality every row of the group satisfies (`@l = 'Error'` typed
-                // into the filter, over a level-split Error segment). Intersecting with the
-                // identity removes nothing, and handing it on would be the group-sized array
-                // the level road stopped building. So it is carried as the same fact the
-                // counted marker is — the difference being that this list had to be built to
-                // be recognised.
-                if (groupEventCount != 0 && invOffsets.Length == groupEventCount)
-                {
-                    hintsNameTheGroup = true;
+                    rows = IntersectSorted(rows.Span, invOffsets.Span);
+                    if (rows.IsEmpty) return GroupVerdict.Dropped;
                 }
                 else
                 {
-                    candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
-                    if (candidates.Length == 0) return false;
+                    rows  = invOffsets;
+                    named = true;
                 }
             }
         }
 
-        // The levels parameter, through the same posting lists a `@l = '...'` filter
-        // uses. Union across the set — an event matches ANY allowed level — and only
-        // definitive when every level answered (null = the group predates the index or
-        // the bucket is unknown: no information, scan). An empty union proves the group
-        // holds none of the allowed levels. The per-event level re-check in the scan
-        // stays the correctness gate, as with every other narrowing here.
-        if (levelHints is not null)
+        // The level union, where the allowed levels are a genuine part of the group. The
+        // per-event level re-check in the scan stays the correctness gate, as with every other
+        // narrowing here.
+        if (levelsToName)
         {
-            uint[]? union     = null;
-            long    totalOffs = 0;
-            bool    definitive = true;
-            foreach (var hint in levelHints)
+            ReadOnlyMemory<uint> union = default;
+            bool                 any   = false;
+            foreach (var hint in levelHints!)
             {
-                var offs = idx.LookupIntersect(hint);
-                if (offs is null) { definitive = false; break; }
-                totalOffs += offs.Length;
-                if (offs.Length > 0) union = union is null ? offs : UnionSorted(union, offs);
-            }
-            if (definitive)
-            {
-                if (union is null) return false;
-
-                // LEVEL-PURE GROUP: an event has exactly one level, so a group's level posting
-                // lists are disjoint and their lengths sum to at most its event count. Equality
-                // therefore proves the union IS the group — the normal case for a level-split
-                // Error segment, where `@l = Error` names all ~100k of its rows. Intersecting
-                // an existing candidate set with the identity cannot remove anything, so the
-                // merge over the whole group is skipped and the candidates stand.
-                //
-                // Only when something else already narrowed. With NO other hint the union is
-                // still the whole answer this group contributes — and the honest way to say so
-                // is `everyRow`, not the array. Returning the array made a level-only filter
-                // (`@l != 'Error'`, which the compiled filter now derives a level set from even
-                // when the request names none) pay, per group and per query, for a group-sized
-                // uint[] built by a posting-list union, copied into a List and copied out again
-                // — three copies of the group — which the reader then resolved with two binary
-                // searches per block and a cursor step per row, to select 100 % of them.
-                // Returning null instead is not available here: null means UNNARROWED, and one
-                // unnarrowed group sends the whole segment, its narrowed groups included, to a
-                // full scan. Hence the third state.
-                bool identity = groupEventCount != 0 && totalOffs == groupEventCount;
-                if (candidates is null)
+                if (!idx.TryLookupIntersect(hint, out var offs))
                 {
-                    if (identity) everyRow = true;
-                    else          candidates = union;
+                    // The count said this bucket was there. An index that gives no list for it
+                    // has no information after all, and the levels narrow nothing.
+                    levelsToName = false;
+                    break;
                 }
-                else if (!identity)
+                if (offs.IsEmpty) continue;
+                union = any ? UnionSorted(union.Span, offs.Span) : offs;
+                any   = true;
+            }
+            if (levelsToName)
+            {
+                if (!any) return GroupVerdict.Dropped;
+
+                if (named)
                 {
-                    candidates = IntersectSorted(candidates, union);
-                    if (candidates.Length == 0) return false;
+                    rows = IntersectSorted(rows.Span, union.Span);
+                    if (rows.IsEmpty) return GroupVerdict.Dropped;
+                }
+                else
+                {
+                    rows  = union;
+                    named = true;
                 }
             }
         }
 
-        // The inverted hints named the group — the marker by its count, or a list by its length
-        // — and nothing else narrowed: it contributes all of its rows, which is the third state
-        // and not "no information". Left as a null candidate list alone it would read as an
-        // unnarrowed group, and one of those sends the whole segment — the groups this query
-        // did narrow or reject included — to a full scan.
-        if (candidates is null && hintsNameTheGroup) everyRow = true;
+        if (named)
+        {
+            candidates = rows;
+            return GroupVerdict.Named;
+        }
 
-        return true;
+        // Nothing named. If that is because the lists that could have named rows name the group
+        // — an inverted hint by its count, the level set by its sum — the group contributes all
+        // of its rows, which is a statement about it; otherwise the index had nothing to say.
+        return nearlyAll != 0 || levelsNearlyAll ? GroupVerdict.EveryRow : GroupVerdict.NoInformation;
     }
 
     /// <summary>
-    /// Whether the exception marker's list, of at most <paramref name="rows"/> rows, names so
-    /// much of a group of <paramref name="groupEventCount"/> that it is carried as "every row"
-    /// instead of being built: fifteen rows in sixteen, or more.
+    /// Whether a posting list of at most <paramref name="rows"/> rows names so much of a group
+    /// of <paramref name="groupEventCount"/> that the group is carried as "every row" instead of
+    /// the list being built: fifteen rows in sixteen, or more.
     ///
     /// <para>SAFE at any threshold — "every row" is a superset, and the scan re-checks each row
-    /// against the whole filter — so the number is about cost alone. Naming a row costs the
-    /// query twelve bytes of candidate list (the copy the index hands out, the list the groups
-    /// are gathered in, the array the reader walks; sixteen without the index cache, which has
-    /// to decode it first). Not naming it costs a decoded row the filter then rejects, and only
-    /// for the rows the list left out.</para>
+    /// against the whole filter — so the number is about cost alone. Naming a row costs four
+    /// bytes, to decode the list, the first time a group is asked (the index keeps the decoded
+    /// list when there is a cache, and lends it uncopied after that). Not naming it costs a
+    /// decoded row the filter then rejects, and only for the rows the list left out.</para>
     ///
     /// <para>MEASURED (<c>ExceptionPresencePageProbe</c>, Release, eight groups of 10 000 Error
-    /// rows). On a FULL read the two costs meet where the list leaves out about one row in
-    /// thirteen, for rows as cheap to reject as a row gets (one short property, ~150 B); a
-    /// costlier row moves that towards one in thirty. Either way the full read is indifferent
-    /// here: the two differ by a fraction of a percent of what the rows themselves cost. A PAGE
-    /// is not indifferent. Just under the line (93 rows in a hundred, the list built) fifty rows
-    /// cost 1.0-1.4 MB against 0.15 MB for the plain scan; just above it (94) they cost what the
-    /// plain scan costs and ~50 KB for opening the batch. So the line is drawn where the full
-    /// read does not care and the page does.</para>
+    /// rows). The line was drawn when a list cost twelve to sixteen bytes a row and was built in
+    /// every group of a page's batch: there a full read was indifferent at it, and a page just
+    /// under it cost 1.0-1.4 MB against 0.15 MB just over. Lists are cheaper now and a page
+    /// builds one for the group it reads, so the page no longer feels the line; a full read
+    /// feels it by under one per cent — just under it (93 rows in a hundred) the list saves the
+    /// read 0.9 % of what it allocates, the rows it leaves out, and just over it the read costs
+    /// what the plain scan costs. The line stays where it was: what it gives up on a full read
+    /// is less than the runs differ by, and what it spares is the largest list a group has,
+    /// decoded the first time each group is asked for it.</para>
     ///
-    /// <para>BELOW it the list is built, and a first page pays for it in every group of its
-    /// batch — 0.6-0.8 MB at one row in two, in that probe. That is what a page of any indexed
-    /// equality pays, and it is not bounded here.</para>
-    ///
-    /// <para>An unknown group size (0) never qualifies, and a group of fewer than sixteen rows
-    /// qualifies only when the list is the whole of it.</para>
+    /// <para>The count is an UPPER bound and may exceed the group — a row filed under two
+    /// spellings of a value is counted twice — which only ever errs towards "every row". An
+    /// unknown group size (0) never qualifies, and a group of fewer than sixteen rows qualifies
+    /// only when the list is the whole of it.</para>
     /// </summary>
     internal static bool NamesNearlyAllOf(uint groupEventCount, int rows) =>
         groupEventCount != 0 && rows >= groupEventCount - groupEventCount / WholeGroupDivisor;
 
-    /// <summary>The marker's list may leave out one row in this many and still stand for its group.</summary>
+    /// <summary>A list may leave out one row in this many and still stand for its group.</summary>
     private const uint WholeGroupDivisor = 16;
 
-    /// <summary>
-    /// The ordinals of whole-group contributors, as plain ascending ranges. Groups are visited
-    /// in ordinal order, so concatenating their ranges is already sorted — no posting list is
-    /// read and no merge runs to produce what the group directory already states.
-    /// </summary>
-    private static uint[] ContiguousOrdinals(List<(uint First, uint Count)> ranges)
-    {
-        long total = 0;
-        for (int r = 0; r < ranges.Count; r++) total += ranges[r].Count;
-
-        var outp = new uint[total];
-        int k = 0;
-        for (int r = 0; r < ranges.Count; r++)
-        {
-            var (first, count) = ranges[r];
-            for (uint o = 0; o < count; o++) outp[k++] = first + o;
-        }
-        return outp;
-    }
-
-    /// <summary>Intersects two ascending, distinct arrays into a new ascending array.</summary>
-    private static uint[] IntersectSorted(uint[] a, uint[] b)
+    /// <summary>Intersects two ascending, distinct lists into a new ascending array. Neither is written.</summary>
+    private static uint[] IntersectSorted(ReadOnlySpan<uint> a, ReadOnlySpan<uint> b)
     {
         var outp = new uint[Math.Min(a.Length, b.Length)];
         int i = 0, j = 0, k = 0;
@@ -1410,8 +1643,8 @@ public sealed class QueryExecutor : IQueryExecutor
         return k == outp.Length ? outp : outp[..k];
     }
 
-    /// <summary>Unions two ascending, distinct arrays into a new ascending array.</summary>
-    private static uint[] UnionSorted(uint[] a, uint[] b)
+    /// <summary>Unions two ascending, distinct lists into a new ascending array. Neither is written.</summary>
+    private static uint[] UnionSorted(ReadOnlySpan<uint> a, ReadOnlySpan<uint> b)
     {
         var outp = new uint[a.Length + b.Length];
         int i = 0, j = 0, k = 0;
@@ -1442,11 +1675,16 @@ public sealed class QueryExecutor : IQueryExecutor
     /// own reader from when <paramref name="borrowed"/> is null. Borrowed as well: the query
     /// releases it, after this iterator's reader has gone.
     /// </param>
+    /// <param name="plan">
+    /// What the prefilter decided about each index group of the segment, and what it left for
+    /// this scan to decide when it reaches the group (<see cref="SegmentPlan"/>); null to read
+    /// every row. A plan is made over <paramref name="borrowed"/> and is never there without it.
+    /// </param>
     private async IAsyncEnumerable<LogEvent> ScanSegmentAsync(
         SegmentInfo info,
         CompiledFilter filter,
         HashSet<Ameto.Core.LogLevel>? levels,
-        uint[]? candidateOffsets,
+        SegmentPlan? plan,
         SegmentReader? borrowed,
         SafeFileHandle? pin,
         DateTimeOffset? from,
@@ -1480,7 +1718,15 @@ public sealed class QueryExecutor : IQueryExecutor
         {
             // Every segment is v2+: events inside each block are sorted by @t and
             // blocks themselves are sorted, so we can stream lazily without buffering.
-            await foreach (var ev in reader.ReadEventsAsync(candidateOffsets, from, to, reversed, ct))
+            //
+            // With a plan the file is walked a group at a time, and each group is asked about as
+            // the walk reaches it — which is where a group left for later has its rows named.
+            // The plan belongs to the reader the prefilter opened; a scan that opened its own
+            // has none, and reads everything.
+            var events = plan is not null && borrowed is not null
+                ? reader.ReadGroupsAsync(plan, from, to, reversed, ct)
+                : reader.ReadEventsAsync(null, from, to, reversed, ct);
+            await foreach (var ev in events)
             {
                 if (pace.Due()) await ScanPace.Yield();
                 if (!InWindow(ev, from, to)) continue;
