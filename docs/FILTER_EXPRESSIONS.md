@@ -88,6 +88,29 @@ Properties are compared case-insensitively when both sides are strings.
 A single quote inside a value is written either doubled or backslash-escaped:
 `Detail = 'can''t connect'` and `Detail = 'can\'t connect'` mean the same thing.
 
+### How a property's value is compared
+
+A property is compared in the terms of the value it holds, whatever the literal looks like:
+
+| The property holds | `=`, `!=`, `<`, … compare it | So |
+|--------------------|------------------------------|----|
+| an integer | exactly, as an integer — with a number literal, or text that denotes an integer (`'42'`, `'1e3'`, `'42.0'`) | `OrderNo = 1234567890123456789` matches that order and no neighbour; `OrderNo = 1234567890123456800` is another number |
+| a floating-point number | as a double: the literal is read as the double nearest it, and equality is exact | `Ratio = 0.3` does not match a stored `0.1 + 0.2` (0.30000000000000004); `Delta = 0` matches `-0.0` |
+| text | as text, case-insensitively; a number literal is read as its digits | `Code = 2.5` matches `'2.5'` |
+| `true` / `false` | with `true` / `false`, or the text `'true'` / `'false'` in any case | `Enabled = 'TRUE'` matches; `Enabled = 0`, `= 1` or `= 'no'` match no bool, so `!=` holds |
+
+A number that does not compare — text that is not numeric, `NaN` — satisfies neither `=` nor `!=`.
+The results of functions (`round`, `bucket`, `toNumber`, …) are compared as doubles that are equal
+within 1e-15, since their own arithmetic can land a hair off the value meant.
+
+`contains`, `startsWith`, `endsWith`, `like`, `in`, the regex functions and the text functions
+read a number as its invariant digits — `12.5`, never `12,5`, and `-` as the minus sign —
+whatever the server's locale. `in` compares that text: `Delta in ['-0']` matches a stored `-0.0`
+and `Delta in [0]` does not.
+
+The event view shows numbers as a browser reads them, which rounds integers past 2^53:
+"filter by this value" on such an integer writes a different number, which matches nothing.
+
 ## Logical connectives
 
 ```
