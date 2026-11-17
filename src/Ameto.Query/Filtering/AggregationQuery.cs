@@ -55,13 +55,21 @@ public sealed class AggregationQuery
     public int Limit { get; init; } = DefaultLimit;
 
     /// <summary>
-    /// When set, <c>sum</c>, <c>min</c>, <c>max</c> and <c>avg</c> take a value only where it is
-    /// STORED as a number. Off, a string that reads as a number counts as one — which is what a
-    /// person at the Logs page wants of <c>"200"</c>, and what turns <c>max(Phone)</c> over
+    /// When set, asked of every stored value that <c>sum</c>, <c>min</c>, <c>max</c> or
+    /// <c>avg</c> is about to take; false leaves that value out of all four. <c>count</c> is
+    /// unaffected — it counts values, whatever they are.
+    ///
+    /// <para>Unset, every value that is or reads as a number is taken — which is what a person
+    /// at the Logs page wants of <c>"200"</c>, and what turns <c>max(Phone)</c> over
     /// <c>"+77015550123"</c> into the phone number with its formatting gone. A caller that must
-    /// not hand an identifier back as a measurement sets this; <c>count</c> is unaffected.
+    /// not hand an identifier back as a measurement decides here which values are measurements:
+    /// the value arrives as it is stored (a <c>string</c>, a <c>long</c>, a <c>double</c>…),
+    /// beside the aggregate that asks for it.</para>
+    ///
+    /// <para>Called once per value on the scan's own thread, so it is the caller's to keep
+    /// cheap; a null check is all it costs everybody else.</para>
     /// </summary>
-    public bool NumbersOnly { get; init; }
+    public Func<AggregateSpec, object, bool>? Admits { get; init; }
 
     /// <summary>True when there is no <c>group by</c> — a single row over the whole window.</summary>
     public bool IsScalar => Keys.Count == 0;

@@ -86,9 +86,14 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
 
     /// <summary>
     /// Writes one call down. <paramref name="repeats"/> is, for a refusal over the minute's
-    /// limit, which one of that minute it is (see <see cref="Keeps"/>); zero otherwise.
+    /// limit, which one of that minute it is (see <see cref="Keeps"/>); zero otherwise. Such a
+    /// refusal is stamped with <paramref name="at"/>, the instant its minute was counted by, so
+    /// that the records of one minute's refusals are the records of one minute — which is what
+    /// the summary adds them up by.
     /// </summary>
-    public void Record(McpProfile profile, string tool, string argumentsJson, ToolResult result, TimeSpan elapsed, string? client, int repeats = 0)
+    public void Record(
+        McpProfile profile, string tool, string argumentsJson, ToolResult result, TimeSpan elapsed, string? client,
+        int repeats = 0, DateTimeOffset? at = null)
     {
         try
         {
@@ -110,7 +115,9 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
             // A refusal is a sentence about the call as it was written, so it is safe to keep.
             if (result.IsError) properties[Fields.Refusal] = result.Text.Length <= 600 ? result.Text : result.Text[..600];
             if (result.Refusal != RefusalKind.None) properties[Fields.RefusalKind] = NameOf(result.Refusal);
-            if (repeats > 1) properties[Fields.Repeats] = repeats;
+            // From the first one on: a record that says "1" is the start of a series or the whole
+            // of it, and a record that says nothing is a call that was not such a refusal.
+            if (repeats > 0) properties[Fields.Repeats] = repeats;
             if (!string.IsNullOrEmpty(client))
                 properties[Fields.Client] = client.Length <= MaxClientChars ? client : string.Concat(client.AsSpan(0, MaxClientChars), "…");
             // The filter the call asked with; for a published tool, its template with this call's
@@ -127,7 +134,7 @@ internal sealed class McpAudit(StorageEngine storage, ILogger<McpAudit> logger)
             int serviceIndex  = storage.TemplatePool.Intern(FilterGuard.AuditService);
             var header = new LogEventHeader
             {
-                TimestampUtcTicks        = DateTime.UtcNow.Ticks,
+                TimestampUtcTicks        = repeats > 0 && at is { } counted ? counted.UtcTicks : DateTime.UtcNow.Ticks,
                 Level                    = result.Status switch
                 {
                     ToolResult.Ok or ToolResult.Trimmed => LogLevel.Information,

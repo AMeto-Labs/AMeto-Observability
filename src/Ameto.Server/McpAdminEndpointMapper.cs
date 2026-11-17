@@ -135,7 +135,7 @@ internal static class McpAdminEndpointMapper
                 }, deadline.Token))
                 {
                     if (summary.Calls == SummaryCeiling) { partial = true; break; }
-                    summary.Add(ev.Properties);
+                    summary.Add(ev);
                 }
             }
             catch (OperationCanceledException) when (!ctx.RequestAborted.IsCancellationRequested) { partial = true; }
@@ -366,11 +366,14 @@ internal static class McpAdminEndpointMapper
                     w.WriteStartObject("sent");
                     w.WriteString("template", masked.Template);
                     w.WriteStartArray("properties");
-                    foreach (var (name, value) in masked.Properties)
+                    for (int i = 0; i < masked.Properties.Count; i++)
                     {
                         w.WriteStartObject();
-                        w.WriteString("name", name);
-                        w.WriteString("value", value);
+                        w.WriteString("name", masked.Properties[i].Key);
+                        w.WriteString("value", masked.Properties[i].Value);
+                        // The name it is stored under: the same, unless the name itself held a
+                        // value and went out as a token. What "stored" and "sent" are paired by.
+                        w.WriteString("stored", masked.StoredNames[i]);
                         w.WriteEndObject();
                     }
                     w.WriteEndArray();
@@ -604,14 +607,30 @@ internal static class McpAdminEndpointMapper
         private readonly List<long> _eventsPerCall = [];
         private long _events, _masked, _byRules, _byStrict, _byDetectors;
 
+        /// <summary>
+        /// The refusals past a profile's minute, by profile and minute: how many of them were
+        /// written down, and the highest number any of those records carries. Only the 1st,
+        /// 2nd, 4th, 8th… are recorded (McpAudit.Keeps), so the last record of a minute says
+        /// how many there were at least, and the records themselves say far fewer.
+        /// </summary>
+        private readonly Dictionary<(string Profile, long Minute), (int Records, long Most)> _pastTheMinute = [];
+
         public int Calls { get; private set; }
 
-        public void Add(Dictionary<string, object?>? p)
+        public void Add(LogEvent ev)
         {
+            var p = ev.Properties;
             Calls++;
-            if (Text(p, McpAudit.Fields.ProfileId) is { Length: > 0 } profile) _profiles.Add(profile);
+            string? profile = Text(p, McpAudit.Fields.ProfileId);
+            if (profile is { Length: > 0 }) _profiles.Add(profile);
             Bump(_statuses, Text(p, McpAudit.Fields.Status) ?? "", 1);
-            if (Text(p, McpAudit.Fields.RefusalKind) is { Length: > 0 } kind) Bump(_refusals, kind, 1);
+            if (Number(p, McpAudit.Fields.Repeats) is { } nth and > 0)
+            {
+                var minute = (profile ?? "", ev.Timestamp.UtcTicks / TimeSpan.TicksPerMinute);
+                var seen = _pastTheMinute.GetValueOrDefault(minute);
+                _pastTheMinute[minute] = (seen.Records + 1, Math.Max(seen.Most, nth));
+            }
+            else if (Text(p, McpAudit.Fields.RefusalKind) is { Length: > 0 } kind) Bump(_refusals, kind, 1);
 
             long events = Number(p, McpAudit.Fields.Events) ?? 0;
             _events += events;
@@ -649,22 +668,43 @@ internal static class McpAdminEndpointMapper
             return _eventsPerCall[_eventsPerCall.Count / 2];
         }
 
-        public object ToDto(int hours, bool partial) => new
+        public object ToDto(int hours, bool partial)
         {
-            hours,
-            partial,
-            calls        = Calls,
-            profiles     = _profiles.Count,
-            events       = _events,
-            medianEvents = MedianEvents(),
-            masked       = _masked,
-            maskedBy     = new { rules = _byRules, strict = _byStrict, detectors = _byDetectors },
-            statuses     = _statuses,
-            refusals     = _refusals,
-            // Hidden values by the rule that hid them (rule id) and by detector (detector id).
-            rules        = _rules,
-            detectors    = _detectors,
-        };
+            // A refusal past the minute is counted by what its minute's last record says, not by
+            // how many records the minute left: twenty such refusals are five records.
+            long pastTheMinute = 0, unrecorded = 0;
+            foreach (var (records, most) in _pastTheMinute.Values)
+            {
+                pastTheMinute += Math.Max(most, records);
+                unrecorded    += Math.Max(most - records, 0);
+            }
+            if (pastTheMinute > 0) Bump(_refusals, McpAudit.NameOf(RefusalKind.Limit), pastTheMinute);
+
+            return new
+            {
+                hours,
+                partial,
+                // The calls that were written down. Beside them, at least `unrecorded` more were
+                // refused past a profile's minute and are known of only by the count their minute's
+                // records carry — "at least", because the count is the last one recorded.
+                calls        = Calls,
+                unrecorded,
+                // True when any refusal past a profile's minute is in the window. Then every count
+                // it is part of is a floor, `unrecorded` 0 included: a minute whose last record is
+                // its 2nd refusal may have had a 3rd, which no record holds.
+                thinned      = pastTheMinute > 0,
+                profiles     = _profiles.Count,
+                events       = _events,
+                medianEvents = MedianEvents(),
+                masked       = _masked,
+                maskedBy     = new { rules = _byRules, strict = _byStrict, detectors = _byDetectors },
+                statuses     = _statuses,
+                refusals     = _refusals,
+                // Hidden values by the rule that hid them (rule id) and by detector (detector id).
+                rules        = _rules,
+                detectors    = _detectors,
+            };
+        }
     }
 
     private static object ProfileDto(McpProfile p, McpSnapshot snapshot) => new

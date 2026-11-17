@@ -43,9 +43,12 @@ internal static class FilterGuard
     public const int MaxFilterChars = 4_000;
 
     /// <summary>
-    /// How deep a filter may nest its parentheses. The parser and everything after it walk a
-    /// filter by recursion, and a filter is text from outside: without a limit, a few thousand
-    /// opening parentheses are a stack no thread has.
+    /// How deep a filter may nest — each parenthesis is a level, and so is each <c>not</c>. The
+    /// parser and everything after it walk a filter by recursion, and a filter is text from
+    /// outside: without a limit, a few thousand opening parentheses are a stack no thread has.
+    /// Far under the engine's own limit (100, counted the same way), so that the text written
+    /// for the engine — which can need one level more than was asked, to keep the profile's
+    /// scope outside an <c>or</c> — is never the one the engine refuses.
     /// </summary>
     public const int MaxNesting = 32;
 
@@ -70,6 +73,22 @@ internal static class FilterGuard
         public static Prepared Hidden(string error) => new(null, error, RefusalKind.Masking);
 
         public static readonly Prepared Nothing = new(null, null);
+
+        /// <summary>
+        /// The values the filter asked about by their tokens, for the answer to show as those
+        /// tokens wherever it would have shown the values (see <see cref="NamedValues"/>). Null
+        /// when it named none.
+        /// </summary>
+        public NamedValues? Named { get; init; }
+    }
+
+    /// <summary>
+    /// A <c>select …</c> query ready to run, or the sentence that says why it will not. Like a
+    /// filter it carries the values it named by their tokens.
+    /// </summary>
+    internal sealed record PreparedQuery(AggregationQuery? Query, string? Error, RefusalKind Kind = RefusalKind.None)
+    {
+        public NamedValues? Named { get; init; }
     }
 
     // ── Search filters ────────────────────────────────────────────────────────
@@ -109,6 +128,12 @@ internal static class FilterGuard
         var judged = Judged(root, policy, vault);
         if (judged.Node is not { } ready) return judged;
 
+        // Counted on the tree, where a 'not' can be counted exactly: the parentheses of the
+        // text are counted before it is parsed (TooDeep), a 'not' stacks only on the 'not's
+        // and groups it stands in, which the text alone does not say.
+        if (WrittenDepth(ready) > MaxNesting)
+            return Prepared.Unreadable($"The filter nests more than {MaxNesting} levels deep: each parenthesis and each 'not' is a level. Simplify the grouping.");
+
         // Written out once here, so that a filter called ready is one that can be run: a value
         // the language has no spelling for is found now, and said to the caller, rather than
         // when the answer is being put together.
@@ -117,7 +142,7 @@ internal static class FilterGuard
         {
             return Prepared.Unreadable("The filter holds a name or a value this server cannot pass on exactly as written. Write it more simply.");
         }
-        return new Prepared(ready, null);
+        return judged;
     }
 
     /// <summary>
@@ -128,10 +153,48 @@ internal static class FilterGuard
     internal static Prepared Judged(FilterNode root, MaskingPolicy policy, TokenVault vault)
     {
         var judge = new Judge(policy, vault);
-        return judge.Visit(root) is { } ready ? new Prepared(ready, null) : judge.Refusal!;
+        return judge.Visit(root) is { } ready
+            ? new Prepared(ready, null) { Named = judge.Named.Count == 0 ? null : judge.Named }
+            : judge.Refusal!;
     }
 
-    /// <summary>True when parentheses or brackets outside string literals nest deeper than <see cref="MaxNesting"/>.</summary>
+    /// <summary>
+    /// How deep <see cref="Write"/> nests a tree: a level for each <c>not</c>, and for each
+    /// <c>and</c> or <c>or</c> that has to be put in parentheses because it stands inside
+    /// another. A chain of one operator is written flat and adds nothing however long it is,
+    /// and its left spine is walked by a loop — so this recurses only as deep as the nesting
+    /// it measures.
+    /// </summary>
+    internal static int WrittenDepth(FilterNode node)
+    {
+        switch (node)
+        {
+            case AndNode or OrNode:
+            {
+                bool and = node is AndNode;
+                int deepest = 0;
+                for (FilterNode at = node; ; )
+                {
+                    var (left, right) = at is AndNode a ? (a.Left, a.Right) : (((OrNode)at).Left, ((OrNode)at).Right);
+                    deepest = Math.Max(deepest, MemberDepth(right));
+                    if (and ? left is AndNode : left is OrNode) { at = left; continue; }
+                    return Math.Max(deepest, MemberDepth(left));
+                }
+            }
+            case NotNode not: return 1 + MemberDepth(not.Operand);
+            default:          return 0;
+        }
+
+        // A member of a chain or the operand of a 'not': in parentheses when it is a pair itself.
+        static int MemberDepth(FilterNode member) => WrittenDepth(member) + (member is AndNode or OrNode ? 1 : 0);
+    }
+
+    /// <summary>
+    /// True when parentheses or brackets outside string literals nest deeper than
+    /// <see cref="MaxNesting"/>. Asked of the text before it is parsed, which is what keeps the
+    /// parser's own recursion short; a <c>not</c> is a level too, and is counted on the parsed
+    /// tree (<see cref="WrittenDepth"/>), where it can be counted exactly.
+    /// </summary>
     internal static bool TooDeep(ReadOnlySpan<char> text)
     {
         const char quote = '\'', escape = '\\';
@@ -163,41 +226,66 @@ internal static class FilterGuard
     /// filter and joined to the profile's scope — so nothing a token stands for can reach a
     /// column heading. An aggregate other than a count may not be taken over a hidden field:
     /// <c>min(CardNumber)</c> is the card number.
+    ///
+    /// <para>Over a field that is not hidden, <c>sum</c>, <c>min</c>, <c>max</c> and <c>avg</c>
+    /// take the values that are measurements and leave out the ones a search would hide
+    /// (<see cref="MaskingPolicy.AdmitsToAggregate"/>); what was left out is counted in
+    /// <paramref name="leftOut"/>, for the answer to say so.</para>
     /// </summary>
-    public static (AggregationQuery? Query, string? Error, RefusalKind Kind) PrepareAggregation(
-        string? text, MaskingPolicy policy, TokenVault vault, McpProfile profile)
+    public static PreparedQuery PrepareAggregation(
+        string? text, MaskingPolicy policy, TokenVault vault, McpProfile profile, MaskStats? leftOut = null)
     {
+        static PreparedQuery Refused(string error, RefusalKind kind = RefusalKind.Input) => new(null, error, kind);
+
         if (string.IsNullOrWhiteSpace(text))
-            return (null, "'query' is empty. Example: select count(*) where @l = 'Error' group by @service", RefusalKind.Input);
+            return Refused("'query' is empty. Example: select count(*) where @l = 'Error' group by @service");
         if (text.Length > MaxFilterChars)
-            return (null, $"The query is {text.Length} characters long; a call may carry at most {MaxFilterChars}.", RefusalKind.Input);
+            return Refused($"The query is {text.Length} characters long; a call may carry at most {MaxFilterChars}.");
         if (TooDeep(text))
-            return (null, $"The query nests parentheses more than {MaxNesting} deep.", RefusalKind.Input);
+            return Refused($"The query nests parentheses more than {MaxNesting} deep.");
 
         AggregationQuery asWritten;
         try { asWritten = AggregationParser.Parse(text); }
-        catch (Exception e) { return (null, $"Invalid aggregation: {e.Message}", RefusalKind.Input); }
+        catch (Exception e) { return Refused($"Invalid aggregation: {e.Message}"); }
 
+        // The aggregates over a field a rule keeps as stored in every service: of those every
+        // value is taken, as every value of them is shown.
+        HashSet<AggregateSpec>? kept = null;
+        // The first aggregate over each property: a value that is left out is left out of every
+        // aggregate over its property, and is one value — counted where the first of them asks.
+        var firstOfProperty = new HashSet<AggregateSpec>(ReferenceEqualityComparer.Instance);
+        var properties      = new HashSet<string>(StringComparer.Ordinal);
         foreach (var aggregate in asWritten.Aggregates)
-            if (aggregate.Property is { } property && aggregate.Kind != AggregateKind.Count && IsHidden(policy, property))
-                return (null, $"{PropertyPath.ToDisplay(property)} is a hidden field: it can be counted, not summed, averaged or ranged.",
-                        RefusalKind.Masking);
+        {
+            if (aggregate.Property is not { } property || aggregate.Kind == AggregateKind.Count) continue;
+            if (IsHidden(policy, property))
+                return Refused($"{PropertyPath.ToDisplay(property)} is a hidden field: it can be counted, not summed, averaged or ranged.",
+                               RefusalKind.Masking);
+            if (!BuiltinFields.TryResolve(property, out _) && policy.KeepsEverywhere(RulePath(property)))
+                (kept ??= new HashSet<AggregateSpec>(ReferenceEqualityComparer.Instance)).Add(aggregate);
+            if (properties.Add(property)) firstOfProperty.Add(aggregate);
+        }
 
         var where = Prepare(asWritten.FilterText, policy, vault);
-        if (where.Error is not null) return (null, where.Error, where.Kind);
+        if (where.Error is not null) return Refused(where.Error, where.Kind);
 
-        return (new AggregationQuery
+        var counted = leftOut ?? new MaskStats();
+        return new PreparedQuery(new AggregationQuery
         {
             Aggregates = asWritten.Aggregates,
             Keys       = asWritten.Keys,
             FilterText = Compose(where.Node, profile),
             Limit      = Math.Clamp(asWritten.Limit, 1, 200),
-            // A sum, a minimum, a maximum or an average is taken over numbers only. A string that
-            // reads as a number is, more often than not, an identifier — a phone number, an IIN
-            // with its leading zeros — and an aggregate would hand it back as a measurement, its
-            // spelling gone and with it everything the detectors know it by.
-            NumbersOnly = true,
-        }, null, RefusalKind.None);
+            // Which stored values a sum, a minimum, a maximum or an average is made of: the
+            // measurements. Not a text that reads as a number — an identifier, more often than
+            // not — and not a number a search would hide. Masking the RESULT covers one value;
+            // it does not cover the sum of two.
+            Admits     = (aggregate, value) => kept?.Contains(aggregate) == true
+                                                || policy.AdmitsToAggregate(value, firstOfProperty.Contains(aggregate) ? counted : null),
+        }, null)
+        {
+            Named = where.Named,
+        };
     }
 
     // ── What a profile may see ────────────────────────────────────────────────
@@ -261,8 +349,16 @@ internal static class FilterGuard
 
     /// <summary>True when a path names a field whose value never leaves as stored. A built-in field is never one.</summary>
     public static bool IsHidden(MaskingPolicy policy, string encodedPath) =>
-        !BuiltinFields.TryResolve(encodedPath, out _)
-        && policy.HidesField(PropertyPath.ToDisplay(PropertyPath.StripIndexSegments(encodedPath)));
+        !BuiltinFields.TryResolve(encodedPath, out _) && policy.HidesField(RulePath(encodedPath));
+
+    /// <summary>
+    /// A path as a rule spells it: names joined by dots, with the positions written as
+    /// subscripts (<c>Items[0]</c>) left out. A position written any other way — <c>Items.0</c>,
+    /// <c>Items[' 0']</c> — is still in it, and is the masking policy's to recognise: it asks
+    /// the engine's own question of every segment (<see cref="PropertyPath.TryReadPosition"/>).
+    /// </summary>
+    internal static string RulePath(string encodedPath) =>
+        PropertyPath.ToDisplay(PropertyPath.StripIndexSegments(encodedPath));
 
     // ── Judging a tree ────────────────────────────────────────────────────────
 
@@ -275,6 +371,9 @@ internal static class FilterGuard
     private sealed class Judge(MaskingPolicy policy, TokenVault vault)
     {
         public Prepared? Refusal { get; private set; }
+
+        /// <summary>The values behind the tokens this filter used, each with the token it was named by.</summary>
+        public NamedValues Named { get; } = new();
 
         public FilterNode? Visit(FilterNode node)
         {
@@ -292,10 +391,15 @@ internal static class FilterGuard
 
                 case InNode list:
                 {
-                    // `in` is equality against each of several values: a token is at home in the list.
+                    // `in` is equality against each of several values: a token is at home in the list —
+                    // of a property's values, not of a built-in field's (see TokenOnBuiltIn).
                     var values = new object?[list.Values.Length];
                     for (int i = 0; i < values.Length; i++)
+                    {
+                        if (IsToken(list.Values[i], out _) && BuiltinFields.TryResolve(list.Property, out _))
+                            return Refuse(Prepared.Hidden(TokenOnBuiltIn(list.Values[i]!, list.Property)));
                         if (!Operand(list.Values[i], out values[i])) return null;
+                    }
                     return new InNode(list.Property, values);
                 }
 
@@ -351,6 +455,7 @@ internal static class FilterGuard
                 // `Elapsed > 'h:…'` would order the hidden value against a visible one, and a
                 // few such questions are a binary search for it.
                 if (!equality) return Refuse(Prepared.Hidden(TokenMisplaced(compare.Value!)));
+                if (BuiltinFields.TryResolve(compare.Property, out _)) return Refuse(Prepared.Hidden(TokenOnBuiltIn(compare.Value!, compare.Property)));
                 return Operand(compare.Value, out object? value) ? new CompareNode(compare.Property, compare.Op, value) : null;
             }
             if (!equality && IsHidden(policy, compare.Property)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
@@ -379,6 +484,8 @@ internal static class FilterGuard
             }
             // A number is put back as a number, so that it equals the number it was read from.
             value = entry.IsNumber && TryNumber(entry.Text, out object? number) ? number : entry.Text;
+            // The answer shows this value as the token it was asked by, wherever it turns up.
+            Named.Add(entry.Text, (string)written!);
             return true;
         }
 
@@ -425,6 +532,18 @@ internal static class FilterGuard
     private static string TokenMisplaced(object token) =>
         $"{token} is a token for a hidden value: it may only stand as the value in =, != or in " +
         "(for example CardNumber = 'h:91c0e2aa5d17'), never in a comparison of order, a pattern or plain words.";
+
+    /// <summary>
+    /// A token compared with a built-in field. No hidden value is ever kept in one — the level,
+    /// the service, the template, the exception's type — and every answer shows them as they
+    /// are: in a group's header line, in an event's detail. So the only thing such a comparison
+    /// can do is find the hidden value lying in the open, and an answer that cannot help but
+    /// show it. A property found that way is shown as the token instead (NamedValues); a
+    /// built-in field is not something an answer can leave out, so the question is refused.
+    /// </summary>
+    private static string TokenOnBuiltIn(object token, string property) =>
+        $"{token} is a token for a hidden value, and {PropertyPath.ToDisplay(property)} is a built-in field, which every answer shows as it is. " +
+        "Compare a token with a property, for example CardNumber = 'h:91c0e2aa5d17'.";
 
     /// <summary>A node type as a person would name the construct: <c>ToJsonCompareNode</c> is <c>toJson()</c>.</summary>
     private static string Name(FilterNode node)

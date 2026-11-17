@@ -61,7 +61,8 @@ public static class BuiltInTools
         new(Aggregate, "Count and group log events",
             "Answers with a table instead of events: select count(*) where @l = 'Error' group by @service. " +
             "Aggregates: count(*), count(P), sum(P), min(P), max(P), avg(P). Clauses: where <filter>, group by <property>[, …], limit <n>. " +
-            "sum, min, max and avg take values stored as numbers; a number kept as text is not counted, and a hidden property can only be counted. " +
+            "sum, min, max and avg are made of measurements: a number kept as text is not counted, nor is a number an answer would hide " +
+            "(the answer says how many values were left out), and a hidden property can only be counted. " +
             "Rows come largest first. A partial answer says so: its numbers are then floors, not totals.",
             Schema($$"""
                 { "type": "object", "required": ["query"], "properties": {
@@ -105,7 +106,7 @@ public static class BuiltInTools
 
         Filters use Seq syntax: @l = 'Error', StatusCode >= 500, @service in ['a', 'b'], has(UserId), @mt like '%timeout%', ci_contains(@x.message, 'refused'), Request.Path = '/pay', combined with and / or / not and parentheses. Plain words are looked for in the message template and in the exception, not in property values: to search a property, name it.
 
-        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value has the same token wherever it is hidden the same way, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A token may only stand as the value in =, != or in; a hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
+        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value has the same token wherever it is hidden the same way, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A token may only stand as the value in =, != or in, with a property (not a built-in field such as @service); where the value is found it is shown as the token again. A hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
 
         Answers are cut to a budget. When one ends with 'more', call again with the cursor it gives.
         """;

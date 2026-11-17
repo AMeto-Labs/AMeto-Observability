@@ -210,11 +210,12 @@ public sealed class AggregationHonestyTests
     // ── Text that reads as a number ───────────────────────────────────────────
 
     [Fact]
-    public async Task A_string_that_reads_as_a_number_counts_as_one_unless_the_query_asks_for_numbers_only()
+    public async Task A_string_that_reads_as_a_number_counts_as_one_unless_the_caller_says_which_values_do()
     {
         // "+77015550123" parses as 77 015 550 123 and "000000000101" as 101: an identifier
         // handed back as a measurement, its spelling gone. A person at the Logs page wants
-        // "200" to be 200; a caller that must not do that to an identifier says NumbersOnly.
+        // "200" to be 200; a caller that must not do that to an identifier says so in Admits —
+        // here: no text, and no number of twelve digits or more.
         var events = new[]
         {
             Event(1, ("Phone", "+77015550123"), ("Iin", "000000000101"), ("Status", "200"), ("Elapsed", 40L)),
@@ -226,18 +227,35 @@ public sealed class AggregationHonestyTests
         Assert.Equal([77015550199d, 101d, 350d, 60.5d, 2d], lenient);
 
         var parsed = Q(query);
+        var asked  = new SortedSet<string>(StringComparer.Ordinal);
         var strict = Assert.Single((await new AggregationExecutor(new StubExecutor(events), 1000).ExecuteAsync(new AggregationQuery
         {
             Aggregates  = parsed.Aggregates,
             Keys        = parsed.Keys,
             FilterText  = parsed.FilterText,
             Limit       = parsed.Limit,
-            NumbersOnly = true,
+            Admits      = (spec, value) =>
+            {
+                asked.Add(spec.Alias);
+                return value is not string && Convert.ToDouble(value) < 100_000_000_000d;
+            },
         }, null, null)).Rows).Values;
         Assert.Null(strict[0]);                    // no number was stored under Phone
         Assert.Null(strict[1]);
         Assert.Null(strict[2]);
-        Assert.Equal(60.5d, strict[3]);            // what IS a number is summed as before
+        Assert.Equal(60.5d, strict[3]);            // what IS a measurement is summed as before
         Assert.Equal(2d, strict[4]);               // and a count is a count of values, whatever they are
+        // Asked for the four that take a value, never for the count.
+        Assert.Equal(["avg(Status)", "max(Phone)", "min(Iin)", "sum(Elapsed)"], asked.Order());
+
+        // A number can be kept out as well as a text: what is left is what the answer is made of.
+        var big = new[] { Event(1, ("N", 900101300126L)), Event(2, ("N", 850315400055L)), Event(3, ("N", 7L)) };
+        var kept = Assert.Single((await new AggregationExecutor(new StubExecutor(big), 1000).ExecuteAsync(new AggregationQuery
+        {
+            Aggregates = Q("select sum(N), max(N), avg(N), count(N)").Aggregates,
+            Keys       = [],
+            Admits     = static (_, value) => Convert.ToDouble(value) < 100_000_000_000d,
+        }, null, null)).Rows).Values;
+        Assert.Equal([7d, 7d, 7d, 3d], kept);
     }
 }

@@ -6,6 +6,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Ameto.Core;
+using Ameto.Query.Filtering;
 using MessagePack;
 
 namespace Ameto.Mcp.Masking;
@@ -55,6 +56,9 @@ public sealed class MaskStats
 
     /// <summary>A value nested past what the walk follows: hidden whole.</summary>
     public const string TooDeep = "tooDeep";
+
+    /// <summary>A value the call itself named by a token: shown as that token (see <see cref="NamedValues"/>).</summary>
+    public const string Named = "named";
 
     public int Count(MaskReason reason)
     {
@@ -124,7 +128,50 @@ public sealed class MaskedEvent
     /// <summary>Top-level properties in stored order; a nested value is compact JSON.</summary>
     public required List<KeyValuePair<string, string>> Properties { get; init; }
 
+    /// <summary>
+    /// The name each of <see cref="Properties"/> is stored under, in the same order. It is the
+    /// name sent, except where the name itself held a value and was replaced by a token.
+    /// </summary>
+    public required List<string> StoredNames { get; init; }
+
     public MaskedException? Exception { get; init; }
+}
+
+/// <summary>
+/// The values a call named by their tokens.
+///
+/// <para>A token in a filter is a question — "the events where this field is the value I was
+/// shown as <c>h:…</c>" — and the answer to it must not be the value. Compared with a field that
+/// is hidden, it is not: the field comes back as a token. Compared with a field that is NOT
+/// hidden (<c>Note = 'h:…'</c>), the engine finds the events where the same value lies in the
+/// open, and without this the answer would show it there: one call, and the token is read.</para>
+///
+/// <para>So wherever an answer would show one of these values as it is stored — in the compared
+/// field or in any other, in an event, a group key or an aggregate's cell — it shows the token
+/// the caller used instead. The caller learns what it asked: that the value is there. Not what
+/// the value is.</para>
+/// </summary>
+public sealed class NamedValues
+{
+    private readonly List<(string Text, string Token)> _values = new(2);
+
+    public int Count => _values.Count;
+
+    public void Add(string text, string token)
+    {
+        if (TokenOf(text) is null) _values.Add((text, token));
+    }
+
+    /// <summary>
+    /// The token this value was named by, or null for a value the call did not name. Compared
+    /// as the engine compares an equality between texts: without regard to case.
+    /// </summary>
+    public string? TokenOf(string text)
+    {
+        foreach (var (known, token) in _values)
+            if (known.Equals(text, StringComparison.OrdinalIgnoreCase)) return token;
+        return null;
+    }
 }
 
 /// <summary>
@@ -245,9 +292,9 @@ public sealed class MaskingPolicy
         Decision best = OnPathOrAbove(path, out ruleId, out keptEverywhere);
 
         // `Items.0.Sku` is `Items[0].Sku` to the engine wherever Items is a list, and the rules
-        // name a list's elements by the list's own path — `Items.Sku`. A path with a number in
-        // it is therefore judged both ways, and has to pass both.
-        if (WithoutNumbers(path) is { } elements)
+        // name a list's elements by the list's own path — `Items.Sku`. A path with a segment
+        // the engine can read as a position is therefore judged both ways, and has to pass both.
+        if (WithoutPositions(path) is { } elements)
         {
             Decision other = OnPathOrAbove(elements, out string? otherRule, out bool otherKept);
             keptEverywhere &= otherKept;
@@ -280,10 +327,16 @@ public sealed class MaskingPolicy
     }
 
     /// <summary>
-    /// The path with every all-digit segment after the first taken out, or null when it has none:
+    /// The path with every segment the engine can read as a list position taken out — every one
+    /// after the first, which is always a property's name — or null when it has none:
     /// <c>Items.0.Sku</c> → <c>Items.Sku</c>.
+    ///
+    /// <para>"Can read as a position" is the engine's own test, asked of the engine's own
+    /// function (<see cref="PropertyPath.TryReadPosition"/>). A copy of the rule kept here —
+    /// "a run of digits" — was narrower than what the engine accepts, and <c>Items[' 0'].Sku</c>
+    /// walked between the two.</para>
     /// </summary>
-    private static string? WithoutNumbers(ReadOnlySpan<char> path)
+    private static string? WithoutPositions(ReadOnlySpan<char> path)
     {
         StringBuilder? sb = null;
         int start = 0, kept = 0;
@@ -291,13 +344,20 @@ public sealed class MaskingPolicy
         {
             if (i < path.Length && path[i] != '.') continue;
             ReadOnlySpan<char> segment = path[start..i];
-            bool number = start > 0 && !segment.IsEmpty && !segment.ContainsAnyExceptInRange('0', '9');
-            if (number) sb ??= new StringBuilder(path.Length).Append(path[..(start - 1)]);
+            bool position = start > 0 && PropertyPath.TryReadPosition(segment, out _);
+            if (position) sb ??= new StringBuilder(path.Length).Append(path[..(start - 1)]);
             else if (sb is not null) { if (kept > 0) sb.Append('.'); sb.Append(segment); }
-            if (!number) kept++;
+            if (!position) kept++;
             start = i + 1;
         }
         return sb?.ToString();
+    }
+
+    /// <summary>True when a rule that holds in every service keeps the field as it is stored.</summary>
+    public bool KeepsEverywhere(string path)
+    {
+        HiddenAnywhere(path, out _, out bool kept);
+        return kept;
     }
 
     private static bool InScope(string[] services, string? service)
@@ -401,7 +461,7 @@ public sealed class MaskingPolicy
     /// caller's to know, from the engine's own table; guessing it from an at sign here would
     /// send a property called <c>@anything</c> past every rule.
     /// </summary>
-    public string? MaskGroupKey(string path, string? value, MaskStats stats)
+    public string? MaskGroupKey(string path, string? value, MaskStats stats, NamedValues? named = null)
     {
         if (value is null) return null;
 
@@ -415,6 +475,7 @@ public sealed class MaskingPolicy
             case Decision.KeepLast4: stats.Add(reason, path, rule); return LastFour(value);
             case Decision.Hash:      stats.Add(reason, path, rule); return TokenOfText(value, isNumber: false);
         }
+        if (NamedToken(value, named, stats) is { } token) return token;
         return kept ? value : MaskText(value, stats);
     }
 
@@ -428,8 +489,12 @@ public sealed class MaskingPolicy
     /// past the same detectors a value does in a search, as a number and as the digits it is
     /// written with. A field that a rule keeps in every service is sent as it is.
     /// </summary>
-    public string MaskNumber(string path, double value, MaskStats stats)
+    public string MaskNumber(string path, double value, MaskStats stats, NamedValues? named = null)
     {
+        bool whole = value == Math.Floor(value) && Math.Abs(value) <= ExactIntegers;
+        string exact = whole ? ((long)value).ToString(CultureInfo.InvariantCulture) : value.ToString("R", CultureInfo.InvariantCulture);
+        if (NamedToken(exact, named, stats) is { } token) return token;
+
         if (value != Math.Floor(value) || double.IsInfinity(value))
             return value.ToString("0.###", CultureInfo.InvariantCulture);
 
@@ -441,12 +506,11 @@ public sealed class MaskingPolicy
             return "(hidden: too long to show exactly)";
         }
 
-        long whole  = (long)value;
-        string text = whole.ToString(CultureInfo.InvariantCulture);
+        string text = exact;
         HiddenAnywhere(path, out _, out bool kept);
         if (kept) return text;
 
-        if (SensitiveValueDetectors.IsSensitiveNumber(whole, _detectors, out var kind))
+        if (SensitiveValueDetectors.IsSensitiveNumber((long)value, _detectors, out var kind))
         {
             stats.Add(MaskReason.Detector, SensitiveValueDetectors.IdOf(kind));
             return TokenOfText(text, isNumber: true);
@@ -454,26 +518,70 @@ public sealed class MaskingPolicy
         return MaskText(text, stats);
     }
 
+    /// <summary>
+    /// Whether <c>sum</c>, <c>min</c>, <c>max</c> or <c>avg</c> may take a stored value — asked
+    /// of each one by the aggregation, for a field no rule names.
+    ///
+    /// <para>Not a text: a string that reads as a number is an identifier more often than a
+    /// measurement, and comes back with its spelling gone. And not a number a search would hide
+    /// — a card number, an IIN. Hiding the RESULT is not enough for those: the sum of two IINs
+    /// is no IIN, and three sums of pairs are three equations in three unknowns. A value that
+    /// is left out is counted in <paramref name="leftOut"/>, by the detector that knows it.</para>
+    /// </summary>
+    public bool AdmitsToAggregate(object value, MaskStats? leftOut)
+    {
+        long whole;
+        switch (value)
+        {
+            case string:  return false;
+            case long l:  whole = l; break;
+            case int i:   whole = i; break;
+            case ulong u when u <= long.MaxValue: whole = (long)u; break;
+            case uint ui: whole = ui; break;
+            case double d when d == Math.Floor(d) && Math.Abs(d) <= ExactIntegers: whole = (long)d; break;
+            case float f when f == MathF.Floor(f) && MathF.Abs(f) <= 16_777_216f:  whole = (long)f; break;
+            case decimal m when m == decimal.Truncate(m) && Math.Abs(m) <= long.MaxValue: whole = (long)m; break;
+            default:      return true;    // a fraction, a boolean: nothing a detector knows by its digits
+        }
+        if (!SensitiveValueDetectors.IsSensitiveNumber(whole, _detectors, out var kind)) return true;
+        leftOut?.Add(MaskReason.Detector, SensitiveValueDetectors.IdOf(kind));
+        return false;
+    }
+
+    /// <summary>
+    /// The token the call itself used for this value, when it named the value by one; counted
+    /// as hidden. Null for every other value.
+    /// </summary>
+    private static string? NamedToken(string? text, NamedValues? named, MaskStats stats)
+    {
+        if (named is null || text is null || named.TokenOf(text) is not { } token) return null;
+        stats.Add(MaskReason.Detector, MaskStats.Named);
+        return token;
+    }
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     /// <summary>Everything the walk of one event carries with it.</summary>
-    private readonly record struct Ctx(ReadOnlyMemory<byte> Raw, string? Service, MaskStats Stats);
+    private readonly record struct Ctx(ReadOnlyMemory<byte> Raw, string? Service, MaskStats Stats, NamedValues? Named);
 
     /// <summary>
     /// <paramref name="ev"/> as the AI gets it. <paramref name="onlyFields"/> narrows the
     /// properties to the named top-level ones; the rules apply to whatever is left.
+    /// <paramref name="named"/> are the values the call asked about by their tokens: shown as
+    /// those tokens wherever they turn up (see <see cref="NamedValues"/>).
     /// </summary>
-    public MaskedEvent Mask(LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields = null)
+    public MaskedEvent Mask(LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields = null, NamedValues? named = null)
     {
-        var props = new List<KeyValuePair<string, string>>();
-        Properties(ev, stats, onlyFields, props, stored: null);
+        var props  = new List<KeyValuePair<string, string>>();
+        var stored = new List<string>();
+        Properties(ev, stats, onlyFields, props, stored, named);
 
         MaskedException? exception = null;
         if (ev.HasException)
         {
             // The tree is built here, for a returned row only. A payload that cannot be read is
             // said to be so rather than failing the whole answer over one row.
-            try { exception = ev.Exception is { } x ? MaskException(x, stats, depth: 1) : null; }
+            try { exception = ev.Exception is { } x ? MaskException(x, stats, named, depth: 1) : null; }
             catch (Exception e) when (e is MessagePackSerializationException or InvalidOperationException or EndOfStreamException)
             {
                 exception = new MaskedException("(unreadable exception)", null, null, null);
@@ -482,10 +590,11 @@ public sealed class MaskingPolicy
 
         return new MaskedEvent
         {
-            Source     = ev,
-            Template   = MaskText(ev.MessageTemplate, stats),
-            Properties = props,
-            Exception  = exception,
+            Source      = ev,
+            Template    = NamedToken(ev.MessageTemplate, named, stats) ?? MaskText(ev.MessageTemplate, stats),
+            Properties  = props,
+            StoredNames = stored,
+            Exception   = exception,
         };
     }
 
@@ -500,12 +609,13 @@ public sealed class MaskingPolicy
     {
         var props  = new List<KeyValuePair<string, string>>();
         var stored = new List<string>();
-        Properties(ev, stats, onlyFields, props, stored);
+        Properties(ev, stats, onlyFields, props, stored, named: null);
         return (props, stored);
     }
 
     private void Properties(
-        LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields, List<KeyValuePair<string, string>> props, List<string>? stored)
+        LogEvent ev, MaskStats stats, IReadOnlySet<string>? onlyFields, List<KeyValuePair<string, string>> props, List<string> stored,
+        NamedValues? named)
     {
         ReadOnlyMemory<byte> raw = ev.RawProperties;
         if (raw.IsEmpty && ev.Properties is { Count: > 0 } map) raw = PropertyBytes.From(map);
@@ -514,7 +624,7 @@ public sealed class MaskingPolicy
         var reader = new MessagePackReader(raw);
         if (reader.NextMessagePackType != MessagePackType.Map) return;
 
-        var ctx = new Ctx(raw, ev.ServiceName, stats);
+        var ctx = new Ctx(raw, ev.ServiceName, stats, named);
         int count = reader.ReadMapHeader();
         for (int i = 0; i < count; i++)
         {
@@ -522,15 +632,15 @@ public sealed class MaskingPolicy
             if (onlyFields is not null && !onlyFields.Contains(key)) { reader.Skip(); continue; }
             if (Cell(ref reader, key, in ctx) is not { } cell) continue;
             props.Add(new(Name(key, stats), cell));
-            stored?.Add(key);
+            stored.Add(key);
         }
     }
 
-    private MaskedException MaskException(ExceptionInfo x, MaskStats stats, int depth) => new(
+    private MaskedException MaskException(ExceptionInfo x, MaskStats stats, NamedValues? named, int depth) => new(
         x.Type,
-        x.Message    is null ? null : MaskText(x.Message, stats),
+        x.Message    is null ? null : NamedToken(x.Message, named, stats) ?? MaskText(x.Message, stats),
         x.StackTrace is null ? null : MaskText(x.StackTrace, stats),
-        x.Inner is { } inner && depth < ExceptionInfo.MaxDepth ? MaskException(inner, stats, depth + 1) : null);
+        x.Inner is { } inner && depth < ExceptionInfo.MaxDepth ? MaskException(inner, stats, named, depth + 1) : null);
 
     /// <summary>The value of one top-level property as cell text; null when a rule removes it.</summary>
     private string? Cell(ref MessagePackReader r, string path, in Ctx c)
@@ -548,7 +658,7 @@ public sealed class MaskingPolicy
         {
             case MessagePackType.String:
                 string s = r.ReadString() ?? "";
-                return keep ? s : Loose(s, path, in c);
+                return NamedToken(s, c.Named, c.Stats) ?? (keep ? s : Loose(s, path, in c));
 
             case MessagePackType.Integer:
             case MessagePackType.Float:
@@ -621,7 +731,7 @@ public sealed class MaskingPolicy
 
             case MessagePackType.String:
                 string s = r.ReadString() ?? "";
-                w.WriteStringValue(keep ? s : Loose(s, path, in c));
+                w.WriteStringValue(NamedToken(s, c.Named, c.Stats) ?? (keep ? s : Loose(s, path, in c)));
                 break;
 
             case MessagePackType.Integer:
@@ -655,6 +765,12 @@ public sealed class MaskingPolicy
     {
         hidden = false;
         string text = ReadNumber(ref r, out long? integer);
+        // Before anything else — a field that is kept is exactly where a named value would show.
+        if (NamedToken(text, c.Named, c.Stats) is { } named)
+        {
+            hidden = true;
+            return named;
+        }
         if (keep) return text;
 
         if (Mode == McpMaskingMode.Strict)

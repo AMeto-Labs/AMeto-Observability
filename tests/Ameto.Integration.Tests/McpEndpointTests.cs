@@ -79,6 +79,11 @@ internal static class McpTesting
                         w.WriteMapHeader(nested.Count);
                         foreach (var (k, v) in nested) { w.Write(k); w.Write(v?.ToString()); }
                         break;
+                    // A list, each element as it is: an object keeps the types of its values.
+                    case List<object?> list:
+                        w.WriteArrayHeader(list.Count);
+                        foreach (object? item in list) WriteItem(ref w, item);
+                        break;
                     default: w.Write(value.ToString()); break;
                 }
             }
@@ -91,6 +96,28 @@ internal static class McpTesting
         response.EnsureSuccessStatusCode();
         var answer = await response.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(events.Length, answer.GetProperty("ingested").GetInt32());
+    }
+
+    private static void WriteItem(ref MessagePackWriter w, object? item)
+    {
+        switch (item)
+        {
+            case null:     w.WriteNil(); break;
+            case string s: w.Write(s); break;
+            case int i:    w.Write(i); break;
+            case long l:   w.Write(l); break;
+            case bool b:   w.Write(b); break;
+            case double d: w.Write(d); break;
+            case Dictionary<string, object?> map:
+                w.WriteMapHeader(map.Count);
+                foreach (var (k, v) in map) { w.Write(k); WriteItem(ref w, v); }
+                break;
+            case List<object?> list:
+                w.WriteArrayHeader(list.Count);
+                foreach (object? inner in list) WriteItem(ref w, inner);
+                break;
+            default: w.Write(item.ToString()); break;
+        }
     }
 
     public static string NewService() => "svc-" + Guid.NewGuid().ToString("N")[..10];

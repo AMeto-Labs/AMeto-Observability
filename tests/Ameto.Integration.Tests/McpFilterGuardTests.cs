@@ -108,8 +108,8 @@ public sealed class McpFilterGuardTests
         var (asProperty, _, _) = FilterGuard.PrepareAggregation($"select count(['{text}'])", policy, vault, Payments);
         Assert.Equal(text, Assert.Single(asProperty!.Aggregates).Property);
 
-        // And the numbers are taken from numbers only.
-        Assert.True(query.NumbersOnly);
+        // And which stored values an aggregate takes is decided here, not left to the engine.
+        Assert.NotNull(query.Admits);
     }
 
     [Theory]
@@ -137,6 +137,36 @@ public sealed class McpFilterGuardTests
         // The refusal names the token, as the caller wrote it — never the value.
         Assert.DoesNotContain("6456116363", prepared.Error);
         Assert.DoesNotContain("4111111111111111", prepared.Error);
+    }
+
+    /// <summary>
+    /// A built-in field holds no hidden value, and every answer shows it as it is — the service
+    /// and level in a group's header line, the exception's type in an event's detail. A token
+    /// compared with one could only find the hidden value lying there in the open, in a place
+    /// the answer cannot leave out; so it is refused, under every spelling of the field.
+    /// </summary>
+    [Theory]
+    [InlineData("@service = '{t}'")]
+    [InlineData("service.name != '{t}'")]
+    [InlineData("@l = '{t}'")]
+    [InlineData("@mt = '{t}'")]
+    [InlineData("@x.type = '{t}'")]
+    [InlineData("Exception = '{t}'")]
+    [InlineData("@x.message = '{t}'")]
+    [InlineData("@tr = '{n}'")]
+    [InlineData("@service in ['payments-api', '{t}']")]
+    [InlineData("A = 1 and not (@x.stack in ['{n}'])")]
+    public void AToken_IsNotComparedWithABuiltInField(string filter)
+    {
+        var (policy, vault, numeric, text) = WithTokens();
+        var prepared = FilterGuard.Prepare(filter.Replace("{n}", numeric).Replace("{t}", text), policy, vault);
+
+        Assert.Contains("is a built-in field", prepared.Error);
+        Assert.Equal(RefusalKind.Masking, prepared.Kind);
+        Assert.Null(prepared.Node);
+        Assert.DoesNotContain("4111111111111111", prepared.Error);
+        // The same comparisons with a value of one's own are ordinary filters.
+        Assert.Null(FilterGuard.Prepare("@service = 'payments-api' and @x.type = 'System.TimeoutException'", policy, vault).Error);
     }
 
     [Theory]
@@ -272,6 +302,152 @@ public sealed class McpFilterGuardTests
         Assert.Contains("hidden field", FilterGuard.Prepare("Limits.5 > 3", policy, vault).Error);
         Assert.Null(FilterGuard.Prepare("Limits.6 > 3", policy, vault).Error);
         Assert.Null(FilterGuard.Prepare("Items.0.Qty > 3", policy, vault).Error);
+    }
+
+    /// <summary>
+    /// What the test above samples, held as a property: whatever segment the ENGINE reads an
+    /// element of a list by, the guard judges as a path to that element. The second review
+    /// found the spelling the first fix had not thought of — <c>Items[' 0']</c>, because the
+    /// engine reads a position with <c>int.TryParse</c> and that takes white space, a sign, a
+    /// trailing NUL. A list of spellings is only as good as the imagination behind it; this
+    /// asks the engine itself, about several thousand of them.
+    /// </summary>
+    [Fact]
+    public void WhateverTheEngineReadsAsAPosition_TheGuardJudgesAsOne()
+    {
+        var vault  = new TokenVault();
+        var policy = Policy(McpMaskingMode.Standard, vault, Rule("Basket.Sku", MaskAction.Hash), Rule("Basket.Price", MaskAction.Hash));
+        var ev = Event("x", new()
+        {
+            ["Basket"] = new List<object?>
+            {
+                new Dictionary<string, object?> { ["Sku"] = "ZX-SECRET-41", ["Price"] = 1250 },
+                new Dictionary<string, object?> { ["Sku"] = "QQ-OTHER-7", ["Price"] = 90 },
+            },
+        });
+
+        // The spellings the review tried, then twenty thousand made of the characters that
+        // could matter: white space of every kind, signs, digits of three scripts, a NUL.
+        var segments = new List<string>
+        {
+            "0", "00", "000", " 0", "0 ", "  0  ", "+0", "-0", " +0 ", "\t0", "0\t", "\n0", "0\n", "\r0", "\v0", "\f0", "0\0", "\00",
+            " 0", "0 ", "​0", "٠", "０", "0.0", "0,0", "1e0", "0x0", "(0)", "0L", "+", "-", "", "1", " 1", "+1", "1\0", "2", "-1",
+        };
+        char[] alphabet = [' ', '\t', '\n', '\r', '\v', '\f', '\0', '+', '-', '0', '1', '2', '9', '.', ',', 'x', 'e', '_', ' ', ' ', '​', '٠', '０'];
+        var random = new Random(162);
+        for (int i = 0; i < 20_000; i++)
+        {
+            var made = new char[random.Next(1, 5)];
+            for (int c = 0; c < made.Length; c++) made[c] = alphabet[random.Next(alphabet.Length)];
+            segments.Add(new string(made));
+        }
+
+        int reached = 0;
+        foreach (string segment in segments)
+        {
+            string path = "Basket" + Sep + segment + Sep + "Sku";
+            if (FilterEvaluator.ReadProperty(ev, path) is not string sku) continue;
+            reached++;
+            string spelled = string.Concat(segment.Select(static c => c is < ' ' or > '~' ? $"\\u{(int)c:X4}" : c.ToString()));
+            Assert.True(FilterGuard.IsHidden(policy, path), $"'{spelled}' reads an element of the list and is not judged as one");
+            Assert.DoesNotContain(sku, policy.MaskGroupKey(FilterGuard.RulePath(path), sku, new MaskStats()));
+        }
+        // Not an empty promise: the engine does read elements by a great many of these.
+        Assert.True(reached > 500, $"only {reached} spellings reached an element");
+
+        // And through the front door, as a filter and as a query.
+        foreach (string position in (string[])["[0]", ".0", "[' 0']", "['0 ']", "['+0']", "['-0']", "['\t0']", "[' +1 ']"])
+        {
+            Assert.Contains("hidden field", FilterGuard.Prepare($"Basket{position}.Sku like 'ZX%'", policy, vault).Error);
+            Assert.Contains("hidden field", FilterGuard.PrepareAggregation($"select max(Basket{position}.Price)", policy, vault, Payments).Error);
+        }
+    }
+
+    [Fact]
+    public void AValueNamedByItsToken_IsShownAsThatToken_WhereverItTurnsUp()
+    {
+        var vault  = new TokenVault();
+        var policy = Policy(McpMaskingMode.Standard, vault,
+            Rule("PatientAge", MaskAction.Hash), Rule("Buyer", MaskAction.Hash), Rule("Reference", MaskAction.Keep));
+        var hidden = Cells(policy.Mask(Event("x", new() { ["PatientAge"] = 7391, ["Buyer"] = "Ivan Petrov" }), new MaskStats()));
+        string age = hidden["PatientAge"], buyer = hidden["Buyer"];
+
+        // The same two values lying in the open, in fields no rule hides — one of them in a
+        // field a rule KEEPS, which is exactly where a value is shown as it is stored.
+        var open = Event("Attempt {Attempt}", new()
+        {
+            ["Attempt"] = 7391, ["AttemptText"] = "7391", ["Reference"] = "IVAN PETROV",
+            ["Tags"] = new List<object?> { "vip", "Ivan Petrov" }, ["Other"] = 7392, ["Greeting"] = "Hello, Ivan Petrov",
+        });
+
+        // The question is a fair one, and is answered: yes, the value is there.
+        var prepared = FilterGuard.Prepare($"Attempt = '{age}' or Reference = '{buyer}' or Tags = '{buyer}'", policy, vault);
+        Assert.True(Run(prepared).Matches(open));
+        Assert.Equal(2, prepared.Named!.Count);
+
+        // What it must not be answered with is the value. Before this, the event came back with
+        // Attempt = 7391 beside it: one call, and the token was read.
+        Assert.Equal("7391", Cells(policy.Mask(open, new MaskStats()))["Attempt"]);
+        var stats = new MaskStats();
+        var cells = Cells(policy.Mask(open, stats, onlyFields: null, prepared.Named));
+        Assert.Equal(age, cells["Attempt"]);
+        Assert.Equal(age, cells["AttemptText"]);                    // the number kept as text is the same value
+        Assert.Equal(buyer, cells["Reference"]);                    // kept by a rule, in another case — and not shown
+        Assert.Equal($"[\"vip\",\"{buyer}\"]", cells["Tags"]);      // one element of a list
+        Assert.Equal("7392", cells["Other"]);                       // another value is another value
+        Assert.Equal("Hello, Ivan Petrov", cells["Greeting"]);      // part of a longer text: no equality ever matched it
+        Assert.Equal(4, stats.ByDetector[MaskStats.Named]);
+
+        // A table's key and an aggregate's cell are answers too.
+        Assert.Equal(buyer, policy.MaskGroupKey("Reference", "Ivan Petrov", new MaskStats(), prepared.Named));
+        Assert.Equal(age, policy.MaskNumber("Attempt", 7391, new MaskStats(), prepared.Named));
+        Assert.Equal("7392", policy.MaskNumber("Attempt", 7392, new MaskStats(), prepared.Named));
+        var query = FilterGuard.PrepareAggregation($"select max(Attempt) where Attempt = '{age}' group by Reference", policy, vault, Payments);
+        Assert.Null(query.Error);
+        Assert.Equal(1, query.Named!.Count);
+
+        // A filter that named nothing carries nothing.
+        Assert.Null(FilterGuard.Prepare("Attempt = 7391", policy, vault).Named);
+    }
+
+    [Fact]
+    public void AnAggregate_TakesNoValueASearchWouldHide()
+    {
+        var policy = Standard(Rule("Total", MaskAction.Keep));
+        var left   = new MaskStats();
+
+        // Measurements, whatever they are stored as.
+        foreach (object measured in (object[])[42L, 7, 12.5, 1250d, true, 99_999_999_999L, 4111111111111112L])
+            Assert.True(policy.AdmitsToAggregate(measured, left));
+        // A text is not one — and is not counted as hidden either: it never was a number.
+        Assert.False(policy.AdmitsToAggregate("+77015550123", left));
+        Assert.False(policy.AdmitsToAggregate("200", left));
+        Assert.Equal(0, left.Total);
+
+        // What a search hides. The result of an aggregate is masked too — but the sum of two
+        // IINs is no IIN, and three sums of pairs are three equations in three unknowns.
+        Assert.True(SensitiveValueDetectors.IsIin("850315400055") && SensitiveValueDetectors.IsIin("780720300233"));
+        Assert.False(policy.AdmitsToAggregate(900101300126L, left));
+        Assert.False(policy.AdmitsToAggregate(850315400055L, left));
+        Assert.False(policy.AdmitsToAggregate(4111111111111111L, left));
+        Assert.False(policy.AdmitsToAggregate(4111111111111111d, left));
+        Assert.False(policy.AdmitsToAggregate(900101300126L, leftOut: null));
+        Assert.Equal(2, left.ByDetector["iin"]);
+        Assert.Equal(2, left.ByDetector["cardNumber"]);
+
+        // As a query asks it: every aggregate over the field refuses the value, and it is one
+        // value — counted once, however many columns were made of the field.
+        var counted  = new MaskStats();
+        var prepared = FilterGuard.PrepareAggregation(
+            "select sum(ClientRef), avg(ClientRef), max(ClientRef), count(ClientRef), sum(Total)", policy, new TokenVault(), Payments, counted);
+        var admits     = prepared.Query!.Admits!;
+        var aggregates = prepared.Query.Aggregates;
+        foreach (var aggregate in aggregates.Take(3)) Assert.False(admits(aggregate, 900101300126L));
+        Assert.Equal(1, counted.Total);
+        Assert.True(admits(aggregates[0], 1250L));
+        // A field a rule keeps as stored in every service: every value of it is taken, as every value of it is shown.
+        Assert.True(admits(aggregates[4], 900101300126L));
+        Assert.Equal(1, counted.Total);
     }
 
     [Fact]
@@ -416,16 +592,20 @@ public sealed class McpFilterGuardTests
     public void ALongFilter_IsWrittenLong_NotDeep()
     {
         var policy = Standard();
-        // Three hundred clauses, five hundred negations, two dozen words: each is a chain, and a
-        // chain is written flat. The text the engine is given nests no deeper than its meaning.
+        // Three hundred clauses, the most negations a filter may stack, two dozen words: each is
+        // a chain, and a chain is written flat. The text the engine is given nests no deeper
+        // than its meaning.
         string clauses = string.Join(" and ", Enumerable.Range(0, 300).Select(static i => "A = " + i % 10));
         string either  = string.Join(" or ", Enumerable.Range(0, 300).Select(static i => "A = " + i % 10));
-        string nots    = string.Concat(Enumerable.Repeat("not ", 500)) + "A = 1";
+        string nots    = string.Concat(Enumerable.Repeat("not ", FilterGuard.MaxNesting)) + "A = 1";
         string words   = string.Join(' ', Enumerable.Range(0, FilterGuard.MaxWords).Select(static i => "w" + i));
+        // The densest chain 4 000 characters hold: a lone '-' is a word, three characters a
+        // clause, 1 334 clauses — a left-deep tree that deep, walked by recursion at each step.
+        string densest = string.Concat(Enumerable.Repeat("-or", 1_333)) + "-";
 
-        string mixed   = $"({string.Join(" or ", Enumerable.Range(0, 120).Select(static i => "B = " + i))}) and {string.Concat(Enumerable.Repeat("not ", 200))}C = 1 and {words}";
+        string mixed   = $"({string.Join(" or ", Enumerable.Range(0, 120).Select(static i => "B = " + i))}) and {string.Concat(Enumerable.Repeat("not ", 30))}C = 1 and {words}";
 
-        foreach (string filter in (string[])[clauses, either, nots, words, mixed])
+        foreach (string filter in (string[])[clauses, either, nots, words, mixed, densest])
         {
             Assert.True(filter.Length <= FilterGuard.MaxFilterChars);
             var prepared = FilterGuard.Prepare(filter, policy, new TokenVault());
@@ -438,9 +618,31 @@ public sealed class McpFilterGuardTests
             CompiledFilter.Compile(text).Matches(Event("w0 w1", new() { ["A"] = 1, ["B"] = 2, ["C"] = 1 }));
         }
 
-        // The engine's own parser has no such limit: some two hundred nested parentheses are
-        // more stack than a thread has, and that ends the process. Here they are counted first.
+        // The engine's own parser had no such limit: some two hundred nested parentheses were
+        // more stack than a thread has, and that ended the process. Here they are counted first.
         Assert.Contains("nests parentheses", FilterGuard.Prepare(new string('(', 250) + "A = 1" + new string(')', 250), policy, new TokenVault()).Error);
+
+        // A 'not' is a level as a parenthesis is — the engine counts it so, and refuses past 100.
+        // Refused here far below that, with a sentence of this server's, also where the text
+        // has no parenthesis at all: the scope joined around an 'or' is one level more, and the
+        // text written for the engine must never be the one it refuses.
+        foreach (string deep in (string[])
+                 [
+                     string.Concat(Enumerable.Repeat("not ", FilterGuard.MaxNesting + 1)) + "A = 1",
+                     string.Concat(Enumerable.Repeat("not ", 500)) + "A = 1",
+                     "A = 1 or " + string.Concat(Enumerable.Repeat("not ", 100)) + "B = 1",
+                     string.Concat(Enumerable.Repeat("not (A = 1 or ", 17)) + "B = 1" + new string(')', 17),
+                 ])
+        {
+            var refused = FilterGuard.Prepare(deep, policy, new TokenVault());
+            Assert.Contains("nests more than", refused.Error);
+            Assert.Equal(RefusalKind.Input, refused.Kind);
+        }
+        // The same count on a tree: a 'not' is a level; an 'or' inside an 'and' is one; a chain is none.
+        Assert.Equal(0, FilterGuard.WrittenDepth(FilterParser.Parse(clauses)));
+        Assert.Equal(1, FilterGuard.WrittenDepth(FilterParser.Parse("A = 1 and (B = 1 or C = 1)")));
+        Assert.Equal(3, FilterGuard.WrittenDepth(FilterParser.Parse("not (A = 1 or not B = 1)")));
+        Assert.Equal(FilterGuard.MaxNesting, FilterGuard.WrittenDepth(FilterParser.Parse(nots)));
 
         var tooMany = FilterGuard.Prepare(words + " onemore", policy, new TokenVault());
         Assert.Contains("plain words", tooMany.Error);
@@ -678,6 +880,42 @@ public sealed class McpFilterGuardTests
         Assert.Contains("at most", PublishedToolBinder.Validate(tool, [])?.Error);
         var deep = OrdersOf with { Filter = new string('(', 40) + "Owner = {owner} and Region = {region}" + new string(')', 40) };
         Assert.Contains("nests parentheses", PublishedToolBinder.Validate(deep, [])?.Error);
+    }
+
+    [Fact]
+    public void AParameterWhereANameStands_IsRefusedWhenTheToolIsSaved_NotAtEveryCall()
+    {
+        // It reads well, and it parses with any one argument — but its filter is another filter
+        // for every name, and every real call would be refused for changing it.
+        var tool = new McpPublishedTool
+        {
+            Id = "t", Name = "by_header", Description = "d",
+            Filter = "@service = 'gateway' and Headers[{name}] = {value}",
+            Parameters = [new() { Name = "name", Required = true }, new() { Name = "value", Required = true }],
+        };
+        var problem = PublishedToolBinder.Validate(tool, []);
+        Assert.Contains("{name} stands where a name stands", problem?.Error);
+        Assert.Equal("filter", problem?.Field);
+
+        // The same parameters, each where a value stands.
+        Assert.Null(PublishedToolBinder.Validate(tool with { Filter = "@service = 'gateway' and Headers['X-Tenant'] = {value} and Name = {name}" }, []));
+
+        // Every type of parameter, with and without a default: none of them changes a shape.
+        var typed = new McpPublishedTool
+        {
+            Id = "t", Name = "typed", Description = "d",
+            Filter = "Owner = {owner} and Elapsed > {minMs} and Retried = {retried} and Reason in [{reason}, 'other'] and startsWith(Path, {prefix}) and {word}",
+            Parameters =
+            [
+                new() { Name = "owner", Required = true, Default = "y" },
+                new() { Name = "minMs", Type = McpToolParameter.Number, Default = "2" },
+                new() { Name = "retried", Type = McpToolParameter.Boolean },
+                new() { Name = "reason", Type = McpToolParameter.Enum, Values = ["a", "b"] },
+                new() { Name = "prefix" },
+                new() { Name = "word" },
+            ],
+        };
+        Assert.Null(PublishedToolBinder.Validate(typed, []));
     }
 
     // ── Values that are hidden wherever they turn up ──────────────────────────

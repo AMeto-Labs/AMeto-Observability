@@ -251,18 +251,53 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         foreach (string leaked in (string[])["900101300126", "77015550123", "77015550199", "411111111111111", "555555555555444", "50312501234", " 101"])
             Assert.DoesNotContain(leaked, strings);
 
-        // A number that is a card number or an IIN comes back as the token a search gives it.
+        // A number that is a card number or an IIN takes no part in an aggregate at all: the
+        // answer says how many values were left out, and what is a measurement is added up.
         var (numbers, numbersError) = await Call(client, "logs_aggregate",
-            ("query", "select max(IinNo), min(CardNo), sum(Amount), avg(Elapsed), count(CardNo) where User = 'u3'"));
+            ("query", "select max(IinNo), min(CardNo), sum(CardNo), sum(Amount), avg(Elapsed), count(CardNo) where User = 'u3'"));
         Assert.False(numbersError, numbers);
         Assert.DoesNotContain("900101300126", numbers);
         Assert.DoesNotContain("411111111111111", numbers);
-        Assert.Equal(2, McpTesting.Token.Matches(numbers).Count);
+        Assert.DoesNotContain("8222222222222222", numbers);              // the two card numbers added up
+        Assert.Empty(McpTesting.Token.Matches(numbers));
+        Assert.Contains("4 values were left out", numbers);              // two events, two such fields
         Assert.Contains("2000", numbers);                                // sum(Amount)
         Assert.Contains("30.5", numbers);                                // avg(Elapsed)
+        Assert.Matches(@"(?m)^null\s+null\s+null\s+2000\s+30\.5\s+2\s*$", numbers);
 
-        // What a table hid is counted, as what a search hides is.
-        Assert.Equal(2, (await Calls(admin, profileId))[0].GetProperty("masked").GetInt64());
+        // What a table kept out is counted, as what a search hides is.
+        Assert.Equal(4, (await Calls(admin, profileId))[0].GetProperty("masked").GetInt64());
+    }
+
+    [Fact]
+    public async Task SumsOfHiddenNumbers_AreNotEquationsToSolve()
+    {
+        // The second review's arithmetic: three IINs kept as numbers in a field no rule names.
+        // One at a time an aggregate gave a token; two at a time it gave their sum — and three
+        // sums of pairs are three equations in three unknowns.
+        var admin = await host.AdminAsync();
+        string service = McpTesting.NewService();
+        long first = 900101300126, second = 850315400055, third = 780720300233;
+        await McpTesting.IngestAsync(admin,
+            new(service, "Client {Who}") { Properties = { ["Who"] = "first",  ["ClientRef"] = first,  ["Visits"] = 3 } },
+            new(service, "Client {Who}") { Properties = { ["Who"] = "second", ["ClientRef"] = second, ["Visits"] = 5 } },
+            new(service, "Client {Who}") { Properties = { ["Who"] = "third",  ["ClientRef"] = third,  ["Visits"] = 8 } });
+        var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "sums", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (search, _) = await Call(client, "logs_search");
+        foreach (long iin in (long[])[first, second, third]) Assert.DoesNotContain(iin.ToString(), search);
+
+        foreach (var (a, b) in ((string, string)[])[("first", "second"), ("second", "third"), ("first", "third")])
+        {
+            var (table, isError) = await Call(client, "logs_aggregate",
+                ("query", $"select sum(ClientRef), avg(ClientRef), min(ClientRef), max(ClientRef), sum(Visits), count(ClientRef) where Who in ['{a}', '{b}']"));
+            Assert.False(isError, table);
+            Assert.Contains("2 values were left out", table);
+            // Nothing of twelve digits or more, and nothing that is half of something of thirteen.
+            Assert.DoesNotMatch(@"\d{11,}", table.Split('\n').Last(static line => line.Length > 0));
+            Assert.Matches(@"(?m)^null\s+null\s+null\s+null\s+\d+\s+2\s*$", table);
+        }
     }
 
     [Fact]
@@ -511,11 +546,29 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
             if ((await Call(client, "logs_overview")).Text.Contains("calls for this minute")) overLimit++;
         Assert.InRange(overLimit, 77, 79);
 
-        var calls = await Calls(admin, profileId, 500);
+        static long Repeats(JsonElement call) => call.TryGetProperty("repeats", out var r) && r.ValueKind == JsonValueKind.Number ? r.GetInt64() : 0;
+
+        var before = await admin.GetFromJsonAsync<JsonElement>("/api/mcp/summary");
+        var calls  = await Calls(admin, profileId, 500);
         Assert.InRange(calls.Count, 7, 18);                             // not eighty
-        long most = calls.Max(static c => c.TryGetProperty("repeats", out var r) && r.ValueKind == JsonValueKind.Number ? r.GetInt64() : 0);
-        Assert.InRange(most, 32, 64);                                   // and the record says about how many there were
-        Assert.All(calls.Where(static c => Text(c, "refusalKind") == "limit"), static c => Assert.Equal("Refused", Text(c, "status")));
+        Assert.InRange(calls.Max(Repeats), 32, 64);                     // and the record says about how many there were
+        var pastTheMinute = calls.Where(static c => Text(c, "refusalKind") == "limit").ToList();
+        Assert.All(pastTheMinute, static c => Assert.Equal("Refused", Text(c, "status")));
+        // Every one of them carries its number, the first one too: "1" is the start of a series
+        // or the whole of it, and a call that was not such a refusal carries none.
+        Assert.All(pastTheMinute, static c => Assert.True(Repeats(c) >= 1));
+        Assert.Contains(pastTheMinute, static c => Repeats(c) == 1);
+        Assert.All(calls.Except(pastTheMinute), static c => Assert.Equal(0, Repeats(c)));
+
+        // The summary counts refusals, not the records of them: what the last record of each
+        // minute says, with the difference named — the calls that left no record of their own.
+        long counted = before.GetProperty("refusals").GetProperty("limit").GetInt64();
+        long unrecorded = before.GetProperty("unrecorded").GetInt64();
+        Assert.InRange(counted, 64, 79);
+        Assert.Equal(counted - pastTheMinute.Count, unrecorded);
+        Assert.True(unrecorded >= 50, $"unrecorded = {unrecorded}");
+        // And it says that every figure it is part of is a floor.
+        Assert.True(before.GetProperty("thinned").GetBoolean());
     }
 
     [Fact]
@@ -616,6 +669,140 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         var problem = await saved.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("filter", problem.GetProperty("field").GetString());
         Assert.Contains("no condition left", problem.GetProperty("error").GetString());
+    }
+
+    // ── What the second review found ──────────────────────────────────────────
+
+    [Fact]
+    public async Task APositionSpelledAnyWay_IsStillAnElementOfTheList()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "Basket.Sku", action = "hash" });
+        await Rule(admin, new { field = "Basket.Price", action = "hash" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin,
+            new McpTesting.Event(service, "Ordered {OrderId}")
+            {
+                Properties =
+                {
+                    ["OrderId"] = "o-1",
+                    ["Basket"] = new List<object?>
+                    {
+                        new Dictionary<string, object?> { ["Sku"] = "ZX-SECRET-41", ["Price"] = 1250 },
+                        new Dictionary<string, object?> { ["Sku"] = "QQ-OTHER-7", ["Price"] = 90 },
+                    },
+                },
+            },
+            new McpTesting.Event(service, "Ordered {OrderId}")
+            {
+                Properties =
+                {
+                    ["OrderId"] = "o-2",
+                    ["Basket"] = new List<object?> { new Dictionary<string, object?> { ["Sku"] = "MM-THIRD-9", ["Price"] = 77 } },
+                },
+            });
+        var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "positions", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (search, _) = await Call(client, "logs_search");
+        Assert.Contains("o-1", search);
+        foreach (string secret in (string[])["ZX-SECRET-41", "QQ-OTHER-7", "MM-THIRD-9", "1250"]) Assert.DoesNotContain(secret, search);
+
+        // The engine reads a position out of any segment that reads as a whole number — a space
+        // before it, a sign, a tab. Each of these is the first element's Sku, and is judged as it.
+        foreach (string position in (string[])["[0]", ".0", "[' 0']", "['0 ']", "['+0']", "['-0']", "['\t0']"])
+        {
+            var (text, isError) = await Call(client, "logs_search", ("filter", $"Basket{position}.Sku like 'ZX-S%'"));
+            Assert.True(isError, position);
+            Assert.Contains("hidden field", text);
+        }
+
+        var (grouped, groupedError) = await Call(client, "logs_aggregate",
+            ("query", "select count(*) group by Basket[' 0'].Sku, Basket['+1'].Sku"));
+        Assert.False(groupedError, grouped);
+        foreach (string secret in (string[])["ZX-SECRET-41", "QQ-OTHER-7", "MM-THIRD-9"]) Assert.DoesNotContain(secret, grouped);
+        Assert.Equal(3, McpTesting.Token.Matches(grouped).Count);        // three values, each as its token
+
+        var (ranged, rangedError) = await Call(client, "logs_aggregate", ("query", "select max(Basket[' 0'].Price), min(Basket[' 0'].Price)"));
+        Assert.True(rangedError);
+        Assert.Contains("hidden field", ranged);
+    }
+
+    [Fact]
+    public async Task ATokenComparedWithAFieldInTheOpen_FindsTheValue_AndDoesNotShowIt()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "PatientAge", action = "hash" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin,
+            new(service, "Admitted {Who}") { Properties = { ["Who"] = "patient", ["PatientAge"] = 7391 } },
+            new(service, "Retried {Who}")  { Properties = { ["Who"] = "worker", ["Attempt"] = 7391, ["StatusCode"] = 200 } },
+            new(service, "Retried {Who}")  { Properties = { ["Who"] = "other", ["Attempt"] = 2, ["StatusCode"] = 200 } });
+        var (profileId, key) = await McpTesting.CreateProfileAsync(admin, new { name = "token in the open", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (search, _) = await Call(client, "logs_search", ("filter", "has(PatientAge)"));
+        Assert.DoesNotContain("7391", search);
+        string token = McpTesting.Token.Match(search).Value;
+        Assert.NotEmpty(token);
+
+        // The same number lies in the open in another field. The token finds it — that is what
+        // a token is for — and the answer says so without saying what the number is.
+        var (found, foundError) = await Call(client, "logs_search", ("filter", $"Attempt = '{token}' or StatusCode = '{token}'"));
+        Assert.False(foundError, found);
+        Assert.Contains("1 event", found);
+        Assert.Contains("worker", found);
+        Assert.Contains(token, found);
+        Assert.DoesNotContain("7391", found);
+
+        var (table, tableError) = await Call(client, "logs_aggregate",
+            ("query", $"select count(*), max(Attempt) where Attempt = '{token}' group by Attempt"));
+        Assert.False(tableError, table);
+        Assert.DoesNotContain("7391", table);
+        Assert.Contains(token, table);
+
+        // Counted with what the answer hid, under its own name.
+        var call = (await Calls(admin, profileId)).First(c => Text(c, "tool") == "logs_search" && Text(c, "filter")!.StartsWith("Attempt"));
+        Assert.Equal(1, call.GetProperty("maskedBy").GetProperty("detectors").GetProperty("named").GetInt64());
+    }
+
+    [Fact]
+    public async Task ThePreview_SaysWhichStoredPropertyEachSentOneIs()
+    {
+        var admin = await host.AdminAsync();
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin, new McpTesting.Event(service, "Limits of {Plan}")
+        {
+            Properties = { ["Plan"] = "gold", ["a.serikov@example.com"] = "active" },
+        });
+
+        using var response = await admin.PostAsJsonAsync("/api/mcp/preview", new { mode = "standard", filter = $"@service = '{service}'" });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var sent = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("sent").GetProperty("properties").EnumerateArray().ToList();
+
+        // A name that holds a value goes out as a token; the preview still says which property it was.
+        var hiddenName = Assert.Single(sent, static p => p.GetProperty("stored").GetString() == "a.serikov@example.com");
+        Assert.Matches("^h:[0-9a-f]{12}$", hiddenName.GetProperty("name").GetString());
+        Assert.Equal("active", hiddenName.GetProperty("value").GetString());
+        var plain = Assert.Single(sent, static p => p.GetProperty("stored").GetString() == "Plan");
+        Assert.Equal("Plan", plain.GetProperty("name").GetString());
+    }
+
+    [Fact]
+    public async Task AToolWithAParameterWhereANameStands_IsNotSaved()
+    {
+        var admin = await host.AdminAsync();
+        using var saved = await admin.PostAsJsonAsync("/api/mcp/tools", new
+        {
+            name        = "by_header_" + Guid.NewGuid().ToString("N")[..8],
+            description = "Requests with one header set to one value.",
+            parameters  = new object[] { new { name = "name", required = true }, new { name = "value", required = true } },
+            filter      = "@service = 'gateway' and Headers[{name}] = {value}",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, saved.StatusCode);
+        var problem = await saved.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("filter", problem.GetProperty("field").GetString());
+        Assert.Contains("{name} stands where a name stands", problem.GetProperty("error").GetString());
     }
 
     // ── The settings API ──────────────────────────────────────────────────────

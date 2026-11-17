@@ -295,6 +295,27 @@ internal static partial class PublishedToolBinder
             }
         }
 
+        // A parameter stands where a value stands. `Headers[{name}] = {value}` reads well and
+        // parses with any one argument — but its filter is a different filter for every name,
+        // and every real call would be refused for changing it. Said here, when it is saved:
+        // each parameter in turn is given another value, and the filter has to keep its shape.
+        var neutral = new Masking.MaskingPolicy(McpMaskingMode.Standard, [], MaskDetectors.None, [], new Masking.TokenVault());
+        string? ShapeWith(string? varied)
+        {
+            string? bound = template.Bind(name =>
+            {
+                var p = tool.Parameters.First(q => q.Name == name);
+                return Literal(p, name == varied ? Other(p) : Sample(p));
+            });
+            var prepared = FilterGuard.Prepare(bound, neutral, new Masking.TokenVault());
+            return prepared.Error is null ? FilterGuard.Shape(prepared.Node) : null;
+        }
+        if (ShapeWith(null) is { } shape)
+            foreach (var p in tool.Parameters)
+                if (ShapeWith(p.Name) is { } other && other != shape)
+                    return ($"{{{p.Name}}} stands where a name stands, not a value: with another argument the filter would be a different filter. " +
+                            "A parameter can only be a value that something is compared with.", "filter");
+
         if (tool.Fields.Any(string.IsNullOrWhiteSpace)) return ("A returned field has no name.", "fields");
         return null;
     }
@@ -454,6 +475,15 @@ internal static partial class PublishedToolBinder
         McpToolParameter.Boolean => "true",
         McpToolParameter.Enum    => p.Values[0],
         _                        => "x",
+    };
+
+    /// <summary>Another value of the parameter's type than <see cref="Sample"/>'s, where it has one.</summary>
+    private static string Other(McpToolParameter p) => p.Type switch
+    {
+        McpToolParameter.Number  => Sample(p) == "2" ? "3" : "2",
+        McpToolParameter.Boolean => Sample(p).Equals("true", StringComparison.OrdinalIgnoreCase) ? "false" : "true",
+        McpToolParameter.Enum    => p.Values.FirstOrDefault(v => !v.Equals(Sample(p), StringComparison.OrdinalIgnoreCase)) ?? Sample(p),
+        _                        => Sample(p) == "y" ? "z" : "y",
     };
 
     private static string? Text(JsonElement value) => value.ValueKind switch

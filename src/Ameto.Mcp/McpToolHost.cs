@@ -162,7 +162,7 @@ internal sealed class McpToolHost(
         if (McpAudit.Keeps(repeats))
             audit.Record(profile, Shown(name),
                 argumentsLength > McpAudit.MaxArgumentChars ? $"(not kept: {argumentsLength} characters)" : ArgumentsJson(arguments),
-                result, Stopwatch.GetElapsedTime(started), ClientOf(request.Server), repeats);
+                result, Stopwatch.GetElapsedTime(started), ClientOf(request.Server), repeats, now);
         store.Touch(profile.Id, now);
 
         return new CallToolResult
