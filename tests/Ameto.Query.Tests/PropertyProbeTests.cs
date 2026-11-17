@@ -153,4 +153,42 @@ public sealed class PropertyProbeTests
         Assert.False(Matches(ev, "customer = 'cust-3'"));   // wrong case is a different key
         Assert.True(Matches(ev, "Customer = 'cust-3'"));
     }
+
+    /// <summary>
+    /// msgpack lets a key be any value, and the project's own Serilog sink writes the keys of a
+    /// <c>Dictionary&lt;int, …&gt;</c> property as integers. A key that is not a string names
+    /// nothing a filter can ask for, so its pair is skipped and the map read on — by the probe,
+    /// which always did, and by the dictionary, which threw on the key and lost the WHOLE map:
+    /// free text, every nested path and the decoded value of the map holding the key then saw no
+    /// properties at all on such an event, while the probe still answered for its top-level keys.
+    /// The index walk skips such a pair the same way.
+    /// </summary>
+    [Fact]
+    public void A_key_that_is_not_a_string_is_skipped_by_the_probe_and_the_dictionary_alike()
+    {
+        static LogEvent WithKeysThatAreNotStrings() => Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(4);
+            w.Write(7);        w.Write("x");
+            w.Write("P");      w.Write("needle");
+            w.Write("Ctx");    w.WriteMapHeader(2); w.WriteNil(); w.Write("y"); w.Write("Tenant"); w.Write("acme");
+            w.Write("Counts"); w.WriteMapHeader(1); w.Write(500); w.Write(3);
+        });
+
+        foreach (bool materialised in (bool[])[false, true])
+        {
+            var ev = WithKeysThatAreNotStrings();
+            if (materialised) Assert.NotNull(ev.Properties);
+            Assert.True(Matches(ev, "P = 'needle'"),        $"materialised: {materialised}");
+            Assert.True(Matches(ev, "Ctx.Tenant = 'acme'"), $"materialised: {materialised}");
+            Assert.True(Matches(ev, "needle"),              $"materialised: {materialised}");   // free text reads the dictionary
+            Assert.True(Matches(ev, "has(Counts)"),         $"materialised: {materialised}");   // a map, even an empty one
+        }
+
+        var map = WithKeysThatAreNotStrings().Properties;
+        Assert.NotNull(map);
+        Assert.Equal(new[] { "P", "Ctx", "Counts" }, map.Keys);
+        Assert.Equal(new[] { "Tenant" }, Assert.IsType<Dictionary<string, object?>>(map["Ctx"]).Keys);
+        Assert.Empty(Assert.IsType<Dictionary<string, object?>>(map["Counts"]));
+    }
 }

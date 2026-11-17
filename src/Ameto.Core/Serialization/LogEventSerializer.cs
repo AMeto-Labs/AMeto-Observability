@@ -727,6 +727,10 @@ public static class LogEventSerializer
     {
         int count = reader.ReadArrayHeader();
         var arr   = new object[count];
+        // An element ReadDynamic answers null for — a nil or an extension — reads as the string
+        // "<null>": what the scan compares, what clients are shown (MsgPackJsonTranscoder writes
+        // the same text) and what SegmentIndexBuilder files for it. A change here is a change to
+        // all three.
         for (int i = 0; i < count; i++)
             arr[i] = ReadDynamic(ref reader) ?? "<null>";
         return arr;
@@ -966,7 +970,20 @@ public static class LogEventSerializer
         var dict  = new Dictionary<string, object?>(count);
         for (int i = 0; i < count; i++)
         {
-            string k = reader.ReadString() ?? string.Empty;
+            // A key that is not a string names nothing a filter can ask for: the pair is skipped
+            // and the map read on, as Probe skips it. msgpack allows any key, and the project's
+            // own Serilog sink writes a Dictionary<int, …> property's keys as integers. Read as a
+            // string, such a key threw, and the catch around this read lost the WHOLE map — free
+            // text, every nested path and the decoded value of the map holding the key saw no
+            // properties at all on the event, while Probe still answered for its top-level keys.
+            // SegmentIndexBuilder's walk skips the pair the same way.
+            if (reader.NextMessagePackType != MessagePackType.String)
+            {
+                reader.Skip();   // the key
+                reader.Skip();   // its value
+                continue;
+            }
+            string k = reader.ReadString()!;
             dict[k]  = ReadDynamic(ref reader);
         }
         return dict;
