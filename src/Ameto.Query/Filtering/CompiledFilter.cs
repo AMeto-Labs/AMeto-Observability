@@ -16,6 +16,7 @@ public sealed class CompiledFilter : IPreparedFilter
     // Pre-computed at compile time so QueryExecutor pays zero allocation per query.
     private readonly IReadOnlyList<(string property, string text)>    _trigramHints;
     private readonly IReadOnlyList<(string property, object? value)>  _invertedHints;
+    private readonly IReadOnlyList<(string property, object? value)>  _invertedHintsBesideExceptionPresence;
 
     // The single bloom/MightContain hint, also resolved once at compile time — the
     // prefilter asks for it inside a per-segment parallel loop.
@@ -32,6 +33,7 @@ public sealed class CompiledFilter : IPreparedFilter
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
+        _invertedHintsBesideExceptionPresence = BesideExceptionPresence(_invertedHints);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
         _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
@@ -467,6 +469,15 @@ public sealed class CompiledFilter : IPreparedFilter
 
     private static void CollectInvertedHints(FilterNode node, List<(string, object?)> out_)
     {
+        // Asked first, because the node kinds it reads are ones the switch below gives no hint
+        // for (has / isDefined) or the wrong one (`@x.exists = …`, whose field has no value
+        // bucket to hint).
+        if (SelectsEventsWithAnException(node))
+        {
+            out_.Add(ExceptionPresentHint);
+            return;
+        }
+
         switch (node)
         {
             // `X = null` is deliberately not hinted: the evaluator treats a missing property
@@ -490,6 +501,113 @@ public sealed class CompiledFilter : IPreparedFilter
                 CollectInvertedHints(and.Right, out_);
                 break;
             // Deliberately skip OrNode — OR is too broad for intersection
+        }
+    }
+
+    // ── Exception presence: the one question the marker bucket can answer ─────
+
+    /// <summary>
+    /// "Which rows carry an exception", as an inverted hint: the bucket
+    /// <c>SegmentIndexBuilder</c> files every such row under, and the one value it files there.
+    ///
+    /// <para>This is NOT the field <c>@x.exists</c> being hinted by value — that field has no
+    /// value bucket (see its row in <see cref="BuiltinFields"/>): the marker holds "true" and
+    /// nothing else, so asking it for <c>false</c> would be answered "no such row" about a
+    /// group full of them. It is the single positive question, emitted only for a predicate
+    /// that <see cref="SelectsEventsWithAnException"/> proves is that question. And it is
+    /// honoured only by an index group whose builder vouched that the marker is complete
+    /// (<c>SegmentInvertedIndex.IsExceptionMarker</c>): there the list is the answer and its
+    /// absence drops the group; an older group says "no information" and is scanned.</para>
+    /// </summary>
+    internal static readonly (string Property, object? Value) ExceptionPresentHint = (ClefFields.ExceptionExists, "true");
+
+    /// <summary>
+    /// True when <see cref="ExceptionPresentHint"/> is among <see cref="GetInvertedHints"/>: the
+    /// filter cannot match an event that carries no exception.
+    ///
+    /// <para>The narrowing treats that one hint apart from the rest
+    /// (<c>QueryExecutor.TryNarrowWithIndex</c>): its posting list is counted before it is
+    /// built, and where it names nearly the whole of a group it is not built at all — the other
+    /// hints then narrow without it (<see cref="GetInvertedHintsBesideExceptionPresence"/>).
+    /// Both are resolved here, once per filter, because the narrowing asks once per group.</para>
+    /// </summary>
+    public bool HintsExceptionPresence => !ReferenceEquals(_invertedHintsBesideExceptionPresence, _invertedHints);
+
+    /// <summary>
+    /// <see cref="GetInvertedHints"/> without the exception marker's hint; the same list when
+    /// that hint is not in it.
+    /// </summary>
+    public IReadOnlyList<(string property, object? value)> GetInvertedHintsBesideExceptionPresence() =>
+        _invertedHintsBesideExceptionPresence;
+
+    private static IReadOnlyList<(string, object?)> BesideExceptionPresence(
+        IReadOnlyList<(string property, object? value)> hints)
+    {
+        List<(string, object?)>? rest = null;
+        for (int i = 0; i < hints.Count; i++)
+        {
+            if (IsExceptionPresentHint(hints[i]))
+            {
+                if (rest is null)
+                {
+                    rest = new List<(string, object?)>(hints.Count);
+                    for (int j = 0; j < i; j++) rest.Add(hints[j]);
+                }
+            }
+            else rest?.Add(hints[i]);
+        }
+        if (rest is null) return hints;
+        return rest.Count == 0 ? Array.Empty<(string, object?)>() : rest;
+    }
+
+    /// <summary>
+    /// The hint itself, key AND value — not merely a hint under the marker's name. Today no other
+    /// is ever filed there (the field of that name has no value bucket; see
+    /// <see cref="CollectInvertedHints"/>), but <see cref="HintsExceptionPresence"/> is what lets
+    /// the narrowing DROP a group whose marker lists no row, and that is only right for a filter
+    /// that cannot match without an exception. A hint for the marker's other answer, should one
+    /// ever be added, must not be taken for this one.
+    /// </summary>
+    private static bool IsExceptionPresentHint((string property, object? value) hint) =>
+        string.Equals(hint.property, ExceptionPresentHint.Property, StringComparison.Ordinal) &&
+        hint.value is string text &&
+        string.Equals(text, (string)ExceptionPresentHint.Value!, StringComparison.Ordinal);
+
+    /// <summary>
+    /// True when <paramref name="node"/> matches an event if and only if the event carries an
+    /// exception — the predicates the scan answers from <c>LogEvent.HasException</c>, which is
+    /// exactly what the index's marker records.
+    ///
+    /// <para><c>has(@x)</c> and <c>isDefined(@x)</c> under every spelling
+    /// <c>FilterEvaluator.HasProperty</c> answers that way, and <c>@x.exists</c> compared with a
+    /// literal that leaves only the events WITH an exception: <c>= true</c>, <c>= 'TRUE'</c>,
+    /// <c>!= false</c>, <c>in [true]</c>. Which literals those are is not decided here. The
+    /// evaluator's own comparison is run on both values the field can take, so this cannot come
+    /// to disagree with the scan about what <c>=</c> means for a bool — the way
+    /// <see cref="Filtering.HeaderPredicate"/> computes a level mask. Anything that also admits
+    /// an event without an exception (<c>= false</c>, <c>!= true</c>, <c>!= null</c>) or admits
+    /// none is not this question and gets no hint.</para>
+    /// </summary>
+    private static bool SelectsEventsWithAnException(FilterNode node)
+    {
+        switch (node)
+        {
+            case HasNode has:
+                return IsBuiltin(has.Property, BuiltinField.ExceptionType);
+
+            case IsDefinedNode defined:
+                return IsBuiltin(defined.Property, BuiltinField.ExceptionType);
+
+            case CompareNode { RightProperty: null } cmp when IsBuiltin(cmp.Property, BuiltinField.ExceptionExists):
+                return FilterEvaluator.CompareValues(true, cmp.Value, cmp.Op)
+                   && !FilterEvaluator.CompareValues(false, cmp.Value, cmp.Op);
+
+            case InNode inNode when IsBuiltin(inNode.Property, BuiltinField.ExceptionExists):
+                return FilterEvaluator.InValues(true, inNode.Values)
+                   && !FilterEvaluator.InValues(false, inNode.Values);
+
+            default:
+                return false;
         }
     }
 

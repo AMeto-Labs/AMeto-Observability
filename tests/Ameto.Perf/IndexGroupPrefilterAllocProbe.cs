@@ -100,6 +100,37 @@ public sealed class IndexGroupPrefilterAllocProbe : IAsyncLifetime
         Assert.True(page * 10 < full, $"an unfiltered page got expensive: {page} B vs {full} B");
     }
 
+    /// <summary>
+    /// A search for exceptions over a segment that holds none — every Information segment of a
+    /// level-split store. <c>has(@x)</c> asks the index's marker and each group is dropped on its
+    /// catalog, unread. The same question spelled so that the hint does not recognise it
+    /// (<c>not not has(@x)</c>) is answered the way <c>has(@x)</c> used to be: by decoding every
+    /// row to find that none matches.
+    /// </summary>
+    [Fact]
+    public async Task ASearchForExceptionsDoesNotReadTheGroupsThatHoldNone()
+    {
+        const string Asked = "has(@x)", Scanned = "not not has(@x)";
+
+        Assert.Empty(await RunAsync(Asked));     // warm — and the premise: no row has one
+        Assert.Empty(await RunAsync(Scanned));
+
+        long b0 = GC.GetTotalAllocatedBytes(precise: true);
+        await RunAsync(Asked);
+        long asked = GC.GetTotalAllocatedBytes(precise: true) - b0;
+
+        long b1 = GC.GetTotalAllocatedBytes(precise: true);
+        await RunAsync(Scanned);
+        long scanned = GC.GetTotalAllocatedBytes(precise: true) - b1;
+
+        _out.WriteLine($"groups              : {QuerySegmentFixtures.GroupCountOf(_segPath)}");
+        _out.WriteLine($"has(@x), by marker  : {asked / 1024.0:F0} KB");
+        _out.WriteLine($"the same, by a scan : {scanned / 1024.0:F0} KB   ({(double)scanned / asked:F1}x)");
+
+        Assert.True(asked * 3 < scanned,
+            $"the exception marker is not dropping groups: {asked} B asked vs {scanned} B scanned over {Events} rows");
+    }
+
     private Task<List<LogEvent>> RunAsync(string? filter, int count = Events + 10) =>
         QuerySegmentFixtures.RunAsync(_query, filter, count);
 }

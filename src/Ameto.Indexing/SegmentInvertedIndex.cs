@@ -457,6 +457,21 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     }
 
     /// <summary>
+    /// <see cref="ISegmentIndex.CountAtMost"/> over the decoded lists: the three answers of
+    /// <see cref="LookupIntersect"/> for the one predicate, by the same rules, with the list's
+    /// length in its place. This reader has every list decoded already, so the count costs it
+    /// nothing and is exact; <see cref="SegmentIndexReader"/> is the one that saves a decode.
+    /// </summary>
+    public int? CountAtMost(string propertyName, object? value)
+    {
+        if (_postings is null) return null;
+
+        int[]? offsets = PostingsForKey(propertyName, value, out bool known);
+        if (!known) return null;                            // unknown property → no information
+        return offsets?.Length ?? 0;                        // known bucket, absent value → proven empty
+    }
+
+    /// <summary>
     /// The tail of <see cref="LookupIntersect"/>, shared with <see cref="SegmentIndexReader"/>:
     /// intersects the first <paramref name="used"/> ascending posting lists, smallest first
     /// (merging against the running result), into a fresh array. The lists themselves are never
@@ -534,6 +549,15 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         known = false;
         int[]? acc = null;
 
+        // The exception marker answers only where its builder vouched for it, and there it is
+        // known even when no row was filed under it — see IsExceptionMarker.
+        if (IsExceptionMarker(property))
+        {
+            if (!(_postings!.TryGetValue(ClefFields.ExceptionExistsComplete, out var word) && word.Count == 0))
+                return null;
+            known = true;
+        }
+
         if (_postings!.TryGetValue(property, out var values))
         {
             known = true;
@@ -589,6 +613,32 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         string.Equals(property, ClefFields.ServiceName, StringComparison.Ordinal)
             ? ClefFields.LegacyServiceName
             : null;
+
+    /// <summary>
+    /// True for the one hint key that names a presence MARKER instead of a property's values:
+    /// <c>@x.exists</c> (<see cref="ClefFields.ExceptionExists"/>), filed with the single value
+    /// "true" for a row that carries an exception. Asked for that value it says which rows
+    /// <c>has(@x)</c> matches, and both readers of a section — this class's decoded dictionaries
+    /// and <see cref="SegmentIndexReader"/>'s packed catalog — give it two rules of its own.
+    ///
+    /// <para>IT ANSWERS ONLY WHERE ITS BUILDER VOUCHED FOR IT. A builder before the vouching
+    /// one filed the marker after reading the exception map, so a row whose map it could not
+    /// read is absent from the list while <c>LogEvent.HasException</c> — the payload's lead
+    /// byte — still counts it. Such a group's marker is a subset of the answer; narrowing by
+    /// it loses rows. So without the group's word
+    /// (<see cref="ClefFields.ExceptionExistsComplete"/>: a bucket of that name with NO value in
+    /// it, which is something only a builder writes) the key is "no information", whatever the
+    /// bucket holds, and the group is scanned as it always was.</para>
+    ///
+    /// <para>AND WHERE IT IS VOUCHED FOR, ITS ABSENCE IS PROOF. The marker bucket exists only
+    /// once a row is filed in it, so in a group that carries no exception at all there is no
+    /// such bucket — which for any other key means "this property was never indexed here,
+    /// scan". Here the builder has promised the bucket is complete, so a missing one says no
+    /// row has an exception, and the group is dropped unread. That is most of what the marker
+    /// is worth: a search for exceptions no longer reads the groups that hold none.</para>
+    /// </summary>
+    internal static bool IsExceptionMarker(string property) =>
+        string.Equals(property, ClefFields.ExceptionExists, StringComparison.Ordinal);
 
     /// <summary>Longest path given a flat alternate — matches
     /// <c>FilterEvaluator.MaxFlatKeyChars</c>, which decides the same thing on the scan side.</summary>
@@ -965,12 +1015,28 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         /// <summary>Lookup by a span, for the flat spelling written into stack scratch.</summary>
         public readonly Dictionary<string, PackedProperty>.AlternateLookup<ReadOnlySpan<char>> BySpan;
 
+        /// <summary>
+        /// The group's word that its exception marker is complete: a property named
+        /// <see cref="ClefFields.ExceptionExistsComplete"/> with no value entry in any of its
+        /// runs. Worked out once, with the catalog — see <see cref="IsExceptionMarker"/>.
+        /// </summary>
+        public readonly bool VouchesForExceptionMarker;
+
         public PackedCatalog(bool codec, Dictionary<string, PackedProperty> properties, long retainedBytes)
         {
             Codec         = codec;
             Properties    = properties;
             RetainedBytes = retainedBytes;
             BySpan        = properties.GetAlternateLookup<ReadOnlySpan<char>>();
+            VouchesForExceptionMarker =
+                properties.TryGetValue(ClefFields.ExceptionExistsComplete, out var word) && HoldsNoValue(word);
+        }
+
+        private static bool HoldsNoValue(PackedProperty property)
+        {
+            foreach (var run in property.Runs)
+                if (run.ValueCount != 0) return false;
+            return true;
         }
     }
 
@@ -1038,6 +1104,35 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// </summary>
     internal static int[]? ScanBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form)
     {
+        WalkBucket(data, codec, runs, form, decode: true, out int[]? postings);
+        return postings;
+    }
+
+    /// <summary>
+    /// How many postings the entries <see cref="ScanBucket"/> would union hold between them,
+    /// read off each list's own leading count, with nothing decoded. −1 when no entry matches,
+    /// which is what <see cref="ScanBucket"/>'s null is. That is not the same answer as 0 — an
+    /// entry that is there and lists no row. No builder writes one, but a section can hold it,
+    /// and the two are told apart here because <see cref="MightContain"/> tells them apart.
+    ///
+    /// <para>An UPPER bound on the union's size, and exact in the ordinary case of one matching
+    /// entry: two entries that differ only in case may both file a row, and the union counts it
+    /// once. That is the direction <see cref="ISegmentIndex.CountAtMost"/> allows. A legacy
+    /// bitmap carries no count up front, so it is decoded to be counted; the layout this build
+    /// writes is not.</para>
+    /// </summary>
+    internal static int CountBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form) =>
+        WalkBucket(data, codec, runs, form, decode: false, out _);
+
+    /// <summary>
+    /// The one walk behind <see cref="ScanBucket"/> and <see cref="CountBucket"/>, so that which
+    /// entries count as "this value" is decided in a single place. Returns the postings counted —
+    /// the union's length when <paramref name="decode"/> is set, the sum of the matching lists'
+    /// counts when it is not — or −1 when no entry matched.
+    /// </summary>
+    private static int WalkBucket(ReadOnlySpan<byte> data, bool codec, PropertyRun[] runs, string form,
+                                  bool decode, out int[]? postings)
+    {
         int  minLen    = form.Length;
         long maxLen    = 3L * form.Length;
         bool formAscii = System.Text.Ascii.IsValid(form);
@@ -1046,7 +1141,9 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         Span<char> scratch = rented ?? stackalloc char[256];
         try
         {
-            int[]? acc = null;
+            int[]? acc     = null;
+            long   counted = 0;
+            bool   matched = false;
             for (int r = 0; r < runs.Length; r++)
             {
                 int pos = runs[r].Offset;
@@ -1060,11 +1157,20 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                     if (valLen < minLen || valLen > maxLen) continue;
                     if (!ValueEquals(value, form, formAscii, scratch)) continue;
 
+                    matched = true;
+                    if (!decode)
+                    {
+                        counted += codec ? SegmentBitmapCodec.Count(bm) : DecodeRoaring(bm).Length;
+                        continue;
+                    }
+
                     var decoded = codec ? DecodeCodec(bm) : DecodeRoaring(bm);
                     acc = acc is null ? decoded : UnionAscending(acc, decoded);
                 }
             }
-            return acc;
+            postings = acc;
+            if (!matched) return -1;
+            return decode ? acc!.Length : (int)Math.Min(counted, int.MaxValue);
         }
         finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
     }

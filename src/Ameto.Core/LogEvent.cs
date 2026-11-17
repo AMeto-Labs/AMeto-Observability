@@ -356,4 +356,26 @@ public static class ClefFields
     public const string ExceptionInnerType = "@x.inner.type";
     /// <summary>Inverted bucket marking "this event carries an exception".</summary>
     public const string ExceptionExists    = "@x.exists";
+
+    /// <summary>
+    /// An inverted bucket with NO value in it: the builder's word that
+    /// <see cref="ExceptionExists"/> is COMPLETE in the index group that holds it — every row
+    /// whose exception column <c>ExceptionInfo.IsPresent</c> accepts is filed there, which is
+    /// every row <see cref="LogEvent.HasException"/> is true for. Only in such a group may the
+    /// marker answer <c>has(@x)</c>: its posting list is the answer, and its absence is proof
+    /// that no row carries an exception.
+    ///
+    /// <para>A builder before this one filed the marker only for an exception it could READ,
+    /// and its groups hold no such bucket, so they are scanned as they always were. An empty
+    /// bucket is also something only a builder can write: a property enters the index with its
+    /// first value, so neither an older group nor a user property that happens to have this
+    /// name can pass for one — a property of this name with a value in it vouches for nothing.</para>
+    ///
+    /// <para>The word is given for <c>ExceptionInfo.IsPresent</c> AS IT STOOD when the group was
+    /// built, and every group that carries it holds that method's answers. So the name is also
+    /// a version: should <c>IsPresent</c> ever come to accept a payload it rejects today, the
+    /// builder has to vouch under a NEW name, or the groups already written would be trusted
+    /// about rows their lists leave out. See the note on that method.</para>
+    /// </summary>
+    public const string ExceptionExistsComplete = "@x.exists.complete";
 }

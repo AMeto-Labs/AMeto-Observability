@@ -551,6 +551,18 @@ public sealed class ExceptionInfo
     /// place to raise corruption nor worth a body walk to detect it. Anything that then READS
     /// the payload still throws, and the caller that hits it sees the same exception it always
     /// did. <c>ExceptionInfoReadTests</c> pins each of these shapes.</para>
+    ///
+    /// <para>THIS TRUTH TABLE IS ON DISK. The segment index files a row under its exception
+    /// marker on this method's answer alone, and a group whose builder left its word
+    /// (<see cref="ClefFields.ExceptionExistsComplete"/>) lets that list stand in for a scan:
+    /// a search for exceptions reads the rows it names and drops a group it is missing from.
+    /// Every such group therefore holds the answers this method gave on the day it was built.
+    /// Making it accept FEWER payloads later is safe — the old lists then name too many rows,
+    /// and the scan re-checks each one it is handed. Making it accept MORE is not: a payload it
+    /// starts to accept is a row the old lists leave out, and <c>has(@x)</c> would silently stop
+    /// short of it in every group already written. A change in that direction needs a new word
+    /// — another bucket name for the builder to vouch under — so that groups vouched under this
+    /// table go back to answering "no information" and are scanned.</para>
     /// </summary>
     public static bool IsPresent(ReadOnlySpan<byte> bytes)
     {

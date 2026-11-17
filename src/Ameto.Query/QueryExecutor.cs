@@ -1157,9 +1157,11 @@ public sealed class QueryExecutor : IQueryExecutor
         => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount, out candidates, out _);
 
     /// <param name="groupEventCount">
-    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision: a level
-    /// union whose posting lists already account for every event in the group is the identity,
-    /// and intersecting with the identity is work with no result. See below.
+    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision, taken in
+    /// two places: posting lists that already account for the group — the level union or the
+    /// intersection of the inverted hints when it names every event, the exception marker's
+    /// list when it names nearly every one (<see cref="NamesNearlyAllOf"/>) — narrow nothing
+    /// worth the list, and the group is reported whole instead. See below.
     /// </param>
     /// <param name="everyRow">
     /// True when the group contributes EVERY one of its rows — the third narrowing state,
@@ -1209,15 +1211,68 @@ public sealed class QueryExecutor : IQueryExecutor
         // Inverted-index event-level narrowing: AND posting lists for all equality
         // predicates. This gives exact event offsets within the segment — the reader will
         // only deserialise those events.
+        //
+        // THE EXCEPTION MARKER IS COUNTED BEFORE IT IS NAMED. Its list is the one a search for
+        // exceptions asks every group for, and over the Error level of a level-split store it
+        // names nearly the whole group: the largest list the group has, narrowing next to
+        // nothing. So the index is first asked how many rows the marker lists (CountAtMost
+        // reads the list's leading count and decodes nothing), and a list that names nearly all
+        // of its group (NamesNearlyAllOf) is not built. It is carried as a fact instead, decided
+        // below once the level set has had its say, and the other hints narrow without it.
+        //
+        // Building it first and measuring it afterwards is what this replaced, and it cost a
+        // PAGE far more than it cost a full read: the prefilter works a whole batch of segments
+        // before the first row is returned, so fifty rows paid for a decoded list, a copy of it
+        // and two more on the way to the reader — in every group of every segment in the batch.
+        //
+        // ONLY the marker is asked this way. Any equality can name a whole group — `@service`
+        // in a one-service store — and would be spared the same list. But the marker's bucket
+        // holds one value, so counting it is one read, where an ordinary property's bucket is
+        // one among thousands and has to be FOUND to be counted: a second walk of the property's
+        // entries, on the very path a selective lookup takes. Those are built as they always
+        // were, and recognised afterwards (below).
+        bool hintsNameTheGroup = false;
         if (invertedHints.Count > 0)
         {
-            var invOffsets = idx.LookupIntersect(invertedHints);
+            var toName = invertedHints;
+            if (filter.HintsExceptionPresence)
+            {
+                var (marker, present) = CompiledFilter.ExceptionPresentHint;
+                int? atMost = idx.CountAtMost(marker, present);
+                if (atMost is 0) return false;              // vouched for, and no row carries one
+
+                if (atMost is int rows && NamesNearlyAllOf(groupEventCount, rows))
+                {
+                    hintsNameTheGroup = true;
+                    toName = filter.GetInvertedHintsBesideExceptionPresence();
+                }
+                // Otherwise it is named with the rest: a list worth having, or — null — a group
+                // whose builder did not vouch for its marker, which LookupIntersect passes over.
+            }
+
+            var invOffsets = toName.Count > 0 ? idx.LookupIntersect(toName) : null;
             if (invOffsets is not null)
             {
                 if (invOffsets.Length == 0) return false;
 
-                candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
-                if (candidates.Length == 0) return false;
+                // A LIST AS LONG AS THE GROUP IS THE GROUP. Ordinals are distinct and a group's
+                // index names only its own rows, so an intersection of groupEventCount of them
+                // names every one — the same identity the level union below recognises, reached
+                // here by an equality every row of the group satisfies (`@l = 'Error'` typed
+                // into the filter, over a level-split Error segment). Intersecting with the
+                // identity removes nothing, and handing it on would be the group-sized array
+                // the level road stopped building. So it is carried as the same fact the
+                // counted marker is — the difference being that this list had to be built to
+                // be recognised.
+                if (groupEventCount != 0 && invOffsets.Length == groupEventCount)
+                {
+                    hintsNameTheGroup = true;
+                }
+                else
+                {
+                    candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
+                    if (candidates.Length == 0) return false;
+                }
             }
         }
 
@@ -1275,8 +1330,50 @@ public sealed class QueryExecutor : IQueryExecutor
             }
         }
 
+        // The inverted hints named the group — the marker by its count, or a list by its length
+        // — and nothing else narrowed: it contributes all of its rows, which is the third state
+        // and not "no information". Left as a null candidate list alone it would read as an
+        // unnarrowed group, and one of those sends the whole segment — the groups this query
+        // did narrow or reject included — to a full scan.
+        if (candidates is null && hintsNameTheGroup) everyRow = true;
+
         return true;
     }
+
+    /// <summary>
+    /// Whether the exception marker's list, of at most <paramref name="rows"/> rows, names so
+    /// much of a group of <paramref name="groupEventCount"/> that it is carried as "every row"
+    /// instead of being built: fifteen rows in sixteen, or more.
+    ///
+    /// <para>SAFE at any threshold — "every row" is a superset, and the scan re-checks each row
+    /// against the whole filter — so the number is about cost alone. Naming a row costs the
+    /// query twelve bytes of candidate list (the copy the index hands out, the list the groups
+    /// are gathered in, the array the reader walks; sixteen without the index cache, which has
+    /// to decode it first). Not naming it costs a decoded row the filter then rejects, and only
+    /// for the rows the list left out.</para>
+    ///
+    /// <para>MEASURED (<c>ExceptionPresencePageProbe</c>, Release, eight groups of 10 000 Error
+    /// rows). On a FULL read the two costs meet where the list leaves out about one row in
+    /// thirteen, for rows as cheap to reject as a row gets (one short property, ~150 B); a
+    /// costlier row moves that towards one in thirty. Either way the full read is indifferent
+    /// here: the two differ by a fraction of a percent of what the rows themselves cost. A PAGE
+    /// is not indifferent. Just under the line (93 rows in a hundred, the list built) fifty rows
+    /// cost 1.0-1.4 MB against 0.15 MB for the plain scan; just above it (94) they cost what the
+    /// plain scan costs and ~50 KB for opening the batch. So the line is drawn where the full
+    /// read does not care and the page does.</para>
+    ///
+    /// <para>BELOW it the list is built, and a first page pays for it in every group of its
+    /// batch — 0.6-0.8 MB at one row in two, in that probe. That is what a page of any indexed
+    /// equality pays, and it is not bounded here.</para>
+    ///
+    /// <para>An unknown group size (0) never qualifies, and a group of fewer than sixteen rows
+    /// qualifies only when the list is the whole of it.</para>
+    /// </summary>
+    internal static bool NamesNearlyAllOf(uint groupEventCount, int rows) =>
+        groupEventCount != 0 && rows >= groupEventCount - groupEventCount / WholeGroupDivisor;
+
+    /// <summary>The marker's list may leave out one row in this many and still stand for its group.</summary>
+    private const uint WholeGroupDivisor = 16;
 
     /// <summary>
     /// The ordinals of whole-group contributors, as plain ascending ranges. Groups are visited
