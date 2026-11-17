@@ -46,6 +46,17 @@ describe('exact JSON — whole numbers keep their digits', () => {
     }
   });
 
+  it('is its digits wherever it turns up outside writeExactJson: in a template, a string, JSON.stringify', () => {
+    const id = new JsonDigits('9007199254740993');
+    // A template interpolates as String() does: the digits, not "[object Object]".
+    expect(String(id)).toBe('9007199254740993');
+    expect(`order ${id}`).toBe('order 9007199254740993');
+    // JSON.stringify writes the digits in quotes: not the double nearest to them, not an object.
+    expect(JSON.stringify({ id, list: [id] })).toBe('{"id":"9007199254740993","list":["9007199254740993"]}');
+    // writeExactJson still writes the number itself.
+    expect(writeExactJson({ id })).toBe('{"id":9007199254740993}');
+  });
+
   it('lays a value out as JSON.stringify does', () => {
     const value: unknown = JSON.parse('{"a":[1,{"b":[]},{}],"c":"x","d":{"e":null}}');
     expect(writeExactJson(value)).toBe(JSON.stringify(value));

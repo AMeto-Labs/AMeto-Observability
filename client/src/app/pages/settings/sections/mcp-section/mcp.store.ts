@@ -1,6 +1,6 @@
 import { DestroyRef, computed, inject } from '@angular/core';
 import { patchState, signalStore, withComputed, withMethods, withState } from '@ngrx/signals';
-import { Subscription, TimeoutError, catchError, firstValueFrom, forkJoin, of, timeout } from 'rxjs';
+import { Observable, Subscription, TimeoutError, catchError, firstValueFrom, forkJoin, of, timeout } from 'rxjs';
 
 import { ApiService } from '../../../../core/services/api.service';
 import { McpApiService, McpSettingsPatch, mcpError } from '../../../../core/services/mcp-api.service';
@@ -21,11 +21,17 @@ export const MCP_TABS = [
 export type McpTabId = (typeof MCP_TABS)[number]['id'];
 
 /**
- * The parts of the section that hold something a reload would lose: unsaved input, and a
- * profile's key while it is on its way or on screen — it is shown once, and the key it
- * replaced has stopped working.
+ * The parts of the section that hold input a reload would lose. A profile's key on its way or
+ * on screen is lost to a reload as well — it is shown once, and the key it replaced has
+ * stopped working — but that the store knows by itself (`keysOnTheirWay`, `keys`).
  */
-export type McpDirtyPart = 'limits' | 'profile' | 'tool' | 'key';
+export type McpDirtyPart = 'limits' | 'profile' | 'tool';
+
+/** A key just created or rotated, with the name of the profile it opens. */
+export interface RevealedKey {
+  key: string;
+  profile: string;
+}
 
 /**
  * How long a change of the section's settings is waited for. The changes go one at a time, so
@@ -55,6 +61,16 @@ interface McpSectionState {
   /** Service names seen lately, for the fields that take one. */
   services: string[];
   dirty: Record<McpDirtyPart, boolean>;
+  /**
+   * Keys just created or rotated, in the order they arrived. Each is shown once, until it is
+   * acknowledged, and none takes the place of another: a key exists nowhere else.
+   */
+  keys: RevealedKey[];
+  /**
+   * Creates and rotations on their way, counted one by one: each answer is a key that will
+   * exist nowhere else, and one answered says nothing of another still out.
+   */
+  keysOnTheirWay: number;
 }
 
 const initialState: McpSectionState = {
@@ -69,7 +85,9 @@ const initialState: McpSectionState = {
   usage: {},
   summary: null,
   services: [],
-  dirty: { limits: false, profile: false, tool: false, key: false },
+  dirty: { limits: false, profile: false, tool: false },
+  keys: [],
+  keysOnTheirWay: 0,
 };
 
 /** The two lists that name each other. */
@@ -133,8 +151,12 @@ export const McpSectionStore = signalStore(
     /** Detector id → the name Settings lists it under. */
     detectorNames: computed<Record<string, string>>(() =>
       Object.fromEntries((store.overview()?.detectors ?? []).map(d => [d.id, d.name]))),
-    /** True when any part of the section holds input that has not been saved. */
-    anyDirty: computed(() => Object.values(store.dirty()).some(Boolean)),
+    /**
+     * True when the section holds something a reload would lose: input that has not been saved,
+     * or a key — on its way, or on screen and not yet acknowledged.
+     */
+    anyDirty: computed(() =>
+      Object.values(store.dirty()).some(Boolean) || store.keysOnTheirWay() > 0 || store.keys().length > 0),
     /** Saved tools that are published: the ones a granted profile is actually offered. */
     publishedTools: computed(() => store.tools().filter(t => t.published)),
   })),
@@ -177,6 +199,26 @@ export const McpSectionStore = signalStore(
         }),
         error: () => patchState(store, { stale: true }),
       });
+    };
+
+    /**
+     * Waits for an answer that carries a key, counted in `keysOnTheirWay` while it is on its
+     * way: each request is counted on its own, so one answered — or another change answered,
+     * which carries no key — does not stop the page asking before a reload while a key is still
+     * out. The key goes to `keys` in the same step that stops counting it, before anything else
+     * is done with the answer: there is no moment when it is neither on its way nor on screen.
+     */
+    const receiveKey = async <T>(request: Observable<T>, keyOf: (answer: T) => RevealedKey): Promise<T> => {
+      patchState(store, { keysOnTheirWay: store.keysOnTheirWay() + 1 });
+      let answer: T;
+      try {
+        answer = await firstValueFrom(request);
+      } catch (e) {
+        patchState(store, { keysOnTheirWay: store.keysOnTheirWay() - 1 });
+        throw e;
+      }
+      patchState(store, { keys: [...store.keys(), keyOf(answer)], keysOnTheirWay: store.keysOnTheirWay() - 1 });
+      return answer;
     };
 
     /**
@@ -267,15 +309,17 @@ export const McpSectionStore = signalStore(
       // ── Profiles ──────────────────────────────────────────────────────────
 
       /**
-       * Answers the new profile with its key: the only time the key exists outside the client's
-       * hands. That is why nothing stands between the server's answer and this one — the lists
-       * are read again afterwards, and a key is never lost to that read.
+       * Answers the new profile as the server kept it. Its key — the only time the key exists
+       * outside the client's hands — goes to `keys` the moment the answer arrives, whoever
+       * asked and whatever they hold by then; the lists are read again afterwards, and a key is
+       * never lost to that read.
        */
-      async createProfile(input: McpProfileInput): Promise<{ profile: McpProfile; key: string }> {
-        const created = await firstValueFrom(api.createProfile(input));
-        patchState(store, withProfile(lists(), created.profile));
+      async createProfile(input: McpProfileInput): Promise<McpProfile> {
+        const { profile } = await receiveKey(api.createProfile(input),
+          created => ({ key: created.key, profile: created.profile.name }));
+        patchState(store, withProfile(lists(), profile));
         readListsAgain();
-        return created;
+        return profile;
       },
 
       /** Changes the fields `input` names, and answers the profile as the server kept it. */
@@ -293,13 +337,21 @@ export const McpSectionStore = signalStore(
       },
 
       /**
-       * Answers the new key; the old one has stopped working by then, so the new one is handed
-       * over at once. Its preview in the list is the one thing only a read can bring.
+       * Gives the profile a new key. The old one has stopped working by the time the answer
+       * comes, so the new one goes to `keys` at once — named as the list names the profile when
+       * it arrives, which is the name beside it on the page. Its preview in the list is the one
+       * thing only a read can bring.
        */
-      async rotateKey(id: string): Promise<string> {
-        const { key } = await firstValueFrom(api.rotateProfileKey(id));
+      async rotateKey(id: string): Promise<void> {
+        await receiveKey(api.rotateProfileKey(id), ({ key }) => ({
+          key, profile: store.profiles().find(p => p.id === id)?.name ?? id,
+        }));
         readListsAgain();
-        return key;
+      },
+
+      /** The key on screen has been taken down: the next one that arrived, if any, is shown in its place. */
+      acknowledgeKey(): void {
+        patchState(store, { keys: store.keys().slice(1) });
       },
 
       // ── Field rules ───────────────────────────────────────────────────────

@@ -48,3 +48,23 @@
     <app-mcp-activity-tab class="m-tabpanel" [hidden]="activeTab() !== 'activity'" [active]="activeTab() === 'activity'" />
   }
 }
+
+<!-- The key, once: after a profile is created or its key rotated, whichever tab is open by the
+     time it arrives. Keys are shown one at a time, in the order they arrived, and none takes the
+     place of another; each names its profile, for the card on the Profiles tab may be another
+     one's by then. Last in the section, so that it is drawn over any question a tab has open —
+     the rotation still on its way, say: every dialog stands at the same height, and of two the
+     later one in the page is on top. -->
+<app-modal [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
+  <div class="m-key-reveal">
+    <lucide-icon name="key" [size]="14" />
+    <span class="m-key-text">{{ revealed()?.key }}</span>
+    <button type="button" class="btn-icon" title="Copy" (click)="copyKey()">
+      <lucide-icon [name]="copied() === revealed()?.key ? 'check' : 'copy'" [size]="13" />
+    </button>
+  </div>
+  <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
+  <div class="m-actions">
+    <button type="button" class="btn primary" (click)="store.acknowledgeKey()">Done</button>
+  </div>
+</app-modal>

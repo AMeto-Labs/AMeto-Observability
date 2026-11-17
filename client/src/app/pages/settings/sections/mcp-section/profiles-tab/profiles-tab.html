@@ -204,24 +204,9 @@
   }
 </div>
 
-<!-- The key, once: after a profile is created or its key rotated. It names its profile: the card
-     under it may be another one's by the time the key arrives. -->
-<app-modal [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
-  <div class="m-key-reveal">
-    <lucide-icon name="key" [size]="14" />
-    <span class="m-key-text">{{ revealed()?.key }}</span>
-    <button type="button" class="btn-icon" title="Copy" (click)="copyKey()">
-      <lucide-icon [name]="copied() ? 'check' : 'copy'" [size]="13" />
-    </button>
-  </div>
-  <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
-  <div class="m-actions">
-    <button type="button" class="btn primary" (click)="acknowledgeKey()">Done</button>
-  </div>
-</app-modal>
-
 <!-- Neither question can be put away while its answer is on its way: the card under it must
-     still be the profile it is about when that answer arrives. -->
+     still be the profile it is about when that answer arrives. The key a rotation brings is
+     shown by the section, over this question and any other (see mcp-section.html). -->
 <app-modal [open]="confirming() === 'rotate'" title="Rotate the key?" [dismissable]="!working()" (close)="confirming.set(null)">
   <span class="m-sub">The current key of “{{ selected()?.name }}” stops working at once. Every client that uses it has to be given the new one.</span>
   <div class="m-actions">

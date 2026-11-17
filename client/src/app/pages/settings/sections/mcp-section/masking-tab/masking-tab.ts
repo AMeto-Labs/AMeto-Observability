@@ -1,13 +1,14 @@
 import {
   ChangeDetectionStrategy, Component, DestroyRef, ElementRef, computed, effect, inject, signal, untracked, viewChild,
 } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { Subscription } from 'rxjs';
 
 import { ModalComponent, SectionComponent } from '../../../../../shared/components/ui';
 import { McpApiService, mcpError } from '../../../../../core/services/mcp-api.service';
-import { McpMaskAction, McpMaskingMode, McpPreview, McpRule } from '../../../../../core/models/mcp.model';
+import { McpFieldError, McpMaskAction, McpMaskingMode, McpPreview, McpRule } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
 import { Segment, cellText, dayOf, fmtCount, hiddenSpan, maskedSentence, sumOf } from '../mcp-format';
 
@@ -33,6 +34,13 @@ interface PreviewLine {
 
 /** What a hidden name's mark says, on either side. */
 const RENAMED = 'The name itself holds a value: the AI gets its token in place of it.';
+
+/**
+ * What a preview as a profile says when the server finds no such profile. That is the one
+ * thing it is not found for: the profile, deleted somewhere else after this page read the list.
+ */
+const goneProfile = (name: string | undefined): string =>
+  `${name ? `The profile “${name}”` : 'The profile'} is gone: it was deleted after this page read the list.`;
 
 const ACTIONS: readonly { id: McpMaskAction; label: string; tone: string; does: string }[] = [
   { id: 'hash',      label: 'Hash',        tone: 'acc', does: 'Replace the value with its token. The AI can still match and search by it.' },
@@ -353,6 +361,9 @@ export class MaskingTabComponent {
     this.previewError.set(null);
     this.previewErrorField.set(null);
     const profileId = this.previewProfile();
+    // Named as it is asked for: by the time the server says there is no such profile, it may
+    // have left the list here as well.
+    const profileName = this.store.profiles().find(p => p.id === profileId)?.name;
     this.previewRequest = this.api.preview({
       filter: this.probe().trim() || undefined,
       ...(profileId ? { profileId } : { mode: this.mode() }),
@@ -362,7 +373,9 @@ export class MaskingTabComponent {
         this.previewing.set(false);
       },
       error: e => {
-        const problem = mcpError(e, 'The preview could not be taken.');
+        const problem: McpFieldError = profileId && e instanceof HttpErrorResponse && e.status === 404
+          ? { error: goneProfile(profileName) }
+          : mcpError(e, 'The preview could not be taken.');
         this.previewError.set(problem.error);
         this.previewErrorField.set(problem.field ?? null);
         this.previewing.set(false);

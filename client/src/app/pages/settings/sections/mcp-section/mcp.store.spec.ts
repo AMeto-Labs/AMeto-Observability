@@ -205,15 +205,17 @@ describe('Settings → AI / MCP — the store', () => {
 
   // ── A key is shown once ─────────────────────────────────────────────────────
 
-  it('answers a new profile with its key before the lists are read again, and whatever becomes of that read', async () => {
+  it('holds a new profile\'s key before the lists are read again, and whatever becomes of that read', async () => {
     const p2: McpProfile = { ...P1, id: 'p2', name: 'Support', keyPreview: '11aa22bb…', publishedTools: ['t1'] };
     const creating = store.createProfile({ ...PROFILE_INPUT, publishedTools: ['t1'] });
+    // On its way the key is something a reload would lose already.
+    expect(store.anyDirty()).toBe(true);
     http.expectOne({ method: 'POST', url: '/api/mcp/profiles' }).flush({ profile: p2, key: 'the-key-shown-once' });
 
-    // Nothing else has been answered yet — and the key is here.
+    // Nothing else has been answered yet — and the key is here, with the name of its profile.
     const created = await creating;
-    expect(created.key).toBe('the-key-shown-once');
-    expect(created.profile.id).toBe('p2');
+    expect(created.id).toBe('p2');
+    expect(store.keys()).toEqual([{ key: 'the-key-shown-once', profile: 'Support' }]);
     // The profile is in the list from the answer alone, with the other end of its grant.
     expect(store.profiles().map(p => p.id)).toEqual(['p1', 'p2']);
     expect(store.tools()[0].profiles).toEqual(['p1', 'p2']);
@@ -221,22 +223,42 @@ describe('Settings → AI / MCP — the store', () => {
     failLists();
     expect(store.stale()).toBe(true);
     expect(store.profiles().map(p => p.id)).toEqual(['p1', 'p2']);
+    expect(store.keys().map(k => k.key)).toEqual(['the-key-shown-once']);
 
     // "Read again" is the way out of that state.
     store.refreshLists();
     answerLists([P1, p2], [{ ...T1, profiles: ['p1', 'p2'] }]);
     expect(store.stale()).toBe(false);
+
+    // Taken down, the key is gone, and nothing is left that a reload would lose.
+    expect(store.anyDirty()).toBe(true);
+    store.acknowledgeKey();
+    expect(store.keys()).toEqual([]);
+    expect(store.anyDirty()).toBe(false);
   });
 
-  it('answers a rotated key though the profiles cannot be read again: the old key is already dead', async () => {
+  it('holds a rotated key though the profiles cannot be read again: the old key is already dead', async () => {
     const rotating = store.rotateKey('p1');
     http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' }).flush({ key: 'the-new-key' });
-    expect(await rotating).toBe('the-new-key');
+    await rotating;
+    expect(store.keys()).toEqual([{ key: 'the-new-key', profile: 'Payments team' }]);
 
     failLists();
     // The preview in the list is the old key's; the store says the list may be behind.
     expect(store.stale()).toBe(true);
     expect(store.profiles()[0].keyPreview).toBe('7a3f09c1…');
+    expect(store.keys().map(k => k.key)).toEqual(['the-new-key']);
+  });
+
+  it('a request for a key that is refused leaves nothing on its way and nothing to show', async () => {
+    const rotating = store.rotateKey('p1');
+    expect(store.keysOnTheirWay()).toBe(1);
+    http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' })
+      .flush({ error: 'Only an administrator can change this.' }, { status: 403, statusText: 'Forbidden' });
+    await expect(rotating).rejects.toBeInstanceOf(HttpErrorResponse);
+    expect(store.keysOnTheirWay()).toBe(0);
+    expect(store.keys()).toEqual([]);
+    expect(store.anyDirty()).toBe(false);
   });
 
   // ── A change is in the state from its own answer ────────────────────────────

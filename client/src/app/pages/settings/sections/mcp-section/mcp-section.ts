@@ -2,9 +2,12 @@ import { ChangeDetectionStrategy, Component, computed, effect, inject, signal, u
 import { Location } from '@angular/common';
 import { takeUntilDestroyed, toSignal } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, NavigationStart, ParamMap, Router } from '@angular/router';
+import { LucideAngularModule } from 'lucide-angular';
 
+import { ModalComponent } from '../../../../shared/components/ui';
+import { copyToClipboard } from '../../../../shared/utils/clipboard';
 import { SettingsDirtyService } from '../../settings-dirty.service';
-import { MCP_TABS, McpSectionStore, McpTabId } from './mcp.store';
+import { MCP_TABS, McpSectionStore, McpTabId, RevealedKey } from './mcp.store';
 import { ConnectionTabComponent } from './connection-tab/connection-tab';
 import { ProfilesTabComponent } from './profiles-tab/profiles-tab';
 import { MaskingTabComponent } from './masking-tab/masking-tab';
@@ -47,6 +50,7 @@ const historyIndex = (): number | null =>
 @Component({
   selector: 'app-mcp-section',
   imports: [
+    LucideAngularModule, ModalComponent,
     ConnectionTabComponent, ProfilesTabComponent, MaskingTabComponent,
     ToolsTabComponent, ToolEditorComponent, ActivityTabComponent,
   ],
@@ -94,6 +98,19 @@ export class McpSectionComponent {
   /** Counts "Create a profile key" clicks on the Connection tab; the Profiles tab opens a blank profile on each. */
   readonly createRequest = signal(0);
 
+  /**
+   * The key on screen: the first of those that arrived and have not been taken down. Shown
+   * here, not on the Profiles tab that asked for it: by the time a key arrives that tab may be
+   * hidden behind another, and a dialog inside a hidden tab is not seen at all.
+   */
+  readonly revealed = computed<RevealedKey | null>(() => this.store.keys()[0] ?? null);
+  readonly keyTitle = computed(() => {
+    const r = this.revealed();
+    return r ? `Key of “${r.profile}”` : '';
+  });
+  /** The key whose Copy button says it was copied, for a moment; a key shown after it was not. */
+  readonly copied = signal<string | null>(null);
+
   constructor() {
     this.router.events.pipe(takeUntilDestroyed()).subscribe(e => {
       if (e instanceof NavigationStart) this.traversing = e.navigationTrigger === 'popstate';
@@ -129,6 +146,14 @@ export class McpSectionComponent {
   newProfile(): void {
     this.createRequest.update(n => n + 1);
     this.go({ mcp: 'profiles', tool: null });
+  }
+
+  async copyKey(): Promise<void> {
+    const key = this.revealed()?.key;
+    if (!key) return;
+    await copyToClipboard(key);
+    this.copied.set(key);
+    setTimeout(() => this.copied.update(k => (k === key ? null : k)), 1500);
   }
 
   /** Leaving the editor drops what it holds; ask once when that is something. */

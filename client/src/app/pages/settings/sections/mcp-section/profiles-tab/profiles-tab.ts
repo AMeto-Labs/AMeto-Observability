@@ -3,7 +3,6 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 
 import { ModalComponent, SectionComponent } from '../../../../../shared/components/ui';
-import { copyToClipboard } from '../../../../../shared/utils/clipboard';
 import { mcpError } from '../../../../../core/services/mcp-api.service';
 import { McpProfile, McpProfileInput, McpPublishedTool } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
@@ -20,12 +19,6 @@ interface ToolSwitch {
   /** Why the switch cannot be used as things stand; null when it can. */
   blocked: string | null;
   draft: boolean;
-}
-
-/** A key just created or rotated, with the name of the profile it opens. */
-interface RevealedKey {
-  key: string;
-  profile: string;
 }
 
 const NEW = 'new';
@@ -83,18 +76,6 @@ export class ProfilesTabComponent {
    */
   private card = 0;
 
-  /**
-   * The key just created or rotated: shown once, until acknowledged. It carries the name of its
-   * profile because the card under it may be another profile's by the time it arrives.
-   */
-  readonly revealed = signal<RevealedKey | null>(null);
-  readonly keyTitle = computed(() => {
-    const r = this.revealed();
-    return r ? `Key of “${r.profile}”` : '';
-  });
-  /** True while a create or a rotate is on its way: its answer is a key that exists nowhere else. */
-  private readonly keyPending = signal(false);
-  readonly copied = signal(false);
   readonly confirming = signal<'delete' | 'rotate' | null>(null);
   readonly working = signal(false);
 
@@ -183,9 +164,6 @@ export class ProfilesTabComponent {
       if (this.createRequest() > 0) untracked(() => this.startNew());
     });
     effect(() => this.store.setDirty('profile', this.dirty()));
-    // A key on its way or on screen is lost to a reload, and the key it replaced is dead
-    // already: leaving the page asks first, as it does for unsaved input.
-    effect(() => this.store.setDirty('key', this.keyPending() || this.revealed() !== null));
   }
 
   private blank(): ProfileForm {
@@ -321,11 +299,9 @@ export class ProfilesTabComponent {
           maxEvents: f.maxEvents, maxWindowMinutes: window, callsPerMinute: f.callsPerMinute,
         };
         if (!sameMembers(f.published, this.baseline().published)) input.publishedTools = f.published;
-        this.keyPending.set(true);
-        const { profile, key } = await this.store.createProfile(input);
-        // Shown whatever the card holds by now: this answer is the only place the key exists.
-        this.revealed.set({ key, profile: profile.name });
-        this.settle(card, profile, f);
+        // The key is the store's to show, whatever the card — or the tab — holds by the time it
+        // arrives; this answer is the only place it exists.
+        this.settle(card, await this.store.createProfile(input), f);
       } else {
         // What was changed here and nothing else: the server keeps every field the body leaves
         // out, so a save that is about the name cannot undo what somebody else did meanwhile —
@@ -337,7 +313,6 @@ export class ProfilesTabComponent {
       this.refused(card, listed, problem.error, problem.field ?? null);
     } finally {
       this.saving.set(false);
-      this.keyPending.set(false);
     }
   }
 
@@ -377,16 +352,15 @@ export class ProfilesTabComponent {
     if (!profile) return;
     const card = this.card;
     this.working.set(true);
-    this.keyPending.set(true);
     try {
-      this.revealed.set({ key: await this.store.rotateKey(profile.id), profile: profile.name });
+      // The new key is the store's to show, as the key of a new profile is.
+      await this.store.rotateKey(profile.id);
       this.confirming.set(null);
     } catch (e) {
       this.refused(card, profile.name, mcpError(e, 'The key could not be rotated.').error, null);
       this.confirming.set(null);
     } finally {
       this.working.set(false);
-      this.keyPending.set(false);
     }
   }
 
@@ -406,18 +380,5 @@ export class ProfilesTabComponent {
     } finally {
       this.working.set(false);
     }
-  }
-
-  async copyKey(): Promise<void> {
-    const key = this.revealed()?.key;
-    if (!key) return;
-    await copyToClipboard(key);
-    this.copied.set(true);
-    setTimeout(() => this.copied.set(false), 1500);
-  }
-
-  acknowledgeKey(): void {
-    this.revealed.set(null);
-    this.copied.set(false);
   }
 }

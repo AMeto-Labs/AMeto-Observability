@@ -2,7 +2,7 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection } from '@angular/core';
 import { Location, PlatformNavigation } from '@angular/common';
 import { HttpRequest, provideHttpClient } from '@angular/common/http';
-import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
+import { HttpTestingController, TestRequest, provideHttpClientTesting } from '@angular/common/http/testing';
 import { Router, provideRouter } from '@angular/router';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -221,19 +221,22 @@ describe('Settings → AI / MCP', () => {
     await settle(f);
   }
 
-  /** The read of both lists that follows a change to either, answered. */
+  /**
+   * The read of both lists that follows a change to either, answered. Told by its method: a new
+   * profile still on its way is a POST to the same address.
+   */
   async function lists(f: ComponentFixture<unknown>, profiles: McpProfile[], tools: McpPublishedTool[]): Promise<void> {
     await settle(f);
-    http.expectOne('/api/mcp/profiles').flush(profiles);
-    http.expectOne('/api/mcp/tools').flush({ builtIn: OVERVIEW.tools, published: tools });
+    http.expectOne({ method: 'GET', url: '/api/mcp/profiles' }).flush(profiles);
+    http.expectOne({ method: 'GET', url: '/api/mcp/tools' }).flush({ builtIn: OVERVIEW.tools, published: tools });
     await settle(f);
   }
 
   /** The same read, failing: the profiles are refused, which abandons the tools. */
   async function failLists(f: ComponentFixture<unknown>): Promise<void> {
     await settle(f);
-    http.expectOne('/api/mcp/profiles').flush({ error: 'The store is busy.' }, BUSY);
-    expect(http.expectOne('/api/mcp/tools').cancelled).toBe(true);
+    http.expectOne({ method: 'GET', url: '/api/mcp/profiles' }).flush({ error: 'The store is busy.' }, BUSY);
+    expect(http.expectOne({ method: 'GET', url: '/api/mcp/tools' }).cancelled).toBe(true);
     await settle(f);
   }
 
@@ -909,6 +912,133 @@ describe('Settings → AI / MCP', () => {
     expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
+  /** Creates a profile called Support from a blank card, and leaves the request on its way. */
+  async function createSupport(f: ComponentFixture<unknown>): Promise<TestRequest> {
+    button(f, 'New profile').click();
+    await settle(f);
+    type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Support');
+    await settle(f);
+    button(f, 'Create profile').click();
+    await settle(f);
+    return http.expectOne({ method: 'POST', url: '/api/mcp/profiles' });
+  }
+
+  /** Asks for a new key of the profile in the card, and leaves the request on its way. */
+  async function rotateInCard(f: ComponentFixture<unknown>): Promise<TestRequest> {
+    button(f, 'Rotate', 'app-mcp-profiles-tab .card').click();
+    await settle(f);
+    button(f, 'Rotate key', '.modal').click();
+    await settle(f);
+    return http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' });
+  }
+
+  it('a save answered while a rotation is on its way leaves the page asking before a reload', async () => {
+    const f = await open('profiles');
+    type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    const rotate = await rotateInCard(f);
+
+    // The save answers first. Nothing typed is left unsaved — but the old key has stopped
+    // working with the rotation, and the new one has not arrived: a reload would lose it.
+    const saved = { ...PROFILES[0], name: 'Payments developers' };
+    put.flush(saved);
+    await lists(f, [saved], TOOLS);
+    expect(button(f, 'Save', 'app-mcp-profiles-tab').disabled).toBe(true);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    // The key arrives, named as the list names its profile by then.
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...saved, keyPreview: 'c0ffee00…' }], TOOLS);
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Payments developers”');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a key taken down while another is still on its way leaves the page asking before a reload', async () => {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    // While the new profile is on its way, the first one's key is rotated — and that answers first.
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    (await rotateInCard(f)).flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }], TOOLS);
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Payments team”');
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+
+    // Nothing is on screen and nothing typed is unsaved; the new profile's key is still out.
+    expect(all(f, '.modal')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Support”');
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('keys that arrive one after the other are all shown, one at a time, over any question still up', async () => {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    const rotate = await rotateInCard(f);
+
+    // The new profile's key arrives while the question about the rotation is still up. Every
+    // dialog stands at the same height, and of two the later one in the page is drawn on top:
+    // the key is shown over the question, its Copy and Done within reach.
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    expect(all(f, '.modal__title').map(t => t.textContent)).toEqual(['Rotate the key?', 'Key of “Support”']);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+
+    // The rotated key arrives: it waits for its turn, and does not take the place of the one on screen.
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
+    expect(all(f, '.modal__title').map(t => t.textContent)).toEqual(['Key of “Support”']);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal__title').map(t => t.textContent)).toEqual(['Key of “Payments team”']);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a key that arrives while another tab is open is shown on that tab, which stays open', async () => {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    // On to the Masking tab while the key is on its way; the tab opens on a preview.
+    await show(f, 'Masking');
+    http.expectOne('/api/mcp/preview').flush(PREVIEW);
+    await settle(f);
+
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    // The Profiles tab is hidden, and the key is not inside it.
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    expect(el(f, '.m-key-text').closest('[hidden]')).toBeNull();
+    expect(el(f, '.m-tab.active').textContent).toContain('Masking');
+
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
   it('the list of profiles is one stop for the Tab key, walked with the arrows', async () => {
     const f = await open('profiles', { profiles: [PROFILES[0], SUPPORT] });
     const rows = (): HTMLElement[] => all(f, '[role=row].pick');
@@ -1066,6 +1196,20 @@ describe('Settings → AI / MCP', () => {
     expect(el<HTMLSelectElement>(f, 'select[aria-label="Preview as"]').value).toBe('p1');
     expect(button(f, 'Strict', '[aria-label="Masking mode"]').getAttribute('aria-pressed')).toBe('true');
     expect(previewLine(f, 1, 'PaymentId').textContent).toBe('h:0123456789ab');
+  });
+
+  it('a preview as a profile deleted meanwhile says that the profile is gone', async () => {
+    const f = await openMasking();
+    // Deleted somewhere else after this page read the list: the list here still offers it.
+    choose(el<HTMLSelectElement>(f, 'select[aria-label="Preview as"]'), 'p1');
+    await settle(f);
+    const asProfile = http.expectOne('/api/mcp/preview');
+    expect(asProfile.request.body).toEqual({ profileId: 'p1' });
+    asProfile.flush('', { status: 404, statusText: 'Not Found' });
+    await settle(f);
+
+    expect(el(f, '#mcp-preview-error').textContent)
+      .toBe('The profile “Payments team” is gone: it was deleted after this page read the list.');
   });
 
   it('a slow preview does not land on top of a newer one', async () => {

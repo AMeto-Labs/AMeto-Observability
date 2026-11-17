@@ -8,9 +8,22 @@
  * `JSON.parse` makes of it.
  */
 
-/** A whole number past what a double holds exactly, as the digits it was written with. */
+/**
+ * A whole number past what a double holds exactly, as the digits it was written with. Wherever
+ * it turns up outside {@link writeExactJson} it is still those digits: in a template or a string
+ * it is the digits, and `JSON.stringify` writes it as a string of them — in quotes, for a number
+ * handed to `JSON.stringify` is a double, and the double is the very thing that has other digits.
+ */
 export class JsonDigits {
   constructor(readonly text: string) {}
+
+  toString(): string {
+    return this.text;
+  }
+
+  toJSON(): string {
+    return this.text;
+  }
 }
 
 /** One token of JSON text, after the space before it: a string, a number, a literal or a mark. */
