@@ -119,8 +119,10 @@ public sealed class IndexingOptions
     /// nothing about a deeper path and — below the default — nothing about free text, which
     /// searches <see cref="DefaultMaxPropertyFlattenDepth"/> levels down whatever this says;
     /// such searches read the rows instead. A group does not record the depth it was built
-    /// with, so raising the value makes the queries ask segments written under the lower one
-    /// about values they never held (see docs/CONFIGURATION.md).</para>
+    /// with, so the query side assumes this one for every segment it holds: raising the value
+    /// from below 5 makes the queries ask segments written under the lower one about values
+    /// they never held, and a segment replicated from a node set lower is asked the same way —
+    /// the value has to be the same on every node that replicates (see docs/CONFIGURATION.md).</para>
     /// </summary>
     public int MaxPropertyFlattenDepth { get; init; } = DefaultMaxPropertyFlattenDepth;
 

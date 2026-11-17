@@ -55,7 +55,9 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
     {
         // The query side reads the same option (QueryExecutor) and asks the index nothing deeper
         // than this: the depth a group was flattened to is recorded nowhere in it, so the one
-        // option is all that keeps the two sides talking about the same index.
+        // option is all that keeps the two sides talking about the same index — on this node,
+        // and on every node its segments are replicated to, which is why it must be the same
+        // on all of them.
         int maxDepth = _opts.MaxPropertyFlattenDepth;
         // One hints object for every group this process builds: each builder pre-sizes its
         // term and trigram tables from what the last sealed group measured (see IndexBuildHints).

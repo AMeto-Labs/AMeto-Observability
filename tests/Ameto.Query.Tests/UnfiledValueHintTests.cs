@@ -342,31 +342,7 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
     [InlineData(5,  "acmecorp",                           new[] { "nested", "flat" })]
     public async Task ConfiguredFlattenDepth_ReachesTheQuerySide(int depth, string filter, string[] expected)
     {
-        // The production wiring, end to end: one ServerOptions, the builder wired by
-        // IndexingWiring and the executor resolved from AddAmetoQuery, both reading it.
-        var options = new ServerOptions
-        {
-            DataDirectory = Path.Combine(_dir, $"depth{depth}-{Math.Abs(filter.GetHashCode())}"),
-            Indexing      = new IndexingOptions { MaxPropertyFlattenDepth = depth },
-        };
-        Directory.CreateDirectory(options.DataDirectory);
-        var engine = new StorageEngine(
-            Options.Create(options),
-            new RetentionStore(options, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance);
-        _engines.Add(engine);
-
-        var services = new ServiceCollection()
-            .AddLogging()
-            .AddSingleton(Options.Create(options))
-            .AddSingleton(engine)
-            .AddSingleton<ISegmentProvider>(engine)
-            .AddAmetoIndexing()
-            .AddAmetoQuery();
-        var provider = services.BuildServiceProvider();
-        _disposables.Add(provider);
-        await provider.GetRequiredService<IndexingWiring>().StartAsync(CancellationToken.None);
-        var hosted = (QueryExecutor)provider.GetRequiredService<IQueryExecutor>();
+        var (engine, hosted, uncached) = await WiredStoreAsync($"depth{depth}-{(uint)filter.GetHashCode():x8}", depth);
 
         Write(engine, NestedRows);
         string[] hot = await RowsAsync(hosted, filter);
@@ -377,13 +353,111 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
 
         string[] cold    = await RowsAsync(hosted, filter);
         string[] again   = await RowsAsync(hosted, filter);
-        var uncached     = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance,
-                                             indexCache: null, options: Options.Create(options));
         string[] direct  = await RowsAsync(uncached, filter);
 
         Assert.Equal(hot, cold);
         Assert.Equal(hot, again);
         Assert.Equal(hot, direct);
+    }
+
+    /// <summary>
+    /// The two other roads a filter takes to the index, below the default depth: a PREPARED
+    /// filter — the live tail compiles one, for the default depth, and carries it on every
+    /// request — and a group whose rows the prefilter leaves for the scan to name (late naming).
+    /// <c>Region = 'eu'</c> names 400 rows of 600: more than the prefilter names up front, fewer
+    /// than "nearly all", so the group is named late. Half the tenants are a nested map and half
+    /// a flat dotted key; an index flattened to 0 holds only the flat half, and a hint on
+    /// <c>Ctx.Tenant</c> would name those alone.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PreparedFilterAndLateNaming_BelowTheDefaultDepth(bool prepared)
+    {
+        const string filter = "Region = 'eu' and Ctx.Tenant = 'acmecorp'";
+        var (engine, hosted, uncached) = await WiredStoreAsync("late-" + prepared, depth: 0);
+        var compiled = prepared ? CompiledFilter.Compile(filter) : null;
+
+        var rows = new Row[600];
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool eu = i < 400, nested = i % 2 == 0;
+            rows[i] = new Row($"r{i:D3}", Props: nested
+                ? (eu ? static (ref MessagePackWriter w) => RegionAndTenant(ref w, "eu", nested: true)
+                      : static (ref MessagePackWriter w) => RegionAndTenant(ref w, "us", nested: true))
+                : (eu ? static (ref MessagePackWriter w) => RegionAndTenant(ref w, "eu", nested: false)
+                      : static (ref MessagePackWriter w) => RegionAndTenant(ref w, "us", nested: false)),
+                PropCount: 2);
+        }
+        Write(engine, rows);
+
+        string[] hot = await PageAsync(hosted, filter, compiled);
+        Assert.Equal([.. Enumerable.Range(0, 50).Select(static i => $"r{i:D3}")], hot);
+
+        await engine.FlushHotTierAsync();
+        AssertOneGroup(engine, rows.Length);
+
+        long namedLate = QueryExecutor.GroupsNamedLate;
+        string[] cold   = await PageAsync(hosted, filter, compiled);
+        Assert.True(QueryExecutor.GroupsNamedLate > namedLate, "the group was meant to be left for the scan to name");
+        string[] direct = await PageAsync(uncached, filter, compiled);
+
+        Assert.Equal(hot, cold);
+        Assert.Equal(hot, direct);
+    }
+
+    private static void RegionAndTenant(ref MessagePackWriter w, string region, bool nested)
+    {
+        w.Write("Region"); w.Write(region);
+        if (nested) { w.Write("Ctx"); w.WriteMapHeader(1); w.Write("Tenant"); w.Write("acmecorp"); }
+        else        { w.Write("Ctx.Tenant"); w.Write("acmecorp"); }
+    }
+
+    private static async Task<string[]> PageAsync(QueryExecutor query, string filter, CompiledFilter? prepared)
+    {
+        var page = new List<string>(50);
+        await foreach (var ev in query.ExecuteAsync(new QueryRequest
+        {
+            Filter = filter, Prepared = prepared, Count = 50, Direction = QueryDirection.Forward,
+        }))
+            page.Add((string)ev.Properties!["Row"]!);
+        return [.. page];
+    }
+
+    /// <summary>
+    /// A store in the production wiring: one <see cref="ServerOptions"/>, the builder wired by
+    /// <see cref="IndexingWiring"/> and the executor resolved from <c>AddAmetoQuery</c> (with its
+    /// index cache), both reading the option — and an uncached executor given the same options.
+    /// </summary>
+    private async Task<(StorageEngine Engine, QueryExecutor Hosted, QueryExecutor Uncached)> WiredStoreAsync(string name, int depth)
+    {
+        var options = new ServerOptions
+        {
+            DataDirectory = Path.Combine(_dir, name),
+            Indexing      = new IndexingOptions { MaxPropertyFlattenDepth = depth },
+        };
+        Directory.CreateDirectory(options.DataDirectory);
+        var engine = new StorageEngine(
+            Options.Create(options),
+            new RetentionStore(options, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        _engines.Add(engine);
+
+        var provider = new ServiceCollection()
+            .AddLogging()
+            .AddSingleton(Options.Create(options))
+            .AddSingleton(engine)
+            .AddSingleton<ISegmentProvider>(engine)
+            .AddAmetoIndexing()
+            .AddAmetoQuery()
+            .BuildServiceProvider();
+        _disposables.Add(provider);
+        await provider.GetRequiredService<IndexingWiring>().StartAsync(CancellationToken.None);
+
+        var hosted   = (QueryExecutor)provider.GetRequiredService<IQueryExecutor>();
+        var uncached = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance,
+                                         indexCache: null, options: Options.Create(options));
+        return (engine, hosted, uncached);
     }
 
     [Theory]
@@ -393,6 +467,33 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
     {
         var compiled = CompiledFilter.Compile("Ctx.Tenant = 'acmecorp' and acmecorp and contains(a.b.c.d.e.f, 'x')");
         Assert.Same(compiled, compiled.ForIndexDepth(depth));
+    }
+
+    /// <summary>
+    /// A request's filter is compiled at the server's depth in one go; a prepared one is copied
+    /// to it. Both give the same hints, and the copy shares what does not depend on the depth.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(-1)]
+    [InlineData(5)]
+    [InlineData(9)]
+    public void CompiledAtADepth_IsTheSameFilterAsACopyAtIt(int depth)
+    {
+        const string text = "Ctx.Tenant = 'acmecorp' and Region = 'eu' and @l = 'Warning' "
+                          + "and @t >= '2026-08-30T00:00:00Z' and contains(Ctx.Org.Unit, 'ops') and acmecorp";
+        var once   = CompiledFilter.Compile(text, depth);
+        var copied = CompiledFilter.Compile(text).ForIndexDepth(depth);
+
+        Assert.Equal(copied.GetInvertedHints(), once.GetInvertedHints());
+        Assert.Equal(copied.GetTrigramHints(), once.GetTrigramHints());
+        Assert.Equal(copied.TryGetIndexHint(out string copiedKey, out object? copiedValue),
+                     once.TryGetIndexHint(out string onceKey, out object? onceValue));
+        Assert.Equal((copiedKey, copiedValue), (onceKey, onceValue));
+        Assert.Equal(copied.MinTimestampTicks, once.MinTimestampTicks);
+        Assert.Equal(copied.DerivedLevels, once.DerivedLevels);
+        Assert.Same(once, once.ForIndexDepth(depth));
     }
 
     [Fact]
@@ -445,9 +546,11 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
     private delegate void Props(ref MessagePackWriter w);
 
     /// <summary>One event: its <c>Row</c> property names it; the rest is what the case needs.</summary>
-    /// <summary>A null <paramref name="Service"/> is an event logged without one, as ingest stages it: no pool index.</summary>
+    /// <param name="Service">Null is an event logged without one, as ingest stages it: no pool index.</param>
+    /// <param name="PropCount">How many properties <paramref name="Props"/> writes besides <c>Row</c>.</param>
     private sealed record Row(
-        string Name, string Template = Template, string? Service = Service, byte[]? Exception = null, Props? Props = null);
+        string Name, string Template = Template, string? Service = Service, byte[]? Exception = null, Props? Props = null,
+        int PropCount = 1);
 
     private (StorageEngine Engine, QueryExecutor Query) Store(string name)
     {
@@ -469,7 +572,7 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
     /// </summary>
     private async Task AssertTiersAgreeAsync(string filter, string[] expected, Row[] rows)
     {
-        var (engine, query) = Store(Math.Abs((filter + rows.Length).GetHashCode()).ToString());
+        var (engine, query) = Store($"{(uint)(filter + rows.Length).GetHashCode():x8}");
         Write(engine, rows);
 
         Assert.Empty(engine.ListSegments());
@@ -508,8 +611,7 @@ public sealed class UnfiledValueHintTests : IAsyncLifetime
             var row = rows[i];
             buf.ResetWrittenCount();
             var w = new MessagePackWriter(buf);
-            // Every row in this file carries at most one property besides Row.
-            w.WriteMapHeader(row.Props is null ? 1 : 2);
+            w.WriteMapHeader(row.Props is null ? 1 : 1 + row.PropCount);
             w.Write("Row"); w.Write(row.Name);
             row.Props?.Invoke(ref w);
             w.Flush();

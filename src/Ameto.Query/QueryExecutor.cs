@@ -51,6 +51,11 @@ public sealed class QueryExecutor : IQueryExecutor
     /// (<see cref="CompiledFilter.ForIndexDepth"/>): a hint on a deeper path, and free text below
     /// the default, is not given, and those rows are read rather than looked up in an index that
     /// never held their values. At the default and above, the filter is asked as it was compiled.
+    ///
+    /// <para>One number for every segment, because a group does not record the depth it was
+    /// flattened to: a segment replicated from a peer was flattened as deep as THAT node is
+    /// configured, and is asked at this one's. Hence the option has to be the same on every node
+    /// that replicates (docs/CONFIGURATION.md).</para>
     /// </summary>
     private readonly int _indexFlattenDepth;
 
@@ -87,11 +92,11 @@ public sealed class QueryExecutor : IQueryExecutor
         // poll) compiles the filter once and carries it on the request; it is trusted only
         // when it was compiled from this request's own text, so a mismatched pair costs a
         // compile, never a wrong filter. Either way it is asked of the index this server
-        // builds, which may flatten less deeply than the filter was compiled for.
-        var filter = (request.Prepared is CompiledFilter prepared
-                      && string.Equals(prepared.Expression, request.Filter, StringComparison.Ordinal)
-            ? prepared
-            : CompiledFilter.Compile(request.Filter)).ForIndexDepth(_indexFlattenDepth);
+        // builds, which may flatten less deeply than a prepared filter was compiled for.
+        var filter = request.Prepared is CompiledFilter prepared
+                     && string.Equals(prepared.Expression, request.Filter, StringComparison.Ordinal)
+            ? prepared.ForIndexDepth(_indexFlattenDepth)
+            : CompiledFilter.Compile(request.Filter, _indexFlattenDepth);
         int limit  = request.Count;
         int count  = 0;
 

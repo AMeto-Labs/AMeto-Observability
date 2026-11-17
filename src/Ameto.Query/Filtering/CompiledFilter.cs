@@ -36,20 +36,18 @@ public sealed class CompiledFilter : IPreparedFilter
     private readonly int     _indexDepth;
     private CompiledFilter?  _atShallowerDepth;
 
-    // First, before anything below recurses over the tree: a long `and` / `or` chain arrives
-    // from the parser as deep as it is long. See ChainBalancer.
-    private CompiledFilter(string? expression, FilterNode root)
-        : this(expression, RewriteTimeCompares(ChainBalancer.Balance(root)), FullIndexDepth) { }
-
-    /// <param name="root">Balanced and rewritten already: the tree the filter keeps.</param>
     private CompiledFilter(string? expression, FilterNode root, int indexDepth)
     {
+        // First, before anything below recurses over the tree: a long `and` / `or` chain
+        // arrives from the parser as deep as it is long. See ChainBalancer.
+        root           = ChainBalancer.Balance(root);
+        root           = RewriteTimeCompares(root);
         Expression     = expression;
         _root          = root;
-        _indexDepth    = indexDepth;
-        _trigramHints  = BuildTrigramHints(root, indexDepth);
-        _invertedHints = BuildInvertedHints(root, indexDepth);
-        _hasHint       = TryExtract(root, indexDepth, out _hintProperty, out _hintValue);
+        _indexDepth    = Math.Min(indexDepth, FullIndexDepth);
+        _trigramHints  = BuildTrigramHints(root, _indexDepth);
+        _invertedHints = BuildInvertedHints(root, _indexDepth);
+        _hasHint       = TryExtract(root, _indexDepth, out _hintProperty, out _hintValue);
         _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
         long? min = null, max = null;
@@ -58,8 +56,33 @@ public sealed class CompiledFilter : IPreparedFilter
         MaxTimestampTicks = max;
     }
 
+    /// <summary>
+    /// <paramref name="source"/> with its hints worked out again for a shallower index: the tree,
+    /// the header predicate and the time bounds are the source's own — none depends on the depth.
+    /// </summary>
+    private CompiledFilter(CompiledFilter source, int indexDepth)
+    {
+        Expression     = source.Expression;
+        _root          = source._root;
+        _indexDepth    = indexDepth;
+        _trigramHints  = BuildTrigramHints(_root, indexDepth);
+        _invertedHints = BuildInvertedHints(_root, indexDepth);
+        _hasHint       = TryExtract(_root, indexDepth, out _hintProperty, out _hintValue);
+        _headerPredicate  = source._headerPredicate;
+        MinTimestampTicks = source.MinTimestampTicks;
+        MaxTimestampTicks = source.MaxTimestampTicks;
+    }
+
     public static CompiledFilter Compile(string? expression) =>
-        new(expression, FilterParser.Parse(expression));
+        new(expression, FilterParser.Parse(expression), FullIndexDepth);
+
+    /// <summary>
+    /// <see cref="Compile(string?)"/> for an index flattened <paramref name="indexDepth"/> deep —
+    /// the same filter <see cref="ForIndexDepth"/> would give, compiled once instead of twice.
+    /// What a server whose depth is not the default compiles a request's filter with.
+    /// </summary>
+    internal static CompiledFilter Compile(string? expression, int indexDepth) =>
+        new(expression, FilterParser.Parse(expression), indexDepth);
 
     /// <summary>
     /// This filter as asked of an index that flattened nested properties only
@@ -76,10 +99,10 @@ public sealed class CompiledFilter : IPreparedFilter
     /// instead. Header fields are filed at any depth and keep their hints.</para>
     ///
     /// <para>At <see cref="FullIndexDepth"/> or deeper this is the filter itself — every hint it
-    /// gives asks for no more than that, and a deeper index holds more, never less. Below it, a
-    /// copy is made the first time and kept: the server's depth is one number, so a filter that
-    /// is asked again (the live tail's prepared filter, once per poll) pays for it once. Never
-    /// adds a hint this filter does not give.</para>
+    /// gives asks for no more than that. Below it, a copy is made the first time and kept on this
+    /// filter, so a filter that is asked again (the live tail's prepared filter, once per poll)
+    /// pays for it once; a request's own filter is compiled at the server's depth to begin with
+    /// (<see cref="Compile(string?, int)"/>). Never adds a hint this filter does not give.</para>
     /// </summary>
     internal CompiledFilter ForIndexDepth(int depth)
     {
@@ -89,7 +112,7 @@ public sealed class CompiledFilter : IPreparedFilter
         if (kept is not null && kept._indexDepth == depth) return kept;
 
         // A race makes two equal copies and keeps the last; either answers the same.
-        var made = new CompiledFilter(Expression, _root, depth);
+        var made = new CompiledFilter(this, depth);
         Volatile.Write(ref _atShallowerDepth, made);
         return made;
     }

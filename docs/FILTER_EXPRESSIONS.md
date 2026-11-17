@@ -128,7 +128,10 @@ Inside the brackets, escape a literal single quote with `\'`.
 > `Request.User.Id = 42` and `contains(Request.Path, '/orders')` are answered from
 > it like a top-level property. A deeper path — or, with that option set lower,
 > any path deeper than it — is answered by reading the rows instead: the same
-> result, more slowly. Array subscripts do not count as levels.
+> result, more slowly. A `[0]` subscript is not a level. A name with dots in it,
+> such as the OTLP attribute `http.request.method`, counts a level per dot when
+> written bare (it may also name a nested map of that shape) and is one level in
+> brackets: `['http.request.method']`.
 
 ## Built-in CLEF fields
 
