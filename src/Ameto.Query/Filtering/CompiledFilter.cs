@@ -34,6 +34,9 @@ public sealed class CompiledFilter : IPreparedFilter
     private CompiledFilter(string? expression, FilterNode root)
     {
         Expression     = expression;
+        // First, before anything below recurses over the tree: a long `and` / `or` chain
+        // arrives from the parser as deep as it is long. See ChainBalancer.
+        root           = ChainBalancer.Balance(root);
         root           = RewriteTimeCompares(root);
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);

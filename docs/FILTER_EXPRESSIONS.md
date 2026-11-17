@@ -23,10 +23,11 @@ an expression — `could not connect` searches for all three words.
 ## When a filter is refused
 
 An input that contains no comparison and no `[ … ]` list is free text, whatever else is
-in it, so a search can't fail. Once one of those appears, the expression must be
-readable **in full** — the parser used to stop at the first token it couldn't use and
-silently run the part before it, so a typo after a valid prefix widened the results and
-a half-typed comparison narrowed them to nothing. These are now 400s naming the position:
+in it, so a search can't fail (but for the nesting limit below). Once one of those appears,
+the expression must be readable **in full** — the parser used to stop at the first token it
+couldn't use and silently run the part before it, so a typo after a valid prefix widened the
+results and a half-typed comparison narrowed them to nothing. These are now 400s naming the
+position:
 
 ```
 @l = 'Error' Region = 'eu'   # two clauses with no 'and'
@@ -35,6 +36,11 @@ Level =                      # nothing to compare against
 sum(Elapsed) > 5             # no such function
 'a' != 'b'                   # no property to test — this used to match everything
 ```
+
+Nesting is limited too: groups in parentheses and `not` may be nested 100 levels deep, and a
+filter nested deeper is a 400 — words inside 101 parentheses are refused, not searched for. A
+long `a and b and c …` is not nesting and does not count (groups that each hold such chains
+do add up: the whole may be 256 levels deep once compiled).
 
 ## Aggregation
 
