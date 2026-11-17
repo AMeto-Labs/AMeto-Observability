@@ -139,6 +139,136 @@ public sealed class BloomFirstSightTests
         Assert.True(bloom.MightContain("@x.exists"));
     }
 
+    // ── A string that spells a typed value's term ─────────────────────────────
+
+    /// <summary>
+    /// The same meeting between two scalars. The inverted index files a typed value under a
+    /// type-tagged form — the long 5 as <c>\0l5</c> — and a string under its own bytes, so the
+    /// string <c>"\0l5"</c> under the same property IS the long's term, and the two give the
+    /// bloom different texts: <c>\0l5</c> and <c>5</c>. Whichever was filed second used to be
+    /// taken for a repeat and kept out of the filter.
+    ///
+    /// <para>Tried for every typed form the walk files, in rows apart either way round, as the
+    /// two elements of one array either way round, and repeated. The streaming build has to come
+    /// out byte-identical to the reference build, which adds every text every time — and both
+    /// texts have to be in it, said outright.</para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TypedKindsAndOrders))]
+    public void AStringSpellingATypedTerm_AndTheTypedValue_BothReachTheBloom(string kind, string order)
+    {
+        var (spelling, text, _) = TypedKinds[kind];
+        var pool = new StringInternPool();
+        using var hot = TaggedTier(kind, order, pool);
+
+        using var streaming = new SegmentIndexBuilder(hot.Count);
+        streaming.Build(hot, pool);
+        using var reference = new SegmentIndexBuilder(hot.Count);
+        reference.BuildReference(hot, pool);
+
+        Assert.Equal(reference.SerialisedBloomFilter,   streaming.SerialisedBloomFilter);
+        Assert.Equal(reference.SerialisedInvertedIndex, streaming.SerialisedInvertedIndex);
+        Assert.Equal(reference.BloomTermsAdded,         streaming.BloomTermsAdded);
+
+        using var bloom = SegmentBloomFilter.Deserialise(streaming.SerialisedBloomFilter);
+        Assert.True(bloom.MightContain(spelling), $"{kind}, `{order}`: the string's text is not in the bloom");
+        Assert.True(bloom.MightContain(text),     $"{kind}, `{order}`: the typed value's text is not in the bloom");
+    }
+
+    public static TheoryData<string, string> TypedKindsAndOrders
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            foreach (string kind in TypedKinds.Keys)
+            foreach (string order in (string[])["string,typed", "typed,string", "[string,typed]", "[typed,string]", "typed,typed,string,typed,string"])
+            {
+                // A nil INSIDE an array is no comparison with the reference: the reference reads
+                // the element as the string "<null>" (LogEventSerializer.ReadArray — and the scan
+                // reads it so too), where the walk files a nil. That disagreement is older than
+                // this rule and untouched by it; the walk's side of the meeting is still asked of
+                // the engine, in StringSpellingATypedTermTests.
+                if (kind == "nil" && order.StartsWith('[')) continue;
+                data.Add(kind, order);
+            }
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// What that rule stands on: the inverted index files every value either under its own text
+    /// — a string, and a number written without a tag — or under a form that begins with NUL. So
+    /// only a string that begins with NUL can share a typed value's term, and those are what the
+    /// builder watches for. A form added later that did neither would let an ordinary string take
+    /// a typed value's term unseen; this fails first.
+    /// </summary>
+    [Fact]
+    public void EveryValueIsFiledUnderItsOwnText_OrUnderAFormThatBeginsWithNul()
+    {
+        object?[] values = [null, true, false, 5, 5L, -7L, 2.5d, 2.5f, (short)3, (byte)4, 5UL, ulong.MaxValue, "plain", ""];
+        foreach (var value in values)
+        {
+            string form = IndexValueForms.Serialise(value);
+            Assert.True(form == IndexValueForms.PlainText(value) || form.StartsWith('\0'),
+                $"{value?.GetType().Name ?? "null"} {value}: filed as `{form.Replace("\0", "\\0")}`, which is neither its own text nor NUL-led");
+        }
+    }
+
+    /// <summary>
+    /// The typed values the walk files with a tag, each with the string that spells its term and
+    /// the text it gives the bloom.
+    /// </summary>
+    private static readonly Dictionary<string, (string Spelling, string Text, PackValue Typed)> TypedKinds = new()
+    {
+        ["long"]   = ("\0l5",    "5",     static (ref MessagePackWriter w) => w.Write(5L)),
+        ["double"] = ("\0d2.5",  "2.5",   static (ref MessagePackWriter w) => w.Write(2.5d)),
+        ["true"]   = ("\0true",  "true",  static (ref MessagePackWriter w) => w.Write(true)),
+        ["false"]  = ("\0false", "false", static (ref MessagePackWriter w) => w.Write(false)),
+        ["nil"]    = ("\0null",  "",      static (ref MessagePackWriter w) => w.WriteNil()),
+    };
+
+    private delegate void PackValue(ref MessagePackWriter writer);
+
+    /// <summary>
+    /// Rows in <paramref name="order"/>: <c>string</c> holds the kind's spelling under <c>P</c>,
+    /// <c>typed</c> its typed value; a bracketed pair is one row whose <c>P</c> is an array of the
+    /// two. Every row also carries a <c>Row</c> of its own.
+    /// </summary>
+    private static HotTierSegment TaggedTier(string kind, string order, StringInternPool pool)
+    {
+        const string Template = "settle {Row}";
+        var (spelling, _, typed) = TypedKinds[kind];
+        string[][] rows = order.StartsWith('[') ? [order.Trim('[', ']').Split(',')] : [.. order.Split(',').Select(static v => new[] { v })];
+
+        var hot = new HotTierSegment(rows.Length + 1, 1024 * 1024);
+        var buf = new ArrayBufferWriter<byte>(64);
+        for (int i = 0; i < rows.Length; i++)
+        {
+            buf.Clear();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(2);
+            w.Write("Row"); w.Write("r-" + i);
+            w.Write("P");
+            if (rows[i].Length > 1) w.WriteArrayHeader(rows[i].Length);
+            foreach (string value in rows[i])
+            {
+                if (value == "string") w.Write(spelling);
+                else                   typed(ref w);
+            }
+            w.Flush();
+
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)i).RawValue,
+                TimestampUtcTicks        = new DateTimeOffset(2026, 11, 17, 9, 0, 0, TimeSpan.Zero).UtcTicks + i,
+                Level                    = LogLevel.Warning,
+                MessageTemplatePoolIndex = pool.Intern(Template),
+                ServiceNamePoolIndex     = pool.Intern("Billing.API"),
+            }, buf.WrittenSpan, Template));
+        }
+        return hot;
+    }
+
     /// <summary>
     /// Rows by kind: <c>exception</c> carries one, <c>client</c> the property
     /// <c>@x.exists = "true"</c> (or <c>["true"]</c>), <c>both</c> both, <c>plain</c> neither.
