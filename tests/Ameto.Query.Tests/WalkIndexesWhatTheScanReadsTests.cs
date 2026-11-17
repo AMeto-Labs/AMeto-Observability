@@ -21,9 +21,11 @@ namespace Ameto.Query.Tests;
 /// <list type="number">
 /// <item>A map key that is not a string ENDED the walk of its row: the walk read every key as a
 /// string, a non-string one threw, and the throw was swallowed, so every property after that key
-/// was never indexed. The scan's probe skips such a pair and reads on. The project's own Serilog
-/// sink writes one — a <c>Dictionary&lt;int, …&gt;</c> property's keys go out as integers — and
-/// CLEF ingest keeps the pair as it came.</item>
+/// was never indexed. The scan's probe skips such a pair and reads on. (Its dictionary, which free
+/// text and nested paths read, threw on the key and lost the whole map; it skips the pair now too,
+/// which is why those filters find these rows hot at all.) The project's own Serilog sink writes
+/// such a key — a <c>Dictionary&lt;int, …&gt;</c> property's keys go out as integers — and CLEF
+/// ingest keeps the pair as it came.</item>
 /// <item>A nil ELEMENT of an array, which the reader turns into the string <c>"&lt;null&gt;"</c>
 /// (<c>LogEventSerializer.ReadArray</c>) — what the scan compares, what the events API shows, and
 /// so what the UI's "filter by this value" builds a filter from (<c>Tags[1] = '&lt;null&gt;'</c>).

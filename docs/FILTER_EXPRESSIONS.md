@@ -127,6 +127,22 @@ Inside the brackets, escape a literal single quote with `\'`.
 > index pre-filter). They are still trigram-accelerated when the right-hand
 > side is a string literal.
 
+### Values that do not read as themselves
+
+A few stored values read as something other than themselves, in every filter and
+in every tier:
+
+- A **nil or msgpack-extension element of an array** (a msgpack timestamp, say)
+  reads as the string `'<null>'` — which is also how the event view shows it — so
+  `Tags[1] = '<null>'` and `contains(Tags, 'null')` find it. A nil property that is
+  not in an array is `null`.
+- A **binary value** reads as the text `'System.Byte[]'` (also how the event view
+  shows it) in `contains`, `startsWith`, `endsWith`, `like` and `in`.
+- A **map key that is not a string** (msgpack allows any; a .NET
+  `Dictionary<int, …>` logged through Serilog has integer keys) cannot be named by
+  a filter, although the event view shows it under its text. Its pair is skipped,
+  by free text too, and the rest of the event reads as usual.
+
 ## Built-in CLEF fields
 
 | Field | Alias | Description |
