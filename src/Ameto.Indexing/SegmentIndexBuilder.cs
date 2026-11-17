@@ -636,6 +636,11 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             {
                 ReadOnlySpan<byte> v = ReadStr(ref reader);
                 int prop = _inverted.PropertyId(flatKey, out bool newKey);
+                // Marked BEFORE it is filed, as AddHeaderString does: a filed string whose property
+                // is not marked is the one state the rule must never leave behind, and the mark can
+                // throw (it may grow the bitset).
+                bool tagged = MaySpellATypedTerm(v);
+                if (tagged) NoteTaggedSpelling(prop);
                 var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
@@ -643,8 +648,6 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 // string that may spell a typed value's term (see MaySpellATypedTerm), or the
                 // exception marker's own term met by a client's value for the first time (see
                 // AddExists; that debt is struck off once the text is in the filter).
-                bool tagged = MaySpellATypedTerm(v);
-                if (tagged) NoteTaggedSpelling(prop);
                 bool owed = r == IndexAddOutcome.Existing && prop == _markerOwesBloom && v.SequenceEqual(MarkerValue);
                 FoldValue(offset, v, bloom: owed || tagged || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
                 if (owed) _markerOwesBloom = -1;
@@ -745,12 +748,15 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// <c>\0d2.5</c>, <c>\0true</c>, <c>\0null</c>) while it files a string as its own bytes.
     ///
     /// <para>Every tag begins with NUL, and a value filed without one is filed under its own text
-    /// (a number too large for a long), so no other string can: for a string that does not begin
-    /// with NUL, "new to the inverted index" stands for "new to the bloom" whoever filed the term
-    /// first. One that does is that typed value's term with the other text, and is handled on
-    /// both sides. It always gives the bloom its own text, and it marks its property
-    /// (<see cref="NoteTaggedSpelling"/>) so that a typed value under it always gives its own.
-    /// <c>BloomFirstSightTests</c> pins the forms this rests on.</para>
+    /// (a number too large for a long), so no other string can: a term that a string not beginning
+    /// with NUL shares was filed under the same bytes with the same text — by a string, a header
+    /// string or such a number — or by the exception marker, which keeps its own account
+    /// (<see cref="AddExists"/>). A string that does begin with NUL may be a typed value's term
+    /// with the other text, and is handled on both sides. It always gives the bloom its own text,
+    /// and it marks its property (<see cref="NoteTaggedSpelling"/>) so that a typed value under it
+    /// always gives its own. <c>BloomFirstSightTests</c> pins the forms this rests on — the walk's
+    /// own, which production files, and <see cref="IndexValueForms.Serialise"/>'s, which the
+    /// reference build files.</para>
     ///
     /// <para>What it costs: one byte read per string. A property that never holds such a string —
     /// every property of every ordinary client — pays nothing more; one that does gives up the
