@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Ameto.Core;
 
@@ -11,12 +14,20 @@ namespace Ameto.Core;
 ///
 /// False-positive rate: ~1% at capacity; false-negative rate: 0% (guaranteed).
 ///
-/// Indexed key: the raw bytes of a UTF-8 serialised property value string.
+/// Indexed key: the UTF-8 bytes of a value's text, CASE-FOLDED by <see cref="CaseFold"/> — see
+/// <see cref="Add(ReadOnlySpan{char})"/>. A filter made by <see cref="CreateForBinaryKeys"/> holds
+/// raw keys instead and takes no text.
 ///
-/// Binary format:
-///   uint32 bitCount   (must be a multiple of 512)
-///   uint32 capacity   (informational; number of items the filter was sized for)
-///   byte[] bits       (bitCount / 8 bytes)
+/// Binary format — two layouts, told apart by the capacity word of the first header:
+///   LEGACY (every build before the canonical fold; binary-keyed filters still):
+///     uint32 bitCount   (must be a multiple of 512)
+///     uint32 capacity   (informational; high bit = <see cref="FoldedMarker"/>)
+///     byte[] bits       (bitCount / 8 bytes)
+///   CANONICAL (text folded by <see cref="CaseFold"/>):
+///     uint32 512, uint32 <see cref="CanonicalMarker"/>, 64 × 0xFF
+///                       — a legacy filter of one block with every bit set
+///     uint64 the writer's <see cref="CaseFold.Fingerprint"/>
+///     uint32 bitCount, uint32 capacity, byte[] bits — the filter itself
 /// </summary>
 public sealed unsafe class SegmentBloomFilter : IDisposable
 {
@@ -25,31 +36,85 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     private const int BlockBits  = BlockBytes * 8; // 512
 
     /// <summary>
-    /// High bit of the serialised <c>capacity</c> word, set by writers that case-fold on
-    /// <see cref="Add(ReadOnlySpan{char})"/>.
+    /// High bit of the LEGACY header's <c>capacity</c> word: the text in the bits was lowercased
+    /// with <c>ToLowerInvariant</c> by whichever host wrote it. Every build from the one that started
+    /// folding up to the canonical fold set it; a blob without it was written before, and holds the
+    /// ORIGINAL casing.
     ///
     /// <para>Capacity is informational — it is the segment's expected event count, never
-    /// within nine orders of magnitude of 2^31 — so the spare bit costs nothing and saves a
-    /// whole-file version bump. A blob without it was written by a build that stored the
-    /// ORIGINAL casing, and <see cref="MightContain(ReadOnlySpan{char})"/> must not treat its
-    /// silence as proof; see there.</para>
+    /// within nine orders of magnitude of 2^31 — so the spare bit costs nothing and saved a
+    /// whole-file version bump. A binary-keyed filter (<see cref="CreateForBinaryKeys"/>) still
+    /// writes it, as every build has, so the files that hold one keep their bytes.</para>
     /// </summary>
     private const uint FoldedMarker = 0x8000_0000u;
 
-    private readonly byte*  _bits;
-    private readonly uint   _blockCount;
-    private readonly uint   _capacity;
-    private readonly bool   _folded;
-    private          bool   _disposed;
-    private          long   _added;
+    /// <summary>
+    /// The capacity word of the one-block filter a CANONICAL section starts with: "LBC1"
+    /// little-endian. It is what tells this build's reader that the real filter follows, folded by
+    /// <see cref="CaseFold"/>.
+    ///
+    /// <para>No legacy section carries it. A legacy capacity word is the filter's capacity — at
+    /// most 0x0CCC_CCCC (<see cref="MaxExpectedItems"/>) since sizing was clamped, a group's
+    /// forecast nowhere near 2^28 before that — with or without <see cref="FoldedMarker"/>'s bit 31;
+    /// this is above 2^28 with bit 31 clear. (A section that had it by accident would be one block
+    /// long, too short for what the marker promises, and refused rather than misread.) And the
+    /// one-block filter in front of it has every bit set, which is what an OLDER build reads: a
+    /// filter that answers "might" to every probe, so a segment this build wrote costs an older
+    /// one its bloom gate and never a row. It cannot read the canonical bits, and must not — it
+    /// would probe them with its own lowercase.</para>
+    /// </summary>
+    private const uint CanonicalMarker = 0x3143_424Cu;   // 'L' 'B' 'C' '1'
 
-    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity, bool folded = true)
+    /// <summary>The one-block legacy filter in front of a canonical one: header and bits.</summary>
+    private const int StubBytes = 8 + BlockBytes;
+
+    /// <summary>Everything a canonical section holds before its bits: the stub, the fingerprint
+    /// and the filter's own header.</summary>
+    private const int CanonicalPreambleBytes = StubBytes + 8 + 8;
+
+    /// <summary>
+    /// How the TEXT in a filter's bits was folded — read off the section it came from, never
+    /// assumed, because it decides which of a literal's spellings a probe can stand for.
+    /// </summary>
+    internal enum TextFold : byte
     {
-        _bits       = bits;
-        _blockCount = blockCount;
-        _capacity   = capacity;
-        _folded     = folded;
+        /// <summary>The original casing: a section written before folding shipped.</summary>
+        None,
+
+        /// <summary><c>ToLowerInvariant</c> of the host that wrote it (<see cref="FoldedMarker"/>):
+        /// every build from folding up to the canonical fold. Also what a binary-keyed filter's
+        /// header says, as it always has.</summary>
+        LowerInvariant,
+
+        /// <summary><see cref="CaseFold"/>, by the table whose fingerprint the section records.</summary>
+        Canonical,
     }
+
+    private readonly byte*    _bits;
+    private readonly uint     _blockCount;
+    private readonly uint     _capacity;
+    private readonly TextFold _fold;
+    private readonly ulong    _foldFingerprint;
+    private readonly bool     _binaryKeys;
+    private          bool     _disposed;
+    private          long     _added;
+
+    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity, TextFold fold, ulong foldFingerprint, bool binaryKeys)
+    {
+        _bits            = bits;
+        _blockCount      = blockCount;
+        _capacity        = capacity;
+        _fold            = fold;
+        _foldFingerprint = foldFingerprint;
+        _binaryKeys      = binaryKeys;
+    }
+
+    /// <summary>How the text in these bits was folded.</summary>
+    internal TextFold Fold => _fold;
+
+    /// <summary>The <see cref="CaseFold.Fingerprint"/> a <see cref="TextFold.Canonical"/> filter
+    /// was folded under; 0 for the others.</summary>
+    internal ulong FoldFingerprint => _foldFingerprint;
 
     /// <summary>Native bytes the bit array occupies — for the index cache's retained-size accounting.</summary>
     public long RetainedBytes => (long)_blockCount * (BlockBits / 8);
@@ -95,9 +160,22 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// </summary>
     private const long MaxFilterBytes = 16L * 1024 * 1024;
 
-    /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>, subject to
-    /// <see cref="MaxFilterBytes"/>.</summary>
-    public static SegmentBloomFilter Create(long expectedItems)
+    /// <summary>Creates a new empty TEXT filter sized for <paramref name="expectedItems"/>, subject
+    /// to <see cref="MaxFilterBytes"/>: text goes in folded by <see cref="CaseFold"/>, and the
+    /// section it serialises to is the canonical layout.</summary>
+    public static SegmentBloomFilter Create(long expectedItems) =>
+        Allocate(expectedItems, TextFold.Canonical, CaseFold.Fingerprint, binaryKeys: false);
+
+    /// <summary>
+    /// Creates a filter for keys that are not text — the trace-id index's eight-byte ids. Only the
+    /// byte overloads apply (the text ones throw), and it serialises in the legacy layout with the
+    /// folded marker, byte for byte what every build has written for it: there is no casing in a
+    /// key like that, and so no reason for those files to change.
+    /// </summary>
+    public static SegmentBloomFilter CreateForBinaryKeys(long expectedItems) =>
+        Allocate(expectedItems, TextFold.LowerInvariant, 0, binaryKeys: true);
+
+    private static SegmentBloomFilter Allocate(long expectedItems, TextFold fold, ulong foldFingerprint, bool binaryKeys)
     {
         // ~10 bits per item → ~1% FPR; round up to multiple of 512. Long arithmetic
         // throughout, then clamped — the old int product wrapped instead of saturating.
@@ -115,7 +193,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         long affordable = Math.Min(clamped, totalBits / 10);
 
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
-        return new SegmentBloomFilter(bits, blockCount, (uint)affordable);
+        return new SegmentBloomFilter(bits, blockCount, (uint)affordable, fold, foldFingerprint, binaryKeys);
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
@@ -163,51 +241,49 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public void Add(string value) => Add((ReadOnlySpan<char>)value);
 
     /// <summary>
-    /// Adds the CASE-FOLDED form of <paramref name="value"/>, encoding into stack/pooled
+    /// Adds <paramref name="value"/> FOLDED BY <see cref="CaseFold"/>, encoding into stack/pooled
     /// scratch instead of allocating a byte[] per add.
     ///
     /// <para>Folding is a correctness requirement, not a nicety: the per-event scan compares
     /// strings <see cref="StringComparison.OrdinalIgnoreCase"/>, so a filter keyed on the raw
     /// casing answers "not here" for a value that differs from the query literal only in case
     /// — <c>@l = 'error'</c> against a stored <c>Error</c> — and the whole segment is dropped
-    /// unread. Folding also keeps the filter's occupancy where it was; storing both casings
-    /// would have raised the false-positive rate for every segment.</para>
+    /// unread. And it has to be THAT comparer's fold: the <c>ToLowerInvariant</c> this used to
+    /// store keeps <c>ς</c> apart from <c>σ</c> and <c>µ</c> from <c>μ</c>, which the comparer
+    /// calls equal, so <c>Place = 'ΟΔΟΣ'</c> lost a stored <c>οδος</c> the moment it was flushed
+    /// (see <see cref="CaseFold"/>). Folding also keeps the filter's occupancy where it was;
+    /// storing both casings would have raised the false-positive rate for every segment.</para>
     /// </summary>
     public void Add(ReadOnlySpan<char> value)
     {
         // Guarded HERE as well as in the byte overload, and before the rent: this path takes a
         // pooled buffer and returns it without a finally, so a throw from further in would strand
         // it. The duplicate check is a load of an already-hot bool against three Murmur passes.
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfNotCanonicalText();
 
-        char[]? foldRented = value.Length > 256
-            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
-            : null;
-        Span<char> foldBuf = foldRented ?? stackalloc char[256];
-        int foldLen = value.ToLowerInvariant(foldBuf);
-        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
-
-        AddRaw(folded);
-
-        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+        char[]? rented = value.Length > 256 ? ArrayPool<char>.Shared.Rent(value.Length) : null;
+        Span<char> folded = rented ?? stackalloc char[256];
+        int n = CaseFold.FoldUtf16(value, folded);
+        AddCanonical(folded[..n]);
+        if (rented is not null) ArrayPool<char>.Shared.Return(rented);
     }
 
     /// <summary>
-    /// Adds the case-folded form of a UTF-8 value — what <see cref="Add(ReadOnlySpan{char})"/>
-    /// stores, reached without a UTF-16 round trip when the value is ASCII. Byte-wise A-Z
-    /// lowering is exactly what <c>ToLowerInvariant</c> does to an ASCII string, and the
-    /// re-encoding of the folded chars is the identity, so the hashed bytes — and therefore the
-    /// bits — are the same. Anything with a non-ASCII byte takes the UTF-16 path unchanged.
+    /// Adds the folded form of a UTF-8 value — what <see cref="Add(ReadOnlySpan{char})"/> stores,
+    /// reached without a UTF-16 round trip when the value is ASCII: <see cref="CaseFold"/> over
+    /// ASCII is A-Z upper, which is <c>Ascii.ToUpper</c>, and the re-encoding of ASCII chars is the
+    /// identity, so the hashed bytes — and therefore the bits — are the same. Anything with a
+    /// non-ASCII byte is folded scalar by scalar straight off its UTF-8.
     /// </summary>
     public void AddUtf8(ReadOnlySpan<byte> value)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfNotCanonicalText();
 
-        byte[]? rented = value.Length > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length) : null;
+        byte[]? rented = value.Length > 512 ? ArrayPool<byte>.Shared.Rent(value.Length) : null;
         Span<byte> fold = rented ?? stackalloc byte[512];
         try
         {
-            if (System.Text.Ascii.ToLower(value, fold, out int n) == System.Buffers.OperationStatus.Done)
+            if (Ascii.ToUpper(value, fold, out int n) == OperationStatus.Done)
             {
                 Add(fold[..n]);
                 return;
@@ -215,32 +291,50 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         }
         finally
         {
-            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
         }
 
-        // Non-ASCII: decode and fold as UTF-16, exactly as the char overload does.
-        int chars = System.Text.Encoding.UTF8.GetCharCount(value);
-        char[]? rentedChars = chars > 256 ? System.Buffers.ArrayPool<char>.Shared.Rent(chars) : null;
-        Span<char> buf = rentedChars ?? stackalloc char[256];
+        char[]? rentedChars = value.Length > 256 ? ArrayPool<char>.Shared.Rent(value.Length) : null;
+        Span<char> chars = rentedChars ?? stackalloc char[256];
         try
         {
-            int written = System.Text.Encoding.UTF8.GetChars(value, buf);
-            Add((ReadOnlySpan<char>)buf[..written]);
+            int n = CaseFold.FoldUtf8(value, chars);
+            AddCanonical(chars[..n]);
         }
         finally
         {
-            if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars);
+            if (rentedChars is not null) ArrayPool<char>.Shared.Return(rentedChars);
         }
     }
 
-    private void AddRaw(ReadOnlySpan<char> value)
+    /// <summary>
+    /// Adds text ALREADY folded by <see cref="CaseFold"/> — one BMP unit per scalar, never a
+    /// surrogate — as the UTF-8 its probe will hash. The index builder folds a non-ASCII value
+    /// once for this filter and the trigram index together, and comes in here.
+    /// </summary>
+    internal void AddCanonical(ReadOnlySpan<char> folded)
     {
-        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
-        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
-        Span<byte> buf = rented ?? stackalloc byte[max];
-        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
-        Add(buf[..n]);
-        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        ThrowIfNotCanonicalText();
+        int max = folded.Length * 3;   // a BMP unit that is not a surrogate is at most three bytes
+        byte[]? rented = max > 512 ? ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> utf8 = rented ?? stackalloc byte[512];
+        int n = Encoding.UTF8.GetBytes(folded, utf8);
+        Add(utf8[..n]);
+        if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+    }
+
+    /// <summary>
+    /// Text goes only into a filter whose bits are canonical: a binary-keyed one serialises in the
+    /// legacy layout, and one read from an older section holds another fold — either would put
+    /// canonical bits under a header that tells the reader to probe them some other way.
+    /// </summary>
+    private void ThrowIfNotCanonicalText()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_fold != TextFold.Canonical)
+            throw new InvalidOperationException(_binaryKeys
+                ? "This bloom filter holds binary keys; text goes into one made by SegmentBloomFilter.Create."
+                : $"This bloom filter was read from a section folded {_fold}; canonical text cannot be added to it.");
     }
 
     // ── Query ─────────────────────────────────────────────────────────────────
@@ -259,60 +353,89 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public bool MightContain(string value) => MightContain((ReadOnlySpan<char>)value);
 
     /// <summary>
-    /// Probes the folded form first — that is what <see cref="Add(ReadOnlySpan{char})"/>
-    /// stores — then the raw form, which is what a pre-folding writer stored.
-    ///
-    /// <para>For a segment written BEFORE folding, two probes are still not enough to prove
-    /// absence. The filter holds one arbitrary casing and the scan compares
-    /// OrdinalIgnoreCase, so <c>@l = 'error'</c> misses a stored <c>Error</c> on the folded
-    /// probe AND on the raw probe, and the phase-1 gate drops the segment before the (now
-    /// case-insensitive) inverted index can disagree. Folding on the WRITE side fixes nothing
-    /// for bytes already on disk. So an unfolded filter may only answer "no" for a value that
-    /// has no cased characters — a number, a punctuation-only key — where its one spelling is
-    /// the only spelling. Everything else gets "might", which costs those segments the cheap
-    /// gate and keeps their rows; the inverted index still prunes them one phase later, and
-    /// compaction retires the state as it rewrites them.</para>
+    /// Whether a value the scan would accept for <paramref name="value"/> might be here. The
+    /// answer "no" is a PROOF that drops the segment's group unread, so it is given only where the
+    /// section's fold makes it one; everywhere else the answer is "might", which costs the group
+    /// this cheap gate and keeps its rows — the inverted index still prunes an equality one phase
+    /// later, exactly. What the section can prove depends on how its text was folded:
+    /// <list type="bullet">
+    ///   <item><b>Canonical, this build's table.</b> The literal is folded the same way and probed.
+    ///     Proof for any literal — unless the HOST compares one of its characters differently from
+    ///     the table (<see cref="CaseFold.HostDisagrees"/>; no host this build runs on does).</item>
+    ///   <item><b>Canonical, another build's table.</b> Only an all-ASCII literal: ASCII folds the
+    ///     same in every table there has been, and no other character does necessarily.</item>
+    ///   <item><b>Lowercase (<see cref="FoldedMarker"/>), every build before the canonical
+    ///     fold.</b> Only an all-ASCII literal, probed lowercased. The writer lowercased with ITS
+    ///     host's casing, which nobody recorded (ICU of some version, or .NET's data under invariant
+    ///     globalization), and lowercase is not the comparer's equivalence in any case: a stored
+    ///     <c>οδος</c> holds <c>ς</c> where <c>ΟΔΟΣ</c> lowercases to <c>σ</c>, a stored <c>ᲀода</c>
+    ///     holds <c>ᲀ</c> where <c>ВОДА</c> lowercases to <c>в</c> — and the archaic forms behind
+    ///     <c>в д о с т ъ</c> make even ordinary Cyrillic unprovable. ASCII lowercases the same on
+    ///     every host there has ever been, and no non-ASCII character is equal to an ASCII one
+    ///     under the comparer, so an ASCII literal's lowercase is the one spelling every matching
+    ///     value was stored under. Folding on the WRITE side fixes nothing for bytes already on
+    ///     disk; segments written before the canonical fold keep this rule until retention or a
+    ///     merge retires them.</item>
+    ///   <item><b>Original casing, a section from before folding shipped.</b> Only a literal with
+    ///     exactly one spelling — ASCII with no letter: a number, an id of digits and dashes. The
+    ///     filter holds one arbitrary casing of anything else.</item>
+    /// </list>
+    /// And on a host whose comparer equates a non-ASCII character with an ASCII one
+    /// (<see cref="CaseFold.HostDisagreesOnAscii"/>), none of the ASCII premises hold, and nothing
+    /// is proof.
     /// </summary>
     public bool MightContain(ReadOnlySpan<char> value)
     {
-        // Before the rent, for the reason given on Add(ReadOnlySpan{char}).
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (CaseFold.HostDisagreesOnAscii) return true;
 
-        char[]? foldRented = value.Length > 256
-            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
-            : null;
-        Span<char> foldBuf = foldRented ?? stackalloc char[256];
-        int foldLen = value.ToLowerInvariant(foldBuf);
-        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+        switch (_fold)
+        {
+            case TextFold.Canonical:
+                bool trusted = _foldFingerprint == CaseFold.Fingerprint
+                    ? !CaseFold.HostDisagreesWithAny(value)
+                    : Ascii.IsValid(value);
+                return !trusted || MightContainCanonical(value);
 
-        bool hit = MightContainRaw(folded);
-        if (!hit && !folded.SequenceEqual(value)) hit = MightContainRaw(value);
-        if (!hit && !_folded && HasCasedChars(value)) hit = true;   // cannot prove absence
+            case TextFold.LowerInvariant:
+                return !Ascii.IsValid(value) || MightContainAscii(value, lower: true);
 
-        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+            default:
+                return !Ascii.IsValid(value)
+                    || value.ContainsAnyInRange('A', 'Z') || value.ContainsAnyInRange('a', 'z')
+                    || MightContainAscii(value, lower: false);
+        }
+    }
+
+    /// <summary>The probe for text folded by <see cref="CaseFold"/>: what <see cref="Add(ReadOnlySpan{char})"/> hashed.</summary>
+    private bool MightContainCanonical(ReadOnlySpan<char> value)
+    {
+        char[]? rentedChars = value.Length > 256 ? ArrayPool<char>.Shared.Rent(value.Length) : null;
+        Span<char> folded = rentedChars ?? stackalloc char[256];
+        int n = CaseFold.FoldUtf16(value, folded);
+
+        int max = n * 3;
+        byte[]? rented = max > 512 ? ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> utf8 = rented ?? stackalloc byte[512];
+        int len = Encoding.UTF8.GetBytes(folded[..n], utf8);
+        bool hit = MightContain(utf8[..len]);
+
+        if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        if (rentedChars is not null) ArrayPool<char>.Shared.Return(rentedChars);
         return hit;
     }
 
-    /// <summary>True when some character has a different upper/lower spelling, i.e. when a
-    /// pre-folding writer could have stored a casing this probe will not reproduce.</summary>
-    private static bool HasCasedChars(ReadOnlySpan<char> value)
+    /// <summary>The probe for an all-ASCII literal against a legacy section: its bytes, lowercased
+    /// when the section was.</summary>
+    private bool MightContainAscii(ReadOnlySpan<char> value, bool lower)
     {
-        for (int i = 0; i < value.Length; i++)
-        {
-            char c = value[i];
-            if (char.ToLowerInvariant(c) != c || char.ToUpperInvariant(c) != c) return true;
-        }
-        return false;
-    }
-
-    private bool MightContainRaw(ReadOnlySpan<char> value)
-    {
-        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
-        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
-        Span<byte> buf = rented ?? stackalloc byte[max];
-        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
-        bool hit = MightContain(buf[..n]);
-        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        byte[]? rented = value.Length > 512 ? ArrayPool<byte>.Shared.Rent(value.Length) : null;
+        Span<byte> ascii = rented ?? stackalloc byte[512];
+        int n;
+        if (lower) Ascii.ToLower(value, ascii, out n);
+        else       Ascii.FromUtf16(value, ascii, out n);
+        bool hit = MightContain(ascii[..n]);
+        if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
         return hit;
     }
 
@@ -335,14 +458,17 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         uint byteCount = _blockCount * BlockBytes;
-        var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
-        WriteHeader(buf);
-        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
+        var buf = new byte[SerialisedLength];
+        int preamble = WritePreamble(buf);
+        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(preamble));
         return buf;
     }
 
-    /// <summary>Bytes <see cref="Serialise"/> / <see cref="WriteTo"/> produce.</summary>
-    public long SerialisedLength => 8L + (long)_blockCount * BlockBytes;
+    /// <summary>Bytes <see cref="Serialise"/> / <see cref="WriteTo"/> produce: the bits and, before
+    /// them, 8 bytes of header — or, for a canonical filter, the 88 bytes of
+    /// <see cref="WritePreamble"/>.</summary>
+    public long SerialisedLength =>
+        (_fold == TextFold.Canonical ? CanonicalPreambleBytes : 8L) + (long)_blockCount * BlockBytes;
 
     /// <summary>
     /// Writes the section — the same bytes <see cref="Serialise"/> returns — straight from the
@@ -354,19 +480,35 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public void WriteTo(Stream destination)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        Span<byte> header = stackalloc byte[8];
-        WriteHeader(header);
-        destination.Write(header);
+        Span<byte> preamble = stackalloc byte[CanonicalPreambleBytes];
+        int n = WritePreamble(preamble);
+        destination.Write(preamble[..n]);
         destination.Write(new ReadOnlySpan<byte>(_bits, (int)(_blockCount * BlockBytes)));
     }
 
-    private void WriteHeader(Span<byte> dest)
+    /// <summary>
+    /// Everything before the bits; returns its length. A canonical filter is preceded by the
+    /// one-block, all-ones legacy filter and <see cref="CanonicalMarker"/> (what an older build
+    /// reads, see there) and by the fingerprint of the table that folded it — this build's for a
+    /// filter it created, the recorded one for a filter it read. A legacy filter keeps saying how
+    /// its text was folded: one read back from a pre-folding section and re-serialised must not
+    /// start claiming a fold its bits never had.
+    /// </summary>
+    private int WritePreamble(Span<byte> dest)
     {
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest, _blockCount * BlockBits);
-        // Only claim folded when this instance's contents really were folded — a filter that
-        // was read back from a pre-folding blob and re-serialised must keep saying so.
-        uint capacityWord = _folded ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(4), capacityWord);
+        int at = 0;
+        if (_fold == TextFold.Canonical)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(dest, BlockBits);
+            BinaryPrimitives.WriteUInt32LittleEndian(dest[4..], CanonicalMarker);
+            dest.Slice(8, BlockBytes).Fill(0xFF);
+            BinaryPrimitives.WriteUInt64LittleEndian(dest[StubBytes..], _foldFingerprint);
+            at = StubBytes + 8;
+        }
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[at..], _blockCount * BlockBits);
+        uint capacityWord = _fold == TextFold.LowerInvariant ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[(at + 4)..], capacityWord);
+        return at + 8;
     }
 
     public static SegmentBloomFilter Deserialise(ReadOnlySpan<byte> data)
@@ -383,9 +525,29 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
             return matchAll;
         }
 
-        uint bitCount     = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
-        uint capacityWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
-        bool folded       = (capacityWord & FoldedMarker) != 0;
+        // A canonical section starts with a legacy filter of one block whose capacity word no
+        // legacy writer produced (CanonicalMarker); the filter itself follows the fingerprint. A
+        // section that has the marker and not the room for what it promises is torn, and is
+        // refused below like any other — never read as the all-ones block in front of it, which
+        // would quietly turn a damaged section into one that proves nothing.
+        if (BinaryPrimitives.ReadUInt32LittleEndian(data) == BlockBits
+            && BinaryPrimitives.ReadUInt32LittleEndian(data[4..]) == CanonicalMarker)
+        {
+            if (data.Length < CanonicalPreambleBytes)
+                throw new InvalidDataException($"Canonical bloom section ends at byte {data.Length}, inside its {CanonicalPreambleBytes}-byte preamble");
+            ulong fingerprint = BinaryPrimitives.ReadUInt64LittleEndian(data[StubBytes..]);
+            return Read(data[(StubBytes + 8)..], TextFold.Canonical, fingerprint);
+        }
+
+        bool folded = (BinaryPrimitives.ReadUInt32LittleEndian(data[4..]) & FoldedMarker) != 0;
+        return Read(data, folded ? TextFold.LowerInvariant : TextFold.None, 0);
+    }
+
+    /// <summary>One filter: a legacy section whole, or what follows a canonical one's preamble.</summary>
+    private static SegmentBloomFilter Read(ReadOnlySpan<byte> data, TextFold fold, ulong foldFingerprint)
+    {
+        uint bitCount     = BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
+        uint capacityWord = BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
         uint capacity     = capacityWord & ~FoldedMarker;
 
         // CHECKED BEFORE THE ALLOCATION, because the allocation is NativeMemory and the thing
@@ -402,8 +564,8 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         // The multiple-of-512 check is the same guard wearing its other face. A bitCount in
         // [8, 512) passes the length test on a tiny blob and yields blockCount == 0, which is a
         // DivideByZeroException inside Add/MightContain rather than at construction — thrown from
-        // under the pooled buffers AddRaw and MightContainRaw take, which they return without a
-        // finally. The format has always required the multiple; nothing enforced it.
+        // under the pooled buffers the text overloads take, which they return without a finally.
+        // The format has always required the multiple; nothing enforced it.
         if (bitCount == 0 || (bitCount & (uint)(BlockBits - 1)) != 0 || data.Length < 8L + bitCount / 8)
             throw new InvalidDataException(
                 $"Bloom section declares {bitCount} bits ({bitCount / 8} bytes) in a {data.Length}-byte section");
@@ -413,7 +575,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
         data.Slice(8, (int)byteCount).CopyTo(new Span<byte>(bits, (int)byteCount));
-        return new SegmentBloomFilter(bits, blockCount, capacity, folded);
+        return new SegmentBloomFilter(bits, blockCount, capacity, fold, foldFingerprint, binaryKeys: false);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -174,11 +174,12 @@ public sealed class EmptyIndexSemanticsTests
 
     /// <summary>
     /// A blob as an older build wrote it: values stored in their ORIGINAL casing (the byte
-    /// overload does not fold) and no folded marker in the capacity word.
+    /// overload does not fold), in the legacy layout — which a binary-keyed filter still writes —
+    /// with no folded marker in the capacity word.
     /// </summary>
     private static byte[] PreFoldingBlob(params string[] values)
     {
-        using var build = SegmentBloomFilter.Create(16);
+        using var build = SegmentBloomFilter.CreateForBinaryKeys(16);
         foreach (var v in values)
             build.Add(System.Text.Encoding.UTF8.GetBytes(v));
 

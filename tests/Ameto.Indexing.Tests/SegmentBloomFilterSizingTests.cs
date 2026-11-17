@@ -13,6 +13,16 @@ public sealed class SegmentBloomFilterSizingTests
 {
     private const long MaxFilterBytes = 16L * 1024 * 1024;
 
+    /// <summary>The filter's own bits, in bytes, as written: a canonical section less its 88-byte
+    /// preamble (the one-block legacy filter, the marker, the fold's fingerprint, the header).</summary>
+    private static long FilterBytes(SegmentBloomFilter filter)
+    {
+        long written = filter.Serialise().Length;
+        Assert.Equal(filter.SerialisedLength, written);
+        Assert.Equal(88 + filter.RetainedBytes, written);
+        return filter.RetainedBytes;
+    }
+
     /// <summary>
     /// The design point, over four orders of magnitude: ~10 bits a term, which is ~1 % false
     /// positives. Below it the filter saturates and the query's phase-1 gate stops rejecting;
@@ -30,7 +40,7 @@ public sealed class SegmentBloomFilterSizingTests
     public void AFilterIsSizedAtTenBitsPerTerm(long terms)
     {
         using var filter = SegmentBloomFilter.Create(terms);
-        long bits = (filter.Serialise().Length - 8L) * 8;
+        long bits = FilterBytes(filter) * 8;
 
         Assert.InRange(bits / (double)terms, 10.0, 10.6);
     }
@@ -61,7 +71,7 @@ public sealed class SegmentBloomFilterSizingTests
         Assert.Equal(1_177_348, Events);
 
         using var filter = SegmentBloomFilter.Create(Terms);
-        long bytes = filter.Serialise().Length - 8L;
+        long bytes = FilterBytes(filter);
 
         Assert.True(bytes <= MaxFilterBytes,
             $"the forecast allocated {bytes / 1048576.0:F1} MB for one group — the filter ceiling is not holding");
@@ -81,9 +91,10 @@ public sealed class SegmentBloomFilterSizingTests
     [Fact]
     public void ACappedFilterReportsTheCapacityItCanActuallyHold()
     {
-        var  serialised = SegmentBloomFilter.Create(MaxFilterBytes * 8).Serialise();
-        uint capacity   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(serialised.AsSpan(4))
-                        & 0x7FFF_FFFFu;
+        // Read back off the bytes, which is where a reader takes it from.
+        using var written = SegmentBloomFilter.Create(MaxFilterBytes * 8);
+        using var read    = SegmentBloomFilter.Deserialise(written.Serialise());
+        long capacity     = read.Capacity;
 
         Assert.True(capacity <= MaxFilterBytes * 8 / 10,
             $"capacity {capacity:N0} exceeds the {MaxFilterBytes * 8 / 10:N0} terms the capped bits can carry");

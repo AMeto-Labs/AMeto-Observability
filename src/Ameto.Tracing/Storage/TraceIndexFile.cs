@@ -212,7 +212,9 @@ internal sealed class TraceIndexWriter
         ulong  minKey = _entries.Count > 0 ? _entries[0].Key   : 0;
         ulong  maxKey = _entries.Count > 0 ? _entries[^1].Key  : 0;
 
-        var bloom       = SegmentBloomFilter.Create(Math.Max(1, _entries.Count));
+        // Binary keys — eight-byte ids, no casing — so the filter keeps the legacy layout every
+        // build has written here, and these files keep their bytes.
+        var bloom       = SegmentBloomFilter.CreateForBinaryKeys(Math.Max(1, _entries.Count));
         var blockFirst  = new List<ulong>();
         var blockOffset = new List<long>();
 

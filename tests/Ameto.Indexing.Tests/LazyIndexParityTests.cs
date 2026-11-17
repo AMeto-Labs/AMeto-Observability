@@ -508,21 +508,36 @@ public sealed class LazyIndexParityTests
         new string('a', 1500), "a" + new string('b', 1100),
     ];
 
+    private static IEnumerable<(uint, string)> TrigramAdds()
+    {
+        for (uint o = 0; o < 64; o++) yield return (o, Texts[o % Texts.Length]);
+        yield return (64, new string('a', 1500));
+    }
+
     private static SegmentTrigramIndex BuildTrigrams()
     {
         var t = new SegmentTrigramIndex();
-        for (uint o = 0; o < 64; o++)
-            t.Add(o, Texts[o % Texts.Length]);
-        t.Add(64, new string('a', 1500));
+        foreach (var (o, text) in TrigramAdds()) t.Add(o, text);
         return t;
     }
 
+    /// <summary>The canonical layout, the V1 Roaring one, and the V2 layout every build wrote before
+    /// the canonical fold — keys lowercased, which a reader asks only for ASCII trigrams.</summary>
+    public static TheoryData<string> TrigramLayouts => new() { "codec", "roaring", "lower-v2" };
+
+    private static byte[] TrigramSection(SegmentTrigramIndex built, IEnumerable<(uint, string)> adds, string layout) => layout switch
+    {
+        "codec"   => built.Serialise(),
+        "roaring" => built.SerialiseRoaringV1(),
+        _         => LogIndexCaseFoldTests.LowercaseTrigrams(adds),
+    };
+
     [Theory]
-    [MemberData(nameof(Layouts))]
+    [MemberData(nameof(TrigramLayouts))]
     public void EveryTrigramSearch_GetsTheDecodedAnswer_FromTheSectionAndFromTheMemo(string layout)
     {
         var built = BuildTrigrams();
-        byte[] section = layout == "codec" ? built.Serialise() : built.SerialiseRoaringV1();
+        byte[] section = TrigramSection(built, TrigramAdds(), layout);
         var oracle = SegmentTrigramIndex.Deserialise(section);
         using var lazy = SegmentIndexReader.Load([], section, []);
 
@@ -581,10 +596,12 @@ public sealed class LazyIndexParityTests
         const string Alphabet = "abcAB-: Ωж1";
         for (int round = 0; round < 30; round++)
         {
-            var t = new SegmentTrigramIndex();
+            var t    = new SegmentTrigramIndex();
+            var adds = new List<(uint, string)>();
             int events = rng.Next(1, 200);
-            for (uint o = 0; o < events; o++) t.Add(o, RandomText(rng, Alphabet, rng.Next(0, 30)));
-            byte[] section = rng.Next(4) == 0 ? t.SerialiseRoaringV1() : t.Serialise();
+            for (uint o = 0; o < events; o++) adds.Add((o, RandomText(rng, Alphabet, rng.Next(0, 30))));
+            foreach (var (o, text) in adds) t.Add(o, text);
+            byte[] section = TrigramSection(t, adds, rng.Next(4) switch { 0 => "roaring", 1 => "lower-v2", _ => "codec" });
             var oracle = SegmentTrigramIndex.Deserialise(section);
             using var lazy = SegmentIndexReader.Load([], section, []);
 

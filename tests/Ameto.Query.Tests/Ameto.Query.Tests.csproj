@@ -19,6 +19,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Segments an earlier build wrote, read by this one (CaseFoldTierParityTests). -->
+    <None Include="Fixtures\**\*.seg" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Query\Ameto.Query.csproj" />
     <!-- Both arrive transitively through Ameto.Query; named here because this suite now writes
